@@ -104,3 +104,43 @@ world browser {
     export run: func();
 }
 ```
+
+# Deliverables
+
+There are a few deliverables we want for the MVP:
+
+## Basic OS API specs
+
+### Execute API
+
+When provided, allows programs to invoke other WASM programs. In practice, this is usually the top-level WASM compiler (unless virtualized for security reasons).
+
+### Disk API
+
+TODO - we want to support ultrahigh concurrency and DMA
+
+### Filesystem API
+
+TODO - we want to provide standard FS stuff, but also some new things like deterministic name/content based hashes all the way up the FS tree.
+You can easily look at the pre-computed hash of any FS node (file or dir) to see if it or its descendants have changed since last snapshot.
+Lets us build backend-agnostic versions of stuff like ZFS tree walk for backup.
+
+### Net API
+
+TODO - similar goals to disk
+
+### Text API
+
+TODO - std{i,o,err}
+
+### Entropy API
+
+TODO
+
+### TODO - other APIs
+
+
+## Usermode binary
+
+We want an `eo9` binary which provides (in macos/linux/etc) a usermode implementation of `eo9` with appropriate OS APIs
+backed by standard *nix APIs. You can invoke this appropriately to get an Eo9 instance running the specified program (which could be a shell).
