@@ -163,6 +163,55 @@ Modeling the buffer as a `resource` rather than a `list<u8>` also makes it DMA-f
 
 > Note: The Component Model's async support (`future`/`stream`) was still stabilizing as of this writing; since async I/O is central to Eo9, the concrete encoding of `future<…>` may need to track the upstream spec. `stream<T>` is sequential and so is not used for the offset-addressed, random-access disk/net APIs.
 
+### Composition and the `$` operator
+
+Virtualization layers are **providers**, not executors. A provider — `virtualnet`, `virtualfs`, a sandbox — is just a component that *exports* one or more OS-API interfaces (importing only what it itself needs). It takes no program argument and runs nothing; it is an inert bag of implementations. This is what makes virtualization zero-overhead: a provider's exports are composed into a program's imports and inlined, so a no-op layer compiles out (see Performance). It also keeps wrappers low-privilege — a provider needs no authority to run other programs.
+
+`$` is the **composition operator**. `provider $ consumer` satisfies the consumer's imports from the provider's matching exports, yielding a new component. It is **right-associative**, with the rightmost term the ultimate consumer:
+
+```
+virtualfs $ virtualnet $ browser  ==  virtualfs $ (virtualnet $ browser)
+```
+
+Both providers compose into `browser`. Composition connects an export to an import *only where the consumer actually imports that interface*; unmatched consumer imports remain residuals for the next layer or the surrounding context. Re-association therefore changes meaning:
+
+```
+(virtualnet $ virtualfs) $ browser
+```
+
+wires `virtualnet` into `virtualfs` only, so `browser` sees `virtualfs`'s exports but never `virtualnet`'s. (Meaningful only if `virtualfs` itself imports net.) This elaborates the example in Virtualization.
+
+**Executors** are the dual, more-privileged role. An executor — the shell, a supervisor, a debugger, the `interpret` slow-path — holds the capability to load and run programs (the Execute API). Reach for an executor when you must *drive or observe* a run (spawn on demand, restart on failure, single-step); reach for a provider when you are merely *substituting* an implementation. Rule of thumb: **substitution → provider; supervision → executor.** Statefulness is not the discriminator (a NAT table lives fine inside a provider); driving the run is. The shell is itself an executor that composes providers and runs the result.
+
+### Programs as values
+
+Naming or composing a program never runs it. A program is an **open component**: a value with (possibly) unsatisfied imports. *Running* is a separate operation — instantiate the component against a context that satisfies its residual imports, then call `main`. This is the Component Model's component-vs-instance distinction, and it gives the operators clean types:
+
+- `$` `: component, component -> component` — composition; the result is still open.
+- `run` / `interpret` / `exec` `: component -> execution` — close the imports from *their own* context, then invoke `main`.
+
+At the **top level** of a shell command the shell implicitly `run`s the resulting component against the shell's context. In an **argument position** a component is just a value — passed, not run.
+
+**Type-directed arguments.** How the shell parses an argument is determined by the declared type of the parameter it fills (the same mechanism as `--verbose true ⇄ verbose: bool`). A `component`-typed parameter makes the shell evaluate its argument as a *program expression* (resolve names, apply `$`); a `string`-typed parameter takes the same text literally. The parameter type is the sole disambiguator between a module literal and text — there is no quoting sigil, and it is checked statically.
+
+| parameter type | command position     | argument position         |
+|----------------|----------------------|---------------------------|
+| `component`    | composed **and run** | composed, passed **open** |
+| `string`       | —                    | literal text              |
+
+For example:
+
+```
+> virtualnet $ browser              # composed, then run by the shell
+> interpret (virtualnet $ browser)  # composed, passed open to `interpret`, which runs it its own (slow) way
+```
+
+In the second case the residual imports of the parenthesized module are satisfied by `interpret`, not the shell — so an interpreter, debugger, or sandbox gets full control over the import environment of the module it is handed.
+
+**Grouping.** An argument is an atom (a name or literal) or a parenthesized expression; `$` lives at the expression level, so a composition used as a single argument must be wrapped in `()`. Without it, `interpret virtualnet $ browser` would parse as `(interpret virtualnet) $ browser`. We use `()` for grouping only — no `[]` or quoting sigils.
+
+**Representation.** A `component` is data. Unlike the OS-API handles we deliberately do *not* pass as arguments (behavior comes from imports), a module genuinely is bytecode, so passing it as an argument is correct. In-shell it is an opaque `component` resource (composed in-process, pre-validated); `load`/`save` convert to and from `list<u8>` when a module must cross a boundary — e.g. shipping it to another machine to interpret.
+
 # Deliverables
 
 There are a few deliverables we want for the MVP:
@@ -171,7 +220,29 @@ There are a few deliverables we want for the MVP:
 
 ### Execute API
 
-When provided, allows programs to invoke other WASM programs. In practice, this is usually the top-level WASM compiler (unless virtualized for security reasons).
+The Execute capability is what makes a program an **executor** (see *Composition and the `$` operator*): it can load and run other WASM programs. It is privileged — the shell, supervisors, debuggers, and the `interpret` slow-path hold it; ordinary providers do not.
+
+It deals in open `component` values. Because a program's imports depend on the program, they are introspected and checked at runtime: `run` satisfies some imports from the caller's own exports (`override`) and the rest from a forwarded `context`, erroring if any import is satisfiable by neither. Sketch:
+
+```wit
+interface exec {
+    resource context;     // opaque bundle of capabilities to run a program against
+    resource component;   // an open, composable program
+
+    load:    func(image: list<u8>) -> result<component, load-error>;
+    imports: func(c: borrow<component>) -> list<string>;     // introspect what it needs
+    compose: func(provider: component, consumer: component)  // the `$` operator
+        -> result<component, compose-error>;
+
+    // satisfy `override` from the caller's own exports; the rest from `base`.
+    run: func(c: component, base: borrow<context>, override: list<string>)
+        -> result<program-outcome, exec-error>;
+}
+```
+
+Composition is also a build-time operation for the fused, zero-overhead path; `compose` simply exposes the same wiring at runtime.
+
+Open question: `run` ultimately yields a program's `result<program-success, program-failure>`, but those types are program-defined, so a generic executor cannot name them statically. We likely need a uniform `program-outcome` rendering (a diagnostic/serialized form) for generic tooling, while a caller that knows the callee's type recovers the precise variant.
 
 ### Disk API
 
