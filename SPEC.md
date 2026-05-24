@@ -188,3 +188,14 @@ We want bootable images for Eo9 for AMD64, AArch64, and rv64gc. These images sho
 ## Test Suite
 
 We want both a usermode and in-QEMU test suite.
+
+# Implementation Details
+
+OS core is written in Rust. Cranelift for WASM.
+
+## Shell
+
+We should provide a built-in shell for Eo9. Call it `eosh`.
+
+The shell should support invoking programs with both arguments (passed to main function, not compiled in) and 
+
