@@ -173,6 +173,14 @@ TODO - std{i,o,err}
 
 TODO
 
+### Time API
+
+TODO
+
+### Perf Measurement API
+
+TODO
+
 ### TODO - other APIs
 
 
@@ -197,5 +205,17 @@ OS core is written in Rust. Cranelift for WASM.
 
 We should provide a built-in shell for Eo9. Call it `eosh`.
 
-The shell should support invoking programs with both arguments (passed to main function, not compiled in) and 
+The shell should support invoking programs with both arguments (passed to main function, not compiled in) and custom imports.
 
+The following should be possible in `eosh`:
+
+```
+> foo
+Fooing
+Foo done in 1.3s
+> foo --count 2
+Fooing
+Fooing
+Foo done in 2.8s
+> virtualtext --out /tmp/a --err /tmp/b foo
+> virtualtime 
