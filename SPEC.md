@@ -34,9 +34,8 @@ For example, if we wanted to run the program `browser` with virtualized networki
 > virtualfs --name fs0 --impl zfsfile=/tmp/fs.zfs $ virtualnet --name net0 --impl loopback-only $ browser
 ```
 
-This would invoke the `browser` program with its
-Eo9-standard `fs : Map<FsName,FsImpl>` and `net : Map<NetName,NetImpl>` arguments set to
-a file-backed filesystem and a mocked-out loopback-only networking interface.
+This would link the `browser` module with `virtualfs` and `virtualnet`-provided implementations of the relevant
+APIs, instead of the standard OS-provided versions.
 
 ## Performance
 
@@ -83,7 +82,7 @@ A WASM module's only channel to the outside world is its imports: core WASM has 
 
 The WASM module imports the set of OS APIs it wants access to. Required OS APIs are imported as a mandatory type, and optional OS APIs are imported as an optional type. We use WIT (the Component Model's interface-definition language) for import/export specification; a WIT `world` is precisely the declaration of which APIs, by name and type, a program requires and provides.
 
-The WASM module exports, at minimum, a `main` entrypoint, which we invoke for normal program execution. `main` returns a `result<program-success, program-failure>`, where the success and failure types are defined by the program itself (typically variants) — so a program reports its outcome in its own structured vocabulary rather than through a lossy numeric exit code.
+Every Eo9 module is exactly one of two kinds. A **binary** exports a `main` entrypoint, which we invoke to run it; `main` returns a `result<program-success, program-failure>` whose success and failure types are defined by the program itself (typically variants), so a program reports its outcome in its own structured vocabulary rather than through a lossy numeric exit code. A **provider** instead exports OS-API interfaces (plus a `configure` entry) for composition into other modules, and is never run directly. A module is never both — see *Composition and the `$` operator*.
 
 At load time, the OS scans the imports and ensures that, for each one, we know how to provide a resource of the specified name and type. Anything we cannot satisfy is rejected before execution.
 
@@ -151,7 +150,7 @@ package eo9:browser@0.1.0 {
 }
 ```
 
-**Arguments vs. imports.** The `main` entry point takes *named, fully-typed* arguments — there is no untyped `argv`. Each shell flag maps to one typed parameter (`--verbose true` ⇄ `verbose: bool`), so the runtime parses and type-checks an invocation against the signature. And because Component Model export parameters keep their names and types in the component's type, a launcher can extract `main`'s signature — via `wasm-tools component wit`, or the `wit-parser`/`wit-component` libraries — to validate arguments, generate a CLI parser, or auto-fill an invocation UI. This is the dual of imports: imports are *capabilities*, resolved at link time and fused in (see Performance); arguments are *invocation data*, supplied dynamically on each run. Behavior always enters through imports — arguments carry data, never functions.
+**Arguments vs. imports.** A module's argument entry — `main` for a binary, `configure` for a provider — takes *named, fully-typed* arguments; there is no untyped `argv`. Each shell flag maps to one typed parameter (`--verbose true` ⇄ `verbose: bool`), so the runtime parses and type-checks an invocation against the signature. Because Component Model export parameters keep their names and types in the component's type, a launcher can extract that signature — via `wasm-tools component wit`, or the `wit-parser`/`wit-component` libraries — to validate arguments, generate a CLI parser, or auto-fill an invocation UI. This is the dual of imports: imports are *capabilities*, resolved at link time and fused in (see Performance); arguments are *invocation data* — a binary's `main` args bound at run time, a provider's `configure` args bound at compose time (see *Composition and the `$` operator*). Behavior always enters through imports — arguments carry data, never functions.
 
 **Ownership and buffers.** WIT has no mutable/immutable data references — there is no `&`/`&mut`. Plain data (lists, records, …) is passed by value, and the only ownership concepts, `own<T>` and `borrow<T>`, apply solely to opaque `resource` handles.
 
@@ -165,7 +164,9 @@ Modeling the buffer as a `resource` rather than a `list<u8>` also makes it DMA-f
 
 ### Composition and the `$` operator
 
-Virtualization layers are **providers**, not executors. A provider — `virtualnet`, `virtualfs`, a sandbox — is just a component that *exports* one or more OS-API interfaces (importing only what it itself needs). It takes no program argument and runs nothing; it is an inert bag of implementations. This is what makes virtualization zero-overhead: a provider's exports are composed into a program's imports and inlined, so a no-op layer compiles out (see Performance). It also keeps wrappers low-privilege — a provider needs no authority to run other programs.
+Virtualization layers are **providers**, not executors. A provider — `virtualnet`, `virtualfs`, a sandbox — is just a component that *exports* one or more OS-API interfaces (importing only what it itself needs). It exports no `main` and is never run directly; it is a configurable bag of implementations. This is what makes virtualization zero-overhead: a provider's exports are composed into a program's imports and inlined, so a no-op layer compiles out (see Performance). It also keeps wrappers low-privilege — a provider needs no authority to run other programs.
+
+**Binary or provider, never both.** Every module is exactly one kind. A *binary* exports `main(args)` and is run; a *provider* exports interfaces plus `configure(args)` and is composed. The two argument surfaces stage differently: a binary's `main` args are bound at run time and may differ each run, while a provider's `configure` args are bound at compose time. A provider takes config the same type-directed way a binary takes flags — `virtualfs --dir /tmp/sandbox` binds `configure(dir: string)` — and because that config is usually a compile-time constant, the compose-and-compile step specializes the provider with it and inlines, so even a configured layer stays zero-overhead. An invalid value fails at `configure`, before the consumer ever runs.
 
 `$` is the **composition operator**. `provider $ consumer` satisfies the consumer's imports from the provider's matching exports, yielding a new component. It is **right-associative**, with the rightmost term the ultimate consumer:
 
@@ -181,7 +182,49 @@ Both providers compose into `browser`. Composition connects an export to an impo
 
 wires `virtualnet` into `virtualfs` only, so `browser` sees `virtualfs`'s exports but never `virtualnet`'s. (Meaningful only if `virtualfs` itself imports net.) This elaborates the example in Virtualization.
 
+**Precedence.** Argument application binds tighter than `$`, so each module's flags attach to that module before composition:
+
+```
+virtualfs --dir /tmp/sandbox $ browser --url https://example.com
+==  (virtualfs --dir /tmp/sandbox) $ (browser --url https://example.com)
+```
+
 **Executors** are the dual, more-privileged role. An executor — the shell, a supervisor, a debugger, the `interpret` slow-path — holds the capability to load and run programs (the Execute API). Reach for an executor when you must *drive or observe* a run (spawn on demand, restart on failure, single-step); reach for a provider when you are merely *substituting* an implementation. Rule of thumb: **substitution → provider; supervision → executor.** Statefulness is not the discriminator (a NAT table lives fine inside a provider); driving the run is. The shell is itself an executor that composes providers and runs the result.
+
+### Packaging and submodules
+
+A WIT **package** groups related worlds and interfaces — think of it as a crate: the provider is the `lib`, sibling binaries are the `[[bin]]` targets, and they share the package's interfaces and types (so a tool and the provider it serves can never drift, and they version together as one semver-tagged package).
+
+Worlds are flat — WIT has no nested worlds — so hierarchy is a naming convention, not containment. The bare package name resolves to a designated **default world**; a dotted suffix selects a sibling:
+
+```wit
+package eo9:virtualfs@1.0.0 {
+    // on-disk layout etc., shared so the provider and its tools never drift
+    interface format { record superblock { version: u32, root: string } }
+
+    // the provider — the package's default world; addressed bare as `virtualfs`
+    world default {
+        use format.{superblock};
+        import eo9:disk/disk@1.0.0;             // underlying storage — a residual import
+        export eo9:fs/fs@1.0.0;                 // provides the standard fs API
+        export configure: func(dir: string) -> result<_, config-error>;
+    }
+
+    // a binary tool — addressed as `virtualfs.create`
+    world create {
+        use format.{superblock};
+        import eo9:disk/disk@1.0.0;
+        export main: func(dir: string, size: u64) -> result<program-success, program-failure>;
+    }
+}
+```
+
+| shell name         | WIT path                | kind     |
+|--------------------|-------------------------|----------|
+| `virtualfs`        | `eo9:virtualfs/default` | provider |
+| `virtualfs.create` | `eo9:virtualfs/create`  | binary   |
+
+The default world is *not* named after the package (so the bare name never doubles as `virtualfs.virtualfs`) and is *not* named `main` (which already means a binary's runnable function). Each world compiles to its own component artifact, shipped together as the package. Deeper hierarchy has no world-level form: flatten the name (`virtualfs.repair`) or split a large subsystem into its own package (`eo9:virtualfs-tools`).
 
 ### Programs as values
 
