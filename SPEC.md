@@ -83,7 +83,7 @@ A WASM module's only channel to the outside world is its imports: core WASM has 
 
 The WASM module imports the set of OS APIs it wants access to. Required OS APIs are imported as a mandatory type, and optional OS APIs are imported as an optional type. We use WIT (the Component Model's interface-definition language) for import/export specification; a WIT `world` is precisely the declaration of which APIs, by name and type, a program requires and provides.
 
-The WASM module exports, at minimum, a `main` entrypoint, which we invoke for normal program execution.
+The WASM module exports, at minimum, a `main` entrypoint, which we invoke for normal program execution. `main` returns a `result<program-success, program-failure>`, where the success and failure types are defined by the program itself (typically variants) — so a program reports its outcome in its own structured vocabulary rather than through a lossy numeric exit code.
 
 At load time, the OS scans the imports and ensures that, for each one, we know how to provide a resource of the specified name and type. Anything we cannot satisfy is rejected before execution.
 
@@ -121,15 +121,37 @@ package eo9:disk@1.0.0 {
     }
 }
 
-// A program targets a `world`, importing the versioned interfaces it needs.
+// A program targets a `world`: OS APIs arrive as compiled-in imports, while
+// invocation config arrives as named, fully-typed arguments — no untyped argv.
 package eo9:browser@0.1.0 {
     world browser {
+        // implementations: resolved at link time, fused in
         import eo9:disk/disk@1.0.0;
         import eo9:net/net@1.0.0;
-        export run: func();
+
+        // outcome types are defined by the program itself
+        variant program-success {
+            exited,
+            restart-requested,
+        }
+        variant program-failure {
+            bad-arguments(string),
+            network-unreachable,
+            internal-error(string),
+        }
+
+        // arguments: named and typed — one shell flag per parameter
+        //   browser --url https://example.com --verbose true --max-connections 64
+        export main: func(
+            url: string,
+            verbose: bool,
+            max-connections: u32
+        ) -> result<program-success, program-failure>;
     }
 }
 ```
+
+**Arguments vs. imports.** The `main` entry point takes *named, fully-typed* arguments — there is no untyped `argv`. Each shell flag maps to one typed parameter (`--verbose true` ⇄ `verbose: bool`), so the runtime parses and type-checks an invocation against the signature. And because Component Model export parameters keep their names and types in the component's type, a launcher can extract `main`'s signature — via `wasm-tools component wit`, or the `wit-parser`/`wit-component` libraries — to validate arguments, generate a CLI parser, or auto-fill an invocation UI. This is the dual of imports: imports are *capabilities*, resolved at link time and fused in (see Performance); arguments are *invocation data*, supplied dynamically on each run. Behavior always enters through imports — arguments carry data, never functions.
 
 **Ownership and buffers.** WIT has no mutable/immutable data references — there is no `&`/`&mut`. Plain data (lists, records, …) is passed by value, and the only ownership concepts, `own<T>` and `borrow<T>`, apply solely to opaque `resource` handles.
 
