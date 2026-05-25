@@ -21,8 +21,9 @@
 //! The crate's world lives in its own `wit/` directory, with the repo-level `wit/<api>`
 //! packages it imports symlinked under `wit/deps/` (the same convention the repo-level
 //! packages use for their own dependencies). The crate must list both `eo9-guest` and
-//! `wit-bindgen` as dependencies (the generated code refers to `wit_bindgen::rt` for its
-//! runtime support).
+//! `wit-bindgen` as dependencies, under those names: the expansion refers to
+//! `eo9_guest::api` for the remapped interface modules and the generated code refers to
+//! `wit_bindgen::rt` for its runtime support.
 
 /// Generate bindings for a program crate's WIT world, mapping the standard `eo9:*` API
 /// interfaces onto the shared modules in [`crate::api`].
