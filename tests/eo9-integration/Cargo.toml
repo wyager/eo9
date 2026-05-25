@@ -1,0 +1,23 @@
+# Cross-area integration tests (plan/13-tests.md, milestone 1): capability semantics
+# observed end-to-end (compose with eo9-component, execute with eo9-runtime), determinism
+# of outcomes / algebra operations / store cache keys, and the kill/linearity contract.
+#
+# The library target is a small reusable harness: building executable fixture components
+# in-process from WIT text plus a hand-written core module (no dependency on the guest
+# workspace or on area 09's stub providers, which are developed in parallel), and running
+# a component to its outcome under a given set of root providers.
+[package]
+name = "eo9-integration"
+description = "Eo9 cross-area integration tests: capability, determinism, and kill/linearity suites plus the shared test harness."
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+eo9-component = { workspace = true }
+eo9-runtime = { workspace = true }
+eo9-store = { workspace = true }
+wit-parser = { workspace = true }
+wit-component = { workspace = true }
+wat = { workspace = true }

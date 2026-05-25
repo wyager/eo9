@@ -3,7 +3,7 @@
 # their own Cargo.toml, toolchain file, and target configuration.
 [workspace]
 resolver = "3"
-members = ["crates/*", "xtask"]
+members = ["crates/*", "tests/eo9-integration", "xtask"]
 exclude = ["guest", "kernel"]
 
 [workspace.package]
@@ -29,6 +29,10 @@ wit-component = "0.250.0"
 wasm-encoder = "0.250.0"
 wasmparser = "0.250.0"
 wasm-wave = "0.250.0"
+# wasm-tools text-format assembler (same 250 family; already in the lockfile via
+# wit-component). Used by the integration-test harness to build executable fixture
+# components from hand-written core modules.
+wat = "1.250.0"
 wac-graph = "0.10.0"
 wit-bindgen = "0.57.1"
 # blake3 is pinned without default features so no_std crates (eofs-core, later the kernel) can
