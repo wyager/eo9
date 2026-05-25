@@ -50,4 +50,54 @@ and each API section under Deliverables.
 3. `eo9:message`, remaining TODO surfaces; v0 freeze.
 
 ## Decisions
-(record here)
+
+Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
+
+1. **Async types (risk a): supported.** `future<T>`, bare `future`, and `stream<T>` in interface function
+   results parse, print, encode to binary, and round-trip exactly as the spec's disk sketch writes them.
+   Binary validation needs the `cm-async` feature (`wasm-tools validate --features cm-async`); the default
+   feature set rejects with "`future` requires the component model async feature". wit-bindgen 0.57.1
+   generates Rust for worlds using `future` without extra flags. `own<buffer>` is accepted as input but
+   normalizes to bare `buffer` (own is the default for resource params/results); `own` is also a reserved
+   word (unusable as an identifier). The authored packages write `buffer` directly.
+2. **Named slots (risk b): supported as written.** `import system-fs: eo9:fs/fs@0.1.0;` plus
+   `import scratch-fs: eo9:fs/fs@0.1.0;` in one world validates and round-trips. No spec adjustment needed.
+3. **Layout.** One directory per package under `wit/` (a directory may contain only one root package;
+   a flat dir of peer packages or a file of only braced packages is rejected). Cross-package references
+   are resolved via `deps/` symlinks to sibling package dirs (e.g. `wit/disk/deps/io -> ../../io`).
+   `wit/check.sh` runs parse → binary encode → validate (`--features cm-async`) → round-trip per package.
+4. **Root resource lives in a per-package `types` interface** (`eo9:X/types { resource x-impl }`), not inside
+   the API interface as the spec sketches. Reason: with the sketch encoding, any world importing
+   `X-optional` (or a `none` stub exporting it) is elaborated by wit-parser to also import the *full
+   required* `X` interface, because `use X.{x-impl}` drags the owning interface in — defeating the
+   optional-capability and `X.none` sealing semantics. With the split, optional importers pick up only the
+   authority-free `eo9:X/types` import. Accessor pattern (`default()`), `borrow<x-impl>` ops, and the
+   `-optional` flavor are otherwise exactly per spec. **Escalated** — if the planner prefers a different
+   encoding this is a mechanical change.
+5. **Same move in eo9:exec:** `resource image` lives in a types-only `images` interface so importing `task`
+   does not implicitly import the `compile` authority. `component` stays in `component-algebra` per the
+   sketch (it is unprivileged, so the implicit import is harmless).
+6. **Keyword collisions** (tooling-forced spellings): `import-need.interface` → `%interface`;
+   component-algebra `rename` takes `old-name`/`new-name` (`from` is a keyword); fs directory listing is
+   `list-directory` (`list` is a keyword).
+7. **Stub worlds** live as sibling worlds in each API package. Self-contained stubs (`none`, `deny`, `memfs`,
+   `mem`, `loopback`, `frozen`, `monotonic-stub`, `seeded`, `null`, `capture`) export `types` + the API so
+   they have zero `eo9:*` imports; attenuating stubs (`fs.readonly`, `disk.readonly`, `time.fuzzy`) import
+   and export the API (shared handle types with the underlying provider). Configurable stubs export an
+   inline `configure: func(...) -> result<_, string>` (seeded: seed; frozen/monotonic-stub: start/step;
+   fuzzy: granularity; disk.mem: size).
+8. **Additions beyond the spec sketches (escalated, not silently adopted):** `buffer.read`/`buffer.write`
+   byte accessors on `eo9:io/buffers` (without them guests cannot move data at all); a `rename` function in
+   `component-algebra`; minimal invented shapes for types the spec references but does not define
+   (`component-info`, `interface-ref`, error variants, `compile-opts`, `named-arg`, `wave-value`,
+   `program-outcome` as WAVE value + WIT type text).
+9. **Policy worlds** (`eo9:sandbox`): `pure` is the empty world; `no-net` imports the base flavor of every
+   standard API except net (an entry admits both flavors per the spec rule, enforced by area 03), including
+   the exec interfaces — `only` restricts, it never grants.
+10. **Open escalations for the planner:** (a) the proposed `fs-impl` → `disk-impl` rename in eo9:disk (kept
+    `fs-impl` per spec for now); (b) decision 4's types-interface encoding; (c) the buffer byte accessors;
+    (d) should `task.spawn` take `borrow<image>` instead of owned `image` (sketch consumes the image, so one
+    image = one spawn); (e) should exec interfaces get `-optional` flavors / stub worlds (they have no root
+    accessor in the sketch, so the pattern doesn't mechanically apply); (f) `import-need` has no slot-name
+    field, so named slots (`system-fs`) are not representable in `describe` output; (g) eo9:message deferred
+    to milestone 3 per the plan.
