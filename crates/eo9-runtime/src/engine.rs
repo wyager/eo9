@@ -64,6 +64,23 @@ pub fn new_engine(opts: &EngineOptions) -> Result<Engine> {
     Engine::new(&config(opts))
 }
 
+/// A fingerprint of everything that determines whether a serialized
+/// [`Image`](crate::Image) is loadable by the given engine: the wasmtime version, the
+/// host target, and every compile-relevant configuration flag (for Eo9 that reduces to
+/// the [`EngineOptions`] used, since the rest is pinned in [`config`]).
+///
+/// Two engines with equal fingerprints accept each other's serialized images; anything
+/// else is rejected by [`Image::deserialize`](crate::Image::deserialize). Intended as the
+/// engine component of a compilation-cache key (areas 06/11), alongside the content hash
+/// of the component being compiled. The value is stable for a given toolchain build but
+/// not across Rust/wasmtime upgrades — exactly the invalidation a cache wants.
+pub fn compatibility_hash(engine: &Engine) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut hasher);
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +93,12 @@ mod tests {
     #[test]
     fn engine_builds_with_debug_info() {
         new_engine(&EngineOptions { debug_info: true }).expect("debug-info config must be valid");
+    }
+
+    #[test]
+    fn compatibility_hash_is_stable_for_equal_options() {
+        let a = new_engine(&EngineOptions::default()).unwrap();
+        let b = new_engine(&EngineOptions::default()).unwrap();
+        assert_eq!(compatibility_hash(&a), compatibility_hash(&b));
     }
 }
