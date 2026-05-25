@@ -14,7 +14,9 @@ note, "The module store and compilation cache" (consumer of plan 06).
   - Pinned Wasmtime `Engine` configuration: components enabled, CM async enabled, **fuel metering on**,
     deterministic options (NaN canonicalization etc. — document what's available).
   - `compile(component, opts) -> Image`: Wasmtime precompilation; `opts` = debug info, opt level, target
-    (cross-compilation for the kernel's AOT path — coordinate with plan 12). Deterministic output is a goal;
+    (cross-compilation kept as a dev/bootstrap convenience; the kernel carries its own compiler, so structure
+    the compile path so its core is reusable under no_std + alloc and coordinate with plan 12 early on which
+    wasmtime/cranelift crates build for such targets). Deterministic output is a goal;
     verify and document what Wasmtime guarantees, escalate gaps (the store cache depends on this).
   - Task host: `spawn(image, args, limits)` (memory ceiling via Wasmtime's limiter), `resume(task, fuel)`
     (donate-and-run, returns out-of-fuel | blocked | done), `runnable`/`wait`/`kill` as futures,
@@ -44,7 +46,7 @@ WIT) to the planner rather than inventing a parallel mechanism.
 ## Milestones
 1. Async + fuel spike (above); `run` a hello component with host-provided text/time.
 2. Full task surface (spawn/resume/runnable/wait/kill + limits) with tests; WAVE args/outcomes.
-3. Compile cache hook-up with plan 06; cross-compile path for plan 12.
+3. Compile cache hook-up with plan 06; no_std+alloc compile-core coordination with plan 12.
 
 ## Decisions
 (record here)

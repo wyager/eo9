@@ -80,7 +80,8 @@ eo9/
   bit-identical runs; store + compile cache hit on second launch.
 - **I3** — concurrency at scale in usermode: a program with thousands of in-flight disk/net ops; fuel
   accounting and `resume`-based user-level scheduling demonstrated; kill/linearity behavior tested.
-- **I4** — bare metal: first arch boots in QEMU, runs a headless AOT-compiled program, output over serial.
+- **I4** — bare metal: first arch boots in QEMU, runs a headless program, output over serial (on-target
+  codegen lands as the immediately following kernel milestone).
 - **I5** — all three arches boot to eosh; usermode + QEMU test suites green in CI.
 
 ## Review & merge workflow
@@ -95,8 +96,9 @@ eo9/
 
 1. Git workflow: spec + plans live on master; area agents on branches/worktrees; reviewer agents review and
    merge (see Review & merge workflow above).
-2. **Open:** bare-metal execution strategy (host-side AOT + no_std runtime vs. on-target codegen vs.
-   interpreter-first). Plan 12's spike settles feasibility; direction under discussion.
+2. Bare-metal execution: **on-target codegen is part of the MVP.** The kernel is no_std **+ alloc** (heap from
+   day one), which is what makes carrying Cranelift feasible. Host-side AOT/cross-compilation is kept only as
+   a dev convenience and bootstrap seed; interpreter-on-metal is a fallback/diagnostic path, not the strategy.
 3. QEMU arch order: aarch64 → riscv64 → x86_64.
 4. eosh is compiled from Rust to a wasm component; it is not an OS builtin.
 5. Nightly Rust is fine anywhere it is useful.
