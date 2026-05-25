@@ -1,0 +1,7 @@
+# Guest crates are wasm components: default every build in this workspace to the wasm
+# target so a plain `cargo build` / `cargo clippy` run from guest/ does the right thing.
+# xtask passes --target explicitly as well. Note `cargo test` is not run in this
+# workspace (there is no wasm test runner wired up); guest code is exercised by the
+# host-side integration tests instead.
+[build]
+target = "wasm32-unknown-unknown"

@@ -1,0 +1,15 @@
+# Guest-side workspace: wasm components (guest SDK, stub providers, eosh, examples).
+# Built for wasm32-unknown-unknown and componentized with `wasm-tools component new`
+# via `cargo xtask build-guest` (see plan/01-workspace.md, Decisions).
+[workspace]
+resolver = "3"
+members = ["eo9-guest-placeholder"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Mirrors the authoritative pin table in the repo-root Cargo.toml — keep versions in sync.
+[workspace.dependencies]
+wit-bindgen = "0.57.1"

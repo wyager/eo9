@@ -1,0 +1,7 @@
+# Pinned nightly for the guest workspace — keep the `channel` in sync with the copies at
+# the repository root and in kernel/ (see plan/01-workspace.md, Decisions).
+[toolchain]
+channel = "nightly-2026-05-25"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
