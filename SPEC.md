@@ -26,7 +26,7 @@ interpreters, user-level schedulers, providers, the shell — is unprivileged by
 
 Spectre-class side channels are mitigated capability-style: fine-grained time is itself a capability. Untrusted
 programs are composed with noisy, adversarial, or stubbed timers (`time.fuzzy`, `time.frozen`, `time.none`) and are
-not granted shared-memory channels or other primitives from which a high-resolution clock could be rebuilt —
+not granted shared-memory threads (thread spawning is itself a capability — see *Execution APIs*) or other primitives from which a high-resolution clock could be rebuilt —
 attenuating the attacker's clock is just provider substitution, the same mechanism as everything else.
 
 ## Virtualization
@@ -65,9 +65,8 @@ optimization and never for privilege separation.
 
 > TODO (scheduling): codegen inserts yield points (fuel checks — chosen over epoch deadlines for determinism), so native tasks are cooperatively
 > schedulable *by construction* and a scheduler is just a program that holds task handles and decides which to
-> resume (see *Execution APIs*). Still to specify: the yield/resume surface of the Task API, the root scheduler's
-> handling of timer interrupts and the idle loop, the scheduling policy itself, and what a "scheduler switch"
-> actually costs.
+> resume (see *Execution APIs*). Still to specify: the root scheduler's handling of timer interrupts and the idle
+> loop, the scheduling policy itself, and what a "scheduler switch" actually costs.
 
 ## Hardware Support
 
@@ -185,7 +184,7 @@ Modeling the buffer as a `resource` rather than a `list<u8>` also makes it DMA-f
 
 **Contract vs. cost.** The Component Model nominally copies data across component boundaries to preserve isolation. Eo9 erases that cost: because driver implementations are compiled into the same module and linear memory as the program (see Performance), there is no runtime boundary between a program and its backends, so the optimizer can elide the canonical-ABI copies — an `own<buffer>` round-trip lowers to passing a pointer within shared linear memory. WIT describes the ownership *contract*; fusion makes it zero-cost.
 
-> Note: The Component Model's async support (`future`/`stream`) was still stabilizing as of this writing; since async I/O is central to Eo9, the concrete encoding of `future<…>` may need to track the upstream spec. `stream<T>` is sequential and so is not used for the offset-addressed, random-access disk/net APIs.
+> Note: The Component Model's async support (`future`/`stream`) was still stabilizing as of this writing; since async I/O is central to Eo9, the concrete encoding of `future<…>` may need to track the upstream spec. `stream<T>` is sequential and so is not used for the offset-addressed, random-access disk/net APIs. We deliberately build on the Component Model's async machinery (tasks, waitable-sets, `future`/`stream`) rather than inventing a parallel Eo9 mechanism — see *Execution APIs*.
 
 ### Composition and the `$` operator
 
@@ -278,7 +277,7 @@ world backup-tool {
 Wiring particular providers to particular slots is pure relabeling:
 
 - `rename a b` — a gate term (like `only`) that relabels slot `a` to `b` on everything to its right. It applies to imports and exports alike, is equivalent to composing an auto-generated forwarding adapter, and costs nothing after fusion.
-- `with p as name` — binds provider `p` to the slot `name`: sugar for renaming `p`'s export slot to `name` and composing. `p` must export exactly one interface (use `rename` explicitly otherwise). The keyword-first form keeps parsing one-directional — the parser sees `with`, then a provider expression, then `as`, then a slot name — and several bindings may be given in one `with`, comma-separated.
+- `with p as name` — binds provider `p` to the slot `name`: sugar for renaming `p`'s export slot to `name` and composing. `p` must export exactly one interface (use `rename` explicitly otherwise). The keyword-first form keeps parsing one-directional — the parser sees `with`, then a provider expression, then `as`, then a slot name — and several bindings may be given in one `with`, comma-separated. Tuples bind positionally: `with (a, b) as (x, y)` means `a as x, b as y` (arities must match).
 
 ```
 > with realfs as system-fs, memfs as scratch-fs $ backup-tool --src /home --dst /backups
@@ -318,6 +317,13 @@ package eo9:virtualfs@1.0.0 {
 | `virtualfs.create` | `eo9:virtualfs/create`  | binary   |
 
 The default world is *not* named after the package (so the bare name never doubles as `virtualfs.virtualfs`) and is *not* named `main` (which already means a binary's runnable function). Each world compiles to its own component artifact, shipped together as the package. Deeper hierarchy has no world-level form: flatten the name (`virtualfs.repair`) or split a large subsystem into its own package (`eo9:virtualfs-tools`).
+
+### The module store and compilation cache
+
+Module storage and naming take their inspiration from Nix:
+
+- **Content-addressed module store.** Modules live in a hash-indexed store; a module's identity *is* its content hash. Bare names (`browser`, `virtualfs.create`) resolve through the store (via profiles/manifests — exact mechanism TODO), and resolution hands back the immutable handle that loading and compilation key on (see *Execution APIs*). Multiple versions coexist naturally; an upgrade re-points a name, never mutates a module. The filesystem's deterministic content hashes (see Filesystem API) are the natural substrate.
+- **Deterministic, hash-keyed compilation cache.** Compilation must be deterministic, so the compiled artifact for a fused composition is cached under the hash of everything it depends on: the content hashes of every module in the composition, the `configure` constants baked in, the compile options, the target, and the compiler version. Frequently-run (environment, program) pairs therefore compile once and launch from cache; entries are evicted LRU/MFU. Determinism makes the cache shareable and auditable — the same key always yields bit-identical output (TODO: pin down the determinism requirements on codegen).
 
 ### Programs as values
 
@@ -475,42 +481,41 @@ interface task {
 
     resource task;
 
-    /// An edge-triggered readiness signal. A task's doorbell is one; so is a waitset's.
-    /// (Likely to move to a shared eo9:async package — I/O completion queues use the same machinery.)
-    resource waitable;
-
-    /// "Any member ready." Schedulers at every level block on one of these; a waitset aggregates to a
-    /// single waitable for *its* parent, so readiness composes up the scheduler hierarchy with no O(n) scans.
-    resource waitset {
-        constructor();
-        add:  func(w: waitable) -> u64;      // returns a key identifying the member (io_uring-style user data)
-        next: func() -> future<u64>;         // resolves with the key of a member that became ready
-        as-waitable: func() -> waitable;
+    /// Static resource limits, fixed at spawn. CPU is not here — CPU is fuel, and fuel is donated.
+    record spawn-limits {
+        max-memory: option<u64>,   // ceiling on linear-memory growth, enforced at memory.grow
     }
 
     // `args` are main's named, typed arguments, WAVE-encoded and checked against main's signature.
-    spawn: func(i: image, args: list<named-arg>) -> result<task, spawn-error>;
+    spawn: func(i: image, args: list<named-arg>, limits: spawn-limits) -> result<task, spawn-error>;
 
     variant resume-outcome { out-of-fuel, blocked, done(program-outcome) }
 
     /// Donate `fuel` to the task and run it now, on the caller's own CPU time; returns when the fuel is
-    /// spent, the task blocks, or it finishes. Fuel-metered yields keep interleaving deterministic.
-    resume:   func(t: borrow<task>, fuel: u64) -> resume-outcome;
-    doorbell: func(t: borrow<task>) -> waitable;   // rings when a blocked task becomes runnable again
+    /// spent, the task blocks on I/O, or it finishes. Fuel is conserved — a scheduler can only donate fuel
+    /// it was itself donated — so CPU budgets compose down the task tree. Fuel-metered yields keep
+    /// interleaving deterministic.
+    resume: func(t: borrow<task>, fuel: u64) -> resume-outcome;
 
-    // Conveniences over resume/doorbell, for callers that are not schedulers:
-    wait: func(t: borrow<task>) -> future<program-outcome>;
-    kill: func(t: borrow<task>) -> future<program-outcome>;
+    /// Readiness and lifecycle are ordinary Component Model futures — the same vocabulary a program already
+    /// uses for its own I/O. "Wait for any of my children plus my own I/O" is plain async code.
+    runnable: func(t: borrow<task>) -> future;                  // resolves when a blocked task can make progress
+    wait:     func(t: borrow<task>) -> future<program-outcome>; // resolves when the task finishes
+    kill:     func(t: borrow<task>) -> future<program-outcome>;
 
-    // TODO: waitset membership/removal semantics, and the multi-core rule (a task is resumed by at most
-    // one scheduler at a time).
+    // TODO: the multi-core rule (a task is resumed by at most one scheduler at a time); the thread-spawn
+    // capability for intra-task parallelism (see the bullets below).
 }
 ```
 
 - **Closed before compile.** There is no ambient `context` and no `override` mechanism: substitution and interposition are composition, decided with `$`/`&`/`only` before codegen and visible in the component value. The shell has no private powers — its top-level rule is literally "compose my environment onto the command, compile, spawn".
 - **Environments are just data.** What an executor may grant onward is an environment value it *possesses*: handed down by its parent (boot hands one to `init`/the shell), passable as an argument like any component, narrowed with `only`, extended with `&`. Possessing driver bytecode is harmless by itself — without Compile it can only be interpreted, and a driver's own imports of raw hardware capabilities (MMIO regions, interrupt lines) are satisfied only by the OS core at instantiation. Those hardware roots are the only true ambient context in the system.
 - **Schedulers are ordinary programs.** Codegen inserts fuel-metered yield points (fuel rather than epoch deadlines, for determinism), so native tasks are cooperatively schedulable *by construction*. A scheduler is then just a program holding `task` handles and deciding which to resume — nested schedulers, supervisors, and deterministic test schedulers are all unprivileged. The irreducibly privileged residue is the compiler that guarantees the yields, and the root holder of timer interrupts and the idle loop.
-- **Blocking and wakeups.** A parent never learns *what* its child is blocked on — the child's hundreds (or millions) of in-flight ops are its own business, recorded in its suspended state. Each task has a completion queue and an edge-triggered doorbell: backends push a completion record onto the queue and ring the doorbell only on the empty→non-empty transition; on the next `resume` the task drains the queue and dispatches internally. That is O(1) per completion and at most one wake per batch (the io_uring shape, and the shape of the Component Model's async ABI), which is what lets the disk/net APIs scale to millions of concurrent ops. Schedulers park doorbells in waitsets; waitsets aggregate into a single doorbell for their parent, so readiness composes up the hierarchy. Determinism: fuel fixes the CPU interleaving, and completion *order* becomes deterministic exactly when the providers are deterministic (`fs.memfs`, `entropy.seeded`, `time.frozen`) — the deterministic-test story goes all the way down. A supervisor that wants to know what a child is waiting on asks a diagnostic query (or interprets it); that is observability, not scheduling.
+- **One concurrency vocabulary.** Programs, providers, supervisors, and schedulers all use the Component Model's async machinery — WIT `future`/`stream`, structured tasks/subtasks, waitable-sets — for everything concurrent. The Task API adds no parallel notion of its own: `wait`/`runnable` are ordinary futures, so "block on any of my children plus my own I/O" is plain async code. The single genuinely OS-level primitive is `resume(task, fuel)`, because donating CPU has no Component Model analog. We build on the Component Model async ABI even while it stabilizes rather than growing a parallel mechanism; its host side is one implementation shared by usermode and bare metal.
+- **How readiness is implemented.** Under the hood the OS core implements the host side of that ABI with per-task completion queues and edge-triggered doorbells: a backend pushes a completion record and rings the doorbell only on the empty→non-empty transition; on its next resume the task drains the queue and dispatches to its parked waitable-sets. O(1) per completion and at most one wake per batch (the io_uring shape) — this is what lets the disk/net APIs scale to millions of concurrent ops. A parent never learns *what* a child is blocked on: that is the child's suspended state, and a supervisor that wants to know asks a diagnostic query or interprets the child. Fuel fixes the CPU interleaving, and completion *order* becomes deterministic exactly when the providers are deterministic (`fs.memfs`, `entropy.seeded`, `time.frozen`) — the deterministic-test story goes all the way down.
+- **There is no fork.** Concurrency inside a program is Component Model structured concurrency — free, not a capability, and unable to exceed the program's own imports. Creating a new *schedulable entity* (new linear memory, new capability set, new fuel budget) is `spawn`, which is necessarily a capability because it is precisely the act of granting capabilities and CPU. Unix-style `fork()` is a non-goal.
+- **Parallelism is a capability.** A task starts with one execution context; CPU parallelism *across* tasks is the scheduler's business and works from day one. Parallelism *within* a task (shared-memory threads) is host-mediated in WASM by construction, so Eo9 exposes it as a capability (`eo9:threads` — TODO, tracking the upstream shared-everything-threads proposal): untrusted code is simply not granted it (a second context plus shared memory is a high-resolution clock — see Security), and deterministic environments don't grant it either, since fuel-determinism only holds for single-context tasks.
+- **Resource limits.** Memory: a per-task ceiling fixed at spawn and enforced where WASM already asks the host for memory — `memory.grow`; there is no ambient malloc to police (allocators are guest code inside the program's own linear memory). CPU: fuel, conserved down the task tree as above. Everything else (DMA buffers, disk space, bandwidth, handle counts) flows through providers, so quotas there are provider configuration — ordinary attenuation. Shell surface for limits (a `limit` gate or spawn flags) is TODO.
 - **Kill and linearity.** The global contract is small: a killed task never observes anything again, and anything it transferred away (an `own<buffer>` in flight) belongs to the transferee, which completes or aborts the operation on its own schedule and then drops the now-unreceivable result — nothing dangles, nothing leaks. Whether a half-done operation is aborted or completed is each provider's documented, per-API semantics.
 - **State sharing.** Fusion shares *implementation*, never state. Spawning two children from one environment gives each its own fused copy of the provider code; they share state only where a provider's backing resources are shared (the real disk, a common store) — which is the provider's business, not the API's.
 - **Arguments and outcomes.** The canonical value encoding is **WAVE** (the Component Model's value text format): `eosh` parses flags and prints results as WAVE, and a generic executor binds `main`'s arguments and renders `program-outcome` — the program's own `result<program-success, program-failure>` — the same way. WAVE is type-directed, which is fine: an executor always holds the component and therefore its types, and an outcome that outlives its component carries a type descriptor alongside the value. A caller that statically knows the callee's world goes typed and lossless instead.
@@ -584,7 +589,11 @@ We want both a usermode and in-QEMU test suite.
 
 # Implementation Details
 
-OS core is written in Rust. Cranelift for WASM.
+OS core is written in Rust. Codegen is Cranelift, embedded via Wasmtime where practical (usermode first); the bare-metal codegen/runtime strategy (on-target codegen vs. host-side AOT feeding a slim runtime) is TODO.
+
+The scheduler is ours, and it is the *same* scheduler on bare metal and in usermode: the usermode `eo9` binary hosts the bare-metal scheduler rather than delegating to a host async runtime. This keeps transitive dependencies small and makes usermode a faithful test bed for the real thing.
+
+Bundling an interpreter (`eo9:interp`) is optional for the MVP — nothing strictly requires it — but it is useful early for compatibility testing and in production for ultra-high-security interpretation-only execution. Which interpreter to bundle is TBD.
 
 ## Shell
 
@@ -601,4 +610,4 @@ There are a few important guiding principles for the design and implementation o
 
 We should never take hacks or shortcuts. Do things properly and with mathematical elegance.
 
-**Nothing in this spec is sacred.** Every concrete choice here — operators and their laws, API shapes, encodings, naming — is provisional. If implementation reveals that a choice is a pain, a sticking point, or simply less elegant than an alternative, we have total freedom (and the obligation) to change the design rather than work around it. The spec serves elegance, not the other way around: change the design, update the spec, move on. The only fixed points are the guiding principles above.
+**Almost nothing in this spec is sacred.** Every concrete choice here — operators and their laws, API shapes, encodings, naming — is provisional. If implementation reveals that a choice is a pain, a sticking point, or simply less elegant than an alternative, we have total freedom (and the obligation) to change the design rather than work around it. The spec serves elegance, not the other way around: change the design, update the spec, move on. The only sacred things are the three guiding principles above and the no-hacks-no-shortcuts rule; everything else is up for renegotiation.
