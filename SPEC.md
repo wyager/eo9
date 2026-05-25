@@ -198,7 +198,7 @@ Modeling the buffer as a `resource` rather than a `list<u8>` also makes it DMA-f
 
 Virtualization layers are **providers**, not executors. A provider — `virtualnet`, `virtualfs`, a sandbox — is just a component that *exports* one or more OS-API interfaces (importing only what it itself needs). It exports no `main` and is never run directly; it is a configurable bag of implementations. This is what makes virtualization zero-overhead: a provider's exports are composed into a program's imports and inlined, so a no-op layer compiles out (see Performance). It also keeps wrappers low-privilege — a provider needs no authority to run other programs.
 
-**Binary or provider, never both.** Every module is exactly one kind. A *binary* exports `main(args)` and is run; a *provider* exports interfaces plus `configure(args)` and is composed. The two argument surfaces stage differently: a binary's `main` args are bound at run time and may differ each run, while a provider's `configure` args are bound at compose time. A provider takes config the same type-directed way a binary takes flags — `virtualfs --dir /tmp/sandbox` binds `configure(dir: string)` — and because that config is usually a compile-time constant, the compose-and-compile step specializes the provider with it and inlines, so even a configured layer stays zero-overhead. An invalid value fails at `configure`, before the consumer ever runs.
+**Binary or provider, never both.** Every module is exactly one kind. A *binary* exports `main(args)` and is run; a *provider* exports interfaces plus `configure(args)` and is composed. The two argument surfaces stage differently: a binary's `main` args are bound at run time and may differ each run, while a provider's `configure` args are bound at compose time. A provider takes config the same type-directed way a binary takes flags — `virtualfs --dir /tmp/sandbox` binds `configure(dir: string)` — and because that config is usually a compile-time constant, the compose-and-compile step specializes the provider with it and inlines, so even a configured layer stays zero-overhead. An invalid value fails at `configure`, before the consumer ever runs. `configure` returns the provider's root capability handle(s) — the `x-impl` resources its exported interfaces operate on — and the consumer-facing `default()` accessor hands out exactly the handle that `configure` produced. Configuration→capability is therefore explicit in the types: an unconfigured provider has no handle to give, so "used before configured" is unrepresentable rather than a convention.
 
 `$` is the **composition operator**. `provider $ consumer` satisfies the consumer's imports from the provider's matching exports, yielding a new component. It is **right-associative**, with the rightmost term the ultimate consumer:
 
@@ -307,7 +307,7 @@ package eo9:virtualfs@1.0.0 {
         use format.{superblock};
         import eo9:disk/disk@1.0.0;             // underlying storage — a residual import
         export eo9:fs/fs@1.0.0;                 // provides the standard fs API
-        export configure: func(dir: string) -> result<_, config-error>;
+        export configure: async func(dir: string) -> result<fs-impl, config-error>;
     }
 
     // a binary tool — addressed as `virtualfs.create`
