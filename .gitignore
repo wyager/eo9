@@ -1,1 +1,8 @@
+# Build outputs of the three Cargo workspaces.
+/target
+/guest/target
+/kernel/target
+
+# Editor / OS noise.
+*.rs.bk
 .DS_Store

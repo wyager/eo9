@@ -1,0 +1,9 @@
+PLACEHOLDER LICENSE
+
+No license has been chosen for this project yet. Until the project owner picks
+one, all rights are reserved and this code is not licensed for redistribution
+or reuse.
+
+This file exists so that the repository scaffolding is complete; replacing it
+with a real license (and adding the matching `license` field to the workspace
+Cargo.toml files) is a project-owner decision.

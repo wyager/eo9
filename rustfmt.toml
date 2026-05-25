@@ -1,0 +1,3 @@
+# Default rustfmt style, on purpose (plan/01-workspace.md).
+# One file at the repository root covers all three workspaces (root, guest/, kernel/)
+# because rustfmt searches parent directories for its configuration.
