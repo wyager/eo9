@@ -107,7 +107,7 @@ Every Eo9 module is exactly one of two kinds. A **binary** exports a `main` entr
 
 At load time, the OS scans the imports and ensures that, for each one, we know how to provide a resource of the specified name and type. Anything we cannot satisfy is rejected before execution.
 
-Interfaces are defined by the Eo9 standard and versioned as semver-tagged WIT packages (e.g. `eo9:disk@1.0.0`), so a program pins the exact API contract it was built against. Link-time satisfaction is semver-compatible: a provider of `eo9:disk@1.2.0` satisfies an import of `eo9:disk@1.0.0` (same major, equal-or-newer minor/patch); different majors are simply different interfaces and never unify. Shared types such as buffers live in their own package and are pulled in with `use`. For example,
+Interfaces are defined by the Eo9 standard and versioned as semver-tagged WIT packages (e.g. `eo9:disk@1.0.0`), so a program pins the exact API contract it was built against. Link-time satisfaction is semver-compatible: a provider of `eo9:disk@1.2.0` satisfies an import of `eo9:disk@1.0.0` (same major, equal-or-newer minor/patch); different majors are simply different interfaces and never unify. For 0.x versions we follow the Cargo/Component-Model convention: `0.minor` is the compatibility track (`0.2.3` satisfies an import of `0.2.1` but not `0.3.0`), and `0.0.x` is exact. Shared types such as buffers live in their own package and are pulled in with `use`. For example,
 
 ```wit
 // Shared I/O types, used across disk, net, text, …
