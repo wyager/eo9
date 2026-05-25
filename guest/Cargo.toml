@@ -3,7 +3,7 @@
 # via `cargo xtask build-guest` (see plan/01-workspace.md, Decisions).
 [workspace]
 resolver = "3"
-members = ["eo9-guest", "examples/*"]
+members = ["eo9-guest", "eosh/*", "examples/*"]
 
 [workspace.package]
 version = "0.0.0"
