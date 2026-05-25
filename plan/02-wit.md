@@ -103,3 +103,23 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
     (e) exec interfaces get no `-optional` flavors / stub worlds: confirmed, unchanged.
     (f) `import-need` gained a `slot` field (slot name, defaulting to the interface name).
     (g) eo9:message remains deferred to milestone 3 per the plan.
+11. **Follow-up batch (SPEC commits 133898c, e5be983):**
+    (a) `program-outcome` is now the flat three-way variant `success(wave-value) | failure(wave-value) |
+        abnormal(abnormal-exit)` with `variant abnormal-exit { trapped(string), killed }`; `task.wait`/`kill`
+        docs updated (kill typically resolves `abnormal(killed)`).
+    (b) `internal(string)` added to `rename-error` and `restrict-error` (mirrors area 03's Rust API).
+    (c) Entrypoints are async: every provider/stub `configure` is `async func`; the eo9:exec package doc
+        notes that binary `main` exports are `async func` by convention. Interface ops that already return
+        `future<T>` were left as they are (only entrypoints were in scope).
+    (d) `configure` returns the provider's root handle. **Encoding note:** a bare world-level
+        `export configure: async func(...) -> result<x-impl, …>` cannot express this correctly — a
+        world-level `use types.{x-impl}` always binds to an *import* of `eo9:X/types`, and a component
+        cannot mint handles of an imported resource type (verified: wit-bindgen generates an
+        unimplementable signature, and the stub world stops being self-contained). So `configure` lives in
+        a small per-world config interface (`eo9:X/<world>-config`, e.g. `eo9:entropy/seeded-config`)
+        exported alongside `types` and the API; all exports then share the provider's own resource type and
+        `default()` hands out exactly the handle `configure` returned. Every world exporting a required
+        interface now has a config interface (nullary where there is nothing to configure: deny, readonly,
+        memfs, null, capture, loopback); `.none` stubs are unchanged. Flagged for the planner: the spec's
+        surface form shows `configure` as a bare world export — either the spec adopts the config-interface
+        encoding or the handle-returning form needs a different mechanism.
