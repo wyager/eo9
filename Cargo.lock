@@ -464,6 +464,7 @@ name = "eo9-providers-unix"
 version = "0.0.0"
 dependencies = [
  "getrandom 0.3.4",
+ "libc",
 ]
 
 [[package]]

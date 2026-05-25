@@ -27,28 +27,46 @@
 //!
 //! # `open-exec` immutability
 //!
-//! `open-exec` returns an immutable handle by **copy-on-open to an anonymous file**: the
-//! source is copied into a freshly created, uniquely named file in the provider's
-//! exec-copy directory (the system temp dir by default), which is then immediately
-//! unlinked, leaving a file reachable only through the provider's own descriptor.
+//! `open-exec` returns an immutable handle by **snapshot-to-an-anonymous-file**: a
+//! snapshot of the source lands in a freshly created, uniquely named file in the
+//! provider's exec-copy directory, which is then immediately unlinked, leaving a file
+//! reachable only through the provider's own descriptor. The default exec-copy
+//! directory is an unpredictably named (`eo9-exec-<pid>-<random>`), owner-only `0o700`
+//! subdirectory of the system temp dir, created fresh at provider construction — a
+//! pre-existing path of that name is refused, never adopted. Both the default and any
+//! caller-supplied exec-copy directory are vetted via `lstat` before use: they must be
+//! real directories (not symlinks) owned by the current effective user.
+//!
+//! The snapshot is **clone-first**: the provider first attempts a zero-overhead COW
+//! clone of the source — `clonefile(2)` on macOS/APFS, the `FICLONE` ioctl (reflink) on
+//! Linux btrfs/XFS. What happens when the backing filesystem cannot clone is the
+//! provider's [`ExecSnapshotPolicy`]:
+//!
+//! * [`CloneOrRefuse`](ExecSnapshotPolicy::CloneOrRefuse) (the default) — `open-exec`
+//!   fails with `not-immutable`: only filesystems that can promise a point-in-time COW
+//!   snapshot back execution. Note this includes the case where the exec-copy directory
+//!   lies on a different filesystem/volume than the source (clones cannot cross
+//!   filesystems), so keep the exec-copy directory on the same volume as the root.
+//! * [`CloneOrCopy`](ExecSnapshotPolicy::CloneOrCopy) (opt-in) — fall back to a
+//!   byte-for-byte copy. The copy is not atomic with respect to a writer actively
+//!   modifying the source *during* `open-exec`: the handle is still immutable
+//!   afterwards, but it may capture a torn intermediate state, and it costs
+//!   O(file size) time and temp space per open.
+//!
+//! Snapshot files are owner-only: the copy path (and the Linux clone path) creates them
+//! mode `0o600` atomically at `open(2)` time; the macOS clone path re-modes the clone to
+//! `0o600` immediately after it is created, with the `0o700` exec-copy directory
+//! covering that instant. So no other local user can read or tamper with the snapshot of
+//! a program that is about to be executed, even between creation and unlink.
+//!
 //! Guarantee: once `open-exec` completes, the bytes observed through the handle cannot
 //! change for the life of the handle — no rename, truncate, rewrite, or deletion of the
 //! original path (by any process) affects it, and no other process can open the private
-//! copy by name because it has none. Limits on a non-COW host filesystem:
-//!
-//! * the snapshot is taken by a plain copy, so it is not atomic with respect to a writer
-//!   actively modifying the source *during* `open-exec` — the handle is still immutable
-//!   afterwards, but it may capture a torn intermediate state (callers that need
-//!   point-in-time consistency must quiesce writers, as with any non-COW snapshot);
-//! * the copy costs O(file size) time and temp space per open (a COW backend — APFS
-//!   `clonefile`, Linux reflink, or a content-addressed store — can make this O(1)
-//!   without changing the caller-visible guarantee);
-//! * host superusers and the owner of the temp directory's filesystem can, as always,
-//!   reach the provider's memory or descriptors; the guarantee is about well-behaved
-//!   host filesystems, not a defense against a hostile host root.
-//!
-//! Because the copy always succeeds in providing the promise, this provider never
-//! returns `not-immutable`.
+//! snapshot by name because it has none. Host superusers and the owner of the temp
+//! directory's filesystem can, as always, reach the provider's memory or descriptors;
+//! the guarantee is about well-behaved host filesystems, not a defense against a hostile
+//! host root. `not-immutable` is returned exactly when the policy is `CloneOrRefuse` and
+//! the backend cannot produce a COW clone.
 //!
 //! # Kill behavior
 //!
@@ -59,7 +77,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -109,6 +127,24 @@ pub enum FsError {
     NotImmutable,
     /// Any other host I/O failure.
     Io(String),
+}
+
+/// How `open-exec` obtains its immutable snapshot (see the module docs).
+///
+/// Not part of the WIT surface: this is host-side provider configuration, chosen by
+/// whoever constructs the provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExecSnapshotPolicy {
+    /// Take a zero-copy COW clone of the source; if the backing filesystem cannot
+    /// clone, refuse `open-exec` with `not-immutable`. The default: execution is a
+    /// property of the filesystem, and a backend that cannot clone does not get to
+    /// pretend otherwise by silently copying.
+    #[default]
+    CloneOrRefuse,
+    /// Take a COW clone where supported and fall back to a byte-for-byte copy
+    /// otherwise (opt-in; the copy fallback has the torn-snapshot limitation described
+    /// in the module docs).
+    CloneOrCopy,
 }
 
 /// Open flags (WIT `open-flags`).
@@ -193,46 +229,139 @@ pub trait ImmutableHost: Send + Sync {
 pub struct FsProvider {
     /// Canonicalized root; every resolved path must stay under it.
     root: PathBuf,
-    /// Where `open-exec` places its private copies before unlinking them.
+    /// Where `open-exec` places its private snapshots before unlinking them.
     exec_copy_dir: PathBuf,
+    /// How `open-exec` snapshots are taken (clone-first; refuse or copy on fallback).
+    exec_snapshot_policy: ExecSnapshotPolicy,
     pool: Arc<BlockingPool>,
 }
 
 impl FsProvider {
     /// A provider rooted at `root` (which must exist and be a directory), with exec
-    /// copies placed in the system temp directory.
+    /// snapshots placed in a freshly created, unpredictably named, owner-only (`0o700`)
+    /// subdirectory of the system temp directory, and the default
+    /// [`ExecSnapshotPolicy::CloneOrRefuse`] snapshot policy (snapshot files are always
+    /// owner-only — see the module docs).
+    ///
+    /// Construction fails if that private directory cannot be created fresh (a
+    /// pre-existing path of the same name is refused, never adopted) or does not verify
+    /// as a real, owner-only directory owned by the current user.
     pub fn new(root: impl AsRef<Path>, pool: Arc<BlockingPool>) -> io::Result<Self> {
-        Self::with_exec_copy_dir(root, std::env::temp_dir(), pool)
+        let root = canonical_root(root.as_ref())?;
+        let exec_copy_dir = create_private_exec_dir(&std::env::temp_dir())?;
+        verify_exec_copy_dir(&exec_copy_dir, Some(0o700))?;
+        Ok(Self {
+            root,
+            exec_copy_dir,
+            exec_snapshot_policy: ExecSnapshotPolicy::default(),
+            pool,
+        })
     }
 
-    /// A provider rooted at `root` with an explicit exec-copy directory (created if
-    /// missing). The exec-copy directory should not live inside `root`, or the private
-    /// copies would be briefly visible to guests while being written.
+    /// A provider rooted at `root` with an explicit exec-copy directory (created mode
+    /// `0o700` if missing). The directory — existing or freshly created — must be a
+    /// real directory (not a symlink) owned by the current effective user, verified via
+    /// `lstat`; its permission bits are otherwise the caller's choice. It should not
+    /// live inside `root`, or the private snapshots would be briefly visible to guests
+    /// while being taken, and should live on the same filesystem as `root`, or COW
+    /// cloning will be unavailable.
     pub fn with_exec_copy_dir(
         root: impl AsRef<Path>,
         exec_copy_dir: impl AsRef<Path>,
         pool: Arc<BlockingPool>,
     ) -> io::Result<Self> {
-        let root = std::fs::canonicalize(root.as_ref())?;
-        if !root.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotADirectory,
-                "fs provider root must be a directory",
-            ));
-        }
+        let root = canonical_root(root.as_ref())?;
         let exec_copy_dir = exec_copy_dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&exec_copy_dir)?;
+        // Owner-only for any directory we create ourselves; like create_dir_all, an
+        // already-existing directory passes here and is then vetted below.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&exec_copy_dir)?;
+        verify_exec_copy_dir(&exec_copy_dir, None)?;
         Ok(Self {
             root,
             exec_copy_dir,
+            exec_snapshot_policy: ExecSnapshotPolicy::default(),
             pool,
         })
+    }
+
+    /// Sets how `open-exec` snapshots are taken (default:
+    /// [`ExecSnapshotPolicy::CloneOrRefuse`]).
+    pub fn with_exec_snapshot_policy(mut self, policy: ExecSnapshotPolicy) -> Self {
+        self.exec_snapshot_policy = policy;
+        self
     }
 
     /// The canonicalized host directory this provider is rooted at.
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    /// The snapshot policy `open-exec` uses.
+    pub fn exec_snapshot_policy(&self) -> ExecSnapshotPolicy {
+        self.exec_snapshot_policy
+    }
+}
+
+/// Canonicalize the provider root and require it to be a directory.
+fn canonical_root(root: &Path) -> io::Result<PathBuf> {
+    let root = std::fs::canonicalize(root)?;
+    if !root.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "fs provider root must be a directory",
+        ));
+    }
+    Ok(root)
+}
+
+/// Create the default private exec-copy directory under `base`: an unpredictably named
+/// (`eo9-exec-<pid>-<random hex>`), owner-only directory that must not already exist —
+/// a pre-existing path (however it got there) is refused rather than adopted, so no
+/// other local user can have planted it.
+fn create_private_exec_dir(base: &Path) -> io::Result<PathBuf> {
+    let mut suffix = [0u8; 8];
+    getrandom::fill(&mut suffix).expect("host OS randomness source failed");
+    let suffix: String = suffix.iter().map(|byte| format!("{byte:02x}")).collect();
+    let dir = base.join(format!("eo9-exec-{}-{suffix}", std::process::id()));
+    // Non-recursive: the system temp directory is assumed to exist, and an
+    // already-existing directory of this name is an error, not something to reuse.
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir)
+}
+
+/// Vet an exec-copy directory before placing snapshots in it: it must be a real
+/// directory (not a symlink — checked via `lstat`) owned by the current effective user,
+/// and, when `require_mode` is given (the default directory we created ourselves), have
+/// exactly those permission bits.
+fn verify_exec_copy_dir(dir: &Path, require_mode: Option<u32>) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "exec-copy directory {} must be a real directory, not a symlink",
+            dir.display()
+        )));
+    }
+    let euid = unsafe { libc::geteuid() };
+    if metadata.uid() != euid {
+        return Err(io::Error::other(format!(
+            "exec-copy directory {} is not owned by the current user",
+            dir.display()
+        )));
+    }
+    if let Some(mode) = require_mode
+        && metadata.mode() & 0o7777 != mode
+    {
+        return Err(io::Error::other(format!(
+            "exec-copy directory {} does not have mode {mode:o}",
+            dir.display()
+        )));
+    }
+    Ok(())
 }
 
 impl FsHost for FsProvider {
@@ -250,10 +379,11 @@ impl FsHost for FsProvider {
     fn open_exec(&self, path: &str, complete: Completer<OpenExecCompletion>) {
         let root = self.root.clone();
         let exec_copy_dir = self.exec_copy_dir.clone();
+        let policy = self.exec_snapshot_policy;
         let pool = Arc::clone(&self.pool);
         let path = path.to_owned();
         self.pool.submit(move || {
-            let result = do_open_exec(&root, &exec_copy_dir, &path, &pool)
+            let result = do_open_exec(&root, &exec_copy_dir, policy, &path, &pool)
                 .map(|exec| Box::new(exec) as Box<dyn ImmutableHost>);
             complete(result);
         });
@@ -330,10 +460,11 @@ impl FileHost for FsFile {
     }
 }
 
-/// A file opened for execution: an anonymous (unlinked) private copy of the source,
-/// reachable only through this handle's descriptor.
+/// A file opened for execution: an anonymous (unlinked) private snapshot of the source
+/// (a COW clone, or an opt-in byte copy), reachable only through this handle's
+/// descriptor.
 struct ExecFile {
-    copy: Arc<File>,
+    snapshot: Arc<File>,
     size: u64,
     pool: Arc<BlockingPool>,
 }
@@ -344,7 +475,7 @@ impl ImmutableHost for ExecFile {
     }
 
     fn read(&self, offset: u64, mut dst: OwnedBuffer, complete: Completer<FileReadCompletion>) {
-        let file = Arc::clone(&self.copy);
+        let file = Arc::clone(&self.snapshot);
         self.pool.submit(move || {
             let result = read_at_filling(&file, offset, dst.as_mut_slice())
                 .map(|bytes_read| ReadResult { bytes_read })
@@ -388,6 +519,7 @@ static EXEC_COPY_ID: AtomicU64 = AtomicU64::new(0);
 fn do_open_exec(
     root: &Path,
     exec_copy_dir: &Path,
+    policy: ExecSnapshotPolicy,
     path: &str,
     pool: &Arc<BlockingPool>,
 ) -> Result<ExecFile, FsError> {
@@ -403,32 +535,131 @@ fn do_open_exec(
     }
     let mut source = File::open(&resolved).map_err(|err| io_to_fs(&err))?;
 
-    // Copy-on-open: snapshot the source into a fresh private file, then unlink it so the
-    // copy has no name and only this handle's descriptor can reach it.
-    let (mut copy, copy_path) = create_exec_copy_target(exec_copy_dir)?;
-    let copied = io::copy(&mut source, &mut copy);
-    let unlinked = std::fs::remove_file(&copy_path);
-    let copied = copied.map_err(|err| io_to_fs(&err))?;
-    unlinked.map_err(|err| io_to_fs(&err))?;
+    // Clone-first: a zero-copy COW snapshot into a fresh private file, immediately
+    // unlinked so only this handle's descriptor can reach it. If the backing filesystem
+    // cannot clone, the policy decides between refusing and a byte-for-byte copy.
+    let snapshot = match try_clone_snapshot(&source, exec_copy_dir)? {
+        Some(clone) => clone,
+        None => match policy {
+            ExecSnapshotPolicy::CloneOrRefuse => return Err(FsError::NotImmutable),
+            ExecSnapshotPolicy::CloneOrCopy => copy_snapshot(&mut source, exec_copy_dir)?,
+        },
+    };
+    let size = snapshot.metadata().map_err(|err| io_to_fs(&err))?.len();
     Ok(ExecFile {
-        copy: Arc::new(copy),
-        size: copied,
+        snapshot: Arc::new(snapshot),
+        size,
         pool: Arc::clone(pool),
     })
 }
 
+/// A unique file name for a private exec snapshot.
+fn exec_snapshot_name() -> String {
+    format!(
+        "eo9-exec-{}-{}",
+        std::process::id(),
+        EXEC_COPY_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Attempt a zero-copy COW clone of `source` into `exec_copy_dir`, returning the opened,
+/// already-unlinked clone. `Ok(None)` means the backing filesystem cannot clone (not an
+/// error: the policy decides what happens next); `Err` is a real I/O failure.
+#[cfg(target_os = "macos")]
+fn try_clone_snapshot(source: &File, exec_copy_dir: &Path) -> Result<Option<File>, FsError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    loop {
+        let path = exec_copy_dir.join(exec_snapshot_name());
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| FsError::Io("exec snapshot path contains a NUL byte".to_owned()))?;
+        // clonefile(2): an APFS copy-on-write clone of the already-open source fd.
+        let rc =
+            unsafe { libc::fclonefileat(source.as_raw_fd(), libc::AT_FDCWD, c_path.as_ptr(), 0) };
+        if rc == 0 {
+            let finish = || -> io::Result<File> {
+                let snapshot = File::open(&path)?;
+                // The clone inherits the source's mode; make it owner-only like every
+                // other snapshot file. The 0o700 exec-copy directory covers the instant
+                // between the clone appearing and this fchmod.
+                snapshot.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                std::fs::remove_file(&path)?;
+                Ok(snapshot)
+            };
+            return match finish() {
+                Ok(snapshot) => Ok(Some(snapshot)),
+                Err(err) => {
+                    let _ = std::fs::remove_file(&path);
+                    Err(io_to_fs(&err))
+                }
+            };
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            // Name collision (e.g. leftovers from a previous run): try the next name.
+            Some(libc::EEXIST) => {}
+            // The backend cannot clone: not APFS, or source and exec-copy dir are on
+            // different volumes.
+            Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EXDEV) => return Ok(None),
+            _ => return Err(io_to_fs(&err)),
+        }
+    }
+}
+
+/// See the macOS version; on Linux the clone is the `FICLONE` ioctl (reflink), issued on
+/// a destination we create ourselves (so it is born mode `0o600`).
+#[cfg(target_os = "linux")]
+fn try_clone_snapshot(source: &File, exec_copy_dir: &Path) -> Result<Option<File>, FsError> {
+    use std::os::fd::AsRawFd;
+
+    let (snapshot, path) = create_exec_copy_target(exec_copy_dir)?;
+    let rc = unsafe { libc::ioctl(snapshot.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) };
+    if rc == 0 {
+        std::fs::remove_file(&path).map_err(|err| io_to_fs(&err))?;
+        return Ok(Some(snapshot));
+    }
+    let err = io::Error::last_os_error();
+    let _ = std::fs::remove_file(&path);
+    match err.raw_os_error() {
+        // The backend cannot reflink: not a COW filesystem, different filesystems, or a
+        // kernel without FICLONE.
+        Some(libc::EOPNOTSUPP | libc::EINVAL | libc::EXDEV | libc::ENOSYS | libc::ENOTTY) => {
+            Ok(None)
+        }
+        _ => Err(io_to_fs(&err)),
+    }
+}
+
+/// Fallback for unix hosts without a known clone primitive: cloning is never supported.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn try_clone_snapshot(_source: &File, _exec_copy_dir: &Path) -> Result<Option<File>, FsError> {
+    Ok(None)
+}
+
+/// The opt-in byte-for-byte snapshot: copy the source into a fresh private file, then
+/// unlink it so only the returned descriptor can reach it.
+fn copy_snapshot(source: &mut File, exec_copy_dir: &Path) -> Result<File, FsError> {
+    let (mut snapshot, path) = create_exec_copy_target(exec_copy_dir)?;
+    let copied = io::copy(source, &mut snapshot);
+    let unlinked = std::fs::remove_file(&path);
+    copied.map_err(|err| io_to_fs(&err))?;
+    unlinked.map_err(|err| io_to_fs(&err))?;
+    Ok(snapshot)
+}
+
 fn create_exec_copy_target(exec_copy_dir: &Path) -> Result<(File, PathBuf), FsError> {
     loop {
-        let name = format!(
-            "eo9-exec-{}-{}",
-            std::process::id(),
-            EXEC_COPY_ID.fetch_add(1, Ordering::Relaxed)
-        );
-        let path = exec_copy_dir.join(name);
+        let path = exec_copy_dir.join(exec_snapshot_name());
         match OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
+            // Owner-only from the moment the file exists: another local user must never
+            // be able to read (or, umask permitting, tamper with) the snapshot of a
+            // program that is about to be executed.
+            .mode(0o600)
             .open(&path)
         {
             Ok(file) => return Ok((file, path)),
@@ -846,6 +1077,8 @@ mod tests {
 
     #[test]
     fn open_exec_snapshots_are_immune_to_later_modification() {
+        // Default policy (clone-or-refuse): on this APFS host the snapshot is a COW
+        // clone, and succeeding at all proves the clone path was taken.
         let fx = fixture();
         let file = open(&fx.provider, "prog.wasm", RW_CREATE).unwrap();
         write_file(file.as_ref(), 0, b"original image bytes")
@@ -884,6 +1117,127 @@ mod tests {
         // The private copy was unlinked as soon as it was populated: the exec-copy
         // directory is empty even while the handle is still alive.
         assert_eq!(std::fs::read_dir(exec.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn exec_snapshots_and_their_default_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A missing exec-copy directory is created owner-only.
+        let base = TempDir::new();
+        let root = TempDir::new();
+        let exec_dir = base.path().join("private-exec");
+        let pool = Arc::new(BlockingPool::new(1));
+        FsProvider::with_exec_copy_dir(root.path(), &exec_dir, Arc::clone(&pool)).unwrap();
+        let dir_mode = std::fs::metadata(&exec_dir).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
+
+        // A copy-path snapshot file is mode 0o600 from the moment it exists (checked via
+        // fstat on the descriptor the provider keeps).
+        let (copy, copy_path) = create_exec_copy_target(&exec_dir).unwrap();
+        let file_mode = copy.metadata().unwrap().permissions().mode();
+        assert_eq!(file_mode & 0o777, 0o600);
+        std::fs::remove_file(copy_path).unwrap();
+
+        // A full open-exec snapshot (the COW clone on this host) ends up owner-only too,
+        // regardless of the source file's own mode (checked via fstat on the handle's
+        // descriptor).
+        std::fs::write(root.path().join("prog"), b"image").unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let exec = do_open_exec(
+            &canonical_root,
+            &exec_dir,
+            ExecSnapshotPolicy::CloneOrCopy,
+            "prog",
+            &pool,
+        )
+        .unwrap();
+        let snapshot_mode = exec.snapshot.metadata().unwrap().permissions().mode();
+        assert_eq!(snapshot_mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn default_private_exec_dirs_are_fresh_unpredictable_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = TempDir::new();
+        let first = create_private_exec_dir(base.path()).unwrap();
+        let second = create_private_exec_dir(base.path()).unwrap();
+
+        // Unpredictable: two creations never collide, and both carry the random suffix
+        // after the pid prefix.
+        assert_ne!(first, second);
+        let prefix = format!("eo9-exec-{}-", std::process::id());
+        for dir in [&first, &second] {
+            let name = dir.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with(&prefix));
+            assert_eq!(name.len(), prefix.len() + 16);
+            assert_eq!(
+                std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            verify_exec_copy_dir(dir, Some(0o700)).unwrap();
+        }
+    }
+
+    #[test]
+    fn symlinked_exec_copy_dirs_are_rejected() {
+        let root = TempDir::new();
+        let target = TempDir::new();
+        let link_holder = TempDir::new();
+        let link = link_holder.path().join("exec-link");
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+
+        let pool = Arc::new(BlockingPool::new(1));
+        // Even though the symlink points at a perfectly good directory we own, the
+        // exec-copy directory itself must not be a symlink.
+        assert!(FsProvider::with_exec_copy_dir(root.path(), &link, pool).is_err());
+    }
+
+    #[test]
+    fn copy_fallback_snapshots_are_owner_only_unlinked_and_immutable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new();
+        let exec_dir = TempDir::new();
+        std::fs::write(dir.path().join("src.bin"), b"copy me exactly").unwrap();
+        let mut source = File::open(dir.path().join("src.bin")).unwrap();
+
+        let snapshot = copy_snapshot(&mut source, exec_dir.path()).unwrap();
+        // Unlinked immediately, owner-only, exact contents.
+        assert_eq!(std::fs::read_dir(exec_dir.path()).unwrap().count(), 0);
+        let mode = snapshot.metadata().unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(snapshot.metadata().unwrap().len(), 15);
+
+        // Later modification of the source never reaches the snapshot.
+        std::fs::write(dir.path().join("src.bin"), b"overwritten").unwrap();
+        let mut contents = vec![0u8; 15];
+        snapshot.read_exact_at(&mut contents, 0).unwrap();
+        assert_eq!(&contents, b"copy me exactly");
+    }
+
+    #[test]
+    fn clone_or_copy_policy_produces_immutable_handles_too() {
+        let root = TempDir::new();
+        let exec = TempDir::new();
+        let pool = Arc::new(BlockingPool::new(2));
+        let provider = FsProvider::with_exec_copy_dir(root.path(), exec.path(), pool)
+            .unwrap()
+            .with_exec_snapshot_policy(ExecSnapshotPolicy::CloneOrCopy);
+        assert_eq!(
+            provider.exec_snapshot_policy(),
+            ExecSnapshotPolicy::CloneOrCopy
+        );
+
+        std::fs::write(root.path().join("prog"), b"fallback ok").unwrap();
+        let handle = wait(|done| provider.open_exec("prog", done)).unwrap();
+        std::fs::write(root.path().join("prog"), b"changed").unwrap();
+
+        assert_eq!(handle.size(), 11);
+        let (buf, result) = read_exec(handle.as_ref(), 0, 11);
+        assert_eq!(result.unwrap().bytes_read, 11);
+        assert_eq!(buf.as_slice(), b"fallback ok");
     }
 
     #[test]

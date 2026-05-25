@@ -70,15 +70,29 @@ Each API section under Deliverables; "Execution APIs" (environments are just dat
    racing host-side actor could still swap a path component; the proper fix is a per-component `O_NOFOLLOW`
    walk or `openat2(RESOLVE_BENEATH)`, deferred past the MVP since the usermode root is chosen by the same
    trusted host user.
-8. **open-exec immutability = copy-on-open to an anonymous file.** The source is copied into a uniquely named
-   file in a provider-configured exec-copy directory (system temp dir by default) which is immediately
-   unlinked, so the snapshot is reachable only through the handle's descriptor. Guarantee: after `open-exec`
-   completes, no modification, rename, truncation, or deletion of the original path by any process changes
-   the bytes seen through the handle. Limits on a non-COW host fs: the copy is not atomic against a writer
-   racing `open-exec` itself (the handle is immutable afterwards but may capture a torn state), it costs
-   O(file size) per open, and a hostile host superuser is out of scope. `not-immutable` is therefore never
-   returned; a COW/content-addressed backend (APFS `clonefile`, Linux reflink, the store) can later make the
-   snapshot O(1) without changing the guarantee.
+8. **open-exec immutability = clone-first snapshot to an anonymous file** (revised by the exec-copy-hardening
+   follow-up). `open-exec` first attempts a zero-overhead COW clone of the source — `clonefile(2)` on
+   macOS/APFS, the `FICLONE` ioctl (reflink) on Linux — into the provider's exec-copy directory, opens it,
+   and immediately unlinks it, so the snapshot is reachable only through the handle's descriptor. What
+   happens when the backend cannot clone is the provider's `ExecSnapshotPolicy`: `CloneOrRefuse` (default)
+   fails `open-exec` with the existing `not-immutable` error — only filesystems that can promise a COW
+   snapshot back execution (this also covers an exec-copy dir on a different volume than the source) — and
+   `CloneOrCopy` (opt-in) falls back to a byte copy, which may capture a torn state if a writer races the
+   open and costs O(file size). Guarantee in both cases: after `open-exec` completes, no modification,
+   rename, truncation, or deletion of the original path by any process changes the bytes seen through the
+   handle; a hostile host superuser is out of scope. The raw clone syscalls come from a direct `libc`
+   dependency (pre-approved by the planner); the existing WIT `not-immutable` case fits the refusal exactly,
+   so no WIT change is requested. The refusal path itself only triggers on non-COW hosts and is therefore
+   not exercised by tests on this APFS machine.
+8a. **Exec snapshot hardening (security-review follow-up).** Snapshot files are owner-only: created mode
+    `0o600` atomically at open time on the copy and Linux-clone paths, and re-moded to `0o600` immediately
+    after the macOS clone (the window is covered by the directory permissions). The default exec-copy
+    directory is an unpredictably named `eo9-exec-<pid>-<random hex>` subdirectory of the system temp dir,
+    created fresh, non-recursively, mode `0o700`, and construction fails if the path already exists (a
+    squatted path is never adopted). Both the default and caller-supplied exec-copy directories are vetted
+    via `lstat` before use: they must be real directories (not symlinks) owned by the current effective uid;
+    the default must additionally be exactly `0o700`, while a caller-supplied directory keeps whatever mode
+    its owner chose (documented in the constructor).
 9. **disk.** File-backed block device (plain file or block-device node); size fixed at open (or supplied via
    `open_with_size` / `create`). Reads and writes must lie entirely within `[0, size)` or fail `out-of-range`
    before touching the file; `read_only` devices fail writes with `read-only`. I/O is `pread`/`pwrite`, so
@@ -88,9 +102,11 @@ Each API section under Deliverables; "Execution APIs" (environments are just dat
     a dead task's runtime drops it — a pre-kill write may still reach the backing file/device, a consumed
     stdin line is lost, a pending sleep fires and is discarded. Dropping a provider never cancels accepted
     work (the pool drains on drop; timer/reader threads finish what they accepted).
-11. **Tests.** Unit tests per module (40 total) use a std-only tempdir helper rooted under `target/` — no
+11. **Tests.** Unit tests per module (45 total) use a std-only tempdir helper rooted under `target/` — no
     network, no extra test deps. Coverage includes escape/symlink attempts, open-exec immutability against
-    overwrite+delete, read-only enforcement, out-of-range disk ops, and hundreds of concurrent completions.
+    overwrite+delete (the COW-clone path on this APFS host), the copy fallback's content/mode/unlink
+    behavior, snapshot and exec-dir permission checks, rejection of symlinked exec-copy dirs, read-only
+    enforcement, out-of-range disk ops, and hundreds of concurrent completions.
 12. **Deferred.** `net` (milestone 3), `perf` (surface still a placeholder in WIT), and the runtime/linker
     wiring (plan 04). Stub/attenuated flavors (`fs.memfs`, `time.frozen`, …) are guest-side providers
     (plan 09), not part of this crate.
