@@ -54,4 +54,43 @@ Milestone 1 depends on none of the in-flight work.
 - New Cargo manifests carry `license = "MIT"`; keep `cargo run -p xtask -- ci` green.
 
 ## Decisions
-(record here)
+
+Milestone 1 (`crates/eofs-core`; the on-disk format is described in `crates/eofs-core/FORMAT.md`):
+
+1. **`BlockDevice` is byte-addressed** (`read_at`/`write_at`/`flush` on byte offsets), the same shape as
+   `eo9:disk`, so the milestone-2 provider is a thin bridge. eofs assumes no write atomicity at all — torn
+   writes (including torn uberblocks) are handled by checksums, and commit ordering is the only requirement.
+2. **Uberblock pair at fixed offsets 0 and 4096** (slot size fixed at 4 KiB regardless of the filesystem block
+   size); data region starts at 8192. Commit alternates slots by `txg mod 2`; mount picks the valid slot with
+   the highest txg. The live root and the snapshot-table reference live directly in the uberblock.
+3. **Everything is a byte object** (file contents, serialized directories, the snapshot table): data blocks of
+   `block_size` under indirect blocks of 56-byte block pointers. Directories are sorted entry lists (name,
+   kind, child object reference); no inodes, no hard links. Snapshots are entries in the snapshot-table object
+   holding a retained root.
+4. **Block pointers carry (addr, logical size, physical size, codec tag, blake3-of-logical-bytes).** Hashing
+   the logical bytes makes hashes codec-independent and lets every read verify what it returns; `verify()` is
+   the same check over every reachable block. Node hashes (exposed via `stat`) are the Merkle roots; for
+   multi-block nodes they depend on physical layout (see FORMAT.md "Hashing") — whether the milestone-2
+   `eo9:fs` hash queries need a content-only hash (extra field, format v2) is an open question for the planner.
+5. **Allocation** is append-at-frontier with allocation-unit granularity (default 512 B) so compressed blocks
+   actually save space; `gc()` is the manual deferred-reclamation entry point (walks all retained roots,
+   builds an in-memory free list that is consumed first-fit; the free list is not persisted). Writes rebuild
+   the changed object's indirect tree rather than patching single pointers — simpler, same format, more write
+   amplification; acceptable for the MVP.
+6. **Compression defaults to lz4** (`lz4_flex`, block format, `default-features = false` + safe encode/decode;
+   added to the root pin table). Blocks that do not shrink are stored raw with codec tag 0. The per-filesystem
+   default codec is fixed at format time and recorded in the uberblock.
+7. **blake3 in no_std mode**: the root pin was changed to `default-features = false` (the hashing API other
+   crates use is unchanged); eofs-core additionally sets `no_neon` for `cfg(target_os = "none")` targets only,
+   because blake3's aarch64 NEON kernels are C and need libc headers that bare-metal targets lack.
+   `cargo check -p eofs-core --target aarch64-unknown-none` is clean and documented in the crate manifest.
+8. **Transactions are explicit**: operations stage copy-on-write state in memory (new blocks are written
+   immediately, the root flip is not), `commit()` is the only durability point, `unmount` discards uncommitted
+   changes. Crash consistency is tested by a power-cut simulator (`CutDevice`) cutting at every write boundary
+   of a multi-transaction scenario, with torn final writes, then remount + `verify()` + exact state comparison.
+9. Test-support devices (`MemDevice`, `CutDevice`) live in the crate itself so the provider, tools, and other
+   areas' tests can reuse them.
+
+Deferred to later milestones: the provider component and `eofs.mkfs` (M2), usermode end-to-end and
+store-on-eofs (M3), kernel adoption (M4), plus content-only node hashes, holes/sparse files, rename, and
+persistent free-space maps if they turn out to be needed.
