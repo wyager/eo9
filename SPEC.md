@@ -556,6 +556,8 @@ Lets us build backend-agnostic versions of stuff like ZFS tree walk for backup.
 
 Also needed: **immutable handles** — opening a file *for execution* yields an immutable handle (COW / content-addressed backends only), which program loading, compile caching, and signing key on (see *Execution APIs*).
 
+**The native filesystem (`eo9fs`).** Eo9 bundles its own filesystem, and it is just a provider: it imports `eo9:disk` (plus time/entropy) and exports `eo9:fs`, so the same component runs on bare metal over a real block device and under usermode Eo9 over a file-backed or in-memory disk. Design: copy-on-write with never-overwrite-in-place and atomic root flips (crash consistency by construction, no fsck); a Merkle tree throughout, so every node's content hash is precomputed all the way to the root (integrity checking, cheap change detection, hash-guided incremental backup); snapshots are retained roots, with deferred reclamation of unreferenced blocks; block compression is **on by default** (lz4-class for the MVP; the format tags the codec per block so zstd or others can be added without a format change); hashes use a fast cryptographic hash (blake3, shared with the module store). Immutable execution handles are structural on eo9fs — opening for execution pins a subtree hash, no copying. Hosted providers (such as the unix-directory provider in usermode) are compatibility shims; eo9fs is the real thing. MVP non-goals: multi-device/RAID, dedup, quotas, encryption.
+
 Standard stubs: `fs.none`, `fs.deny`, `fs.readonly`, `fs.memfs`.
 
 ### Net API
