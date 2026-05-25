@@ -67,13 +67,13 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
    are resolved via `deps/` symlinks to sibling package dirs (e.g. `wit/disk/deps/io -> ../../io`).
    `wit/check.sh` runs parse → binary encode → validate (`--features cm-async`) → round-trip per package.
 4. **Root resource lives in a per-package `types` interface** (`eo9:X/types { resource x-impl }`), not inside
-   the API interface as the spec sketches. Reason: with the sketch encoding, any world importing
+   the API interface as originally sketched. Reason: with the in-interface encoding, any world importing
    `X-optional` (or a `none` stub exporting it) is elaborated by wit-parser to also import the *full
    required* `X` interface, because `use X.{x-impl}` drags the owning interface in — defeating the
    optional-capability and `X.none` sealing semantics. With the split, optional importers pick up only the
    authority-free `eo9:X/types` import. Accessor pattern (`default()`), `borrow<x-impl>` ops, and the
-   `-optional` flavor are otherwise exactly per spec. **Escalated** — if the planner prefers a different
-   encoding this is a mechanical change.
+   `-optional` flavor are otherwise exactly per spec. **Accepted by the planner/owner; SPEC.md now uses
+   this pattern.**
 5. **Same move in eo9:exec:** `resource image` lives in a types-only `images` interface so importing `task`
    does not implicitly import the `compile` authority. `component` stays in `component-algebra` per the
    sketch (it is unprivileged, so the implicit import is harmless).
@@ -86,18 +86,20 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
    and export the API (shared handle types with the underlying provider). Configurable stubs export an
    inline `configure: func(...) -> result<_, string>` (seeded: seed; frozen/monotonic-stub: start/step;
    fuzzy: granularity; disk.mem: size).
-8. **Additions beyond the spec sketches (escalated, not silently adopted):** `buffer.read`/`buffer.write`
+8. **Additions beyond the spec sketches (escalated, then accepted):** `buffer.read`/`buffer.write`
    byte accessors on `eo9:io/buffers` (without them guests cannot move data at all); a `rename` function in
    `component-algebra`; minimal invented shapes for types the spec references but does not define
    (`component-info`, `interface-ref`, error variants, `compile-opts`, `named-arg`, `wave-value`,
-   `program-outcome` as WAVE value + WIT type text).
+   `program-outcome` as WAVE value + WIT type text) — these will be absorbed into the spec as they firm up.
 9. **Policy worlds** (`eo9:sandbox`): `pure` is the empty world; `no-net` imports the base flavor of every
    standard API except net (an entry admits both flavors per the spec rule, enforced by area 03), including
    the exec interfaces — `only` restricts, it never grants.
-10. **Open escalations for the planner:** (a) the proposed `fs-impl` → `disk-impl` rename in eo9:disk (kept
-    `fs-impl` per spec for now); (b) decision 4's types-interface encoding; (c) the buffer byte accessors;
-    (d) should `task.spawn` take `borrow<image>` instead of owned `image` (sketch consumes the image, so one
-    image = one spawn); (e) should exec interfaces get `-optional` flavors / stub worlds (they have no root
-    accessor in the sketch, so the pattern doesn't mechanically apply); (f) `import-need` has no slot-name
-    field, so named slots (`system-fs`) are not representable in `describe` output; (g) eo9:message deferred
-    to milestone 3 per the plan.
+10. **Escalations — planner/owner rulings applied:**
+    (a) eo9:disk root resource renamed `fs-impl` → `disk-impl`; eo9:disk is raw block-device access only
+        (no filesystem semantics — paths/metadata/hashes are eo9:fs's domain), docs updated to match.
+    (b) decision 4's types-interface encoding: accepted, spec updated.
+    (c) buffer byte accessors: accepted, kept.
+    (d) `task.spawn` now takes `borrow<image>` — one cached image, many spawns.
+    (e) exec interfaces get no `-optional` flavors / stub worlds: confirmed, unchanged.
+    (f) `import-need` gained a `slot` field (slot name, defaulting to the interface name).
+    (g) eo9:message remains deferred to milestone 3 per the plan.

@@ -21,6 +21,10 @@ interface component-algebra {
 
     /// One interface a component still needs (a residual import).
     record import-need {
+        /// The slot name this import is keyed by; defaults to the interface name
+        /// when the import is unnamed (see SPEC: Capability slots) — e.g. "system-fs",
+        /// or "eo9:net/net" for a default slot.
+        slot: string,
         /// e.g. "eo9:net/net"
         %interface: string,
         /// semver it was built against (satisfied per the semver rule in the spec)
@@ -171,7 +175,8 @@ interface task {
     }
 
     /// `args` are main's named, typed arguments, WAVE-encoded and checked against main's signature.
-    spawn: func(i: image, args: list<named-arg>, limits: spawn-limits) -> result<task, spawn-error>;
+    /// The image is only borrowed: one cached image can be spawned any number of times.
+    spawn: func(i: borrow<image>, args: list<named-arg>, limits: spawn-limits) -> result<task, spawn-error>;
 
     variant resume-outcome {
         out-of-fuel,
