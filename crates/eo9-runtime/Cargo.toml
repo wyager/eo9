@@ -1,0 +1,22 @@
+# eo9-runtime: the privileged half of execution on the usermode path (plan/04-runtime.md).
+#
+# Dependency notes (PLAN.md ground rule 3):
+#   * `wasmtime` is the pinned foundation dependency, taken from the root pin table. It is
+#     used with its default feature set (Cranelift codegen, component model + async ABI,
+#     fuel metering, `wat`) plus the non-default `wave` feature, which provides WAVE
+#     parsing/rendering directly over `wasmtime::component::Val`/`Type`.
+#   * The `wave` feature uses the wasm-wave version wasmtime itself pins (0.248 family)
+#     because the `WasmValue` impls for `wasmtime::component::Val` live inside wasmtime.
+#     This is the same accepted internal-version skew recorded in the root pin table; see
+#     plan/04-runtime.md Decisions (which also records the follow-up of trimming wasmtime's
+#     default features once the root pin entry can carry `default-features = false`).
+[package]
+name = "eo9-runtime"
+description = "Wasmtime embedding for Eo9: engine configuration, the Compile and Task host APIs, fuel-metered resumable execution, and WAVE argument/outcome handling."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license = "MIT"
+
+[dependencies]
+wasmtime = { workspace = true, features = ["wave"] }

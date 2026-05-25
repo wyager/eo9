@@ -1,0 +1,462 @@
+//! The Task API host side: spawn / resume / runnable / kill over a compiled [`Image`].
+//!
+//! This is the host implementation behind `eo9:exec/task`. A [`Task`] owns one Wasmtime
+//! `Store` (one linear memory, one capability set, one fuel ledger) whose single guest
+//! entrypoint is the component's `main`. Execution only ever happens inside
+//! [`Task::resume`]: fuel is donated by the caller and the guest runs *on the caller's
+//! thread* until the donation is spent, the guest blocks on host I/O, or `main` finishes.
+//!
+//! ## How a resume drives the guest (and why it looks like this)
+//!
+//! Wasmtime 45 keeps all component-model-async execution state (guest tasks, parked fibers,
+//! pending host operations) inside the `Store`, and the embedder drives it by polling the
+//! future returned by `Store::run_concurrent`. Two limitations of the pinned version shape
+//! the implementation (full findings in plan/04-runtime.md § Decisions):
+//!
+//! * a **fuel yield suspends the executing fiber in place**, held by the in-flight
+//!   `run_concurrent` poll — it is not parked in the store, so that future cannot be
+//!   dropped and re-created between donations without destroying the guest;
+//! * while that future exists it **mutably borrows the store**, so fuel cannot be added
+//!   or inspected between donations.
+//!
+//! The runtime therefore uses one **long-lived drive future per task** that owns the store
+//! for the task's whole life, a **fixed fuel-yield quantum** configured before the drive
+//! starts, and an embedder-side **quantum ledger**:
+//!
+//! 1. at spawn the store gets an effectively-infinite fuel pool and a yield interval of
+//!    [`FUEL_QUANTUM`]; the drive future (instantiated component + the one call to `main`)
+//!    is created but not polled;
+//! 2. `resume(fuel)` converts the donation into quanta and polls the drive: every poll that
+//!    returns `Pending` after waking its own waker synchronously is one quantum of guest
+//!    execution consumed (the fuel yield); polling stops when the donated quanta are spent
+//!    — **out-of-fuel**, genuinely suspended, resumable later;
+//! 3. a poll that returns `Pending` *without* a synchronous wake means nothing can progress
+//!    until an external completion arrives — **blocked**;
+//! 4. when `main` completes (value or trap) the outcome is rendered — **done**.
+//!
+//! Fuel accounting is therefore quantum-granular: a donation buys `fuel / FUEL_QUANTUM`
+//! quanta, unspent remainder is carried to the next resume, and a resume that ends blocked
+//! or done under-charges by at most one quantum. This is the documented shim over what
+//! wasmtime 45 supports today; the WIT surface (`eo9:exec/task`) is unchanged.
+//!
+//! ## Doorbell
+//!
+//! The per-task doorbell is the edge-triggered wake channel from SPEC "How readiness is
+//! implemented": every poll of the task's drive uses the doorbell as its waker, so host
+//! completions (provider operations finishing on other threads) ring it, and `runnable`
+//! reports / waits on exactly that edge. The per-completion queue itself lives inside
+//! Wasmtime's per-store concurrent state (which already delivers completions to the guest's
+//! waitable-sets); this crate adds only the doorbell on top.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+
+use wasmtime::Store;
+use wasmtime::component::{Linker, Type, Val};
+
+use crate::image::Image;
+use crate::link;
+use crate::outcome::Outcome;
+use crate::providers::Providers;
+use crate::wave;
+
+pub use crate::wave::NamedArg;
+
+/// The fuel-yield quantum: the granularity of CPU donation. The store suspends guest
+/// execution every `FUEL_QUANTUM` units of fuel, which is the point at which `resume`
+/// decides whether the donation is spent. See the module docs for why the quantum is fixed
+/// at spawn rather than derived from each donation.
+pub const FUEL_QUANTUM: u64 = 10_000;
+
+/// Static resource limits, fixed at spawn (`eo9:exec/task.spawn-limits`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpawnLimits {
+    /// Ceiling on linear-memory growth in bytes, enforced at `memory.grow`.
+    pub max_memory: Option<u64>,
+}
+
+/// Why a task could not be spawned (`eo9:exec/task.spawn-error`).
+#[derive(Debug)]
+pub enum SpawnError {
+    /// Argument WAVE parse / type-check failure against `main`'s signature.
+    BadArguments(String),
+    /// An import could not be satisfied by the fused component plus the root providers
+    /// (the loader rule from SPEC "WASM runtime"), or instantiation failed.
+    Internal(String),
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnError::BadArguments(msg) => write!(f, "bad arguments: {msg}"),
+            SpawnError::Internal(msg) => write!(f, "spawn failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for SpawnError {}
+
+/// The result of one `resume` donation (`eo9:exec/task.resume-outcome`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    /// The donation was consumed; the task has more work to do.
+    OutOfFuel,
+    /// Every in-flight operation is waiting on an external completion; donating more fuel
+    /// will not help until the doorbell rings (see [`Task::runnable`]).
+    Blocked,
+    /// `main` finished (or the task trapped); the task will not run again.
+    Done(Outcome),
+}
+
+// ---------------------------------------------------------------------------------------
+// Doorbell
+// ---------------------------------------------------------------------------------------
+
+/// Edge-triggered per-task doorbell. Rung by any wake of the task's store (host completions
+/// from provider threads, guest fuel yields); drained by the run loop and by `runnable`.
+#[derive(Default)]
+pub(crate) struct Doorbell {
+    rung: AtomicBool,
+    waiters: Mutex<Vec<Waker>>,
+}
+
+impl Doorbell {
+    fn ring(&self) {
+        self.rung.store(true, Ordering::SeqCst);
+        let waiters = std::mem::take(&mut *self.waiters.lock().unwrap());
+        for waker in waiters {
+            waker.wake();
+        }
+    }
+
+    /// Clear the doorbell, returning whether it had been rung (the edge).
+    fn take(&self) -> bool {
+        self.rung.swap(false, Ordering::SeqCst)
+    }
+
+    fn is_rung(&self) -> bool {
+        self.rung.load(Ordering::SeqCst)
+    }
+
+    fn register(&self, waker: &Waker) {
+        self.waiters.lock().unwrap().push(waker.clone());
+    }
+}
+
+impl std::task::Wake for Doorbell {
+    fn wake(self: Arc<Self>) {
+        self.ring();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.ring();
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Store data
+// ---------------------------------------------------------------------------------------
+
+/// Memory limits enforced where WASM asks the host for memory (`memory.grow`).
+struct MemoryLimits {
+    max_memory: Option<u64>,
+}
+
+impl wasmtime::ResourceLimiter for MemoryLimits {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(match self.max_memory {
+            Some(max) => desired as u64 <= max,
+            None => true,
+        })
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        _desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(true)
+    }
+}
+
+/// Per-task store data: the task's root providers and its resource limits.
+pub(crate) struct TaskState {
+    pub(crate) providers: Providers,
+    limits: MemoryLimits,
+}
+
+// ---------------------------------------------------------------------------------------
+// Task
+// ---------------------------------------------------------------------------------------
+
+/// `main`'s eventual result: the returned value, or the trap/error that ended the call.
+type MainResultCell = Arc<Mutex<Option<Result<Val, String>>>>;
+
+enum LifeState {
+    Running,
+    Done(Outcome),
+}
+
+/// One spawned task: the long-lived drive future (which owns the store), the shared result
+/// cell, and the doorbell.
+pub struct Task {
+    /// Owns the `Store` and runs the task's event loop plus the single call to `main`.
+    drive: Pin<Box<dyn Future<Output = wasmtime::Result<()>> + Send>>,
+    main_result: MainResultCell,
+    result_ty: Option<Type>,
+    doorbell: Arc<Doorbell>,
+    state: LifeState,
+    /// Donated fuel not yet charged (smaller than one quantum, or left over from a resume
+    /// that ended blocked).
+    carried_fuel: u64,
+    /// True when the last resume returned [`ResumeOutcome::Blocked`] and the doorbell has
+    /// not rung since.
+    parked: bool,
+}
+
+impl std::fmt::Debug for Task {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Task")
+            .field(
+                "state",
+                match &self.state {
+                    LifeState::Running => &"running",
+                    LifeState::Done(_) => &"done",
+                },
+            )
+            .field("parked", &self.parked)
+            .field("carried_fuel", &self.carried_fuel)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Task {
+    /// Spawn a new task from a compiled image: instantiate it against the given root
+    /// providers, type-check the WAVE `args` against `main`'s signature, and set up the
+    /// call to `main`. No guest code runs until the first [`Task::resume`].
+    pub fn spawn(
+        image: &Image,
+        args: &[NamedArg],
+        limits: SpawnLimits,
+        providers: Providers,
+    ) -> Result<Self, SpawnError> {
+        let internal = |err: wasmtime::Error| SpawnError::Internal(format!("{err:#}"));
+
+        let engine = image.engine().clone();
+        let mut linker: Linker<TaskState> = Linker::new(&engine);
+        link::add_providers(&mut linker, &providers)
+            .map_err(|err| SpawnError::Internal(format!("provider wiring failed: {err:#}")))?;
+
+        let state = TaskState {
+            providers,
+            limits: MemoryLimits {
+                max_memory: limits.max_memory,
+            },
+        };
+        let mut store = Store::new(&engine, state);
+        store.limiter(|state| &mut state.limits);
+
+        // Lifetime fuel pool and the fixed yield quantum; both must be configured before
+        // the drive future takes ownership of the store.
+        store.set_fuel(u64::MAX).map_err(internal)?;
+        store
+            .fuel_async_yield_interval(Some(FUEL_QUANTUM))
+            .map_err(internal)?;
+
+        let doorbell = Arc::new(Doorbell::default());
+
+        // Instantiation runs no donated fuel worth of guest code for Eo9 components (no
+        // start functions) and must not depend on external completions; drive it with a
+        // bounded manual poll loop.
+        let instance = {
+            let instantiate = linker.instantiate_async(&mut store, image.component());
+            let mut instantiate = std::pin::pin!(instantiate);
+            let waker = Waker::from(doorbell.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut result = None;
+            for _ in 0..1024 {
+                match instantiate.as_mut().poll(&mut cx) {
+                    Poll::Ready(r) => {
+                        result = Some(r);
+                        break;
+                    }
+                    Poll::Pending if doorbell.take() => continue,
+                    Poll::Pending => break,
+                }
+            }
+            result
+                .ok_or_else(|| {
+                    SpawnError::Internal("instantiation unexpectedly suspended".to_string())
+                })?
+                .map_err(internal)?
+        };
+
+        let main = instance
+            .get_func(&mut store, "main")
+            .ok_or_else(|| SpawnError::Internal("component does not export `main`".into()))?;
+
+        let signature = main.ty(&store);
+        let params = wave::parse_args(&signature, args).map_err(SpawnError::BadArguments)?;
+        let result_ty = signature.results().next();
+
+        // The long-lived drive: owns the store, runs the event loop, performs the one call
+        // to `main`, and parks the result (value or trap) in the shared cell.
+        let main_result: MainResultCell = Arc::new(Mutex::new(None));
+        let cell = main_result.clone();
+        let drive = Box::pin(async move {
+            let mut store = store;
+            store
+                .run_concurrent(async move |accessor| {
+                    let mut results = vec![Val::Bool(false)];
+                    let call = main.call_concurrent(accessor, &params, &mut results).await;
+                    let stored = match call {
+                        Ok(()) => Ok(results.into_iter().next().unwrap_or(Val::Bool(false))),
+                        Err(err) => Err(format!("{err:#}")),
+                    };
+                    *cell.lock().unwrap() = Some(stored);
+                })
+                .await
+        });
+
+        Ok(Self {
+            drive,
+            main_result,
+            result_ty,
+            doorbell,
+            state: LifeState::Running,
+            carried_fuel: 0,
+            parked: false,
+        })
+    }
+
+    /// Donate `fuel` to the task and run it now, on the caller's thread, until the donation
+    /// is spent, the task blocks on I/O, or it finishes.
+    pub fn resume(&mut self, fuel: u64) -> ResumeOutcome {
+        if let LifeState::Done(outcome) = &self.state {
+            return ResumeOutcome::Done(outcome.clone());
+        }
+        self.parked = false;
+
+        // Whole quanta available from the carried remainder plus this donation.
+        let mut budget = self.carried_fuel.saturating_add(fuel);
+        let waker = Waker::from(self.doorbell.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        loop {
+            if budget < FUEL_QUANTUM {
+                // Not enough left to run another quantum; carry the remainder.
+                self.carried_fuel = budget;
+                return ResumeOutcome::OutOfFuel;
+            }
+
+            self.doorbell.take();
+            match self.drive.as_mut().poll(&mut cx) {
+                Poll::Ready(result) => {
+                    let outcome = self.finish(result);
+                    self.carried_fuel = budget;
+                    return ResumeOutcome::Done(outcome);
+                }
+                Poll::Pending => {
+                    if self.doorbell.take() {
+                        // The guest yielded after consuming one fuel quantum; charge it
+                        // and keep going while the donation lasts.
+                        budget -= FUEL_QUANTUM;
+                        continue;
+                    }
+                    // No synchronous wake: every pending operation waits on an external
+                    // completion. The task is parked until the doorbell rings.
+                    self.carried_fuel = budget;
+                    self.parked = true;
+                    return ResumeOutcome::Blocked;
+                }
+            }
+        }
+    }
+
+    /// Convert the completed drive (and the shared result cell) into the final outcome.
+    fn finish(&mut self, drive_result: wasmtime::Result<()>) -> Outcome {
+        let main_result = self.main_result.lock().unwrap().take();
+        let outcome = match (main_result, drive_result) {
+            (Some(Ok(val)), _) => match &self.result_ty {
+                Some(ty) => wave::render_outcome(ty, &val),
+                None => Outcome::Success(crate::outcome::WaveValue {
+                    ty: String::new(),
+                    value: String::new(),
+                }),
+            },
+            (Some(Err(trap)), _) => Outcome::Trapped(trap),
+            (None, Err(err)) => Outcome::Trapped(format!("{err:#}")),
+            (None, Ok(())) => {
+                Outcome::Trapped("task event loop finished without a `main` result".to_string())
+            }
+        };
+        self.state = LifeState::Done(outcome.clone());
+        outcome
+    }
+
+    /// True when the task could make progress if resumed: it has never been parked, or an
+    /// external completion has rung the doorbell since it was parked. A finished task is
+    /// never runnable.
+    pub fn is_runnable(&self) -> bool {
+        match self.state {
+            LifeState::Done(_) => false,
+            LifeState::Running => !self.parked || self.doorbell.is_rung(),
+        }
+    }
+
+    /// Wait (as a plain future) until the task is runnable again. Resolves immediately if
+    /// [`Task::is_runnable`] is already true; never resolves for a finished task (callers
+    /// should check [`Task::outcome`] first).
+    pub fn runnable(&self) -> impl Future<Output = ()> + '_ {
+        std::future::poll_fn(move |cx| {
+            if self.is_runnable() {
+                Poll::Ready(())
+            } else {
+                self.doorbell.register(cx.waker());
+                // Re-check to close the race between the check above and registration.
+                if self.is_runnable() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        })
+    }
+
+    /// The task's final outcome, if it has finished.
+    pub fn outcome(&self) -> Option<&Outcome> {
+        match &self.state {
+            LifeState::Done(outcome) => Some(outcome),
+            LifeState::Running => None,
+        }
+    }
+
+    /// Kill the task and return its final outcome.
+    ///
+    /// A killed task never observes anything again: its drive future — and with it the
+    /// store, linear memory, guest state and queued completions — is dropped here.
+    /// Outstanding provider operations are dropped with it; each provider's `Drop`
+    /// completes or aborts the underlying work on its own schedule, and results destined
+    /// for the dead task go nowhere (SPEC "Kill and linearity").
+    pub fn kill(self) -> Outcome {
+        match self.state {
+            LifeState::Done(outcome) => outcome,
+            LifeState::Running => Outcome::Killed,
+        }
+    }
+
+    /// Fuel donated to this task that has not yet been charged against guest execution
+    /// (sub-quantum remainder plus anything donated while the task was blocked).
+    pub fn unspent_fuel(&self) -> u64 {
+        self.carried_fuel
+    }
+}
