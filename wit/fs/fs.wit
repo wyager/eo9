@@ -117,6 +117,25 @@ interface fs-optional {
     default: func() -> option<fs-impl>;
 }
 
+/// Compose-time configuration entry for fs.deny: `configure` returns the root handle
+/// that the exported `fs` serves via `default()` (see SPEC: Binary or provider, never both).
+interface deny-config {
+    use types.{fs-impl};
+    configure: async func() -> result<fs-impl, string>;
+}
+
+/// Compose-time configuration entry for fs.readonly (same convention as `deny-config`).
+interface readonly-config {
+    use types.{fs-impl};
+    configure: async func() -> result<fs-impl, string>;
+}
+
+/// Compose-time configuration entry for fs.memfs (same convention as `deny-config`).
+interface memfs-config {
+    use types.{fs-impl};
+    configure: async func() -> result<fs-impl, string>;
+}
+
 /// fs.none — absence: exports the optional flavor answering `none`.
 world none {
     export types;
@@ -127,6 +146,7 @@ world none {
 world deny {
     export types;
     export fs;
+    export deny-config;
 }
 
 /// fs.readonly — attenuation: a read-only view of an underlying filesystem; writes
@@ -134,10 +154,12 @@ world deny {
 world readonly {
     import fs;
     export fs;
+    export readonly-config;
 }
 
 /// fs.memfs — a RAM-backed filesystem (deterministic; the standard scratch/test fs).
 world memfs {
     export types;
     export fs;
+    export memfs-config;
 }

@@ -32,6 +32,14 @@ interface entropy-optional {
     default: func() -> option<entropy-impl>;
 }
 
+/// Compose-time configuration entry for entropy.seeded: `configure` binds the seed and
+/// returns the root handle that the exported `entropy` serves via `default()`
+/// (see SPEC: Binary or provider, never both).
+interface seeded-config {
+    use types.{entropy-impl};
+    configure: async func(seed: u64) -> result<entropy-impl, string>;
+}
+
 /// entropy.none — absence: exports the optional flavor answering `none`.
 world none {
     export types;
@@ -42,5 +50,5 @@ world none {
 world seeded {
     export types;
     export entropy;
-    export configure: func(seed: u64) -> result<_, string>;
+    export seeded-config;
 }

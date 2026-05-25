@@ -61,6 +61,20 @@ interface disk-optional {
     default: func() -> option<disk-impl>;
 }
 
+/// Compose-time configuration entry for disk.readonly: `configure` returns the root handle
+/// that the exported `disk` serves via `default()` (see SPEC: Binary or provider, never both).
+interface readonly-config {
+    use types.{disk-impl};
+    configure: async func() -> result<disk-impl, string>;
+}
+
+/// Compose-time configuration entry for disk.mem: `configure` binds the device size and
+/// returns the root handle that the exported `disk` serves via `default()`.
+interface mem-config {
+    use types.{disk-impl};
+    configure: async func(size: u64) -> result<disk-impl, string>;
+}
+
 /// disk.none — absence: exports the optional flavor answering `none`.
 world none {
     export types;
@@ -72,11 +86,12 @@ world none {
 world readonly {
     import disk;
     export disk;
+    export readonly-config;
 }
 
 /// disk.mem — RAM-backed block device of a configured size.
 world mem {
     export types;
     export disk;
-    export configure: func(size: u64) -> result<_, string>;
+    export mem-config;
 }

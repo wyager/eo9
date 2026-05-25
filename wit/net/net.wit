@@ -92,6 +92,19 @@ interface net-optional {
     default: func() -> option<net-impl>;
 }
 
+/// Compose-time configuration entry for net.deny: `configure` returns the root handle
+/// that the exported `net` serves via `default()` (see SPEC: Binary or provider, never both).
+interface deny-config {
+    use types.{net-impl};
+    configure: async func() -> result<net-impl, string>;
+}
+
+/// Compose-time configuration entry for net.loopback (same convention as `deny-config`).
+interface loopback-config {
+    use types.{net-impl};
+    configure: async func() -> result<net-impl, string>;
+}
+
 /// net.none — absence: exports the optional flavor answering `none`.
 world none {
     export types;
@@ -102,6 +115,7 @@ world none {
 world deny {
     export types;
     export net;
+    export deny-config;
 }
 
 /// net.loopback — a self-contained loopback-only network: only 127.0.0.1/::1
@@ -109,4 +123,5 @@ world deny {
 world loopback {
     export types;
     export net;
+    export loopback-config;
 }

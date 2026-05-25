@@ -47,6 +47,19 @@ interface text-optional {
     default: func() -> option<text-impl>;
 }
 
+/// Compose-time configuration entry for text.null: `configure` returns the root handle
+/// that the exported `text` serves via `default()` (see SPEC: Binary or provider, never both).
+interface null-config {
+    use types.{text-impl};
+    configure: async func() -> result<text-impl, string>;
+}
+
+/// Compose-time configuration entry for text.capture (same convention as `null-config`).
+interface capture-config {
+    use types.{text-impl};
+    configure: async func() -> result<text-impl, string>;
+}
+
 /// text.none — absence: exports the optional flavor answering `none`.
 world none {
     export types;
@@ -57,6 +70,7 @@ world none {
 world null {
     export types;
     export text;
+    export null-config;
 }
 
 /// text.capture — buffer output for later retrieval.
@@ -64,4 +78,5 @@ world null {
 world capture {
     export types;
     export text;
+    export capture-config;
 }
