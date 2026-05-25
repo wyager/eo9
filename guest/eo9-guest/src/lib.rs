@@ -41,3 +41,12 @@ pub mod text;
 pub mod time;
 
 mod macros;
+
+/// Run a future to completion on the calling task, blocking until it resolves.
+///
+/// The `eo9:*` APIs return Component Model futures (`FutureReader<T>` in the bindings);
+/// inside a synchronous `main` the idiomatic pattern is
+/// `eo9_guest::block_on(async { ... op().await ... })`. Waiting uses the Component
+/// Model's own waitable-set machinery, so the host can schedule other tasks while this
+/// one is parked.
+pub use wit_bindgen::block_on;

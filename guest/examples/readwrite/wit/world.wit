@@ -1,0 +1,27 @@
+// readwrite — the filesystem / async example: every fs operation returns a Component
+// Model future, and buffers make the owned round-trip (transferred to the backend,
+// returned on completion — see SPEC.md, "Ownership and buffers").
+package eo9-examples:readwrite@0.1.0;
+
+/// Writes `contents` to the file at `path`, reads it back, and checks the round-trip.
+///
+///   readwrite --path /scratch/note.txt --contents "hello disk"
+world readwrite {
+    import eo9:fs/fs@0.1.0;
+
+    variant program-success {
+        /// The file round-tripped intact; carries the number of bytes written.
+        round-tripped(u64),
+    }
+
+    variant program-failure {
+        /// An argument value was rejected (e.g. an empty path).
+        bad-arguments(string),
+        /// A filesystem operation failed, carrying the fs API's own error.
+        fs(string),
+        /// The bytes read back differ from the bytes written.
+        mismatch,
+    }
+
+    export main: func(path: string, contents: string) -> result<program-success, program-failure>;
+}

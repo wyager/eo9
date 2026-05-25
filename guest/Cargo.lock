@@ -56,6 +56,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-example-readwrite"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-guest"
 version = "0.0.0"
 dependencies = [
