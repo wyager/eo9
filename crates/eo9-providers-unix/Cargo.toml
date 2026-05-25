@@ -1,0 +1,15 @@
+[package]
+name = "eo9-providers-unix"
+description = "Unix-backed root providers for the Eo9 OS APIs: text, time, entropy, fs, disk."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license = "MIT"
+
+[dependencies]
+# The OS random-number source (eo9:entropy root provider). Chosen because it is the
+# standard, tiny, audited binding to getentropy/getrandom with no transitive deps beyond
+# libc on unix; writing the raw syscall wrappers ourselves would duplicate it badly.
+# Pinned to 0.3 rather than 0.4 because 0.4's wasm-target support drags a large
+# wit-bindgen/wit-component tree into the lockfile that we never compile.
+getrandom = "0.3"
