@@ -456,6 +456,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-integration"
+version = "0.0.0"
+dependencies = [
+ "eo9-component",
+ "eo9-runtime",
+ "eo9-store",
+ "wat",
+ "wit-component",
+ "wit-parser 0.250.0",
+]
+
+[[package]]
 name = "eo9-placeholder"
 version = "0.0.0"
 
