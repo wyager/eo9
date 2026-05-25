@@ -5,7 +5,8 @@
 ///
 /// See SPEC.md: "Eo9 API design" and the disk sketch in "WASM runtime".
 /// Designed to scale to millions of concurrent read/write ops (high-IOPS SSDs,
-/// RAID, …); concurrency comes from issuing many ops and awaiting their futures.
+/// RAID, …); concurrency comes from issuing many async ops and awaiting them
+/// individually or jointly.
 package eo9:disk@0.1.0;
 
 /// Root-handle type, shared by the required and `-optional` flavors.
@@ -46,11 +47,11 @@ interface disk {
     /// backend holds it uniquely across the async boundary. (The spec sketch writes
     /// `own<buffer>`; a bare `buffer` parameter/result is the same owned handle —
     /// wasm-tools normalizes `own<T>` to `T`.)
-    read: func(d: borrow<disk-impl>, offset: u64, dst: buffer)
-        -> future<tuple<buffer, result<read-result, read-error>>>;
+    read: async func(dev: borrow<disk-impl>, offset: u64, dst: buffer)
+        -> tuple<buffer, result<read-result, read-error>>;
 
-    write: func(d: borrow<disk-impl>, offset: u64, src: buffer)
-        -> future<tuple<buffer, result<write-result, write-error>>>;
+    write: async func(dev: borrow<disk-impl>, offset: u64, src: buffer)
+        -> tuple<buffer, result<write-result, write-error>>;
 }
 
 /// Optional flavor of `disk` (hand-written for v0; see SPEC: The capability algebra).

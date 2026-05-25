@@ -36,7 +36,7 @@ interface text {
     write: func(t: borrow<text-impl>, to: output-stream, text: string) -> result<_, text-error>;
 
     /// Read one line from stdin (without the trailing newline); `none` at end of input.
-    read-line: func(t: borrow<text-impl>) -> future<result<option<string>, text-error>>;
+    read-line: async func(t: borrow<text-impl>) -> result<option<string>, text-error>;
 }
 
 /// Optional flavor of `text` (hand-written for v0; see SPEC: The capability algebra).

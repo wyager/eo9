@@ -70,43 +70,43 @@ interface fs {
 
     // --- path operations ---------------------------------------------------
 
-    open: func(fs: borrow<fs-impl>, path: string, options: open-flags)
-        -> future<result<file, fs-error>>;
+    open: async func(fs: borrow<fs-impl>, path: string, options: open-flags)
+        -> result<file, fs-error>;
 
     /// Open for execution, yielding an immutable handle.
-    open-exec: func(fs: borrow<fs-impl>, path: string)
-        -> future<result<immutable-handle, fs-error>>;
+    open-exec: async func(fs: borrow<fs-impl>, path: string)
+        -> result<immutable-handle, fs-error>;
 
     /// Names of the entries of a directory.
     /// (Called `list` in the area plan; `list` is a WIT keyword, hence the longer name.)
-    list-directory: func(fs: borrow<fs-impl>, path: string)
-        -> future<result<list<string>, fs-error>>;
+    list-directory: async func(fs: borrow<fs-impl>, path: string)
+        -> result<list<string>, fs-error>;
 
-    stat: func(fs: borrow<fs-impl>, path: string)
-        -> future<result<node-stat, fs-error>>;
+    stat: async func(fs: borrow<fs-impl>, path: string)
+        -> result<node-stat, fs-error>;
 
-    create-directory: func(fs: borrow<fs-impl>, path: string)
-        -> future<result<_, fs-error>>;
+    create-directory: async func(fs: borrow<fs-impl>, path: string)
+        -> result<_, fs-error>;
 
     /// Remove a file or an empty directory.
-    remove: func(fs: borrow<fs-impl>, path: string)
-        -> future<result<_, fs-error>>;
+    remove: async func(fs: borrow<fs-impl>, path: string)
+        -> result<_, fs-error>;
 
     // --- file I/O: owned-buffer round-trip, as in the disk API --------------
 
-    read: func(f: borrow<file>, offset: u64, dst: buffer)
-        -> future<tuple<buffer, result<read-result, fs-error>>>;
+    read: async func(f: borrow<file>, offset: u64, dst: buffer)
+        -> tuple<buffer, result<read-result, fs-error>>;
 
-    write: func(f: borrow<file>, offset: u64, src: buffer)
-        -> future<tuple<buffer, result<write-result, fs-error>>>;
+    write: async func(f: borrow<file>, offset: u64, src: buffer)
+        -> tuple<buffer, result<write-result, fs-error>>;
 
     // --- immutable handles ---------------------------------------------------
 
     /// Size in bytes of the immutable file.
     exec-size: func(h: borrow<immutable-handle>) -> u64;
 
-    exec-read: func(h: borrow<immutable-handle>, offset: u64, dst: buffer)
-        -> future<tuple<buffer, result<read-result, fs-error>>>;
+    exec-read: async func(h: borrow<immutable-handle>, offset: u64, dst: buffer)
+        -> tuple<buffer, result<read-result, fs-error>>;
 }
 
 /// Optional flavor of `fs` (hand-written for v0; see SPEC: The capability algebra).
