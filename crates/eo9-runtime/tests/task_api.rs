@@ -272,6 +272,7 @@ fn memory_ceiling_is_enforced_at_grow() {
         &[],
         SpawnLimits {
             max_memory: Some(2 * 1024 * 1024),
+            ..SpawnLimits::default()
         },
         Providers::none(),
     )
