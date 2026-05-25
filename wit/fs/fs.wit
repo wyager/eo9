@@ -1,0 +1,143 @@
+/// eo9:fs — the filesystem API (MVP surface).
+///
+/// See SPEC.md: "Filesystem API" and "Execution APIs" (immutable handles).
+/// TODO (spec): deterministic name/content hashes for every FS node, queryable all
+/// the way up the tree — not yet specified here.
+package eo9:fs@0.1.0;
+
+/// Root-handle type, shared by the required and `-optional` flavors.
+/// (Types-only interface — see plan/02-wit.md Decisions.)
+interface types {
+    /// The filesystem capability's root handle.
+    resource fs-impl;
+}
+
+interface fs {
+    use eo9:io/buffers@0.1.0.{buffer};
+    use types.{fs-impl};
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> fs-impl;
+
+    enum node-kind {
+        file,
+        directory,
+    }
+
+    record node-stat {
+        kind: node-kind,
+        /// Size in bytes (0 for directories).
+        size: u64,
+    }
+
+    variant fs-error {
+        not-found,
+        already-exists,
+        not-a-directory,
+        is-a-directory,
+        /// Refused by policy — the error `fs.deny` answers every op with.
+        denied,
+        read-only,
+        no-space,
+        /// The backend cannot promise immutability (open-exec on a backend that is
+        /// neither COW nor content-addressed).
+        not-immutable,
+        io(string),
+    }
+
+    flags open-flags {
+        read,
+        write,
+        create,
+        truncate,
+    }
+
+    /// An open file: offset-addressed owned-buffer I/O, the same shape as the disk API.
+    resource file;
+
+    /// A file opened *for execution*: immutable and content-stable for the life of the
+    /// handle (COW / content-addressed backends only). Program loading, compile caching,
+    /// and signing key on this (see SPEC: Execution APIs).
+    resource immutable-handle;
+
+    record read-result {
+        bytes-read: u64,
+    }
+
+    record write-result {
+        bytes-written: u64,
+    }
+
+    // --- path operations ---------------------------------------------------
+
+    open: func(fs: borrow<fs-impl>, path: string, options: open-flags)
+        -> future<result<file, fs-error>>;
+
+    /// Open for execution, yielding an immutable handle.
+    open-exec: func(fs: borrow<fs-impl>, path: string)
+        -> future<result<immutable-handle, fs-error>>;
+
+    /// Names of the entries of a directory.
+    /// (Called `list` in the area plan; `list` is a WIT keyword, hence the longer name.)
+    list-directory: func(fs: borrow<fs-impl>, path: string)
+        -> future<result<list<string>, fs-error>>;
+
+    stat: func(fs: borrow<fs-impl>, path: string)
+        -> future<result<node-stat, fs-error>>;
+
+    create-directory: func(fs: borrow<fs-impl>, path: string)
+        -> future<result<_, fs-error>>;
+
+    /// Remove a file or an empty directory.
+    remove: func(fs: borrow<fs-impl>, path: string)
+        -> future<result<_, fs-error>>;
+
+    // --- file I/O: owned-buffer round-trip, as in the disk API --------------
+
+    read: func(f: borrow<file>, offset: u64, dst: buffer)
+        -> future<tuple<buffer, result<read-result, fs-error>>>;
+
+    write: func(f: borrow<file>, offset: u64, src: buffer)
+        -> future<tuple<buffer, result<write-result, fs-error>>>;
+
+    // --- immutable handles ---------------------------------------------------
+
+    /// Size in bytes of the immutable file.
+    exec-size: func(h: borrow<immutable-handle>) -> u64;
+
+    exec-read: func(h: borrow<immutable-handle>, offset: u64, dst: buffer)
+        -> future<tuple<buffer, result<read-result, fs-error>>>;
+}
+
+/// Optional flavor of `fs` (hand-written for v0; see SPEC: The capability algebra).
+interface fs-optional {
+    use types.{fs-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<fs-impl>;
+}
+
+/// fs.none — absence: exports the optional flavor answering `none`.
+world none {
+    export types;
+    export fs-optional;
+}
+
+/// fs.deny — refusal: exports `fs` with every operation failing with `denied`.
+world deny {
+    export types;
+    export fs;
+}
+
+/// fs.readonly — attenuation: a read-only view of an underlying filesystem; writes
+/// (and create/remove) fail with `read-only`.
+world readonly {
+    import fs;
+    export fs;
+}
+
+/// fs.memfs — a RAM-backed filesystem (deterministic; the standard scratch/test fs).
+world memfs {
+    export types;
+    export fs;
+}

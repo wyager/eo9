@@ -1,0 +1,26 @@
+/// eo9:sandbox — standard policy worlds: named allow-lists for `only`.
+///
+/// See SPEC.md: "Restriction: only". A policy world compiles to no component at all —
+/// it is pure interface, referenced by name (`only sandbox.no-net $ …`). Each import
+/// entry admits both the required and `-optional` flavor of that interface, matched by
+/// the same semver rule as imports; the types-only `eo9:*/types` interfaces that WIT
+/// elaboration adds alongside carry no authority.
+package eo9:sandbox@0.1.0;
+
+/// sandbox.pure — the empty allow-list: a fully closed program, pure compute.
+world pure {
+}
+
+/// sandbox.no-net — everything standard except the network.
+world no-net {
+    import eo9:io/buffers@0.1.0;
+    import eo9:text/text@0.1.0;
+    import eo9:time/time@0.1.0;
+    import eo9:entropy/entropy@0.1.0;
+    import eo9:perf/perf@0.1.0;
+    import eo9:disk/disk@0.1.0;
+    import eo9:fs/fs@0.1.0;
+    import eo9:exec/component-algebra@0.1.0;
+    import eo9:exec/compile@0.1.0;
+    import eo9:exec/task@0.1.0;
+}
