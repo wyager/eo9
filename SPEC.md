@@ -87,8 +87,8 @@ Eo9 OS APIs are designed around modern patterns that support a high degree of co
 Eo9 OS APIs are built around futures which resolve asynchronously and can be blocked on individually or jointly. For example, the disk API looks like
 
 ```
-fn read(fs : &FsImpl, offset: u64, dst: Buffer) -> Async<(Buffer, Result<ReadResult, ReadError>)>
-fn write(fs : &FsImpl, offset: u64, src: Buffer) -> Async<(Buffer, Result<WriteResult, WriteError>)>
+fn read(dev : &DiskImpl, offset: u64, dst: Buffer) -> Async<(Buffer, Result<ReadResult, ReadError>)>
+fn write(dev : &DiskImpl, offset: u64, src: Buffer) -> Async<(Buffer, Result<WriteResult, WriteError>)>
 ```
 
 The `Buffer` is passed by ownership and returned to the caller on completion (on both success and error), so the backend holds it uniquely across the async boundary; see WASM runtime for how this lowers to WIT.
@@ -118,18 +118,26 @@ package eo9:io@1.0.0 {
         resource buffer {
             constructor(len: u64);
             len: func() -> u64;
+            // ... plus read/write accessors for copying bytes between the buffer
+            // and the program's own memory (full signatures live in wit/).
         }
     }
 }
 
 package eo9:disk@1.0.0 {
+    // The root resource lives in a types-only interface so the `-optional` flavor and
+    // stubs (e.g. `disk.none`) can `use` it without importing the authority-bearing
+    // `disk` interface itself.
+    interface types {
+        resource disk-impl;
+    }
+
     interface disk {
         use eo9:io/buffers@1.0.0.{buffer};
-
-        resource fs-impl;
+        use types.{disk-impl};
 
         /// The capability's root handle (see The capability algebra).
-        default: func() -> fs-impl;
+        default: func() -> disk-impl;
 
         record read-result  { bytes-read: u64 }
         record write-result { bytes-written: u64 }
@@ -137,9 +145,9 @@ package eo9:disk@1.0.0 {
         variant write-error { io(string), out-of-range, read-only }
 
         /// own<buffer> in, own<buffer> back out (on both success and error).
-        read:  func(fs: borrow<fs-impl>, offset: u64, dst: own<buffer>)
+        read:  func(dev: borrow<disk-impl>, offset: u64, dst: own<buffer>)
             -> future<tuple<own<buffer>, result<read-result, read-error>>>;
-        write: func(fs: borrow<fs-impl>, offset: u64, src: own<buffer>)
+        write: func(dev: borrow<disk-impl>, offset: u64, src: own<buffer>)
             -> future<tuple<own<buffer>, result<write-result, write-error>>>;
     }
 }
@@ -359,17 +367,20 @@ In the second case the residual imports of the parenthesized module are satisfie
 
 Composition as defined so far can only *add* implementations: a provider satisfies imports, and whatever it doesn't satisfy flows outward to be satisfied ambiently at run time. Three further forms complete the algebra — declaring a capability optional, dropping or denying one, and bounding everything to the right of a point to a fixed allow-list. None of them introduce new runtime machinery: they are ordinary worlds and providers plus one static judgment, and they all compile away under fusion.
 
-**Optional capabilities are typed, not metadata.** Every API interface declares its root resource and an accessor for obtaining it (this is also how a program gets its `fs-impl`/`net-impl` handle in the first place). Tooling mechanically derives an `-optional` flavor whose accessor returns `option`:
+**Optional capabilities are typed, not metadata.** Every API declares its root resource and an accessor for obtaining it (this is also how a program gets its `disk-impl`/`net-impl` handle in the first place); the resource itself lives in a types-only sibling interface, so the `-optional` flavor and the stubs can name it without importing any authority. Tooling mechanically derives an `-optional` flavor whose accessor returns `option`:
 
 ```wit
 package eo9:net@1.0.0 {
-    interface net {
+    interface types {                         // types only — no authority; safe for anything to import
         resource net-impl;
+    }
+    interface net {
+        use types.{net-impl};
         default: func() -> net-impl;          // the capability's root handle
         // ... ops take borrow<net-impl> ...
     }
-    interface net-optional {                  // auto-derived from `net`
-        use net.{net-impl};
+    interface net-optional {                  // derived from `net`
+        use types.{net-impl};
         default: func() -> option<net-impl>;  // absence is in the type
     }
 }
@@ -441,8 +452,9 @@ Running programs decomposes into pieces with very different privilege. The guidi
 interface component-algebra {
     resource component;          // an open program value: binary or provider
 
-    /// One interface a component still needs (a residual import).
+    /// One slot a component still needs (a residual import).
     record import-need {
+        slot:      string,       // slot name (defaults to the interface name)
         interface: string,       // e.g. "eo9:net/net"
         version:   string,       // semver it was built against (satisfied per the semver rule above)
         required:  bool,         // mandatory vs. optional import
@@ -455,6 +467,7 @@ interface component-algebra {
     compose:  func(p: component, c: component) -> result<component, compose-error>;                 // `$`
     extend:   func(base: component, layer: component) -> result<component, compose-error>;          // `&`
     restrict: func(c: component, allow: list<interface-ref>) -> result<component, restrict-error>;  // `only`
+    rename:   func(c: component, from: string, to: string) -> result<component, rename-error>;      // slot relabeling
 }
 ```
 
@@ -487,7 +500,7 @@ interface task {
     }
 
     // `args` are main's named, typed arguments, WAVE-encoded and checked against main's signature.
-    spawn: func(i: image, args: list<named-arg>, limits: spawn-limits) -> result<task, spawn-error>;
+    spawn: func(i: borrow<image>, args: list<named-arg>, limits: spawn-limits) -> result<task, spawn-error>;  // borrow: one cached image, many spawns
 
     variant resume-outcome { out-of-fuel, blocked, done(program-outcome) }
 
@@ -522,13 +535,18 @@ interface task {
 
 ### Disk API
 
+Raw block-device access: offset-addressed reads/writes of owned buffers against a `disk-impl`. Deliberately
+carries no filesystem semantics — that is the Filesystem API's job, layered on top.
+
 TODO - we want to support ultrahigh concurrency and DMA
 
 Standard stubs: `disk.none`, `disk.readonly`, `disk.mem` (RAM-backed).
 
 ### Filesystem API
 
-TODO - we want to provide standard FS stuff, but also some new things like deterministic name/content based hashes all the way up the FS tree.
+Unix-comparable filesystem operations, layered over a disk (or other) backend.
+
+TODO - we want to provide standard FS stuff, but also some optional additions, exposed where the backing store supports them, like deterministic name/content based hashes all the way up the FS tree.
 You can easily look at the pre-computed hash of any FS node (file or dir) to see if it or its descendants have changed since last snapshot.
 Lets us build backend-agnostic versions of stuff like ZFS tree walk for backup.
 
