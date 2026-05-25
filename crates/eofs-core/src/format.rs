@@ -46,6 +46,12 @@ pub const SNAP_ENTRY_FIXED: usize = 16 + OBJ_REF_SIZE;
 /// Longest accepted file, directory, or snapshot name, in bytes.
 pub const MAX_NAME_LEN: usize = 255;
 
+/// Largest accepted *metadata* object (a serialized directory or the snapshot table), in
+/// bytes. Metadata objects are read into memory whole, so their size is bounded tightly —
+/// independently of the device size — to keep a corrupted or hostile image from driving
+/// huge allocations. 16 MiB is room for over two hundred thousand directory entries.
+pub const MAX_META_OBJECT_SIZE: u64 = 1 << 24;
+
 /// How a block's bytes are stored on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {

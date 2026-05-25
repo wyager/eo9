@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use crate::device::BlockDevice;
 use crate::error::FsError;
-use crate::format::{BLOCK_PTR_SIZE, BlockPtr, Codec, DATA_START, ObjRef};
+use crate::format::{BLOCK_PTR_SIZE, BlockPtr, Codec, DATA_START, MAX_META_OBJECT_SIZE, ObjRef};
 use crate::fs::Eofs;
 
 impl<D: BlockDevice> Eofs<D> {
@@ -54,7 +54,11 @@ impl<D: BlockDevice> Eofs<D> {
         if ptr.is_null() {
             return Err(FsError::Corrupt("read through a null block pointer"));
         }
-        if ptr.lsize == 0 || ptr.lsize > self.block_size || ptr.psize == 0 {
+        if ptr.lsize == 0
+            || ptr.lsize > self.block_size
+            || ptr.psize == 0
+            || ptr.psize > self.block_size
+        {
             return Err(FsError::Corrupt("block pointer with impossible sizes"));
         }
         if ptr.addr < DATA_START
@@ -90,22 +94,53 @@ impl<D: BlockDevice> Eofs<D> {
         Ok(logical)
     }
 
-    /// The ordered data-block pointers of an object (reads and checks every indirect block
-    /// on the way down).
-    pub(crate) fn collect_leaves(&self, obj: &ObjRef) -> Result<Vec<BlockPtr>, FsError> {
+    /// Sanity-check an object reference *before* walking or allocating for it, so a
+    /// corrupted or hostile reference cannot drive unbounded work. Returns the number of
+    /// data blocks the object must have.
+    ///
+    /// Checks: an empty object has a null root and level 0; a non-empty object has a
+    /// non-null root, needs no more data blocks than the device could possibly hold (every
+    /// block occupies at least one allocation unit), and declares exactly the tree height
+    /// the writer would have produced for its size (so an inflated `level` cannot multiply
+    /// the walk's fan-out).
+    pub(crate) fn check_object(&self, obj: &ObjRef) -> Result<u64, FsError> {
         if obj.size == 0 {
-            if !obj.root.is_null() {
+            if !obj.root.is_null() || obj.level != 0 {
                 return Err(FsError::Corrupt("empty object with a root block"));
             }
-            return Ok(Vec::new());
+            return Ok(0);
         }
         if obj.root.is_null() {
             return Err(FsError::Corrupt("non-empty object without a root block"));
         }
+        let leaf_count = obj.size.div_ceil(self.block_size as u64);
+        let max_leaves = (self.device_size - DATA_START) / self.alloc_unit as u64;
+        if leaf_count > max_leaves {
+            return Err(FsError::Corrupt("object larger than the device"));
+        }
+        let fanout = self.fanout() as u64;
+        let mut canonical_level = 0u8;
+        let mut capacity = 1u64;
+        while capacity < leaf_count {
+            capacity = capacity.saturating_mul(fanout);
+            canonical_level += 1;
+        }
+        if obj.level != canonical_level {
+            return Err(FsError::Corrupt("object level inconsistent with its size"));
+        }
+        Ok(leaf_count)
+    }
+
+    /// The ordered data-block pointers of an object (reads and checks every indirect block
+    /// on the way down).
+    pub(crate) fn collect_leaves(&self, obj: &ObjRef) -> Result<Vec<BlockPtr>, FsError> {
+        let leaf_count = self.check_object(obj)?;
+        if leaf_count == 0 {
+            return Ok(Vec::new());
+        }
         let mut leaves = Vec::new();
-        self.collect_level(&obj.root, obj.level, &mut leaves)?;
-        let expected = obj.size.div_ceil(self.block_size as u64);
-        if leaves.len() as u64 != expected {
+        self.collect_level(&obj.root, obj.level, leaf_count, &mut leaves)?;
+        if leaves.len() as u64 != leaf_count {
             return Err(FsError::Corrupt("object data-block count mismatch"));
         }
         Ok(leaves)
@@ -115,9 +150,15 @@ impl<D: BlockDevice> Eofs<D> {
         &self,
         ptr: &BlockPtr,
         level: u8,
+        leaf_count: u64,
         out: &mut Vec<BlockPtr>,
     ) -> Result<(), FsError> {
         if level == 0 {
+            if out.len() as u64 >= leaf_count {
+                return Err(FsError::Corrupt(
+                    "object has more data blocks than its size",
+                ));
+            }
             out.push(*ptr);
             return Ok(());
         }
@@ -127,7 +168,7 @@ impl<D: BlockDevice> Eofs<D> {
         }
         for chunk in block.chunks(BLOCK_PTR_SIZE) {
             let child = BlockPtr::read_from(chunk)?;
-            self.collect_level(&child, level - 1, out)?;
+            self.collect_level(&child, level - 1, leaf_count, out)?;
         }
         Ok(())
     }
@@ -165,8 +206,15 @@ impl<D: BlockDevice> Eofs<D> {
         self.write_object_range(&ObjRef::EMPTY, 0, data)
     }
 
-    /// Read a whole byte object.
+    /// Read a whole byte object into memory. This is the *metadata* read path (serialized
+    /// directories and the snapshot table), so the object's declared size is capped at
+    /// [`MAX_META_OBJECT_SIZE`] before anything is allocated; file contents go through
+    /// [`read_object_range`](Self::read_object_range) into caller-provided buffers instead.
     pub(crate) fn read_object(&self, obj: &ObjRef) -> Result<Vec<u8>, FsError> {
+        if obj.size > MAX_META_OBJECT_SIZE {
+            return Err(FsError::Corrupt("metadata object impossibly large"));
+        }
+        self.check_object(obj)?;
         let mut buf = vec![0u8; obj.size as usize];
         let got = self.read_object_range(obj, 0, &mut buf)?;
         debug_assert_eq!(got as u64, obj.size);
