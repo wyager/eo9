@@ -61,14 +61,14 @@ eo9/
 | 11 | Usermode binary     | plan/11-usermode.md         | `crates/eo9`                           | 03–08      |
 | 12 | Bare metal / QEMU   | plan/12-kernel.md           | `kernel/`, bootable images             | 04, 05, 06 |
 | 13 | Test suite          | plan/13-tests.md            | `tests/`, CI gates                     | all        |
-| 14 | Native fs (eo9fs)   | plan/14-eo9fs.md            | `crates/eo9fs-core`, guest provider    | 01, 02, 07 |
+| 14 | Native fs (eofs)   | plan/14-eofs.md            | `crates/eofs-core`, guest provider    | 01, 02, 07 |
 
 ## Phases
 
 - **Phase 0 (serial):** 01 workspace, then 02 WIT v0. Everything else keys off these.
 - **Phase 1 (parallel):** 03 component algebra, 04 runtime, 05 scheduler, 06 store, 07 guest SDK,
   08 unix providers. These only touch `wit/` read-only and their own crates.
-- **Phase 2 (parallel):** 09 stubs, 10 eosh, 11 usermode integration, 13 tests build-out, 14 eo9fs core
+- **Phase 2 (parallel):** 09 stubs, 10 eosh, 11 usermode integration, 13 tests build-out, 14 eofs core
   (format + library; its provider component and kernel adoption land alongside Phase 3).
 - **Phase 3:** 12 bare metal (one arch first, then the other two), QEMU test suite.
 
