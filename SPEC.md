@@ -84,7 +84,7 @@ any OS (including Eo9 itself).
 
 Eo9 OS APIs are designed around modern patterns that support a high degree of concurrency and asynchronicity.
 
-Eo9 OS APIs are built around futures which resolve asynchronously and can be blocked on individually or jointly. For example, the disk API looks like
+Eo9 OS APIs are built around asynchronous operations — async-typed functions whose in-flight calls can be awaited individually or jointly. For example, the disk API looks like
 
 ```
 fn read(dev : &DiskImpl, offset: u64, dst: Buffer) -> Async<(Buffer, Result<ReadResult, ReadError>)>
@@ -145,10 +145,10 @@ package eo9:disk@1.0.0 {
         variant write-error { io(string), out-of-range, read-only }
 
         /// own<buffer> in, own<buffer> back out (on both success and error).
-        read:  func(dev: borrow<disk-impl>, offset: u64, dst: own<buffer>)
-            -> future<tuple<own<buffer>, result<read-result, read-error>>>;
-        write: func(dev: borrow<disk-impl>, offset: u64, src: own<buffer>)
-            -> future<tuple<own<buffer>, result<write-result, write-error>>>;
+        read:  async func(dev: borrow<disk-impl>, offset: u64, dst: own<buffer>)
+            -> tuple<own<buffer>, result<read-result, read-error>>;
+        write: async func(dev: borrow<disk-impl>, offset: u64, src: own<buffer>)
+            -> tuple<own<buffer>, result<write-result, write-error>>;
     }
 }
 
@@ -192,7 +192,7 @@ Modeling the buffer as a `resource` rather than a `list<u8>` also makes it DMA-f
 
 **Contract vs. cost.** The Component Model nominally copies data across component boundaries to preserve isolation. Eo9 erases that cost: because driver implementations are compiled into the same module and linear memory as the program (see Performance), there is no runtime boundary between a program and its backends, so the optimizer can elide the canonical-ABI copies — an `own<buffer>` round-trip lowers to passing a pointer within shared linear memory. WIT describes the ownership *contract*; fusion makes it zero-cost.
 
-> Note: The Component Model's async support (`future`/`stream`) was still stabilizing as of this writing; since async I/O is central to Eo9, the concrete encoding of `future<…>` may need to track the upstream spec. `stream<T>` is sequential and so is not used for the offset-addressed, random-access disk/net APIs. We deliberately build on the Component Model's async machinery (tasks, waitable-sets, `future`/`stream`) rather than inventing a parallel Eo9 mechanism — see *Execution APIs*.
+> Note: The Component Model's async support was still stabilizing as of this writing; since async I/O is central to Eo9, the concrete encoding may need to track the upstream spec. Operations are declared `async func` — async-ness is part of a function's component-level type, only async-typed exports may block, and that is also what lets providers be implemented as wasm components. `future<T>`/`stream<T>` remain available as value types where a first-class handle is genuinely needed; `stream<T>` is sequential and so is not used for the offset-addressed, random-access disk/net APIs. We deliberately build on the Component Model's async machinery (async functions, tasks, waitable-sets) rather than inventing a parallel Eo9 mechanism — see *Execution APIs*.
 
 ### Composition and the `$` operator
 
@@ -517,11 +517,11 @@ interface task {
     /// interleaving deterministic.
     resume: func(t: borrow<task>, fuel: u64) -> resume-outcome;
 
-    /// Readiness and lifecycle are ordinary Component Model futures — the same vocabulary a program already
-    /// uses for its own I/O. "Wait for any of my children plus my own I/O" is plain async code.
-    runnable: func(t: borrow<task>) -> future;                  // resolves when a blocked task can make progress
-    wait:     func(t: borrow<task>) -> future<program-outcome>; // resolves when the task finishes
-    kill:     func(t: borrow<task>) -> future<program-outcome>;
+    /// Readiness and lifecycle are ordinary async calls — the same vocabulary a program already uses for
+    /// its own I/O. "Wait for any of my children plus my own I/O" is plain async code.
+    runnable: async func(t: borrow<task>);                      // returns when a blocked task can make progress
+    wait:     async func(t: borrow<task>) -> program-outcome;   // returns when the task finishes
+    kill:     async func(t: borrow<task>) -> program-outcome;
 
     // TODO: the multi-core rule (a task is resumed by at most one scheduler at a time); the thread-spawn
     // capability for intra-task parallelism (see the bullets below).
@@ -531,7 +531,7 @@ interface task {
 - **Closed before compile.** There is no ambient `context` and no `override` mechanism: substitution and interposition are composition, decided with `$`/`&`/`only` before codegen and visible in the component value. The shell has no private powers — its top-level rule is literally "compose my environment onto the command, compile, spawn".
 - **Environments are just data.** What an executor may grant onward is an environment value it *possesses*: handed down by its parent (boot hands one to `init`/the shell), passable as an argument like any component, narrowed with `only`, extended with `&`. Possessing driver bytecode is harmless by itself — without Compile it can only be interpreted, and a driver's own imports of raw hardware capabilities (MMIO regions, interrupt lines) are satisfied only by the OS core at instantiation. Those hardware roots are the only true ambient context in the system.
 - **Schedulers are ordinary programs.** Codegen inserts fuel-metered yield points (fuel rather than epoch deadlines, for determinism), so native tasks are cooperatively schedulable *by construction*. A scheduler is then just a program holding `task` handles and deciding which to resume — nested schedulers, supervisors, and deterministic test schedulers are all unprivileged. The irreducibly privileged residue is the compiler that guarantees the yields, and the root holder of timer interrupts and the idle loop.
-- **One concurrency vocabulary.** Programs, providers, supervisors, and schedulers all use the Component Model's async machinery — WIT `future`/`stream`, structured tasks/subtasks, waitable-sets — for everything concurrent. The Task API adds no parallel notion of its own: `wait`/`runnable` are ordinary futures, so "block on any of my children plus my own I/O" is plain async code. The single genuinely OS-level primitive is `resume(task, fuel)`, because donating CPU has no Component Model analog. We build on the Component Model async ABI even while it stabilizes rather than growing a parallel mechanism; its host side is one implementation shared by usermode and bare metal.
+- **One concurrency vocabulary.** Programs, providers, supervisors, and schedulers all use the Component Model's async machinery — async-typed functions, structured tasks/subtasks, waitable-sets, and `future`/`stream` values where a first-class handle is needed — for everything concurrent. The Task API adds no parallel notion of its own: `wait`/`runnable` are ordinary futures, so "block on any of my children plus my own I/O" is plain async code. The single genuinely OS-level primitive is `resume(task, fuel)`, because donating CPU has no Component Model analog. We build on the Component Model async ABI even while it stabilizes rather than growing a parallel mechanism; its host side is one implementation shared by usermode and bare metal.
 - **How readiness is implemented.** Under the hood the OS core implements the host side of that ABI with per-task completion queues and edge-triggered doorbells: a backend pushes a completion record and rings the doorbell only on the empty→non-empty transition; on its next resume the task drains the queue and dispatches to its parked waitable-sets. O(1) per completion and at most one wake per batch (the io_uring shape) — this is what lets the disk/net APIs scale to millions of concurrent ops. A parent never learns *what* a child is blocked on: that is the child's suspended state, and a supervisor that wants to know asks a diagnostic query or interprets the child. Fuel fixes the CPU interleaving, and completion *order* becomes deterministic exactly when the providers are deterministic (`fs.memfs`, `entropy.seeded`, `time.frozen`) — the deterministic-test story goes all the way down.
 - **There is no fork.** Concurrency inside a program is Component Model structured concurrency — free, not a capability, and unable to exceed the program's own imports. Creating a new *schedulable entity* (new linear memory, new capability set, new fuel budget) is `spawn`, which is necessarily a capability because it is precisely the act of granting capabilities and CPU. Unix-style `fork()` is a non-goal.
 - **Parallelism is a capability.** A task starts with one execution context; CPU parallelism *across* tasks is the scheduler's business and works from day one. Parallelism *within* a task (shared-memory threads) is host-mediated in WASM by construction, so Eo9 exposes it as a capability (`eo9:threads` — TODO, tracking the upstream shared-everything-threads proposal): untrusted code is simply not granted it (a second context plus shared memory is a high-resolution clock — see Security), and deterministic environments don't grant it either, since fuel-determinism only holds for single-context tasks.
