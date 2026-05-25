@@ -117,9 +117,17 @@ fn build(root: &Path) -> Result<(), String> {
 fn test(root: &Path) -> Result<(), String> {
     run(root, "cargo", ["test", "--workspace"])?;
     // Kernel unit tests run on the host triple; the placeholder crate is `no_std`
-    // except under `cfg(test)`. Guest crates have no wasm test runner wired up and are
-    // exercised by host-side integration tests instead.
-    run(&root.join("kernel"), "cargo", ["test", "--workspace"])
+    // except under `cfg(test)`. Guest component crates have no wasm test runner wired
+    // up and are exercised by host-side integration tests instead, but eosh-core is a
+    // plain no_std library whose unit tests run on the host triple — passed explicitly,
+    // because the guest workspace defaults to the wasm target (guest/.cargo/config.toml).
+    run(&root.join("kernel"), "cargo", ["test", "--workspace"])?;
+    let host = host_triple()?;
+    run(
+        &root.join("guest"),
+        "cargo",
+        ["test", "-p", "eosh-core", "--target", host.as_str()],
+    )
 }
 
 fn build_guest(root: &Path) -> Result<(), String> {
@@ -268,6 +276,26 @@ fn repo_root() -> PathBuf {
 /// The three workspace roots, in the order they are formatted/linted.
 fn workspaces(root: &Path) -> [PathBuf; 3] {
     [root.to_path_buf(), root.join("guest"), root.join("kernel")]
+}
+
+/// The host target triple, from `rustc -vV` (needed to run host-side tests inside the
+/// guest workspace, which defaults every build to the wasm target).
+fn host_triple() -> Result<String, String> {
+    let output = Command::new("rustc")
+        .arg("-vV")
+        // Match `run`: respect each workspace's rust-toolchain.toml pin rather than the
+        // toolchain the rustup shim picked for xtask itself.
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .output()
+        .map_err(|err| format!("failed to run `rustc -vV`: {err}"))?;
+    if !output.status.success() {
+        return Err(format!("`rustc -vV` failed ({})", output.status));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(str::to_owned)
+        .ok_or_else(|| String::from("`rustc -vV` printed no `host:` line"))
 }
 
 fn expect_no_args(cmd: &str, rest: &[String]) -> Result<(), String> {
