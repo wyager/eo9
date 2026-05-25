@@ -35,4 +35,40 @@ usermode binary's fs mapping), 12 (store image).
 3. Store image builder for the kernel.
 
 ## Decisions
-(record here)
+
+1. **Store root & layout.** Root is `$EO9_STORE`, else `~/.eo9/store` (`Store::open_default`). Layout:
+   `version` (marker line `eo9-store 1`, checked on open), `objects/<blake3-hex>`, `manifests/<stem>.manifest`,
+   `profiles/<stem>.profile`, `cache/<key-hex>/{image,meta}`. Everything is written via temp-file/dir + rename,
+   so readers never see partial writes; objects are chmod'd read-only before they become visible.
+2. **Hashes.** blake3, 64-char lowercase hex everywhere (object file names, manifest entries, cache dirs).
+   `ObjectHash` (content) and `CacheKey` (derived) are distinct types.
+3. **Names.** `Name` = dot-separated kebab-case segments (`browser`, `virtualfs.create`, `fs.memfs`); the store
+   treats the dotted name as a flat key, with `package()`/`world()` accessors for the spec's package.world
+   convention. Manifest/profile file stems are single segments (no dots, no path separators).
+4. **Manifest format (v1).** Line-oriented text: header `eo9-manifest 1`, then `<name> <hash>` lines, `#`
+   comments and blank lines ignored, duplicate names rejected, serialized sorted by name.
+5. **Profile format (v1).** Header `eo9-profile 1`, then manifest stems one per line, base first; **later
+   manifests shadow earlier ones** (same override direction as `&`). If `profiles/<p>.profile` is absent, the
+   profile is implicitly the single manifest `<p>` (absent ⇒ empty), so a fresh store works with just
+   `add` + `bind` + `resolve` and no profile file. An explicit profile naming a missing manifest is an error.
+   Default manifest and profile are both named `default`.
+6. **Binding rule.** `bind` requires the target object to already be in the store — manifests never point at
+   objects that don't exist.
+7. **Resolution result.** `resolve(name)` returns hash + `ObjectHandle` (hash, store path, open read-only
+   file) — the usermode realization of the spec's immutable handle; `verify()` re-checks content against hash.
+8. **Cache key (v1).** blake3 `derive_key` with context `"eo9-store compile-cache key v1"` over length-prefixed
+   fields: ordered module hashes, configure constants (stable-sorted by name, WAVE-encoded values), compile-opts
+   text, target triple, compiler version string, and a `compiler_deterministic` flag. The flag is `false` until
+   plan 04 verifies deterministic codegen, keying unverified entries separately per the determinism note.
+9. **Cache entry format (v1).** `cache/<key>/image` (bytes) + `cache/<key>/meta` (text: header `eo9-image-meta 1`,
+   `created`, `last-used`, `use-count`, `image-size`, `target`, `compiler`, `deterministic`, repeated `module`
+   lines). Lookups bump `use-count`/`last-used` by atomically rewriting `meta`.
+10. **Eviction.** `gc(CachePolicy { max_bytes })` (default budget 4 GiB, provisional) evicts in ascending
+    `(use-count, last-used, key)` order until image bytes fit the budget — the simplest deterministic LRU/MFU
+    blend; the policy is a pure, separately testable `CachePolicy::plan`. `gc` also sweeps `.tmp-*` leftovers
+    older than one hour.
+11. **Dependencies.** Only `blake3` (from the root pin table) plus std; temp dirs in tests are hand-rolled to
+    avoid a `tempfile` dev-dependency.
+12. **Deferred.** Milestone 3 (read-only store-image builder for the kernel) and object-level GC (objects
+    unreachable from any manifest/cache entry) are not implemented yet; runtime/CLI integration is consumed by
+    plans 04 and 11 against the API above.
