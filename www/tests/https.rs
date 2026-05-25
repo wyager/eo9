@@ -15,7 +15,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, OnceLock};
 
 use common::{HttpResponse, parse_response, site_root, start_server};
-use eo9_www::server::serve_site_https;
+use eo9_www::server::{Limits, serve_site_https};
 use eo9_www::tls::manual_tls;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -42,7 +42,9 @@ fn tls_server() -> &'static TlsTestServer {
 
         // Start the HTTPS listener through the same code path as a real deployment.
         let settings = manual_tls(&cert_path, &key_path).expect("load certificate and key");
-        let addr = start_server(move |listener| serve_site_https(listener, settings, site_root()));
+        let addr = start_server(move |listener| {
+            serve_site_https(listener, settings, site_root(), Limits::default())
+        });
 
         // A client that trusts exactly the certificate generated above.
         let mut roots = RootCertStore::empty();

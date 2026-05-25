@@ -47,7 +47,9 @@ What the server does:
 - malformed percent-encoding gets a `400`; malformed HTTP is rejected by the HTTP layer
   without taking the server down;
 - in the HTTPS modes, the plain-HTTP listener 301-redirects everything to HTTPS (preserving
-  host, path, and query).
+  host, path, and query);
+- every listener caps concurrent connections and applies handshake/header/lifetime deadlines
+  (see "Built-in limits" under deployment).
 
 ## Modes
 
@@ -153,6 +155,13 @@ Renewal is automatic: the server re-orders a certificate when the cached one app
 expiry, with no restart and no downtime. If you ever need to supply a certificate from
 elsewhere instead, use `--tls-cert`/`--tls-key` (manual mode) — the rest of the behavior is
 identical.
+
+**Built-in limits.** Each listener caps concurrent connections at 256 and applies deadlines:
+10 s for a TLS handshake, 10 s to read a request's headers (which also bounds idle
+keep-alive waits), and 60 s for one connection's total lifetime. Stalled or hostile
+(slowloris-style) clients are therefore dropped instead of pinning sockets or tasks. The
+values live in `Limits` in `src/server.rs` (deliberately not CLI flags — change them in code
+if eo9.org ever needs different numbers).
 
 ## The logo
 

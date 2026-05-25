@@ -1,5 +1,9 @@
 //! The listeners and request handlers: plain-HTTP site serving, HTTPS site serving
 //! (manual or ACME certificates), and the HTTP→HTTPS redirect listener.
+//!
+//! Every listener applies the same connection hygiene (see [`Limits`]): a cap on concurrent
+//! connections, a TLS-handshake deadline, a header-read deadline, and an overall per-connection
+//! lifetime, so stalled or hostile clients cannot pin tasks or sockets indefinitely.
 
 use std::convert::Infallible;
 use std::io;
@@ -13,16 +17,47 @@ use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri, header};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use rustls_acme::is_tls_alpn_challenge;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
 use tokio_rustls::LazyConfigAcceptor;
+use tokio_rustls::server::TlsStream;
 
 use crate::tls::TlsSettings;
 use crate::{Config, Mode, ResolveError, cache_control, content_type, resolve, tls};
 
 type Body = Full<Bytes>;
+
+/// Connection limits applied to every listener. Defaults are generous for a small static
+/// site; tests use smaller values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Maximum concurrent connections per listener; further connections wait in the kernel
+    /// accept backlog until a slot frees up.
+    pub max_connections: usize,
+    /// Time allowed for a TLS handshake to complete before the connection is dropped.
+    pub tls_handshake_timeout: Duration,
+    /// Time allowed for a client to send its request headers (also bounds how long an idle
+    /// keep-alive connection waits for its next request).
+    pub header_read_timeout: Duration,
+    /// Overall lifetime of one connection; when it expires the connection is dropped even
+    /// mid-request. Keep-alive is fine within this bound.
+    pub max_connection_lifetime: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_connections: 256,
+            tls_handshake_timeout: Duration::from_secs(10),
+            header_read_timeout: Duration::from_secs(10),
+            max_connection_lifetime: Duration::from_secs(60),
+        }
+    }
+}
 
 /// Run the configured server until failure. This is the whole program after argument parsing.
 pub async fn run(config: Config) -> Result<(), String> {
@@ -38,6 +73,7 @@ pub async fn run(config: Config) -> Result<(), String> {
         https_bind,
         mode,
     } = config;
+    let limits = Limits::default();
 
     match mode {
         Mode::PlainHttp => {
@@ -47,13 +83,13 @@ pub async fn run(config: Config) -> Result<(), String> {
                 site_root.display(),
                 local_addr(&listener, &http_bind)
             );
-            serve_site_http(listener, site_root)
+            serve_site_http(listener, site_root, limits)
                 .await
                 .map_err(|e| format!("http server failed: {e}"))
         }
         Mode::ManualTls { cert, key } => {
             let settings = tls::manual_tls(&cert, &key)?;
-            run_tls(&site_root, &http_bind, &https_bind, settings, None).await
+            run_tls(&site_root, &http_bind, &https_bind, settings, None, limits).await
         }
         Mode::Acme {
             domains,
@@ -89,6 +125,7 @@ pub async fn run(config: Config) -> Result<(), String> {
                 &https_bind,
                 settings,
                 domains.into_iter().next(),
+                limits,
             )
             .await
         }
@@ -102,6 +139,7 @@ async fn run_tls(
     https_bind: &str,
     settings: TlsSettings,
     canonical_host: Option<String>,
+    limits: Limits,
 ) -> Result<(), String> {
     let https_listener = bind(https_bind).await?;
     let http_listener = bind(http_bind).await?;
@@ -112,8 +150,8 @@ async fn run_tls(
         local_addr(&http_listener, http_bind)
     );
     tokio::try_join!(
-        serve_site_https(https_listener, settings, site_root.to_path_buf()),
-        serve_redirect(http_listener, canonical_host),
+        serve_site_https(https_listener, settings, site_root.to_path_buf(), limits),
+        serve_redirect(http_listener, canonical_host, limits),
     )
     .map(|_| ())
     .map_err(|e| format!("server failed: {e}"))
@@ -135,12 +173,21 @@ fn local_addr(listener: &TcpListener, configured: &str) -> String {
 }
 
 /// Serve the site over plain HTTP (development mode).
-pub async fn serve_site_http(listener: TcpListener, site_root: PathBuf) -> io::Result<()> {
+pub async fn serve_site_http(
+    listener: TcpListener,
+    site_root: PathBuf,
+    limits: Limits,
+) -> io::Result<()> {
     let site_root = Arc::new(site_root);
+    let permits = Arc::new(Semaphore::new(limits.max_connections));
     loop {
+        let permit = acquire(&permits).await;
         let stream = accept(&listener).await;
         let site_root = site_root.clone();
-        tokio::spawn(async move { serve_site_connection(stream, site_root).await });
+        tokio::spawn(async move {
+            let _permit = permit; // released when the connection is done
+            serve_site_connection(stream, site_root, limits).await;
+        });
     }
 }
 
@@ -151,15 +198,19 @@ pub async fn serve_site_https(
     listener: TcpListener,
     settings: TlsSettings,
     site_root: PathBuf,
+    limits: Limits,
 ) -> io::Result<()> {
     let settings = Arc::new(settings);
     let site_root = Arc::new(site_root);
+    let permits = Arc::new(Semaphore::new(limits.max_connections));
     loop {
+        let permit = acquire(&permits).await;
         let stream = accept(&listener).await;
         let settings = settings.clone();
         let site_root = site_root.clone();
         tokio::spawn(async move {
-            if let Err(error) = serve_tls_connection(stream, &settings, site_root).await {
+            let _permit = permit; // released when the connection is done
+            if let Err(error) = serve_tls_connection(stream, &settings, site_root, limits).await {
                 eprintln!("eo9-www: tls connection error: {error}");
             }
         });
@@ -171,12 +222,16 @@ pub async fn serve_site_https(
 pub async fn serve_redirect(
     listener: TcpListener,
     canonical_host: Option<String>,
+    limits: Limits,
 ) -> io::Result<()> {
     let canonical_host = Arc::new(canonical_host);
+    let permits = Arc::new(Semaphore::new(limits.max_connections));
     loop {
+        let permit = acquire(&permits).await;
         let stream = accept(&listener).await;
         let canonical_host = canonical_host.clone();
         tokio::spawn(async move {
+            let _permit = permit; // released when the connection is done
             let service = service_fn(move |request: Request<Incoming>| {
                 let canonical_host = canonical_host.clone();
                 async move {
@@ -191,14 +246,18 @@ pub async fn serve_redirect(
                     ))
                 }
             });
-            if let Err(error) = http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-            {
-                eprintln!("eo9-www: http connection error: {error}");
-            }
+            drive_connection(stream, service, limits).await;
         });
     }
+}
+
+/// Wait for a free connection slot. The semaphore is never closed, so this cannot fail.
+async fn acquire(permits: &Arc<Semaphore>) -> tokio::sync::OwnedSemaphorePermit {
+    permits
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("connection semaphore is never closed")
 }
 
 /// Accept the next connection; transient accept failures are logged and retried after a
@@ -215,32 +274,50 @@ async fn accept(listener: &TcpListener) -> TcpStream {
     }
 }
 
-/// Complete the TLS handshake and serve the site over the resulting stream.
+/// Complete the TLS handshake (within the handshake deadline) and serve the site over the
+/// resulting stream.
 async fn serve_tls_connection(
     stream: TcpStream,
     settings: &TlsSettings,
     site_root: Arc<PathBuf>,
+    limits: Limits,
 ) -> io::Result<()> {
-    let handshake = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await?;
-    match &settings.challenge_config {
-        Some(challenge_config) if is_tls_alpn_challenge(&handshake.client_hello()) => {
-            // An ACME validation connection: complete the handshake with the challenge
-            // certificate and close. Nothing is served.
-            let mut tls = handshake.into_stream(challenge_config.clone()).await?;
-            tls.shutdown().await
-        }
-        _ => {
-            let tls = handshake
-                .into_stream(settings.server_config.clone())
-                .await?;
-            serve_site_connection(tls, site_root).await;
+    let accepted = timeout(limits.tls_handshake_timeout, tls_accept(stream, settings))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tls handshake timed out"))??;
+    match accepted {
+        // An ACME validation connection: already answered and closed in `tls_accept`.
+        None => Ok(()),
+        Some(tls) => {
+            serve_site_connection(tls, site_root, limits).await;
             Ok(())
         }
     }
 }
 
+/// Run the TLS handshake. Returns `None` for ACME TLS-ALPN-01 validation connections (the
+/// handshake with the challenge certificate *is* the whole exchange — nothing is served).
+async fn tls_accept(
+    stream: TcpStream,
+    settings: &TlsSettings,
+) -> io::Result<Option<TlsStream<TcpStream>>> {
+    let handshake = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await?;
+    match &settings.challenge_config {
+        Some(challenge_config) if is_tls_alpn_challenge(&handshake.client_hello()) => {
+            let mut tls = handshake.into_stream(challenge_config.clone()).await?;
+            tls.shutdown().await?;
+            Ok(None)
+        }
+        _ => Ok(Some(
+            handshake
+                .into_stream(settings.server_config.clone())
+                .await?,
+        )),
+    }
+}
+
 /// Serve HTTP/1.1 on one (plain or TLS) connection, answering every request from the site.
-async fn serve_site_connection<IO>(stream: IO, site_root: Arc<PathBuf>)
+async fn serve_site_connection<IO>(stream: IO, site_root: Arc<PathBuf>, limits: Limits)
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
@@ -250,11 +327,26 @@ where
             Ok::<_, Infallible>(site_response(request.method(), request.uri(), &site_root).await)
         }
     });
-    if let Err(error) = http1::Builder::new()
-        .serve_connection(TokioIo::new(stream), service)
-        .await
-    {
-        eprintln!("eo9-www: http connection error: {error}");
+    drive_connection(stream, service, limits).await;
+}
+
+/// Drive one HTTP/1.1 connection with the configured deadlines: hyper's header-read timeout
+/// covers each request's headers (and idle keep-alive waits), and the whole connection is
+/// dropped once its lifetime budget is spent.
+async fn drive_connection<IO, S>(stream: IO, service: S, limits: Limits)
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+    S: hyper::service::Service<Request<Incoming>, Response = Response<Body>, Error = Infallible>,
+{
+    let connection = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.header_read_timeout)
+        .serve_connection(TokioIo::new(stream), service);
+    match timeout(limits.max_connection_lifetime, connection).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("eo9-www: http connection error: {error}"),
+        // Lifetime budget spent: dropping the connection future closes the socket.
+        Err(_elapsed) => {}
     }
 }
 
@@ -385,5 +477,13 @@ mod tests {
         // No usable host at all: refuse rather than guess.
         let none = redirect_response(None, &uri, None);
         assert_eq!(none.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn default_limits_are_sane() {
+        let limits = Limits::default();
+        assert!(limits.max_connections >= 64);
+        assert!(limits.tls_handshake_timeout <= limits.max_connection_lifetime);
+        assert!(limits.header_read_timeout <= limits.max_connection_lifetime);
     }
 }

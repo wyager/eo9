@@ -8,19 +8,23 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::OnceLock;
 
 use common::{HttpResponse, parse_response, site_root, start_server};
-use eo9_www::server::{serve_redirect, serve_site_http};
+use eo9_www::server::{Limits, serve_redirect, serve_site_http};
 
 /// One shared plain-HTTP site server for the whole test binary.
 fn site_server_addr() -> SocketAddr {
     static ADDR: OnceLock<SocketAddr> = OnceLock::new();
-    *ADDR.get_or_init(|| start_server(|listener| serve_site_http(listener, site_root())))
+    *ADDR.get_or_init(|| {
+        start_server(|listener| serve_site_http(listener, site_root(), Limits::default()))
+    })
 }
 
 /// One shared redirect server (as used in the TLS modes), with `eo9.org` as canonical host.
 fn redirect_server_addr() -> SocketAddr {
     static ADDR: OnceLock<SocketAddr> = OnceLock::new();
     *ADDR.get_or_init(|| {
-        start_server(|listener| serve_redirect(listener, Some("eo9.org".to_owned())))
+        start_server(|listener| {
+            serve_redirect(listener, Some("eo9.org".to_owned()), Limits::default())
+        })
     })
 }
 
