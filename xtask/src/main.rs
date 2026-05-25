@@ -17,6 +17,16 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-outcomes",
     "eo9-example-cruncher",
     "eo9-example-readwrite",
+    // Standard stub providers (guest/stubs/*, plan/09-providers-stubs.md).
+    "eo9-stub-disk-none",
+    "eo9-stub-entropy-none",
+    "eo9-stub-entropy-seeded",
+    "eo9-stub-fs-none",
+    "eo9-stub-net-none",
+    "eo9-stub-perf-none",
+    "eo9-stub-perf-null",
+    "eo9-stub-text-none",
+    "eo9-stub-time-none",
 ];
 
 /// Target used to build guest crates before componentizing them.
