@@ -41,8 +41,8 @@ example programs used by every other area's tests.
    `extern crate alloc`; the SDK's `rt` module provides the global allocator and a panic handler that
    lowers to the wasm `unreachable` instruction (the host sees a trap; no capability is needed to report a
    panic). The allocator is `dlmalloc` (feature `global`) — the same allocator rustc's own `std` uses on
-   wasm targets — added to the guest workspace pins. *New dependency beyond the approved foundation list;
-   flagged for planner sign-off.* `wit-bindgen` is taken with `default-features = false` and features
+   wasm targets — added to the guest workspace pins (a dependency beyond the approved foundation list;
+   **approved by the planner**). `wit-bindgen` is taken with `default-features = false` and features
    `macros, realloc, bitflags, macro-string, async` (dropping its `std` feature; `async` is dependency-free
    and no_std-clean).
 2. **One shared set of bindings, re-exported per API.** `eo9-guest` runs `wit_bindgen::generate!` once
@@ -64,15 +64,14 @@ example programs used by every other area's tests.
    world's typed success/failure variants. Program crates depend on `eo9-guest` and `wit-bindgen` under
    those names. Helpers (`text`, `time`, `entropy`, `buffer`) are stateless one-shot wrappers that fetch the
    root handle via `default()` per call; programs doing repeated I/O hold the handle themselves.
-5. **Async story (wit-bindgen 0.57.1) — works in the guest, gated on validation/host support.** Imports
+5. **Async story (wit-bindgen 0.57.1) — works in the guest; running it needs host-side CM-async.** Imports
    returning `future<T>` are generated as synchronous functions returning `FutureReader<T>`; awaiting them
    inside `eo9_guest::block_on(async { ... })` uses the Component Model waitable-set built-ins and works
    under no_std. `wasm-tools component new` (1.250) componentizes such modules fine and the result imports
-   only the expected eo9 interfaces, but `wasm-tools validate` accepts it only with `--features cm-async`.
-   The `readwrite` (fs) example exercises this end to end and builds in CI, but is **not** in
-   `GUEST_COMPONENTS` yet: enabling it needs the cm-async feature on xtask's validate step (area 01,
-   one flag) and CM-async support on the host side (area 04). `time.sleep` / many-reads-style concurrency
-   examples wait on the same gate.
+   only the expected eo9 interfaces; validation needs the cm-async feature, so (with planner authorization)
+   xtask's build-guest validate step now passes `--features cm-async` and the `readwrite` (fs) example ships
+   in `GUEST_COMPONENTS`. Actually *executing* future-bearing components still depends on CM-async support
+   in the host runtime (area 04); `time.sleep` / many-reads-style concurrency examples wait on that.
 6. **Deferred.** Bindings/helpers for the `-optional` interface flavors; `sleepy`, `many-reads`, and
-   `netcat-lite` examples (blocked on the async gate above); provider-authoring support (export an API +
-   `configure`, milestone 3); any `println!`-style formatting macros.
+   `netcat-lite` examples (pending the area-04 async host support above); provider-authoring support
+   (export an API + `configure`, milestone 3); any `println!`-style formatting macros.
