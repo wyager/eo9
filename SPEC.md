@@ -103,7 +103,7 @@ A WASM module's only channel to the outside world is its imports: core WASM has 
 
 The WASM module imports the set of OS APIs it wants access to. Required OS APIs are imported directly; optional OS APIs are imported through the API's `-optional` flavor, so optionality is visible both in the import list and in the types (see *The capability algebra*). We use WIT (the Component Model's interface-definition language) for import/export specification; a WIT `world` is precisely the declaration of which APIs, by name and type, a program requires and provides.
 
-Every Eo9 module is exactly one of two kinds. A **binary** exports a `main` entrypoint, which we invoke to run it; `main` returns a `result<program-success, program-failure>` whose success and failure types are defined by the program itself (typically variants), so a program reports its outcome in its own structured vocabulary rather than through a lossy numeric exit code. A **provider** instead exports OS-API interfaces (plus a `configure` entry) for composition into other modules, and is never run directly. A module is never both — see *Composition and the `$` operator*.
+Every Eo9 module is exactly one of two kinds. A **binary** exports a `main` entrypoint, which we invoke to run it; `main` returns a `result<program-success, program-failure>` whose success and failure types are defined by the program itself (typically variants), so a program reports its outcome in its own structured vocabulary rather than through a lossy numeric exit code. A **provider** instead exports OS-API interfaces (plus a `configure` entry) for composition into other modules, and is never run directly. A module is never both — see *Composition and the `$` operator*. Both entrypoints — `main` and `configure` — are declared `async`: in the Component Model's async ABI, whether an export may block is part of its type, and anything that performs I/O must therefore be async-lifted.
 
 At load time, the OS scans the imports and ensures that, for each one, we know how to provide a resource of the specified name and type. Anything we cannot satisfy is rejected before execution.
 
@@ -173,7 +173,7 @@ package eo9:browser@0.1.0 {
 
         // arguments: named and typed — one shell flag per parameter
         //   browser --url https://example.com --verbose true --max-connections 64
-        export main: func(
+        export main: async func(
             url: string,
             verbose: bool,
             max-connections: u32
@@ -535,7 +535,7 @@ interface task {
 - **Resource limits.** Memory: a per-task ceiling fixed at spawn and enforced where WASM already asks the host for memory — `memory.grow`; there is no ambient malloc to police (allocators are guest code inside the program's own linear memory). CPU: fuel, conserved down the task tree as above. Everything else (DMA buffers, disk space, bandwidth, handle counts) flows through providers, so quotas there are provider configuration — ordinary attenuation. Shell surface for limits (a `limit` gate or spawn flags) is TODO.
 - **Kill and linearity.** The global contract is small: a killed task never observes anything again, and anything it transferred away (an `own<buffer>` in flight) belongs to the transferee, which completes or aborts the operation on its own schedule and then drops the now-unreceivable result — nothing dangles, nothing leaks. Whether a half-done operation is aborted or completed is each provider's documented, per-API semantics.
 - **State sharing.** Fusion shares *implementation*, never state. Spawning two children from one environment gives each its own fused copy of the provider code; they share state only where a provider's backing resources are shared (the real disk, a common store) — which is the provider's business, not the API's.
-- **Arguments and outcomes.** The canonical value encoding is **WAVE** (the Component Model's value text format): `eosh` parses flags and prints results as WAVE, and a generic executor binds `main`'s arguments and renders `program-outcome` — the program's own `result<program-success, program-failure>` — the same way. WAVE is type-directed, which is fine: an executor always holds the component and therefore its types, and an outcome that outlives its component carries a type descriptor alongside the value. A caller that statically knows the callee's world goes typed and lossless instead.
+- **Arguments and outcomes.** The canonical value encoding is **WAVE** (the Component Model's value text format): `eosh` parses flags and prints results as WAVE, and a generic executor binds `main`'s arguments and renders outcomes the same way. `program-outcome` is a flat three-way variant: `success(…)` and `failure(…)` carry the program's own success/failure variants, WAVE-rendered with their type; `abnormal(abnormal-exit)` covers runs that never returned (`trapped(reason)`, `killed`). A program's `main` itself still returns only `result<program-success, program-failure>` — a program cannot report its own trap; the abnormal arm belongs to the executor's view. WAVE is type-directed, which is fine: an executor always holds the component and therefore its types, and an outcome that outlives its component carries a type descriptor alongside the value. A caller that statically knows the callee's world goes typed and lossless instead.
 
 ### Disk API
 
