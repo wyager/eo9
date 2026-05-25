@@ -208,7 +208,7 @@ fn run_cruncher_is_deterministic_pure_compute() {
 // -----------------------------------------------------------------------------------
 
 #[test]
-fn second_run_hits_the_compile_cache() {
+fn second_run_launches_from_the_cached_image() {
     let store = temp_store("cache-hit");
     let cruncher = component_arg("cruncher");
     let args = ["-v", "run", &cruncher, "--seed", "1", "--rounds", "10"];
@@ -220,12 +220,25 @@ fn second_run_hits_the_compile_cache() {
         "first run should miss: {}",
         first.stderr
     );
+    assert!(
+        first.stderr.contains("cached image"),
+        "first run should cache the image it compiled: {}",
+        first.stderr
+    );
 
+    // The second run takes the cached path: it deserializes the stored image and never
+    // reaches codegen (no "compiling"/"compiled" diagnostics), yet the outcome is
+    // identical.
     let second = eo9(&store, &args);
     assert_eq!(second.code, 0, "stderr: {}", second.stderr);
     assert!(
-        second.stderr.contains("compile cache hit"),
-        "second run should hit: {}",
+        second.stderr.contains("launched from cached image"),
+        "second run should launch from the cache: {}",
+        second.stderr
+    );
+    assert!(
+        !second.stderr.contains("compiling") && !second.stderr.contains("compiled"),
+        "second run must not pay codegen: {}",
         second.stderr
     );
     assert_eq!(second.stdout, first.stdout);
@@ -252,6 +265,44 @@ fn second_run_hits_the_compile_cache() {
 }
 
 #[test]
+fn corrupted_cache_entries_are_ignored_not_trusted() {
+    let store = temp_store("cache-corrupt");
+    let cruncher = component_arg("cruncher");
+    let args = ["-v", "run", &cruncher, "--seed", "3", "--rounds", "10"];
+
+    let first = eo9(&store, &args);
+    assert_eq!(first.code, 0, "stderr: {}", first.stderr);
+
+    // Flip the last byte of the cached artifact: the envelope's recorded content hash no
+    // longer matches, so the entry must be refused and the component recompiled.
+    let cache_dir = store.join("cache");
+    let entry = fs::read_dir(&cache_dir)
+        .expect("cache directory must exist")
+        .next()
+        .expect("one cache entry")
+        .expect("readable cache entry");
+    let image_path = entry.path().join("image");
+    let mut bytes = fs::read(&image_path).expect("readable cached image");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    fs::write(&image_path, &bytes).expect("cached image is writable in the test store");
+
+    let second = eo9(&store, &args);
+    assert_eq!(second.code, 0, "stderr: {}", second.stderr);
+    assert!(
+        second.stderr.contains("ignoring compile-cache entry"),
+        "the tampered entry should be refused: {}",
+        second.stderr
+    );
+    assert!(
+        !second.stderr.contains("launched from cached image"),
+        "the tampered entry must not be launched: {}",
+        second.stderr
+    );
+    assert_eq!(second.stdout, first.stdout);
+}
+
+#[test]
 fn compile_warms_the_cache_for_a_later_run() {
     let store = temp_store("compile-warm");
     let outcomes = component_arg("outcomes");
@@ -270,8 +321,8 @@ fn compile_warms_the_cache_for_a_later_run() {
     );
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
     assert!(
-        run.stderr.contains("compile cache hit"),
-        "run after warm should hit: {}",
+        run.stderr.contains("launched from cached image"),
+        "run after warm should launch from the cache: {}",
         run.stderr
     );
 
