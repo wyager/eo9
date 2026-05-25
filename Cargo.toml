@@ -31,7 +31,13 @@ wasmparser = "0.250.0"
 wasm-wave = "0.250.0"
 wac-graph = "0.10.0"
 wit-bindgen = "0.57.1"
-blake3 = "1.8.5"
+# blake3 is pinned without default features so no_std crates (eofs-core, later the kernel) can
+# use it; the hashing API used by std crates is identical, they just don't get the std-only
+# io::Write/Error impls.
+blake3 = { version = "1.8.5", default-features = false }
+# lz4 block compression for eofs (plan/14-eofs.md). Pure Rust, no_std with default features
+# off; the safe encode/decode implementations are kept on.
+lz4_flex = { version = "0.13.0", default-features = false, features = ["safe-encode", "safe-decode"] }
 
 # Intra-workspace crates (add new crates/* entries here as areas land).
 eo9-component = { path = "crates/eo9-component" }
@@ -39,3 +45,4 @@ eo9-placeholder = { path = "crates/eo9-placeholder" }
 eo9-providers-unix = { path = "crates/eo9-providers-unix" }
 eo9-sched = { path = "crates/eo9-sched" }
 eo9-store = { path = "crates/eo9-store" }
+eofs-core = { path = "crates/eofs-core" }
