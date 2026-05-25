@@ -6,3 +6,4 @@
 # Editor / OS noise.
 *.rs.bk
 .DS_Store
+.claude
