@@ -341,17 +341,15 @@ OS core is written in Rust. Cranelift for WASM.
 
 We should provide a built-in shell for Eo9. Call it `eosh`.
 
-The shell should support invoking programs with both arguments (passed to main function, not compiled in) and custom imports.
+The shell should support invoking programs and providers.
 
-The following should be possible in `eosh`:
+# Overall Guiding Principles
 
-```
-> foo
-Fooing
-Foo done in 1.3s
-> foo --count 2
-Fooing
-Fooing
-Foo done in 2.8s
-> virtualtext --out /tmp/a --err /tmp/b foo
-> virtualtime 
+There are a few important guiding principles for the design and implementation of this OS.
+1. It should be elegant and beautiful.
+2. It should be safe by construction.
+3. It should have clear, algebraically-expressed properties whenever possible.
+
+We should never take hacks or shortcuts. Do things properly and with mathematical elegance.
+
+We shouldn't be afraid to change the spec if we find a more elegant approach.
