@@ -1,0 +1,46 @@
+/// eo9:entropy — randomness.
+///
+/// See SPEC.md: "Entropy API".
+package eo9:entropy@0.1.0;
+
+/// Root-handle type, shared by the required and `-optional` flavors.
+/// (Types-only interface — see plan/02-wit.md Decisions.)
+interface types {
+    /// The entropy capability's root handle.
+    resource entropy-impl;
+}
+
+interface entropy {
+    use types.{entropy-impl};
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> entropy-impl;
+
+    /// Return `len` random bytes. The root provider is cryptographically secure;
+    /// attenuated providers (entropy.seeded) document their own guarantees.
+    get-bytes: func(e: borrow<entropy-impl>, len: u64) -> list<u8>;
+
+    /// Return a single random 64-bit value.
+    get-u64: func(e: borrow<entropy-impl>) -> u64;
+}
+
+/// Optional flavor of `entropy` (hand-written for v0; see SPEC: The capability algebra).
+interface entropy-optional {
+    use types.{entropy-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<entropy-impl>;
+}
+
+/// entropy.none — absence: exports the optional flavor answering `none`.
+world none {
+    export types;
+    export entropy-optional;
+}
+
+/// entropy.seeded — deterministic PRNG from a fixed seed (reproducible tests).
+world seeded {
+    export types;
+    export entropy;
+    export configure: func(seed: u64) -> result<_, string>;
+}

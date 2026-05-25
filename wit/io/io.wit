@@ -1,0 +1,28 @@
+/// eo9:io — shared I/O types, used across disk, fs, net, text, …
+///
+/// See SPEC.md: "WASM runtime" (the buffer sketch) and "Ownership and buffers".
+package eo9:io@0.1.0;
+
+interface buffers {
+    /// A handle to a (possibly DMA-backed) block of memory. Transferred by
+    /// ownership (a bare `buffer` parameter/result is an owned handle in WIT),
+    /// so a backend takes exclusive possession for the life of an op.
+    ///
+    /// Note: the spec sketch declares only `constructor` and `len`. The `read`
+    /// and `write` accessors below are an addition (escalated to the planner):
+    /// without them a guest has no way to move bytes in or out of a buffer.
+    resource buffer {
+        constructor(len: u64);
+
+        /// Total capacity of the buffer in bytes.
+        len: func() -> u64;
+
+        /// Copy `len` bytes starting at `offset` out of the buffer.
+        /// Traps if the range is out of bounds.
+        read: func(offset: u64, len: u64) -> list<u8>;
+
+        /// Copy `bytes` into the buffer starting at `offset`.
+        /// Traps if the range is out of bounds.
+        write: func(offset: u64, bytes: list<u8>);
+    }
+}

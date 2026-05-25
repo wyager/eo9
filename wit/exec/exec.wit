@@ -1,0 +1,200 @@
+/// eo9:exec — the execution APIs: component algebra (unprivileged), compile and
+/// task (privileged).
+///
+/// See SPEC.md: "Execution APIs". The interfaces follow the spec's sketches; the
+/// `image` resource has been moved into a types-only `images` interface so that
+/// importing `task` does not implicitly import the `compile` authority (see
+/// plan/02-wit.md Decisions). `interface` is a WIT keyword, so the spec's
+/// `import-need.interface` field is spelled `%interface` here.
+package eo9:exec@0.1.0;
+
+/// Pure value manipulation on program bytecode (unprivileged).
+interface component-algebra {
+    /// An open program value: binary or provider.
+    resource component;
+
+    /// Which of the two module kinds a component is (see SPEC: binary or provider, never both).
+    enum component-kind {
+        binary,
+        provider,
+    }
+
+    /// One interface a component still needs (a residual import).
+    record import-need {
+        /// e.g. "eo9:net/net"
+        %interface: string,
+        /// semver it was built against (satisfied per the semver rule in the spec)
+        version: string,
+        /// mandatory vs. optional import
+        required: bool,
+    }
+
+    /// One export slot: a name carrying an interface and version.
+    record export-slot {
+        name: string,
+        %interface: string,
+        version: string,
+    }
+
+    /// One named, typed argument of `main` (binary) or `configure` (provider).
+    /// `ty` is WIT type text; it drives WAVE parsing of invocations.
+    record arg-spec {
+        name: string,
+        ty: string,
+    }
+
+    /// Kind, imports, exports, and argument signature of a component.
+    record component-info {
+        kind: component-kind,
+        imports: list<import-need>,
+        exports: list<export-slot>,
+        args: list<arg-spec>,
+    }
+
+    /// A reference to an interface for `restrict` allow-lists, e.g. "eo9:fs/fs".
+    /// An entry admits both the required and `-optional` flavor (see SPEC: only).
+    record interface-ref {
+        %interface: string,
+        /// Absent means "any version of this interface".
+        version: option<string>,
+    }
+
+    variant load-error {
+        /// Not a valid Component Model component.
+        invalid-component(string),
+        /// Valid component, but not an Eo9 module (neither binary nor provider).
+        not-an-eo9-module(string),
+    }
+
+    variant compose-error {
+        /// The left operand is not a provider.
+        not-a-provider,
+        /// An export and the import it would satisfy have incompatible types.
+        type-mismatch(string),
+        internal(string),
+    }
+
+    variant restrict-error {
+        /// Required residual imports outside the allow-list (the compose-time error of `only`),
+        /// naming the offenders.
+        required-outside-allow-list(list<string>),
+        invalid-allow-list(string),
+    }
+
+    variant rename-error {
+        no-such-slot(string),
+        slot-collision(string),
+    }
+
+    load:     func(image: list<u8>) -> result<component, load-error>;
+    save:     func(c: borrow<component>) -> list<u8>;
+    describe: func(c: borrow<component>) -> component-info;
+
+    /// `$` — composition: satisfy `c`'s imports from `p`'s matching exports (see SPEC).
+    compose:  func(p: component, c: component) -> result<component, compose-error>;
+    /// `&` — environment extension: `base` extended and, where they overlap, overridden by `layer`.
+    extend:   func(base: component, layer: component) -> result<component, compose-error>;
+    /// `only` — bound `c` to a fixed allow-list of interfaces.
+    restrict: func(c: component, allow: list<interface-ref>) -> result<component, restrict-error>;
+    /// `rename a b` — relabel slot `old-name` to `new-name`, on imports and exports alike.
+    /// (`from` is a WIT keyword, hence the longer parameter names.)
+    rename:   func(c: component, old-name: string, new-name: string) -> result<component, rename-error>;
+}
+
+/// Opaque compiled-artifact type, shared by `compile` (which mints images) and
+/// `task` (which admits them for execution). Types-only so that holding Task
+/// does not imply holding Compile.
+interface images {
+    /// An opaque compiled artifact; admitted for execution via `task`, never read back as bytes.
+    resource image;
+}
+
+/// Codegen (privileged): asking the TCB to generate native code. Holding Compile
+/// is what makes a program a *native* executor (see SPEC: Execution APIs).
+interface compile {
+    use component-algebra.{component};
+    use images.{image};
+
+    /// Options select debug info / safepoint maps, i.e. how inspectable the native task is.
+    record compile-opts {
+        debug-info: bool,
+        safepoint-maps: bool,
+    }
+
+    variant compile-error {
+        /// The component is a provider, not a binary.
+        not-a-binary,
+        /// The component is not closed: residual required imports, named.
+        not-closed(list<string>),
+        codegen(string),
+    }
+
+    /// `c` must be a *closed binary*: every capability decision was already made — inspectably —
+    /// with the component algebra.
+    compile: func(c: component, opts: compile-opts) -> result<image, compile-error>;
+}
+
+/// Spawning and driving native tasks (privileged, paired with `compile`).
+interface task {
+    use images.{image};
+
+    resource task;
+
+    /// One named `main` argument, WAVE-encoded; checked against main's signature at spawn.
+    record named-arg {
+        name: string,
+        value: string,
+    }
+
+    /// A WAVE-encoded value carrying its WIT type text, so an outcome can outlive its component.
+    record wave-value {
+        ty: string,
+        value: string,
+    }
+
+    /// The program's own `result<program-success, program-failure>`, generically encoded.
+    variant program-outcome {
+        success(wave-value),
+        failure(wave-value),
+    }
+
+    /// Static resource limits, fixed at spawn. CPU is not here — CPU is fuel, and fuel is donated.
+    record spawn-limits {
+        /// Ceiling on linear-memory growth, enforced at memory.grow.
+        max-memory: option<u64>,
+    }
+
+    variant spawn-error {
+        /// Argument WAVE parse / type-check failure against main's signature.
+        bad-arguments(string),
+        internal(string),
+    }
+
+    /// `args` are main's named, typed arguments, WAVE-encoded and checked against main's signature.
+    spawn: func(i: image, args: list<named-arg>, limits: spawn-limits) -> result<task, spawn-error>;
+
+    variant resume-outcome {
+        out-of-fuel,
+        blocked,
+        done(program-outcome),
+    }
+
+    /// Donate `fuel` to the task and run it now, on the caller's own CPU time; returns when the
+    /// fuel is spent, the task blocks on I/O, or it finishes. Fuel is conserved — a scheduler can
+    /// only donate fuel it was itself donated — so CPU budgets compose down the task tree.
+    /// Fuel-metered yields keep interleaving deterministic.
+    resume: func(t: borrow<task>, fuel: u64) -> resume-outcome;
+
+    /// Resolves when a blocked task can make progress.
+    runnable: func(t: borrow<task>) -> future;
+
+    /// Resolves when the task finishes.
+    wait: func(t: borrow<task>) -> future<program-outcome>;
+
+    /// Kill the task; resolves with its final outcome. A killed task never observes anything again
+    /// (see SPEC: Kill and linearity).
+    kill: func(t: borrow<task>) -> future<program-outcome>;
+
+    // TODO (SPEC): the multi-core rule (a task is resumed by at most one scheduler at a time);
+    // the thread-spawn capability for intra-task parallelism (eo9:threads).
+}
