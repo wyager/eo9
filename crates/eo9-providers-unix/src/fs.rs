@@ -29,8 +29,12 @@
 //!
 //! `open-exec` returns an immutable handle by **copy-on-open to an anonymous file**: the
 //! source is copied into a freshly created, uniquely named file in the provider's
-//! exec-copy directory (the system temp dir by default), which is then immediately
-//! unlinked, leaving a file reachable only through the provider's own descriptor.
+//! exec-copy directory (by default a per-process, owner-only `0o700` subdirectory of the
+//! system temp dir), which is then immediately unlinked, leaving a file reachable only
+//! through the provider's own descriptor. The copy is created with mode `0o600`
+//! (atomically, at `open(2)` time), so even in the window between creation and unlink no
+//! other local user can read or tamper with the snapshot of a program that is about to
+//! be executed.
 //! Guarantee: once `open-exec` completes, the bytes observed through the handle cannot
 //! change for the life of the handle — no rename, truncate, rewrite, or deletion of the
 //! original path (by any process) affects it, and no other process can open the private
@@ -59,7 +63,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -200,14 +204,18 @@ pub struct FsProvider {
 
 impl FsProvider {
     /// A provider rooted at `root` (which must exist and be a directory), with exec
-    /// copies placed in the system temp directory.
+    /// copies placed in a per-process, owner-only subdirectory of the system temp
+    /// directory (the copies themselves are always created mode `0o600` — see the
+    /// module docs).
     pub fn new(root: impl AsRef<Path>, pool: Arc<BlockingPool>) -> io::Result<Self> {
-        Self::with_exec_copy_dir(root, std::env::temp_dir(), pool)
+        let exec_copy_dir = std::env::temp_dir().join(format!("eo9-exec-{}", std::process::id()));
+        Self::with_exec_copy_dir(root, exec_copy_dir, pool)
     }
 
-    /// A provider rooted at `root` with an explicit exec-copy directory (created if
-    /// missing). The exec-copy directory should not live inside `root`, or the private
-    /// copies would be briefly visible to guests while being written.
+    /// A provider rooted at `root` with an explicit exec-copy directory (created mode
+    /// `0o700` if missing; an existing directory keeps its permissions). The exec-copy
+    /// directory should not live inside `root`, or the private copies would be briefly
+    /// visible to guests while being written.
     pub fn with_exec_copy_dir(
         root: impl AsRef<Path>,
         exec_copy_dir: impl AsRef<Path>,
@@ -221,7 +229,12 @@ impl FsProvider {
             ));
         }
         let exec_copy_dir = exec_copy_dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&exec_copy_dir)?;
+        // Owner-only for any directory we create ourselves; like create_dir_all, an
+        // already-existing directory is fine and left untouched.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&exec_copy_dir)?;
         Ok(Self {
             root,
             exec_copy_dir,
@@ -429,6 +442,10 @@ fn create_exec_copy_target(exec_copy_dir: &Path) -> Result<(File, PathBuf), FsEr
             .read(true)
             .write(true)
             .create_new(true)
+            // Owner-only from the moment the file exists: another local user must never
+            // be able to read (or, umask permitting, tamper with) the snapshot of a
+            // program that is about to be executed.
+            .mode(0o600)
             .open(&path)
         {
             Ok(file) => return Ok((file, path)),
@@ -884,6 +901,27 @@ mod tests {
         // The private copy was unlinked as soon as it was populated: the exec-copy
         // directory is empty even while the handle is still alive.
         assert_eq!(std::fs::read_dir(exec.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn exec_copies_and_their_default_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A missing exec-copy directory is created owner-only.
+        let base = TempDir::new();
+        let root = TempDir::new();
+        let exec_dir = base.path().join("private-exec");
+        let pool = Arc::new(BlockingPool::new(1));
+        FsProvider::with_exec_copy_dir(root.path(), &exec_dir, pool).unwrap();
+        let dir_mode = std::fs::metadata(&exec_dir).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
+
+        // The snapshot file itself is mode 0o600 from the moment it exists (checked via
+        // fstat on the descriptor the provider keeps).
+        let (copy, copy_path) = create_exec_copy_target(&exec_dir).unwrap();
+        let file_mode = copy.metadata().unwrap().permissions().mode();
+        assert_eq!(file_mode & 0o777, 0o600);
+        std::fs::remove_file(copy_path).unwrap();
     }
 
     #[test]
