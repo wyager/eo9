@@ -67,7 +67,9 @@
 
 pub mod buffer;
 pub mod completion;
+pub mod disk;
 pub mod entropy;
+pub mod fs;
 pub mod pool;
 pub mod text;
 pub mod time;
@@ -75,3 +77,6 @@ pub mod time;
 pub use buffer::OwnedBuffer;
 pub use completion::{Completer, completer};
 pub use pool::BlockingPool;
+
+#[cfg(test)]
+pub(crate) mod testutil;
