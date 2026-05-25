@@ -1,0 +1,9 @@
+[package]
+name = "eo9-sched"
+description = "The Eo9 scheduler: no_std + alloc task table, conserved fuel ledger, run-queue policies, and completion/doorbell primitives shared by the usermode runtime and the bare-metal kernel."
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
