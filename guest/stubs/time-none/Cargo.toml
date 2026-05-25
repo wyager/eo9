@@ -1,0 +1,15 @@
+[package]
+name = "eo9-stub-time-none"
+description = "Eo9 standard stub provider `time.none`: exports eo9:time/time-optional with default() answering none (absence of the time capability)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

@@ -13,7 +13,9 @@
 //!   ([`text`], [`time`], [`entropy`], [`buffer`]);
 //! * the [`bindings!`] and [`main!`] macros, which map a program crate onto its WIT
 //!   world: `bindings!` generates the world bindings (reusing the shared API modules),
-//!   `main!` implements the world's `main` export from a plain Rust function.
+//!   `main!` implements the world's `main` export from a plain Rust function;
+//! * [`provider`] — support for crates that *export* eo9 APIs (the standard stub
+//!   providers under `guest/stubs/*`): shared provider state and ready-made futures.
 //!
 //! Program crates build as `cdylib`s for `wasm32-unknown-unknown` and are componentized
 //! by `cargo xtask build-guest`; see `guest/examples/*` for complete programs.
@@ -37,6 +39,7 @@ mod bindings {
 pub mod api;
 pub mod buffer;
 pub mod entropy;
+pub mod provider;
 pub mod text;
 pub mod time;
 

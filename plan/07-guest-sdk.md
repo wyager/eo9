@@ -73,5 +73,14 @@ example programs used by every other area's tests.
    in `GUEST_COMPONENTS`. Actually *executing* future-bearing components still depends on CM-async support
    in the host runtime (area 04); `time.sleep` / many-reads-style concurrency examples wait on that.
 6. **Deferred.** Bindings/helpers for the `-optional` interface flavors; `sleepy`, `many-reads`, and
-   `netcat-lite` examples (pending the area-04 async host support above); provider-authoring support
-   (export an API + `configure`, milestone 3); any `println!`-style formatting macros.
+   `netcat-lite` examples (pending the area-04 async host support above); any `println!`-style formatting
+   macros. (Provider-authoring support — milestone 3 — has partially landed; see decision 7.)
+7. **Provider-authoring support (milestone 3, first slice — added by area 09).** `eo9_guest::provider`
+   provides `ProviderState<T>`, the `static`-friendly cell for a provider's shared state (bound by
+   `configure`, read by `default()` and every operation; exported resources are just tokens referring to
+   it). Provider crates do **not** use `bindings!`/the shared API modules: exported interfaces must be
+   generated locally, so each stub crate calls `wit_bindgen::generate!` directly against its stub world in
+   the repo-level `wit/<api>` package. Helpers for operations that return `future<T>` are deliberately
+   absent for now: such exports cannot be implemented by a wasm guest provider with the pinned toolchain
+   (only `async func` exports may be async-lifted) — see plan/09-providers-stubs.md Decisions for the
+   constraint and the escalation.
