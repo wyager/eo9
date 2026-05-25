@@ -1,6 +1,6 @@
-// readwrite — the filesystem / async example: every fs operation returns a Component
-// Model future, and buffers make the owned round-trip (transferred to the backend,
-// returned on completion — see SPEC.md, "Ownership and buffers").
+// readwrite — the filesystem / async example: every fs operation is an async function
+// awaited by an async `main`, and buffers make the owned round-trip (transferred to the
+// backend, returned on completion — see SPEC.md, "Ownership and buffers").
 package eo9-examples:readwrite@0.1.0;
 
 /// Writes `contents` to the file at `path`, reads it back, and checks the round-trip.
@@ -23,5 +23,5 @@ world readwrite {
         mismatch,
     }
 
-    export main: func(path: string, contents: string) -> result<program-success, program-failure>;
+    export main: async func(path: string, contents: string) -> result<program-success, program-failure>;
 }
