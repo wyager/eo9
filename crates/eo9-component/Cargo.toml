@@ -1,0 +1,27 @@
+# The component algebra (SPEC.md "Execution APIs" -> component-algebra): pure,
+# unprivileged value manipulation on program bytecode. Math on bytes -- no execution,
+# no I/O policy. Mirrors the WIT interface in wit/exec/exec.wit so the runtime (area 04)
+# can expose it to guests with a thin shim.
+[package]
+name = "eo9-component"
+description = "Eo9 component algebra: load/save/describe, $ (compose), & (extend), only (restrict), rename"
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+wasmparser = { workspace = true }
+# The `wasmparser` feature provides the parse-type -> encode-type conversions used by
+# `rename`'s section rewriting.
+wasm-encoder = { workspace = true, features = ["wasmparser"] }
+wit-parser = { workspace = true }
+wit-component = { workspace = true }
+wac-graph = { workspace = true }
+
+[dev-dependencies]
+# Test fixtures are tiny components generated in-process from WIT text: a dummy core
+# module (`dummy-module` feature) is wrapped into a component with wit-component, so no
+# prebuilt guest artifacts are needed (area 07 is built in parallel and is not a
+# dependency of this crate).
+wit-component = { workspace = true, features = ["dummy-module"] }

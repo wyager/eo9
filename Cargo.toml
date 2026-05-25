@@ -34,6 +34,7 @@ wit-bindgen = "0.57.1"
 blake3 = "1.8.5"
 
 # Intra-workspace crates (add new crates/* entries here as areas land).
+eo9-component = { path = "crates/eo9-component" }
 eo9-placeholder = { path = "crates/eo9-placeholder" }
 eo9-providers-unix = { path = "crates/eo9-providers-unix" }
 eo9-sched = { path = "crates/eo9-sched" }

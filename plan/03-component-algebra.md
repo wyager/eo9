@@ -46,4 +46,48 @@ The pure, unprivileged value algebra on components, as a host library: load/save
 3. `extend`, `restrict`, `rename` + full law suite.
 
 ## Decisions
-(record here)
+
+1. **Wiring mechanism.** `compose`/`extend`/`restrict`-sealing are built on `wac-graph` 0.10 (register the
+   operands as packages, instantiate, wire arguments, encode); slot-name matching and the semver rule are
+   ours, wac supplies the type-checked wiring, residual-import merging, and type hoisting. `rename` is direct
+   re-encoding of the outer import/export sections (no wrapper layer). Every operation re-validates and
+   re-classifies its output via `load`, so a `Component` value is always a well-formed Eo9 module.
+2. **`implements` name annotations.** wit-component 0.250 encodes named slots (`import system-fs: eo9:fs/fs`)
+   with a `(implements "...")` annotation on the extern name; that annotation is what lets `describe` report
+   the interface identity of a plain-named slot, and `rename` emits it when relabeling a default slot.
+   wac-graph 0.10 (wasm-tools 0.247 family) rejects that encoding, so the algebra strips the annotations
+   before wiring and re-attaches them to the result's own imports/exports afterwards (they are purely
+   descriptive; wiring and validation never depend on them). **Escalation:** check whether wasmtime 45
+   (0.248 family) accepts `implements` names before area 04 instantiates components with named slots.
+3. **Kind classification.** Binary = exports the `main` function and no interfaces; provider = everything
+   else that exports only interfaces, types, and optionally `configure` (the empty component is the identity
+   provider). Components exporting both `main` and interfaces/`configure`, or any other bare function, are
+   rejected as `not-an-eo9-module`.
+4. **Describe surface.** The import list contains every interface import, including the types-only
+   `eo9:*/types` interfaces that `use` drags in (describe is honest about the component's real imports);
+   `required` is derived from the `-optional` interface-name suffix. Slot names and `import-need.interface`
+   are versionless; the version is its own field.
+5. **Semver rule for 0.x.** The spec defines same-major / >= minor.patch but is silent on pre-1.0. We follow
+   the wasm-tools/wac/cargo convention: `0.minor` is the compatibility track (0.1.2 satisfies 0.1.0; 0.2.0
+   does not satisfy 0.1.0) and `0.0.x` matches only exactly. Pre-release versions match only exactly.
+   **Escalation:** spec should state the 0.x interpretation explicitly.
+6. **`restrict` details.** Allow-list entries match by interface name (admitting the `-optional` flavor); a
+   version-pinned entry admits imports it could itself satisfy under the semver rule. Types-only interfaces
+   (no functions) carry no authority and are always admitted. Optional residuals outside the list are sealed
+   by synthesizing the absent provider inline (a generated component whose `default()` returns `none`),
+   observationally identical to composing `X.none` — no store dependency. Only the mechanically-derived
+   `-optional` shape (nullary option-returning accessors) is sealable; anything else is treated as an error.
+7. **Subsumption not yet implemented.** The spec's rule that an export of `X` also satisfies an import of
+   `X-optional` needs a mechanically derived `some(·)` adapter; `compose` currently matches slot names only,
+   so that adapter is future work (likely shared with the loader in area 04).
+8. **Error surface.** The Rust API mirrors the WIT error variants, plus an `internal(string)`-style case on
+   rename/restrict errors that the WIT currently lacks (the underlying encoding machinery can fail).
+   **Escalation:** consider adding `internal(string)` to `rename-error` and `restrict-error` in wit/exec.
+9. **Test fixtures.** Built in-process from WIT text (wit-parser + `wit_component::dummy_module` +
+   ComponentEncoder), so this area does not depend on area 07; fixtures cover a self-contained `fix:kit`
+   vocabulary plus the real `eo9:text`/`eo9:entropy` packages. "≡" in law tests is observational equality on
+   `describe()` (slot sets + kind + args); behavioral equivalence under a runtime is deferred to plan 13.
+10. **Dependencies.** Only pinned workspace crates are used (wasmparser, wasm-encoder with its `wasmparser`
+    feature, wit-parser, wit-component, wac-graph); the `dummy-module` feature of wit-component is enabled
+    for dev-dependencies only. No semver crate: the crate carries a ~40-line version parser implementing
+    exactly the spec rule.
