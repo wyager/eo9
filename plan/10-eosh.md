@@ -2,7 +2,7 @@
 
 ## Scope
 The Eo9 shell, written as an ordinary Eo9 program (a wasm component importing `eo9:exec`, `eo9:text`,
-`eo9:fs`) — the shell has no private powers. (Pending PLAN.md Q4.)
+`eo9:fs`) — the shell has no private powers. (Confirmed: compiled from Rust to a wasm component, not an OS builtin.)
 
 ## Spec references
 "Shell", "Programs as values" (type-directed arguments, grouping, top-level rule), "Composition and the `$`

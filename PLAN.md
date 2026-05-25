@@ -83,13 +83,21 @@ eo9/
 - **I4** — bare metal: first arch boots in QEMU, runs a headless AOT-compiled program, output over serial.
 - **I5** — all three arches boot to eosh; usermode + QEMU test suites green in CI.
 
-## Open questions (planner ↔ user)
+## Review & merge workflow
 
-Tracked here; answers get folded into the relevant plan files.
+- Area agents work on a branch or worktree scoped to their area and keep commits small.
+- When an area milestone is ready, a **reviewer agent** (not the planner) reviews the diff against SPEC.md and
+  the area plan, runs `xtask ci`, requests fixes, and merges to master.
+- The planner stays out of diff-level work: it receives short summaries and gets involved only for escalated
+  design questions, changes to `wit/` or other cross-area contracts, and integration milestones.
 
-1. Git workflow: commit SPEC.md + plans to master; sub-agents work on branches/worktrees; planner merges.
-2. Bare-metal strategy: host-side AOT + no_std Wasmtime runtime on target for MVP (on-target codegen later)?
-3. QEMU arch order: proposal aarch64 → riscv64 → x86_64.
-4. eosh as a wasm component from day one (vs. a throwaway native shell)?
-5. Rust nightly allowed where required (kernel); stable elsewhere.
-6. CI host: GitHub Actions, or local scripts only for now?
+## Decisions (planner ↔ user)
+
+1. Git workflow: spec + plans live on master; area agents on branches/worktrees; reviewer agents review and
+   merge (see Review & merge workflow above).
+2. **Open:** bare-metal execution strategy (host-side AOT + no_std runtime vs. on-target codegen vs.
+   interpreter-first). Plan 12's spike settles feasibility; direction under discussion.
+3. QEMU arch order: aarch64 → riscv64 → x86_64.
+4. eosh is compiled from Rust to a wasm component; it is not an OS builtin.
+5. Nightly Rust is fine anywhere it is useful.
+6. CI is local-only for now (`xtask ci`); no hosted CI.

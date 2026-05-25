@@ -2,8 +2,9 @@
 
 ## Scope
 Bootable Eo9 images for AMD64, AArch64, rv64gc per the spec deliverable: boot, run a headless program, and
-boot-to-eosh over serial. Strategy pending PLAN.md Q2/Q3; this plan assumes the recommendation
-(host-side AOT + slim no_std runtime, aarch64 first) and must be revised if that changes.
+boot-to-eosh over serial. Arch order is confirmed (aarch64 → riscv64 → x86_64). The execution strategy is
+still under discussion (PLAN.md Decisions item 2); this plan assumes the recommendation (host-side AOT + slim
+no_std runtime) and must be revised if that changes.
 
 ## Spec references
 "Hardware Support", "Bootable QEMU Images" deliverable, "Performance" (no MMU for privilege; bounds-check
