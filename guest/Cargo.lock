@@ -72,6 +72,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eosh"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "eosh-core",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eosh-core"
+version = "0.0.0"
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

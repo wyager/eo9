@@ -1,0 +1,38 @@
+// eosh — the Eo9 shell, itself an ordinary Eo9 program (SPEC.md, "Shell").
+//
+// The shell has no private powers: composing is the unprivileged component algebra,
+// and running is the Compile + Task capabilities it was granted like any other
+// executor. Program names resolve through the filesystem for now (`/bin/<name>.wasm`,
+// opened for execution); the store-backed resolution of area 11 replaces that
+// convention without touching this world.
+package eo9-eosh:eosh@0.1.0;
+
+/// The interactive shell: reads command lines from standard input, composes and runs
+/// them, and prints each program's outcome as WAVE. With `--command` it executes that
+/// single command line and exits (the one-shot form used by scripts and tests).
+///
+///   eosh
+///   eosh --command "net.none $ browser --url https://example.com"
+world eosh {
+    import eo9:exec/component-algebra@0.1.0;
+    import eo9:exec/compile@0.1.0;
+    import eo9:exec/task@0.1.0;
+    import eo9:text/text@0.1.0;
+    import eo9:fs/fs@0.1.0;
+
+    variant program-success {
+        /// The session ended cleanly (end of input, `exit`, or a one-shot command that
+        /// completed successfully).
+        exited,
+    }
+
+    variant program-failure {
+        /// Reading from or writing to the text streams failed.
+        io(string),
+        /// One-shot mode only: the command could not be run, or the program it ran
+        /// reported failure or ended abnormally (the rendered outcome or error).
+        command-failed(string),
+    }
+
+    export main: async func(command: option<string>) -> result<program-success, program-failure>;
+}

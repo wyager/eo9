@@ -1,0 +1,11 @@
+[package]
+name = "eosh-core"
+description = "The eosh shell's parser, evaluator, and planning logic as a host-testable no_std library: the grammar ($, &, only, rename, with, let, type-directed arguments) and the top-level run rule, expressed against a small Backend trait that the eosh component binds to the eo9:exec / eo9:text / eo9:fs imports."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Intentionally none: the library is pure no_std + alloc so it can be unit-tested on the
+# host and reused unchanged by the eosh component (and, later, by host-side tooling).

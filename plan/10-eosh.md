@@ -37,4 +37,36 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
 3. Builtins polish, error messages worth reading.
 
 ## Decisions
-(record here)
+
+1. **Split: `eosh-core` (library) + `eosh` (component).** `guest/eosh/eosh-core` is a dependency-free
+   `no_std + alloc` library holding the lexer, parser, evaluator, WAVE argument encoding, outcome/describe
+   rendering, and the session (builtins, `let` bindings, the top-level rule), all behind a `Backend` trait
+   (resolve, load, duplicate, describe, compose, extend, restrict, rename, compile, spawn, wait, print).
+   `guest/eosh/eosh` is the thin component crate: it binds `Backend` to the real WIT imports and runs the
+   read–eval loop. The runtime does not expose `eo9:exec` to guests yet, so the component cannot run end to
+   end; everything that can be tested without it is unit-tested on the host against a mock backend
+   (73 tests: grammar precedence/associativity incl. the spec's re-association example, `only`/`rename`/
+   `with` incl. the tuple form, `let`, type-directed flags, the top-level plan, outcome rendering).
+2. **World.** Package `eo9-eosh:eosh@0.1.0`, world `eosh`: imports `eo9:exec/{component-algebra, compile,
+   task}`, `eo9:text/text`, `eo9:fs/fs`; exports `main: async func(command: option<string>)` — interactive
+   REPL when absent, one-shot command when present (for scripts/golden transcripts). The exec bindings are
+   generated in the eosh crate (the SDK world does not include exec); text/fs/io map onto `eo9_guest::api`.
+3. **Grammar details.** `$ & ( ) , =` are always structural and must be quoted inside values; `#` comments;
+   `let only rename with as` are reserved words; builtin names (`help`, `env`, `history`, `describe`,
+   `imports`, `exit`/`quit`) are special only as the first word of a command. Gate terms must be followed by
+   `$`. Flag tokens are WAVE-encoded by the declared parameter type: `string` is quoted/escaped by the shell,
+   `option<…>` wraps in `some(…)` (bare `none` = absent, omitted optionals auto-fill `none`), everything else
+   passes through as the user's own WAVE text; the host's `spawn` remains the type checker.
+4. **Name resolution convention (interim).** A program name resolves to `/bin/<name>.wasm` (dotted name
+   verbatim) on the shell's granted fs, opened with `open-exec`, read via the immutable handle, and `load`ed.
+   Area 11's store-backed resolution replaces only `Backend::resolve` in the component crate.
+5. **`let` bindings are duplicated per use.** The WIT algebra consumes components, so bound values are copied
+   (`save` + `load` in the component backend) each time a binding or the granted environment is used.
+6. **Deferred / escalations.** (a) Provider `configure` arguments: the algebra has no compose-time configure
+   binding, so `virtualfs --dir …` parses but reports "not supported yet" — needs a cross-area decision.
+   (b) Component-typed arguments (`interpret (…)`) are classified correctly but rejected at argument-encoding
+   time: `spawn` takes WAVE text only. (c) `only <world-name>` (named policy worlds) needs store resolution.
+   (d) `save`/`load` builtins, unmatched-export warnings, and history recall/line editing beyond in-memory
+   `history`. (e) eosh-core's host tests are run with `cargo test -p eosh-core --target <host-triple>` inside
+   `guest/`; `xtask ci` does not run guest-workspace host tests — wiring that in (one line in xtask `test`)
+   or moving eosh-core under `crates/` is a planner call.
