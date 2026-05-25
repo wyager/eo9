@@ -172,6 +172,28 @@ instantiate phase of `spawn` runs on a small fixed fuel budget (4 quanta, no yie
 interval), so start-time code in a component fails the spawn instead of burning unbounded
 CPU before any fuel was donated.
 
+### D9. Milestone-2 follow-up (branch `area/04-runtime-m2`)
+
+**Image serialization for the compile cache.** `Image::serialize` and (unsafe)
+`Image::deserialize` expose wasmtime's precompiled-component bytes so the usermode cache
+can skip codegen on a hit; `engine::compatibility_hash` gives area 11 the engine half of
+the cache key (wasmtime version + target + compile-relevant config — for Eo9, the
+`EngineOptions`). Deserialization verifies engine/version compatibility but is *not* an
+integrity check: the bytes are native code, so they must only come from the trusted store
+with their content hash verified — hence the `unsafe` contract, to be wrapped by area 11.
+Round-trip and rejection tests live in `tests/image_cache.rs`.
+
+**fs / io-buffer linking: on hold.** Work on wiring `eo9:io/buffers` and `eo9:fs/fs` into
+the runtime (provider trait + linker, so `eo9-example-readwrite` runs end to end) was
+paused on the planner's instruction while the WIT shape of the API operations
+(`func(...) -> future<T>` vs `async func(...) -> T`) is under owner review; only an
+uncommitted sketch of the host-side `FsProvider` trait existed and was dropped. One
+runtime finding feeds that review: under wasmtime 45 a *sync-lifted* `main` cannot block
+on waitable-sets (`CannotBlockSyncTask`, spike finding D1), and `wit-bindgen 0.57`'s
+`block_on` waits exactly that way — so changing the operations to `async func` does not by
+itself make wit-bindgen guests runnable; `main` (or the guest SDK's wait strategy) must
+become async-capable too (escalation E1).
+
 ### Escalations for the planner
 
 - **E1 (wit/, area 02 + 07):** for a binary to await anything, its `main` must be an

@@ -21,7 +21,7 @@ pub mod providers;
 pub mod task;
 pub mod wave;
 
-pub use engine::{EngineOptions, new_engine};
+pub use engine::{EngineOptions, compatibility_hash, new_engine};
 pub use image::{CompileError, Image};
 pub use outcome::{Outcome, WaveValue};
 pub use providers::{
