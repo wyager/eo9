@@ -3,13 +3,26 @@
 # via `cargo xtask build-guest` (see plan/01-workspace.md, Decisions).
 [workspace]
 resolver = "3"
-members = ["eo9-guest-placeholder"]
+members = ["eo9-guest", "examples/*"]
 
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
+license = "MIT"
 publish = false
 
 # Mirrors the authoritative pin table in the repo-root Cargo.toml — keep versions in sync.
 [workspace.dependencies]
-wit-bindgen = "0.57.1"
+# Guest crates are no_std + alloc (plan/07-guest-sdk.md, Decisions): default features are
+# disabled to drop `std`; `async` is kept for Component Model future/stream support.
+wit-bindgen = { version = "0.57.1", default-features = false, features = [
+    "macros",
+    "realloc",
+    "bitflags",
+    "macro-string",
+    "async",
+] }
+# The guest global allocator (the same allocator rustc's std uses on wasm targets).
+dlmalloc = { version = "0.2.9", default-features = false, features = ["global"] }
+
+eo9-guest = { path = "eo9-guest" }

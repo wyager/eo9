@@ -1,0 +1,19 @@
+// Binding-generation world for the guest SDK.
+//
+// This world exists only so that `wit_bindgen::generate!` produces one shared set of
+// Rust bindings for every eo9 OS API; the `eo9-guest` crate re-exports them per API
+// (see src/api.rs) and example/program crates map their own worlds onto these modules
+// with the `with` option (see the `eo9_guest::bindings!` macro). It is never built
+// into a component and never appears in an import list.
+package eo9-guest:sdk@0.1.0;
+
+world sdk {
+    import eo9:io/buffers@0.1.0;
+    import eo9:text/text@0.1.0;
+    import eo9:time/time@0.1.0;
+    import eo9:entropy/entropy@0.1.0;
+    import eo9:perf/perf@0.1.0;
+    import eo9:disk/disk@0.1.0;
+    import eo9:fs/fs@0.1.0;
+    import eo9:net/net@0.1.0;
+}

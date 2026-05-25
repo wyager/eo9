@@ -1,0 +1,43 @@
+//! Guest SDK for writing Eo9 programs in Rust.
+//!
+//! An Eo9 program is a WASM component whose imports are exactly the `eo9:*` OS APIs it
+//! needs and whose `main` export reports its outcome as a typed
+//! `result<program-success, program-failure>` (see SPEC.md, "WASM runtime"). This crate
+//! gives guest code everything it needs to be written comfortably:
+//!
+//! * [`api`] — the `wit-bindgen`-generated bindings for the `eo9:*` WIT packages,
+//!   re-exported one module per API, shared by every guest crate;
+//! * the `no_std + alloc` guest runtime (allocator + panic handler, see `rt`), so
+//!   components never grow hidden WASI or libc imports;
+//! * thin wrappers over each API's `default()` accessor and common operations
+//!   ([`text`], [`time`], [`entropy`], [`buffer`]);
+//! * the [`bindings!`] and [`main!`] macros, which map a program crate onto its WIT
+//!   world: `bindings!` generates the world bindings (reusing the shared API modules),
+//!   `main!` implements the world's `main` export from a plain Rust function.
+//!
+//! Program crates build as `cdylib`s for `wasm32-unknown-unknown` and are componentized
+//! by `cargo xtask build-guest`; see `guest/examples/*` for complete programs.
+
+#![no_std]
+
+extern crate alloc;
+
+mod rt;
+
+#[doc(hidden)]
+mod bindings {
+    // Parses this crate's `wit/` directory: the `sdk` world plus, under `wit/deps/`,
+    // symlinks to the repo-level `wit/<api>` packages (the interface source of truth).
+    wit_bindgen::generate!({
+        world: "sdk",
+        generate_all,
+    });
+}
+
+pub mod api;
+pub mod buffer;
+pub mod entropy;
+pub mod text;
+pub mod time;
+
+mod macros;

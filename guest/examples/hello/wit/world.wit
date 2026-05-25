@@ -1,0 +1,26 @@
+// hello — the introductory Eo9 example program (see SPEC.md, "WASM runtime": a binary
+// exports `main` returning its own typed success/failure variants, and OS APIs arrive
+// as imports while invocation data arrives as named, typed arguments).
+package eo9-examples:hello@0.1.0;
+
+/// Greets `name` on standard output, stamped with the current wall-clock time.
+///
+///   hello --name world --excited true
+world hello {
+    import eo9:text/text@0.1.0;
+    import eo9:time/time@0.1.0;
+
+    variant program-success {
+        /// The greeting was written.
+        greeted,
+    }
+
+    variant program-failure {
+        /// An argument value was rejected (e.g. an empty name).
+        bad-arguments(string),
+        /// Writing the greeting failed, carrying the text API's own error.
+        io(string),
+    }
+
+    export main: func(name: string, excited: bool) -> result<program-success, program-failure>;
+}

@@ -1,0 +1,15 @@
+[package]
+name = "eo9-example-hello"
+description = "Eo9 example program: greets a name on standard output, stamped with the current wall-clock time (targets the eo9-examples:hello/hello world: text + time)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

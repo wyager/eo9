@@ -12,7 +12,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 /// Guest crates that `build-guest` turns into wasm components (package names).
-const GUEST_COMPONENTS: &[&str] = &["eo9-guest-placeholder"];
+const GUEST_COMPONENTS: &[&str] = &[
+    "eo9-example-hello",
+    "eo9-example-outcomes",
+    "eo9-example-cruncher",
+];
 
 /// Target used to build guest crates before componentizing them.
 const GUEST_TARGET: &str = "wasm32-unknown-unknown";
