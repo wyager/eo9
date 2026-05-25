@@ -1,0 +1,112 @@
+/// eo9:net — networking (MVP surface): TCP connect/listen/accept/send/recv and UDP,
+/// with the owned-buffer round-trip.
+///
+/// See SPEC.md: "Net API" (same concurrency goals as disk).
+package eo9:net@0.1.0;
+
+/// Root-handle type, shared by the required and `-optional` flavors.
+/// (Types-only interface — see plan/02-wit.md Decisions.)
+interface types {
+    /// The net capability's root handle.
+    resource net-impl;
+}
+
+interface net {
+    use eo9:io/buffers@0.1.0.{buffer};
+    use types.{net-impl};
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> net-impl;
+
+    variant ip-address {
+        v4(tuple<u8, u8, u8, u8>),
+        v6(tuple<u16, u16, u16, u16, u16, u16, u16, u16>),
+    }
+
+    record socket-address {
+        address: ip-address,
+        port: u16,
+    }
+
+    variant net-error {
+        /// Refused by policy — the error `net.deny` answers every op with.
+        denied,
+        unreachable,
+        connection-refused,
+        connection-reset,
+        timed-out,
+        address-in-use,
+        io(string),
+    }
+
+    /// An established TCP connection.
+    resource tcp-connection;
+    /// A listening TCP socket.
+    resource tcp-listener;
+    /// A bound UDP socket.
+    resource udp-socket;
+
+    record send-result {
+        bytes-sent: u64,
+    }
+
+    record recv-result {
+        bytes-received: u64,
+    }
+
+    // --- TCP -----------------------------------------------------------------
+
+    connect: func(n: borrow<net-impl>, remote: socket-address)
+        -> future<result<tcp-connection, net-error>>;
+
+    listen: func(n: borrow<net-impl>, local: socket-address)
+        -> future<result<tcp-listener, net-error>>;
+
+    accept: func(l: borrow<tcp-listener>)
+        -> future<result<tuple<tcp-connection, socket-address>, net-error>>;
+
+    /// Owned buffer in, owned buffer back out (on both success and error), as in the disk API.
+    send: func(c: borrow<tcp-connection>, src: buffer)
+        -> future<tuple<buffer, result<send-result, net-error>>>;
+
+    recv: func(c: borrow<tcp-connection>, dst: buffer)
+        -> future<tuple<buffer, result<recv-result, net-error>>>;
+
+    // --- UDP -----------------------------------------------------------------
+
+    bind-udp: func(n: borrow<net-impl>, local: socket-address)
+        -> future<result<udp-socket, net-error>>;
+
+    send-to: func(s: borrow<udp-socket>, remote: socket-address, src: buffer)
+        -> future<tuple<buffer, result<send-result, net-error>>>;
+
+    recv-from: func(s: borrow<udp-socket>, dst: buffer)
+        -> future<tuple<buffer, result<tuple<recv-result, socket-address>, net-error>>>;
+}
+
+/// Optional flavor of `net` (hand-written for v0; see SPEC: The capability algebra).
+interface net-optional {
+    use types.{net-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<net-impl>;
+}
+
+/// net.none — absence: exports the optional flavor answering `none`.
+world none {
+    export types;
+    export net-optional;
+}
+
+/// net.deny — refusal: exports `net` with every operation failing with `denied`.
+world deny {
+    export types;
+    export net;
+}
+
+/// net.loopback — a self-contained loopback-only network: only 127.0.0.1/::1
+/// destinations are reachable, and only within this provider instance.
+world loopback {
+    export types;
+    export net;
+}

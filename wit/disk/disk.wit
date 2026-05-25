@@ -1,0 +1,82 @@
+/// eo9:disk — raw block-device access: offset-addressed reads and writes with the
+/// owned-buffer round-trip. No filesystem semantics live here (paths, directories,
+/// metadata are eo9:fs's business); a disk is just a flat span of bytes addressed
+/// by offset.
+///
+/// See SPEC.md: "Eo9 API design" and the disk sketch in "WASM runtime".
+/// Designed to scale to millions of concurrent read/write ops (high-IOPS SSDs,
+/// RAID, …); concurrency comes from issuing many ops and awaiting their futures.
+package eo9:disk@0.1.0;
+
+/// Root-handle type, shared by the required and `-optional` flavors.
+/// (Types-only interface — see plan/02-wit.md Decisions.)
+interface types {
+    /// The disk capability's root handle: one block device.
+    resource disk-impl;
+}
+
+interface disk {
+    use eo9:io/buffers@0.1.0.{buffer};
+    use types.{disk-impl};
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> disk-impl;
+
+    record read-result {
+        bytes-read: u64,
+    }
+
+    record write-result {
+        bytes-written: u64,
+    }
+
+    variant read-error {
+        not-found,
+        io(string),
+        out-of-range,
+    }
+
+    variant write-error {
+        io(string),
+        out-of-range,
+        read-only,
+    }
+
+    /// Owned buffer in, owned buffer back out (on both success and error), so the
+    /// backend holds it uniquely across the async boundary. (The spec sketch writes
+    /// `own<buffer>`; a bare `buffer` parameter/result is the same owned handle —
+    /// wasm-tools normalizes `own<T>` to `T`.)
+    read: func(d: borrow<disk-impl>, offset: u64, dst: buffer)
+        -> future<tuple<buffer, result<read-result, read-error>>>;
+
+    write: func(d: borrow<disk-impl>, offset: u64, src: buffer)
+        -> future<tuple<buffer, result<write-result, write-error>>>;
+}
+
+/// Optional flavor of `disk` (hand-written for v0; see SPEC: The capability algebra).
+interface disk-optional {
+    use types.{disk-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<disk-impl>;
+}
+
+/// disk.none — absence: exports the optional flavor answering `none`.
+world none {
+    export types;
+    export disk-optional;
+}
+
+/// disk.readonly — attenuation over an underlying block device: reads pass through,
+/// writes fail with `read-only`.
+world readonly {
+    import disk;
+    export disk;
+}
+
+/// disk.mem — RAM-backed block device of a configured size.
+world mem {
+    export types;
+    export disk;
+    export configure: func(size: u64) -> result<_, string>;
+}

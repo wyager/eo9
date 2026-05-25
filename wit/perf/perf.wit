@@ -1,0 +1,43 @@
+/// eo9:perf — performance measurement (placeholder only).
+///
+/// See SPEC.md: "Perf Measurement API". Note: perf counters are themselves a timing
+/// side channel — gate them like time (see SPEC: Security).
+package eo9:perf@0.1.0;
+
+/// Root-handle type, shared by the required and `-optional` flavors.
+/// (Types-only interface — see plan/02-wit.md Decisions.)
+interface types {
+    /// The perf capability's root handle.
+    resource perf-impl;
+}
+
+interface perf {
+    use types.{perf-impl};
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> perf-impl;
+
+    /// TODO: the real counter surface (named counters, sampling, …) is unspecified.
+    /// Placeholder: a single monotonically increasing cycle counter.
+    cycle-counter: func(p: borrow<perf-impl>) -> u64;
+}
+
+/// Optional flavor of `perf` (hand-written for v0; see SPEC: The capability algebra).
+interface perf-optional {
+    use types.{perf-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<perf-impl>;
+}
+
+/// perf.none — absence: exports the optional flavor answering `none`.
+world none {
+    export types;
+    export perf-optional;
+}
+
+/// perf.null — accept and discard: counters read as zero.
+world null {
+    export types;
+    export perf;
+}

@@ -1,0 +1,81 @@
+/// eo9:time — wall-clock and monotonic time.
+///
+/// Fine-grained time is itself a capability (see SPEC.md: Security); attenuated
+/// clocks are ordinary providers (the stub worlds below).
+package eo9:time@0.1.0;
+
+/// Root-handle type, shared by the required and `-optional` flavors.
+/// (Types-only interface — see plan/02-wit.md Decisions.)
+interface types {
+    /// The time capability's root handle.
+    resource time-impl;
+}
+
+interface time {
+    use types.{time-impl};
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> time-impl;
+
+    /// A point on the monotonic clock: nanoseconds since an arbitrary (per-boot) epoch.
+    record instant {
+        nanoseconds: u64,
+    }
+
+    /// Wall-clock time: seconds and nanoseconds since the Unix epoch (UTC).
+    record datetime {
+        seconds: s64,
+        nanoseconds: u32,
+    }
+
+    /// Current wall-clock time.
+    now: func(t: borrow<time-impl>) -> datetime;
+
+    /// Current monotonic time.
+    monotonic-now: func(t: borrow<time-impl>) -> instant;
+
+    /// The granularity of this clock in nanoseconds. Attenuated clocks
+    /// (e.g. time.fuzzy) report their true, degraded resolution.
+    resolution: func(t: borrow<time-impl>) -> u64;
+
+    /// Resolves once at least `duration-ns` nanoseconds of monotonic time have elapsed.
+    sleep: func(t: borrow<time-impl>, duration-ns: u64) -> future;
+}
+
+/// Optional flavor of `time` (hand-written for v0; see SPEC: The capability algebra).
+interface time-optional {
+    use types.{time-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<time-impl>;
+}
+
+/// time.none — absence: exports the optional flavor answering `none`.
+/// (There is deliberately no time.deny: denying a clock is meaningless — see SPEC.)
+world none {
+    export types;
+    export time-optional;
+}
+
+/// time.frozen — both clocks frozen at a configured instant; `sleep` resolves immediately.
+world frozen {
+    export types;
+    export time;
+    export configure: func(now-seconds: s64, monotonic-ns: u64) -> result<_, string>;
+}
+
+/// time.monotonic-stub — deterministic stand-in clock: monotonic time advances by a
+/// fixed step per observation; wall time advances in lockstep from a configured start.
+world monotonic-stub {
+    export types;
+    export time;
+    export configure: func(start-ns: u64, step-ns: u64) -> result<_, string>;
+}
+
+/// time.fuzzy — degraded/jittered resolution over an underlying clock
+/// (Spectre-class side-channel mitigation; see SPEC: Security).
+world fuzzy {
+    import time;
+    export time;
+    export configure: func(granularity-ns: u64) -> result<_, string>;
+}

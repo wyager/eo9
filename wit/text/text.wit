@@ -1,0 +1,67 @@
+/// eo9:text — standard text streams (std{in,out,err}).
+///
+/// See SPEC.md: "Text API", "The capability algebra".
+package eo9:text@0.1.0;
+
+/// Root-handle type, shared by the required and `-optional` flavors.
+///
+/// The root resource lives in its own types-only interface (rather than inside
+/// `text` as the spec sketches) so that importing `text-optional` — or exporting
+/// it from the `none` stub — does not implicitly import the full required `text`
+/// interface. See plan/02-wit.md Decisions.
+interface types {
+    /// The text capability's root handle.
+    resource text-impl;
+}
+
+interface text {
+    use types.{text-impl};
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> text-impl;
+
+    variant text-error {
+        /// The stream is closed (e.g. output was detached, or stdin hit end of input).
+        closed,
+        io(string),
+    }
+
+    /// Which output stream to write to.
+    enum output-stream {
+        out,
+        err,
+    }
+
+    /// Write UTF-8 text to stdout or stderr.
+    write: func(t: borrow<text-impl>, to: output-stream, text: string) -> result<_, text-error>;
+
+    /// Read one line from stdin (without the trailing newline); `none` at end of input.
+    read-line: func(t: borrow<text-impl>) -> future<result<option<string>, text-error>>;
+}
+
+/// Optional flavor of `text` (hand-written for v0; see SPEC: The capability algebra).
+interface text-optional {
+    use types.{text-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<text-impl>;
+}
+
+/// text.none — absence: exports the optional flavor answering `none`.
+world none {
+    export types;
+    export text-optional;
+}
+
+/// text.null — accept and discard all output; stdin is permanently at end of input.
+world null {
+    export types;
+    export text;
+}
+
+/// text.capture — buffer output for later retrieval.
+/// TODO: forward over the Message API (eo9:message) once that package exists.
+world capture {
+    export types;
+    export text;
+}
