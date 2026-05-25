@@ -1,0 +1,24 @@
+# eo9: the usermode Eo9 binary (plan/11-usermode.md) — the embedder that glues the
+# runtime, store, and unix root providers into a running usermode Eo9 instance.
+#
+# Dependency notes (PLAN.md ground rule 3): only the sibling Eo9 crates. Argument parsing
+# is hand-rolled over std::env (no CLI framework), and the wasmtime engine is only ever
+# touched through the types eo9-runtime hands back, so there is no direct wasmtime
+# dependency here.
+[package]
+name = "eo9"
+description = "The usermode Eo9 binary: run, describe, and compile Eo9 programs against the module store and the unix root providers."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license = "MIT"
+
+[dependencies]
+eo9-component = { workspace = true }
+eo9-providers-unix = { workspace = true }
+eo9-runtime = { workspace = true }
+eo9-store = { workspace = true }
+
+[[bin]]
+name = "eo9"
+path = "src/main.rs"

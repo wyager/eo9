@@ -110,6 +110,15 @@ fn build(root: &Path) -> Result<(), String> {
         &root.join("kernel"),
         "cargo",
         ["build", "--workspace", "--target", KERNEL_CHECK_TARGET],
+    )?;
+    // eo9-sched is shared with the bare-metal kernel, so keep it honestly no_std by also
+    // checking it against the bare-metal target. This runs after the kernel build so
+    // rustup has already ensured that target is installed for the pinned toolchain (the
+    // root workspace's rust-toolchain.toml does not list it; the kernel's does).
+    run(
+        root,
+        "cargo",
+        ["check", "-p", "eo9-sched", "--target", KERNEL_CHECK_TARGET],
     )
 }
 

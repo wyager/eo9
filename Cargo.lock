@@ -445,6 +445,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9"
+version = "0.0.0"
+dependencies = [
+ "eo9-component",
+ "eo9-providers-unix",
+ "eo9-runtime",
+ "eo9-store",
+]
+
+[[package]]
 name = "eo9-component"
 version = "0.0.0"
 dependencies = [
