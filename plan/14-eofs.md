@@ -90,6 +90,10 @@ Milestone 1 (`crates/eofs-core`; the on-disk format is described in `crates/eofs
    of a multi-transaction scenario, with torn final writes, then remount + `verify()` + exact state comparison.
 9. Test-support devices (`MemDevice`, `CutDevice`) live in the crate itself so the provider, tools, and other
    areas' tests can reuse them.
+10. **Hostile-image hardening**: object references are validated before any allocation or walk (size bounded by
+    the device, metadata objects capped at 16 MiB, tree level must match the canonical height, data-block count
+    bounded during the walk), and the verify/GC directory walks are iterative with a visited set — so corrupted
+    or adversarial images fail with `Corrupt` instead of unbounded allocation, fan-out, or recursion.
 
 Deferred to later milestones: the provider component and `eofs.mkfs` (M2), usermode end-to-end and
 store-on-eofs (M3), kernel adoption (M4), plus content-only node hashes, holes/sparse files, rename, and
