@@ -38,8 +38,8 @@ interface time {
     /// (e.g. time.fuzzy) report their true, degraded resolution.
     resolution: func(t: borrow<time-impl>) -> u64;
 
-    /// Resolves once at least `duration-ns` nanoseconds of monotonic time have elapsed.
-    sleep: func(t: borrow<time-impl>, duration-ns: u64) -> future;
+    /// Returns once at least `duration-ns` nanoseconds of monotonic time have elapsed.
+    sleep: async func(t: borrow<time-impl>, duration-ns: u64);
 }
 
 /// Optional flavor of `time` (hand-written for v0; see SPEC: The capability algebra).

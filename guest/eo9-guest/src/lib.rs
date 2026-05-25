@@ -47,9 +47,11 @@ mod macros;
 
 /// Run a future to completion on the calling task, blocking until it resolves.
 ///
-/// The `eo9:*` APIs return Component Model futures (`FutureReader<T>` in the bindings);
-/// inside a synchronous `main` the idiomatic pattern is
-/// `eo9_guest::block_on(async { ... op().await ... })`. Waiting uses the Component
-/// Model's own waitable-set machinery, so the host can schedule other tasks while this
-/// one is parked.
+/// The blocking `eo9:*` operations are `async func`s, generated as async Rust functions;
+/// a program whose world declares `main: async func` (the spec's convention) simply
+/// awaits them — see the `async fn main` form of [`main!`]. `block_on` remains for
+/// driving an auxiliary future from a context that is already allowed to block; a
+/// sync-lifted export cannot block, so it is not a way around an async `main`. Waiting
+/// uses the Component Model's own waitable-set machinery, so the host can schedule other
+/// tasks while this one is parked.
 pub use wit_bindgen::block_on;

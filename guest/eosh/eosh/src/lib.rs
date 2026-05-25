@@ -164,7 +164,8 @@ impl Backend for WitBackend {
 
     async fn resolve(&mut self, name: &str) -> Result<Self::Component, BackendError> {
         let path = eosh_core::module_path(name);
-        let handle = fs::open_exec(&self.fs, &path).await.map_err(|err| {
+        // `open-exec` is an async import, so its string argument is passed by value.
+        let handle = fs::open_exec(&self.fs, path.clone()).await.map_err(|err| {
             BackendError::new(format!("cannot resolve `{name}` ({path}): {err:?}"))
         })?;
         let bytes = Self::read_exec(&handle).await?;

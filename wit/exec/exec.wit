@@ -207,15 +207,15 @@ interface task {
     /// Fuel-metered yields keep interleaving deterministic.
     resume: func(t: borrow<task>, fuel: u64) -> resume-outcome;
 
-    /// Resolves when a blocked task can make progress.
-    runnable: func(t: borrow<task>) -> future;
+    /// Returns when a blocked task can make progress.
+    runnable: async func(t: borrow<task>);
 
-    /// Resolves when the task finishes.
-    wait: func(t: borrow<task>) -> future<program-outcome>;
+    /// Returns when the task finishes.
+    wait: async func(t: borrow<task>) -> program-outcome;
 
-    /// Kill the task; resolves with its final outcome — `abnormal(killed)` unless the task had
+    /// Kill the task; returns its final outcome — `abnormal(killed)` unless the task had
     /// already finished. A killed task never observes anything again (see SPEC: Kill and linearity).
-    kill: func(t: borrow<task>) -> future<program-outcome>;
+    kill: async func(t: borrow<task>) -> program-outcome;
 
     // TODO (SPEC): the multi-core rule (a task is resumed by at most one scheduler at a time);
     // the thread-spawn capability for intra-task parallelism (eo9:threads).
