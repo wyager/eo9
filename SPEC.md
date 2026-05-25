@@ -186,7 +186,7 @@ package eo9:browser@0.1.0 {
 
 **Ownership and buffers.** WIT has no mutable/immutable data references — there is no `&`/`&mut`. Plain data (lists, records, …) is passed by value, and the only ownership concepts, `own<T>` and `borrow<T>`, apply solely to opaque `resource` handles.
 
-For I/O buffers we use an **owned-buffer round-trip**: the caller transfers an `own<buffer>` to the backend and gets it back when the operation completes. Because `own` is linear (consumed on transfer), the backend has manifestly unique ownership of the buffer for the whole duration of the async operation — no aliasing, and no reference whose lifetime must span an await point. A `borrow<T>`, by contrast, is valid only for the operation it was passed to and may not be retained beyond it; that suits the `fs-impl` handle (a reference to an OS-owned resource) but not a buffer the backend must take exclusive possession of and return. The buffer comes back on *both* the success and error paths — placed outside the `result` so a failed op never leaks it.
+For I/O buffers we use an **owned-buffer round-trip**: the caller transfers an `own<buffer>` to the backend and gets it back when the operation completes. (WIT itself spells this bare — `buffer` — since `own` is the default for resource params/results and a reserved word; the spec writes `own<buffer>` to emphasize the contract.) Because `own` is linear (consumed on transfer), the backend has manifestly unique ownership of the buffer for the whole duration of the async operation — no aliasing, and no reference whose lifetime must span an await point. A `borrow<T>`, by contrast, is valid only for the operation it was passed to and may not be retained beyond it; that suits the `fs-impl` handle (a reference to an OS-owned resource) but not a buffer the backend must take exclusive possession of and return. The buffer comes back on *both* the success and error paths — placed outside the `result` so a failed op never leaks it.
 
 Modeling the buffer as a `resource` rather than a `list<u8>` also makes it DMA-friendly: it can be backed by host/driver-managed memory, so `own<buffer>` transfer maps directly onto "who may touch this I/O region right now," and the bytes never move.
 
@@ -478,11 +478,15 @@ interface component-algebra {
 **Compile and Task APIs (privileged).** The dangerous authority is asking the TCB to generate native code and admit it for execution; holding Compile is what makes a program a *native* executor (see *Composition and the `$` operator*). Sketch:
 
 ```wit
-interface compile {
-    use component-algebra.{component};
-
+/// Types-only, so holding `task` never implies holding `compile` (or vice versa).
+interface images {
     /// An opaque compiled artifact; admitted for execution via `task`, never read back as bytes.
     resource image;
+}
+
+interface compile {
+    use component-algebra.{component};
+    use images.{image};
 
     // `c` must be a *closed binary*: every capability decision was already made — inspectably — with the
     // component algebra. Options select debug info / safepoint maps, i.e. how inspectable the native task is.
@@ -490,7 +494,7 @@ interface compile {
 }
 
 interface task {
-    use compile.{image};
+    use images.{image};
 
     resource task;
 
