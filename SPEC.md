@@ -2,6 +2,8 @@
 
 Eo9 is an operating system built on modern language-theoretic principles for security, performance, and composability.
 
+This is a living document: every concrete design choice below is provisional (see *Overall Guiding Principles*).
+
 ## Design
 
 At its core, Eo9 is simply a set of APIs that programs can interact with.
@@ -21,6 +23,11 @@ so we can enforce security properties at the language level.
 The trusted computing base is correspondingly small and explicit: the compiler (the only thing that may generate
 native code), the root scheduler, and the hardware-root capabilities held by the OS core. Everything else —
 interpreters, user-level schedulers, providers, the shell — is unprivileged by construction (see *Execution APIs*).
+
+Spectre-class side channels are mitigated capability-style: fine-grained time is itself a capability. Untrusted
+programs are composed with noisy, adversarial, or stubbed timers (`time.fuzzy`, `time.frozen`, `time.none`) and are
+not granted shared-memory channels or other primitives from which a high-resolution clock could be rebuilt —
+attenuating the attacker's clock is just provider substitution, the same mechanism as everything else.
 
 ## Virtualization
 
@@ -51,7 +58,12 @@ The consequences of this are:
 2. There is no overhead from memory isolation. No MMU, no nested address translation.
 3. There is no overhead from virtualization. Virtualized implementations that do nothing at all simply get compiled out.
 
-> TODO (scheduling): codegen inserts yield points (epoch/fuel checks), so native tasks are cooperatively
+One honest caveat on (2): without an MMU there are no guard-page tricks, so on MMU-less targets linear-memory safety
+is paid for with explicit bounds checks — the overhead moves from address translation to whatever loads and stores
+the optimizer cannot prove safe. On MMU-equipped hardware the compiler may still use guard pages, purely as an
+optimization and never for privilege separation.
+
+> TODO (scheduling): codegen inserts yield points (fuel checks — chosen over epoch deadlines for determinism), so native tasks are cooperatively
 > schedulable *by construction* and a scheduler is just a program that holds task handles and decides which to
 > resume (see *Execution APIs*). Still to specify: the yield/resume surface of the Task API, the root scheduler's
 > handling of timer interrupts and the idle loop, the scheduling policy itself, and what a "scheduler switch"
@@ -195,7 +207,7 @@ Both providers compose into `browser`. Composition connects an export to an impo
 
 wires `virtualnet` into `virtualfs` only, so `browser` sees `virtualfs`'s exports but never `virtualnet`'s. (Meaningful only if `virtualfs` itself imports net.) This elaborates the example in Virtualization.
 
-**Algebraic properties.** Write `imports(m)` / `exports(m)` for a module's import and export sets (interface names with versions). Composition obeys:
+**Algebraic properties.** Write `imports(m)` / `exports(m)` for a module's import and export sets — sets of *slots*, each a name carrying an interface type and version, where a slot's name defaults to its interface name (see *Capability slots, `rename`, and `with`*). Composition obeys:
 
 - **Sealing.** In `p $ c`, every import of `c` matched by an export of `p` is *sealed*: it is not an import of the result, and no outer layer — nor the ambient context at run time — can see it or re-satisfy it. The innermost provider wins; a capability decision made close to the consumer can be further attenuated from inside, but never undone from outside.
 - **Residuals.** `imports(p $ c) = imports(p) ∪ (imports(c) ∖ exports(p))`: the consumer's unmatched imports flow outward, and the provider's own imports become obligations of the composition.
@@ -246,6 +258,31 @@ The two operators fit together by an **action law**:
 ```
 
 Binaries do not participate in `&` (the result would be both runnable and composable, which the module-kind rule forbids); the final application of an environment to a binary is always `$`. An environment is also how an executor's grantable capabilities are represented: what an executor may pass on to its children is just an environment value it possesses — handed down by its parent, narrowed with `only`, extended with `&` (see *Execution APIs*).
+
+### Capability slots, `rename`, and `with`
+
+A module's ports are **slots**: a slot is a *(name, interface type)* pair, and the name defaults to the interface name — which is why everything above could say simply "imports `eo9:net/net`". Distinct slots of the same type are how a program asks for more than one instance of a capability:
+
+```wit
+world backup-tool {
+    // Component-level imports are name-keyed, so two slots of one interface type are representable;
+    // this is the Eo9 world dialect for it.
+    import system-fs:  eo9:fs/fs@1.0.0;   // the tree being backed up
+    import scratch-fs: eo9:fs/fs@1.0.0;   // staging space for temporary state
+    // ... main, outcome types ...
+}
+```
+
+`$` and `&` match exports to imports **by slot name** (with the interface-name default, single-instance programs behave exactly as before). `only` keeps matching by interface *type* — the security-relevant question is what kind of capability may cross the gate, not what it is locally called.
+
+Wiring particular providers to particular slots is pure relabeling:
+
+- `rename a b` — a gate term (like `only`) that relabels slot `a` to `b` on everything to its right. It applies to imports and exports alike, is equivalent to composing an auto-generated forwarding adapter, and costs nothing after fusion.
+- `with p as name` — binds provider `p` to the slot `name`: sugar for renaming `p`'s export slot to `name` and composing. `p` must export exactly one interface (use `rename` explicitly otherwise). The keyword-first form keeps parsing one-directional — the parser sees `with`, then a provider expression, then `as`, then a slot name — and several bindings may be given in one `with`, comma-separated.
+
+```
+> with realfs as system-fs, memfs as scratch-fs $ backup-tool --src /home --dst /backups
+```
 
 ### Packaging and submodules
 
@@ -415,6 +452,8 @@ interface component-algebra {
 }
 ```
 
+**Loading is immutability-first.** Opening a file *for execution* yields an **immutable handle** — only filesystems that can promise immutability (COW or content-addressed backends) can back execution — and the component algebra turns immutable handles into `component` values; `load` from raw `list<u8>` remains for components that arrive over other channels. Immutability gives TOCTOU-free loading and a stable content identity, which is exactly what compilation caches, signatures, and the filesystem's content hashes key on (see Filesystem API).
+
 **Interpretation (unprivileged).** An interpreter is just a program; `eo9:interp` ships as a standard component, but anyone can write one. An interpreted child's imports are satisfied by the interpreter *from its own imports*, so the child can never exceed what the interpreter already holds and chooses to forward — confinement is automatic and requires no capability at all. Inspection of interpreted children (single-stepping, watchpoints, deterministic replay) is likewise free, because the interpreter mediates every step. There is no separate "inspect" privilege anywhere in the system: you can always inspect what you interpret, native children are inspectable only to the degree chosen at compile time (debug info, safepoint maps), and there are simply no handles to tasks you didn't create.
 
 **Compile and Task APIs (privileged).** The dangerous authority is asking the TCB to generate native code and admit it for execution; holding Compile is what makes a program a *native* executor (see *Composition and the `$` operator*). Sketch:
@@ -436,24 +475,51 @@ interface task {
 
     resource task;
 
-    // `args` are main's named, typed arguments, carried in the canonical self-describing value encoding.
+    /// An edge-triggered readiness signal. A task's doorbell is one; so is a waitset's.
+    /// (Likely to move to a shared eo9:async package — I/O completion queues use the same machinery.)
+    resource waitable;
+
+    /// "Any member ready." Schedulers at every level block on one of these; a waitset aggregates to a
+    /// single waitable for *its* parent, so readiness composes up the scheduler hierarchy with no O(n) scans.
+    resource waitset {
+        constructor();
+        add:  func(w: waitable) -> u64;      // returns a key identifying the member (io_uring-style user data)
+        next: func() -> future<u64>;         // resolves with the key of a member that became ready
+        as-waitable: func() -> waitable;
+    }
+
+    // `args` are main's named, typed arguments, WAVE-encoded and checked against main's signature.
     spawn: func(i: image, args: list<named-arg>) -> result<task, spawn-error>;
-    wait:  func(t: borrow<task>) -> future<program-outcome>;
-    kill:  func(t: borrow<task>) -> future<program-outcome>;
-    // TODO: the yield/resume surface a user-level scheduler uses to donate CPU to a task.
+
+    variant resume-outcome { out-of-fuel, blocked, done(program-outcome) }
+
+    /// Donate `fuel` to the task and run it now, on the caller's own CPU time; returns when the fuel is
+    /// spent, the task blocks, or it finishes. Fuel-metered yields keep interleaving deterministic.
+    resume:   func(t: borrow<task>, fuel: u64) -> resume-outcome;
+    doorbell: func(t: borrow<task>) -> waitable;   // rings when a blocked task becomes runnable again
+
+    // Conveniences over resume/doorbell, for callers that are not schedulers:
+    wait: func(t: borrow<task>) -> future<program-outcome>;
+    kill: func(t: borrow<task>) -> future<program-outcome>;
+
+    // TODO: waitset membership/removal semantics, and the multi-core rule (a task is resumed by at most
+    // one scheduler at a time).
 }
 ```
 
 - **Closed before compile.** There is no ambient `context` and no `override` mechanism: substitution and interposition are composition, decided with `$`/`&`/`only` before codegen and visible in the component value. The shell has no private powers — its top-level rule is literally "compose my environment onto the command, compile, spawn".
 - **Environments are just data.** What an executor may grant onward is an environment value it *possesses*: handed down by its parent (boot hands one to `init`/the shell), passable as an argument like any component, narrowed with `only`, extended with `&`. Possessing driver bytecode is harmless by itself — without Compile it can only be interpreted, and a driver's own imports of raw hardware capabilities (MMIO regions, interrupt lines) are satisfied only by the OS core at instantiation. Those hardware roots are the only true ambient context in the system.
-- **Schedulers are ordinary programs.** Codegen inserts yield points (epoch/fuel checks), so native tasks are cooperatively schedulable *by construction*. A scheduler is then just a program holding `task` handles and deciding which to resume — nested schedulers, supervisors, and deterministic test schedulers are all unprivileged. The irreducibly privileged residue is the compiler that guarantees the yields, and the root holder of timer interrupts and the idle loop.
+- **Schedulers are ordinary programs.** Codegen inserts fuel-metered yield points (fuel rather than epoch deadlines, for determinism), so native tasks are cooperatively schedulable *by construction*. A scheduler is then just a program holding `task` handles and deciding which to resume — nested schedulers, supervisors, and deterministic test schedulers are all unprivileged. The irreducibly privileged residue is the compiler that guarantees the yields, and the root holder of timer interrupts and the idle loop.
+- **Blocking and wakeups.** A parent never learns *what* its child is blocked on — the child's hundreds (or millions) of in-flight ops are its own business, recorded in its suspended state. Each task has a completion queue and an edge-triggered doorbell: backends push a completion record onto the queue and ring the doorbell only on the empty→non-empty transition; on the next `resume` the task drains the queue and dispatches internally. That is O(1) per completion and at most one wake per batch (the io_uring shape, and the shape of the Component Model's async ABI), which is what lets the disk/net APIs scale to millions of concurrent ops. Schedulers park doorbells in waitsets; waitsets aggregate into a single doorbell for their parent, so readiness composes up the hierarchy. Determinism: fuel fixes the CPU interleaving, and completion *order* becomes deterministic exactly when the providers are deterministic (`fs.memfs`, `entropy.seeded`, `time.frozen`) — the deterministic-test story goes all the way down. A supervisor that wants to know what a child is waiting on asks a diagnostic query (or interprets it); that is observability, not scheduling.
 - **Kill and linearity.** The global contract is small: a killed task never observes anything again, and anything it transferred away (an `own<buffer>` in flight) belongs to the transferee, which completes or aborts the operation on its own schedule and then drops the now-unreceivable result — nothing dangles, nothing leaks. Whether a half-done operation is aborted or completed is each provider's documented, per-API semantics.
 - **State sharing.** Fusion shares *implementation*, never state. Spawning two children from one environment gives each its own fused copy of the provider code; they share state only where a provider's backing resources are shared (the real disk, a common store) — which is the provider's business, not the API's.
-- **Arguments and outcomes.** A generic executor binds `main`'s arguments and reads `program-outcome` — a canonical, self-describing rendering of the program's own `result<program-success, program-failure>` — through the same value encoding in both directions (TODO: pick the encoding — WAVE-style text or a tagged binary form). A caller that statically knows the callee's world goes typed and lossless instead.
+- **Arguments and outcomes.** The canonical value encoding is **WAVE** (the Component Model's value text format): `eosh` parses flags and prints results as WAVE, and a generic executor binds `main`'s arguments and renders `program-outcome` — the program's own `result<program-success, program-failure>` — the same way. WAVE is type-directed, which is fine: an executor always holds the component and therefore its types, and an outcome that outlives its component carries a type descriptor alongside the value. A caller that statically knows the callee's world goes typed and lossless instead.
 
 ### Disk API
 
 TODO - we want to support ultrahigh concurrency and DMA
+
+Standard stubs: `disk.none`, `disk.readonly`, `disk.mem` (RAM-backed).
 
 ### Filesystem API
 
@@ -461,13 +527,21 @@ TODO - we want to provide standard FS stuff, but also some new things like deter
 You can easily look at the pre-computed hash of any FS node (file or dir) to see if it or its descendants have changed since last snapshot.
 Lets us build backend-agnostic versions of stuff like ZFS tree walk for backup.
 
+Also needed: **immutable handles** — opening a file *for execution* yields an immutable handle (COW / content-addressed backends only), which program loading, compile caching, and signing key on (see *Execution APIs*).
+
+Standard stubs: `fs.none`, `fs.deny`, `fs.readonly`, `fs.memfs`.
+
 ### Net API
 
 TODO - similar goals to disk
 
+Standard stubs: `net.none`, `net.deny`, `net.loopback`.
+
 ### Text API
 
 TODO - std{i,o,err}
+
+Standard stubs: `text.none`, `text.null` (discard), `text.capture` (buffer or forward over the Message API).
 
 ### Message API
 
@@ -478,13 +552,19 @@ supervision traffic, and interposition providers that forward to their parent (s
 
 TODO
 
+Standard stubs: `entropy.none`, `entropy.seeded` (deterministic PRNG from a fixed seed — reproducible tests).
+
 ### Time API
 
 TODO
 
+Standard stubs: `time.none`, `time.monotonic-stub` (deterministic stand-in clock), `time.frozen`, `time.fuzzy` (degraded/jittered resolution for side-channel mitigation; see Security).
+
 ### Perf Measurement API
 
 TODO
+
+Standard stubs: `perf.none`, `perf.null` (accept and discard). Note: perf counters are themselves a timing side channel — gate them like time.
 
 ### TODO - other APIs
 
@@ -510,7 +590,7 @@ OS core is written in Rust. Cranelift for WASM.
 
 We should provide a built-in shell for Eo9. Call it `eosh`.
 
-The shell should support invoking programs and providers, composing them with `$` and `&`, and the capability forms `x.none`, `x.deny`, and `only` (see *The capability algebra*).
+The shell should support invoking programs and providers, composing them with `$` and `&`, the capability forms `x.none`, `x.deny`, and `only` (see *The capability algebra*), and slot wiring with `rename` and `with … as …` (see *Capability slots, `rename`, and `with`*). It also supports `let`-bindings for session-local names of component and environment values — `let det-env = time.monotonic-stub & virtualnet` — so composed environments can be named and reused. Bare program names resolve through the filesystem/package store: resolution opens the file for execution, yielding the immutable handle that `load` consumes (see *Execution APIs*).
 
 # Overall Guiding Principles
 
@@ -521,4 +601,4 @@ There are a few important guiding principles for the design and implementation o
 
 We should never take hacks or shortcuts. Do things properly and with mathematical elegance.
 
-We shouldn't be afraid to change the spec if we find a more elegant approach.
+**Nothing in this spec is sacred.** Every concrete choice here — operators and their laws, API shapes, encodings, naming — is provisional. If implementation reveals that a choice is a pain, a sticking point, or simply less elegant than an alternative, we have total freedom (and the obligation) to change the design rather than work around it. The spec serves elegance, not the other way around: change the design, update the spec, move on. The only fixed points are the guiding principles above.
