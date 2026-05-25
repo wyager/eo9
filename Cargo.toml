@@ -35,3 +35,4 @@ blake3 = "1.8.5"
 
 # Intra-workspace crates (add new crates/* entries here as areas land).
 eo9-placeholder = { path = "crates/eo9-placeholder" }
+eo9-store = { path = "crates/eo9-store" }
