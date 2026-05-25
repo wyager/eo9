@@ -70,3 +70,7 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
    `history`. (e) eosh-core's host tests are run with `cargo test -p eosh-core --target <host-triple>` inside
    `guest/`; `xtask ci` does not run guest-workspace host tests — wiring that in (one line in xtask `test`)
    or moving eosh-core under `crates/` is a planner call.
+7. **Mechanical update by area 02 (async operations, branch `area/02-async-operations`):** the eo9 ops the
+   shell awaits (`fs.open-exec`/`exec-read`, `text.read-line`, `task.wait`) are now `async func` imports;
+   call sites and eosh-core are unchanged except one owned-String argument in `Backend::resolve`
+   (`open-exec` takes its path by value).

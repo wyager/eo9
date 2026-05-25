@@ -123,3 +123,18 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
         memfs, null, capture, loopback); `.none` stubs are unchanged. Flagged for the planner: the spec's
         surface form shows `configure` as a bare world export — either the spec adopts the config-interface
         encoding or the handle-returning form needs a different mechanism.
+12. **Async operations (SPEC commit c11ca7a, branch `area/02-async-operations`):** every operation that
+    returned `future<T>` is now `async func(...) -> T` — disk read/write (param renamed `d` → `dev` to match
+    the spec sketch), all fs path/file/immutable-handle ops, all net TCP/UDP ops, text `read-line`, time
+    `sleep`, and eo9:exec/task `runnable`/`wait`/`kill` (`runnable: async func(t)` with no result); `resume`
+    and `spawn` are unchanged, as are already-sync ops (`len`, `now`, `get-bytes`, `exec-size`, `write`, …).
+    No `future<T>`/`stream<T>` value types remain in any eo9 package. Verified with the pinned toolchain:
+    `async func` with `borrow<…>` parameters and resource results validates, and wit-bindgen 0.57.1
+    generates async Rust imports (`pub async fn op(…)`) and guest-implementable async trait methods for
+    exports — which is what unblocks wasm guest providers for the blocking ops (plan/09's constraint).
+    One binding-level consequence: async imports take `string`/`list` arguments by value rather than by
+    reference (one-line call-site changes in eosh and readwrite). Mechanical cross-area updates made under
+    planner authorization: eo9-guest (`main!` gained an `async fn main` arm; block_on doc), readwrite
+    example (async `main`, no more block_on), eosh component (one owned-String call site). The runtime and
+    integration-test crates embed their own WIT copies and were left untouched — area 04 reconciles the
+    host side (async-lifted task.wait/kill/runnable and provider ops) when it syncs its copy.

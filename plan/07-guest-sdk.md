@@ -84,3 +84,9 @@ example programs used by every other area's tests.
    absent for now: such exports cannot be implemented by a wasm guest provider with the pinned toolchain
    (only `async func` exports may be async-lifted) — see plan/09-providers-stubs.md Decisions for the
    constraint and the escalation.
+8. **Mechanical update by area 02 (async operations, branch `area/02-async-operations`):** blocking API ops
+   are now `async func` in wit/, so the generated imports are async Rust functions (string/list args by
+   value). `main!` gained an `async fn main` arm for worlds with `main: async func`; the readwrite example
+   moved to an async `main` and dropped `block_on`; hello/outcomes/cruncher are untouched. The decision-7
+   constraint on future-returning exports is now moot for the standard APIs (no ops return `future<T>`
+   anymore), which unblocks the deferred async stubs/examples once area 04's host side catches up.
