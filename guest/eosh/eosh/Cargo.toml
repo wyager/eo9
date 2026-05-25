@@ -1,0 +1,16 @@
+[package]
+name = "eosh"
+description = "The Eo9 shell: an ordinary Eo9 program (no private powers) that composes programs with the capability algebra and runs the result — imports eo9:exec (component-algebra, compile, task), eo9:text, and eo9:fs; the grammar and evaluator live in eosh-core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eosh-core = { path = "../eosh-core" }
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

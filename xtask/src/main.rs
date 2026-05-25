@@ -17,6 +17,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-outcomes",
     "eo9-example-cruncher",
     "eo9-example-readwrite",
+    "eosh",
 ];
 
 /// Target used to build guest crates before componentizing them.
