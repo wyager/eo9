@@ -63,23 +63,33 @@ its first milestones, and to be the place where cross-area seams get found.
 6. **Drive loop.** `run` uses the simple built-in loop from milestone 1: donate fuel in fixed 100-quantum
    slices, park the thread on the task's `runnable()` future when it blocks on I/O, stop at `Done`. Adopting
    `eo9-sched` run queues is deferred until there is more than one task to schedule.
-7. **Compile cache integration (and its current limit).** Cache keys follow plan 06 exactly: single module
-   hash (no composition yet), empty configure constants, a canonical compile-opts text
-   (`eo9-compile-opts 1` + `debug-info`), the host target triple and pinned wasmtime version captured at
-   build time (build.rs reads the workspace lockfile), `compiler_deterministic = false`. The cached artifact
-   is `Engine::precompile_component` output. Because eo9-runtime does not yet expose image
-   serialization/deserialization (plan 04 deferred item), a cache hit cannot short-circuit codegen for the
-   run itself: `run` still builds its in-memory `Image` from the component bytes, and a miss therefore pays
-   codegen twice (artifact + image). **Escalation for the planner:** add `Image::serialize` /
-   `Image::deserialize` (or equivalent) to eo9-runtime so cached artifacts can be launched directly.
+7. **Compile cache integration** *(escalation resolved by the area-04-m2 merge — `Image::serialize` /
+   `Image::deserialize` / `engine::compatibility_hash`)*. Cache keys follow plan 06: single module hash (no
+   composition yet), empty configure constants, a canonical compile-opts text (`eo9-compile-opts 1` +
+   `debug-info`), the host target triple, `compiler_deterministic = false`, and an engine-identity string
+   that combines the human-readable wasmtime pin captured at build time (build.rs reads the workspace
+   lockfile — kept for auditable cache metadata) with the engine's runtime `compatibility_hash` fingerprint
+   (`… compat-<16 hex>`), which covers the wasmtime build, target, and compile-relevant settings. Caveat per
+   plan 04: the fingerprint is stable for a given toolchain build but not across Rust/wasmtime upgrades, so
+   an upgrade invalidates old entries (spurious misses, never false hits). The cached artifact is
+   `Image::serialize` output wrapped in a one-line envelope recording its own blake3
+   (`eo9-cached-image 1 <hash>` + payload): on a hit the envelope is verified against that recorded content
+   hash before the bytes are handed to `unsafe Image::deserialize` (the deserialize trust contract), and the
+   run launches with **no codegen**; a miss compiles exactly once and caches the very image it runs. An entry
+   that fails the integrity or engine-compatibility check is ignored with a warning and the source is
+   recompiled — it is never trusted with native code. `-v` distinguishes "compile cache miss … compiling /
+   cached image" from "launched from cached image". `eo9 compile` now warms the cache with the same path
+   (and, since it goes through `Image::compile`, rejects providers as not-a-binary — the cache holds closed
+   binaries per the spec).
 8. **`eo9 shell` is stubbed** with a clear message: it needs the runtime to expose `eo9:exec` to guests
    (plan 04 deferred) and eosh itself (area 10).
 9. **Tests.** Unit tests cover the argv parser, cache-key construction, WAVE string quoting/arg binding, the
    outcome→exit-code mapping, and the oneshot bridge. Integration tests (`crates/eo9/tests/cli.rs`) drive the
    real binary against the built example components: hello/outcomes (all arms incl. trap→abnormal)/cruncher
-   end to end, second-run cache hit (stderr + use-count evidence), memory-limit enforcement, store
-   add/ls/gc + run-by-name, describe, compile warm, readwrite's documented refusal, and the shell stub. The
-   test harness builds the components via `cargo xtask build-guest` if they are missing.
+   end to end, second-run launch from the cached image (stderr + use-count evidence, and no codegen
+   diagnostics on the hit), a tampered cache entry being refused and recompiled, memory-limit enforcement,
+   store add/ls/gc + run-by-name, describe, compile warm, readwrite's documented refusal, and the shell
+   stub. The test harness builds the components via `cargo xtask build-guest` if they are missing.
 10. **xtask touch (authorized follow-up).** `xtask build` (and therefore `ci`) now also runs
     `cargo check -p eo9-sched --target aarch64-unknown-none`, after the kernel build so the pinned toolchain
     already has that target installed.
