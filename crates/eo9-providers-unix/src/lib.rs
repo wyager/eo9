@@ -67,7 +67,10 @@
 
 pub mod buffer;
 pub mod completion;
+pub mod entropy;
 pub mod pool;
+pub mod text;
+pub mod time;
 
 pub use buffer::OwnedBuffer;
 pub use completion::{Completer, completer};
