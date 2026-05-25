@@ -109,6 +109,13 @@ are ordinary blocks: compressed, hashed, and verified like everything else.
 There are no holes: writing past the end of a file materialises zero-filled blocks for the
 gap (they compress to almost nothing when compression is on).
 
+Readers validate an object reference before walking or allocating for it: the declared size
+must fit on the device, `level` must be exactly the height the writer would produce for that
+size, the walk must not meet more data blocks than the size allows, and *metadata* objects
+(serialized directories and the snapshot table, which are read into memory whole) are capped
+at 16 MiB — so a corrupted or hostile reference fails cleanly instead of driving unbounded
+allocation or fan-out.
+
 ## Directories
 
 A directory is a byte object containing its entries, each:

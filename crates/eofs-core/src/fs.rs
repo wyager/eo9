@@ -7,6 +7,7 @@
 //! filesystem when [`Eofs::commit`] writes a new uberblock; until then a crash or a remount
 //! simply falls back to the last committed root. See `FORMAT.md`.
 
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -14,9 +15,9 @@ use alloc::vec::Vec;
 use crate::device::BlockDevice;
 use crate::error::FsError;
 use crate::format::{
-    BLOCK_PTR_SIZE, BlockPtr, Codec, DATA_START, DirEntry, MAX_NAME_LEN, NodeKind, ObjRef,
-    SLOT_OFFSETS, SLOT_SIZE, SnapEntry, Uberblock, parse_dir, parse_snapshots, serialize_dir,
-    serialize_snapshots,
+    BLOCK_PTR_SIZE, BlockPtr, Codec, DATA_START, DirEntry, MAX_META_OBJECT_SIZE, MAX_NAME_LEN,
+    NodeKind, ObjRef, SLOT_OFFSETS, SLOT_SIZE, SnapEntry, Uberblock, parse_dir, parse_snapshots,
+    serialize_dir, serialize_snapshots,
 };
 use crate::space::{Allocator, Extent};
 
@@ -409,6 +410,9 @@ impl<D: BlockDevice> Eofs<D> {
             root: self.live_root,
         });
         let bytes = serialize_snapshots(&entries);
+        if bytes.len() as u64 > MAX_META_OBJECT_SIZE {
+            return Err(FsError::NoSpace);
+        }
         self.snapshots = self.write_object(&bytes)?;
         self.dirty = true;
         Ok(())
@@ -456,48 +460,56 @@ impl<D: BlockDevice> Eofs<D> {
         Ok(report)
     }
 
-    fn verify_dir_tree(&self, dir: &ObjRef, report: &mut VerifyReport) -> Result<(), FsError> {
-        report.directories += 1;
-        self.verify_object(dir, report)?;
-        for entry in parse_dir(&self.read_object(dir)?)? {
-            check_name(&entry.name)?;
-            match entry.kind {
-                NodeKind::File => {
-                    report.files += 1;
-                    self.verify_object(&entry.obj, report)?;
+    /// Walk one directory tree with an explicit worklist (no recursion, so a corrupted
+    /// image cannot exhaust the stack with a deep chain) and a visited set (so repeated or
+    /// cyclic references to the same directory object terminate with an error instead of
+    /// multiplying the walk).
+    fn verify_dir_tree(&self, root: &ObjRef, report: &mut VerifyReport) -> Result<(), FsError> {
+        let mut pending: Vec<ObjRef> = vec![*root];
+        let mut visited: BTreeSet<u64> = BTreeSet::new();
+        while let Some(dir) = pending.pop() {
+            if !dir.root.is_null() && !visited.insert(dir.root.addr) {
+                return Err(FsError::Corrupt("directory tree is not a tree"));
+            }
+            report.directories += 1;
+            self.verify_object(&dir, report)?;
+            for entry in parse_dir(&self.read_object(&dir)?)? {
+                check_name(&entry.name)?;
+                match entry.kind {
+                    NodeKind::File => {
+                        report.files += 1;
+                        self.verify_object(&entry.obj, report)?;
+                    }
+                    NodeKind::Directory => pending.push(entry.obj),
                 }
-                NodeKind::Directory => self.verify_dir_tree(&entry.obj, report)?,
             }
         }
         Ok(())
     }
 
     fn verify_object(&self, obj: &ObjRef, report: &mut VerifyReport) -> Result<(), FsError> {
-        if obj.size == 0 {
-            if !obj.root.is_null() {
-                return Err(FsError::Corrupt("empty object with a root block"));
-            }
+        let leaf_count = self.check_object(obj)?;
+        if leaf_count == 0 {
             return Ok(());
         }
-        if obj.root.is_null() {
-            return Err(FsError::Corrupt("non-empty object without a root block"));
-        }
-        let expected = obj.size.div_ceil(self.block_size as u64);
-        let counted = self.verify_ptr(&obj.root, obj.level, obj.size, 0, report)?;
-        if counted != expected {
+        let counted = self.verify_ptr(&obj.root, obj.level, obj.size, leaf_count, 0, report)?;
+        if counted != leaf_count {
             return Err(FsError::Corrupt("object data-block count mismatch"));
         }
         Ok(())
     }
 
     /// Verify the subtree under `ptr` (at `level`), whose first data block is data block
-    /// number `first_leaf` of an object `obj_size` bytes long; returns how many data blocks
-    /// it covers.
+    /// number `first_leaf` of an object `obj_size` bytes long with `leaf_count` data blocks
+    /// in total; returns how many data blocks it covers. The walk fails as soon as it finds
+    /// more data blocks than the object's declared size allows, so an inflated tree cannot
+    /// drive unbounded work.
     fn verify_ptr(
         &self,
         ptr: &BlockPtr,
         level: u8,
         obj_size: u64,
+        leaf_count: u64,
         first_leaf: u64,
         report: &mut VerifyReport,
     ) -> Result<u64, FsError> {
@@ -509,6 +521,11 @@ impl<D: BlockDevice> Eofs<D> {
             report.compressed_blocks += 1;
         }
         if level == 0 {
+            if first_leaf >= leaf_count {
+                return Err(FsError::Corrupt(
+                    "object has more data blocks than its size",
+                ));
+            }
             let bs = self.block_size as u64;
             let expected = core::cmp::min(bs, obj_size - first_leaf * bs);
             if ptr.lsize as u64 != expected {
@@ -522,8 +539,14 @@ impl<D: BlockDevice> Eofs<D> {
         let mut covered = 0u64;
         for chunk in logical.chunks(BLOCK_PTR_SIZE) {
             let child = BlockPtr::read_from(chunk)?;
-            covered +=
-                self.verify_ptr(&child, level - 1, obj_size, first_leaf + covered, report)?;
+            covered += self.verify_ptr(
+                &child,
+                level - 1,
+                obj_size,
+                leaf_count,
+                first_leaf + covered,
+                report,
+            )?;
         }
         Ok(covered)
     }
@@ -575,30 +598,55 @@ impl<D: BlockDevice> Eofs<D> {
         })
     }
 
-    fn mark_dir_tree(&self, dir: &ObjRef, out: &mut Vec<Extent>) -> Result<(), FsError> {
-        self.mark_object(dir, out)?;
-        for entry in parse_dir(&self.read_object(dir)?)? {
-            match entry.kind {
-                NodeKind::File => self.mark_object(&entry.obj, out)?,
-                NodeKind::Directory => self.mark_dir_tree(&entry.obj, out)?,
+    /// Same walk discipline as [`verify_dir_tree`](Self::verify_dir_tree): an explicit
+    /// worklist and a visited set, so GC over a corrupted image cannot recurse without
+    /// bound or loop on a cyclic directory structure.
+    fn mark_dir_tree(&self, root: &ObjRef, out: &mut Vec<Extent>) -> Result<(), FsError> {
+        let mut pending: Vec<ObjRef> = vec![*root];
+        let mut visited: BTreeSet<u64> = BTreeSet::new();
+        while let Some(dir) = pending.pop() {
+            if !dir.root.is_null() && !visited.insert(dir.root.addr) {
+                return Err(FsError::Corrupt("directory tree is not a tree"));
+            }
+            self.mark_object(&dir, out)?;
+            for entry in parse_dir(&self.read_object(&dir)?)? {
+                match entry.kind {
+                    NodeKind::File => self.mark_object(&entry.obj, out)?,
+                    NodeKind::Directory => pending.push(entry.obj),
+                }
             }
         }
         Ok(())
     }
 
     fn mark_object(&self, obj: &ObjRef, out: &mut Vec<Extent>) -> Result<(), FsError> {
-        if obj.size == 0 {
+        let leaf_count = self.check_object(obj)?;
+        if leaf_count == 0 {
             return Ok(());
         }
-        self.mark_ptr(&obj.root, obj.level, out)
+        let mut leaves_seen = 0u64;
+        self.mark_ptr(&obj.root, obj.level, leaf_count, &mut leaves_seen, out)
     }
 
-    fn mark_ptr(&self, ptr: &BlockPtr, level: u8, out: &mut Vec<Extent>) -> Result<(), FsError> {
+    fn mark_ptr(
+        &self,
+        ptr: &BlockPtr,
+        level: u8,
+        leaf_count: u64,
+        leaves_seen: &mut u64,
+        out: &mut Vec<Extent>,
+    ) -> Result<(), FsError> {
         out.push(Extent {
             addr: ptr.addr,
             len: self.alloc.aligned(ptr.psize as u64),
         });
         if level == 0 {
+            *leaves_seen += 1;
+            if *leaves_seen > leaf_count {
+                return Err(FsError::Corrupt(
+                    "object has more data blocks than its size",
+                ));
+            }
             return Ok(());
         }
         let logical = self.read_block(ptr)?;
@@ -607,7 +655,7 @@ impl<D: BlockDevice> Eofs<D> {
         }
         for chunk in logical.chunks(BLOCK_PTR_SIZE) {
             let child = BlockPtr::read_from(chunk)?;
-            self.mark_ptr(&child, level - 1, out)?;
+            self.mark_ptr(&child, level - 1, leaf_count, leaves_seen, out)?;
         }
         Ok(())
     }
@@ -682,6 +730,9 @@ impl<D: BlockDevice> Eofs<D> {
             }
         }
         let bytes = serialize_dir(&entries);
+        if bytes.len() as u64 > MAX_META_OBJECT_SIZE {
+            return Err(FsError::NoSpace);
+        }
         self.write_object(&bytes)
     }
 
