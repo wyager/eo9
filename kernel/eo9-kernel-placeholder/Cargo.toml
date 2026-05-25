@@ -1,0 +1,8 @@
+[package]
+name = "eo9-kernel-placeholder"
+description = "Placeholder crate for the bare-metal workspace; replaced when area 12 lands."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

@@ -1,0 +1,8 @@
+# Pinned nightly for the kernel workspace — keep the `channel` in sync with the copies at
+# the repository root and in guest/ (see plan/01-workspace.md, Decisions).
+# rust-src is included for later -Zbuild-std work on custom targets (area 12).
+[toolchain]
+channel = "nightly-2026-05-25"
+profile = "minimal"
+components = ["rustfmt", "clippy", "rust-src"]
+targets = ["aarch64-unknown-none", "riscv64gc-unknown-none-elf", "x86_64-unknown-none"]

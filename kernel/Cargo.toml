@@ -1,0 +1,15 @@
+# Bare-metal workspace: the no_std (+ alloc) kernel core and per-arch ports (area 12).
+# Built with explicit --target flags via xtask; `cargo test` here runs on the host triple
+# (the placeholder is no_std except under test).
+[workspace]
+resolver = "3"
+members = ["eo9-kernel-placeholder"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Dependency pins for kernel crates go here as area 12 lands; keep any versions shared
+# with the host side in sync with the authoritative table in the repo-root Cargo.toml.
+[workspace.dependencies]
