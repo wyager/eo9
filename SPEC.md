@@ -18,6 +18,10 @@ Unlike every mainstream OS, Eo9 does not rely on hardware security features (lik
 Instead, Eo9 is secure-by-construction. Programs are distributed as WASM bytecode, not pre-compiled assembly,
 so we can enforce security properties at the language level. 
 
+The trusted computing base is correspondingly small and explicit: the compiler (the only thing that may generate
+native code), the root scheduler, and the hardware-root capabilities held by the OS core. Everything else —
+interpreters, user-level schedulers, providers, the shell — is unprivileged by construction (see *Execution APIs*).
+
 ## Virtualization
 
 One of the strongest selling points of Eo9 is that it does not require any sort of special support to implement
@@ -47,10 +51,11 @@ The consequences of this are:
 2. There is no overhead from memory isolation. No MMU, no nested address translation.
 3. There is no overhead from virtualization. Virtualized implementations that do nothing at all simply get compiled out.
 
-> TODO (scheduling): with fused native code and no privilege boundary, specify how the scheduler regains
-> control from a program that never yields — timer interrupt + compiler-inserted safepoints, or
-> epoch/fuel-style preemption checks injected at compile time — plus the scheduling policy itself and what a
-> "scheduler switch" actually costs.
+> TODO (scheduling): codegen inserts yield points (epoch/fuel checks), so native tasks are cooperatively
+> schedulable *by construction* and a scheduler is just a program that holds task handles and decides which to
+> resume (see *Execution APIs*). Still to specify: the yield/resume surface of the Task API, the root scheduler's
+> handling of timer interrupts and the idle loop, the scheduling policy itself, and what a "scheduler switch"
+> actually costs.
 
 ## Hardware Support
 
@@ -197,7 +202,7 @@ wires `virtualnet` into `virtualfs` only, so `browser` sees `virtualfs`'s export
 - **Kind preservation & layering.** `exports(p $ c) = exports(c)`: composition never changes what the rightmost term *is* — providers composed into a binary yield a binary; into a provider, a provider. A provider's exports that the consumer does not import are **dropped**, not re-exported: nothing crosses a composition boundary the consumer didn't declare. (Reusable multi-API bundles are built with `&` instead — see *Environments and the `&` operator* — not by changing `$`.)
 - **Identity.** The empty provider (no imports, no exports) is the identity: `empty $ c ≡ c`.
 - **Non-associativity.** `$` is not associative — re-association changes who serves whom, as above. Concretely, `(a $ b) $ c ≡ a $ (b $ c)` only when `a` exports nothing that `c` imports and `b` doesn't already provide; hence the fixed right-associative reading.
-- **Composition is early context-override.** Modulo fusion, running `p $ c` in context `Γ` behaves like running `c` in the context `exports(p)` layered over `Γ` (cf. `override` in the Execute API). Doing the override with `$` — at compose time rather than run time — is exactly what lets the compiler inline the layer and erase its cost (see Performance).
+- **Composition is early context-override.** Modulo fusion, running `p $ c` in context `Γ` behaves like running `c` in the context `exports(p)` layered over `Γ`. Doing the override with `$` — at compose time rather than run time — is exactly what lets the compiler inline the layer and erase its cost (see Performance).
 
 **Precedence.** Argument application binds tighter than `$`, so each module's flags attach to that module before composition:
 
@@ -206,7 +211,7 @@ virtualfs --dir /tmp/sandbox $ browser --url https://example.com
 ==  (virtualfs --dir /tmp/sandbox) $ (browser --url https://example.com)
 ```
 
-**Executors** are the dual, more-privileged role. An executor — the shell, a supervisor, a debugger, the `interpret` slow-path — holds the capability to load and run programs (the Execute API). Reach for an executor when you must *drive or observe* a run (spawn on demand, restart on failure, single-step); reach for a provider when you are merely *substituting* an implementation. Rule of thumb: **substitution → provider; supervision → executor.** Statefulness is not the discriminator (a NAT table lives fine inside a provider); driving the run is. The shell is itself an executor that composes providers and runs the result.
+**Executors** are the dual role: an executor *drives or observes* a run (spawn on demand, restart on failure, single-step), where a provider merely *substitutes* an implementation. Rule of thumb: **substitution → provider; supervision → executor.** Statefulness is not the discriminator (a NAT table lives fine inside a provider); driving the run is. Executors come in two flavors with very different privilege: an *interpreting* executor (a debugger, a test harness, the `interpret` slow-path) needs no special capability at all, while a *native* executor (the shell, a root scheduler) holds the Compile capability — the genuinely privileged authority (see *Execution APIs*). The shell is itself an executor that composes providers and runs the result.
 
 ### Environments and the `&` operator
 
@@ -240,7 +245,7 @@ The two operators fit together by an **action law**:
 > realnet & nat $ app                        # app sees nat's net, which is backed by realnet's
 ```
 
-Binaries do not participate in `&` (the result would be both runnable and composable, which the module-kind rule forbids); the final application of an environment to a binary is always `$`. An environment is also the natural shape for an executor's `context` — a `context` is morally a closed environment value (TODO: consider defining it as exactly that in the Execute API).
+Binaries do not participate in `&` (the result would be both runnable and composable, which the module-kind rule forbids); the final application of an environment to a binary is always `$`. An environment is also how an executor's grantable capabilities are represented: what an executor may pass on to its children is just an environment value it possesses — handed down by its parent, narrowed with `only`, extended with `&` (see *Execution APIs*).
 
 ### Packaging and submodules
 
@@ -375,7 +380,7 @@ The only new primitive is the static judgment in step 1; step 2 is sugar over `X
 - With an empty allow-list the result is a fully closed program — pure compute.
 - The result is still an ordinary component value: it can be passed to `interpret`, `save`d, or shipped, and the bound travels with it.
 
-A gate at the far left of a top-level command bounds what the shell's ambient context may inject into that command — the per-command least-privilege form. Standard policy worlds (e.g. `eo9:sandbox/no-net`, `eo9:sandbox/pure`) make common restrictions nameable and reusable; a policy world compiles to no component at all — it is pure interface, referenced by name. `run(c, base, override)` against a narrowed `base` is the dynamic mirror of `only`; the static form is preferred because it fails before anything runs and the restricted component is inspectable.
+A gate at the far left of a top-level command bounds what the shell's ambient context may inject into that command — the per-command least-privilege form. Standard policy worlds (e.g. `eo9:sandbox/no-net`, `eo9:sandbox/pure`) make common restrictions nameable and reusable; a policy world compiles to no component at all — it is pure interface, referenced by name. An interpreting executor can enforce the same bound dynamically, by simply declining to forward anything outside `w`; `only` is the static form — it fails before anything runs, and the restricted component is inspectable and shippable.
 
 # Deliverables
 
@@ -383,38 +388,68 @@ There are a few deliverables we want for the MVP:
 
 ## Basic OS API specs
 
-### Execute API
+### Execution APIs
 
-The Execute capability is what makes a program an **executor** (see *Composition and the `$` operator*): it can load and run other WASM programs. It is privileged — the shell, supervisors, debuggers, and the `interpret` slow-path hold it; ordinary providers do not.
+Running programs decomposes into pieces with very different privilege. The guiding asymmetry: **an interpreter bug only harms the interpreter's own sandbox; a compiler bug mints unsafe native code and harms everyone.** So the privilege line sits at codegen, not at "running programs".
 
-It deals in open `component` values. Because a program's imports depend on the program, they are introspected and checked at runtime: `run` satisfies some imports from the caller's own exports (`override`) and the rest from a forwarded `context`, erroring if any import is satisfiable by neither. Sketch:
+**Component algebra (unprivileged).** Pure value manipulation on program bytecode. No authority is required — this could be an ordinary library; exposing it as an API just avoids every executor bundling the tooling.
 
 ```wit
-interface exec {
-    resource context;     // opaque bundle of capabilities to run a program against
-    resource component;   // an open, composable program
+interface component-algebra {
+    resource component;          // an open program value: binary or provider
 
-    load:    func(image: list<u8>) -> result<component, load-error>;
-
-    /// One interface the component still needs (a residual import).
+    /// One interface a component still needs (a residual import).
     record import-need {
-        interface: string,   // e.g. "eo9:net/net"
-        version:   string,   // semver it was built against (satisfied per the semver rule above)
-        required:  bool,     // mandatory vs. optional import
+        interface: string,       // e.g. "eo9:net/net"
+        version:   string,       // semver it was built against (satisfied per the semver rule above)
+        required:  bool,         // mandatory vs. optional import
     }
-    imports: func(c: borrow<component>) -> list<import-need>; // introspect what it needs
-    compose: func(provider: component, consumer: component)  // the `$` operator
-        -> result<component, compose-error>;
 
-    // satisfy `override` from the caller's own exports; the rest from `base`.
-    run: func(c: component, base: borrow<context>, override: list<string>)
-        -> result<program-outcome, exec-error>;
+    load:     func(image: list<u8>) -> result<component, load-error>;
+    save:     func(c: borrow<component>) -> list<u8>;
+    describe: func(c: borrow<component>) -> component-info;   // kind, imports, exports, arg signature
+
+    compose:  func(p: component, c: component) -> result<component, compose-error>;                 // `$`
+    extend:   func(base: component, layer: component) -> result<component, compose-error>;          // `&`
+    restrict: func(c: component, allow: list<interface-ref>) -> result<component, restrict-error>;  // `only`
 }
 ```
 
-Composition is also a build-time operation for the fused, zero-overhead path; `compose` simply exposes the same wiring at runtime.
+**Interpretation (unprivileged).** An interpreter is just a program; `eo9:interp` ships as a standard component, but anyone can write one. An interpreted child's imports are satisfied by the interpreter *from its own imports*, so the child can never exceed what the interpreter already holds and chooses to forward — confinement is automatic and requires no capability at all. Inspection of interpreted children (single-stepping, watchpoints, deterministic replay) is likewise free, because the interpreter mediates every step. There is no separate "inspect" privilege anywhere in the system: you can always inspect what you interpret, native children are inspectable only to the degree chosen at compile time (debug info, safepoint maps), and there are simply no handles to tasks you didn't create.
 
-`run` ultimately yields the program's own `result<program-success, program-failure>`, but those types are program-defined, so a generic executor cannot name them statically. `program-outcome` is therefore a canonical, self-describing rendering of that value: the success/failure tag plus the payload in a standard self-describing encoding (TODO: pick the encoding — WAVE-style text or a tagged binary form). Generic tooling (the shell, supervisors, logs) consumes the rendering directly; a caller that statically knows the callee's world recovers the precise typed variant from it losslessly.
+**Compile and Task APIs (privileged).** The dangerous authority is asking the TCB to generate native code and admit it for execution; holding Compile is what makes a program a *native* executor (see *Composition and the `$` operator*). Sketch:
+
+```wit
+interface compile {
+    use component-algebra.{component};
+
+    /// An opaque compiled artifact; admitted for execution via `task`, never read back as bytes.
+    resource image;
+
+    // `c` must be a *closed binary*: every capability decision was already made — inspectably — with the
+    // component algebra. Options select debug info / safepoint maps, i.e. how inspectable the native task is.
+    compile: func(c: component, opts: compile-opts) -> result<image, compile-error>;
+}
+
+interface task {
+    use compile.{image};
+
+    resource task;
+
+    // `args` are main's named, typed arguments, carried in the canonical self-describing value encoding.
+    spawn: func(i: image, args: list<named-arg>) -> result<task, spawn-error>;
+    wait:  func(t: borrow<task>) -> future<program-outcome>;
+    kill:  func(t: borrow<task>) -> future<program-outcome>;
+    // TODO: the yield/resume surface a user-level scheduler uses to donate CPU to a task.
+}
+```
+
+- **Closed before compile.** There is no ambient `context` and no `override` mechanism: substitution and interposition are composition, decided with `$`/`&`/`only` before codegen and visible in the component value. The shell has no private powers — its top-level rule is literally "compose my environment onto the command, compile, spawn".
+- **Environments are just data.** What an executor may grant onward is an environment value it *possesses*: handed down by its parent (boot hands one to `init`/the shell), passable as an argument like any component, narrowed with `only`, extended with `&`. Possessing driver bytecode is harmless by itself — without Compile it can only be interpreted, and a driver's own imports of raw hardware capabilities (MMIO regions, interrupt lines) are satisfied only by the OS core at instantiation. Those hardware roots are the only true ambient context in the system.
+- **Schedulers are ordinary programs.** Codegen inserts yield points (epoch/fuel checks), so native tasks are cooperatively schedulable *by construction*. A scheduler is then just a program holding `task` handles and deciding which to resume — nested schedulers, supervisors, and deterministic test schedulers are all unprivileged. The irreducibly privileged residue is the compiler that guarantees the yields, and the root holder of timer interrupts and the idle loop.
+- **Kill and linearity.** The global contract is small: a killed task never observes anything again, and anything it transferred away (an `own<buffer>` in flight) belongs to the transferee, which completes or aborts the operation on its own schedule and then drops the now-unreceivable result — nothing dangles, nothing leaks. Whether a half-done operation is aborted or completed is each provider's documented, per-API semantics.
+- **State sharing.** Fusion shares *implementation*, never state. Spawning two children from one environment gives each its own fused copy of the provider code; they share state only where a provider's backing resources are shared (the real disk, a common store) — which is the provider's business, not the API's.
+- **Arguments and outcomes.** A generic executor binds `main`'s arguments and reads `program-outcome` — a canonical, self-describing rendering of the program's own `result<program-success, program-failure>` — through the same value encoding in both directions (TODO: pick the encoding — WAVE-style text or a tagged binary form). A caller that statically knows the callee's world goes typed and lossless instead.
 
 ### Disk API
 
@@ -433,6 +468,11 @@ TODO - similar goals to disk
 ### Text API
 
 TODO - std{i,o,err}
+
+### Message API
+
+TODO - typed message channels between running programs: the substrate for pipes and std{i,o} plumbing, parent↔child
+supervision traffic, and interposition providers that forward to their parent (see *Execution APIs*).
 
 ### Entropy API
 
