@@ -6,6 +6,9 @@
 /// importing `task` does not implicitly import the `compile` authority (see
 /// plan/02-wit.md Decisions). `interface` is a WIT keyword, so the spec's
 /// `import-need.interface` field is spelled `%interface` here.
+///
+/// Entrypoint convention: a binary's `main` and a provider's `configure` exports are
+/// `async func` (see SPEC: WASM runtime) — anything that performs I/O must be async-lifted.
 package eo9:exec@0.1.0;
 
 /// Pure value manipulation on program bytecode (unprivileged).
@@ -83,11 +86,13 @@ interface component-algebra {
         /// naming the offenders.
         required-outside-allow-list(list<string>),
         invalid-allow-list(string),
+        internal(string),
     }
 
     variant rename-error {
         no-such-slot(string),
         slot-collision(string),
+        internal(string),
     }
 
     load:     func(image: list<u8>) -> result<component, load-error>;
@@ -156,10 +161,22 @@ interface task {
         value: string,
     }
 
-    /// The program's own `result<program-success, program-failure>`, generically encoded.
+    /// A run that never returned an outcome of its own. This is the executor's view —
+    /// a program cannot report its own trap (see SPEC: Arguments and outcomes).
+    variant abnormal-exit {
+        /// The task trapped; the payload is the trap reason.
+        trapped(string),
+        /// The task was killed before finishing.
+        killed,
+    }
+
+    /// A program's outcome, as a flat three-way variant (see SPEC: Arguments and outcomes).
+    /// `success` and `failure` carry the program's own success/failure variants, WAVE-rendered
+    /// with their type; `abnormal` covers runs that never returned.
     variant program-outcome {
         success(wave-value),
         failure(wave-value),
+        abnormal(abnormal-exit),
     }
 
     /// Static resource limits, fixed at spawn. CPU is not here — CPU is fuel, and fuel is donated.
@@ -196,8 +213,8 @@ interface task {
     /// Resolves when the task finishes.
     wait: func(t: borrow<task>) -> future<program-outcome>;
 
-    /// Kill the task; resolves with its final outcome. A killed task never observes anything again
-    /// (see SPEC: Kill and linearity).
+    /// Kill the task; resolves with its final outcome — `abnormal(killed)` unless the task had
+    /// already finished. A killed task never observes anything again (see SPEC: Kill and linearity).
     kill: func(t: borrow<task>) -> future<program-outcome>;
 
     // TODO (SPEC): the multi-core rule (a task is resumed by at most one scheduler at a time);
