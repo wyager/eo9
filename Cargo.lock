@@ -64,6 +64,10 @@ name = "eo9-placeholder"
 version = "0.0.0"
 
 [[package]]
+name = "eo9-sched"
+version = "0.0.0"
+
+[[package]]
 name = "eo9-store"
 version = "0.0.0"
 dependencies = [
