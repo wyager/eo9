@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Eo9 logo">
+  <!--
+    The Eo9 mark: a program (the filled core) held inside its capability boundary (the frame).
+    Two shapes, no text, no external fonts; legible from 16px up to 512px and beyond.
+    The frame follows the viewer's light/dark preference; the core keeps its accent color.
+  -->
+  <style>
+    .frame { stroke: #243b4a; }
+    .core  { fill: #2f9e8f; }
+    @media (prefers-color-scheme: dark) {
+      .frame { stroke: #dce7ee; }
+    }
+  </style>
+  <rect class="frame" x="7" y="7" width="50" height="50" rx="15" fill="none" stroke-width="6"/>
+  <circle class="core" cx="32" cy="32" r="11"/>
+</svg>
