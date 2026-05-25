@@ -1,0 +1,16 @@
+# Website workspace: the eo9.org static site and the small server that serves it.
+# Deliberately its own workspace (like guest/ and kernel/) so its dependencies never
+# enter the OS dependency tree; build and test it with plain `cargo` from this directory.
+[workspace]
+
+[package]
+name = "eo9-www"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Static-file server for the eo9.org website"
+
+[dependencies]
+# Small synchronous HTTP/1.1 server (no tokio, no framework); see README.md for rationale.
+tiny_http = "0.12.0"
