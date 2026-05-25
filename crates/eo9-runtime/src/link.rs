@@ -259,6 +259,13 @@ fn add_time(linker: &mut Linker<TaskState>) -> Result<()> {
 // eo9:entropy
 // ---------------------------------------------------------------------------------------
 
+/// Per-call ceiling on `eo9:entropy/entropy.get-bytes` requests. The host materialises the
+/// returned `list<u8>` before it is copied into the guest, so the request size must be
+/// bounded *before* any allocation happens — otherwise a guest could exhaust host memory
+/// regardless of its own linear-memory ceiling. Entropy requests are inherently small;
+/// anything larger than this is treated as hostile and traps the task.
+const MAX_ENTROPY_REQUEST_BYTES: u64 = 64 * 1024;
+
 fn add_entropy(linker: &mut Linker<TaskState>) -> Result<()> {
     let mut types = linker.instance("eo9:entropy/types@0.1.0")?;
     types.resource(
@@ -275,6 +282,13 @@ fn add_entropy(linker: &mut Linker<TaskState>) -> Result<()> {
         |mut store: StoreContextMut<'_, TaskState>,
          (_cap, len): (Resource<EntropyCap>, u64)|
          -> Result<(Vec<u8>,)> {
+            // The bound must hold before any allocation (here or in the provider).
+            if len > MAX_ENTROPY_REQUEST_BYTES {
+                return Err(wasmtime::Error::msg(format!(
+                    "entropy get-bytes request of {len} bytes exceeds the per-call cap of \
+                     {MAX_ENTROPY_REQUEST_BYTES} bytes"
+                )));
+            }
             Ok((store.data_mut().entropy_provider()?.get_bytes(len),))
         },
     )?;

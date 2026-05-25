@@ -160,6 +160,18 @@ no_std+alloc compile-core split (plan 12); `wait`/`kill` as guest-visible future
 multi-core "one scheduler at a time" rule; a guest-driven test of `read-line`'s future
 path (the host wiring exists; `sleep` covers the mechanism).
 
+### D8. Hardening follow-up (branch `area/04-security-hardening`)
+
+Three resource-exhaustion fixes from security review, tests in `tests/hardening.rs`:
+`eo9:entropy/entropy.get-bytes` requests are capped at 64 KiB per call before any host
+allocation (oversized requests trap the task; the WIT has no error case to report them —
+fold into escalation E2 if one is wanted); `spawn-limits` gained `max-table-elements`
+(host-side only for now) and a memory-limited task gets a derived table ceiling
+(`max-memory / 8`) so `table.grow` is never unbounded alongside a memory cap; and the
+instantiate phase of `spawn` runs on a small fixed fuel budget (4 quanta, no yield
+interval), so start-time code in a component fails the spawn instead of burning unbounded
+CPU before any fuel was donated.
+
 ### Escalations for the planner
 
 - **E1 (wit/, area 02 + 07):** for a binary to await anything, its `main` must be an

@@ -54,8 +54,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use wasmtime::Store;
 use wasmtime::component::{Linker, Type, Val};
+use wasmtime::{Store, Trap};
 
 use crate::image::Image;
 use crate::link;
@@ -71,11 +71,23 @@ pub use crate::wave::NamedArg;
 /// at spawn rather than derived from each donation.
 pub const FUEL_QUANTUM: u64 = 10_000;
 
+/// Fuel budget for the instantiate phase of `spawn`. Instantiation is paid for by the
+/// spawner, not by later `resume` donations, so it must be bounded: a component whose core
+/// modules carry start-time code gets at most this much fuel before spawn fails (rather
+/// than burning unbounded CPU). Eo9 components have no start functions and consume none of
+/// it.
+const SPAWN_FUEL: u64 = 4 * FUEL_QUANTUM;
+
 /// Static resource limits, fixed at spawn (`eo9:exec/task.spawn-limits`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SpawnLimits {
     /// Ceiling on linear-memory growth in bytes, enforced at `memory.grow`.
     pub max_memory: Option<u64>,
+    /// Ceiling on core-wasm table growth, in elements, enforced at `table.grow`. When
+    /// absent but `max_memory` is set, a bound is derived from the memory ceiling (one
+    /// element per 8 bytes of allowed linear memory) so that a memory-limited task can
+    /// never grow tables without bound either.
+    pub max_table_elements: Option<u64>,
 }
 
 /// Why a task could not be spawned (`eo9:exec/task.spawn-error`).
@@ -160,12 +172,28 @@ impl std::task::Wake for Doorbell {
 // Store data
 // ---------------------------------------------------------------------------------------
 
-/// Memory limits enforced where WASM asks the host for memory (`memory.grow`).
-struct MemoryLimits {
+/// Resource limits enforced where WASM asks the host for resources (`memory.grow`,
+/// `table.grow`).
+struct StoreLimits {
     max_memory: Option<u64>,
+    max_table_elements: Option<u64>,
 }
 
-impl wasmtime::ResourceLimiter for MemoryLimits {
+impl StoreLimits {
+    fn new(limits: &SpawnLimits) -> Self {
+        Self {
+            max_memory: limits.max_memory,
+            // A memory-limited task must not be able to grow tables without bound either:
+            // derive a table ceiling from the memory ceiling when none was given
+            // explicitly (one element per 8 bytes — the host-side size of a reference).
+            max_table_elements: limits
+                .max_table_elements
+                .or_else(|| limits.max_memory.map(|max| (max / 8).max(1))),
+        }
+    }
+}
+
+impl wasmtime::ResourceLimiter for StoreLimits {
     fn memory_growing(
         &mut self,
         _current: usize,
@@ -181,17 +209,20 @@ impl wasmtime::ResourceLimiter for MemoryLimits {
     fn table_growing(
         &mut self,
         _current: usize,
-        _desired: usize,
+        desired: usize,
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        Ok(true)
+        Ok(match self.max_table_elements {
+            Some(max) => desired as u64 <= max,
+            None => true,
+        })
     }
 }
 
 /// Per-task store data: the task's root providers and its resource limits.
 pub(crate) struct TaskState {
     pub(crate) providers: Providers,
-    limits: MemoryLimits,
+    limits: StoreLimits,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -258,25 +289,19 @@ impl Task {
 
         let state = TaskState {
             providers,
-            limits: MemoryLimits {
-                max_memory: limits.max_memory,
-            },
+            limits: StoreLimits::new(&limits),
         };
         let mut store = Store::new(&engine, state);
         store.limiter(|state| &mut state.limits);
 
-        // Lifetime fuel pool and the fixed yield quantum; both must be configured before
-        // the drive future takes ownership of the store.
-        store.set_fuel(u64::MAX).map_err(internal)?;
-        store
-            .fuel_async_yield_interval(Some(FUEL_QUANTUM))
-            .map_err(internal)?;
-
         let doorbell = Arc::new(Doorbell::default());
 
-        // Instantiation runs no donated fuel worth of guest code for Eo9 components (no
-        // start functions) and must not depend on external completions; drive it with a
-        // bounded manual poll loop.
+        // Instantiation runs on a small, bounded fuel budget paid by the spawner: any
+        // start-time code in the component either finishes within SPAWN_FUEL or the spawn
+        // fails (no yield interval is configured yet, so exhaustion is a trap here, never
+        // an unbounded burn). It must also not depend on external completions; drive it
+        // with a bounded manual poll loop.
+        store.set_fuel(SPAWN_FUEL).map_err(internal)?;
         let instance = {
             let instantiate = linker.instantiate_async(&mut store, image.component());
             let mut instantiate = std::pin::pin!(instantiate);
@@ -297,8 +322,26 @@ impl Task {
                 .ok_or_else(|| {
                     SpawnError::Internal("instantiation unexpectedly suspended".to_string())
                 })?
-                .map_err(internal)?
+                .map_err(|err| {
+                    if matches!(err.downcast_ref::<Trap>(), Some(Trap::OutOfFuel)) {
+                        SpawnError::Internal(format!(
+                            "component start-time code exceeded the spawn fuel budget \
+                             ({SPAWN_FUEL} fuel): instantiation must not run unbounded \
+                             guest code"
+                        ))
+                    } else {
+                        internal(err)
+                    }
+                })?
         };
+
+        // Normal fuel regime for the task's life: an effectively-infinite pool sliced by
+        // the fixed yield quantum. Both must be configured before the drive future takes
+        // ownership of the store.
+        store.set_fuel(u64::MAX).map_err(internal)?;
+        store
+            .fuel_async_yield_interval(Some(FUEL_QUANTUM))
+            .map_err(internal)?;
 
         let main = instance
             .get_func(&mut store, "main")
