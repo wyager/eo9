@@ -30,6 +30,13 @@ interface perf-optional {
     default: func() -> option<perf-impl>;
 }
 
+/// Compose-time configuration entry for perf.null: `configure` returns the root handle
+/// that the exported `perf` serves via `default()` (see SPEC: Binary or provider, never both).
+interface null-config {
+    use types.{perf-impl};
+    configure: async func() -> result<perf-impl, string>;
+}
+
 /// perf.none — absence: exports the optional flavor answering `none`.
 world none {
     export types;
@@ -40,4 +47,5 @@ world none {
 world null {
     export types;
     export perf;
+    export null-config;
 }

@@ -50,6 +50,26 @@ interface time-optional {
     default: func() -> option<time-impl>;
 }
 
+/// Compose-time configuration entry for time.frozen: `configure` binds the frozen instant
+/// and returns the root handle that the exported `time` serves via `default()`
+/// (see SPEC: Binary or provider, never both).
+interface frozen-config {
+    use types.{time-impl};
+    configure: async func(now-seconds: s64, monotonic-ns: u64) -> result<time-impl, string>;
+}
+
+/// Compose-time configuration entry for time.monotonic-stub (same convention as `frozen-config`).
+interface monotonic-stub-config {
+    use types.{time-impl};
+    configure: async func(start-ns: u64, step-ns: u64) -> result<time-impl, string>;
+}
+
+/// Compose-time configuration entry for time.fuzzy (same convention as `frozen-config`).
+interface fuzzy-config {
+    use types.{time-impl};
+    configure: async func(granularity-ns: u64) -> result<time-impl, string>;
+}
+
 /// time.none — absence: exports the optional flavor answering `none`.
 /// (There is deliberately no time.deny: denying a clock is meaningless — see SPEC.)
 world none {
@@ -61,7 +81,7 @@ world none {
 world frozen {
     export types;
     export time;
-    export configure: func(now-seconds: s64, monotonic-ns: u64) -> result<_, string>;
+    export frozen-config;
 }
 
 /// time.monotonic-stub — deterministic stand-in clock: monotonic time advances by a
@@ -69,7 +89,7 @@ world frozen {
 world monotonic-stub {
     export types;
     export time;
-    export configure: func(start-ns: u64, step-ns: u64) -> result<_, string>;
+    export monotonic-stub-config;
 }
 
 /// time.fuzzy — degraded/jittered resolution over an underlying clock
@@ -77,5 +97,5 @@ world monotonic-stub {
 world fuzzy {
     import time;
     export time;
-    export configure: func(granularity-ns: u64) -> result<_, string>;
+    export fuzzy-config;
 }
