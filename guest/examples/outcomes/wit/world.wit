@@ -1,0 +1,35 @@
+// outcomes — conformance fixture for the typed outcome vocabulary (see SPEC.md,
+// "WASM runtime": main returns result<program-success, program-failure> in the
+// program's own structured vocabulary, never a numeric exit code).
+package eo9-examples:outcomes@0.1.0;
+
+/// Produces whichever outcome its arguments request, so executors and tests can
+/// exercise every path: each success variant, each failure variant, argument
+/// rejection, and a guest trap.
+///
+///   outcomes --mode ok    --detail "all good"     → success: completed("all good")
+///   outcomes --mode quiet --detail ""             → success: quiet
+///   outcomes --mode fail  --detail "went wrong"   → failure: requested-failure("went wrong")
+///   outcomes --mode trap  --detail ""             → traps (guest panic → wasm unreachable)
+///   outcomes --mode nonsense --detail ""          → failure: bad-arguments(...)
+world outcomes {
+    import eo9:text/text@0.1.0;
+
+    variant program-success {
+        /// Mode "ok": echoes the detail string back through the success variant.
+        completed(string),
+        /// Mode "quiet": succeeded without writing any output.
+        quiet,
+    }
+
+    variant program-failure {
+        /// The mode argument was not one of the understood values.
+        bad-arguments(string),
+        /// Mode "fail": a failure reported in the program's own vocabulary.
+        requested-failure(string),
+        /// Writing to the text stream failed, carrying the text API's own error.
+        io(string),
+    }
+
+    export main: func(mode: string, detail: string) -> result<program-success, program-failure>;
+}

@@ -1,0 +1,15 @@
+[package]
+name = "eo9-example-readwrite"
+description = "Eo9 example program: writes its argument to a file and reads it back through the owned-buffer round-trip, awaiting the fs API's futures (targets the eo9-examples:readwrite/readwrite world: fs)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

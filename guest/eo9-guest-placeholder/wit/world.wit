@@ -1,8 +1,0 @@
-// Local placeholder WIT, used only to prove the component build flow end to end.
-// Real guest crates target worlds from the repo-level wit/ packages (area 02).
-package eo9:guest-placeholder@0.0.0;
-
-world placeholder {
-    /// Returns a fixed value so the host can check the component is callable.
-    export ping: func() -> u32;
-}

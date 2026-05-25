@@ -1,0 +1,11 @@
+[package]
+name = "eo9-guest"
+description = "Guest SDK for writing Eo9 programs in Rust: wit-bindgen bindings for the eo9:* APIs, the no_std guest runtime (allocator + panic handler), and helpers for accessors, buffers, and main exports."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wit-bindgen = { workspace = true }
+dlmalloc = { workspace = true }

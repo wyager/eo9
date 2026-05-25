@@ -12,7 +12,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 /// Guest crates that `build-guest` turns into wasm components (package names).
-const GUEST_COMPONENTS: &[&str] = &["eo9-guest-placeholder"];
+const GUEST_COMPONENTS: &[&str] = &[
+    "eo9-example-hello",
+    "eo9-example-outcomes",
+    "eo9-example-cruncher",
+    "eo9-example-readwrite",
+];
 
 /// Target used to build guest crates before componentizing them.
 const GUEST_TARGET: &str = "wasm32-unknown-unknown";
@@ -152,10 +157,18 @@ fn build_guest(root: &Path) -> Result<(), String> {
                 component.as_os_str(),
             ],
         )?;
+        // The eo9 APIs return Component Model futures, so components built from them
+        // use the async canonical built-ins; the validator only accepts those with the
+        // cm-async feature enabled.
         run(
             &guest,
             "wasm-tools",
-            [OsStr::new("validate"), component.as_os_str()],
+            [
+                OsStr::new("validate"),
+                OsStr::new("--features"),
+                OsStr::new("cm-async"),
+                component.as_os_str(),
+            ],
         )?;
         println!("xtask: built component {}", component.display());
     }

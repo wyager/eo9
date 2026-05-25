@@ -1,0 +1,23 @@
+// cruncher — pure compute: a world with no imports at all, i.e. a fully closed
+// program (see SPEC.md, "Restriction: only" — the empty allow-list is pure compute).
+// Useful for `only`/sandbox.pure demos and for determinism tests: the same arguments
+// always produce the same outcome, with no environment to vary.
+package eo9-examples:cruncher@0.1.0;
+
+/// Iterates a 64-bit mixing function `rounds` times starting from `seed` and reports
+/// the resulting digest through its success variant.
+///
+///   cruncher --seed 9 --rounds 1000000
+world cruncher {
+    variant program-success {
+        /// The digest after `rounds` iterations.
+        digest(u64),
+    }
+
+    variant program-failure {
+        /// An argument value was rejected (e.g. zero rounds).
+        bad-arguments(string),
+    }
+
+    export main: func(seed: u64, rounds: u64) -> result<program-success, program-failure>;
+}
