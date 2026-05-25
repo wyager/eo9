@@ -13,3 +13,6 @@ license = "MIT"
 # Pinned to 0.3 rather than 0.4 because 0.4's wasm-target support drags a large
 # wit-bindgen/wit-component tree into the lockfile that we never compile.
 getrandom = "0.3"
+# Raw COW file-clone syscalls for open-exec snapshots: clonefile(2) on macOS and the
+# FICLONE ioctl on Linux have no std wrappers. Already in the tree via getrandom.
+libc = "0.2"
