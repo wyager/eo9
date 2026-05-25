@@ -1,0 +1,3 @@
+# Convenience alias so the CI gate can be run as `cargo xtask ci`.
+[alias]
+xtask = "run --package xtask --"

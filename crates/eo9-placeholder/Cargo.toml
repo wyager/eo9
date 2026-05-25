@@ -1,0 +1,8 @@
+[package]
+name = "eo9-placeholder"
+description = "Placeholder crate for the host workspace; replaced as real crates land (areas 03-08, 11)."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

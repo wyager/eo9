@@ -1,0 +1,37 @@
+# Host-side workspace: everything that runs on the host OS (crates/*) plus the xtask
+# build orchestrator. The guest/ and kernel/ directories are separate workspaces with
+# their own Cargo.toml, toolchain file, and target configuration.
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+exclude = ["guest", "kernel"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# ---------------------------------------------------------------------------------------
+# Foundation dependency pins (PLAN.md ground rule 3). This table is the authoritative
+# record of the wasmtime / wasm-tools family versions for the whole repository; crates in
+# this workspace must take these via `{ workspace = true }`, and the guest/ and kernel/
+# workspaces mirror the subset they need (keep the versions in sync with this table).
+#
+# Version notes (2026-05-25, see plan/01-workspace.md Decisions):
+#   * wasm-tools library family 0.250.0 matches the installed wasm-tools CLI 1.250.0.
+#   * wasmtime 45.0.0 internally uses the 0.248 family and wac-graph 0.10.0 the 0.247
+#     family; those stay private to them and may coexist with our direct 0.250 pins.
+# ---------------------------------------------------------------------------------------
+[workspace.dependencies]
+wasmtime = "45.0.0"
+wit-parser = "0.250.0"
+wit-component = "0.250.0"
+wasm-encoder = "0.250.0"
+wasmparser = "0.250.0"
+wasm-wave = "0.250.0"
+wac-graph = "0.10.0"
+wit-bindgen = "0.57.1"
+blake3 = "1.8.5"
+
+# Intra-workspace crates (add new crates/* entries here as areas land).
+eo9-placeholder = { path = "crates/eo9-placeholder" }

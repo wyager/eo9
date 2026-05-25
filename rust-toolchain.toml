@@ -1,0 +1,9 @@
+# Pinned nightly for the host workspace (see plan/01-workspace.md, Decisions).
+#
+# guest/ and kernel/ carry their own copies of this file (same pin, plus the extra
+# compilation targets each needs) because rustup resolves the toolchain per directory.
+# Keep the `channel` line identical in all three files.
+[toolchain]
+channel = "nightly-2026-05-25"
+profile = "minimal"
+components = ["rustfmt", "clippy", "rust-src"]
