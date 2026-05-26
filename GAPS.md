@@ -8,21 +8,25 @@ xtask-order / web-try wave)._
 
 ## Decisions pending with the owner
 
-- **Upstreaming the wasmtime no_std CM-async patch** (kernel/vendor/wasmtime: 15 files, ~329 lines,
-  documented in kernel/vendor/README.md and plan/12 D16): owner ruling (2026-05-26) — hold until the
-  bare-metal track has a working end-to-end result (boot-to-eosh / on-target codegen), then revisit; likely
-  bundled with whatever the codegen port needs.
-- **/try v2 — eosh in the browser**: owner-preferred direction is the wasm32 + Pulley blob running the real
-  stack (spike merged: plan/15 D15–20, probe under www/embed-spike). Everything works except async-lifted
-  calls — wasmtime routes them through wasmtime-fiber, which has no wasm32 backend; the 2026-05-26 upstream
-  survey found no fiberless callback-ABI path in any release or on main, and no wasm32 fiber plan (JSPI is
-  the only viable substrate: Chrome shipped, Firefox flagged, Safari in progress). Options: (1) build a
-  JSPI-backed fiber shim ourselves (browser-only, likely obsoleted by upstream), (2) raise the
-  fiberless-callback question upstream and keep /try v1 meanwhile, (3) start the path-independent
-  `eo9-embed` crate now regardless. Planner recommends 2+3; owner decision pending.
+- **/try v2 — eosh in the browser**: direction set — the wasm32 + Pulley blob running the real stack (spike
+  merged: plan/15 D15–20, probe under www/embed-spike). The only blocker is suspending async-lifted guest
+  calls in the browser, since wasmtime-fiber has no wasm32 backend (no upstream fiberless callback path
+  exists). Owner asked for an **effort estimate of a JSPI-backed fiber shim** before committing — being
+  scoped now. `eo9-embed` (the path-independent embeddable-runtime foundation) is green-lit and underway
+  (area 16) regardless.
 - **Compose-time vs run-time provider parameters.** Changing a seed currently changes the composed artifact
   and forces a recompile, same as changing a structural choice. Owner parked the "late-bound parameter"
   idea until there is a clean design; revisit if deterministic sweeps start thrashing the compile cache.
+
+## Settled directions (recorded so they're not re-litigated)
+
+- **No upstreaming until a compelling MVP** (owner ruling 2026-05-26). The no_std CM-async patch and the new
+  cranelift no_std fork stay as in-tree vendored forks under kernel/vendor; revisit offering anything to
+  wasmtime/cranelift upstream only once Eo9 has a compelling MVP.
+- **On-target codegen: fork cranelift now** (owner ruling 2026-05-26), do not wait for upstream's in-flight
+  no_std work to finish. Vendor/fork the compile layers (cranelift-codegen and the wasm→CLIF + emission /
+  loader path) into a no_std+alloc state under kernel/vendor; build on upstream's no_std PRs where they
+  help, but don't block on them. In progress on area/12-codegen. (plan/12)
 
 ## Design decisions deliberately parked
 

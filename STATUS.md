@@ -70,32 +70,35 @@ rung. Pending owner decisions: /try v2 path and `eo9-embed` go/no-go (see Next u
 | Website + server + /try in-browser demo | `www/` | complete, deployable; /try v2 (eosh in browser) pending |
 | Bare-metal kernel (aarch64: boot, heap, timer, MMU, kernel providers, sync + async guests, baked-in store, **boot-to-interactive-eosh**, vendored CM-async no_std patch) | `kernel/` | milestones 1–4 merged; on-target codegen (unlocks composition) is the next + last MVP rung; GIC/fuel/sched + riscv64/x86_64 deferred |
 
-## In progress right now
+## In progress right now (area branches, agents active)
 
-- Nothing on area branches; all of the last wave is merged. Next dispatches are queued behind the owner
-  decisions below.
+- **On-target codegen** (`area/12-codegen`): the last MVP-gating rung — forking cranelift + the
+  wasmtime-environ compile layers into a no_std+alloc state (owner ruling: fork now, don't wait for
+  upstream) so the kernel compiles components on the machine and the bare-metal shell gains `$`/`&`
+  composition. Checkpoints: crates build for the kernel target → trivial module compiled on-target →
+  real component on-target → wired into the shell.
+- **`eo9-embed`** (`area/16-embed`): the embeddable-runtime library (runtime + host providers behind a
+  one-call API) — green-lit; foundation for `eo9 bundle` and the /try v2 browser blob.
+- **JSPI-fiber shim estimate** (read-only research): scoping the effort to suspend async guests in the
+  wasm32 browser blob, to inform the /try v2 decision.
 
 ## Next up (rough order)
 
-1. **On-target codegen** (the last MVP-gating rung): port the wasmtime-environ `compile` + cranelift layers
-   to no_std+alloc so the kernel can compile components on the machine (and the bare-metal shell gains `$`/`&`
-   composition); Pulley only as a stopgap. The 2026-05-26 upstream survey found cranelift no_std work
-   actively landing upstream — build on it rather than duplicate. (plan/12)
-2. Kernel hardening toward "more than a spike": GIC + interrupts (stop busy-polling), child fuel +
-   eo9-sched adoption, io/buffers + fs/types wiring for children (friendly missing-fs story), cache
-   maintenance / W^X for code pages; then riscv64/x86_64 ports and the QEMU test tier.
-3. Owner decisions pending: (a) /try v2 path — JSPI-backed fiber shim now vs raise the fiberless-callback
-   question upstream and keep v1 vs hold (planner rec: raise upstream + start eo9-embed); (b) `eo9-embed`
-   library crate go/no-go (path-independent foundation for /try v2 and `eo9 bundle`); (c) whether to file
-   the wasmtime no_std CM-async patch upstream (owner ruling: hold until the metal track has a working
-   end-to-end result — boot-to-eosh now qualifies, so revisitable).
-4. Demo packaging: ship prebuilt components with the published crate so `cargo install eo9; eo9` works
+1. Kernel hardening toward "more than a spike" (alongside / after codegen): GIC + interrupts (stop
+   busy-polling), child fuel + eo9-sched adoption, io/buffers + fs/types wiring for children (friendly
+   missing-fs story), cache maintenance / W^X for code pages; then riscv64/x86_64 ports and the QEMU test
+   tier.
+2. /try v2: pick the path once the JSPI-shim estimate lands; build it on `eo9-embed`.
+3. Demo packaging: ship prebuilt components with the published crate so `cargo install eo9; eo9` works
    without a checkout.
-5. Bundle milestone: `eo9-embed` library + `eo9 bundle` (native executables for other OSes).
-6. eo9:pci follow-ups: `pci.deny`/`pci.filtered` stubs (area 09); a kernel/QEMU virtio-over-PCI provider as
+4. Bundle milestone: `eo9 bundle` (native executables for other OSes) on top of `eo9-embed`.
+5. eo9:pci follow-ups: `pci.deny`/`pci.filtered` stubs (area 09); a kernel/QEMU virtio-over-PCI provider as
    the first real consumer; dma-buffer ↔ `eo9:io` buffer story.
-7. Exec follow-ups: guest-facing `resume`/fuel donation (E5); net provider linking, `net.loopback`,
+6. Exec follow-ups: guest-facing `resume`/fuel donation (E5); net provider linking, `net.loopback`,
    Message API; eofs milestone 2+ (provider, mkfs, store-on-eofs, content hashes).
-8. Housekeeping: push to origin, crates.io name, Message/perf/threads API design.
+7. Housekeeping: push to origin, crates.io name, Message/perf/threads API design.
+
+_Settled (see GAPS): upstreaming anything is deferred until a compelling MVP; on-target codegen forks
+cranelift now rather than waiting for upstream._
 
 See `GAPS.md` for known limitations and deferred decisions.
