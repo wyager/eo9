@@ -14,6 +14,7 @@
 //! See `plan/04-runtime.md` (scope, milestones, decisions) and SPEC.md "Execution APIs".
 
 pub mod engine;
+pub mod exec;
 pub mod image;
 mod link;
 pub mod outcome;
@@ -22,6 +23,7 @@ pub mod task;
 pub mod wave;
 
 pub use engine::{EngineOptions, compatibility_hash, new_engine};
+pub use exec::{ChildPolicy, ExecProvider};
 pub use image::{CompileError, Image};
 pub use outcome::{Outcome, WaveValue};
 pub use providers::{

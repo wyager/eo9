@@ -373,6 +373,9 @@ pub struct Task {
     /// Donated fuel not yet charged (smaller than one quantum, or left over from a resume
     /// that ended blocked).
     carried_fuel: u64,
+    /// Children spawned through this task's exec capability (shared with the exec
+    /// provider inside the store). Driven by [`Task::resume`]; dropped with the task.
+    children: Option<crate::exec::ChildSet>,
     /// True when the last resume returned [`ResumeOutcome::Blocked`] and the doorbell has
     /// not rung since.
     parked: bool,
@@ -407,6 +410,7 @@ impl Task {
         let internal = |err: wasmtime::Error| SpawnError::Internal(format!("{err:#}"));
 
         let engine = image.engine().clone();
+        let children = providers.exec.as_ref().map(|exec| exec.child_set());
         let mut linker: Linker<TaskState> = Linker::new(&engine);
         link::add_providers(&mut linker, &providers)
             .map_err(|err| SpawnError::Internal(format!("provider wiring failed: {err:#}")))?;
@@ -502,6 +506,7 @@ impl Task {
             doorbell,
             state: LifeState::Running,
             carried_fuel: 0,
+            children,
             parked: false,
         })
     }
@@ -522,6 +527,27 @@ impl Task {
         loop {
             if budget < FUEL_QUANTUM {
                 // Not enough left to run another quantum; carry the remainder.
+                self.carried_fuel = budget;
+                return ResumeOutcome::OutOfFuel;
+            }
+
+            // Children spawned through this task's exec capability run on their parent's
+            // donated fuel, one slice per runnable child per iteration (they cannot be run
+            // from inside the parent's own event loop — wasmtime forbids recursive
+            // `run_concurrent` — so the embedder-facing resume is where they execute).
+            if let Some(children) = self.children.clone() {
+                let mut children = children.lock().unwrap();
+                for child in children.iter_mut() {
+                    if budget < FUEL_QUANTUM {
+                        break;
+                    }
+                    if child.outcome().is_none() && child.is_runnable() {
+                        child.resume(FUEL_QUANTUM);
+                        budget -= FUEL_QUANTUM;
+                    }
+                }
+            }
+            if budget < FUEL_QUANTUM {
                 self.carried_fuel = budget;
                 return ResumeOutcome::OutOfFuel;
             }

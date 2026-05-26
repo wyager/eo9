@@ -493,6 +493,7 @@ dependencies = [
 name = "eo9-runtime"
 version = "0.0.0"
 dependencies = [
+ "eo9-component",
  "wasmtime",
 ]
 

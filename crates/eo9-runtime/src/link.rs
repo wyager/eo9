@@ -78,6 +78,9 @@ pub(crate) fn add_providers(linker: &mut Linker<TaskState>, providers: &Provider
     if providers.fs.is_some() {
         add_fs(linker)?;
     }
+    if providers.exec.is_some() {
+        add_exec(linker)?;
+    }
     Ok(())
 }
 
@@ -778,6 +781,13 @@ impl TaskState {
             .ok_or_else(|| wasmtime::Error::msg("entropy capability was not granted to this task"))
     }
 
+    fn exec_provider(&mut self) -> Result<&mut crate::exec::ExecProvider> {
+        self.providers
+            .exec
+            .as_mut()
+            .ok_or_else(|| wasmtime::Error::msg("exec capability was not granted to this task"))
+    }
+
     fn fs_provider(&mut self) -> Result<&mut dyn crate::providers::FsProvider> {
         self.providers
             .fs
@@ -786,5 +796,616 @@ impl TaskState {
             .ok_or_else(|| {
                 wasmtime::Error::msg("filesystem capability was not granted to this task")
             })
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// eo9:exec — component algebra, compile, task (granted only through the exec provider)
+// ---------------------------------------------------------------------------------------
+
+/// Host representation of `eo9:exec/component-algebra.component`.
+pub struct AlgComponentRes;
+/// Host representation of `eo9:exec/images.image`.
+pub struct ExecImageRes;
+/// Host representation of `eo9:exec/task.task` (a child task).
+pub struct ChildTaskRes;
+
+#[derive(Clone, Copy, ComponentType, Lift, Lower)]
+#[component(enum)]
+#[repr(u8)]
+#[allow(dead_code)]
+enum WitComponentKind {
+    #[component(name = "binary")]
+    Binary,
+    #[component(name = "provider")]
+    Provider,
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitImportNeed {
+    slot: String,
+    interface: String,
+    version: String,
+    required: bool,
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitExportSlot {
+    name: String,
+    interface: String,
+    version: String,
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitArgSpec {
+    name: String,
+    ty: String,
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitComponentInfo {
+    kind: WitComponentKind,
+    imports: Vec<WitImportNeed>,
+    exports: Vec<WitExportSlot>,
+    args: Vec<WitArgSpec>,
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitInterfaceRef {
+    interface: String,
+    version: Option<String>,
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(variant)]
+enum WitLoadError {
+    #[component(name = "invalid-component")]
+    InvalidComponent(String),
+    #[component(name = "not-an-eo9-module")]
+    NotAnEo9Module(String),
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(variant)]
+enum WitComposeError {
+    #[component(name = "not-a-provider")]
+    NotAProvider,
+    #[component(name = "type-mismatch")]
+    TypeMismatch(String),
+    #[component(name = "internal")]
+    Internal(String),
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(variant)]
+enum WitRestrictError {
+    #[component(name = "required-outside-allow-list")]
+    RequiredOutsideAllowList(Vec<String>),
+    #[component(name = "invalid-allow-list")]
+    InvalidAllowList(String),
+    #[component(name = "internal")]
+    Internal(String),
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(variant)]
+enum WitRenameError {
+    #[component(name = "no-such-slot")]
+    NoSuchSlot(String),
+    #[component(name = "slot-collision")]
+    SlotCollision(String),
+    #[component(name = "internal")]
+    Internal(String),
+}
+
+#[derive(Clone, Copy, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitCompileOpts {
+    #[component(name = "debug-info")]
+    debug_info: bool,
+    #[component(name = "safepoint-maps")]
+    safepoint_maps: bool,
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(variant)]
+enum WitCompileError {
+    #[component(name = "not-a-binary")]
+    NotABinary,
+    #[component(name = "not-closed")]
+    NotClosed(Vec<String>),
+    #[component(name = "codegen")]
+    Codegen(String),
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitNamedArg {
+    name: String,
+    value: String,
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitWaveValue {
+    ty: String,
+    value: String,
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(variant)]
+enum WitAbnormalExit {
+    #[component(name = "trapped")]
+    Trapped(String),
+    #[component(name = "killed")]
+    Killed,
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(variant)]
+enum WitProgramOutcome {
+    #[component(name = "success")]
+    Success(WitWaveValue),
+    #[component(name = "failure")]
+    Failure(WitWaveValue),
+    #[component(name = "abnormal")]
+    Abnormal(WitAbnormalExit),
+}
+
+#[derive(Clone, Copy, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitSpawnLimits {
+    #[component(name = "max-memory")]
+    max_memory: Option<u64>,
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(variant)]
+enum WitSpawnError {
+    #[component(name = "bad-arguments")]
+    BadArguments(String),
+    #[component(name = "internal")]
+    Internal(String),
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(variant)]
+enum WitResumeOutcome {
+    #[component(name = "out-of-fuel")]
+    OutOfFuel,
+    #[component(name = "blocked")]
+    Blocked,
+    #[component(name = "done")]
+    Done(WitProgramOutcome),
+}
+
+fn wit_outcome(outcome: &crate::outcome::Outcome) -> WitProgramOutcome {
+    use crate::outcome::Outcome;
+    match outcome {
+        Outcome::Success(value) => WitProgramOutcome::Success(WitWaveValue {
+            ty: value.ty.clone(),
+            value: value.value.clone(),
+        }),
+        Outcome::Failure(value) => WitProgramOutcome::Failure(WitWaveValue {
+            ty: value.ty.clone(),
+            value: value.value.clone(),
+        }),
+        Outcome::Trapped(reason) => {
+            WitProgramOutcome::Abnormal(WitAbnormalExit::Trapped(reason.clone()))
+        }
+        Outcome::Killed => WitProgramOutcome::Abnormal(WitAbnormalExit::Killed),
+    }
+}
+
+fn wit_component_info(info: &eo9_component::ComponentInfo) -> WitComponentInfo {
+    WitComponentInfo {
+        kind: match info.kind {
+            eo9_component::ComponentKind::Binary => WitComponentKind::Binary,
+            eo9_component::ComponentKind::Provider => WitComponentKind::Provider,
+        },
+        imports: info
+            .imports
+            .iter()
+            .map(|need| WitImportNeed {
+                slot: need.slot.clone(),
+                interface: need.interface.clone(),
+                version: need.version.clone(),
+                required: need.required,
+            })
+            .collect(),
+        exports: info
+            .exports
+            .iter()
+            .map(|slot| WitExportSlot {
+                name: slot.name.clone(),
+                interface: slot.interface.clone(),
+                version: slot.version.clone(),
+            })
+            .collect(),
+        args: info
+            .args
+            .iter()
+            .map(|arg| WitArgSpec {
+                name: arg.name.clone(),
+                ty: arg.ty.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Pull a consumed (`own`) component out of the table, releasing its byte budget.
+fn take_component(
+    exec: &mut crate::exec::ExecProvider,
+    rep: u32,
+) -> Result<eo9_component::Component> {
+    let component = exec.components.take(rep)?;
+    exec.component_bytes = exec
+        .component_bytes
+        .saturating_sub(component.save().len() as u64);
+    Ok(component)
+}
+
+/// Insert an algebra result, accounting its bytes, and mint the guest handle.
+fn insert_component(
+    exec: &mut crate::exec::ExecProvider,
+    component: eo9_component::Component,
+) -> Result<Resource<AlgComponentRes>> {
+    let size = component.save().len() as u64;
+    let rep = exec.insert_component(component, size)?;
+    Ok(Resource::new_own(rep))
+}
+
+fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
+    // ----- component-algebra ------------------------------------------------------------
+    let mut algebra = linker.instance("eo9:exec/component-algebra@0.1.0")?;
+    algebra.resource(
+        "component",
+        ResourceType::host::<AlgComponentRes>(),
+        |mut store: StoreContextMut<'_, TaskState>, rep| {
+            if let Ok(exec) = store.data_mut().exec_provider() {
+                exec.free_component(rep);
+            }
+            Ok(())
+        },
+    )?;
+
+    algebra.func_wrap(
+        "load",
+        |mut store: StoreContextMut<'_, TaskState>,
+         (bytes,): (Vec<u8>,)|
+         -> Result<(Result<Resource<AlgComponentRes>, WitLoadError>,)> {
+            let exec = store.data_mut().exec_provider()?;
+            if bytes.len() as u64 > crate::exec::MAX_COMPONENT_BYTES {
+                return Err(wasmtime::Error::msg(
+                    "component image exceeds the per-task component byte budget",
+                ));
+            }
+            let size = bytes.len() as u64;
+            Ok((match eo9_component::Component::load(bytes) {
+                Ok(component) => {
+                    let rep = exec.insert_component(component, size)?;
+                    Ok(Resource::new_own(rep))
+                }
+                Err(eo9_component::LoadError::InvalidComponent(msg)) => {
+                    Err(WitLoadError::InvalidComponent(msg))
+                }
+                Err(eo9_component::LoadError::NotAnEo9Module(msg)) => {
+                    Err(WitLoadError::NotAnEo9Module(msg))
+                }
+            },))
+        },
+    )?;
+
+    algebra.func_wrap(
+        "save",
+        |mut store: StoreContextMut<'_, TaskState>,
+         (component,): (Resource<AlgComponentRes>,)|
+         -> Result<(Vec<u8>,)> {
+            let exec = store.data_mut().exec_provider()?;
+            Ok((exec.components.get_mut(component.rep())?.save(),))
+        },
+    )?;
+
+    algebra.func_wrap(
+        "describe",
+        |mut store: StoreContextMut<'_, TaskState>,
+         (component,): (Resource<AlgComponentRes>,)|
+         -> Result<(WitComponentInfo,)> {
+            let exec = store.data_mut().exec_provider()?;
+            let info = exec.components.get_mut(component.rep())?.describe();
+            Ok((wit_component_info(&info),))
+        },
+    )?;
+
+    algebra.func_wrap(
+        "compose",
+        |mut store: StoreContextMut<'_, TaskState>,
+         (provider, consumer): (Resource<AlgComponentRes>, Resource<AlgComponentRes>)|
+         -> Result<(Result<Resource<AlgComponentRes>, WitComposeError>,)> {
+            let exec = store.data_mut().exec_provider()?;
+            let provider = take_component(exec, provider.rep())?;
+            let consumer = take_component(exec, consumer.rep())?;
+            Ok((match eo9_component::compose(&provider, &consumer) {
+                Ok(result) => Ok(insert_component(exec, result)?),
+                Err(err) => Err(wit_compose_error(err)),
+            },))
+        },
+    )?;
+
+    algebra.func_wrap(
+        "extend",
+        |mut store: StoreContextMut<'_, TaskState>,
+         (base, layer): (Resource<AlgComponentRes>, Resource<AlgComponentRes>)|
+         -> Result<(Result<Resource<AlgComponentRes>, WitComposeError>,)> {
+            let exec = store.data_mut().exec_provider()?;
+            let base = take_component(exec, base.rep())?;
+            let layer = take_component(exec, layer.rep())?;
+            Ok((match eo9_component::extend(&base, &layer) {
+                Ok(result) => Ok(insert_component(exec, result)?),
+                Err(err) => Err(wit_compose_error(err)),
+            },))
+        },
+    )?;
+
+    algebra.func_wrap(
+        "restrict",
+        |mut store: StoreContextMut<'_, TaskState>,
+         (component, allow): (Resource<AlgComponentRes>, Vec<WitInterfaceRef>)|
+         -> Result<(Result<Resource<AlgComponentRes>, WitRestrictError>,)> {
+            let exec = store.data_mut().exec_provider()?;
+            let component = take_component(exec, component.rep())?;
+            let allow: Vec<eo9_component::InterfaceRef> = allow
+                .into_iter()
+                .map(|entry| eo9_component::InterfaceRef {
+                    interface: entry.interface,
+                    version: entry.version,
+                })
+                .collect();
+            Ok((match eo9_component::restrict(&component, &allow) {
+                Ok(result) => Ok(insert_component(exec, result)?),
+                Err(eo9_component::RestrictError::RequiredOutsideAllowList(names)) => {
+                    Err(WitRestrictError::RequiredOutsideAllowList(names))
+                }
+                Err(eo9_component::RestrictError::InvalidAllowList(msg)) => {
+                    Err(WitRestrictError::InvalidAllowList(msg))
+                }
+                Err(eo9_component::RestrictError::Internal(msg)) => {
+                    Err(WitRestrictError::Internal(msg))
+                }
+            },))
+        },
+    )?;
+
+    algebra.func_wrap(
+        "rename",
+        |mut store: StoreContextMut<'_, TaskState>,
+         (component, old_name, new_name): (Resource<AlgComponentRes>, String, String)|
+         -> Result<(Result<Resource<AlgComponentRes>, WitRenameError>,)> {
+            let exec = store.data_mut().exec_provider()?;
+            let component = take_component(exec, component.rep())?;
+            Ok((
+                match eo9_component::rename(&component, &old_name, &new_name) {
+                    Ok(result) => Ok(insert_component(exec, result)?),
+                    Err(eo9_component::RenameError::NoSuchSlot(msg)) => {
+                        Err(WitRenameError::NoSuchSlot(msg))
+                    }
+                    Err(eo9_component::RenameError::SlotCollision(msg)) => {
+                        Err(WitRenameError::SlotCollision(msg))
+                    }
+                    Err(eo9_component::RenameError::Internal(msg)) => {
+                        Err(WitRenameError::Internal(msg))
+                    }
+                },
+            ))
+        },
+    )?;
+
+    // ----- images + compile --------------------------------------------------------------
+    let mut images = linker.instance("eo9:exec/images@0.1.0")?;
+    images.resource(
+        "image",
+        ResourceType::host::<ExecImageRes>(),
+        |mut store: StoreContextMut<'_, TaskState>, rep| {
+            if let Ok(exec) = store.data_mut().exec_provider() {
+                exec.images.free(rep);
+            }
+            Ok(())
+        },
+    )?;
+
+    let mut compile = linker.instance("eo9:exec/compile@0.1.0")?;
+    compile.func_wrap(
+        "compile",
+        |mut store: StoreContextMut<'_, TaskState>,
+         (component, _opts): (Resource<AlgComponentRes>, WitCompileOpts)|
+         -> Result<(Result<Resource<ExecImageRes>, WitCompileError>,)> {
+            let exec = store.data_mut().exec_provider()?;
+            let component = take_component(exec, component.rep())?;
+            let bytes = component.save();
+            Ok((match crate::image::Image::compile(&exec.engine, bytes) {
+                Ok(image) => {
+                    let rep = exec.images.insert(image)?;
+                    Ok(Resource::new_own(rep))
+                }
+                Err(crate::image::CompileError::NotABinary) => Err(WitCompileError::NotABinary),
+                Err(err) => Err(WitCompileError::Codegen(err.to_string())),
+            },))
+        },
+    )?;
+
+    // ----- task ---------------------------------------------------------------------------
+    let mut task = linker.instance("eo9:exec/task@0.1.0")?;
+    task.resource(
+        "task",
+        ResourceType::host::<ChildTaskRes>(),
+        |mut store: StoreContextMut<'_, TaskState>, rep| {
+            // Dropping the handle kills the child (its store and in-flight work are dropped).
+            if let Ok(exec) = store.data_mut().exec_provider() {
+                exec.children.lock().unwrap().free(rep);
+            }
+            Ok(())
+        },
+    )?;
+
+    task.func_wrap(
+        "spawn",
+        |mut store: StoreContextMut<'_, TaskState>,
+         (image, args, limits): (Resource<ExecImageRes>, Vec<WitNamedArg>, WitSpawnLimits)|
+         -> Result<(Result<Resource<ChildTaskRes>, WitSpawnError>,)> {
+            let exec = store.data_mut().exec_provider()?;
+            let providers = exec.policy.providers_for_child();
+            let args: Vec<crate::wave::NamedArg> = args
+                .into_iter()
+                .map(|arg| crate::wave::NamedArg::new(arg.name, arg.value))
+                .collect();
+            let limits = crate::task::SpawnLimits {
+                max_memory: limits.max_memory,
+                max_table_elements: None,
+            };
+            let image = exec.images.get_mut(image.rep())?;
+            let spawned = crate::task::Task::spawn(image, &args, limits, providers);
+            let exec = store.data_mut().exec_provider()?;
+            Ok((match spawned {
+                Ok(child) => {
+                    let rep = exec.children.lock().unwrap().insert(child)?;
+                    Ok(Resource::new_own(rep))
+                }
+                Err(crate::task::SpawnError::BadArguments(msg)) => {
+                    Err(WitSpawnError::BadArguments(msg))
+                }
+                Err(crate::task::SpawnError::Internal(msg)) => Err(WitSpawnError::Internal(msg)),
+            },))
+        },
+    )?;
+
+    task.func_wrap(
+        "resume",
+        |mut store: StoreContextMut<'_, TaskState>,
+         (child, _fuel): (Resource<ChildTaskRes>, u64)|
+         -> Result<(WitResumeOutcome,)> {
+            // Executing a child inline would re-enter the event loop (wasmtime forbids
+            // recursive `run_concurrent`), so guest-level resume is not supported yet:
+            // children run on the parent's own resumes and are observed via `wait`.
+            // If the child has already finished, report that; otherwise fail loudly.
+            let exec = store.data_mut().exec_provider()?;
+            let mut children = exec.children.lock().unwrap();
+            let child = children.get_mut(child.rep())?;
+            if let Some(outcome) = child.outcome() {
+                return Ok((WitResumeOutcome::Done(wit_outcome(outcome)),));
+            }
+            Err(wasmtime::Error::msg(
+                "eo9:exec/task.resume is not supported by this runtime yet: child tasks \
+                 run on their parent's donated fuel; use wait (escalated, see plan/04)",
+            ))
+        },
+    )?;
+
+    task.func_wrap_concurrent(
+        "wait",
+        |accessor: &Accessor<TaskState>,
+         (child,): (Resource<ChildTaskRes>,)|
+         -> ConcurrentFuture<'_, (WitProgramOutcome,)> {
+            Box::pin(async move {
+                let rep = child.rep();
+                let outcome = std::future::poll_fn(move |cx| {
+                    accessor.with(|mut access| {
+                        let exec = match access.data_mut().exec_provider() {
+                            Ok(exec) => exec,
+                            Err(err) => return std::task::Poll::Ready(Err(err)),
+                        };
+                        let children = exec.children.clone();
+                        let mut children = children.lock().unwrap();
+                        let child = match children.get_mut(rep) {
+                            Ok(child) => child,
+                            Err(err) => return std::task::Poll::Ready(Err(err)),
+                        };
+                        if let Some(outcome) = child.outcome() {
+                            return std::task::Poll::Ready(Ok(wit_outcome(outcome)));
+                        }
+                        if child.is_runnable() {
+                            // The child still needs CPU; it executes inside the parent's
+                            // next resume iteration, so keep the parent awake.
+                            cx.waker().wake_by_ref();
+                        } else {
+                            // The child is blocked on its own I/O: wake the parent when
+                            // the child's doorbell rings.
+                            let runnable = child.runnable();
+                            let mut runnable = std::pin::pin!(runnable);
+                            let _ = runnable.as_mut().poll(cx);
+                        }
+                        std::task::Poll::Pending
+                    })
+                })
+                .await?;
+                Ok((outcome,))
+            })
+        },
+    )?;
+
+    task.func_wrap_concurrent(
+        "runnable",
+        |accessor: &Accessor<TaskState>,
+         (child,): (Resource<ChildTaskRes>,)|
+         -> ConcurrentFuture<'_, ()> {
+            Box::pin(async move {
+                let rep = child.rep();
+                std::future::poll_fn(move |cx| {
+                    accessor.with(|mut access| {
+                        let exec = match access.data_mut().exec_provider() {
+                            Ok(exec) => exec,
+                            Err(err) => return std::task::Poll::Ready(Err(err)),
+                        };
+                        let children = exec.children.clone();
+                        let mut children = children.lock().unwrap();
+                        let child = match children.get_mut(rep) {
+                            Ok(child) => child,
+                            Err(err) => return std::task::Poll::Ready(Err(err)),
+                        };
+                        if child.outcome().is_some() || child.is_runnable() {
+                            return std::task::Poll::Ready(Ok(()));
+                        }
+                        let runnable = child.runnable();
+                        let mut runnable = std::pin::pin!(runnable);
+                        match runnable.as_mut().poll(cx) {
+                            std::task::Poll::Ready(()) => std::task::Poll::Ready(Ok(())),
+                            std::task::Poll::Pending => std::task::Poll::Pending,
+                        }
+                    })
+                })
+                .await?;
+                Ok(())
+            })
+        },
+    )?;
+
+    task.func_wrap_concurrent(
+        "kill",
+        |accessor: &Accessor<TaskState>,
+         (child,): (Resource<ChildTaskRes>,)|
+         -> ConcurrentFuture<'_, (WitProgramOutcome,)> {
+            Box::pin(async move {
+                let outcome = accessor.with(|mut access| -> Result<_> {
+                    let exec = access.data_mut().exec_provider()?;
+                    let child = exec.children.lock().unwrap().take(child.rep())?;
+                    Ok(wit_outcome(&child.kill()))
+                })?;
+                Ok((outcome,))
+            })
+        },
+    )?;
+
+    Ok(())
+}
+
+fn wit_compose_error(err: eo9_component::ComposeError) -> WitComposeError {
+    match err {
+        eo9_component::ComposeError::NotAProvider => WitComposeError::NotAProvider,
+        eo9_component::ComposeError::TypeMismatch(msg) => WitComposeError::TypeMismatch(msg),
+        eo9_component::ComposeError::Internal(msg) => WitComposeError::Internal(msg),
     }
 }

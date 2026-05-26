@@ -197,6 +197,9 @@ pub struct Providers {
     pub time: Option<Box<dyn TimeProvider>>,
     pub entropy: Option<Box<dyn EntropyProvider>>,
     pub fs: Option<Box<dyn FsProvider>>,
+    /// The exec capability (component algebra + compile + task). Granting it makes the
+    /// task a native executor; see [`crate::exec::ExecProvider`].
+    pub exec: Option<crate::exec::ExecProvider>,
 }
 
 impl Providers {

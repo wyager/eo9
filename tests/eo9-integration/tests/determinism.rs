@@ -24,6 +24,7 @@ fn run_det_guest(seed: u64) -> (Outcome, String) {
         time: Some(Box::new(FrozenTime::new(1_750_000_000, 123_456_789))),
         entropy: Some(Box::new(SeededEntropy::new(seed))),
         fs: None,
+        exec: None,
     };
     let outcome = run::run_image(&image, &[NamedArg::new("tag", "\"det-run\"")], providers);
     (outcome, capture.stdout())

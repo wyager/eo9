@@ -448,6 +448,7 @@ pub fn root_providers(cfg: &Config) -> Result<Providers, String> {
             inner: UnixEntropy::new(),
         })),
         fs,
+        exec: None,
     })
 }
 
