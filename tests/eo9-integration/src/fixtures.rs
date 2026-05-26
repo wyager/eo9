@@ -476,14 +476,15 @@ pub fn det_guest() -> Component {
 // The kill/linearity fixture (raw component WAT)
 // -----------------------------------------------------------------------------------------
 
-/// A component whose `main` calls `eo9:time/time.sleep` and parks on the returned future
-/// (Component Model async built-ins; `main` is async-lifted because sync-lifted exports
-/// cannot block on the pinned runtime). With a provider whose sleep never resolves, the
-/// task stays blocked on the provider future — exactly the state the kill/linearity
-/// contract is about. Returns `9` if the sleep ever completes.
+/// A component whose `main` calls the async `eo9:time/time.sleep` operation and parks on
+/// it (`main` is async-lifted because sync-lifted exports cannot block on the pinned
+/// runtime; the sync-lowered call to the async operation suspends the task until the host
+/// completes it). With a provider whose sleep never resolves, the task stays blocked on
+/// the provider operation — exactly the state the kill/linearity contract is about.
+/// Returns `9` if the sleep ever completes.
 ///
-/// This is raw WAT rather than a WIT-built fixture because it needs the async canonical
-/// built-ins directly; `eo9_runtime::Image::compile` accepts WAT text.
+/// This is raw WAT rather than a WIT-built fixture because it needs the async lift
+/// directly; `eo9_runtime::Image::compile` accepts WAT text.
 pub fn sleeper_wat() -> &'static str {
     r#"
 (component
@@ -491,65 +492,31 @@ pub fn sleeper_wat() -> &'static str {
     (export "time-impl" (type (sub resource)))))
   (alias export $time-types "time-impl" (type $time-impl))
   (import "eo9:time/time@0.1.0" (instance $time
-    (export "default" (func (result (own $time-impl))))
-    (export "sleep" (func (param "t" (borrow $time-impl)) (param "duration-ns" u64) (result (future))))))
-
-  (core module $libc (memory (export "memory") 1))
-  (core instance $libc (instantiate $libc))
+    (export "time-impl" (type $ti (eq $time-impl)))
+    (export "default" (func (result (own $ti))))
+    (export "sleep" (func async (param "t" (borrow $ti)) (param "duration-ns" u64)))))
 
   (alias export $time "default" (func $default))
   (alias export $time "sleep" (func $sleep))
 
-  (type $ft (future))
   (core func $default-lowered (canon lower (func $default)))
   (core func $sleep-lowered (canon lower (func $sleep)))
-  (core func $future-read (canon future.read $ft async (memory $libc "memory")))
-  (core func $ws-new (canon waitable-set.new))
-  (core func $ws-join (canon waitable.join))
-  (core func $ws-wait (canon waitable-set.wait (memory $libc "memory")))
-  (core func $future-drop (canon future.drop-readable $ft))
-  (core func $ws-drop (canon waitable-set.drop))
   (core func $task-return (canon task.return (result u32)))
 
   (core module $m
-    (import "libc" "memory" (memory 1))
     (import "host" "default" (func $default (result i32)))
-    (import "host" "sleep" (func $sleep (param i32 i64) (result i32)))
-    (import "host" "future-read" (func $future-read (param i32 i32) (result i32)))
-    (import "host" "waitable-set-new" (func $ws-new (result i32)))
-    (import "host" "waitable-join" (func $ws-join (param i32 i32)))
-    (import "host" "waitable-set-wait" (func $ws-wait (param i32 i32) (result i32)))
-    (import "host" "future-drop" (func $future-drop (param i32)))
-    (import "host" "waitable-set-drop" (func $ws-drop (param i32)))
+    (import "host" "sleep" (func $sleep (param i32 i64)))
     (import "host" "task-return" (func $task-return (param i32)))
 
     (func (export "main")
-      (local $h i32) (local $f i32) (local $ws i32) (local $status i32)
-      (local.set $h (call $default))
       ;; ask for a one-hour sleep; the test provider never resolves it anyway
-      (local.set $f (call $sleep (local.get $h) (i64.const 3600000000000)))
-      (local.set $status (call $future-read (local.get $f) (i32.const 16)))
-      (if (i32.eq (local.get $status) (i32.const -1))
-        (then
-          (local.set $ws (call $ws-new))
-          (call $ws-join (local.get $f) (local.get $ws))
-          (drop (call $ws-wait (local.get $ws) (i32.const 32)))
-          (call $ws-join (local.get $f) (i32.const 0))
-          (call $ws-drop (local.get $ws))))
-      (call $future-drop (local.get $f))
+      (call $sleep (call $default) (i64.const 3600000000000))
       (call $task-return (i32.const 9))))
 
   (core instance $i (instantiate $m
-    (with "libc" (instance $libc))
     (with "host" (instance
       (export "default" (func $default-lowered))
       (export "sleep" (func $sleep-lowered))
-      (export "future-read" (func $future-read))
-      (export "waitable-set-new" (func $ws-new))
-      (export "waitable-join" (func $ws-join))
-      (export "waitable-set-wait" (func $ws-wait))
-      (export "future-drop" (func $future-drop))
-      (export "waitable-set-drop" (func $ws-drop))
       (export "task-return" (func $task-return))))))
 
   (func (export "main") async (result u32) (canon lift (core func $i "main") async))

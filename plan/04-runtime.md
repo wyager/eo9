@@ -242,10 +242,12 @@ exports, which is exactly what wasmtime 45 requires for a guest that awaits.
 `tests/readwrite.rs` builds the component via the guest workspace if it is missing
 (normally `cargo xtask build-guest` has already produced it).
 
-**Cross-crate touch-up (disclosed).** Adding the `fs` field to `Providers` required a
+**Cross-crate touch-ups (disclosed).** Adding the `fs` field to `Providers` required a
 one-line `fs: None` addition at the two existing construction sites outside this area
-(`crates/eo9/src/providers.rs`, `tests/eo9-integration/tests/determinism.rs`) to keep the
-workspace compiling; areas 11/13 may replace those with real fs providers when ready.
+(`crates/eo9/src/providers.rs`, `tests/eo9-integration/tests/determinism.rs`), and area
+13's kill/linearity sleeper fixture was mechanically re-synced to the async `sleep`
+operation (its old future-returning import no longer links). Areas 11/13 own both files
+and may adjust further.
 
 ### Escalations for the planner
 
