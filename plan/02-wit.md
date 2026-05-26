@@ -150,3 +150,36 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
     component-algebra; wit-bindgen keeps `arg-spec`/`named-arg` visible as `use` aliases inside both
     interfaces, so existing guest code compiles unchanged. Host-side implementation of the new function
     falls to areas 03/04; eosh's generated bindings already require it.
+14. **`eo9:pci` — standardized PCI / PCI Express device API (owner request, branch `area/02-pci`).**
+    New package `wit/pci` with the usual shape: types-only `types`, the `pci` interface, `pci-optional`,
+    per-world config interfaces, and worlds `none` / `deny` / `filtered`. Shape decisions and reasoning:
+    (a) `device-address` (segment/bus/device/function) lives in `types` next to `pci-impl` so
+        `filtered-config` can name it without dragging the authority-bearing `pci` interface into the
+        world's imports — same motivation as decision 4, extended to a pure-data record.
+    (b) Configuration-space and BAR register access is **width-explicit** (`access-width:
+        byte|word|dword|qword`, values zero-extended/truncated through u64) rather than owned-buffer:
+        register access is width-sensitive (a 4-byte register is not four 1-byte writes), so the width is
+        part of the request. There are no bulk-data operations in v0, so `eo9:pci` has **no `eo9:io`
+        dependency**; a bulk BAR read/write with the owned-buffer round-trip can be added later if a
+        real driver wants it (framebuffers).
+    (c) Interrupts: `enable-interrupts(kind, count) -> list<interrupt>` (one resource per vector; intx is
+        exactly one; dropping every handle disables delivery) and a repeated `wait(borrow<interrupt>) ->
+        u64` that returns the number of deliveries coalesced since the previous wait — the same
+        repeated-await convention as `net.accept`/`task.wait`, per decision 12 no `stream` value types.
+    (d) DMA: `alloc-dma` hangs off the `device` (not the root) because the mapping — and the IOMMU domain,
+        where one exists — is per-device and the returned bus/IOVA address is only meaningful for that
+        device. `dma-buffer` exposes `dma-address`/`dma-len` plus `dma-read`/`dma-write` copy accessors
+        that mirror `eo9:io` buffer's accessors (including trap-on-out-of-bounds); how a `dma-buffer`
+        relates to `eo9:io` buffer (e.g. a NIC driver handing DMA'd packets up as buffers) is an open
+        question flagged to the planner.
+    (e) Device control is explicit where it is security-relevant: `set-bus-master` and `reset` are
+        first-class ops (auditable, deniable by an attenuator) even though they are expressible as raw
+        config-space writes; a provider that gates DMA must also filter command-register config writes.
+    (f) Worlds: `none` (absence — universal), `deny` (refusal is meaningful for PCI), and `filtered`
+        (attenuator: `configure(allow: list<device-address>)`, only listed devices are enumerable/openable,
+        everything else answers `denied`) — `filtered` is how "exactly this one device" grants are
+        composed, which is the security posture for a capability that implies DMA. Stub implementations:
+        `pci.none` shipped under `guest/stubs/pci-none` (area-09 conventions, registered in
+        `GUEST_COMPONENTS`); `pci.deny`/`pci.filtered` implementations are deferred to area 09.
+    (g) `wit/check.sh` now validates `pci`; no existing package changed. SPEC.md has no PCI section yet —
+        a proposed paragraph went to the planner with this decision.
