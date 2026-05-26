@@ -328,8 +328,9 @@ fn seeded_stub_bytes() -> Vec<u8> {
     std::fs::read(path).unwrap()
 }
 
-/// Currently captures the open issue: the algebra-configured composition traps at
-/// instantiation (see the test below). Returns the spawn error text.
+/// Configures the real `entropy.seeded` stub with the given seed at compose time,
+/// composes it onto the entropy consumer, runs it, and returns the rendered outcome
+/// (or the spawn error text).
 fn run_configured_consumer(seed: &str) -> String {
     let engine = new_engine(&EngineOptions::default()).unwrap();
     let stub = eo9_component::Component::load(seeded_stub_bytes()).unwrap();
@@ -351,17 +352,33 @@ fn run_configured_consumer(seed: &str) -> String {
     }
 }
 
-/// KNOWN OPEN ISSUE (planner decision pending — see plan/04 D12): the composition produced
-/// by `configure` + `compose` traps at *instantiation* with "uninitialized element" (an
-/// indirect call through a never-initialized table slot in the synthesized binder), so the
-/// configured provider never runs under wasmtime 45. This test pins that exact behaviour;
-/// flip it to assert the deterministic seeded stream once the binder issue is resolved
-/// (host-side fix or bind-on-first-use in the algebra).
+/// Behavioral proof of the algebra's `configure` (resolves the binder issue previously
+/// pinned here, see plan/04 D12): the seeded provider is configured entirely at compose
+/// time -- the program neither imports nor calls any configuration surface -- and the
+/// composition runs under wasmtime and observes the deterministic SplitMix64 stream for
+/// the baked-in seed.
 #[test]
-fn algebra_configured_composition_currently_traps_at_instantiation() {
-    let result = run_configured_consumer("9");
+fn algebra_configured_composition_observes_the_seeded_stream() {
+    /// First draw of the stub's documented SplitMix64 stream, truncated to u32 by the
+    /// consumer.
+    fn splitmix_first_draw_u32(seed: u64) -> u32 {
+        let counter = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = counter;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        (z ^ (z >> 31)) as u32
+    }
+
+    let run_nine = run_configured_consumer("9");
     assert!(
-        result.contains("spawn failed") && result.contains("uninitialized element"),
-        "behaviour changed (did the configure binder start working?): {result}"
+        run_nine.contains(&format!("\"{}\"", splitmix_first_draw_u32(9))),
+        "expected the seed-9 stream, got: {run_nine}"
+    );
+    // Same baked-in seed, same stream; a different seed, a different stream.
+    assert_eq!(run_nine, run_configured_consumer("9"));
+    let run_ten = run_configured_consumer("10");
+    assert!(
+        run_ten.contains(&format!("\"{}\"", splitmix_first_draw_u32(10))),
+        "expected the seed-10 stream, got: {run_ten}"
     );
 }
