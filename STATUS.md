@@ -3,10 +3,12 @@
 Maintained by the planner; refreshed when merges land. Companion docs: `PLAN.md` (how work is organized),
 `plan/*.md` (per-area briefs + decisions), `GAPS.md` (known gaps and deferred items), `SPEC.md` (the design).
 
-_Last updated: 2026-05-26, master at 0dc0fb5. The latest wave is fully merged: eo9:pci, shell tab-completion
-+ capability-aware `env`, configure for async-API providers, kernel milestone 3 (component-model-async on
-no_std; async guests on bare metal), the xtask test-ordering fix, and the eo9.org `/try` in-browser demo.
-No area branches are currently in flight; the next wave is pending three owner decisions (see Next up)._
+_Last updated: 2026-05-26, master at a72abfb. Headline: **Eo9 now boots to an interactive eosh shell on
+bare metal (aarch64/QEMU).** This wave also merged eo9:pci, shell tab-completion + capability-aware `env`,
+the interactive-prompt fix, configure for async-API providers, kernel milestones 3–4 (component-model-async
+on no_std; async guests; baked-in store; boot-to-eosh), the xtask test-ordering fix, the eo9.org `/try`
+in-browser demo, and the wasm32+Pulley embed feasibility spike. On-target codegen is the last MVP-gating
+rung. Pending owner decisions: /try v2 path and `eo9-embed` go/no-go (see Next up)._
 
 ## Works today (usermode, on master, CI-gated)
 
@@ -30,12 +32,19 @@ No area branches are currently in flight; the next wave is pending three owner d
   optional-absent / would-be-refused. Exec is granted to the shell only; provider flags bind `configure`.
 - The out-of-box demo flow: bare `eo9` boots to the shell and, on an empty store, seeds ~22 components
   embedded in the binary (hello, the stubs, eosh itself); `eo9 <name-or-path> [--flags]` is an implicit run.
-- **Bare metal (aarch64/QEMU):** `cargo xtask build-kernel aarch64 && cargo xtask qemu aarch64` boots Eo9 on
-  the `virt` machine — MMU on, kernel root providers (PL011 text, PL031/generic-timer time, seeded entropy),
-  the real `eo9-example-hello` ending in `outcome = success(greeted)`, **plus async guests**: a component
-  that suspends across a 50 ms sleep against the kernel timer, and the unmodified `entropy.seeded` stub
-  configured through its async-lifted `configure`. Component-model-async runs on the no_std kernel via a
-  minimal vendored wasmtime patch (15 files, ~329 lines, kernel-workspace-only; see GAPS for upstreaming).
+- **Bare metal (aarch64/QEMU) — boots to an interactive shell:** `cargo xtask build-kernel aarch64 &&
+  cargo xtask qemu aarch64` boots Eo9 on the `virt` machine straight into an **interactive eosh prompt over
+  serial**. The unmodified eosh runs against kernel-side fs (a read-only `/bin` view of a baked-in 7-program
+  store image), exec, and root providers; a user can `hello --name metal --excited true`, `cruncher`,
+  `outcomes --mode fail`, `env`, `describe`, and `exit` (clean PSCI power-off). Children receive text/time/
+  entropy only — never fs or exec (an fs-needing program is refused at instantiation). MMU on; PL011 text,
+  PL031/generic-timer time, seeded entropy. Async works: a guest suspends across a 50 ms sleep against the
+  kernel timer; the unmodified `entropy.seeded` stub runs through its async-lifted `configure`. CM-async runs
+  on the no_std kernel via a minimal vendored wasmtime patch (15 files, ~329 lines, kernel-workspace-only).
+  Headless modes: `cargo xtask qemu aarch64 demo` (the m1–m3 sequence) and `program=<name> [k=v …]` both
+  self-power-off; the no-argument boot is interactive and does not self-terminate. Not yet on metal:
+  composition (`$`/`&`) — `compile` is an AOT-artifact lookup today, so composition arrives with on-target
+  codegen — plus GIC (executor still polls) and child fuel.
 - The eo9.org website (`www/`): static site + logo + standalone Rust server with built-in ACME TLS, and the
   `/try` page — real example components (hello, outcomes, cruncher, readwrite incl. async/JSPI) transpiled
   at build time and run client-side in the visitor's browser, with a live grant/revoke capability demo.
@@ -59,7 +68,7 @@ No area branches are currently in flight; the next wave is pending three owner d
 | Integration suites (capability laws, determinism, invoker-configured env, kill/linearity, CLI transcripts) | `tests/eo9-integration` + `crates/eo9/tests` | 30+ tests; QEMU tier not started |
 | Usermode binary `eo9` | `crates/eo9` | run/store/describe/compile/cache/shell/demo-seeding done |
 | Website + server + /try in-browser demo | `www/` | complete, deployable; /try v2 (eosh in browser) pending |
-| Bare-metal kernel (aarch64: boot, heap, timer, MMU, kernel providers, sync + async guests on metal, vendored CM-async no_std patch) | `kernel/` | milestones 1–3 merged; boot-to-eosh and on-target codegen next; riscv64/x86_64 not started |
+| Bare-metal kernel (aarch64: boot, heap, timer, MMU, kernel providers, sync + async guests, baked-in store, **boot-to-interactive-eosh**, vendored CM-async no_std patch) | `kernel/` | milestones 1–4 merged; on-target codegen (unlocks composition) is the next + last MVP rung; GIC/fuel/sched + riscv64/x86_64 deferred |
 
 ## In progress right now
 
@@ -68,21 +77,25 @@ No area branches are currently in flight; the next wave is pending three owner d
 
 ## Next up (rough order)
 
-1. Kernel ladder: boot-to-eosh on metal — read-only store image + cmdline program selection, GIC (stop
-   busy-polling), UART RX, fuel on metal, eo9-sched adoption — then the wasmtime-environ/cranelift no_std
-   port for **on-target codegen (required for MVP; Pulley only as a stopgap)**; then riscv64/x86_64 and the
-   QEMU test tier.
-2. Owner decisions pending: (a) configure for resource-owning providers — grow the binder (resource proxying)
-   vs a runtime-assisted configuration path vs park; (b) /try v2 — the real eosh REPL in the browser
-   (JS exec host + HTTP-backed store) — go/no-go; (c) whether/who to offer the wasmtime no_std CM-async
-   patch upstream.
-3. Demo packaging: ship prebuilt components with the published crate so `cargo install eo9; eo9` works
+1. **On-target codegen** (the last MVP-gating rung): port the wasmtime-environ `compile` + cranelift layers
+   to no_std+alloc so the kernel can compile components on the machine (and the bare-metal shell gains `$`/`&`
+   composition); Pulley only as a stopgap. The 2026-05-26 upstream survey found cranelift no_std work
+   actively landing upstream — build on it rather than duplicate. (plan/12)
+2. Kernel hardening toward "more than a spike": GIC + interrupts (stop busy-polling), child fuel +
+   eo9-sched adoption, io/buffers + fs/types wiring for children (friendly missing-fs story), cache
+   maintenance / W^X for code pages; then riscv64/x86_64 ports and the QEMU test tier.
+3. Owner decisions pending: (a) /try v2 path — JSPI-backed fiber shim now vs raise the fiberless-callback
+   question upstream and keep v1 vs hold (planner rec: raise upstream + start eo9-embed); (b) `eo9-embed`
+   library crate go/no-go (path-independent foundation for /try v2 and `eo9 bundle`); (c) whether to file
+   the wasmtime no_std CM-async patch upstream (owner ruling: hold until the metal track has a working
+   end-to-end result — boot-to-eosh now qualifies, so revisitable).
+4. Demo packaging: ship prebuilt components with the published crate so `cargo install eo9; eo9` works
    without a checkout.
-4. Bundle milestone: `eo9-embed` library + `eo9 bundle` (native executables for other OSes).
-5. eo9:pci follow-ups: `pci.deny`/`pci.filtered` stubs (area 09); a kernel/QEMU virtio-over-PCI provider as
+5. Bundle milestone: `eo9-embed` library + `eo9 bundle` (native executables for other OSes).
+6. eo9:pci follow-ups: `pci.deny`/`pci.filtered` stubs (area 09); a kernel/QEMU virtio-over-PCI provider as
    the first real consumer; dma-buffer ↔ `eo9:io` buffer story.
-6. Exec follow-ups: guest-facing `resume`/fuel donation (E5); net provider linking, `net.loopback`,
+7. Exec follow-ups: guest-facing `resume`/fuel donation (E5); net provider linking, `net.loopback`,
    Message API; eofs milestone 2+ (provider, mkfs, store-on-eofs, content hashes).
-7. Housekeeping: push to origin, crates.io name, Message/perf/threads API design.
+8. Housekeeping: push to origin, crates.io name, Message/perf/threads API design.
 
 See `GAPS.md` for known limitations and deferred decisions.

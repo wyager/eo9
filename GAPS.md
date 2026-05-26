@@ -82,10 +82,14 @@ xtask-order / web-try wave)._
 - **Wasmtime version bumps are not free:** CM-async internals are churning upstream, so any future bump off
   45 requires re-verifying the binder's ABI-constants block (and the kernel executor's mirrored encodings)
   and re-AOT-ing all cached/baked artifacts.
-- **Kernel current limits:** executor busy-polls until GIC interrupt handling lands; `text.read-line`
-  reports EOF (no UART RX); fuel not yet enabled on metal; no read-only store image or cmdline program
-  selection yet (hello's args are fixed in the kernel); eo9-sched not yet adopted. These are the
-  boot-to-eosh-on-metal work items. (plan/12 D17–18)
+- **Kernel current limits (post boot-to-eosh):** the bare-metal shell can *run* baked-in store programs but
+  cannot *compose* them — `compile` is an AOT-artifact lookup, so `$`/`&` return a clean "arrives with
+  on-target codegen" error; composition on metal unlocks with the codegen rung. Also: executor and read-line
+  still busy-poll (no GIC); no child fuel yet (compile-relevant — lands with re-precompiled artifacts +
+  scheduler work); eo9-sched not yet adopted; children lack io/buffers + fs/types wiring, so an fs-needing
+  child gets the raw linker missing-import error instead of the friendly missing-fs story; no session
+  manifest for headless runs. Behavioral note: the no-argument boot is now interactive and does not
+  self-power-off — automation uses `demo` or `program=<name>`. (plan/12 D22–25)
 - **Kernel hardening debt:** identity-map MMU without D/I-cache maintenance on code publication or W^X for
   wasm code pages (QEMU tolerates it, real hardware will not); polled timer; exceptions are fatal.
   (plan/12 D3–4)
