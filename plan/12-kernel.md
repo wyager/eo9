@@ -410,3 +410,57 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
       implemented on the bare-metal kernel yet" error). That makes on-target codegen reachable interactively
       rather than only in the boot demo. Then: optional fuel-on-metal and a determinism check.
 
+30. **Checkpoint 4 — survey: interactive composition is a *second* multi-crate no_std fork (the algebra
+    layer), comparable to the codegen rung, not a wire-up.** The codegen work made the kernel *compile*
+    component bytes on-target; what the shell still cannot do is *produce the fused component bytes* that a
+    composition expression (`$`/`&`/`only`/`configure`) denotes. In usermode that fusion is
+    `crates/eo9-component` (`compose`/`extend`/`restrict`/`rename`/`configure`), which is byte-level
+    component composition — not anything wasmtime does at instantiation. To run `entropy.seeded $ cruncher`
+    on metal honestly (reusing the real algebra, per the brief — no kernel-only re-implementation, no
+    host-prefused lookups, no runtime instance-linking shortcut), that algebra must build no_std and link
+    into the kernel. There is **no honest partial that delivers the user-visible goal without it**: the
+    shell's `compile` already has a working codegen path (Decision 29), but it has nothing fused to compile
+    until the algebra produces a fused component, and a baked program already runs via the AOT fast path, so
+    routing plain programs through codegen adds latency without function. Hence this checkpoint is gated on
+    the algebra fork below; this Decision records the survey so the next session executes rather than
+    re-discovers. No code landed this pass (the worktree stays building; nothing half-vendored was
+    committed). **Magnitude: similar to or larger than Decisions 26–29.**
+
+    - **What `eo9-component` needs (`compose`/`extend` → `wac_graph::CompositionGraph`):** the dependency
+      closure is wasmparser, wasm-encoder, wit-parser, wasm-wave, wac-types, wac-graph, wit-component, plus
+      anyhow, id-arena, indexmap, semver, bitflags, serde, thiserror, log, petgraph, wasm-metadata.
+    - **Already no_std-capable (just enable the `std=false` feature + resolve feature-unification, the same
+      gotcha as Decision 28):** wasmparser, wasm-encoder, wit-parser, wasm-wave (all four have an `std`
+      feature and `#![no_std]`), semver, bitflags, anyhow, id-arena, indexmap, serde, log, and thiserror
+      (2.x supports no_std via `core::error::Error`). `eo9-component`'s own only-std use is
+      `std::collections::BTreeMap` — trivial.
+    - **Vendor + de-std (mechanical, like Decision 28):** `wac-types` (~5.2k lines, 8 files; deps all
+      no_std-capable — the cleanest), `wac-graph` (~3.0k lines, 4 files; almost no `std::`/io itself), and
+      `wit-component` (~14k lines, 15 files — but its `wat`/`wast` deps are optional features we do NOT
+      enable, so the text-format parser drops out; composition needs only the binary encoder path).
+    - **Two genuine sub-blockers (need a decision, not just elbow grease):**
+      1. **`wasm-metadata` cannot be ported — it must be excised.** It is a dep of both `wac-graph` and
+         `wit-component`, and it pulls `clap`, `flate2`, `url`, `serde_json`, `spdx`, `auditable-serde` —
+         none no_std. It is used only to merge the `producers`/`metadata` custom sections, which Eo9 does not
+         need on metal. Plan: feature-gate or delete the metadata-merging code paths in the vendored
+         `wac-graph`/`wit-component` so `wasm-metadata` leaves the closure. Invasive (removing a code path)
+         but bounded; document in `kernel/vendor/README.md`.
+      2. **`petgraph` (0.6) no_std is unverified.** `wac-graph` uses it for the composition graph
+         (topological ordering of instantiation). Confirm `default-features=false` gives the algorithms
+         `wac-graph` actually calls under no_std; if not, vendor/replace (the used surface is small — a
+         DAG topo-sort — so a hand-rolled replacement in vendored `wac-graph` is a fallback).
+    - **After the algebra builds no_std:** make `eo9-component` (or a thin kernel-side reuse of it) linkable
+      from the kernel; add `compose`/`extend`/`restrict`/`rename`/`configure` to `shellexec.rs` calling the
+      real algebra on the `/bin` store components; change `compile` so a *fused* component (no baked
+      artifact) goes through `codegen.rs` (Decision 29) while a plain baked program keeps the AOT fast path;
+      run the fused result against the kernel roots with the existing child/capability rules. Then test
+      `entropy.seeded $ cruncher …` interactively and confirm capability containment still holds.
+    - **`build-kernel` already enables `wasm-codegen`** (Decision 29), so the compile half is ready; this
+      checkpoint adds an algebra feature/closure on top. Keep the featureless CI build lean and green.
+    - **Alternatives if the full fork is not wanted now (recorded, not recommended):** (a) defer interactive
+      composition and ship the rest of the metal MVP (the shell already runs baked programs, and on-target
+      codegen is proven in the boot demo); (b) a minimal hand-rolled binary component composer in the kernel
+      using only wasmparser+wasm-encoder for the `provider $ consumer` case — rejected here because it is a
+      kernel-only re-implementation that would drift from the spec/usermode sealing+type-checking semantics,
+      which the brief forbids.
+
