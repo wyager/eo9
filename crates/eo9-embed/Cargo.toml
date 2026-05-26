@@ -1,0 +1,33 @@
+# eo9-embed: embed a usermode Eo9 instance in any Rust program (plan/16-embed.md).
+#
+# This is the reusable core behind the future `eo9 bundle` command and the /try v2 browser
+# blob: the runtime + a pluggable root-provider backend behind a small builder API. It
+# composes the sibling crates through their public APIs and adds no foundation dependencies
+# of its own — the wasmtime engine is only ever touched through the types eo9-runtime hands
+# back.
+#
+# Features:
+#   * `host` (default): the host-OS-backed provider backend (stdio text, the wall clock,
+#     the OS RNG, and a rooted host filesystem), via eo9-providers-unix. Turn it off
+#     (`default-features = false`) for a portable build that keeps only the in-memory
+#     `sandbox` backend — the shape the wasm32/Pulley embedding (plan/15) will extend.
+[package]
+name = "eo9-embed"
+description = "Embed a usermode Eo9 instance in a Rust program: a pluggable root-provider backend plus the runtime behind a small builder API."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license = "MIT"
+
+[features]
+default = ["host"]
+host = ["dep:eo9-providers-unix"]
+
+[dependencies]
+eo9-component = { workspace = true }
+eo9-runtime = { workspace = true }
+eo9-providers-unix = { workspace = true, optional = true }
+
+[[example]]
+name = "embed_hello"
+required-features = ["host"]
