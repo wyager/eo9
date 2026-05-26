@@ -663,11 +663,26 @@ impl Task {
     /// Outstanding provider operations are dropped with it; each provider's `Drop`
     /// completes or aborts the underlying work on its own schedule, and results destined
     /// for the dead task go nowhere (SPEC "Kill and linearity").
-    pub fn kill(self) -> Outcome {
-        match self.state {
-            LifeState::Done(outcome) => outcome,
-            LifeState::Running => Outcome::Killed,
+    pub fn kill(mut self) -> Outcome {
+        self.kill_in_place()
+    }
+
+    /// Kill the task without consuming the handle: the drive future (and with it the
+    /// store, guest state, and in-flight provider operations) is dropped immediately and
+    /// the task becomes finished with [`Outcome::Killed`] (unless it had already
+    /// finished, in which case that outcome is kept). Later observations — `outcome()`,
+    /// `wait()`, or a guest-level `wait` through the exec surface — see the final
+    /// outcome instead of an error.
+    pub fn kill_in_place(&mut self) -> Outcome {
+        if let LifeState::Done(outcome) = &self.state {
+            return outcome.clone();
         }
+        // Replace the drive with an inert future, dropping the store and everything in it.
+        self.drive = Box::pin(std::future::ready(Ok(())));
+        let outcome = Outcome::Killed;
+        self.state = LifeState::Done(outcome.clone());
+        self.doorbell.ring();
+        outcome
     }
 
     /// Fuel donated to this task that has not yet been charged against guest execution

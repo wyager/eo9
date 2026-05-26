@@ -21,3 +21,6 @@ license = "MIT"
 [dependencies]
 wasmtime = { workspace = true, features = ["wave"] }
 eo9-component = { workspace = true }
+
+[dev-dependencies]
+eo9-component = { workspace = true }

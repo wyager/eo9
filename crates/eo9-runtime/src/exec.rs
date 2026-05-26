@@ -186,3 +186,45 @@ impl ExecProvider {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_count_caps_reject_cleanly() {
+        let mut table: Table<u32> = Table::new(2, "thing");
+        table.insert(1).unwrap();
+        table.insert(2).unwrap();
+        let err = table.insert(3).unwrap_err();
+        assert!(format!("{err}").contains("too many live thing handles"));
+        // Freeing a slot makes room again.
+        table.free(0);
+        table.insert(4).unwrap();
+    }
+
+    #[test]
+    fn component_byte_budget_rejects_an_over_limit_load() {
+        let engine = crate::engine::new_engine(&crate::engine::EngineOptions::default()).unwrap();
+        let mut exec = ExecProvider::new(&engine, ChildPolicy::no_providers());
+        let tiny = eo9_component::Component::load(
+            wasmtime::component::Component::new(&engine, "(component)")
+                .map(|_| wat_bytes())
+                .unwrap(),
+        )
+        .unwrap();
+        // A component whose claimed size exceeds the budget is refused before insertion.
+        let err = exec
+            .insert_component(tiny, MAX_COMPONENT_BYTES + 1)
+            .unwrap_err();
+        assert!(format!("{err}").contains("component byte budget exceeded"));
+        assert_eq!(exec.component_bytes, 0);
+    }
+
+    /// The smallest valid binary component encoding (an empty component), used as a stand-in
+    /// for "some component bytes" in the byte-budget test.
+    fn wat_bytes() -> Vec<u8> {
+        // (component) binary header: magic + version/layer.
+        vec![0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00]
+    }
+}
