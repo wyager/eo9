@@ -3,7 +3,7 @@
 Tracked by the planner so nothing gets lost. Each item notes where it is recorded and what unblocks it.
 Items are removed when closed; design questions move to SPEC.md when resolved.
 
-_Last updated: 2026-05-26 (master at 27bb1af)._
+_Last updated: 2026-05-26 (master at ff9e96b, the kernel milestone-2 merge)._
 
 ## Design decisions deliberately parked
 
@@ -42,12 +42,14 @@ _Last updated: 2026-05-26 (master at 27bb1af)._
 - **Indirect-params ABI case** (>16 flattened configure params) rejected gracefully, not supported.
 
 - **Bare metal: wasmtime's `component-model-async` and compile features require `std` upstream.** Consequence:
-  async eo9 guests (eosh, readwrite, configured stubs) and on-target codegen don't run on metal yet; the
-  sync-ABI `hello` does. Owner-approved sequence: port/upstream CM-async for no_std → boot-to-shell with
-  host-AOT → port the compile layers for on-target codegen (required for MVP; Pulley stopgap only).
-  (plan/12 Decisions 8–9, 11, 14)
-- **Kernel spike hardening debt:** identity-map MMU only (cache maintenance needed for real hardware), polled
-  timer (no GIC), exceptions are fatal. (plan/12 Decisions 3–4)
+  async eo9 guests (eosh, readwrite, configured stubs) and on-target codegen don't run on metal yet; the real
+  `hello` runs because it is sync at the canonical-ABI level. Owner-approved sequence: port/upstream CM-async
+  for no_std (in flight on `area/12-cm-async-nostd`) → boot-to-shell with host-AOT → port the compile layers
+  for on-target codegen (required for MVP; Pulley stopgap only). Decision 14 asks the planner who drives the
+  upstream PR. (plan/12 Decisions 8–9, 11, 14)
+- **Kernel hardening debt:** identity-map MMU without cache maintenance on code publication (needed for real
+  hardware) or W^X for wasm code pages; polled timer (no GIC); exceptions are fatal; hello's `main` args are
+  fixed in the kernel rather than taken from the cmdline. (plan/12 Decisions 3–4, milestone-2 notes)
 
 ## Minor nits / housekeeping
 
