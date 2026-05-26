@@ -756,6 +756,100 @@ fn shell_resolves_store_bound_names_and_eosh_from_the_store() {
     assert!(store.join("shell/bin/eosh.wasm").is_file());
 }
 
+#[test]
+fn shell_env_shows_the_session_capability_picture() {
+    // `env` renders the manifest the shell start writes into the session directory:
+    // what the shell holds, what children receive, and how to grant more.
+    let store = temp_store("shell-env");
+    let run = eo9(&store, &["shell", "-c", "env"]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(
+        run.stdout.contains("capabilities granted to this shell:"),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("exec"), "{}", run.stdout);
+    assert!(
+        run.stdout
+            .contains("programs started from this shell receive:"),
+        "{}",
+        run.stdout
+    );
+    // Without --fs-root, children get no filesystem and env says how to grant one.
+    assert!(run.stdout.contains("--fs-root"), "{}", run.stdout);
+    assert!(
+        run.stdout
+            .contains("never receive the exec capability"),
+        "{}",
+        run.stdout
+    );
+    // The manifest itself sits in the session directory the shell's fs is rooted at.
+    assert!(store.join("shell/session").is_file());
+
+    // With --fs-root, the children's filesystem grant (and its root) shows up.
+    let fs_root = store.join("data");
+    fs::create_dir_all(&fs_root).expect("failed to create the fs root");
+    let granted = eo9(
+        &store,
+        &[
+            "shell",
+            "--fs-root",
+            fs_root.to_str().expect("utf-8 path"),
+            "-c",
+            "env",
+        ],
+    );
+    assert_eq!(granted.code, 0, "stderr: {}", granted.stderr);
+    assert!(
+        granted.stdout.contains("host directory")
+            && granted.stdout.contains("(from --fs-root)"),
+        "{}",
+        granted.stdout
+    );
+    assert!(
+        !granted.stdout.contains("--fs-root <dir> to grant one"),
+        "{}",
+        granted.stdout
+    );
+}
+
+#[test]
+fn shell_env_of_a_program_marks_imports_against_the_session() {
+    let store = temp_store("shell-env-of");
+
+    // hello needs only text, which every session provides.
+    let hello = eo9(&store, &["shell", "-c", "env hello"]);
+    assert_eq!(hello.code, 0, "stderr: {}", hello.stderr);
+    assert!(
+        hello.stdout.contains("eo9:text/text@0.1.0"),
+        "{}",
+        hello.stdout
+    );
+    assert!(
+        hello.stdout.contains("satisfied by the session (text)"),
+        "{}",
+        hello.stdout
+    );
+    // Inspecting never runs the program.
+    assert!(!hello.stdout.contains("Hello"), "{}", hello.stdout);
+
+    // readwrite requires a filesystem; without --fs-root this session would refuse it.
+    let readwrite = eo9(&store, &["shell", "-c", "env readwrite"]);
+    assert_eq!(readwrite.code, 0, "stderr: {}", readwrite.stderr);
+    assert!(
+        readwrite.stdout.contains("eo9:fs/fs@0.1.0"),
+        "{}",
+        readwrite.stdout
+    );
+    assert!(
+        readwrite
+            .stdout
+            .contains("missing — would be refused at spawn"),
+        "{}",
+        readwrite.stdout
+    );
+}
+
 // -----------------------------------------------------------------------------------
 // Store, names, describe
 // -----------------------------------------------------------------------------------
