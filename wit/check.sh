@@ -9,7 +9,7 @@
 set -eu
 cd "$(dirname "$0")"
 
-packages="io text time entropy perf exec disk fs net sandbox"
+packages="io text time entropy perf exec disk fs net pci sandbox"
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT INT TERM

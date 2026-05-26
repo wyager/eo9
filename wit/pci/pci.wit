@@ -1,0 +1,242 @@
+/// eo9:pci — PCI / PCI Express device access: enumeration, configuration space,
+/// BAR (MMIO / I/O-space) register access, interrupts, and DMA buffers.
+///
+/// This is the capability a *driver* holds. It deliberately carries no device-class
+/// semantics (what the registers mean is the driver's business) and no kernel policy
+/// (which devices a program may see is the provider's business — see the `filtered`
+/// world). A PCI device capability that can enable bus mastering is, absent an IOMMU,
+/// effectively full-memory authority; providers are expected to hand out the narrowest
+/// device handle that works (see SPEC: Security, The capability algebra).
+///
+/// See SPEC.md: "Eo9 API design" (async operations, ownership), "Execution APIs"
+/// (hardware roots are satisfied only by the OS core at instantiation).
+package eo9:pci@0.1.0;
+
+/// Root-handle type and the device address, shared by the required and `-optional`
+/// flavors and by the config interfaces. (Types-only interface — see plan/02-wit.md
+/// Decisions.)
+interface types {
+    /// The PCI capability's root handle: a view of (some of) a PCI hierarchy.
+    resource pci-impl;
+
+    /// A PCI(e) function address: segment (domain), bus, device, function.
+    record device-address {
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+    }
+}
+
+interface pci {
+    use types.{pci-impl, device-address};
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> pci-impl;
+
+    /// Configuration-space header layout (header type 0/1/2).
+    enum header-type {
+        endpoint,
+        pci-bridge,
+        cardbus-bridge,
+    }
+
+    /// Identity of one PCI function, as read from its configuration-space header.
+    record device-info {
+        address: device-address,
+        vendor-id: u16,
+        device-id: u16,
+        class-code: u8,
+        subclass: u8,
+        prog-if: u8,
+        revision: u8,
+        header: header-type,
+    }
+
+    /// Memory-space or I/O-space BAR.
+    enum bar-kind {
+        memory,
+        io,
+    }
+
+    /// One base address register of a device.
+    record bar-info {
+        index: u8,
+        kind: bar-kind,
+        /// Size of the decoded region in bytes.
+        size: u64,
+        /// Memory BARs only: the region is prefetchable.
+        prefetchable: bool,
+        /// Memory BARs only: the BAR decodes a 64-bit address (occupies two BAR slots).
+        wide: bool,
+    }
+
+    /// Interrupt delivery mechanisms.
+    enum interrupt-kind {
+        intx,
+        msi,
+        msi-x,
+    }
+
+    /// Access width for configuration-space and BAR register accesses. Register access
+    /// is width-sensitive, so the width is explicit rather than inferred from a buffer
+    /// length; values are zero-extended to / truncated from u64.
+    enum access-width {
+        byte,
+        word,
+        dword,
+        qword,
+    }
+
+    variant pci-error {
+        /// Refused by policy — the error `pci.deny` answers every op with, and what a
+        /// filtering provider answers for devices outside its allow-list.
+        denied,
+        /// No device at that address (or no such BAR / vector).
+        not-found,
+        /// The device is already claimed by another driver.
+        busy,
+        /// Access outside the configuration space, BAR, or DMA buffer.
+        out-of-range,
+        /// The device or provider does not support the request (e.g. MSI-X on a device
+        /// without the capability, function-level reset where unavailable, a qword
+        /// configuration-space access).
+        unsupported,
+        /// No interrupt vectors or DMA address space left.
+        exhausted,
+        io(string),
+    }
+
+    /// An opened PCI function: the unit of grant and of driver ownership.
+    resource device;
+    /// An opened BAR: a window for register access into one region of one device.
+    resource bar;
+    /// One allocated interrupt vector; await it repeatedly to receive deliveries.
+    resource interrupt;
+    /// A DMA-able memory region allocated for (and mapped to) one device.
+    resource dma-buffer;
+
+    // --- enumeration and device access ---------------------------------------
+
+    /// The devices visible through this capability. A provider may expose any subset
+    /// of the physical hierarchy (see the `filtered` world).
+    enumerate: async func(p: borrow<pci-impl>) -> result<list<device-info>, pci-error>;
+
+    /// Claim one function for exclusive driver use.
+    open: async func(p: borrow<pci-impl>, address: device-address)
+        -> result<device, pci-error>;
+
+    // --- configuration space --------------------------------------------------
+
+    /// Read from configuration space at `offset` (byte-addressed; extended config
+    /// space reaches 4 KiB on PCIe). The value is zero-extended to u64.
+    config-read: async func(dev: borrow<device>, offset: u32, width: access-width)
+        -> result<u64, pci-error>;
+
+    /// Write to configuration space at `offset`. The value is truncated to `width`.
+    config-write: async func(dev: borrow<device>, offset: u32, width: access-width, value: u64)
+        -> result<_, pci-error>;
+
+    // --- BARs (MMIO / I/O-space registers) -------------------------------------
+
+    /// Describe the device's base address registers.
+    bars: async func(dev: borrow<device>) -> result<list<bar-info>, pci-error>;
+
+    /// Open one BAR for register access.
+    open-bar: async func(dev: borrow<device>, index: u8) -> result<bar, pci-error>;
+
+    /// Read a register at `offset` within the BAR. The value is zero-extended to u64.
+    bar-read: async func(b: borrow<bar>, offset: u64, width: access-width)
+        -> result<u64, pci-error>;
+
+    /// Write a register at `offset` within the BAR. The value is truncated to `width`.
+    bar-write: async func(b: borrow<bar>, offset: u64, width: access-width, value: u64)
+        -> result<_, pci-error>;
+
+    // --- device control ---------------------------------------------------------
+
+    /// Enable or disable bus mastering (the device's ability to DMA). Providers that
+    /// gate DMA must also filter raw config-space writes to the command register.
+    set-bus-master: async func(dev: borrow<device>, enable: bool) -> result<_, pci-error>;
+
+    /// Function-level reset (or the closest supported equivalent).
+    reset: async func(dev: borrow<device>) -> result<_, pci-error>;
+
+    // --- interrupts --------------------------------------------------------------
+
+    /// Allocate up to `count` interrupt vectors of the given kind. Returns the vectors
+    /// actually allocated (possibly fewer); `intx` allocates exactly one. Dropping every
+    /// returned handle disables delivery for this device.
+    enable-interrupts: async func(dev: borrow<device>, kind: interrupt-kind, count: u32)
+        -> result<list<interrupt>, pci-error>;
+
+    /// Wait for the next delivery on this vector. Returns the number of deliveries
+    /// coalesced since the previous wait (at least 1); call again for the next batch.
+    wait: async func(i: borrow<interrupt>) -> result<u64, pci-error>;
+
+    // --- DMA ----------------------------------------------------------------------
+
+    /// Allocate a DMA-able buffer of `len` bytes mapped for this device (into its IOMMU
+    /// domain where one exists). The allocation is per-device because the device-visible
+    /// address is only meaningful for the device it was mapped for.
+    alloc-dma: async func(dev: borrow<device>, len: u64) -> result<dma-buffer, pci-error>;
+
+    /// The device-visible (bus / IOVA) address of the buffer — what the driver writes
+    /// into the device's descriptors.
+    dma-address: func(b: borrow<dma-buffer>) -> u64;
+
+    /// Total length of the buffer in bytes.
+    dma-len: func(b: borrow<dma-buffer>) -> u64;
+
+    /// Copy `len` bytes starting at `offset` out of the buffer.
+    /// Traps if the range is out of bounds (same contract as eo9:io buffer accessors).
+    dma-read: func(b: borrow<dma-buffer>, offset: u64, len: u64) -> list<u8>;
+
+    /// Copy `bytes` into the buffer starting at `offset`.
+    /// Traps if the range is out of bounds (same contract as eo9:io buffer accessors).
+    dma-write: func(b: borrow<dma-buffer>, offset: u64, bytes: list<u8>);
+}
+
+/// Optional flavor of `pci` (hand-written for v0; see SPEC: The capability algebra).
+interface pci-optional {
+    use types.{pci-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<pci-impl>;
+}
+
+/// Compose-time configuration entry for pci.deny: `configure` returns the root handle
+/// that the exported `pci` serves via `default()` (see SPEC: Binary or provider, never both).
+interface deny-config {
+    use types.{pci-impl};
+    configure: async func() -> result<pci-impl, string>;
+}
+
+/// Compose-time configuration entry for pci.filtered: `configure` binds the allow-list of
+/// device addresses and returns the root handle that the exported `pci` serves via `default()`.
+interface filtered-config {
+    use types.{pci-impl, device-address};
+    configure: async func(allow: list<device-address>) -> result<pci-impl, string>;
+}
+
+/// pci.none — absence: exports the optional flavor answering `none`.
+world none {
+    export types;
+    export pci-optional;
+}
+
+/// pci.deny — refusal: exports `pci` with every operation failing with `denied`.
+world deny {
+    export types;
+    export pci;
+    export deny-config;
+}
+
+/// pci.filtered — attenuation over an underlying PCI capability: only the configured
+/// allow-list of device addresses is visible through `enumerate` and openable; everything
+/// else answers `denied`. This is how "exactly this one device" grants are composed.
+world filtered {
+    import pci;
+    export pci;
+    export filtered-config;
+}

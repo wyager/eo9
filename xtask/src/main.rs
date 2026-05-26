@@ -28,6 +28,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-fs-readonly",
     "eo9-stub-net-deny",
     "eo9-stub-net-none",
+    "eo9-stub-pci-none",
     "eo9-stub-perf-none",
     "eo9-stub-perf-null",
     "eo9-stub-text-none",
