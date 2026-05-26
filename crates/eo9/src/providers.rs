@@ -29,7 +29,8 @@ use eo9_providers_unix::time::{TimeHost, TimeProvider as UnixTime};
 use eo9_providers_unix::{BlockingPool, OwnedBuffer, completer};
 use eo9_runtime::providers::{BoxOp, FsError, FsHandle, FsProvider, NodeKind, NodeStat, OpenFlags};
 use eo9_runtime::{
-    Datetime, EntropyProvider, OutputStream, Providers, Task, TextError, TextProvider, TimeProvider,
+    ChildPolicy, Datetime, EntropyProvider, ExecProvider, Image, OutputStream, Providers, Task,
+    TextError, TextProvider, TimeProvider,
 };
 
 use crate::cli::Config;
@@ -437,7 +438,51 @@ pub fn root_providers(cfg: &Config) -> Result<Providers, String> {
         Some(root) => Some(Box::new(HostFs::new(root, cfg.exec_snapshot)?)),
         None => None,
     };
-    Ok(Providers {
+    Ok(assemble(fs, None))
+}
+
+/// The root providers for a child spawned *by the shell*: exactly the same grant a direct
+/// `eo9 run` would make (text/time/entropy, fs only when `--fs-root` was given), and never
+/// the exec capability. Infallible because the exec provider's child-policy factory cannot
+/// report errors: a broken `--fs-root` degrades to a warning and no filesystem.
+pub fn child_root_providers(cfg: &Config) -> Providers {
+    let fs: Option<Box<dyn FsProvider>> = match &cfg.fs_root {
+        Some(root) => match HostFs::new(root, cfg.exec_snapshot) {
+            Ok(fs) => Some(Box::new(fs)),
+            Err(err) => {
+                eprintln!("eo9: warning: the shell's children get no fs capability: {err}");
+                None
+            }
+        },
+        None => None,
+    };
+    assemble(fs, None)
+}
+
+/// The providers granted to the shell task itself: terminal stdio, the host clocks, the
+/// OS RNG, a filesystem rooted at the session directory (the `/bin` name view eosh
+/// resolves programs from), and the exec capability — the one grant that makes eosh a
+/// native executor. Children spawned through that capability receive
+/// [`child_root_providers`], never exec itself.
+pub fn shell_providers(
+    cfg: &Config,
+    session_root: &Path,
+    image: &Image,
+) -> Result<Providers, String> {
+    let child_cfg = cfg.clone();
+    let policy = ChildPolicy::with_providers(move || child_root_providers(&child_cfg));
+    let fs: Option<Box<dyn FsProvider>> =
+        Some(Box::new(HostFs::new(session_root, cfg.exec_snapshot)?));
+    Ok(assemble(
+        fs,
+        Some(ExecProvider::new(image.engine(), policy)),
+    ))
+}
+
+/// The fixed part of every provider set this binary hands out: terminal stdio, host
+/// clocks, and the OS RNG, plus whatever fs/exec grant the caller decided on.
+fn assemble(fs: Option<Box<dyn FsProvider>>, exec: Option<ExecProvider>) -> Providers {
+    Providers {
         text: Some(Box::new(StdioText {
             inner: UnixText::stdio(),
         })),
@@ -448,8 +493,8 @@ pub fn root_providers(cfg: &Config) -> Result<Providers, String> {
             inner: UnixEntropy::new(),
         })),
         fs,
-        exec: None,
-    })
+        exec,
+    }
 }
 
 // ---------------------------------------------------------------------------------------

@@ -21,7 +21,7 @@ pub const EXIT_ABNORMAL: u8 = 2;
 pub const EXIT_ERROR: u8 = 3;
 
 /// Configuration assembled from the global options (and their defaults).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Config {
     /// `-v` / `--verbose`: diagnostics on stderr.
     pub verbose: bool,
@@ -157,6 +157,34 @@ pub fn parse_program_flags(stream: &mut ArgStream) -> Result<Vec<(String, String
         flags.push((name.to_string(), value));
     }
     Ok(flags)
+}
+
+/// Parse the `shell` command's own arguments: global options plus an optional
+/// `-c`/`--command <line>` one-shot command.
+pub fn parse_shell_args(
+    stream: &mut ArgStream,
+    cfg: &mut Config,
+) -> Result<Option<String>, String> {
+    let mut command = None;
+    loop {
+        consume_global_options(stream, cfg)?;
+        match stream.peek() {
+            Some("-c") | Some("--command") => {
+                let flag = stream.next().expect("peeked token exists");
+                let line = stream
+                    .next()
+                    .ok_or_else(|| format!("option `{flag}` needs a command line"))?;
+                if command.replace(line).is_some() {
+                    return Err("`-c`/`--command` may be given at most once".to_string());
+                }
+            }
+            Some(other) => {
+                return Err(format!("unexpected argument `{other}` for `shell`"));
+            }
+            None => break,
+        }
+    }
+    Ok(command)
 }
 
 /// Fail if any tokens remain.

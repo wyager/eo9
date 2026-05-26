@@ -9,16 +9,19 @@
 //! * `describe` — the component algebra's `describe` over a name or path.
 //! * `compile`  — warm the compile cache without running anything.
 //! * `store`    — `add` / `ls` / `gc` on the content-addressed module store.
-//! * `shell`    — stubbed until the runtime exposes `eo9:exec` to guest programs.
+//! * `shell`    — run eosh (the Eo9 shell, itself a guest component) against a session:
+//!   a `/bin` name view of the store, the terminal, and the exec capability.
 //!
-//! Exit codes for `run` mirror the three-way program outcome: 0 success, 1 failure,
-//! 2 abnormal (trap or kill); 3 means eo9 itself failed before an outcome existed.
+//! Exit codes for `run` and `shell` mirror the three-way program outcome: 0 success,
+//! 1 failure, 2 abnormal (trap or kill); 3 means eo9 itself failed before an outcome
+//! existed.
 
 mod cli;
 mod compile;
 mod describe;
 mod providers;
 mod run;
+mod shell;
 mod source;
 mod storecmd;
 
@@ -67,13 +70,8 @@ fn dispatch(args: Vec<String>) -> Result<u8, String> {
         }
         "store" => storecmd::cmd_store(&mut stream, &mut cfg),
         "shell" => {
-            eprintln!(
-                "eo9: `eo9 shell` is not available yet: eosh is an ordinary Eo9 program and \
-                 needs the runtime to expose the eo9:exec interfaces (component algebra, \
-                 compile, task) to guests, which is still pending (plan/04-runtime.md, \
-                 deferred items). Use `eo9 run <name-or-path>` in the meantime."
-            );
-            Ok(EXIT_ERROR)
+            let command = cli::parse_shell_args(&mut stream, &mut cfg)?;
+            shell::cmd_shell(&cfg, command)
         }
         "help" | "--help" | "-h" => {
             print_help();
@@ -111,7 +109,9 @@ COMMANDS:
     store ls                  List name bindings, objects, and compile-cache entries
     store gc [--max-cache-bytes <n>]
                               Evict compile-cache entries down to a size budget
-    shell                     Not available yet (needs guest-facing eo9:exec)
+    shell [-c <command>]      Run eosh, the Eo9 shell: interactive REPL on the terminal, or
+                              one command line with -c (programs resolve from the store's
+                              bound names; --fs-root governs what children may touch)
     help                      Show this message
 
 OPTIONS (before the program name; `--<flag> <value>` after it belongs to the program):
