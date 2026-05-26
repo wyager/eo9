@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-# Deliberately dependency-free (PLAN.md ground rule 3): plain std argument parsing and
-# std::process only.
+# Kept close to dependency-free (PLAN.md ground rule 3): plain std argument parsing and
+# std::process, plus exactly what `build-kernel` needs to precompile the bare-metal seed
+# component — `wat` to assemble kernel/seed/hello.wat and `wasmtime` (the pinned foundation
+# dependency, already built for this workspace via eo9-runtime) to precompile it for the
+# aarch64-unknown-none target.
 [dependencies]
+wasmtime = { workspace = true, features = ["cranelift", "component-model"] }
+wat = { workspace = true }
