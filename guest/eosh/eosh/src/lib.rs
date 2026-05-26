@@ -227,6 +227,21 @@ impl Backend for WitBackend {
         component_algebra::rename(component, from, to).map_err(|err| algebra_error("`rename`", err))
     }
 
+    fn configure(
+        &mut self,
+        provider: Self::Component,
+        args: &[eosh_core::NamedArg],
+    ) -> Result<Self::Component, BackendError> {
+        let args: Vec<component_algebra::NamedArg> = args
+            .iter()
+            .map(|arg| component_algebra::NamedArg {
+                name: arg.name.clone(),
+                value: arg.value.clone(),
+            })
+            .collect();
+        component_algebra::configure(provider, &args).map_err(|err| algebra_error("configure", err))
+    }
+
     fn compile(&mut self, component: Self::Component) -> Result<Self::Image, BackendError> {
         let opts = compile::CompileOpts {
             debug_info: false,

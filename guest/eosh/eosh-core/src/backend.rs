@@ -174,6 +174,15 @@ pub trait Backend {
         to: &str,
     ) -> Result<Self::Component, BackendError>;
 
+    /// Bind a provider's `configure` arguments as compose-time constants, yielding the
+    /// configured provider (its config interface is no longer visible afterwards).
+    /// This is how a provider's flags are applied before it is used by `$`, `&`, or `with`.
+    fn configure(
+        &mut self,
+        provider: Self::Component,
+        args: &[NamedArg],
+    ) -> Result<Self::Component, BackendError>;
+
     /// Compile a closed binary to an image.
     fn compile(&mut self, component: Self::Component) -> Result<Self::Image, BackendError>;
 
