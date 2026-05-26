@@ -193,6 +193,12 @@ pub trait Backend {
     /// Wait for a task to finish and return its outcome.
     async fn wait(&mut self, task: Self::Task) -> Outcome;
 
+    /// The embedder-written session manifest (the capability picture rendered by the
+    /// `env` builtin — see [`crate::envinfo`]), if one is available. The component
+    /// backend reads it from the session filesystem; `None` simply means the
+    /// information is unavailable and never affects what the shell can do.
+    async fn session_manifest(&mut self) -> Option<String>;
+
     /// Write a line to the shell's standard output.
     fn print(&mut self, text: &str);
 

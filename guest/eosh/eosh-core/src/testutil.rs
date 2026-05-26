@@ -82,6 +82,8 @@ pub struct MockBackend {
     next_task: u32,
     /// The outcome `wait` reports (settable by tests).
     pub outcome: Outcome,
+    /// The session manifest text `session_manifest` reports (settable by tests).
+    pub manifest: Option<String>,
     /// Every backend operation, one line each.
     pub log: Vec<String>,
     /// Lines printed to standard output.
@@ -102,6 +104,7 @@ impl MockBackend {
                 ty: "program-success".to_string(),
                 value: "done".to_string(),
             }),
+            manifest: None,
             log: Vec::new(),
             out: Vec::new(),
             err: Vec::new(),
@@ -299,6 +302,11 @@ impl Backend for MockBackend {
     async fn wait(&mut self, task: u32) -> Outcome {
         self.log.push(format!("wait(t{task})"));
         self.outcome.clone()
+    }
+
+    async fn session_manifest(&mut self) -> Option<String> {
+        self.log.push("session_manifest()".to_string());
+        self.manifest.clone()
     }
 
     fn print(&mut self, text: &str) {

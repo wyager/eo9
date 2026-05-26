@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 
 use crate::ast::{Command, Expr};
 use crate::backend::{Backend, ComponentKind, Outcome};
+use crate::envinfo::{self, SessionManifest};
 use crate::eval::{EvalError, Evaluator, complete_args};
 use crate::parse::parse_command;
 use crate::render::{render_imports, render_info, render_outcome};
@@ -90,32 +91,68 @@ impl<B: Backend> Session<B> {
                 }
                 LineResult::Ok
             }
-            Command::Env => {
-                match &self.environment {
-                    None => self.backend.print("no environment granted"),
-                    Some(environment) => {
-                        let info = self.backend.describe(environment);
-                        self.backend.print("granted environment:");
-                        for line in render_info(&info) {
-                            self.backend.print(&format!("  {line}"));
-                        }
-                    }
-                }
-                if !self.bindings.is_empty() {
-                    self.backend.print("bindings:");
-                    let names: Vec<String> = self.bindings.keys().cloned().collect();
-                    for name in names {
-                        self.backend.print(&format!("  {name}"));
-                    }
-                }
-                LineResult::Ok
-            }
+            Command::Env => self.run_env().await,
+            Command::EnvOf(expr) => self.run_env_of(&expr).await,
             Command::Exit => LineResult::Exit,
             Command::Let { name, expr } => self.run_let(name, &expr).await,
             Command::Describe(expr) => self.run_describe(&expr, false).await,
             Command::Imports(expr) => self.run_describe(&expr, true).await,
             Command::Run(expr) => self.run_program(&expr).await,
         }
+    }
+
+    /// `env`: the session's capability picture (from the embedder's manifest), plus the
+    /// granted environment and `let` bindings the session has built up.
+    async fn run_env(&mut self) -> LineResult {
+        match self.manifest().await {
+            Some(manifest) => {
+                for line in envinfo::render_session(&manifest) {
+                    self.backend.print(&line);
+                }
+            }
+            None => self
+                .backend
+                .print("no session capability information available"),
+        }
+
+        if let Some(environment) = &self.environment {
+            let info = self.backend.describe(environment);
+            self.backend.print("granted environment:");
+            for line in render_info(&info) {
+                self.backend.print(&format!("  {line}"));
+            }
+        }
+        if !self.bindings.is_empty() {
+            self.backend.print("bindings:");
+            let names: Vec<String> = self.bindings.keys().cloned().collect();
+            for name in names {
+                self.backend.print(&format!("  {name}"));
+            }
+        }
+        LineResult::Ok
+    }
+
+    /// `env <expr>`: how this session would treat the expression's imports if it were
+    /// run — without running (or even compiling) anything.
+    async fn run_env_of(&mut self, expr: &Expr) -> LineResult {
+        let mut evaluator = Evaluator::new(&mut self.backend, &self.bindings);
+        let component = match evaluator.eval(expr).await {
+            Ok(output) => output.component,
+            Err(err) => return self.report(err),
+        };
+        let info = self.backend.describe(&component);
+        let manifest = self.manifest().await;
+        for line in envinfo::render_capability_view(&info, manifest.as_ref()) {
+            self.backend.print(&line);
+        }
+        LineResult::Ok
+    }
+
+    /// The parsed session manifest, if the embedder left one where the backend can
+    /// read it.
+    async fn manifest(&mut self) -> Option<SessionManifest> {
+        let text = self.backend.session_manifest().await?;
+        SessionManifest::parse(&text)
     }
 
     /// `let name = expr`: evaluate to a component value and remember it.
@@ -222,7 +259,9 @@ pub fn help_lines() -> &'static [&'static str] {
         "  let <name> = <expr>           name a component or environment value",
         "  (…)                           grouping; a parenthesized argument is passed open, not run",
         "",
-        "builtins: help, env, history, describe <expr>, imports <expr>, exit",
+        "builtins: help, env [<expr>], history, describe <expr>, imports <expr>, exit",
+        "  env            what this session holds and what programs run from it receive",
+        "  env <expr>     how this session treats the expression's imports, without running it",
     ]
 }
 
@@ -428,7 +467,10 @@ mod tests {
         assert_eq!(run(&mut session, ""), LineResult::Ok);
         assert_eq!(run(&mut session, "   # comment only"), LineResult::Ok);
         assert_eq!(run(&mut session, "env"), LineResult::Ok);
-        assert_eq!(session.backend.out, vec!["no environment granted"]);
+        assert_eq!(
+            session.backend.out,
+            vec!["no session capability information available"]
+        );
         assert_eq!(run(&mut session, "help"), LineResult::Ok);
         assert!(session.backend.out.iter().any(|l| l.contains("builtins")));
         assert_eq!(run(&mut session, "history"), LineResult::Ok);
@@ -441,6 +483,77 @@ mod tests {
         );
         assert_eq!(run(&mut session, "exit"), LineResult::Exit);
         assert_eq!(run(&mut session, "quit"), LineResult::Exit);
+    }
+
+    #[test]
+    fn env_renders_the_session_manifest_and_bindings() {
+        let mut session = session_with(&[("time.frozen", provider(&["eo9:time/time"]))]);
+        session.backend.manifest = Some(
+            "eo9-session 1\n\
+             shell text terminal standard streams\n\
+             shell exec spawn programs as children\n\
+             child text terminal standard streams\n\
+             note children never receive the exec capability\n"
+                .to_string(),
+        );
+        assert_eq!(run(&mut session, "let t = time.frozen"), LineResult::Ok);
+        assert_eq!(run(&mut session, "env"), LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(
+            out.contains("capabilities granted to this shell:"),
+            "{out}"
+        );
+        assert!(out.contains("exec"), "{out}");
+        assert!(
+            out.contains("programs started from this shell receive:"),
+            "{out}"
+        );
+        assert!(out.contains("note: children never receive"), "{out}");
+        assert!(out.contains("bindings:") && out.contains("  t"), "{out}");
+    }
+
+    #[test]
+    fn env_of_an_expression_marks_imports_against_the_session() {
+        let mut session = session_with(&[(
+            "reader",
+            crate::backend::ComponentInfo {
+                kind: ComponentKind::Binary,
+                imports: vec![
+                    crate::backend::ImportNeed {
+                        slot: "eo9:text/text".to_string(),
+                        interface: "eo9:text/text".to_string(),
+                        version: "0.1.0".to_string(),
+                        required: true,
+                    },
+                    crate::backend::ImportNeed {
+                        slot: "eo9:fs/fs".to_string(),
+                        interface: "eo9:fs/fs".to_string(),
+                        version: "0.1.0".to_string(),
+                        required: true,
+                    },
+                ],
+                exports: vec![],
+                args: vec![],
+            },
+        )]);
+        session.backend.manifest = Some(
+            "eo9-session 1\n\
+             child text terminal standard streams\n\
+             child time host clocks\n"
+                .to_string(),
+        );
+        assert_eq!(run(&mut session, "env reader"), LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(out.contains("satisfied by the session (text)"), "{out}");
+        assert!(out.contains("missing — would be refused at spawn"), "{out}");
+        // Nothing was compiled or spawned.
+        assert!(
+            !session
+                .backend
+                .log
+                .iter()
+                .any(|line| line.starts_with("compile") || line.starts_with("spawn"))
+        );
     }
 
     #[test]

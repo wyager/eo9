@@ -36,6 +36,7 @@ extern crate std;
 
 pub mod ast;
 pub mod backend;
+pub mod envinfo;
 pub mod eval;
 pub mod lex;
 pub mod parse;
@@ -51,6 +52,7 @@ pub use backend::{
     ArgSpec, Backend, BackendError, ComponentInfo, ComponentKind, ExportSlot, ImportNeed,
     InterfaceRef, NamedArg, Outcome, WaveValue,
 };
+pub use envinfo::SESSION_MANIFEST_PATH;
 pub use eval::{EvalError, EvalOutput, Evaluator};
 pub use parse::{ParseError, parse_command, parse_expr};
 pub use render::render_outcome;
