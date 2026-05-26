@@ -2,7 +2,7 @@
 //! (plan/11-usermode.md): `run` of hello / outcomes / cruncher with the three-way
 //! outcome and exit codes, compile-cache behaviour on a second run, the memory-limit
 //! flag, store-resolved names, `describe`, `compile`, `store` subcommands, and the
-//! current refusal paths (readwrite's fs import, the `shell` stub).
+//! readwrite end to end through the unix fs provider, and the `shell` stub.
 //!
 //! The tests drive the real binary (`CARGO_BIN_EXE_eo9`) as a subprocess, with the
 //! module store pointed at a per-test directory under `CARGO_TARGET_TMPDIR`. Example
@@ -430,12 +430,97 @@ fn memory_limit_flag_is_enforced() {
 }
 
 #[test]
-fn readwrite_reports_the_missing_fs_capability() {
-    // eo9-runtime does not yet link eo9:fs (or the shared eo9:io buffers), so the spawn
-    // is refused by the loader rule rather than running without the capability. This
-    // test documents the current seam; it should start passing end to end once the
-    // runtime grows fs provider wiring.
+fn readwrite_round_trips_through_the_unix_fs() {
+    // The async fs example end to end from the CLI: the program's eo9:fs capability is
+    // the unix fs provider rooted at --fs-root, the owned-buffer write/read round-trip
+    // goes through real host files, and the outcome is the program's own success value.
     let store = temp_store("readwrite");
+    let fs_root = temp_store("readwrite-fsroot");
+    let readwrite = component_arg("readwrite");
+    let run = eo9(
+        &store,
+        &[
+            "--fs-root",
+            fs_root.to_str().expect("utf-8 fs root"),
+            "run",
+            &readwrite,
+            "--path",
+            "note.txt",
+            "--contents",
+            "hello disk",
+        ],
+    );
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert_eq!(run.stdout.trim(), "success(round-tripped(10))");
+
+    // The write really landed on the host filesystem, under the fs root.
+    assert_eq!(
+        fs::read_to_string(fs_root.join("note.txt")).expect("note.txt exists under the fs root"),
+        "hello disk"
+    );
+}
+
+#[test]
+fn readwrite_failures_stay_in_the_programs_vocabulary_and_inside_the_root() {
+    let store = temp_store("readwrite-fail");
+    let fs_root = temp_store("readwrite-fail-fsroot");
+    let readwrite = component_arg("readwrite");
+    let run_with_path = |path: &str| {
+        eo9(
+            &store,
+            &[
+                "--fs-root",
+                fs_root.to_str().expect("utf-8 fs root"),
+                "run",
+                &readwrite,
+                "--path",
+                path,
+                "--contents",
+                "should not land",
+            ],
+        )
+    };
+
+    // A path that tries to climb out of the fs root is refused by the provider's
+    // containment and surfaces as the program's own fs(...) failure case.
+    let escape = run_with_path("../escaped.txt");
+    assert_eq!(escape.code, 1, "stderr: {}", escape.stderr);
+    assert!(
+        escape.stdout.trim().starts_with("failure(fs("),
+        "expected the program's fs failure: {}",
+        escape.stdout
+    );
+    assert!(
+        escape.stdout.contains("Denied"),
+        "expected a denied error: {}",
+        escape.stdout
+    );
+    assert!(
+        !fs_root
+            .parent()
+            .expect("fs root has a parent")
+            .join("escaped.txt")
+            .exists(),
+        "nothing may be created outside the fs root"
+    );
+
+    // Opening inside a directory that does not exist fails through the provider and is
+    // reported the same way (not-found, in the program's vocabulary).
+    let missing = run_with_path("no-such-dir/note.txt");
+    assert_eq!(missing.code, 1, "stderr: {}", missing.stderr);
+    assert!(
+        missing.stdout.trim().starts_with("failure(fs("),
+        "expected the program's fs failure: {}",
+        missing.stdout
+    );
+}
+
+#[test]
+fn fs_is_not_granted_without_an_explicit_fs_root() {
+    // No ambient filesystem authority: without --fs-root there is no fs provider at all,
+    // and a program that requires eo9:fs is refused before it runs, with a hint that
+    // names the flag.
+    let store = temp_store("readwrite-no-grant");
     let readwrite = component_arg("readwrite");
     let run = eo9(
         &store,
@@ -445,15 +530,22 @@ fn readwrite_reports_the_missing_fs_capability() {
             "--path",
             "note.txt",
             "--contents",
-            "hello disk",
+            "should never land",
         ],
     );
     assert_eq!(run.code, 3, "stdout: {}", run.stdout);
     assert!(
-        run.stderr.contains("cannot spawn") && run.stderr.contains("eo9:"),
-        "expected an unsatisfied-import spawn error: {}",
+        run.stderr.contains("--fs-root"),
+        "the refusal should point at --fs-root: {}",
         run.stderr
     );
+    assert!(
+        run.stderr.contains("eo9:fs"),
+        "the refusal should name the missing capability: {}",
+        run.stderr
+    );
+    // And nothing was written anywhere (the repo root is eo9's cwd in these tests).
+    assert!(!repo_root().join("note.txt").exists());
 }
 
 #[test]

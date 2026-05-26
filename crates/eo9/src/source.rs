@@ -111,17 +111,13 @@ fn resolve_path(cfg: &Config, path: &Path) -> Result<ProgramSource, String> {
         return Err(format!("{} is not a regular file", path.display()));
     }
 
-    // The provider is rooted at --fs-root (when given) or the file's own directory, and
-    // the file is addressed by its path below that root.
-    let root = match &cfg.fs_root {
-        Some(root) => root
-            .canonicalize()
-            .map_err(|err| format!("cannot open --fs-root {}: {err}", root.display()))?,
-        None => canonical
-            .parent()
-            .ok_or_else(|| format!("{} has no parent directory", canonical.display()))?
-            .to_path_buf(),
-    };
+    // The snapshot provider is rooted at the program file's own directory and the file is
+    // addressed by name below it. (`--fs-root` is a different concern: it is the root of
+    // the *program's* eo9:fs capability, not of where the program may be loaded from.)
+    let root = canonical
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", canonical.display()))?
+        .to_path_buf();
     let relative = canonical.strip_prefix(&root).map_err(|_| {
         format!(
             "{} is not under the fs root {}",

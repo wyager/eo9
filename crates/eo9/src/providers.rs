@@ -5,25 +5,34 @@
 //! is runtime-agnostic (plain structs, completion callbacks, no wasmtime types), and
 //! `eo9-runtime`'s provider traits use plain futures polled from the task's event loop
 //! (the waker is the task's doorbell). The glue lives here, in the embedder
-//! (plan/11-usermode.md): each adapter wraps a unix provider and bridges its
-//! callback-style completions into the runtime's [`BoxOp`] futures with a one-shot cell.
+//! (plan/11-usermode.md): each adapter (text, time, entropy, fs) wraps a unix provider
+//! and bridges its callback-style completions into the runtime's [`BoxOp`] futures with a
+//! one-shot cell.
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
-use eo9_providers_unix::completer;
 use eo9_providers_unix::entropy::{EntropyHost, EntropyProvider as UnixEntropy};
+use eo9_providers_unix::fs::{
+    FileHost, FileReadCompletion, FileWriteCompletion, FsError as UnixFsError, FsHost,
+    FsProvider as UnixFs, ImmutableHost, NodeKind as UnixNodeKind, OpenFlags as UnixOpenFlags,
+};
 use eo9_providers_unix::text::{
     OutputStream as UnixOutputStream, ReadLineCompletion, TextError as UnixTextError, TextHost,
     TextProvider as UnixText,
 };
 use eo9_providers_unix::time::{TimeHost, TimeProvider as UnixTime};
-use eo9_runtime::providers::BoxOp;
+use eo9_providers_unix::{BlockingPool, OwnedBuffer, completer};
+use eo9_runtime::providers::{BoxOp, FsError, FsHandle, FsProvider, NodeKind, NodeStat, OpenFlags};
 use eo9_runtime::{
     Datetime, EntropyProvider, OutputStream, Providers, Task, TextError, TextProvider, TimeProvider,
 };
+
+use crate::cli::Config;
 
 // ---------------------------------------------------------------------------------------
 // Completion-callback -> future bridge
@@ -156,14 +165,279 @@ impl EntropyProvider for HostEntropy {
     }
 }
 
-/// The root providers of a usermode run: text on the process's standard streams, the
-/// host's real clocks, and the OS RNG.
+/// `eo9:fs/fs` backed by the unix filesystem provider, rooted at a host directory.
 ///
-/// Handing all three to `spawn` never widens a program's capability set: the runtime only
+/// The adapter owns the handle tables: the unix provider hands back `Box<dyn FileHost>` /
+/// `Box<dyn ImmutableHost>` objects, and the runtime's trait speaks in `u32` handles (the
+/// Component Model resource reps), so open operations park the boxed handle in a shared
+/// map keyed by a freshly allocated id and the close callbacks drop it again. Containment
+/// (guest paths can never escape the root) is the unix provider's own guarantee; nothing
+/// here widens it.
+struct HostFs {
+    inner: UnixFs,
+    files: Arc<Mutex<HashMap<FsHandle, Box<dyn FileHost>>>>,
+    execs: Arc<Mutex<HashMap<FsHandle, Box<dyn ImmutableHost>>>>,
+    next_handle: FsHandle,
+}
+
+impl HostFs {
+    /// A provider rooted at `root` (which must exist and be a directory), with the given
+    /// exec-snapshot policy for `open-exec`.
+    fn new(
+        root: &Path,
+        policy: eo9_providers_unix::fs::ExecSnapshotPolicy,
+    ) -> Result<Self, String> {
+        let pool = Arc::new(BlockingPool::with_default_size());
+        let inner = UnixFs::new(root, pool)
+            .map_err(|err| {
+                format!(
+                    "cannot create the fs provider rooted at {}: {err}",
+                    root.display()
+                )
+            })?
+            .with_exec_snapshot_policy(policy);
+        Ok(Self {
+            inner,
+            files: Arc::new(Mutex::new(HashMap::new())),
+            execs: Arc::new(Mutex::new(HashMap::new())),
+            next_handle: 1,
+        })
+    }
+
+    fn alloc_handle(&mut self) -> FsHandle {
+        let handle = self.next_handle;
+        self.next_handle += 1;
+        handle
+    }
+}
+
+fn fs_error(err: UnixFsError) -> FsError {
+    match err {
+        UnixFsError::NotFound => FsError::NotFound,
+        UnixFsError::AlreadyExists => FsError::AlreadyExists,
+        UnixFsError::NotADirectory => FsError::NotADirectory,
+        UnixFsError::IsADirectory => FsError::IsADirectory,
+        UnixFsError::Denied => FsError::Denied,
+        UnixFsError::ReadOnly => FsError::ReadOnly,
+        UnixFsError::NoSpace => FsError::NoSpace,
+        UnixFsError::NotImmutable => FsError::NotImmutable,
+        UnixFsError::Io(message) => FsError::Io(message),
+    }
+}
+
+/// A ready operation, for the defensive unknown-handle paths.
+fn ready_op<T: Send + 'static>(value: T) -> BoxOp<T> {
+    Box::pin(std::future::ready(value))
+}
+
+impl FsProvider for HostFs {
+    fn open(&mut self, path: &str, flags: OpenFlags) -> BoxOp<Result<FsHandle, FsError>> {
+        let handle = self.alloc_handle();
+        let files = Arc::clone(&self.files);
+        let (op, complete) = oneshot();
+        self.inner.open(
+            path,
+            UnixOpenFlags {
+                read: flags.read,
+                write: flags.write,
+                create: flags.create,
+                truncate: flags.truncate,
+            },
+            completer(move |result: Result<Box<dyn FileHost>, UnixFsError>| {
+                complete(match result {
+                    Ok(file) => {
+                        files.lock().unwrap().insert(handle, file);
+                        Ok(handle)
+                    }
+                    Err(err) => Err(fs_error(err)),
+                });
+            }),
+        );
+        op
+    }
+
+    fn open_exec(&mut self, path: &str) -> BoxOp<Result<FsHandle, FsError>> {
+        let handle = self.alloc_handle();
+        let execs = Arc::clone(&self.execs);
+        let (op, complete) = oneshot();
+        self.inner.open_exec(
+            path,
+            completer(move |result: Result<Box<dyn ImmutableHost>, UnixFsError>| {
+                complete(match result {
+                    Ok(exec) => {
+                        execs.lock().unwrap().insert(handle, exec);
+                        Ok(handle)
+                    }
+                    Err(err) => Err(fs_error(err)),
+                });
+            }),
+        );
+        op
+    }
+
+    fn list_directory(&mut self, path: &str) -> BoxOp<Result<Vec<String>, FsError>> {
+        let (op, complete) = oneshot();
+        self.inner.list_directory(
+            path,
+            completer(move |result: Result<Vec<String>, UnixFsError>| {
+                complete(result.map_err(fs_error));
+            }),
+        );
+        op
+    }
+
+    fn stat(&mut self, path: &str) -> BoxOp<Result<NodeStat, FsError>> {
+        let (op, complete) = oneshot();
+        self.inner.stat(
+            path,
+            completer(
+                move |result: Result<eo9_providers_unix::fs::NodeStat, UnixFsError>| {
+                    complete(result.map_err(fs_error).map(|stat| NodeStat {
+                        kind: match stat.kind {
+                            UnixNodeKind::File => NodeKind::File,
+                            UnixNodeKind::Directory => NodeKind::Directory,
+                        },
+                        size: stat.size,
+                    }));
+                },
+            ),
+        );
+        op
+    }
+
+    fn create_directory(&mut self, path: &str) -> BoxOp<Result<(), FsError>> {
+        let (op, complete) = oneshot();
+        self.inner.create_directory(
+            path,
+            completer(move |result: Result<(), UnixFsError>| {
+                complete(result.map_err(fs_error));
+            }),
+        );
+        op
+    }
+
+    fn remove(&mut self, path: &str) -> BoxOp<Result<(), FsError>> {
+        let (op, complete) = oneshot();
+        self.inner.remove(
+            path,
+            completer(move |result: Result<(), UnixFsError>| {
+                complete(result.map_err(fs_error));
+            }),
+        );
+        op
+    }
+
+    fn read(
+        &mut self,
+        file: FsHandle,
+        offset: u64,
+        dst: Vec<u8>,
+    ) -> BoxOp<(Vec<u8>, Result<u64, FsError>)> {
+        let files = self.files.lock().unwrap();
+        let Some(open_file) = files.get(&file) else {
+            return ready_op((dst, Err(FsError::Io("unknown file handle".to_string()))));
+        };
+        let (op, complete) = oneshot();
+        open_file.read(
+            offset,
+            OwnedBuffer::from_vec(dst),
+            completer(move |(buffer, result): FileReadCompletion| {
+                complete((
+                    buffer.into_vec(),
+                    result.map(|read| read.bytes_read).map_err(fs_error),
+                ));
+            }),
+        );
+        op
+    }
+
+    fn write(
+        &mut self,
+        file: FsHandle,
+        offset: u64,
+        src: Vec<u8>,
+    ) -> BoxOp<(Vec<u8>, Result<u64, FsError>)> {
+        let files = self.files.lock().unwrap();
+        let Some(open_file) = files.get(&file) else {
+            return ready_op((src, Err(FsError::Io("unknown file handle".to_string()))));
+        };
+        let (op, complete) = oneshot();
+        open_file.write(
+            offset,
+            OwnedBuffer::from_vec(src),
+            completer(move |(buffer, result): FileWriteCompletion| {
+                complete((
+                    buffer.into_vec(),
+                    result.map(|write| write.bytes_written).map_err(fs_error),
+                ));
+            }),
+        );
+        op
+    }
+
+    fn exec_size(&mut self, handle: FsHandle) -> u64 {
+        self.execs
+            .lock()
+            .unwrap()
+            .get(&handle)
+            .map(|exec| exec.size())
+            .unwrap_or(0)
+    }
+
+    fn exec_read(
+        &mut self,
+        handle: FsHandle,
+        offset: u64,
+        dst: Vec<u8>,
+    ) -> BoxOp<(Vec<u8>, Result<u64, FsError>)> {
+        let execs = self.execs.lock().unwrap();
+        let Some(exec) = execs.get(&handle) else {
+            return ready_op((
+                dst,
+                Err(FsError::Io("unknown immutable handle".to_string())),
+            ));
+        };
+        let (op, complete) = oneshot();
+        exec.read(
+            offset,
+            OwnedBuffer::from_vec(dst),
+            completer(move |(buffer, result): FileReadCompletion| {
+                complete((
+                    buffer.into_vec(),
+                    result.map(|read| read.bytes_read).map_err(fs_error),
+                ));
+            }),
+        );
+        op
+    }
+
+    fn close_file(&mut self, file: FsHandle) {
+        self.files.lock().unwrap().remove(&file);
+    }
+
+    fn close_exec(&mut self, handle: FsHandle) {
+        self.execs.lock().unwrap().remove(&handle);
+    }
+}
+
+/// The root providers of a usermode run: text on the process's standard streams, the
+/// host's real clocks, the OS RNG, and — only when `--fs-root` was given — the host
+/// filesystem rooted at that directory.
+///
+/// Handing these to `spawn` never widens a program's capability set: the runtime only
 /// links the interfaces the component actually imports (the loader rule), and an import
-/// with no provider — today, anything beyond text/time/entropy — is a spawn error.
-pub fn root_providers() -> Providers {
-    Providers {
+/// with no provider is a spawn error. The fs capability is bounded by its root: the unix
+/// provider refuses any path that would escape it.
+pub fn root_providers(cfg: &Config) -> Result<Providers, String> {
+    // The filesystem is granted only when the user names a root explicitly — there is no
+    // ambient default (handing out, say, the current directory unasked would be ambient
+    // authority). Without `--fs-root`, a required fs import is refused at spawn and an
+    // optional one observes absence.
+    let fs: Option<Box<dyn FsProvider>> = match &cfg.fs_root {
+        Some(root) => Some(Box::new(HostFs::new(root, cfg.exec_snapshot)?)),
+        None => None,
+    };
+    Ok(Providers {
         text: Some(Box::new(StdioText {
             inner: UnixText::stdio(),
         })),
@@ -173,10 +447,8 @@ pub fn root_providers() -> Providers {
         entropy: Some(Box::new(HostEntropy {
             inner: UnixEntropy::new(),
         })),
-        // No root fs provider yet: the unix-backed filesystem provider is area 08/11
-        // follow-up work; programs importing eo9:fs keep failing at spawn until then.
-        fs: None,
-    }
+        fs,
+    })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -261,5 +533,91 @@ mod tests {
         };
         assert_eq!(entropy.get_bytes(16).len(), 16);
         let _ = entropy.get_u64();
+    }
+
+    /// Drive a provider operation to completion on the test thread.
+    fn block_on<T>(op: BoxOp<T>) -> T {
+        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut op = op;
+        loop {
+            match op.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
+    /// A fresh scratch directory for one fs-adapter test.
+    fn scratch_dir(test: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("eo9-hostfs-{test}-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn fs_adapter_round_trips_a_file_under_its_root() {
+        let root = scratch_dir("roundtrip");
+        let mut fs = HostFs::new(
+            &root,
+            eo9_providers_unix::fs::ExecSnapshotPolicy::CloneOrRefuse,
+        )
+        .unwrap();
+
+        let flags = OpenFlags {
+            read: true,
+            write: true,
+            create: true,
+            truncate: true,
+        };
+        let file = block_on(fs.open("note.txt", flags)).expect("open should succeed");
+
+        let (_, written) = block_on(fs.write(file, 0, b"hello adapter".to_vec()));
+        assert_eq!(written.unwrap(), 13);
+
+        let (buffer, read) = block_on(fs.read(file, 0, vec![0u8; 13]));
+        assert_eq!(read.unwrap(), 13);
+        assert_eq!(buffer, b"hello adapter");
+
+        let stat = block_on(fs.stat("note.txt")).expect("stat should succeed");
+        assert_eq!(stat.kind, NodeKind::File);
+        assert_eq!(stat.size, 13);
+
+        fs.close_file(file);
+        block_on(fs.remove("note.txt")).expect("remove should succeed");
+        assert_eq!(block_on(fs.stat("note.txt")), Err(FsError::NotFound));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn fs_adapter_keeps_the_root_contained() {
+        let root = scratch_dir("contained");
+        let mut fs = HostFs::new(
+            &root,
+            eo9_providers_unix::fs::ExecSnapshotPolicy::CloneOrRefuse,
+        )
+        .unwrap();
+
+        let flags = OpenFlags {
+            read: true,
+            write: true,
+            create: true,
+            truncate: false,
+        };
+        assert_eq!(
+            block_on(fs.open("../escaped.txt", flags)),
+            Err(FsError::Denied)
+        );
+        assert!(!root.parent().unwrap().join("escaped.txt").exists());
+
+        // An operation on a handle the adapter does not know is an error, never a panic.
+        let (_, result) = block_on(fs.read(999, 0, vec![0u8; 4]));
+        assert!(result.is_err());
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -7,7 +7,7 @@
 //! run-queue machinery (so many tasks can share the CPU under a real policy) is later
 //! work — with a single foreground task there is nothing for a scheduler to decide yet.
 
-use eo9_component::{ArgSpec, Component, ComponentKind};
+use eo9_component::{ArgSpec, Component, ComponentKind, ImportNeed};
 use eo9_runtime::task::FUEL_QUANTUM;
 use eo9_runtime::{NamedArg, Outcome, ResumeOutcome, SpawnLimits, Task, WaveValue};
 
@@ -35,6 +35,17 @@ pub fn cmd_run(cfg: &Config, reference: &str, flags: &[(String, String)]) -> Res
             source.origin
         ));
     }
+    // The filesystem is never granted implicitly: a program that *requires* eo9:fs needs
+    // an explicit `--fs-root` grant, and saying so here beats the raw linker error.
+    // Optional fs imports simply observe absence (the runtime auto-seals them).
+    if cfg.fs_root.is_none() && requires_fs(&info.imports) {
+        return Err(format!(
+            "{} requires the eo9:fs filesystem capability, which eo9 does not grant by \
+             default: pass `--fs-root <dir>` to give the program access to a host \
+             directory (guest paths cannot escape that root)",
+            source.origin
+        ));
+    }
     let args = bind_args(&info.args, flags);
 
     // Obtain the image through the compile cache: a hit is deserialized without codegen,
@@ -48,8 +59,13 @@ pub fn cmd_run(cfg: &Config, reference: &str, flags: &[(String, String)]) -> Res
         max_memory: cfg.max_memory,
         max_table_elements: None,
     };
-    let mut task = Task::spawn(&loaded.image, &args, limits, providers::root_providers())
-        .map_err(|err| format!("cannot spawn {}: {err}", source.origin))?;
+    let mut task = Task::spawn(
+        &loaded.image,
+        &args,
+        limits,
+        providers::root_providers(cfg)?,
+    )
+    .map_err(|err| format!("cannot spawn {}: {err}", source.origin))?;
 
     // The built-in drive loop: donate, run, park on I/O, repeat.
     let mut resumes: u64 = 0;
@@ -95,6 +111,15 @@ fn bind_args(params: &[ArgSpec], flags: &[(String, String)]) -> Vec<NamedArg> {
             NamedArg::new(name.clone(), value)
         })
         .collect()
+}
+
+/// Whether the component has a *required* import of an `eo9:fs` interface — i.e. it
+/// cannot run without an explicit `--fs-root` grant. Optional fs imports do not count:
+/// the runtime seals those with absence.
+fn requires_fs(imports: &[ImportNeed]) -> bool {
+    imports
+        .iter()
+        .any(|need| need.required && need.interface.starts_with("eo9:fs/"))
 }
 
 /// Render the executor's view of how the task ended as the spec's three-way
@@ -174,6 +199,29 @@ mod tests {
         let flags = [("nonsense".to_string(), "1".to_string())];
         let args = bind_args(&params, &flags);
         assert_eq!(args[0], NamedArg::new("nonsense", "1"));
+    }
+
+    #[test]
+    fn only_required_fs_imports_demand_an_fs_root_grant() {
+        let need = |interface: &str, required: bool| ImportNeed {
+            slot: interface.to_string(),
+            interface: interface.to_string(),
+            version: "0.1.0".to_string(),
+            required,
+        };
+        // Required fs (and its types interface) demands a grant.
+        assert!(requires_fs(&[need("eo9:fs/fs", true)]));
+        assert!(requires_fs(&[
+            need("eo9:text/text", true),
+            need("eo9:fs/types", true),
+        ]));
+        // Optional fs is sealed with absence; other APIs never demand a grant.
+        assert!(!requires_fs(&[need("eo9:fs/fs", false)]));
+        assert!(!requires_fs(&[
+            need("eo9:text/text", true),
+            need("eo9:time/time", true),
+        ]));
+        assert!(!requires_fs(&[]));
     }
 
     #[test]
