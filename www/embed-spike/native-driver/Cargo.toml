@@ -1,0 +1,16 @@
+# Host-side half of the wasm32 embed spike:
+#   * `preaot`  — precompile real Eo9 components to Pulley (target pulley32) artifacts,
+#                 mirroring how xtask pre-AOTs artifacts for the bare-metal kernel.
+#   * `run`     — execute the wasm32 probe blob (wasm-host-probe) under the same pinned
+#                 wasmtime, providing only a `host_log` import, and report what it printed.
+[package]
+name = "native-driver"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Default features (cranelift, component-model, async, wat, std…) so the driver can both
+# compile-for-pulley32 and run the probe core module. wasmtime always builds its cranelift
+# dependency with the pulley backend, so no extra feature is needed to target pulley32.
+wasmtime = { workspace = true }

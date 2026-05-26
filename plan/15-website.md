@@ -131,3 +131,67 @@ Arguments-and-outcomes (WAVE), "Shell".
     (`/bin/<name>.wasm`) backed by HTTP fetches of the component bytes. Prerequisites: the upstream fix from
     Decision 11 (stub `configure`), a JSPI story for non-Chromium browsers, and a planner call on how
     faithful the JS `compile`/fuel semantics must be before the page may call the thing it runs "eosh".
+
+## wasm32 embed spike (the /try v2 direction; probe under `www/embed-spike/`)
+
+Owner-approved direction for v2 (and groundwork for `eo9-embed`/`eo9 bundle`): instead of
+re-implementing exec in JavaScript over transpiled components, compile the real usermode stack —
+eo9-runtime + eo9-component + eo9-store + the shell drive loop, with wasmtime inside it on the
+Pulley interpreter backend — to one wasm32 blob, with thin JS shims only for the true roots
+(terminal ↔ text, performance/Date ↔ time, crypto ↔ entropy) and fs from `fs.memfs` or a
+memory-backed provider inside the blob. The spike answers whether wasmtime works as a *host* on
+wasm32 well enough for that.
+
+15. **Pulley execution on a wasm32 host works (sync ABI), fuel included.** The kernel seed component,
+    pre-AOT'd on the host with `Config::target("pulley32")` (no extra cargo features needed — wasmtime
+    always builds its cranelift dependency with the Pulley backend), deserializes, instantiates, and runs
+    inside wasmtime compiled for `wasm32-unknown-unknown`: `hello()` returns the expected string, `add(17,
+    25) -> 42`, and with a `consume_fuel` artifact the store meters fuel (8 units for the seed's `hello()`).
+    The probe blob executes under the repo's own native wasmtime via a 1-function host (`env.host_log`);
+    the whole probe (engine setup, three artifacts, all steps) completes in ~0.5 ms on the host machine.
+16. **The wasm32 embedding is the kernel embedding.** wasmtime's `std` feature does not compile for
+    `wasm32-unknown-unknown` (its std platform layer assumes mmap: `vm::sys::mmap` unresolved), so the blob
+    uses the same custom-platform configuration as the bare-metal kernel: `default-features = false`,
+    `runtime` + `component-model` (+ `async`/`component-model-async` via the kernel's vendored relaxation,
+    reused with `[patch.crates-io]` — upstream's feature graph requires `std` for CM-async), embedder-provided
+    `wasmtime_tls_get/set` + `wasmtime_concurrent_tls_get/set`, a no-op `CustomCodeMemory`, and the same
+    compile-relevant flags as xtask's kernel pre-AOT (`signals_based_traps(false)`, no reservations/guards,
+    no CoW init) with `target("pulley32")` on both sides. The probe crate itself still uses Rust `std`.
+17. **The fiber gap is the one blocker for real Eo9 guests.** Sync instantiation of a CM-async component
+    succeeds, but *every call into an async-lifted export* — `call_async` like the kernel, and
+    `run_concurrent`/`call_concurrent` like eo9-runtime — fails at run time with "fibers unsupported on this
+    host architecture": wasmtime 45 routes all such calls through `wasmtime-fiber`, which has no wasm32
+    stack-switching backend (and refuses to compile under `std` on wasm32; the no_std backend compiles and
+    defers the error to fiber creation). Consequences: the unmodified `entropy.seeded` (and every real Eo9
+    guest, whose `main`/ops are async) cannot run on a wasm32 host with wasmtime 45 as-is. Paths to close it,
+    in rough order of attractiveness: (a) upstream wasmtime work to drive callback-ABI ("stackless") guests
+    without a fiber — check newer wasmtime releases for this before building anything; (b) a JSPI-backed
+    wasmtime-fiber backend for wasm32-in-the-browser (suspend to JS at fiber switch points) — plausible but
+    real engineering and browser-only; (c) Asyncify-instrumenting the whole blob to hand-roll a fiber backend
+    — heavy code-size and complexity cost; treat as last resort. Note that fuel-*sliced* preemption of a
+    running guest (eo9-runtime's resumable tasks) is inherently stackful and will need (b)/(c) or upstream
+    support regardless; fuel as a hard limit (trap on exhaustion) already works.
+18. **In-blob compilation is blocked on the same std/mmap port as kernel on-target codegen.** wasmtime's
+    `cranelift` feature requires `std`, which does not build on wasm32 (Decision 16); so the browser blob
+    cannot compile components itself yet. v2 therefore ships **pre-AOT'd Pulley images** produced at site
+    build time (exactly how xtask pre-AOTs for the kernel), served through the HTTP-backed store; live
+    in-browser compilation becomes a stretch goal that falls out of the same upstream work as the kernel's
+    on-target-codegen rung.
+19. **Size and speed are fine for a demo page.** The probe blob — wasmtime runtime + component model +
+    CM-async machinery + Pulley interpreter + ~126 KB of embedded artifacts, `opt-level = "s"`, LTO,
+    stripped — is 1.03 MiB raw / 373 KiB gzipped. Pre-AOT'd artifacts: seed 3.2 KB, the real
+    `entropy.seeded` stub 117 KB. Pulley-interpreted execution of the demo steps is sub-millisecond on the
+    host; browser numbers will be slower but the same order of magnitude for shell-sized work.
+20. **v2 architecture sketch (pending the fiber answer).** Blob: `eo9-embed` (new library crate factoring
+    the runtime/store/providers behind one API — shared with `eo9 bundle`) + browser root providers (text →
+    JS terminal bridge, time → `performance.now`, entropy → `crypto.getRandomValues`, fs → memfs) compiled
+    to wasm32 with wasmtime-on-Pulley inside. Store: pre-AOT'd Pulley images + component bytes fetched over
+    HTTP from `www/site/try/store/`, content-addressed exactly like the native store. JS surface: a thin
+    ES module that instantiates the blob, wires the terminal, and forwards keystrokes; no JSPI requirement
+    for the blob itself unless (b) above is the chosen fiber path. Determinism/fuel: deterministic
+    environments behave as on native (the providers are the same components); fuel is a hard limit until
+    fibers exist on wasm32. Milestones: (i) resolve the fiber question (upstream check first); (ii)
+    `eo9-embed` crate + native smoke test; (iii) wasm32 build of eo9-embed running `hello` end-to-end in a
+    page; (iv) eosh + store + exec in the blob — the real shell in the browser; (v) fold `/try` v1's page
+    into the new flow (keep the jco path only if it still earns its place). The spike's probe code stays
+    under `www/embed-spike/` as the reference for the wasm32 embedding details until (ii) starts.
