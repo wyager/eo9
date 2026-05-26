@@ -9,22 +9,32 @@
 //! boot (QEMU `virt` has no entropy source the kernel drives yet; virtio-rng is a later
 //! milestone).
 //!
-//! Only the synchronous functions of each interface are registered. The async members
-//! (`text.read-line`, `time.sleep`) and the `configure` interfaces need wasmtime's
-//! component-model-async host machinery, which is `std`-only today (plan/12-kernel.md
-//! Decisions); nothing the hello program imports requires them.
+//! Both the synchronous functions and the async members (`text.read-line`, `time.sleep`)
+//! of each interface are registered; the async ones go through wasmtime's
+//! component-model-async machinery, available on this no_std target via the patched
+//! vendor/wasmtime copy (plan/12-kernel.md Decisions, kernel/vendor/README.md). `sleep`
+//! is a real await against the generic timer; `read-line` reports end-of-input because
+//! serial input is not wired up yet.
 //!
 //! The WIT-shaped host types below are structural copies of the ones in
 //! `eo9-runtime::link`; that crate targets host wasmtime (std + async + WAVE) and does not
 //! compile for `aarch64-unknown-none`, so the shapes are mirrored rather than reused.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 
 use wasmtime::component::{
-    ComponentType, Lift, Linker, LinkerInstance, Lower, Resource, ResourceType,
+    Accessor, ComponentType, Lift, Linker, LinkerInstance, Lower, Resource, ResourceType,
 };
 use wasmtime::{Result, StoreContextMut};
+
+/// Boxed future returned by the `func_wrap_concurrent` closures below (the same shape as
+/// the usermode runtime's alias in `eo9-runtime::link`).
+type ConcurrentFuture<'a, R> = Pin<Box<dyn Future<Output = Result<R>> + Send + 'a>>;
 
 /// Per-call ceiling on `eo9:entropy/entropy.get-bytes` requests, mirroring the usermode
 /// runtime: the host materialises the returned `list<u8>` before it is copied into the
@@ -159,6 +169,17 @@ fn add_text(linker: &mut Linker<KernelState>) -> Result<()> {
         },
     )?;
 
+    // Serial input is not wired up yet (no UART RX path); report end of input rather
+    // than blocking forever, so programs that probe stdin terminate deterministically.
+    text.func_wrap_concurrent(
+        "read-line",
+        |_accessor: &Accessor<KernelState>,
+         (_cap,): (Resource<TextCap>,)|
+         -> ConcurrentFuture<'_, (Result<Option<String>, WitTextError>,)> {
+            Box::pin(async move { Ok((Ok(None),)) })
+        },
+    )?;
+
     Ok(())
 }
 
@@ -200,7 +221,44 @@ fn add_time(linker: &mut Linker<KernelState>) -> Result<()> {
          -> Result<(u64,)> { Ok((crate::timer::resolution_ns(),)) },
     )?;
 
+    // The awaited operation: returns once the generic timer says `duration-ns` of
+    // monotonic time has elapsed. The future re-arms its waker on every poll, so the
+    // kernel's polling executor (super::block_on) keeps driving it; with timer
+    // interrupts (GIC) this becomes an interrupt-armed wake instead of a busy poll.
+    time.func_wrap_concurrent(
+        "sleep",
+        |_accessor: &Accessor<KernelState>,
+         (_cap, duration_ns): (Resource<TimeCap>, u64)|
+         -> ConcurrentFuture<'_, ()> {
+            let deadline = crate::timer::uptime_ns().saturating_add(duration_ns);
+            Box::pin(async move {
+                SleepUntil { deadline }.await;
+                Ok(())
+            })
+        },
+    )?;
+
     Ok(())
+}
+
+/// Future that resolves once the generic timer's uptime reaches `deadline`.
+struct SleepUntil {
+    deadline: u64,
+}
+
+impl Future for SleepUntil {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if crate::timer::uptime_ns() >= self.deadline {
+            Poll::Ready(())
+        } else {
+            // Polled-timer kernel: ask to be polled again right away. The wake is what
+            // makes wasmtime's internal future queue re-poll this future.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
 }
 
 /// `eo9:entropy/entropy`: counter-seeded splitmix64 (a stub, not a CSPRNG).

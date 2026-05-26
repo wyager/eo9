@@ -38,7 +38,10 @@ mod rtc;
 mod timer;
 #[cfg(target_os = "none")]
 mod uart;
-#[cfg(all(target_os = "none", any(feature = "wasm-seed", feature = "wasm-hello")))]
+#[cfg(all(
+    target_os = "none",
+    any(feature = "wasm-seed", feature = "wasm-hello", feature = "wasm-async")
+))]
 mod wasm;
 
 /// Rust entry point, called from the assembly boot stub with the stack set up and `.bss`
@@ -73,7 +76,9 @@ extern "C" fn kmain() -> ! {
     wasm::seed::run();
     #[cfg(feature = "wasm-hello")]
     wasm::hello::run();
-    #[cfg(not(any(feature = "wasm-seed", feature = "wasm-hello")))]
+    #[cfg(feature = "wasm-async")]
+    wasm::async_demo::run();
+    #[cfg(not(any(feature = "wasm-seed", feature = "wasm-hello", feature = "wasm-async")))]
     kprintln!("wasm: no components embedded (build with `cargo xtask build-kernel aarch64`)");
 
     kprintln!(
