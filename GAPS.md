@@ -8,11 +8,6 @@ xtask-order / web-try wave)._
 
 ## Decisions pending with the owner
 
-- **Configure for resource-owning providers** (fs.memfs, disk.mem, net-style): the binder now forwards
-  freestanding sync and async APIs, but interface-owned resources need export-side resource proxying plus
-  variant-shaped `task.return` reloading — both mechanical but substantial codegen (plan/03 D13). Options:
-  grow the binder, add a runtime-assisted configuration path, or park (note: fs.memfs's `configure` takes no
-  args, so the deterministic environment loses nothing today).
 - **Upstreaming the wasmtime no_std CM-async patch** (kernel/vendor/wasmtime: 15 files, ~329 lines,
   documented in kernel/vendor/README.md and plan/12 D16): owner ruling (2026-05-26) — hold until the
   bare-metal track has a working end-to-end result (boot-to-eosh / on-target codegen), then revisit; likely
@@ -27,6 +22,11 @@ xtask-order / web-try wave)._
 
 ## Design decisions deliberately parked
 
+- **Configure for resource-owning providers** (fs.memfs, disk.mem, net-style): owner ruling (2026-05-26) —
+  parked until there are concrete consumers (likely the net/disk provider work) so the strategy can be
+  evaluated against real needs. Options on the table: grow the binder (export-side resource proxying +
+  variant-shaped `task.return` reloading, plan/03 D13) vs a runtime-assisted configuration path. fs.memfs's
+  `configure` takes no args, so the deterministic environment loses nothing today.
 - **Content-only vs layout-dependent eofs node hashes.** eofs `stat` hashes are Merkle roots over the
   physical layout; the spec's fs hash queries may want content-only identity (format v2 field). Decide when
   eofs milestone 2 specifies the `eo9:fs` hash surface. (plan/14 Decisions 4)
