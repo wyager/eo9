@@ -5,14 +5,12 @@
 //!
 //! Scope note: everything here is *in-process, same-machine* determinism. Cross-machine /
 //! cross-compiler-codegen determinism is the store-cache concern tracked by areas 04 and
-//! 06 and is out of scope for this suite. Byte-identity of `eo9_runtime::Image::compile`
-//! output cannot be tested yet because `Image` exposes no serialized form (image
-//! serialization is deferred in plan/04-runtime.md § D7); see plan/13-tests.md Decisions.
+//! 06 and is out of scope for this suite.
 
 use eo9_component::{compose, extend, rename, restrict};
 use eo9_integration::{fixtures, run};
 use eo9_runtime::providers::{CaptureText, FrozenTime, SeededEntropy};
-use eo9_runtime::{NamedArg, Outcome, Providers};
+use eo9_runtime::{EngineOptions, Image, NamedArg, Outcome, Providers, new_engine};
 use eo9_store::{CacheKeyParams, ObjectHash};
 
 /// One run of the determinism guest under fully deterministic providers: frozen time,
@@ -171,4 +169,31 @@ fn store_cache_keys_are_stable_and_sensitive_to_every_field() {
     let mut changed = params.clone();
     changed.compiler_deterministic = true;
     assert_ne!(changed.key(), base, "determinism flag");
+}
+
+/// `Image::compile` + `Image::serialize` (the bytes the compile cache stores) are
+/// byte-identical across repeated in-process compiles of the same component under
+/// identically configured engines — the in-process half of the codegen-determinism claim
+/// the store cache depends on (cross-machine determinism stays out of scope, see the
+/// module docs). Added in milestone 2, once `Image::serialize` existed.
+#[test]
+fn compiled_image_serialization_is_byte_identical_across_repeated_compiles() {
+    let component = compose(&fixtures::answer_provider(7), &fixtures::answer_consumer())
+        .expect("provider $ consumer");
+
+    let serialize = || {
+        let engine = new_engine(&EngineOptions::default()).expect("pinned engine config");
+        Image::compile(&engine, component.bytes())
+            .expect("fixture should compile")
+            .serialize()
+            .expect("compiled image should serialize")
+    };
+
+    let first = serialize();
+    let second = serialize();
+    assert!(!first.is_empty());
+    assert_eq!(
+        first, second,
+        "identically configured engines must produce byte-identical serialized images"
+    );
 }

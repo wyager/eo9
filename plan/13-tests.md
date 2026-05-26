@@ -86,3 +86,47 @@ Everything; starts alongside Phase 1 (law tests) and grows with each milestone.
    the `many-reads` concurrency soak and fuel-conservation accounting (gates I3); the QEMU harness
    tier (gates I4/I5). Law-level property tests stay with area 03
    (`crates/eo9-component/tests/algebra.rs`); this package covers the runtime-observable semantics.
+
+### Milestone 2 (branch `area/13-tests-2`)
+
+7. **Deterministic environment (gate I2), and how the stubs get configured.** The new
+   `tests/deterministic_env.rs` composes the real stub components — `time.frozen`, `entropy.seeded`,
+   `fs.memfs`, built by `xtask build-guest` — around a fixture program with `eo9-component`, both as
+   the `$`-chain and as the `&`-environment form (the two agree, the action law with real stubs), and
+   runs the result with `eo9-runtime`: the program observes the configured frozen instant, the seeded
+   entropy stream, and the memfs contents it creates; repeated runs are byte-identical (outcome and
+   captured output); conflicting ambient root providers change nothing (sealing); and re-composing
+   from the same stubs is byte-identical. **Configuration caveat:** nothing host-side can invoke a
+   provider's `configure` today — `$`/`&` drop the unconsumed `*-config` exports and neither the
+   runtime nor the CLI calls `configure` (eosh reports the same gap, plan/10 § 6a) — so the fixture
+   program itself imports the config interfaces and binds them at the top of `main`, which the
+   composition then seals like any other import. That uses the config interfaces exactly as the WIT
+   defines them, but it is program-side, not invoker-side, configuration; compose-time `configure`
+   binding remains an open cross-area need (escalated again here). The real `text.null` stub also
+   replaces nothing-up-my-sleeve fixture sinks in one ambient-sealing test; the hermetic milestone-1
+   suites keep their in-package fixtures so they still run without any guest artifacts.
+8. **Guest-component harness.** `src/guest.rs` locates `guest/target/components` and builds it on
+   demand (once per process, via `cargo run -p xtask -- build-guest`) — the same convention the
+   runtime's and the CLI's own tests use, needed because `xtask ci` runs host tests before
+   `build-guest`. The CLI suite likewise locates the workspace `eo9` binary next to the test
+   executable and builds it with cargo if missing.
+9. **Runtime rules suite.** `tests/runtime_rules.rs`: the io-buffer caps are enforced as clean
+   in-band errors before any host allocation (per-buffer cap named in the trap for a 16 MiB + 1
+   request; the 64 MiB per-task budget named when a fifth 16 MiB buffer would cross it; within-cap
+   allocations succeed), and the loader rule's optional auto-seal at spawn is observable (the same
+   probe component sees `none` without a grant and `some` with one) — complementing the
+   composition-level absence tests of milestone 1.
+10. **CLI golden transcripts.** `tests/cli_transcripts.rs` drives the `eo9` binary as a subprocess
+    against per-test stores: store add + bind + run-by-name (golden stdout transcript with content
+    hashes and trap reasons normalized), the three-way outcome → exit-code mapping (0/1/2, 3 for
+    eo9's own errors), and the cached second run (`-v` miss/hit diagnostics, identical outcome).
+    fs-from-the-CLI cases are deliberately excluded while area 11 wires the fs provider in parallel.
+11. **Milestone-1 gap closed.** `Image::serialize` now exists, so the determinism suite asserts
+    byte-identical serialized images across repeated in-process compiles under identically configured
+    engines (decision 5a is superseded; cross-machine codegen determinism stays out of scope).
+12. **Skipped stretch goal.** The many-concurrent-reads soak is not included: a credible
+    concurrency soak needs a guest that issues genuinely overlapping async reads (guest-SDK
+    structured concurrency or a far more elaborate hand-written fixture than is reasonable here);
+    it stays queued for milestone 3 (gates I3) alongside fuel-conservation accounting.
+13. **Test-group counts after milestone 2** (30 total): capabilities 8, deterministic-env 5,
+    runtime-rules 4, CLI transcripts 3, determinism 5, kill/linearity 2, harness self-checks 3.

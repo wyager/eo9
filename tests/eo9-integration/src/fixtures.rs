@@ -523,3 +523,344 @@ pub fn sleeper_wat() -> &'static str {
 )
 "#
 }
+
+// -----------------------------------------------------------------------------------------
+// The deterministic-environment fixture (raw component WAT, milestone 2 / gate I2)
+// -----------------------------------------------------------------------------------------
+
+/// The wall-clock seconds [`det_env_guest`] binds through `eo9:time/frozen-config`.
+pub const DET_ENV_FROZEN_SECONDS: i64 = 1111;
+/// The monotonic reading [`det_env_guest`] binds through `eo9:time/frozen-config`.
+pub const DET_ENV_FROZEN_MONOTONIC_NS: u64 = 2222;
+/// The seed [`det_env_guest`] binds through `eo9:entropy/seeded-config`.
+pub const DET_ENV_SEED: u64 = 7777;
+/// The fixed line [`det_env_guest`] writes to stdout (followed by one entropy-derived
+/// character).
+pub const DET_ENV_OUTPUT_LINE: &str = "det-env-ok";
+
+/// The guest of the deterministic-environment suite: a binary that imports the real
+/// `eo9:time`, `eo9:entropy`, `eo9:fs`, and `eo9:text` interfaces *plus the stub
+/// config interfaces* (`frozen-config`, `seeded-config`, `memfs-config`).
+///
+/// Its async `main`:
+/// 1. binds the three stub configurations through their config interfaces (the constants
+///    above — today the config interfaces are ordinary capability imports, because the
+///    algebra has no compose-time `configure` binding yet; see plan/13-tests.md Decisions),
+/// 2. checks that the frozen clock serves exactly the configured instant,
+/// 3. draws two samples from the seeded entropy,
+/// 4. creates and stats a directory in the memfs (and checks a missing path reports
+///    `not-found`),
+/// 5. writes [`DET_ENV_OUTPUT_LINE`] plus one entropy-derived character through `eo9:text`
+///    (left residual, so the ambient text provider captures it), and
+/// 6. returns `x ^ y` over the two entropy samples.
+///
+/// Any failed internal check returns a small sentinel (1..=12) instead, so a broken stub
+/// shows up as a distinct outcome value rather than a trap.
+pub fn det_env_guest() -> Component {
+    let bytes = wat::parse_str(det_env_wat())
+        .expect("det-env fixture must be valid component WAT")
+        .to_vec();
+    Component::load(bytes).expect("det-env fixture should load")
+}
+
+fn det_env_wat() -> String {
+    format!(
+        r#"
+(component
+  ;; ----- time: the API, and time.frozen's config interface --------------------------------
+  (import "eo9:time/types@0.1.0" (instance $time-types
+    (export "time-impl" (type (sub resource)))))
+  (alias export $time-types "time-impl" (type $time-impl))
+  (import "eo9:time/time@0.1.0" (instance $time
+    (export "time-impl" (type $ti (eq $time-impl)))
+    (type $datetime-def (record (field "seconds" s64) (field "nanoseconds" u32)))
+    (export "datetime" (type $datetime (eq $datetime-def)))
+    (type $instant-def (record (field "nanoseconds" u64)))
+    (export "instant" (type $instant (eq $instant-def)))
+    (export "default" (func (result (own $ti))))
+    (export "now" (func (param "t" (borrow $ti)) (result $datetime)))
+    (export "monotonic-now" (func (param "t" (borrow $ti)) (result $instant)))))
+  (import "eo9:time/frozen-config@0.1.0" (instance $frozen-config
+    (export "time-impl" (type $tfc (eq $time-impl)))
+    (export "configure" (func async (param "now-seconds" s64) (param "monotonic-ns" u64)
+      (result (result (own $tfc) (error string)))))))
+
+  ;; ----- entropy: the API, and entropy.seeded's config interface --------------------------
+  (import "eo9:entropy/types@0.1.0" (instance $entropy-types
+    (export "entropy-impl" (type (sub resource)))))
+  (alias export $entropy-types "entropy-impl" (type $entropy-impl))
+  (import "eo9:entropy/entropy@0.1.0" (instance $entropy
+    (export "entropy-impl" (type $ei (eq $entropy-impl)))
+    (export "default" (func (result (own $ei))))
+    (export "get-u64" (func (param "e" (borrow $ei)) (result u64)))))
+  (import "eo9:entropy/seeded-config@0.1.0" (instance $seeded-config
+    (export "entropy-impl" (type $eic (eq $entropy-impl)))
+    (export "configure" (func async (param "seed" u64)
+      (result (result (own $eic) (error string)))))))
+
+  ;; ----- fs: the API (narrowed), and fs.memfs's config interface ---------------------------
+  (import "eo9:fs/types@0.1.0" (instance $fs-types
+    (export "fs-impl" (type (sub resource)))))
+  (alias export $fs-types "fs-impl" (type $fs-impl))
+  (import "eo9:fs/fs@0.1.0" (instance $fs
+    (export "fs-impl" (type $fsi (eq $fs-impl)))
+    (type $fs-error-def (variant
+      (case "not-found") (case "already-exists") (case "not-a-directory")
+      (case "is-a-directory") (case "denied") (case "read-only") (case "no-space")
+      (case "not-immutable") (case "io" string)))
+    (export "fs-error" (type $fs-error (eq $fs-error-def)))
+    (type $node-kind-def (enum "file" "directory"))
+    (export "node-kind" (type $node-kind (eq $node-kind-def)))
+    (type $node-stat-def (record (field "kind" $node-kind) (field "size" u64)))
+    (export "node-stat" (type $node-stat (eq $node-stat-def)))
+    (export "default" (func (result (own $fsi))))
+    (export "create-directory" (func async (param "fs" (borrow $fsi)) (param "path" string)
+      (result (result (error $fs-error)))))
+    (export "stat" (func async (param "fs" (borrow $fsi)) (param "path" string)
+      (result (result $node-stat (error $fs-error)))))))
+  (import "eo9:fs/memfs-config@0.1.0" (instance $memfs-config
+    (export "fs-impl" (type $fsic (eq $fs-impl)))
+    (export "configure" (func async
+      (result (result (own $fsic) (error string)))))))
+
+  ;; ----- text: left residual so the ambient text provider captures the output --------------
+  (import "eo9:text/types@0.1.0" (instance $text-types
+    (export "text-impl" (type (sub resource)))))
+  (alias export $text-types "text-impl" (type $text-impl))
+  (import "eo9:text/text@0.1.0" (instance $text
+    (export "text-impl" (type $txi (eq $text-impl)))
+    (type $output-stream-def (enum "out" "err"))
+    (export "output-stream" (type $output-stream (eq $output-stream-def)))
+    (type $text-error-def (variant (case "closed") (case "io" string)))
+    (export "text-error" (type $text-error (eq $text-error-def)))
+    (export "default" (func (result (own $txi))))
+    (export "write" (func
+      (param "t" (borrow $txi))
+      (param "to" $output-stream)
+      (param "text" string)
+      (result (result (error $text-error)))))))
+
+  ;; ----- libc: memory, bump realloc, string constants --------------------------------------
+  (core module $libc
+    (memory (export "memory") 1)
+    (global $heap (mut i32) (i32.const 4096))
+    (data (i32.const 16) "scratch")
+    (data (i32.const 32) "missing")
+    (data (i32.const 48) "det-env-ok")
+    (func (export "realloc") (param $old i32) (param $old-size i32) (param $align i32) (param $new-size i32) (result i32)
+      (local $ptr i32)
+      (local.set $ptr
+        (i32.and
+          (i32.add (global.get $heap) (i32.sub (local.get $align) (i32.const 1)))
+          (i32.sub (i32.const 0) (local.get $align))))
+      (global.set $heap (i32.add (local.get $ptr) (local.get $new-size)))
+      (local.get $ptr)))
+  (core instance $libc (instantiate $libc))
+
+  ;; ----- lowered imports --------------------------------------------------------------------
+  (alias export $frozen-config "configure" (func $configure-frozen))
+  (alias export $seeded-config "configure" (func $configure-seeded))
+  (alias export $memfs-config "configure" (func $configure-memfs))
+  (alias export $time "default" (func $time-default))
+  (alias export $time "now" (func $now))
+  (alias export $time "monotonic-now" (func $monotonic-now))
+  (alias export $entropy "default" (func $entropy-default))
+  (alias export $entropy "get-u64" (func $get-u64))
+  (alias export $fs "default" (func $fs-default))
+  (alias export $fs "create-directory" (func $create-dir))
+  (alias export $fs "stat" (func $stat))
+  (alias export $text "default" (func $text-default))
+  (alias export $text "write" (func $text-write))
+
+  (core func $configure-frozen-lowered (canon lower (func $configure-frozen)
+    (memory $libc "memory") (realloc (func $libc "realloc"))))
+  (core func $configure-seeded-lowered (canon lower (func $configure-seeded)
+    (memory $libc "memory") (realloc (func $libc "realloc"))))
+  (core func $configure-memfs-lowered (canon lower (func $configure-memfs)
+    (memory $libc "memory") (realloc (func $libc "realloc"))))
+  (core func $time-default-lowered (canon lower (func $time-default)))
+  (core func $now-lowered (canon lower (func $now) (memory $libc "memory")))
+  (core func $monotonic-now-lowered (canon lower (func $monotonic-now)))
+  (core func $entropy-default-lowered (canon lower (func $entropy-default)))
+  (core func $get-u64-lowered (canon lower (func $get-u64)))
+  (core func $fs-default-lowered (canon lower (func $fs-default)))
+  (core func $create-dir-lowered (canon lower (func $create-dir)
+    (memory $libc "memory") (realloc (func $libc "realloc"))))
+  (core func $stat-lowered (canon lower (func $stat)
+    (memory $libc "memory") (realloc (func $libc "realloc"))))
+  (core func $text-default-lowered (canon lower (func $text-default)))
+  (core func $text-write-lowered (canon lower (func $text-write)
+    (memory $libc "memory") (realloc (func $libc "realloc"))))
+  (core func $task-return (canon task.return (result u64)))
+
+  ;; ----- the program --------------------------------------------------------------------------
+  (core module $m
+    (import "libc" "memory" (memory 1))
+    ;; configure(now-seconds, monotonic-ns, retptr) / (seed, retptr) / (retptr)
+    (import "host" "configure-frozen" (func $configure-frozen (param i64 i64 i32)))
+    (import "host" "configure-seeded" (func $configure-seeded (param i64 i32)))
+    (import "host" "configure-memfs" (func $configure-memfs (param i32)))
+    (import "host" "time-default" (func $time-default (result i32)))
+    ;; now(handle, retptr): datetime {{ seconds: s64 @0, nanoseconds: u32 @8 }}
+    (import "host" "now" (func $now (param i32 i32)))
+    (import "host" "monotonic-now" (func $monotonic-now (param i32) (result i64)))
+    (import "host" "entropy-default" (func $entropy-default (result i32)))
+    (import "host" "get-u64" (func $get-u64 (param i32) (result i64)))
+    (import "host" "fs-default" (func $fs-default (result i32)))
+    ;; create-directory(handle, path-ptr, path-len, retptr) / stat(handle, path-ptr, path-len, retptr)
+    (import "host" "create-directory" (func $create-dir (param i32 i32 i32 i32)))
+    (import "host" "stat" (func $stat (param i32 i32 i32 i32)))
+    (import "host" "text-default" (func $text-default (result i32)))
+    ;; write(handle, stream, text-ptr, text-len, retptr)
+    (import "host" "write" (func $write (param i32 i32 i32 i32 i32)))
+    (import "host" "task-return" (func $task-return (param i64)))
+
+    (func (export "main")
+      (local $t i32) (local $e i32) (local $f i32) (local $txt i32)
+      (local $x i64) (local $y i64)
+
+      ;; 1. bind the three stub configurations through their config interfaces
+      (call $configure-frozen (i64.const {frozen_seconds}) (i64.const {frozen_monotonic}) (i32.const 256))
+      (if (i32.load8_u (i32.const 256))
+        (then (call $task-return (i64.const 1)) (return)))
+      (call $configure-seeded (i64.const {seed}) (i32.const 288))
+      (if (i32.load8_u (i32.const 288))
+        (then (call $task-return (i64.const 2)) (return)))
+      (call $configure-memfs (i32.const 320))
+      (if (i32.load8_u (i32.const 320))
+        (then (call $task-return (i64.const 3)) (return)))
+
+      ;; 2. the frozen clock serves exactly the configured instant
+      (local.set $t (call $time-default))
+      (call $now (local.get $t) (i32.const 352))
+      (if (i64.ne (i64.load (i32.const 352)) (i64.const {frozen_seconds}))
+        (then (call $task-return (i64.const 4)) (return)))
+      (if (i64.ne (call $monotonic-now (local.get $t)) (i64.const {frozen_monotonic}))
+        (then (call $task-return (i64.const 5)) (return)))
+
+      ;; 3. two samples from the seeded entropy
+      (local.set $e (call $entropy-default))
+      (local.set $x (call $get-u64 (local.get $e)))
+      (local.set $y (call $get-u64 (local.get $e)))
+      (if (i64.eq (local.get $x) (local.get $y))
+        (then (call $task-return (i64.const 6)) (return)))
+
+      ;; 4. the memfs is real: create "scratch", stat it, and miss "missing"
+      (local.set $f (call $fs-default))
+      (call $create-dir (local.get $f) (i32.const 16) (i32.const 7) (i32.const 384))
+      (if (i32.load8_u (i32.const 384))
+        (then (call $task-return (i64.const 7)) (return)))
+      ;; stat result: discriminant @0; payload @8 (node-stat kind @8, size @16 / fs-error disc @8)
+      (call $stat (local.get $f) (i32.const 16) (i32.const 7) (i32.const 416))
+      (if (i32.load8_u (i32.const 416))
+        (then (call $task-return (i64.const 8)) (return)))
+      (if (i32.ne (i32.load8_u (i32.const 424)) (i32.const 1))
+        (then (call $task-return (i64.const 9)) (return)))
+      (if (i64.ne (i64.load (i32.const 432)) (i64.const 0))
+        (then (call $task-return (i64.const 10)) (return)))
+      (call $stat (local.get $f) (i32.const 32) (i32.const 7) (i32.const 448))
+      (if (i32.eqz (i32.load8_u (i32.const 448)))
+        (then (call $task-return (i64.const 11)) (return)))
+      (if (i32.load8_u (i32.const 456))
+        (then (call $task-return (i64.const 12)) (return)))
+
+      ;; 5. observable output: the fixed line plus one entropy-derived character
+      (local.set $txt (call $text-default))
+      (call $write (local.get $txt) (i32.const 0) (i32.const 48) (i32.const 10) (i32.const 480))
+      (i32.store8 (i32.const 64)
+        (i32.add (i32.const 97) (i32.and (i32.wrap_i64 (local.get $x)) (i32.const 15))))
+      (call $write (local.get $txt) (i32.const 0) (i32.const 64) (i32.const 1) (i32.const 480))
+
+      ;; 6. the outcome folds the two entropy samples
+      (call $task-return (i64.xor (local.get $x) (local.get $y)))))
+
+  (core instance $i (instantiate $m
+    (with "libc" (instance $libc))
+    (with "host" (instance
+      (export "configure-frozen" (func $configure-frozen-lowered))
+      (export "configure-seeded" (func $configure-seeded-lowered))
+      (export "configure-memfs" (func $configure-memfs-lowered))
+      (export "time-default" (func $time-default-lowered))
+      (export "now" (func $now-lowered))
+      (export "monotonic-now" (func $monotonic-now-lowered))
+      (export "entropy-default" (func $entropy-default-lowered))
+      (export "get-u64" (func $get-u64-lowered))
+      (export "fs-default" (func $fs-default-lowered))
+      (export "create-directory" (func $create-dir-lowered))
+      (export "stat" (func $stat-lowered))
+      (export "text-default" (func $text-default-lowered))
+      (export "write" (func $text-write-lowered))
+      (export "task-return" (func $task-return))))))
+
+  (func (export "main") async (result u64) (canon lift (core func $i "main") async))
+)
+"#,
+        frozen_seconds = DET_ENV_FROZEN_SECONDS,
+        frozen_monotonic = DET_ENV_FROZEN_MONOTONIC_NS,
+        seed = DET_ENV_SEED,
+    )
+}
+
+// -----------------------------------------------------------------------------------------
+// Runtime-rule fixtures (milestone 2): io-buffer caps and the optional-import loader rule
+// -----------------------------------------------------------------------------------------
+
+/// A binary that constructs `count` io buffers of `len` bytes each and returns `count`.
+/// Used to exercise the runtime's per-buffer and per-task buffer caps: an over-cap request
+/// must fail with a clean in-band error (a trap naming the cap), never by growing host
+/// memory. Raw WAT, compiled directly by `Image::compile`.
+pub fn buffer_hog_wat() -> &'static str {
+    r#"
+(component
+  (import "eo9:io/buffers@0.1.0" (instance $buffers
+    (export "buffer" (type $buffer (sub resource)))
+    (export "[constructor]buffer" (func (param "len" u64) (result (own $buffer))))))
+  (alias export $buffers "[constructor]buffer" (func $new))
+  (core func $new-lowered (canon lower (func $new)))
+  (core module $m
+    (import "host" "new" (func $new (param i64) (result i32)))
+    (func (export "main") (param $len i64) (param $count i32) (result i32)
+      (local $i i32)
+      (block $done
+        (loop $again
+          (br_if $done (i32.ge_u (local.get $i) (local.get $count)))
+          (drop (call $new (local.get $len)))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $again)))
+      (local.get $count)))
+  (core instance $i (instantiate $m
+    (with "host" (instance (export "new" (func $new-lowered))))))
+  (func (export "main") (param "len" u64) (param "count" u32) (result u32)
+    (canon lift (core func $i "main")))
+)
+"#
+}
+
+/// A binary importing only the real `eo9:entropy/entropy-optional` flavor; `main` returns
+/// `ok(1)` when the capability is present and `ok(0)` when it observes absence. Used to
+/// exercise the runtime's loader rule for optional imports (auto-sealing at spawn).
+pub fn optional_entropy_probe() -> Component {
+    const WIT: &str = r#"
+package eo9-tests:optional@0.1.0;
+
+/// A binary that merely *can use* entropy: presence or absence is observed through the
+/// `-optional` import's own type.
+world entropy-probe {
+    import eo9:entropy/entropy-optional@0.1.0;
+    export main: func() -> result<u32, string>;
+}
+"#;
+    const CORE: &str = r#"
+(module
+  (import "eo9:entropy/entropy-optional@0.1.0" "default" (func $default (param i32)))
+  (memory (export "memory") 1)
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+  (func (export "main") (result i32)
+    ;; option<entropy-impl> is written to 16 by the import; its discriminant is the answer
+    (call $default (i32.const 16))
+    (i32.store8 (i32.const 32) (i32.const 0))
+    (i32.store (i32.const 36) (i32.load8_u (i32.const 16)))
+    (i32.const 32)))
+"#;
+    build_component(WIT, &["entropy"], "entropy-probe", CORE)
+}
