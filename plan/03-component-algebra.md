@@ -88,6 +88,24 @@ The pure, unprivileged value algebra on components, as a host library: load/save
    vocabulary plus the real `eo9:text`/`eo9:entropy` packages. "≡" in law tests is observational equality on
    `describe()` (slot sets + kind + args); behavioral equivalence under a runtime is deferred to plan 13.
 10. **Dependencies.** Only pinned workspace crates are used (wasmparser, wasm-encoder with its `wasmparser`
-    feature, wit-parser, wit-component, wac-graph); the `dummy-module` feature of wit-component is enabled
-    for dev-dependencies only. No semver crate: the crate carries a ~40-line version parser implementing
-    exactly the spec rule.
+    feature, wit-parser, wit-component, wac-graph, and — for `configure` — wasm-wave); the `dummy-module`
+    feature of wit-component is enabled for dev-dependencies only. No semver crate: the crate carries a
+    ~40-line version parser implementing exactly the spec rule.
+11. **`configure` (compose-time binding).** `configure(provider, args)` finds the provider's single exported
+    `*-config` interface, WAVE-parses each named arg against `configure`'s declared parameter types
+    (wasm-wave `value` types; the same approach the runtime uses for `main` args), and synthesizes a small
+    *binder* component that imports that config interface and calls `configure` with the baked-in constants
+    from its start function — i.e. exactly once, at instantiation, before any export of the wrapper can be
+    called — trapping if `configure` returns an error. Binder and provider are wired with the usual wac
+    machinery and every provider export except the config interface is re-exported, so the result is an
+    ordinary provider with the config surface sealed away (a second `configure` reports
+    `no-config-interface`). Supported parameter types for baking: scalars, `char`, `string`, and enums;
+    anything richer is an error for now. Multiple config interfaces on one provider are rejected.
+    `describe` now also reports a provider's args from its `*-config` interface (previously only from a
+    world-level `configure` export). **Escalations:** (a) behavioral verification is area 13's — in
+    particular, the binder calls a sync-lowered, async-lifted `configure` during component instantiation,
+    and the Component Model's instantiation/reentrancy rules (wasmtime's `may_enter`/`task` bookkeeping for
+    async lifts) may require runtime-side accommodation or a follow-up (e.g. the runtime invoking an explicit
+    init export after instantiation instead); (b) the `configure-error` cases implemented here
+    (not-a-provider / no-config-interface / unknown-argument / missing-argument / invalid-argument /
+    internal) are the reference for the WIT mirror area 02 is adding.
