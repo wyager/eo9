@@ -48,8 +48,13 @@ pub fn cmd_run(cfg: &Config, reference: &str, flags: &[(String, String)]) -> Res
         max_memory: cfg.max_memory,
         max_table_elements: None,
     };
-    let mut task = Task::spawn(&loaded.image, &args, limits, providers::root_providers())
-        .map_err(|err| format!("cannot spawn {}: {err}", source.origin))?;
+    let mut task = Task::spawn(
+        &loaded.image,
+        &args,
+        limits,
+        providers::root_providers(cfg)?,
+    )
+    .map_err(|err| format!("cannot spawn {}: {err}", source.origin))?;
 
     // The built-in drive loop: donate, run, park on I/O, repeat.
     let mut resumes: u64 = 0;
