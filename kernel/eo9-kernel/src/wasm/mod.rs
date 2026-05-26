@@ -19,6 +19,8 @@
 
 #[cfg(feature = "wasm-async")]
 pub mod async_demo;
+#[cfg(feature = "wasm-codegen")]
+pub mod codegen;
 #[cfg(feature = "wasm-hello")]
 pub mod hello;
 #[cfg(any(feature = "wasm-hello", feature = "wasm-async", feature = "wasm-store"))]
@@ -56,6 +58,11 @@ use wasmtime::{Config, CustomCodeMemory, Engine};
 /// them from the `aarch64-unknown-none` target.
 pub fn new_engine() -> Result<Engine, wasmtime::Error> {
     let mut config = Config::new();
+    // With the compiler (`wasm-codegen`) linked in, wasmtime would otherwise try to infer
+    // the host target through `cranelift-native`, which needs `std` and is disabled here.
+    // The kernel is built *for* this triple, so `Triple::host()` equals it and execution of
+    // both deserialized and on-target-compiled code is accepted as native.
+    config.target("aarch64-unknown-none")?;
     config.wasm_component_model(true);
     // The component-model async ABI plus the two sub-features the eo9 guest SDK relies on
     // (stackful async lifts and the extra async built-ins behind waitable-set waits).
@@ -64,6 +71,17 @@ pub fn new_engine() -> Result<Engine, wasmtime::Error> {
     config.wasm_component_model_async(true);
     config.wasm_component_model_async_stackful(true);
     config.wasm_component_model_more_async_builtins(true);
+    // The OS-less tunables. These match xtask's `precompile_for_kernel` so deserialized
+    // artifacts load, and — now that the compiler (`wasm-codegen`) is linked, which makes
+    // wasmtime run its native-host compatibility check on every engine — they are also what
+    // make this engine pass that check (no native signals, no virtual-memory reservations or
+    // guards, no copy-on-write memory initialization).
+    config.signals_based_traps(false);
+    config.memory_reservation(0);
+    config.memory_reservation_for_growth(1 << 20);
+    config.memory_guard_size(0);
+    config.memory_init_cow(false);
+    config.concurrency_support(true);
     // Without virtual memory wasmtime cannot flip page protections itself, so it asks the
     // embedder to "publish" code memory; on this machine that is D-cache clean + I-cache
     // invalidate over the range (see below), no page-permission flips.

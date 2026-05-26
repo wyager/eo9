@@ -440,6 +440,19 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
         .map_err(|err| format!("failed to assemble {}: {err}", seed_wat.display()))?;
     let seed = precompile_for_kernel(root, &seed_wasm, "seed component", "seed.cwasm")?;
 
+    // The same seed component as *raw* (un-precompiled) wasm bytes, for the on-target
+    // codegen demo: the kernel compiles this with its own Cranelift (wasm-codegen) rather
+    // than deserializing a host-produced artifact.
+    let seed_wasm_path = root
+        .join("kernel")
+        .join("target")
+        .join("precompiled")
+        .join("seed.wasm");
+    std::fs::create_dir_all(seed_wasm_path.parent().unwrap())
+        .map_err(|err| format!("failed to create precompiled dir: {err}"))?;
+    std::fs::write(&seed_wasm_path, &seed_wasm)
+        .map_err(|err| format!("failed to write {}: {err}", seed_wasm_path.display()))?;
+
     // The async canary (awaits time.sleep against the kernel timer), assembled from WAT.
     let sleepy_wat = root.join("kernel").join("seed").join("sleepy.wat");
     let sleepy_wasm = wat::parse_file(&sleepy_wat)
@@ -481,10 +494,11 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
             "--target",
             KERNEL_CHECK_TARGET,
             "--features",
-            "wasm-seed,wasm-hello,wasm-async,wasm-store",
+            "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen",
         ],
         &[
             ("EO9_SEED_CWASM", seed.as_os_str()),
+            ("EO9_SEED_WASM", seed_wasm_path.as_os_str()),
             ("EO9_HELLO_CWASM", hello.as_os_str()),
             ("EO9_SLEEPY_CWASM", sleepy.as_os_str()),
             ("EO9_ENTROPY_SEEDED_CWASM", entropy.as_os_str()),

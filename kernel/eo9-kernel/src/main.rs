@@ -98,7 +98,14 @@ extern "C" fn kmain(dtb: *const u8) -> ! {
         wasm::hello::run();
         #[cfg(feature = "wasm-async")]
         wasm::async_demo::run();
-        #[cfg(not(any(feature = "wasm-seed", feature = "wasm-hello", feature = "wasm-async")))]
+        #[cfg(feature = "wasm-codegen")]
+        wasm::codegen::run();
+        #[cfg(not(any(
+            feature = "wasm-seed",
+            feature = "wasm-hello",
+            feature = "wasm-async",
+            feature = "wasm-codegen"
+        )))]
         kprintln!("wasm: no components embedded (build with `cargo xtask build-kernel aarch64`)");
     }
 
