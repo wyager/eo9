@@ -150,3 +150,29 @@ its first milestones, and to be the place where cross-area seams get found.
     never touched, so seeding is idempotent and user bindings are never clobbered. Seeding failures degrade
     to a warning, and the embedded eosh also serves as the last-resort shell component when neither the store
     nor a dev tree provides one.
+12. **Interactive shell line editor (tab completion + history).** When `eo9 shell` is interactive — no `-c`
+    and both stdin and stdout are terminals — the shell task's text provider is `InteractiveText`
+    (`interactive.rs`): `write` goes to the real streams (tracking the trailing partial line so the editor
+    knows the prompt to repaint), and `read-line` runs a small hand-rolled raw-mode line editor
+    (`editor.rs`) on a dedicated thread, completing the runtime op through the same oneshot bridge the other
+    adapters use. The editor implements emacs-style editing (cursor movement, kill, delete-word, Ctrl-L),
+    in-memory ↑/↓ history, and readline-style tab completion: a unique candidate completes the word,
+    ambiguity first extends to the longest common prefix, a no-progress tab lists alternatives and repaints.
+    Candidates come from `complete.rs`: eosh builtins/keywords (lists mirror eosh-core's grammar — keep in
+    sync), the session bin-view names `materialize_session` just placed (exactly what eosh can resolve), the
+    standard `eo9:*` interface refs for words containing `:` (for `only`), and — only when `--fs-root` was
+    given — paths under that root for words containing `/` or filling a flag value (a path-valued argument
+    refers to the *child's* filesystem, so the host CWD is never offered). Flag names are not guessed.
+    Raw mode is termios via `libc` (already in the tree through eo9-providers-unix; std has no termios),
+    restored on drop; ^C cancels the line, ^D on an empty line ends the session, and if raw mode cannot be
+    enabled the read falls back to a plain buffered line. Piped sessions, `-c` one-shots, and all children
+    keep the plain stdio provider, so transcripts and tests are unchanged; the editor only changes how the
+    interactive line is typed, never what is granted. Known cosmetic limit: output a child printed without a
+    trailing newline is not part of the tracked prompt, so a mid-edit repaint redraws only the shell's own
+    prompt. The editor and completer are unit-tested against in-memory streams (no TTY in CI).
+13. **Session manifest for `env`.** Every shell start writes `<session>/session` (`providers::
+    session_manifest`, format `eo9-session 1` — see plan/10 Decision 9): the shell's grants, what children
+    receive (fs only when `--fs-root` was given, never exec), and notes. It is generated next to
+    `shell_providers`/`child_root_providers` and must be kept in sync with them; writing it is best-effort
+    (a failure degrades to a warning and `env` just has less to say). Children cannot read it — their
+    filesystem, if any, is `--fs-root`, not the session directory.
