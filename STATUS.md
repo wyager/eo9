@@ -79,8 +79,6 @@ rung. Pending owner decisions: /try v2 path and `eo9-embed` go/no-go (see Next u
   real component on-target → wired into the shell.
 - **`eo9-embed`** (`area/16-embed`): the embeddable-runtime library (runtime + host providers behind a
   one-call API) — green-lit; foundation for `eo9 bundle` and the /try v2 browser blob.
-- **JSPI-fiber shim estimate** (read-only research): scoping the effort to suspend async guests in the
-  wasm32 browser blob, to inform the /try v2 decision.
 
 ## Next up (rough order)
 
@@ -88,17 +86,17 @@ rung. Pending owner decisions: /try v2 path and `eo9-embed` go/no-go (see Next u
    busy-polling), child fuel + eo9-sched adoption, io/buffers + fs/types wiring for children (friendly
    missing-fs story), cache maintenance / W^X for code pages; then riscv64/x86_64 ports and the QEMU test
    tier.
-2. /try v2: pick the path once the JSPI-shim estimate lands; build it on `eo9-embed`.
-3. Demo packaging: ship prebuilt components with the published crate so `cargo install eo9; eo9` works
+2. Demo packaging: ship prebuilt components with the published crate so `cargo install eo9; eo9` works
    without a checkout.
-4. Bundle milestone: `eo9 bundle` (native executables for other OSes) on top of `eo9-embed`.
+3. Bundle milestone: `eo9 bundle` (native executables for other OSes) on top of `eo9-embed`.
 5. eo9:pci follow-ups: `pci.deny`/`pci.filtered` stubs (area 09); a kernel/QEMU virtio-over-PCI provider as
    the first real consumer; dma-buffer ↔ `eo9:io` buffer story.
 6. Exec follow-ups: guest-facing `resume`/fuel donation (E5); net provider linking, `net.loopback`,
    Message API; eofs milestone 2+ (provider, mkfs, store-on-eofs, content hashes).
 7. Housekeeping: push to origin, crates.io name, Message/perf/threads API design.
 
-_Settled (see GAPS): upstreaming anything is deferred until a compelling MVP; on-target codegen forks
-cranelift now rather than waiting for upstream._
+_Settled (see GAPS): /try v2 (the wasm32 real-stack browser blob) is deferred — v1 already demos async
+components in the browser, and the blob is month-plus + not MVP-critical; on-target codegen forks cranelift
+now rather than waiting for upstream; upstreaming anything is deferred until a compelling MVP._
 
 See `GAPS.md` for known limitations and deferred decisions.

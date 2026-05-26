@@ -8,24 +8,18 @@ xtask-order / web-try wave)._
 
 ## Decisions pending with the owner
 
-- **/try v2 — eosh in the browser**: direction set — the wasm32 + Pulley blob running the real stack (spike
-  merged: plan/15 D15–20, probe under www/embed-spike). The only blocker is suspending async-lifted guest
-  calls in the browser. **JSPI-shim estimate (2026-05-26): month-plus, and a "drop-in" JSPI fiber backend is
-  infeasible** — wasmtime-fiber's contract is symmetric synchronous native stack-switching; JSPI is
-  asymmetric Promise-based suspension, so you inevitably end up doing the *fiberless callback-execution*
-  surgery in wasmtime's component-async layer (~15–30 eng-days, high risk) plus JSPI for host-import
-  blocking. That is essentially the same work as the deferred upstream fiberless path. Key context: **/try
-  v1 already runs async components in the browser today** (jco on the browser's native engine + JSPI — never
-  touches wasmtime-fiber), so the "async in the browser" demo already exists; the wasm32 real-stack blob is
-  a nice-to-have, not MVP-critical. Planner recommendation: **defer** (ship v1, finish the MVP first);
-  optional cheap door-opener is a 1–2 day probe of fiberless callback execution in concurrent.rs. Owner call
-  pending. `eo9-embed` (the path-independent foundation) proceeds regardless (area 16).
+- _(no open owner decisions right now — /try v2 was settled, see below.)_
 - **Compose-time vs run-time provider parameters.** Changing a seed currently changes the composed artifact
   and forces a recompile, same as changing a structural choice. Owner parked the "late-bound parameter"
   idea until there is a clean design; revisit if deterministic sweeps start thrashing the compile cache.
 
 ## Settled directions (recorded so they're not re-litigated)
 
+- **/try v2 (wasm32 real-stack browser blob): deferred** (owner ruling 2026-05-26). /try v1 already runs real
+  async components in the browser via jco + JSPI, so the demo exists; the real-stack blob would cost month-
+  plus (the infeasible-drop-in-backend → fiberless-callback-surgery problem above) and is not MVP-critical.
+  Keep v1; revisit the fiberless work — or upstream it — after the MVP. The wasm32 findings live in
+  plan/15 D15–20; `eo9-embed` (area 16) remains the shared foundation for whenever it's picked back up.
 - **No upstreaming until a compelling MVP** (owner ruling 2026-05-26). The no_std CM-async patch and the new
   cranelift no_std fork stay as in-tree vendored forks under kernel/vendor; revisit offering anything to
   wasmtime/cranelift upstream only once Eo9 has a compelling MVP.
