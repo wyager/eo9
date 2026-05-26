@@ -12,10 +12,14 @@ xtask-order / web-try wave)._
   documented in kernel/vendor/README.md and plan/12 D16): owner ruling (2026-05-26) — hold until the
   bare-metal track has a working end-to-end result (boot-to-eosh / on-target codegen), then revisit; likely
   bundled with whatever the codegen port needs.
-- **/try v2 — eosh in the browser**: prerequisites are a JS exec host (algebra over the transpiled-component
-  graph, spawn/wait, WAVE checking), an HTTP-backed store, the upstream js-component-bindgen TDZ fix (issue
-  text drafted in plan/15 D11 for the owner to file), a Safari/Firefox JSPI re-check, and a call on how
-  faithful compile/fuel semantics must be before the page may call it "eosh". Go/no-go pending.
+- **/try v2 — eosh in the browser**: owner-preferred direction is the wasm32 + Pulley blob running the real
+  stack (spike merged: plan/15 D15–20, probe under www/embed-spike). Everything works except async-lifted
+  calls — wasmtime routes them through wasmtime-fiber, which has no wasm32 backend; the 2026-05-26 upstream
+  survey found no fiberless callback-ABI path in any release or on main, and no wasm32 fiber plan (JSPI is
+  the only viable substrate: Chrome shipped, Firefox flagged, Safari in progress). Options: (1) build a
+  JSPI-backed fiber shim ourselves (browser-only, likely obsoleted by upstream), (2) raise the
+  fiberless-callback question upstream and keep /try v1 meanwhile, (3) start the path-independent
+  `eo9-embed` crate now regardless. Planner recommends 2+3; owner decision pending.
 - **Compose-time vs run-time provider parameters.** Changing a seed currently changes the composed artifact
   and forces a recompile, same as changing a structural choice. Owner parked the "late-bound parameter"
   idea until there is a clean design; revisit if deterministic sweeps start thrashing the compile cache.
@@ -71,7 +75,13 @@ xtask-order / web-try wave)._
 - **On-target codegen still blocked by std requirements upstream:** wasmtime's `cranelift` feature and
   wasmtime-environ's `compile` feature require `std`. CM-async is solved on metal (vendored patch); the
   compile layers are the remaining rung — port them for no_std+alloc (required for MVP; Pulley stopgap
-  only). (plan/12 D8, D14, D16)
+  only). Good news from the 2026-05-26 upstream survey: cranelift no_std work is actively landing upstream
+  (cranelift-codegen/isle/frontend no_std PRs #12222/#12236/#12947/#13401/#13479, wasmtime-environ refactors
+  #12507/#12565, a no_std CI gate #12812) — the port should build on those rather than duplicate them.
+  (plan/12 D8, D14, D16)
+- **Wasmtime version bumps are not free:** CM-async internals are churning upstream, so any future bump off
+  45 requires re-verifying the binder's ABI-constants block (and the kernel executor's mirrored encodings)
+  and re-AOT-ing all cached/baked artifacts.
 - **Kernel current limits:** executor busy-polls until GIC interrupt handling lands; `text.read-line`
   reports EOF (no UART RX); fuel not yet enabled on metal; no read-only store image or cmdline program
   selection yet (hello's args are fixed in the kernel); eo9-sched not yet adopted. These are the
