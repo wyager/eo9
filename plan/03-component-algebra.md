@@ -94,18 +94,30 @@ The pure, unprivileged value algebra on components, as a host library: load/save
 11. **`configure` (compose-time binding).** `configure(provider, args)` finds the provider's single exported
     `*-config` interface, WAVE-parses each named arg against `configure`'s declared parameter types
     (wasm-wave `value` types; the same approach the runtime uses for `main` args), and synthesizes a small
-    *binder* component that imports that config interface and calls `configure` with the baked-in constants
-    from its start function — i.e. exactly once, at instantiation, before any export of the wrapper can be
-    called — trapping if `configure` returns an error. Binder and provider are wired with the usual wac
-    machinery and every provider export except the config interface is re-exported, so the result is an
-    ordinary provider with the config surface sealed away (a second `configure` reports
+    *binder* component. Binder and provider are wired with the usual wac machinery; the wrapper re-exports
+    the provider's API surface with the config interface sealed away (a second `configure` reports
     `no-config-interface`). Supported parameter types for baking: scalars, `char`, `string`, and enums;
     anything richer is an error for now. Multiple config interfaces on one provider are rejected.
     `describe` now also reports a provider's args from its `*-config` interface (previously only from a
-    world-level `configure` export). **Escalations:** (a) behavioral verification is area 13's — in
-    particular, the binder calls a sync-lowered, async-lifted `configure` during component instantiation,
-    and the Component Model's instantiation/reentrancy rules (wasmtime's `may_enter`/`task` bookkeeping for
-    async lifts) may require runtime-side accommodation or a follow-up (e.g. the runtime invoking an explicit
-    init export after instantiation instead); (b) the `configure-error` cases implemented here
-    (not-a-provider / no-config-interface / unknown-argument / missing-argument / invalid-argument /
-    internal) are the reference for the WIT mirror area 02 is adding.
+    world-level `configure` export). The `configure-error` cases implemented here (not-a-provider /
+    no-config-interface / unknown-argument / missing-argument / invalid-argument / internal) are the
+    reference for the WIT mirror area 02 is adding.
+12. **`configure` binder is bind-on-first-use (root cause of the instantiation trap).** The first binder
+    design called `configure` from the binder module's core `start` section; that traps under wasmtime 45
+    with "uninitialized element": wit-component lowers an import that needs memory/realloc *indirectly*,
+    through a funcref-table shim filled in by a fix-up instance only after the main module is instantiated,
+    so a start-section call goes through a not-yet-initialized table slot. Deferring the call to
+    `_initialize` fixes the table ordering but then hits the Component Model's concurrency rules
+    ("cannot block a synchronous task"): `configure` is an async-lifted export, and neither instantiation
+    nor a synchronous consumer task may make a blocking (sync-lowered) call to it. The binder therefore now
+    imports the provider's API interfaces as well and re-exports them through gating forwarders: the first
+    forwarded call *async-lowers* `configure` with the baked-in constants (accepting only an
+    immediately-completed result; blocking or an error traps), marks the provider configured, and every call
+    then forwards flat values unchanged (releasing lent borrow handles per the canonical ABI). Configuration
+    thus still happens exactly once, before any observable API use, inside the consumer's own task — which
+    is what wasmtime's rules permit — and the end-to-end check
+    (`eo9-runtime/tests/exec_api.rs::algebra_configured_composition_observes_the_seeded_stream`) proves the
+    baked-in seed is observed with no program-side configuration. **Limitations (escalate as needed):**
+    providers whose API interfaces define their own resources (fs-, net-style interfaces), have non-
+    freestanding or async API functions, or nest borrows inside parameters are rejected by `configure` for
+    now — binding those needs either resource proxying in the binder or runtime-side configuration.
