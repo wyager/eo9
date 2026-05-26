@@ -91,6 +91,12 @@ eo9/
   small demo tools), and `eo9 <file> [args…]` runs an arbitrary component from the host filesystem (implicit
   `run`). Pieces: runtime exec-to-guests, eosh store-backed resolution, CLI defaults (bare → shell,
   path → run), store seeding from embedded components, demo tools.
+- **Bundle** ("eo9 as a platform", after Demo) — ship an eo9 program as a native executable for other OSes:
+  an `eo9-embed` library crate (runtime + host-backed providers behind a one-call API, for embedding an Eo9
+  instance in any Rust program) and an `eo9 bundle <program> -o app [--target …]` command that packages a
+  launcher with the component (plus its AOT image for the target when available) into one self-contained
+  binary; capability decisions (stubs, `only`, environments) are composable in at bundle time, so a bundled
+  app ships with exactly the authority it was given.
 
 ## Review & merge workflow
 
