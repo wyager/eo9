@@ -499,10 +499,7 @@ mod tests {
         assert_eq!(run(&mut session, "let t = time.frozen"), LineResult::Ok);
         assert_eq!(run(&mut session, "env"), LineResult::Ok);
         let out = session.backend.out.join("\n");
-        assert!(
-            out.contains("capabilities granted to this shell:"),
-            "{out}"
-        );
+        assert!(out.contains("capabilities granted to this shell:"), "{out}");
         assert!(out.contains("exec"), "{out}");
         assert!(
             out.contains("programs started from this shell receive:"),

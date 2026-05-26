@@ -778,8 +778,7 @@ fn shell_env_shows_the_session_capability_picture() {
     // Without --fs-root, children get no filesystem and env says how to grant one.
     assert!(run.stdout.contains("--fs-root"), "{}", run.stdout);
     assert!(
-        run.stdout
-            .contains("never receive the exec capability"),
+        run.stdout.contains("never receive the exec capability"),
         "{}",
         run.stdout
     );
@@ -801,8 +800,7 @@ fn shell_env_shows_the_session_capability_picture() {
     );
     assert_eq!(granted.code, 0, "stderr: {}", granted.stderr);
     assert!(
-        granted.stdout.contains("host directory")
-            && granted.stdout.contains("(from --fs-root)"),
+        granted.stdout.contains("host directory") && granted.stdout.contains("(from --fs-root)"),
         "{}",
         granted.stdout
     );

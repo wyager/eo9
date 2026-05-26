@@ -317,7 +317,8 @@ impl Editor<'_> {
         self.output.write_all(self.line().as_bytes())?;
         let behind = self.buffer.len() - self.cursor;
         if behind > 0 {
-            self.output.write_all(format!("\x1b[{behind}D").as_bytes())?;
+            self.output
+                .write_all(format!("\x1b[{behind}D").as_bytes())?;
         }
         self.output.flush()
     }

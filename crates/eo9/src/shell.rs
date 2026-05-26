@@ -61,9 +61,8 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
     // Interactive sessions on a real terminal get the line editor (history + tab
     // completion over the session's names); piped input and `-c` keep the plain
     // provider so transcripts behave exactly as before.
-    let interactive = command.is_none()
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal();
+    let interactive =
+        command.is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let editor = interactive
         .then(|| InteractiveText::new(ShellCompleter::new(session_names, cfg.fs_root.clone())));
 

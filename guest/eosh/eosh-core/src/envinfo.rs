@@ -96,9 +96,7 @@ impl SessionManifest {
 
     /// Does this session hand the named capability to children spawned from the shell?
     pub fn child_has(&self, capability: &str) -> bool {
-        self.child
-            .iter()
-            .any(|line| line.capability == capability)
+        self.child.iter().any(|line| line.capability == capability)
     }
 }
 
@@ -107,7 +105,11 @@ impl SessionManifest {
 pub fn capability_of(interface: &str) -> Option<&str> {
     let rest = interface.strip_prefix("eo9:")?;
     let package = rest.split('/').next()?;
-    if package.is_empty() { None } else { Some(package) }
+    if package.is_empty() {
+        None
+    } else {
+        Some(package)
+    }
 }
 
 /// Is this interface one that every program gets regardless of grants? Types-only
@@ -327,7 +329,11 @@ mod tests {
             args: Vec::new(),
         };
         let lines = render_capability_view(&info, None);
-        assert!(lines.iter().any(|l| l.contains("needs the `fs` capability")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("needs the `fs` capability"))
+        );
         assert!(
             lines
                 .iter()
