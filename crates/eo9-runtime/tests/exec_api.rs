@@ -252,3 +252,116 @@ fn exec_is_not_linked_unless_granted() {
     let message = format!("{err}");
     assert!(message.contains("eo9:exec"), "unexpected error: {message}");
 }
+
+// ---------------------------------------------------------------------------------------
+// Behavioral verification: algebra-configured provider works at run time (no program-side
+// configuration), proving the async-lifted `configure` binder runs under wasmtime 45.
+// ---------------------------------------------------------------------------------------
+
+/// Entropy consumer: returns the low 32 bits of one `get-u64` draw; no configuration.
+const ENTROPY_CONSUMER_WAT: &str = r#"
+(component
+  (import "eo9:entropy/types@0.1.0" (instance $types (export "entropy-impl" (type (sub resource)))))
+  (alias export $types "entropy-impl" (type $impl))
+  (import "eo9:entropy/entropy@0.1.0" (instance $entropy
+    (export "entropy-impl" (type $ei (eq $impl)))
+    (export "default" (func (result (own $ei))))
+    (export "get-u64" (func (param "e" (borrow $ei)) (result u64)))))
+  (alias export $entropy "default" (func $default))
+  (alias export $entropy "get-u64" (func $get))
+  (core func $default-lowered (canon lower (func $default)))
+  (core func $get-lowered (canon lower (func $get)))
+  (core module $m
+    (import "host" "default" (func $default (result i32)))
+    (import "host" "get" (func $get (param i32) (result i64)))
+    (func (export "main") (result i32)
+      (i32.wrap_i64 (call $get (call $default)))))
+  (core instance $i (instantiate $m
+    (with "host" (instance
+      (export "default" (func $default-lowered))
+      (export "get" (func $get-lowered))))))
+  (func (export "main") (result u32) (canon lift (core func $i "main")))
+)
+"#;
+
+fn seeded_stub_bytes() -> Vec<u8> {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap()
+        .to_path_buf();
+    let path = repo_root.join("guest/target/components/eo9-stub-entropy-seeded.wasm");
+    if !path.exists() {
+        // Same steps as `cargo xtask build-guest`, limited to the one package.
+        let guest = repo_root.join("guest");
+        assert!(
+            Command::new("cargo")
+                .args([
+                    "build",
+                    "--release",
+                    "--target",
+                    "wasm32-unknown-unknown",
+                    "-p",
+                    "eo9-stub-entropy-seeded"
+                ])
+                .current_dir(&guest)
+                .env_remove("RUSTUP_TOOLCHAIN")
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(
+            Command::new("wasm-tools")
+                .args(["component", "new"])
+                .arg(
+                    guest
+                        .join("target/wasm32-unknown-unknown/release/eo9_stub_entropy_seeded.wasm")
+                )
+                .arg("-o")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::read(path).unwrap()
+}
+
+/// Currently captures the open issue: the algebra-configured composition traps at
+/// instantiation (see the test below). Returns the spawn error text.
+fn run_configured_consumer(seed: &str) -> String {
+    let engine = new_engine(&EngineOptions::default()).unwrap();
+    let stub = eo9_component::Component::load(seeded_stub_bytes()).unwrap();
+    let configured = eo9_component::configure(&stub, &[("seed", seed)]).unwrap();
+    let consumer =
+        eo9_component::Component::load(wat_to_bytes("entropy-consumer", ENTROPY_CONSUMER_WAT))
+            .unwrap();
+    let composed = eo9_component::compose(&configured, &consumer).unwrap();
+    let image = Image::compile(&engine, composed.save()).unwrap();
+    match Task::spawn(&image, &[], SpawnLimits::default(), Providers::none()) {
+        Ok(mut task) => loop {
+            match task.resume(100 * FUEL_QUANTUM) {
+                ResumeOutcome::Done(outcome) => break format!("ran: {outcome:?}"),
+                ResumeOutcome::OutOfFuel => continue,
+                ResumeOutcome::Blocked => break "blocked".to_string(),
+            }
+        },
+        Err(err) => format!("spawn failed: {err}"),
+    }
+}
+
+/// KNOWN OPEN ISSUE (planner decision pending — see plan/04 D12): the composition produced
+/// by `configure` + `compose` traps at *instantiation* with "uninitialized element" (an
+/// indirect call through a never-initialized table slot in the synthesized binder), so the
+/// configured provider never runs under wasmtime 45. This test pins that exact behaviour;
+/// flip it to assert the deterministic seeded stream once the binder issue is resolved
+/// (host-side fix or bind-on-first-use in the algebra).
+#[test]
+fn algebra_configured_composition_currently_traps_at_instantiation() {
+    let result = run_configured_consumer("9");
+    assert!(
+        result.contains("spawn failed") && result.contains("uninitialized element"),
+        "behaviour changed (did the configure binder start working?): {result}"
+    );
+}

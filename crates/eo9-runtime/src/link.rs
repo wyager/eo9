@@ -905,7 +905,6 @@ enum WitRenameError {
 
 #[derive(Clone, ComponentType, Lift, Lower)]
 #[component(variant)]
-#[allow(dead_code)]
 enum WitConfigureError {
     #[component(name = "not-a-provider")]
     NotAProvider,
@@ -1222,18 +1221,31 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
     algebra.func_wrap(
         "configure",
         |mut store: StoreContextMut<'_, TaskState>,
-         (component, _args): (Resource<AlgComponentRes>, Vec<WitNamedArg>)|
+         (component, args): (Resource<AlgComponentRes>, Vec<WitNamedArg>)|
          -> Result<(Result<Resource<AlgComponentRes>, WitConfigureError>,)> {
-            // eo9-component does not implement configure binding yet (it landed in the WIT
-            // first); fail in-band so guests importing the new interface still link and get
-            // a structured error. Delegation is a small follow-up once area 03 ships it.
             let exec = store.data_mut().exec_provider()?;
-            let _consumed = take_component(exec, component.rep())?;
-            Ok((Err(WitConfigureError::Internal(
-                "configure is not yet implemented host-side; delegation to eo9-component \
-                 lands as a follow-up"
-                    .to_string(),
-            )),))
+            let provider = take_component(exec, component.rep())?;
+            let args: Vec<(String, String)> =
+                args.into_iter().map(|arg| (arg.name, arg.value)).collect();
+            Ok((match eo9_component::configure(&provider, &args) {
+                Ok(result) => Ok(insert_component(exec, result)?),
+                Err(eo9_component::ConfigureError::NotAProvider) => {
+                    Err(WitConfigureError::NotAProvider)
+                }
+                Err(eo9_component::ConfigureError::NoConfigInterface) => {
+                    Err(WitConfigureError::NoConfigInterface)
+                }
+                Err(eo9_component::ConfigureError::UnknownArgument(msg))
+                | Err(eo9_component::ConfigureError::MissingArgument(msg)) => {
+                    Err(WitConfigureError::InvalidArgs(msg))
+                }
+                Err(eo9_component::ConfigureError::InvalidArgument { name, message }) => {
+                    Err(WitConfigureError::InvalidArgs(format!("{name}: {message}")))
+                }
+                Err(eo9_component::ConfigureError::Internal(msg)) => {
+                    Err(WitConfigureError::Internal(msg))
+                }
+            },))
         },
     )?;
 
@@ -1427,8 +1439,11 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
             Box::pin(async move {
                 let outcome = accessor.with(|mut access| -> Result<_> {
                     let exec = access.data_mut().exec_provider()?;
-                    let child = exec.children.lock().unwrap().take(child.rep())?;
-                    Ok(wit_outcome(&child.kill()))
+                    let children = exec.children.clone();
+                    let mut children = children.lock().unwrap();
+                    // The entry stays in the table (as a finished task) so a later `wait`
+                    // on the same handle resolves to abnormal(killed) instead of trapping.
+                    Ok(wit_outcome(&children.get_mut(child.rep())?.kill_in_place()))
                 })?;
                 Ok((outcome,))
             })

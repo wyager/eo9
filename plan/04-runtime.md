@@ -284,6 +284,24 @@ second test shows exec is not linked unless granted. Adding the `exec` field to
 `Providers` needed the same disclosed one-line `exec: None` touch-ups in `crates/eo9` and
 `tests/eo9-integration` as the fs field before it.
 
+### D12. Exec polish (branch `area/04-exec-polish`)
+
+`configure` in the granted exec surface now delegates to `eo9_component::configure`
+(unknown/missing/invalid-argument cases map to `invalid-args`, the rest 1:1). `kill` keeps
+the child entry as a finished task (`Task::kill_in_place`), so `wait` after `kill`
+resolves to `abnormal(killed)` instead of trapping. The per-task handle-count and
+component-byte caps have direct unit tests.
+
+**Open issue (planner decision needed): configured compositions trap at instantiation.**
+Configuring the real `entropy.seeded` stub via the algebra, composing it onto an
+unconfigured entropy consumer, compiling and spawning fails during instantiation with
+`wasm trap: uninitialized element` (an indirect call through a never-initialized table
+slot in the synthesized binder) — the configured provider never runs under wasmtime 45.
+Captured verbatim by `algebra_configured_composition_currently_traps_at_instantiation`
+in `tests/exec_api.rs`, which should be flipped to assert the deterministic seeded stream
+once resolved. Per instruction, no workaround was attempted; candidate directions are an
+area-03 binder fix or bind-on-first-use.
+
 ### Escalations for the planner
 
 - **E1 (resolved by the async-operations migration):** binaries that await must have an
