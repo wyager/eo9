@@ -249,6 +249,41 @@ one-line `fs: None` addition at the two existing construction sites outside this
 operation (its old future-returning import no longer links). Areas 11/13 own both files
 and may adjust further.
 
+### D11. Exec provider (branch `area/04-exec-provider`)
+
+**Granted surface.** A new optional `exec` provider (None by default) links
+`eo9:exec/{component-algebra, images, compile, task}` for the task that holds it.
+Component-algebra operations delegate to `eo9-component` (load/save/describe/compose/
+extend/restrict/rename; `configure` is registered but
+answers `configure-error::internal` until area 03's implementation lands — small
+follow-up); `compile` delegates to `Image::compile` on the same
+pinned engine. Per-task handle tables carry caps: 32 components / 64 MiB total component
+bytes / 16 images / 8 children, enforced before allocation.
+
+**Child capability policy.** `ExecProvider::new(engine, ChildPolicy)` takes an explicit,
+embedder-supplied policy; a child gets exactly what its composed image carries plus the
+root providers the policy factory returns (default: none). Nothing is inherited from the
+parent's own host authority.
+
+**How children are driven.** wasmtime forbids recursive `run_concurrent`, so a child
+cannot execute inside the parent's host calls. Children live in a `ChildSet` shared
+between the exec provider (inside the parent's store) and the parent `Task`; the parent's
+embedder-facing `resume` gives each runnable, unfinished child one fuel quantum per
+iteration, charged against the parent's own donation — so children run on parent fuel with
+no embedder changes, and killing/dropping the parent drops its children. The guest-facing
+`wait`/`runnable` host functions only observe child state (waking the parent while a child
+still needs CPU, or parking on the child's doorbell when it is blocked); guest-facing
+`resume` is not supported yet (it reports a finished child's outcome, otherwise traps with
+a clear message) — escalation E5. Dropping a `task` handle kills the child.
+
+**Evidence.** `tests/exec_api.rs`: an executor guest granted exec receives a child binary
+and an adapter provider as `list<u8>` arguments, loads both, composes the adapter onto the
+child, compiles, spawns with no extra providers, waits, and returns the child's rendered
+outcome ("42") as its own success — all under the ordinary fuel-sliced resume loop; a
+second test shows exec is not linked unless granted. Adding the `exec` field to
+`Providers` needed the same disclosed one-line `exec: None` touch-ups in `crates/eo9` and
+`tests/eo9-integration` as the fs field before it.
+
 ### Escalations for the planner
 
 - **E1 (resolved by the async-operations migration):** binaries that await must have an
@@ -260,5 +295,10 @@ and may adjust further.
   cannot express "killed". Proposal: add a third arm (e.g. `aborted(abort-reason)`).
 - **E3 (upstream / planner):** the resume shim of D2 and whether to pursue a wasmtime
   change (or carry a patch) for store-parked fuel yields before milestone I3.
+- **E5 (guest-facing `resume`):** donating fuel from one guest to another cannot be
+  implemented by executing the child inside the parent's host call (recursive event loops
+  are forbidden); it needs either an upstream wasmtime facility or a redesign where the
+  embedder loop brokers per-child donations. Until then `eo9:exec/task.resume` traps with
+  a clear message and schedulers must use `wait`.
 - **E4 (area 01):** root pin entry for wasmtime could become `default-features = false`
   so the runtime can opt out of unused default features in the TCB build.
