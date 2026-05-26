@@ -14,8 +14,9 @@ xtask-order / web-try wave)._
   grow the binder, add a runtime-assisted configuration path, or park (note: fs.memfs's `configure` takes no
   args, so the deterministic environment loses nothing today).
 - **Upstreaming the wasmtime no_std CM-async patch** (kernel/vendor/wasmtime: 15 files, ~329 lines,
-  documented in kernel/vendor/README.md and plan/12 D16): upstream-shaped and worth offering so the vendored
-  copy can be dropped; filing it is public activity — owner to decide whether/when/who.
+  documented in kernel/vendor/README.md and plan/12 D16): owner ruling (2026-05-26) — hold until the
+  bare-metal track has a working end-to-end result (boot-to-eosh / on-target codegen), then revisit; likely
+  bundled with whatever the codegen port needs.
 - **/try v2 — eosh in the browser**: prerequisites are a JS exec host (algebra over the transpiled-component
   graph, spawn/wait, WAVE checking), an HTTP-backed store, the upstream js-component-bindgen TDZ fix (issue
   text drafted in plan/15 D11 for the owner to file), a Safari/Firefox JSPI re-check, and a call on how
