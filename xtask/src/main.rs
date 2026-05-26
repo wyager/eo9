@@ -49,6 +49,19 @@ const KERNEL_CHECK_TARGET: &str = "aarch64-unknown-none";
 /// Architectures accepted by `build-kernel` and `qemu` (QEMU bring-up order).
 const KERNEL_ARCHES: &[&str] = &["aarch64", "riscv64", "x86_64"];
 
+/// Components baked into the kernel's read-only store image: (guest package, shell name).
+/// The shell names follow the same convention the usermode store seeding uses
+/// (`eo9-example-hello` → `hello`, `eo9-stub-entropy-seeded` → `entropy.seeded`).
+const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
+    ("eosh", "eosh"),
+    ("eo9-example-hello", "hello"),
+    ("eo9-example-outcomes", "outcomes"),
+    ("eo9-example-cruncher", "cruncher"),
+    ("eo9-example-readwrite", "readwrite"),
+    ("eo9-stub-entropy-seeded", "entropy.seeded"),
+    ("eo9-stub-time-frozen", "time.frozen"),
+];
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match dispatch(&args) {
@@ -89,7 +102,20 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             build_kernel(&root, &arch_arg("build-kernel", rest)?)?;
             Ok(())
         }
-        "qemu" => qemu(&root, &arch_arg("qemu", rest)?),
+        "qemu" => {
+            let Some((arch, append)) = rest.split_first() else {
+                return Err(
+                    "qemu: expected an architecture argument (e.g. `cargo xtask qemu aarch64`)"
+                        .to_string(),
+                );
+            };
+            if !KERNEL_ARCHES.contains(&arch.as_str()) {
+                return Err(format!(
+                    "qemu: unknown architecture `{arch}` (expected one of {KERNEL_ARCHES:?})"
+                ));
+            }
+            qemu(&root, arch, append)
+        }
         "fmt" => fmt(&root, check_flag("fmt", rest)?),
         "lint" => {
             expect_no_args("lint", rest)?;
@@ -289,6 +315,55 @@ fn build_web_demo(root: &Path) -> Result<(), String> {
 /// `kernel/eo9-kernel/src/heap.rs`, which hands everything above the image to the heap.
 const KERNEL_QEMU_MEMORY: &str = "512M";
 
+/// Assemble the kernel's read-only store image (kernel/eo9-kernel/src/wasm/store.rs
+/// documents the format): each listed guest component is built, componentized, and
+/// host-AOT precompiled for the bare-metal target, then packed as
+/// `name + component bytes + artifact bytes`.
+fn build_store_image(root: &Path) -> Result<PathBuf, String> {
+    let mut image: Vec<u8> = Vec::new();
+    image.extend_from_slice(b"EO9STOR1");
+    image.extend_from_slice(
+        &u32::try_from(KERNEL_STORE_COMPONENTS.len())
+            .unwrap()
+            .to_le_bytes(),
+    );
+    for (package, shell_name) in KERNEL_STORE_COMPONENTS {
+        let component_path = build_guest_component(root, package)?;
+        let component = std::fs::read(&component_path)
+            .map_err(|err| format!("failed to read {}: {err}", component_path.display()))?;
+        let artifact_path = precompile_for_kernel(
+            root,
+            &component,
+            package,
+            &format!("store-{shell_name}.cwasm"),
+        )?;
+        let artifact = std::fs::read(&artifact_path)
+            .map_err(|err| format!("failed to read {}: {err}", artifact_path.display()))?;
+
+        let name = shell_name.as_bytes();
+        image.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+        image.extend_from_slice(name);
+        image.extend_from_slice(&u32::try_from(component.len()).unwrap().to_le_bytes());
+        image.extend_from_slice(&component);
+        image.extend_from_slice(&u32::try_from(artifact.len()).unwrap().to_le_bytes());
+        image.extend_from_slice(&artifact);
+    }
+
+    let out_dir = root.join("kernel").join("target").join("precompiled");
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|err| format!("failed to create {}: {err}", out_dir.display()))?;
+    let out_path = out_dir.join("store.img");
+    std::fs::write(&out_path, &image)
+        .map_err(|err| format!("failed to write {}: {err}", out_path.display()))?;
+    println!(
+        "xtask: assembled store image {} ({} bytes, {} components)",
+        out_path.display(),
+        image.len(),
+        KERNEL_STORE_COMPONENTS.len()
+    );
+    Ok(out_path)
+}
+
 /// Build the bootable kernel image for `arch` and return its path.
 ///
 /// For aarch64 this precompiles the wasm artifacts the kernel embeds — the hand-written
@@ -334,6 +409,11 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
         "entropy-seeded.cwasm",
     )?;
 
+    // The read-only store image: every listed component plus its host-AOT artifact,
+    // keyed by shell name, for the kernel's `program=<name>` selection (and, later,
+    // eosh's /bin view).
+    let store_image = build_store_image(root)?;
+
     let kernel_dir = root.join("kernel");
     run_with_env(
         &kernel_dir,
@@ -346,13 +426,14 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
             "--target",
             KERNEL_CHECK_TARGET,
             "--features",
-            "wasm-seed,wasm-hello,wasm-async",
+            "wasm-seed,wasm-hello,wasm-async,wasm-store",
         ],
         &[
             ("EO9_SEED_CWASM", seed.as_os_str()),
             ("EO9_HELLO_CWASM", hello.as_os_str()),
             ("EO9_SLEEPY_CWASM", sleepy.as_os_str()),
             ("EO9_ENTROPY_SEEDED_CWASM", entropy.as_os_str()),
+            ("EO9_STORE_IMAGE", store_image.as_os_str()),
         ],
     )?;
 
@@ -429,7 +510,7 @@ fn precompile_for_kernel(
 /// The exact invocation (aarch64): `qemu-system-aarch64 -M virt -cpu max -smp 1 -m 512M
 /// -nographic -kernel <image>`. The kernel powers the machine off via PSCI when its run
 /// completes (or on panic), so QEMU exits by itself; to quit earlier press Ctrl-A then X.
-fn qemu(root: &Path, arch: &str) -> Result<(), String> {
+fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
     let image = build_kernel(root, arch)?;
     let qemu = format!("qemu-system-{arch}");
     println!(
@@ -437,23 +518,29 @@ fn qemu(root: &Path, arch: &str) -> Result<(), String> {
          or press Ctrl-A then X to quit)",
         image.display()
     );
-    run(
-        root,
-        &qemu,
-        [
-            OsStr::new("-M"),
-            OsStr::new("virt"),
-            OsStr::new("-cpu"),
-            OsStr::new("max"),
-            OsStr::new("-smp"),
-            OsStr::new("1"),
-            OsStr::new("-m"),
-            OsStr::new(KERNEL_QEMU_MEMORY),
-            OsStr::new("-nographic"),
-            OsStr::new("-kernel"),
-            image.as_os_str(),
-        ],
-    )
+    let mut args: Vec<std::ffi::OsString> = [
+        "-M",
+        "virt",
+        "-cpu",
+        "max",
+        "-smp",
+        "1",
+        "-m",
+        KERNEL_QEMU_MEMORY,
+        "-nographic",
+        "-kernel",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    args.push(image.as_os_str().to_os_string());
+    // Anything after the architecture becomes the kernel command line, e.g.
+    // `cargo xtask qemu aarch64 program=cruncher seed=9 rounds=200000`.
+    if !append.is_empty() {
+        args.push("-append".into());
+        args.push(append.join(" ").into());
+    }
+    run(root, &qemu, args)
 }
 
 fn fmt(root: &Path, check: bool) -> Result<(), String> {

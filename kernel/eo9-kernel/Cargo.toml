@@ -24,6 +24,10 @@ wasm-hello = ["dep:wasmtime"]
 # `entropy.seeded` stub from the guest workspace, whose `configure` export uses the async
 # canonical ABI) and run them at boot through the component-model-async machinery.
 wasm-async = ["dep:wasmtime"]
+# Embed the read-only store image assembled by xtask (EO9_STORE_IMAGE: shell-named
+# components plus their host-AOT artifacts) and the headless runner that the kernel
+# command line's `program=<name> [arg=value …]` selects from.
+wasm-store = ["dep:wasmtime"]
 
 # These dependencies are only used by the real bare-metal build; host-triple builds (unit
 # tests, `cargo check` without --target) compile the stub entry point and need neither.

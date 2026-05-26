@@ -169,14 +169,16 @@ fn add_text(linker: &mut Linker<KernelState>) -> Result<()> {
         },
     )?;
 
-    // Serial input is not wired up yet (no UART RX path); report end of input rather
-    // than blocking forever, so programs that probe stdin terminate deterministically.
+    // Read one line from the PL011 (QEMU feeds it from stdin under -nographic), echoing
+    // as the user types: printable characters echo back, backspace erases, CR/LF ends
+    // the line, and Ctrl-D on an empty line is end of input. Polled like time.sleep —
+    // the future re-arms its waker until the line is complete.
     text.func_wrap_concurrent(
         "read-line",
         |_accessor: &Accessor<KernelState>,
          (_cap,): (Resource<TextCap>,)|
          -> ConcurrentFuture<'_, (Result<Option<String>, WitTextError>,)> {
-            Box::pin(async move { Ok((Ok(None),)) })
+            Box::pin(async move { Ok((Ok(ReadLine::default().await),)) })
         },
     )?;
 
@@ -239,6 +241,48 @@ fn add_time(linker: &mut Linker<KernelState>) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+/// Future that reads one line from the PL011, echoing input as it arrives.
+///
+/// Resolves to `Some(line)` on CR/LF (without the terminator) and to `None` (end of
+/// input) on Ctrl-D at the start of an empty line. Backspace/DEL erase the last
+/// character. Other control bytes are ignored.
+#[derive(Default)]
+struct ReadLine {
+    line: String,
+}
+
+impl Future for ReadLine {
+    type Output = Option<String>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        while let Some(byte) = crate::uart::try_get_byte() {
+            match byte {
+                b'\r' | b'\n' => {
+                    crate::kprint!("\n");
+                    return Poll::Ready(Some(core::mem::take(&mut this.line)));
+                }
+                // Ctrl-D on an empty line: end of input.
+                0x04 if this.line.is_empty() => return Poll::Ready(None),
+                // Backspace / DEL.
+                0x08 | 0x7f => {
+                    if this.line.pop().is_some() {
+                        crate::kprint!("\u{8} \u{8}");
+                    }
+                }
+                0x20..=0x7e => {
+                    let ch = char::from(byte);
+                    this.line.push(ch);
+                    crate::kprint!("{ch}");
+                }
+                _ => {}
+            }
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
 }
 
 /// Future that resolves once the generic timer's uptime reaches `deadline`.

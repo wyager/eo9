@@ -16,6 +16,11 @@ const UARTDR: usize = 0x000;
 const UARTFR: usize = 0x018;
 /// Flag register: transmit FIFO full.
 const UARTFR_TXFF: u32 = 1 << 5;
+/// Flag register: receive FIFO empty.
+// Receive is only consumed by the wasm `read-line` provider, which the feature-less CI
+// build does not compile; keep the path unconditional rather than feature-gating MMIO.
+#[allow(dead_code)]
+const UARTFR_RXFE: u32 = 1 << 4;
 
 fn mmio_read(offset: usize) -> u32 {
     // SAFETY: `UART_BASE + offset` is a valid PL011 register on the `virt` machine, and
@@ -34,6 +39,17 @@ pub fn put_byte(byte: u8) {
         core::hint::spin_loop();
     }
     mmio_write(UARTDR, u32::from(byte));
+}
+
+/// Read one received byte if one is waiting (non-blocking; QEMU feeds the RX FIFO from
+/// stdin under `-nographic`). Returns `None` when the receive FIFO is empty.
+#[allow(dead_code)] // see UARTFR_RXFE above
+pub fn try_get_byte() -> Option<u8> {
+    if mmio_read(UARTFR) & UARTFR_RXFE != 0 {
+        None
+    } else {
+        Some((mmio_read(UARTDR) & 0xff) as u8)
+    }
 }
 
 /// Zero-sized serial console handle; `core::fmt::Write` goes straight to the hardware.
