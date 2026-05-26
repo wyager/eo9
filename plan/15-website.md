@@ -24,12 +24,12 @@ Arguments-and-outcomes (WAVE), "Shell".
 
 ## Milestones
 1. Feasibility spike: transpile the real components, run them in a JS engine against a hand-written host
-   (done — see Decisions 2–5).
-2. `/try` v1: sync-ABI examples (`hello`, `outcomes`, `cruncher`) + invoker-configured stubs
-   (`entropy.seeded`, `time.frozen`) running on the page via a minimal launcher host; honest framing; no
-   eosh claim yet.
+   (**done** — see Decisions 2–5).
+2. `/try` v1: the example binaries running on the page via a minimal launcher + browser host; honest
+   framing; no eosh claim (**done** — see Decisions 8–13; ships without stub providers, see Decision 10).
 3. `/try` v2: the real eosh REPL — requires the JS exec host (component-algebra over the transpiled-module
-   graph, spawn/wait/kill, WAVE argument checking) and the store-backed name resolution eosh expects.
+   graph, spawn/wait/kill, WAVE argument checking) and the store-backed name resolution eosh expects;
+   stub-provider composition rides on the same work (see Decision 14).
 4. Polish: bundle-size reduction (shared intrinsics), browser-support matrix, suggested-command tour.
 
 ## Decisions
@@ -79,4 +79,55 @@ Arguments-and-outcomes (WAVE), "Shell".
 7. **Build-machine note for reproducing the spike.** Cargo build scripts executed from `/tmp` are killed by
    the machine's execution policy; the spike crate builds normally under the repository tree. The spike
    lives outside the website sources and is not part of the site; `www/` itself is unchanged by this
-   investigation.
+   investigation. (Standing rule since adopted: keep every build inside the repository tree.)
+8. **v1 shipped.** `/try/` is a static page: a hand-written terminal + launcher (`site/try/try.js`,
+   ~500 lines), the browser host (`site/try/host.js`, ~180 lines: eo9:text → terminal, eo9:time → browser
+   clock, eo9:fs → page-session memfs, eo9:io buffers), and the committed generated bundle
+   (`site/try/components/`, four programs — hello, outcomes, cruncher, readwrite — ~750 KiB uncompressed,
+   15 files). `www/try-build` (its own workspace; js-component-bindgen `=1.19.3`, wit-parser/wit-component
+   0.250 for the manifest) generates the bundle; `cargo xtask build-web-demo` = build-guest + try-build.
+   `cargo xtask ci` does not depend on any of it, and the eo9-www server needed no code changes (its
+   content-type table already covered .js/.wasm/.json).
+9. **No third-party JavaScript: the terminal is hand-rolled.** The approved xterm.js vendoring turned out to
+   be unnecessary — the launcher is line-oriented, so a ~100-line scrollback-plus-input widget does the job,
+   keeps the "no external assets" property of the site, and avoids carrying a vendored copy of someone
+   else's minified bundle. xterm remains an option for v2 if eosh wants real line editing.
+10. **v1 ships without stub providers (owner's option (c)).** Composing a stub at run time requires calling
+    its `configure` export from JS, and async-lifted exports that return an owned exported resource trip the
+    upstream TDZ bug (Decision 4); no fixed release exists (1.19.3 is the latest as of 2026-05-26). The
+    suggested avoidance (a) — binding `configure` at build time with the native algebra and transpiling the
+    fused result — is plausible but was deliberately not gambled on for v1: the algebra's bind-on-first-use
+    binder leans on wasmtime's CM-async subtask-status encoding (plan/03 D12), and whether the transpiled JS
+    runtime reproduces that behavior is exactly the kind of thing that needs its own verification pass. The
+    capability story v1 demonstrates instead is the loader rule (grant/revoke + refusal before execution),
+    which needs no stubs. Stub composition lands with v2.
+11. **Upstream issue draft (for the owner to file against bytecodealliance/jco):** *Title:* "transpile
+    (instantiation mode): exported-resource class is declared after the task-return trampoline that
+    references it, causing a TDZ ReferenceError for async-lifted exports returning owned resources."
+    *Body:* Transpiling a component whose async-lifted export returns an `own<R>` of an exported resource R
+    (e.g. `configure: async func(seed: u64) -> result<r, string>` in an exported config interface), with
+    `instantiation_mode: Async`, produces output where the `liftFns` array for the task-return trampoline
+    captures `className: R` before `class R { … }` is declared later in the same instantiation body;
+    instantiation then throws `ReferenceError: Cannot access 'R' before initialization`. Observed with
+    js-component-bindgen 1.19.3 (Rust API); hoisting the class declaration above the trampolines makes the
+    component work correctly, so the fix is an ordering change in the generated output. A minimal reproducer
+    is any component exporting a resource plus an async function returning it.
+12. **What was verified in a real browser** (local eo9-www serving the worktree, WebKit-based webview with
+    JSPI): hello prints through eo9:text and returns `success(greeted)`; cruncher returns the same digest on
+    repeated runs (pure compute, no imports); readwrite (async main, async fs imports via JSPI) returns
+    `success(round-tripped(n))` and `files` shows what it wrote to the page memfs; outcomes' failure variant
+    renders as `failure(requested-failure("…"))`; `revoke time` makes hello be refused before instantiation
+    with the loader-rule message and `grant time` restores it; no console errors.
+13. **Browser support statement.** Sync-ABI programs run in any modern browser. Async-main programs need
+    JSPI (`WebAssembly.Suspending`); the page feature-detects it, marks affected programs in `list`, and
+    explains when a run is attempted without it. Recent Chromium-based browsers ship JSPI; Safari/Firefox
+    status should be re-checked when v2 (eosh, which has an async main) is attempted, since v2 cannot fall
+    back the way v1 does.
+14. **v2 sketch (the real eosh REPL), not started.** Transpile eosh + the stubs into the bundle; implement
+    the `eo9:exec` surface in the browser host: `component-algebra` over a graph of pre-transpiled
+    components (compose/extend/restrict/rename as wiring decisions, `configure` as recorded constants,
+    `describe` from build-time metadata), `compile` as graph resolution, `task.spawn` as instantiating the
+    transpiled modules with the chosen wiring, WAVE argument encoding/checking, and a read-only store view
+    (`/bin/<name>.wasm`) backed by HTTP fetches of the component bytes. Prerequisites: the upstream fix from
+    Decision 11 (stub `configure`), a JSPI story for non-Chromium browsers, and a planner call on how
+    faithful the JS `compile`/fuel semantics must be before the page may call the thing it runs "eosh".
