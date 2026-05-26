@@ -26,6 +26,18 @@
 //! and makes the call lazily, from within the consumer's own task, accepting only an
 //! immediately-completed result (compose-time configuration must not block).
 //!
+//! Forwarding follows each API function's own ABI:
+//!
+//! * synchronous functions are forwarded with sync-lowered calls -- flat values pass
+//!   through unchanged and indirect results land in a per-call buffer;
+//! * `async` functions are re-exported as async (callback) lifts and forwarded with
+//!   async-lowered calls. When the provider completes immediately the forwarder returns
+//!   the result within the same task; when the provider genuinely suspends, the forwarder
+//!   parks the call in its own waitable set and finishes it from its callback once the
+//!   provider's subtask returns -- a configured provider keeps the provider's own
+//!   blocking behavior. Cancellation of an in-flight forwarded call is not supported yet
+//!   (it traps); see plan/03 Decisions.
+//!
 //! The result is an ordinary provider: composable, sealable, and byte-deterministic for
 //! the same operands. The configured behavior end-to-end is exercised by the runtime and
 //! integration suites.
@@ -40,8 +52,8 @@ use wasm_wave::wasm::WasmValue;
 use wit_parser::abi::{AbiVariant, FlatTypes, WasmSignature, WasmType};
 use wit_parser::decoding::{DecodedWasm, decode};
 use wit_parser::{
-    Function, FunctionKind, Handle, InterfaceId, Resolve, SizeAlign, Type, TypeDefKind, TypeId,
-    TypeOwner, WorldItem,
+    Function, FunctionKind, Handle, InterfaceId, Mangling, Resolve, SizeAlign, Type, TypeDefKind,
+    TypeId, TypeOwner, WorldItem, WorldKey,
 };
 
 use crate::compose::{
@@ -55,6 +67,22 @@ use crate::{Component, ComponentKind, synth};
 /// ABI: the low four bits of an async-lowered call's packed return value).
 const SUBTASK_RETURNED: i32 = 2;
 
+/// The mask selecting the subtask status from an async-lowered call's packed return
+/// value; the remaining upper bits are the subtask's waitable handle.
+const SUBTASK_STATUS_MASK: i32 = 0xF;
+
+/// Callback code returned by an async-lifted export (or its callback) when the task has
+/// completed (`task.return` has been called).
+const CALLBACK_CODE_EXIT: i32 = 0;
+
+/// Callback code returned by an async-lifted export (or its callback) to wait for an
+/// event on the waitable set packed into the upper bits.
+const CALLBACK_CODE_WAIT: i32 = 2;
+
+/// The event code delivered to an async export's callback when a subtask it is waiting
+/// on changes state; the accompanying payload is the subtask's new status.
+const EVENT_SUBTASK: i32 = 1;
+
 /// One canonical-ABI constant baked into the binder's call to `configure`.
 enum FlatConst {
     I32(i32),
@@ -65,21 +93,70 @@ enum FlatConst {
     Str(String),
 }
 
+/// One memory load the binder performs to turn a canonically-stored value into a flat
+/// core value (used to re-read an async call's results for `task.return`).
+struct ResultLoad {
+    /// Byte offset from the start of the result area.
+    offset: u32,
+    /// The load instruction shape.
+    op: LoadOp,
+}
+
+/// The load instruction shapes [`ResultLoad`] distinguishes.
+enum LoadOp {
+    I32U8,
+    I32S8,
+    I32U16,
+    I32S16,
+    I32,
+    I64,
+    F32,
+    F64,
+}
+
+/// How one forwarded API function is forwarded.
+enum ForwardKind {
+    /// A synchronous function: sync-lowered call, flat values pass through, indirect
+    /// results land in a per-call buffer of this many bytes.
+    Sync { result_area: u32 },
+    /// An `async` function: async-lifted (callback) export forwarding to an
+    /// async-lowered call, with a per-call frame for the suspended case.
+    Async(AsyncForward),
+}
+
+/// Everything the async forwarder for one function needs beyond [`ForwardFunction`].
+struct AsyncForward {
+    /// The `task.return` intrinsic's core import module and field.
+    task_return_module: String,
+    task_return_field: String,
+    /// The `task.return` intrinsic's core signature (the function's flat results).
+    task_return_sig: WasmSignature,
+    /// Loads that reconstruct the flat results from the per-call result area.
+    result_loads: Vec<ResultLoad>,
+    /// Bytes of the per-call result area (0 when the function has no result).
+    result_size: u32,
+    /// Bytes of the per-call frame header (subtask, waitable set, lent borrows).
+    frame_header: u32,
+}
+
 /// One provider API function the binder forwards (gated on configuration).
 struct ForwardFunction {
-    /// The binder's core export name, e.g. `eo9:entropy/entropy@0.1.0#get-bytes`.
+    /// The binder's core export name, e.g. `eo9:entropy/entropy@0.1.0#get-bytes`
+    /// (async functions get the `[async-lift]` / `[callback][async-lift]` prefixes).
     export_name: String,
     /// The core import module (the interface extern name) and field (function name).
     import_module: String,
     import_field: String,
-    /// The sync-lowered (caller-side) core signature.
+    /// The lowered (caller-side) core signature.
     import_sig: WasmSignature,
-    /// The sync-lifted (callee-side) core signature.
+    /// The lifted (callee-side) core signature.
     export_sig: WasmSignature,
     /// Borrow-handle parameters this function receives, as (flat parameter index,
     /// index into [`BinderPlan::drop_intrinsics`]): the canonical ABI requires the
-    /// callee to drop every borrow it was lent before returning.
+    /// callee to drop every borrow it was lent before its task completes.
     borrow_drops: Vec<(u32, usize)>,
+    /// How the function is forwarded (sync passthrough or async with a callback).
+    kind: ForwardKind,
 }
 
 /// A `[resource-drop]` intrinsic the binder needs for releasing lent borrow handles.
@@ -102,7 +179,10 @@ struct BinderPlan {
     forwards: Vec<ForwardFunction>,
     /// The resource-drop intrinsics referenced by [`ForwardFunction::borrow_drops`].
     drop_intrinsics: Vec<DropIntrinsic>,
-    /// Bytes reserved for indirect results (configure's and forwarded calls').
+    /// Whether any forwarded function is async (and the binder therefore needs the
+    /// root async intrinsics).
+    any_async: bool,
+    /// Bytes reserved at the fixed scratch offset for `configure`'s indirect result.
     scratch_size: u32,
 }
 
@@ -249,10 +329,11 @@ where
 }
 
 /// Checks that an exported API interface can be forwarded by the binder: only
-/// freestanding, synchronous functions, no resources of its own (resources shared
-/// through a types-only interface are fine -- they pass through as plain handles), and
-/// borrow handles only as direct parameters (so the forwarder can locate and release
-/// them).
+/// freestanding functions (synchronous or `async`), no resources of its own (resources
+/// shared through a types-only interface are fine -- they pass through as plain
+/// handles), and borrow handles only as direct parameters (so the forwarder can locate
+/// and release them). Per-function ABI limits (parameter flattening, async result
+/// shapes) are checked by [`plan_binder`].
 fn check_forwardable(resolve: &Resolve, extern_name: &str, id: InterfaceId) -> Result<(), String> {
     let interface = &resolve.interfaces[id];
     let owns_resource = interface.types.values().any(|ty| {
@@ -266,10 +347,13 @@ fn check_forwardable(resolve: &Resolve, extern_name: &str, id: InterfaceId) -> R
         ));
     }
     for (name, function) in &interface.functions {
-        if !matches!(function.kind, FunctionKind::Freestanding) {
+        if !matches!(
+            function.kind,
+            FunctionKind::Freestanding | FunctionKind::AsyncFreestanding
+        ) {
             return Err(format!(
-                "API function `{extern_name}#{name}` is not a freestanding synchronous \
-                 function; compose-time configuration of such providers is not supported yet"
+                "API function `{extern_name}#{name}` is not a freestanding function; \
+                 compose-time configuration of such providers is not supported yet"
             ));
         }
         for param in &function.params {
@@ -343,6 +427,73 @@ fn contains_borrow(resolve: &Resolve, ty: &Type) -> bool {
     }
 }
 
+/// The loads that rebuild an `async` function's flat results from its canonically-stored
+/// result area (for `task.return`), plus the area's size in bytes.
+///
+/// Only result shapes whose canonical memory layout can be re-read with straight-line
+/// loads are supported: nothing, scalars, enums, handles to shared (types-interface)
+/// resources, strings, and lists. Variants (including `option`/`result`), records,
+/// tuples, and flags would need discriminant-dependent reloading and are rejected with a
+/// clear error instead.
+fn async_result_plan(
+    resolve: &Resolve,
+    sizes: &SizeAlign,
+    extern_name: &str,
+    name: &str,
+    function: &Function,
+) -> Result<(Vec<ResultLoad>, u32), String> {
+    let Some(result) = &function.result else {
+        return Ok((Vec::new(), 0));
+    };
+    let unsupported = |what: &str| {
+        format!(
+            "API function `{extern_name}#{name}` is async and returns {what}; forwarding \
+             such results through compose-time configuration is not supported yet"
+        )
+    };
+
+    // Follow type aliases down to the underlying type.
+    let mut ty = *result;
+    while let Type::Id(id) = ty {
+        match &resolve.types[id].kind {
+            TypeDefKind::Type(inner) => ty = *inner,
+            _ => break,
+        }
+    }
+
+    let at = |offset: u32, op: LoadOp| ResultLoad { offset, op };
+    let size = sizes.size(result).size_wasm32() as u32;
+    let loads = match ty {
+        Type::Bool | Type::U8 => vec![at(0, LoadOp::I32U8)],
+        Type::S8 => vec![at(0, LoadOp::I32S8)],
+        Type::U16 => vec![at(0, LoadOp::I32U16)],
+        Type::S16 => vec![at(0, LoadOp::I32S16)],
+        Type::U32 | Type::S32 | Type::Char => vec![at(0, LoadOp::I32)],
+        Type::U64 | Type::S64 => vec![at(0, LoadOp::I64)],
+        Type::F32 => vec![at(0, LoadOp::F32)],
+        Type::F64 => vec![at(0, LoadOp::F64)],
+        Type::String => vec![at(0, LoadOp::I32), at(4, LoadOp::I32)],
+        Type::Id(id) => match &resolve.types[id].kind {
+            TypeDefKind::Handle(_) => vec![at(0, LoadOp::I32)],
+            TypeDefKind::Enum(_) => vec![at(
+                0,
+                match size {
+                    1 => LoadOp::I32U8,
+                    2 => LoadOp::I32U16,
+                    _ => LoadOp::I32,
+                },
+            )],
+            TypeDefKind::List(_) => vec![at(0, LoadOp::I32), at(4, LoadOp::I32)],
+            TypeDefKind::Variant(_) | TypeDefKind::Option(_) | TypeDefKind::Result(_) => {
+                return Err(unsupported("a variant-shaped value"));
+            }
+            _ => return Err(unsupported("a composite value")),
+        },
+        _ => return Err(unsupported("a value of this type")),
+    };
+    Ok((loads, size))
+}
+
 /// Lays out everything the binder core module needs.
 fn plan_binder(
     resolve: &Resolve,
@@ -386,21 +537,36 @@ fn plan_binder(
         drop_intrinsics.len() - 1
     }
 
-    let mut scratch_size = result_size(config_function);
+    let scratch_size = result_size(config_function);
+    let mut any_async = false;
     let mut forwards = Vec::new();
     let mut drop_intrinsics: Vec<DropIntrinsic> = Vec::new();
     for (extern_name, id) in forward_interfaces {
         for (name, function) in &resolve.interfaces[*id].functions {
-            let import_sig = resolve.wasm_signature(AbiVariant::GuestImport, function);
-            let export_sig = resolve.wasm_signature(AbiVariant::GuestExport, function);
-            if import_sig.retptr {
-                scratch_size = scratch_size.max(result_size(function));
+            let is_async = function.kind.is_async();
+            let (import_variant, export_variant) = if is_async {
+                (AbiVariant::GuestImportAsync, AbiVariant::GuestExportAsync)
+            } else {
+                (AbiVariant::GuestImport, AbiVariant::GuestExport)
+            };
+            let import_sig = resolve.wasm_signature(import_variant, function);
+            let export_sig = resolve.wasm_signature(export_variant, function);
+
+            // Async forwarders move every flat parameter from the lifted export to the
+            // lowered call; the async-lowered side flattens at most four parameters, so
+            // anything wider (or anything indirect) is rejected with a clear error.
+            if is_async && (import_sig.indirect_params || export_sig.indirect_params) {
+                return Err(format!(
+                    "API function `{extern_name}#{name}` is async and takes too many (or \
+                     too large) parameters for the configuration binder to forward; \
+                     compose-time configuration of such providers is not supported yet"
+                ));
             }
 
             // Locate every borrow-handle parameter: the forwarder must release them
-            // before it returns. Flat positions only exist when parameters are passed
-            // flat, so the (unrealistic) indirect-parameters-with-borrows combination is
-            // rejected rather than mishandled.
+            // before its task completes. Flat positions only exist when parameters are
+            // passed flat, so the (unrealistic) indirect-parameters-with-borrows
+            // combination is rejected rather than mishandled.
             let mut borrow_drops = Vec::new();
             let mut flat_index = 0u32;
             for param in &function.params {
@@ -422,6 +588,40 @@ fn plan_binder(
                 flat_index += width;
             }
 
+            let kind = if is_async {
+                any_async = true;
+                let (result_loads, result_bytes) =
+                    async_result_plan(resolve, &sizes, extern_name, name, function)?;
+                let key = WorldKey::Name((*extern_name).clone());
+                let (task_return_module, task_return_field, task_return_sig) =
+                    function.task_return_import(resolve, Some(&key), Mangling::Legacy);
+                if result_loads.len() != task_return_sig.params.len() {
+                    return Err(format!(
+                        "API function `{extern_name}#{name}`: the binder's result reload \
+                         plan ({} values) does not match the task-return signature ({} \
+                         parameters); this is a bug in the configuration binder",
+                        result_loads.len(),
+                        task_return_sig.params.len()
+                    ));
+                }
+                ForwardKind::Async(AsyncForward {
+                    task_return_module,
+                    task_return_field,
+                    task_return_sig,
+                    result_loads,
+                    result_size: result_bytes,
+                    frame_header: (8 + 4 * borrow_drops.len() as u32).next_multiple_of(8),
+                })
+            } else {
+                ForwardKind::Sync {
+                    result_area: if import_sig.retptr {
+                        result_size(function).max(8)
+                    } else {
+                        0
+                    },
+                }
+            };
+
             forwards.push(ForwardFunction {
                 export_name: format!("{extern_name}#{name}"),
                 import_module: extern_name.clone(),
@@ -429,6 +629,7 @@ fn plan_binder(
                 import_sig,
                 export_sig,
                 borrow_drops,
+                kind,
             });
         }
     }
@@ -439,6 +640,7 @@ fn plan_binder(
         constants,
         forwards,
         drop_intrinsics,
+        any_async,
         scratch_size: scratch_size.next_multiple_of(8).max(16),
     })
 }
@@ -628,9 +830,30 @@ fn layout(plan: &BinderPlan) -> Layout {
     }
 }
 
-/// Builds the binder's core module: the async-lowered `configure` import, a sync-lowered
-/// import and a gating forwarder export for every provider API function, a one-shot
-/// configuration flag, and a bump allocator for canonical-ABI lifting.
+/// The function indices of the root async intrinsics the binder imports when it forwards
+/// at least one async function.
+#[derive(Default, Clone, Copy)]
+struct RootIntrinsics {
+    waitable_set_new: u32,
+    waitable_join: u32,
+    waitable_set_drop: u32,
+    subtask_drop: u32,
+    context_set: u32,
+    context_get: u32,
+}
+
+/// The core function indices belonging to one forwarded function: its lowered API import
+/// and (for async functions) its `task.return` intrinsic.
+struct ForwardIndices {
+    import: u32,
+    task_return: u32,
+}
+
+/// Builds the binder's core module: the async-lowered `configure` import, a lowered
+/// import and a gating forwarder export for every provider API function (sync
+/// passthroughs for sync functions, async-callback lifts for async ones), a one-shot
+/// configuration flag, an in-flight call counter, and a bump allocator for canonical-ABI
+/// lifting.
 fn synthesize_binder_module(plan: &BinderPlan) -> Vec<u8> {
     let layout = layout(plan);
 
@@ -641,39 +864,102 @@ fn synthesize_binder_module(plan: &BinderPlan) -> Vec<u8> {
     let mut code = CodeSection::new();
 
     // Imported functions first (they occupy the low function indices): the async-lowered
-    // `configure`, the sync-lowered API functions, then the resource-drop intrinsics.
+    // `configure`, the lowered API functions (with their task-return intrinsics), the
+    // resource-drop intrinsics, then the root async intrinsics.
+    let mut next_import = 0u32;
+
     let configure_import = synth::push_signature(&mut types, &plan.config_sig);
     imports.import(
         &plan.config_extern,
         &format!("[async-lower]{CONFIGURE}"),
         wasm_encoder::EntityType::Function(configure_import),
     );
-    let configure_func = 0u32;
-    let mut forward_imports = Vec::new();
+    let configure_func = next_import;
+    next_import += 1;
+
+    let mut forward_indices = Vec::new();
     for forward in &plan.forwards {
         let ty = synth::push_signature(&mut types, &forward.import_sig);
+        let field = match &forward.kind {
+            ForwardKind::Sync { .. } => forward.import_field.clone(),
+            ForwardKind::Async(_) => format!("[async-lower]{}", forward.import_field),
+        };
         imports.import(
             &forward.import_module,
-            &forward.import_field,
+            &field,
             wasm_encoder::EntityType::Function(ty),
         );
-        forward_imports.push(1 + forward_imports.len() as u32);
+        let import = next_import;
+        next_import += 1;
+
+        let task_return = if let ForwardKind::Async(async_forward) = &forward.kind {
+            let ty = synth::push_signature(&mut types, &async_forward.task_return_sig);
+            imports.import(
+                &async_forward.task_return_module,
+                &async_forward.task_return_field,
+                wasm_encoder::EntityType::Function(ty),
+            );
+            let index = next_import;
+            next_import += 1;
+            index
+        } else {
+            u32::MAX
+        };
+        forward_indices.push(ForwardIndices {
+            import,
+            task_return,
+        });
     }
+
     let drop_type = types.len();
     types.ty().function([ValType::I32], []);
-    let first_drop = 1 + plan.forwards.len() as u32;
+    let mut drop_funcs = Vec::new();
     for intrinsic in &plan.drop_intrinsics {
         imports.import(
             &intrinsic.module,
             &intrinsic.field,
             wasm_encoder::EntityType::Function(drop_type),
         );
+        drop_funcs.push(next_import);
+        next_import += 1;
     }
 
-    // Defined functions: cabi_realloc, the one-shot gate, then one forwarder per API
-    // function.
-    let imported = first_drop + plan.drop_intrinsics.len() as u32;
-    let realloc_func = imported;
+    let mut root = RootIntrinsics::default();
+    if plan.any_async {
+        let returns_i32 = types.len();
+        types.ty().function([], [ValType::I32]);
+        let takes_i32 = types.len();
+        types.ty().function([ValType::I32], []);
+        let takes_two_i32 = types.len();
+        types.ty().function([ValType::I32, ValType::I32], []);
+
+        let root_intrinsics: [(&str, u32, &mut u32); 6] = [
+            (
+                "[waitable-set-new]",
+                returns_i32,
+                &mut root.waitable_set_new,
+            ),
+            ("[waitable-join]", takes_two_i32, &mut root.waitable_join),
+            (
+                "[waitable-set-drop]",
+                takes_i32,
+                &mut root.waitable_set_drop,
+            ),
+            ("[subtask-drop]", takes_i32, &mut root.subtask_drop),
+            ("[context-set-0]", takes_i32, &mut root.context_set),
+            ("[context-get-0]", returns_i32, &mut root.context_get),
+        ];
+        for (field, ty, slot) in root_intrinsics {
+            imports.import("$root", field, wasm_encoder::EntityType::Function(ty));
+            *slot = next_import;
+            next_import += 1;
+        }
+    }
+
+    // Defined functions: cabi_realloc, the one-shot gate, then the forwarders (sync
+    // forwarders are one function each; async forwarders are an entry plus a callback).
+    let mut next_func = next_import;
+
     let realloc_type = types.len();
     types.ty().function(
         [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
@@ -681,25 +967,73 @@ fn synthesize_binder_module(plan: &BinderPlan) -> Vec<u8> {
     );
     functions.function(realloc_type);
     code.function(&realloc_body());
+    let realloc_func = next_func;
+    next_func += 1;
 
-    let gate_func = imported + 1;
     let gate_type = types.len();
     types.ty().function([], []);
     functions.function(gate_type);
     code.function(&gate_body(plan, &layout, configure_func));
+    let gate_func = next_func;
+    next_func += 1;
 
-    for (forward, import_index) in plan.forwards.iter().zip(&forward_imports) {
-        let ty = synth::push_signature(&mut types, &forward.export_sig);
-        functions.function(ty);
-        let index = imported + 2 + *import_index - 1;
-        exports.export(&forward.export_name, ExportKind::Func, index);
-        code.function(&forward_body(
-            forward,
-            &layout,
-            *import_index,
-            gate_func,
-            first_drop,
-        ));
+    for (forward, indices) in plan.forwards.iter().zip(&forward_indices) {
+        match &forward.kind {
+            ForwardKind::Sync { result_area } => {
+                let ty = synth::push_signature(&mut types, &forward.export_sig);
+                functions.function(ty);
+                code.function(&sync_forward_body(
+                    forward,
+                    &layout,
+                    *result_area,
+                    indices.import,
+                    gate_func,
+                    realloc_func,
+                    &drop_funcs,
+                ));
+                exports.export(&forward.export_name, ExportKind::Func, next_func);
+                next_func += 1;
+            }
+            ForwardKind::Async(async_forward) => {
+                let ty = synth::push_signature(&mut types, &forward.export_sig);
+                functions.function(ty);
+                code.function(&async_entry_body(
+                    forward,
+                    async_forward,
+                    &layout,
+                    indices,
+                    gate_func,
+                    realloc_func,
+                    &drop_funcs,
+                    &root,
+                ));
+                exports.export(
+                    &format!("[async-lift]{}", forward.export_name),
+                    ExportKind::Func,
+                    next_func,
+                );
+                next_func += 1;
+
+                let callback_type = types.len();
+                types
+                    .ty()
+                    .function([ValType::I32, ValType::I32, ValType::I32], [ValType::I32]);
+                functions.function(callback_type);
+                code.function(&async_callback_body(
+                    forward,
+                    async_forward,
+                    indices,
+                    &drop_funcs,
+                    &root,
+                ));
+                exports.export(
+                    &format!("[callback][async-lift]{}", forward.export_name),
+                    ExportKind::Func,
+                    next_func,
+                );
+                next_func += 1;
+            }
+        }
     }
 
     let mut memories = MemorySection::new();
@@ -711,7 +1045,8 @@ fn synthesize_binder_module(plan: &BinderPlan) -> Vec<u8> {
         page_size_log2: None,
     });
 
-    // Globals: 0 = bump pointer, 1 = "configure has run" flag.
+    // Globals: 0 = bump pointer, 1 = "configure has run" flag, 2 = in-flight call count
+    // (the bump pointer is only reset when nothing is in flight).
     let mut globals = GlobalSection::new();
     globals.global(
         GlobalType {
@@ -721,14 +1056,16 @@ fn synthesize_binder_module(plan: &BinderPlan) -> Vec<u8> {
         },
         &ConstExpr::i32_const(layout.heap_base as i32),
     );
-    globals.global(
-        GlobalType {
-            val_type: ValType::I32,
-            mutable: true,
-            shared: false,
-        },
-        &ConstExpr::i32_const(0),
-    );
+    for _ in 0..2 {
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(0),
+        );
+    }
 
     exports.export("memory", ExportKind::Memory, 0);
     exports.export("cabi_realloc", ExportKind::Func, realloc_func);
@@ -868,34 +1205,107 @@ fn gate_body(plan: &BinderPlan, layout: &Layout, configure_func: u32) -> wasm_en
     f
 }
 
-/// A gating forwarder: ensure `configure` has run, reset the bump allocator (the
-/// previous call's results have been consumed by then), forward the call to the
-/// provider -- passing flat values through unchanged and routing indirect results via
-/// the shared scratch area -- and release any borrow handles the caller lent us, as the
-/// canonical ABI requires before an export returns.
-fn forward_body(
-    forward: &ForwardFunction,
-    layout: &Layout,
-    import_index: u32,
-    gate_func: u32,
-    first_drop: u32,
-) -> wasm_encoder::Function {
-    let mut f = wasm_encoder::Function::new([]);
-
+/// Emits the configuration gate: if `configure` has not run yet, run it now.
+fn push_gate(f: &mut wasm_encoder::Function, gate_func: u32) {
     f.instruction(&Instruction::GlobalGet(1));
     f.instruction(&Instruction::I32Eqz);
     f.instruction(&Instruction::If(BlockType::Empty));
     f.instruction(&Instruction::Call(gate_func));
     f.instruction(&Instruction::End);
+}
 
+/// Emits the per-call entry bookkeeping: reset the bump allocator if no other call is in
+/// flight (its previous allocations have been consumed by then), then count this call as
+/// in flight.
+fn push_call_enter(f: &mut wasm_encoder::Function, layout: &Layout) {
+    f.instruction(&Instruction::GlobalGet(2));
+    f.instruction(&Instruction::I32Eqz);
+    f.instruction(&Instruction::If(BlockType::Empty));
     f.instruction(&Instruction::I32Const(layout.heap_base as i32));
     f.instruction(&Instruction::GlobalSet(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::GlobalGet(2));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::GlobalSet(2));
+}
 
-    for index in 0..forward.export_sig.params.len() as u32 {
+/// Emits the per-call exit bookkeeping: this call is no longer in flight.
+fn push_call_exit(f: &mut wasm_encoder::Function) {
+    f.instruction(&Instruction::GlobalGet(2));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Sub);
+    f.instruction(&Instruction::GlobalSet(2));
+}
+
+/// Emits a bump allocation of `size` bytes (8-aligned), leaving the pointer on the stack.
+fn push_alloc(f: &mut wasm_encoder::Function, realloc_func: u32, size: u32) {
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Const(8));
+    f.instruction(&Instruction::I32Const(size as i32));
+    f.instruction(&Instruction::Call(realloc_func));
+}
+
+/// Emits the loads that rebuild a forwarded async call's flat results (for `task.return`)
+/// from the canonically-stored result area at `base` bytes past the frame pointer in
+/// `frame_local`.
+fn push_result_loads(
+    f: &mut wasm_encoder::Function,
+    frame_local: u32,
+    base: u32,
+    loads: &[ResultLoad],
+) {
+    for load in loads {
+        f.instruction(&Instruction::LocalGet(frame_local));
+        let memarg = |align: u32| MemArg {
+            offset: u64::from(base + load.offset),
+            align,
+            memory_index: 0,
+        };
+        f.instruction(&match load.op {
+            LoadOp::I32U8 => Instruction::I32Load8U(memarg(0)),
+            LoadOp::I32S8 => Instruction::I32Load8S(memarg(0)),
+            LoadOp::I32U16 => Instruction::I32Load16U(memarg(1)),
+            LoadOp::I32S16 => Instruction::I32Load16S(memarg(1)),
+            LoadOp::I32 => Instruction::I32Load(memarg(2)),
+            LoadOp::I64 => Instruction::I64Load(memarg(3)),
+            LoadOp::F32 => Instruction::F32Load(memarg(2)),
+            LoadOp::F64 => Instruction::F64Load(memarg(3)),
+        });
+    }
+}
+
+/// A synchronous gating forwarder: ensure `configure` has run, forward the call to the
+/// provider -- passing flat values through unchanged and routing indirect results via a
+/// per-call buffer -- and release any borrow handles the caller lent us, as the canonical
+/// ABI requires before an export returns.
+fn sync_forward_body(
+    forward: &ForwardFunction,
+    layout: &Layout,
+    result_area: u32,
+    import_index: u32,
+    gate_func: u32,
+    realloc_func: u32,
+    drop_funcs: &[u32],
+) -> wasm_encoder::Function {
+    let params = forward.export_sig.params.len() as u32;
+    let retptr_local = params;
+    let mut f = wasm_encoder::Function::new([(1, ValType::I32)]);
+
+    push_gate(&mut f, gate_func);
+    push_call_enter(&mut f, layout);
+
+    if forward.import_sig.retptr {
+        push_alloc(&mut f, realloc_func, result_area);
+        f.instruction(&Instruction::LocalSet(retptr_local));
+    }
+
+    for index in 0..params {
         f.instruction(&Instruction::LocalGet(index));
     }
     if forward.import_sig.retptr {
-        f.instruction(&Instruction::I32Const(layout.scratch as i32));
+        f.instruction(&Instruction::LocalGet(retptr_local));
     }
     f.instruction(&Instruction::Call(import_index));
 
@@ -903,12 +1313,212 @@ fn forward_body(
     // the operand stack).
     for (flat_index, drop) in &forward.borrow_drops {
         f.instruction(&Instruction::LocalGet(*flat_index));
-        f.instruction(&Instruction::Call(first_drop + *drop as u32));
+        f.instruction(&Instruction::Call(drop_funcs[*drop]));
     }
 
+    push_call_exit(&mut f);
+
     if forward.export_sig.retptr {
-        f.instruction(&Instruction::I32Const(layout.scratch as i32));
+        f.instruction(&Instruction::LocalGet(retptr_local));
     }
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// An async gating forwarder's entry function (the `[async-lift]` export): ensure
+/// `configure` has run, allocate a per-call frame, make the async-lowered call, and
+/// either complete the task immediately (the provider already returned) or park the
+/// provider's subtask in a fresh waitable set and wait for the callback.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one-shot generator, plain data in"
+)]
+fn async_entry_body(
+    forward: &ForwardFunction,
+    async_forward: &AsyncForward,
+    layout: &Layout,
+    indices: &ForwardIndices,
+    gate_func: u32,
+    realloc_func: u32,
+    drop_funcs: &[u32],
+    root: &RootIntrinsics,
+) -> wasm_encoder::Function {
+    let params = forward.export_sig.params.len() as u32;
+    let frame = params;
+    let status = params + 1;
+    let set = params + 2;
+    let header = async_forward.frame_header;
+    let mut f = wasm_encoder::Function::new([(3, ValType::I32)]);
+
+    push_gate(&mut f, gate_func);
+    push_call_enter(&mut f, layout);
+
+    // The per-call frame: subtask, waitable set, the lent borrow handles, then the
+    // result area the async-lowered call writes into.
+    push_alloc(&mut f, realloc_func, header + async_forward.result_size);
+    f.instruction(&Instruction::LocalSet(frame));
+    for (slot, (flat_index, _)) in forward.borrow_drops.iter().enumerate() {
+        f.instruction(&Instruction::LocalGet(frame));
+        f.instruction(&Instruction::LocalGet(*flat_index));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: u64::from(8 + 4 * slot as u32),
+            align: 2,
+            memory_index: 0,
+        }));
+    }
+
+    // The async-lowered call: flat parameters pass through unchanged; results (if any)
+    // go to the frame's result area.
+    for index in 0..params {
+        f.instruction(&Instruction::LocalGet(index));
+    }
+    if forward.import_sig.retptr {
+        f.instruction(&Instruction::LocalGet(frame));
+        f.instruction(&Instruction::I32Const(header as i32));
+        f.instruction(&Instruction::I32Add);
+    }
+    f.instruction(&Instruction::Call(indices.import));
+    f.instruction(&Instruction::LocalSet(status));
+
+    // Already returned: release the lent borrows, return the results, and exit the task.
+    f.instruction(&Instruction::LocalGet(status));
+    f.instruction(&Instruction::I32Const(SUBTASK_STATUS_MASK));
+    f.instruction(&Instruction::I32And);
+    f.instruction(&Instruction::I32Const(SUBTASK_RETURNED));
+    f.instruction(&Instruction::I32Eq);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    for (flat_index, drop) in &forward.borrow_drops {
+        f.instruction(&Instruction::LocalGet(*flat_index));
+        f.instruction(&Instruction::Call(drop_funcs[*drop]));
+    }
+    push_result_loads(&mut f, frame, header, &async_forward.result_loads);
+    f.instruction(&Instruction::Call(indices.task_return));
+    push_call_exit(&mut f);
+    f.instruction(&Instruction::I32Const(CALLBACK_CODE_EXIT));
+    f.instruction(&Instruction::Return);
+    f.instruction(&Instruction::End);
+
+    // The provider suspended: park its subtask in a fresh waitable set, remember
+    // everything the callback needs in the frame (and the frame in the task-local
+    // context slot), and wait.
+    f.instruction(&Instruction::LocalGet(status));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32ShrU);
+    f.instruction(&Instruction::LocalSet(status));
+    f.instruction(&Instruction::Call(root.waitable_set_new));
+    f.instruction(&Instruction::LocalSet(set));
+    f.instruction(&Instruction::LocalGet(status));
+    f.instruction(&Instruction::LocalGet(set));
+    f.instruction(&Instruction::Call(root.waitable_join));
+    f.instruction(&Instruction::LocalGet(frame));
+    f.instruction(&Instruction::LocalGet(status));
+    f.instruction(&Instruction::I32Store(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::LocalGet(frame));
+    f.instruction(&Instruction::LocalGet(set));
+    f.instruction(&Instruction::I32Store(MemArg {
+        offset: 4,
+        align: 2,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::LocalGet(frame));
+    f.instruction(&Instruction::Call(root.context_set));
+    f.instruction(&Instruction::LocalGet(set));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Shl);
+    f.instruction(&Instruction::I32Const(CALLBACK_CODE_WAIT));
+    f.instruction(&Instruction::I32Or);
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// An async gating forwarder's callback: invoked when the parked provider subtask
+/// changes state. Anything other than this call's own subtask completing -- including a
+/// cancellation request -- is unsupported and traps.
+fn async_callback_body(
+    forward: &ForwardFunction,
+    async_forward: &AsyncForward,
+    indices: &ForwardIndices,
+    drop_funcs: &[u32],
+    root: &RootIntrinsics,
+) -> wasm_encoder::Function {
+    // Parameters: 0 = event code, 1 = the waitable that changed, 2 = its payload.
+    let frame = 3;
+    let header = async_forward.frame_header;
+    let mut f = wasm_encoder::Function::new([(1, ValType::I32)]);
+
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::I32Const(EVENT_SUBTASK));
+    f.instruction(&Instruction::I32Ne);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+
+    f.instruction(&Instruction::Call(root.context_get));
+    f.instruction(&Instruction::LocalSet(frame));
+
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::LocalGet(frame));
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::I32Ne);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+
+    // Not finished yet (e.g. a starting -> started transition): keep waiting.
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Const(SUBTASK_RETURNED));
+    f.instruction(&Instruction::I32Ne);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::LocalGet(frame));
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: 4,
+        align: 2,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Shl);
+    f.instruction(&Instruction::I32Const(CALLBACK_CODE_WAIT));
+    f.instruction(&Instruction::I32Or);
+    f.instruction(&Instruction::Return);
+    f.instruction(&Instruction::End);
+
+    // The provider returned: retire the subtask and the waitable set, release the lent
+    // borrows, return the results, and exit the task.
+    f.instruction(&Instruction::LocalGet(frame));
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::Call(root.subtask_drop));
+    f.instruction(&Instruction::LocalGet(frame));
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: 4,
+        align: 2,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::Call(root.waitable_set_drop));
+    for (slot, (_, drop)) in forward.borrow_drops.iter().enumerate() {
+        f.instruction(&Instruction::LocalGet(frame));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: u64::from(8 + 4 * slot as u32),
+            align: 2,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::Call(drop_funcs[*drop]));
+    }
+    push_result_loads(&mut f, frame, header, &async_forward.result_loads);
+    f.instruction(&Instruction::Call(indices.task_return));
+    push_call_exit(&mut f);
+    f.instruction(&Instruction::I32Const(CALLBACK_CODE_EXIT));
     f.instruction(&Instruction::End);
     f
 }

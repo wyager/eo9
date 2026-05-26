@@ -121,3 +121,33 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     providers whose API interfaces define their own resources (fs-, net-style interfaces), have non-
     freestanding or async API functions, or nest borrows inside parameters are rejected by `configure` for
     now — binding those needs either resource proxying in the binder or runtime-side configuration.
+    *(Partially superseded by D13: async freestanding API functions are now forwarded; interfaces that
+    define their own resources are still rejected.)*
+13. **The binder forwards async API functions (async-callback lifts + async-lowered calls).** Each forwarded
+    function follows its own ABI: sync functions keep the flat passthrough (now with a per-call result
+    buffer instead of the shared scratch area), and `async` functions are re-exported as async (callback)
+    lifts that async-lower the provider call. An immediately-completed provider call is returned within the
+    same task (`task.return`, then exit); a provider that genuinely suspends is parked — the subtask joins a
+    fresh per-call waitable set, the per-call frame (subtask, set, lent borrows, result area) is recorded in
+    the task-local context slot, and the callback completes the call when the subtask's "returned" event
+    arrives. A new in-flight counter makes the bump allocator sound under concurrent calls (it is only reset
+    when nothing is in flight), and lent borrows are released after the forwarded call completes, per the
+    canonical ABI. The configuration gate itself is unchanged. Supported async shapes: freestanding
+    functions whose parameters flatten to at most four values (the async-lower limit) and whose results are
+    nothing, scalars, enums, shared-resource handles, strings, or lists; variant-shaped results
+    (`option`/`result`/variants, e.g. every fs/disk operation) need discriminant-dependent reloading for
+    `task.return` and are rejected with a clear error. In practice this makes the time-shaped providers
+    (`time.frozen`, `time.monotonic-stub`, `time.fuzzy`) invoker-configurable; with `entropy.seeded` that is
+    enough for the invoker-configured deterministic environment
+    (`tests/eo9-integration/tests/invoker_configured_env.rs`: the guest imports no config interfaces, its
+    `sleep` through the configured frozen clock completes, runs are byte-identical, ambient providers do not
+    leak, and the `&` form agrees with the `$` chain). The suspended path is implemented per the canonical
+    ABI (constants mirrored from wasmtime 45's `concurrent.rs`) but is not yet exercised end-to-end — no
+    configurable provider blocks today; `configure(time.fuzzy, …)` over a real clock will be the first.
+    **Remaining limitations (escalate as needed):** (a) interfaces that define their own resources (fs,
+    disk, net, io) still need export-side resource proxying (`[resource-new]`/`[resource-rep]`/`[dtor]`
+    wrappers whose representation is the provider's handle) *and* variant-result reloading — those are the
+    two concrete blockers for `configure(fs.memfs)` / `configure(disk.mem)`; (b) cancellation of an
+    in-flight forwarded call is unsupported and traps (a caller that drops a pending future would hit it;
+    none of the current guests cancel); (c) the binder now also leans on the packed callback-code and
+    subtask-event encodings of the CM async ABI, kept in one constants block at the top of `configure.rs`.

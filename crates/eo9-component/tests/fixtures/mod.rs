@@ -161,6 +161,21 @@ world entropy-user {
 }
 "#;
 
+/// A placeholder package for fixtures that only select a world from the repository's
+/// own `wit/` packages.
+const EMPTY_WIT: &str = "package fix:empty@0.1.0;\n";
+
+/// Fixture worlds against the real `eo9:time` package.
+const CLOCK_WIT: &str = r#"
+package fix:clock@0.1.0;
+
+/// A binary requiring the real `eo9:time/time` capability.
+world clock-user {
+    import eo9:time/time@0.1.0;
+    export main: func() -> result<u64, string>;
+}
+"#;
+
 /// Builds a `fix:kit` fixture world and loads it.
 pub fn kit(world: &str) -> Component {
     Component::load(kit_bytes(world)).expect("fixture should load")
@@ -174,6 +189,39 @@ pub fn seeded_provider() -> Component {
         &[("fix-hello.wit", HELLO_WIT)],
         &["text", "entropy"],
         "eo9:entropy/seeded",
+    );
+    Component::load(bytes).expect("fixture should load")
+}
+
+/// The real `eo9:time/frozen` stub world (types + time + frozen-config), built against
+/// the repository's own WIT with a dummy implementation whose async functions are lifted
+/// with the async-callback ABI: the same shape as the real `time.frozen` provider in
+/// `guest/stubs`, including the async `sleep` in its API.
+pub fn frozen_provider() -> Component {
+    let bytes = build_bytes_with(
+        &[("fix-empty.wit", EMPTY_WIT)],
+        &["time"],
+        "eo9:time/frozen",
+        ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback),
+    );
+    Component::load(bytes).expect("fixture should load")
+}
+
+/// A binary importing the real `eo9:time/time` interface (for composing a configured
+/// clock provider into).
+pub fn clock_user() -> Component {
+    let bytes = build_bytes(&[("fix-clock.wit", CLOCK_WIT)], &["time"], "clock-user");
+    Component::load(bytes).expect("fixture should load")
+}
+
+/// The real `eo9:fs/memfs` stub world, whose API interface defines its own resources --
+/// the provider shape compose-time configuration cannot bind yet.
+pub fn memfs_provider() -> Component {
+    let bytes = build_bytes_with(
+        &[("fix-empty.wit", EMPTY_WIT)],
+        &["fs"],
+        "eo9:fs/memfs",
+        ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback),
     );
     Component::load(bytes).expect("fixture should load")
 }
@@ -236,8 +284,25 @@ pub fn eo9_fixture(world: &str) -> Component {
 }
 
 /// Parses the given WIT sources (plus any `wit/<dir>` packages from the repository) and
-/// encodes the selected world as a component with a dummy core implementation.
+/// encodes the selected world as a component with a dummy core implementation using the
+/// synchronous ABI.
 fn build_bytes(sources: &[(&str, &str)], wit_dirs: &[&str], world: &str) -> Vec<u8> {
+    build_bytes_with(
+        sources,
+        wit_dirs,
+        world,
+        ManglingAndAbi::Legacy(LiftLowerAbi::Sync),
+    )
+}
+
+/// [`build_bytes`], with the dummy implementation's lift/lower ABI chosen by the caller
+/// (async-callback for stub-shaped fixtures whose WIT has async functions).
+fn build_bytes_with(
+    sources: &[(&str, &str)],
+    wit_dirs: &[&str],
+    world: &str,
+    abi: ManglingAndAbi,
+) -> Vec<u8> {
     let mut resolve = Resolve::default();
     for dir in wit_dirs {
         let path = repo_wit_dir().join(dir);
@@ -260,7 +325,7 @@ fn build_bytes(sources: &[(&str, &str)], wit_dirs: &[&str], world: &str) -> Vec<
         )
         .unwrap_or_else(|err| panic!("failed to select fixture world: {err:#}"));
 
-    let mut module = dummy_module(&resolve, world, ManglingAndAbi::Legacy(LiftLowerAbi::Sync));
+    let mut module = dummy_module(&resolve, world, abi);
     embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
         .expect("failed to embed component metadata");
     ComponentEncoder::default()
