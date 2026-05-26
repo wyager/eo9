@@ -10,10 +10,16 @@ xtask-order / web-try wave)._
 
 - **/try v2 — eosh in the browser**: direction set — the wasm32 + Pulley blob running the real stack (spike
   merged: plan/15 D15–20, probe under www/embed-spike). The only blocker is suspending async-lifted guest
-  calls in the browser, since wasmtime-fiber has no wasm32 backend (no upstream fiberless callback path
-  exists). Owner asked for an **effort estimate of a JSPI-backed fiber shim** before committing — being
-  scoped now. `eo9-embed` (the path-independent embeddable-runtime foundation) is green-lit and underway
-  (area 16) regardless.
+  calls in the browser. **JSPI-shim estimate (2026-05-26): month-plus, and a "drop-in" JSPI fiber backend is
+  infeasible** — wasmtime-fiber's contract is symmetric synchronous native stack-switching; JSPI is
+  asymmetric Promise-based suspension, so you inevitably end up doing the *fiberless callback-execution*
+  surgery in wasmtime's component-async layer (~15–30 eng-days, high risk) plus JSPI for host-import
+  blocking. That is essentially the same work as the deferred upstream fiberless path. Key context: **/try
+  v1 already runs async components in the browser today** (jco on the browser's native engine + JSPI — never
+  touches wasmtime-fiber), so the "async in the browser" demo already exists; the wasm32 real-stack blob is
+  a nice-to-have, not MVP-critical. Planner recommendation: **defer** (ship v1, finish the MVP first);
+  optional cheap door-opener is a 1–2 day probe of fiberless callback execution in concurrent.rs. Owner call
+  pending. `eo9-embed` (the path-independent foundation) proceeds regardless (area 16).
 - **Compose-time vs run-time provider parameters.** Changing a seed currently changes the composed artifact
   and forces a recompile, same as changing a structural choice. Owner parked the "late-bound parameter"
   idea until there is a clean design; revisit if deterministic sweeps start thrashing the compile cache.
