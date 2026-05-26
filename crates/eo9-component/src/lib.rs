@@ -10,6 +10,8 @@
 //!   (right-biased export union, imports wired left-to-right).
 //! * [`restrict`] -- `only`: bound a component to a fixed allow-list of interfaces.
 //! * [`rename`] -- relabel a capability slot on imports and exports alike.
+//! * [`configure`] -- bind a provider's compose-time configuration constants and seal
+//!   its config interface away.
 //!
 //! No execution and no I/O policy lives here -- this is math on bytes. Operations are
 //! deterministic: the same inputs produce byte-identical outputs, which is what the
@@ -17,6 +19,7 @@
 
 mod component;
 mod compose;
+mod configure;
 mod describe;
 mod error;
 mod externs;
@@ -24,10 +27,12 @@ mod rename;
 mod restrict;
 pub mod semver;
 mod slots;
+mod synth;
 
 pub use component::Component;
 pub use compose::{compose, extend};
-pub use error::{ComposeError, LoadError, RenameError, RestrictError};
+pub use configure::configure;
+pub use error::{ComposeError, ConfigureError, LoadError, RenameError, RestrictError};
 pub use rename::rename;
 pub use restrict::restrict;
 

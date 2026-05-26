@@ -460,6 +460,7 @@ version = "0.0.0"
 dependencies = [
  "wac-graph",
  "wasm-encoder 0.250.0",
+ "wasm-wave 0.250.0",
  "wasmparser 0.250.0",
  "wit-component",
  "wit-parser 0.250.0",
@@ -1725,6 +1726,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-wave"
+version = "0.250.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e17cd128d1e4543bd11a9abf6ccab1eedf01d5c931785ec16dbaa297044670e"
+dependencies = [
+ "logos",
+ "thiserror 2.0.18",
+ "wit-parser 0.250.0",
+]
+
+[[package]]
 name = "wasmparser"
 version = "0.247.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1810,7 +1822,7 @@ dependencies = [
  "tempfile",
  "wasm-compose",
  "wasm-encoder 0.248.0",
- "wasm-wave",
+ "wasm-wave 0.248.0",
  "wasmparser 0.248.0",
  "wasmtime-environ",
  "wasmtime-internal-cache",

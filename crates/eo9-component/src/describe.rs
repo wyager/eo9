@@ -16,6 +16,13 @@ use crate::{ArgSpec, ComponentInfo, ComponentKind, ExportSlot, ImportNeed};
 /// (SPEC.md "The capability algebra").
 pub(crate) const OPTIONAL_SUFFIX: &str = "-optional";
 
+/// The suffix that marks a provider's compose-time configuration interface
+/// (SPEC.md "Binary or provider, never both").
+pub(crate) const CONFIG_SUFFIX: &str = "-config";
+
+/// The entry point of a `*-config` interface.
+pub(crate) const CONFIGURE: &str = "configure";
+
 /// Slot-level metadata for one import of a component.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImportMeta {
@@ -109,12 +116,20 @@ impl Meta {
         let mut exports = Vec::new();
         let mut main: Option<&Function> = None;
         let mut configure: Option<&Function> = None;
+        let mut config_interface_entries: Vec<&Function> = Vec::new();
         let mut other_funcs = Vec::new();
         for (key, item) in &world.exports {
             match item {
                 WorldItem::Interface { id, .. } => {
                     let extern_name = resolve.name_world_key(key);
                     let (interface, version) = interface_ident(resolve, *id);
+                    // A provider's argument surface lives in its exported `*-config`
+                    // interface (SPEC.md "Binary or provider, never both").
+                    if interface.ends_with(CONFIG_SUFFIX)
+                        && let Some(entry) = resolve.interfaces[*id].functions.get(CONFIGURE)
+                    {
+                        config_interface_entries.push(entry);
+                    }
                     exports.push(ExportMeta {
                         slot: slots::slot_name(&extern_name).to_string(),
                         extern_name,
@@ -159,7 +174,17 @@ impl Meta {
                 }
                 (ComponentKind::Binary, Some(main))
             }
-            (None, configure) => (ComponentKind::Provider, configure),
+            // A provider's `configure` entry may be a bare world-level export or live in
+            // a single exported `*-config` interface; either way its parameters are the
+            // provider's argument signature. (With several config interfaces the
+            // signature is ambiguous, so no arguments are reported.)
+            (None, configure) => {
+                let config_entry = match config_interface_entries.as_slice() {
+                    [entry] => Some(*entry),
+                    _ => None,
+                };
+                (ComponentKind::Provider, configure.or(config_entry))
+            }
         };
 
         let args = entry
@@ -232,7 +257,7 @@ fn interface_ident(resolve: &Resolve, id: InterfaceId) -> (String, String) {
 /// Renders a WIT type as the text used in `arg-spec.ty` (e.g. `string`, `list<u8>`,
 /// `option<instant>`). Named types are rendered by name; anonymous constructors are
 /// rendered structurally.
-fn type_text(resolve: &Resolve, ty: &Type) -> String {
+pub(crate) fn type_text(resolve: &Resolve, ty: &Type) -> String {
     match ty {
         Type::Bool => "bool".to_string(),
         Type::U8 => "u8".to_string(),
