@@ -717,6 +717,75 @@ fn shell_interactive_transcript_with_let_bindings() {
     assert!(run.stdout.contains("ok: greeted"), "{}", run.stdout);
 }
 
+/// Regression test for the duplicated interactive prompt: pressing Enter on a line that
+/// produces no stdout (an empty line, a parse error) must not make the next repaint show
+/// `eosh> eosh> …`. The interactive path needs a real terminal, so the shell is run
+/// inside a pseudo-terminal via script(1); the BSD invocation used here is macOS-only
+/// (which is also the only place `cargo xtask ci` runs today).
+#[test]
+#[cfg(target_os = "macos")]
+fn shell_interactive_pty_prompt_is_not_duplicated() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    ensure_components();
+    let store = temp_store("shell-pty-prompt");
+
+    // Warm the store seeding and the eosh compile cache first (no pty), so the pty
+    // session below reaches its first interactive read quickly and the paced input
+    // arrives after the editor owns the terminal.
+    let warm = eo9(&store, &["shell", "-c", "help"]);
+    assert_eq!(warm.code, 0, "stderr: {}", warm.stderr);
+
+    let mut child = Command::new("/usr/bin/script")
+        .args(["-q", "/dev/null", env!("CARGO_BIN_EXE_eo9"), "shell"])
+        .env("EO9_STORE", &store)
+        .current_dir(repo_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start script(1) with the eo9 shell");
+
+    // Paced keystrokes: empty Enters, a command with output, a parse error (stderr
+    // only), then exit. The pauses keep each line's processing apart; exact timing is
+    // not load-bearing for the assertion (a duplicate would persist in the repaints).
+    {
+        let stdin = child.stdin.as_mut().expect("stdin was piped");
+        let mut send = |bytes: &[u8], wait_ms: u64| {
+            stdin.write_all(bytes).expect("write to the pty");
+            stdin.flush().expect("flush the pty");
+            std::thread::sleep(Duration::from_millis(wait_ms));
+        };
+        std::thread::sleep(Duration::from_millis(1500));
+        send(b"\r", 400);
+        send(b"\r", 400);
+        send(b"hello --name pty --excited true\r", 1500);
+        send(b"\r", 400);
+        send(b"badsyntax )\r", 600);
+        send(b"exit\r", 600);
+    }
+    drop(child.stdin.take());
+
+    let output = child
+        .wait_with_output()
+        .expect("script(1) session did not finish");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    // The interactive editor ran (prompt repaints use clear-line escapes)…
+    assert!(stdout.contains("eosh>"), "no prompt seen: {stdout:?}");
+    assert!(
+        stdout.contains("\u{1b}[2K"),
+        "the interactive editor did not run (no repaints): {stdout:?}"
+    );
+    // …and no repaint ever stacked one prompt onto another.
+    assert!(
+        !stdout.contains("eosh> eosh>"),
+        "duplicated prompt in the interactive session: {stdout:?}"
+    );
+}
+
 #[test]
 fn shell_resolves_store_bound_names_and_eosh_from_the_store() {
     // Bind eosh and a program under a name that exists only in the store: the session

@@ -25,8 +25,14 @@ pub struct InteractiveText {
 }
 
 struct Shared {
-    /// Whatever was last written to stdout after its final newline — visually, the
-    /// prompt the cursor is sitting after — used to repaint the line while editing.
+    /// What stdout holds since the most recent newline — visually, the prompt the
+    /// cursor is sitting after — used to repaint the line while editing. Both writers
+    /// of the terminal keep it honest: guest writes update it in [`TextProvider::write`]
+    /// (a newline resets it, a partial line extends it), and the editor — which always
+    /// ends an edit by emitting its own newline — resets it when `read-line` completes.
+    /// Without that second half, every prompt eosh writes after an output-less line
+    /// (an empty Enter, a parse error) would be appended to the previous one and the
+    /// repaint would show `eosh> eosh> …`.
     pending_prompt: String,
     /// Lines entered this session (oldest first), for ↑/↓ recall.
     history: Vec<String>,
@@ -90,13 +96,19 @@ impl TextProvider for InteractiveText {
                     (shared.pending_prompt.clone(), shared.history.clone())
                 };
                 let result = read_one_line(&prompt, &history, &completer);
-                if let Ok(Some(line)) = &result {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        let mut shared = shared
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if shared.history.last().map(String::as_str) != Some(trimmed) {
+                {
+                    let mut shared = shared
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    // The edit ended the physical line (the editor and the cooked-mode
+                    // fallback both finish with a newline), so the tracked prompt
+                    // prefix starts over; the next prompt eosh writes stands alone.
+                    shared.pending_prompt.clear();
+                    if let Ok(Some(line)) = &result {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty()
+                            && shared.history.last().map(String::as_str) != Some(trimmed)
+                        {
                             shared.history.push(trimmed.to_string());
                         }
                     }
