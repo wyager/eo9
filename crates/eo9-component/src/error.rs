@@ -87,6 +87,58 @@ impl fmt::Display for RestrictError {
 
 impl Error for RestrictError {}
 
+/// Errors from [`configure`](crate::configure) -- binding a provider's compose-time
+/// configuration constants.
+///
+/// The reference for the `configure-error` variant being added to
+/// `eo9:exec/component-algebra` (area 02 mirrors this surface).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigureError {
+    /// The operand is not a provider.
+    NotAProvider,
+    /// The provider exports no `*-config` interface, so there is nothing to bind --
+    /// either it takes no configuration at all, or it has already been configured.
+    NoConfigInterface,
+    /// A supplied argument does not name a parameter of `configure`.
+    UnknownArgument(String),
+    /// A parameter of `configure` was not supplied.
+    MissingArgument(String),
+    /// An argument's WAVE value does not type-check against the declared parameter type
+    /// (or was supplied more than once).
+    InvalidArgument {
+        /// The parameter name.
+        name: String,
+        /// What went wrong.
+        message: String,
+    },
+    /// An unexpected failure in the underlying synthesis/wiring machinery, or a
+    /// configuration signature this implementation cannot bake in yet.
+    Internal(String),
+}
+
+impl fmt::Display for ConfigureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotAProvider => write!(f, "operand is not a provider"),
+            Self::NoConfigInterface => {
+                write!(f, "the provider exports no `*-config` interface to bind")
+            }
+            Self::UnknownArgument(name) => {
+                write!(f, "`{name}` is not a parameter of `configure`")
+            }
+            Self::MissingArgument(name) => {
+                write!(f, "missing argument `{name}`")
+            }
+            Self::InvalidArgument { name, message } => {
+                write!(f, "invalid argument `{name}`: {message}")
+            }
+            Self::Internal(msg) => write!(f, "internal configure error: {msg}"),
+        }
+    }
+}
+
+impl Error for ConfigureError {}
+
 /// Errors from [`rename`](crate::rename).
 ///
 /// Mirrors `rename-error` in `eo9:exec/component-algebra`.

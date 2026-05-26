@@ -21,14 +21,14 @@ use wasm_encoder::{
     CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, FunctionSection, Instruction,
     MemorySection, MemoryType, Module, TypeSection, ValType,
 };
-use wit_parser::abi::{AbiVariant, WasmSignature, WasmType};
+use wit_parser::abi::{AbiVariant, WasmSignature};
 use wit_parser::decoding::{DecodedWasm, decode};
 use wit_parser::{Resolve, WorldId, WorldItem};
 
 use crate::compose::{encode, export_all, register, slot_annotations, world_exports};
 use crate::describe::{ImportMeta, OPTIONAL_SUFFIX};
 use crate::error::RestrictError;
-use crate::{Component, InterfaceRef, semver, slots};
+use crate::{Component, InterfaceRef, semver, slots, synth};
 
 /// Bounds `c` to the allow-list `allow`, per the rules above.
 pub fn restrict(c: &Component, allow: &[InterfaceRef]) -> Result<Component, RestrictError> {
@@ -213,21 +213,8 @@ fn build_absent_provider(
 
     // The core module implementing it: one function per exported interface function,
     // returning zeroes (plus a zero-filled exported memory for indirect returns).
-    let mut module = synthesize_zero_module(resolve, world)?;
-
-    wit_component::embed_component_metadata(
-        &mut module,
-        resolve,
-        world,
-        wit_component::StringEncoding::UTF8,
-    )
-    .map_err(|err| format!("failed to embed component metadata: {err:#}"))?;
-    wit_component::ComponentEncoder::default()
-        .validate(true)
-        .module(&module)
-        .map_err(|err| format!("failed to encode the absent provider: {err:#}"))?
-        .encode()
-        .map_err(|err| format!("failed to encode the absent provider: {err:#}"))
+    let module = synthesize_zero_module(resolve, world)?;
+    synth::encode_component(module, resolve, world)
 }
 
 /// Checks that an optional import has the mechanically derived `-optional` shape:
@@ -295,7 +282,7 @@ fn synthesize_zero_module(resolve: &Resolve, world: WorldId) -> Result<Vec<u8>, 
         let interface_name = resolve.name_world_key(key);
         for (func_name, function) in &resolve.interfaces[*id].functions {
             let signature = resolve.wasm_signature(AbiVariant::GuestExport, function);
-            let type_index = push_signature(&mut types, &signature);
+            let type_index = synth::push_signature(&mut types, &signature);
             functions.function(type_index);
             exports.export(
                 &format!("{interface_name}#{func_name}"),
@@ -320,21 +307,12 @@ fn synthesize_zero_module(resolve: &Resolve, world: WorldId) -> Result<Vec<u8>, 
     Ok(module.finish())
 }
 
-/// Adds the core type for a canonical-ABI signature and returns its index.
-fn push_signature(types: &mut TypeSection, signature: &WasmSignature) -> u32 {
-    let params: Vec<ValType> = signature.params.iter().map(val_type).collect();
-    let results: Vec<ValType> = signature.results.iter().map(val_type).collect();
-    let index = types.len();
-    types.ty().function(params, results);
-    index
-}
-
 /// A function body returning a zero for every result (a zero pointer for indirect
 /// returns points at zero-filled memory, which lifts to `none`).
 fn zero_returning_body(signature: &WasmSignature) -> wasm_encoder::Function {
     let mut body = wasm_encoder::Function::new([]);
     for result in &signature.results {
-        match val_type(result) {
+        match synth::val_type(result) {
             ValType::I32 => body.instruction(&Instruction::I32Const(0)),
             ValType::I64 => body.instruction(&Instruction::I64Const(0)),
             ValType::F32 => body.instruction(&Instruction::F32Const(0.0f32.into())),
@@ -344,14 +322,4 @@ fn zero_returning_body(signature: &WasmSignature) -> wasm_encoder::Function {
     }
     body.instruction(&Instruction::End);
     body
-}
-
-/// The core value type for a canonical-ABI wasm type (32-bit pointer flavor).
-fn val_type(ty: &WasmType) -> ValType {
-    match ty {
-        WasmType::I32 | WasmType::Pointer | WasmType::Length => ValType::I32,
-        WasmType::I64 | WasmType::PointerOrI64 => ValType::I64,
-        WasmType::F32 => ValType::F32,
-        WasmType::F64 => ValType::F64,
-    }
 }

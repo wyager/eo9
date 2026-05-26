@@ -153,11 +153,29 @@ world text-mock {
     export eo9:text/types@0.1.0;
     export eo9:text/text@0.1.0;
 }
+
+/// A binary requiring entropy (for composing a configured provider into).
+world entropy-user {
+    import eo9:entropy/entropy@0.1.0;
+    export main: func(count: u32) -> result<u64, string>;
+}
 "#;
 
 /// Builds a `fix:kit` fixture world and loads it.
 pub fn kit(world: &str) -> Component {
     Component::load(kit_bytes(world)).expect("fixture should load")
+}
+
+/// The real `eo9:entropy/seeded` stub world (types + entropy + seeded-config), built
+/// against the repository's own WIT with a dummy implementation: the same shape as the
+/// real `entropy.seeded` provider in `guest/stubs`.
+pub fn seeded_provider() -> Component {
+    let bytes = build_bytes(
+        &[("fix-hello.wit", HELLO_WIT)],
+        &["text", "entropy"],
+        "eo9:entropy/seeded",
+    );
+    Component::load(bytes).expect("fixture should load")
 }
 
 /// Builds a `fix:kit` fixture world, returning raw bytes (for load-rejection tests).

@@ -18,6 +18,9 @@ wasm-encoder = { workspace = true, features = ["wasmparser"] }
 wit-parser = { workspace = true }
 wit-component = { workspace = true }
 wac-graph = { workspace = true }
+# WAVE is the canonical value encoding for invocations (SPEC "Arguments and outcomes");
+# `configure` parses compose-time constants with it against the config signature.
+wasm-wave = { workspace = true }
 
 [dev-dependencies]
 # Test fixtures are tiny components generated in-process from WIT text: a dummy core

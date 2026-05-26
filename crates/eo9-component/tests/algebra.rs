@@ -11,10 +11,12 @@ mod fixtures;
 use std::collections::BTreeSet;
 
 use eo9_component::{
-    Component, ComponentInfo, ComponentKind, ComposeError, InterfaceRef, LoadError, RenameError,
-    RestrictError, compose, extend, rename, restrict,
+    Component, ComponentInfo, ComponentKind, ComposeError, ConfigureError, InterfaceRef, LoadError,
+    RenameError, RestrictError, compose, configure, extend, rename, restrict,
 };
-use fixtures::{eo9_fixture, kit, kit_bytes, kit_mismatched, ver_consumer, ver_provider};
+use fixtures::{
+    eo9_fixture, kit, kit_bytes, kit_mismatched, seeded_provider, ver_consumer, ver_provider,
+};
 
 /// The normalized form of `describe()`: kind, sorted import slots, sorted export slots,
 /// and the argument signature in declaration order.
@@ -650,5 +652,95 @@ fn restrict_is_deterministic() {
     let app = kit("app-optional");
     let once = restrict(&app, &allow(&["fix:kit/cap-b"])).unwrap();
     let twice = restrict(&app, &allow(&["fix:kit/cap-b"])).unwrap();
+    assert_eq!(once.save(), twice.save());
+}
+
+// ---------------------------------------------------------------------------
+// configure -- binding a provider's compose-time constants
+// ---------------------------------------------------------------------------
+
+#[test]
+fn describe_reports_a_providers_config_arguments() {
+    let seeded = seeded_provider();
+    let info = seeded.describe();
+    assert_eq!(info.kind, ComponentKind::Provider);
+    assert!(export_slots(&info).contains("eo9:entropy/seeded-config"));
+    let args: Vec<(&str, &str)> = info
+        .args
+        .iter()
+        .map(|a| (a.name.as_str(), a.ty.as_str()))
+        .collect();
+    assert_eq!(args, vec![("seed", "u64")]);
+}
+
+#[test]
+fn configure_bakes_args_and_seals_the_config_interface() {
+    let seeded = seeded_provider();
+    let configured = configure(&seeded, &[("seed", "42")]).unwrap();
+    let info = configured.describe();
+
+    // Still an ordinary provider, but the config surface is gone and there is nothing
+    // left to bind.
+    assert_eq!(info.kind, ComponentKind::Provider);
+    let exports = export_slots(&info);
+    assert!(exports.contains("eo9:entropy/entropy"));
+    assert!(exports.contains("eo9:entropy/types"));
+    assert!(!exports.contains("eo9:entropy/seeded-config"));
+    assert!(info.args.is_empty());
+
+    // It composes like any provider: the consumer's entropy need is sealed and the
+    // config interface never reaches it.
+    let consumer = eo9_fixture("entropy-user");
+    let bound = compose(&configured, &consumer).unwrap();
+    assert_eq!(bound.kind(), ComponentKind::Binary);
+    assert!(!import_slots(&bound.describe()).contains("eo9:entropy/entropy"));
+    assert!(!import_slots(&bound.describe()).contains("eo9:entropy/types"));
+}
+
+#[test]
+fn configure_requires_a_provider() {
+    let err = configure(&eo9_fixture("hello"), &[("seed", "1")]).unwrap_err();
+    assert_eq!(err, ConfigureError::NotAProvider);
+}
+
+#[test]
+fn configure_requires_a_config_interface() {
+    // A provider without a config interface has nothing to bind ...
+    let err = configure(&kit("provider-ab"), &[] as &[(&str, &str)]).unwrap_err();
+    assert_eq!(err, ConfigureError::NoConfigInterface);
+
+    // ... and an already-configured provider errors the same way (no double-configure).
+    let configured = configure(&seeded_provider(), &[("seed", "42")]).unwrap();
+    let err = configure(&configured, &[("seed", "42")]).unwrap_err();
+    assert_eq!(err, ConfigureError::NoConfigInterface);
+}
+
+#[test]
+fn configure_rejects_unknown_missing_and_ill_typed_arguments() {
+    let seeded = seeded_provider();
+
+    let err = configure(&seeded, &[("seed", "1"), ("extra", "2")]).unwrap_err();
+    assert_eq!(err, ConfigureError::UnknownArgument("extra".to_string()));
+
+    let err = configure(&seeded, &[] as &[(&str, &str)]).unwrap_err();
+    assert_eq!(err, ConfigureError::MissingArgument("seed".to_string()));
+
+    let err = configure(&seeded, &[("seed", "\"not a number\"")]).unwrap_err();
+    assert!(
+        matches!(&err, ConfigureError::InvalidArgument { name, .. } if name == "seed"),
+        "{err:?}"
+    );
+
+    let err = configure(&seeded, &[("seed", "1"), ("seed", "2")]).unwrap_err();
+    assert!(
+        matches!(&err, ConfigureError::InvalidArgument { name, .. } if name == "seed"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn configure_is_deterministic() {
+    let once = configure(&seeded_provider(), &[("seed", "7")]).unwrap();
+    let twice = configure(&seeded_provider(), &[("seed", "7")]).unwrap();
     assert_eq!(once.save(), twice.save());
 }
