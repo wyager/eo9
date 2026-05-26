@@ -11,8 +11,33 @@
 /// `async func` (see SPEC: WASM runtime) — anything that performs I/O must be async-lifted.
 package eo9:exec@0.1.0;
 
+/// Shared argument vocabulary: the signature side (`arg-spec`) and the value side
+/// (`named-arg`) of named, typed arguments — `main` arguments bound at spawn time,
+/// `configure` arguments bound at compose time. Record-only (no functions, no
+/// resources), so `use`-ing it carries no authority — the same types-only convention
+/// as `eo9:X/types` and `images`.
+interface args {
+    /// One named, typed argument of `main` (binary) or `configure` (provider).
+    /// `ty` is WIT type text; it drives WAVE parsing of invocations.
+    record arg-spec {
+        name: string,
+        ty: string,
+    }
+
+    /// One named, constant argument value, WAVE-encoded: a `configure` argument bound at
+    /// compose time (`component-algebra.configure`) or a `main` argument bound at spawn
+    /// time (`task.spawn`). Always checked against the target's declared signature (its
+    /// `arg-spec`s).
+    record named-arg {
+        name: string,
+        value: string,
+    }
+}
+
 /// Pure value manipulation on program bytecode (unprivileged).
 interface component-algebra {
+    use args.{arg-spec, named-arg};
+
     /// An open program value: binary or provider.
     resource component;
 
@@ -41,21 +66,6 @@ interface component-algebra {
         name: string,
         %interface: string,
         version: string,
-    }
-
-    /// One named, typed argument of `main` (binary) or `configure` (provider).
-    /// `ty` is WIT type text; it drives WAVE parsing of invocations.
-    record arg-spec {
-        name: string,
-        ty: string,
-    }
-
-    /// One named, constant argument value, WAVE-encoded: a `configure` argument bound at
-    /// compose time (here) or a `main` argument bound at spawn time (`task.spawn`). Always
-    /// checked against the target's declared signature (its `arg-spec`s).
-    record named-arg {
-        name: string,
-        value: string,
     }
 
     /// Kind, imports, exports, and argument signature of a component.
@@ -171,7 +181,7 @@ interface compile {
 
 /// Spawning and driving native tasks (privileged, paired with `compile`).
 interface task {
-    use component-algebra.{named-arg};
+    use args.{named-arg};
     use images.{image};
 
     resource task;

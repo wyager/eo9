@@ -143,9 +143,10 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
     `eo9:exec/component-algebra` — binds a provider's exported config interface with constant, WAVE-typed
     argument values and returns an already-configured provider that re-exports only the API (the config
     interface is no longer visible); invalid or ill-typed arguments fail at compose time. `configure-error`
-    cases: `not-a-provider`, `no-config-interface`, `invalid-args(string)`, `internal(string)`. The
-    `named-arg` record moved from `task` into `component-algebra` (next to `arg-spec`, its dual) so both
-    operations share one type; `task` now `use`s it, which makes a world importing `task` also implicitly
-    import `component-algebra` — acceptable because component-algebra is unprivileged by the spec's own
-    judgment (flag if the planner prefers a separate record-only vocabulary interface instead). Host-side
-    implementation of the new function falls to areas 03/04; eosh's generated bindings already require it.
+    cases: `not-a-provider`, `no-config-interface`, `invalid-args(string)`, `internal(string)`. The shared
+    argument vocabulary (`arg-spec`, `named-arg`) lives in a record-only `eo9:exec/args` interface (the
+    same types-only convention as `eo9:X/types` and `images`), `use`d by both `component-algebra` and
+    `task` — so a world importing `task` picks up only the authority-free `args` vocabulary, not
+    component-algebra; wit-bindgen keeps `arg-spec`/`named-arg` visible as `use` aliases inside both
+    interfaces, so existing guest code compiles unchanged. Host-side implementation of the new function
+    falls to areas 03/04; eosh's generated bindings already require it.
