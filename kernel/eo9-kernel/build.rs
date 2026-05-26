@@ -1,10 +1,11 @@
 //! Build script for the bare-metal kernel.
 //!
 //! For bare-metal targets (`target_os = "none"`) this injects the linker script that lays
-//! the image out for QEMU's aarch64 `virt` machine. When the `wasm-seed` feature is
-//! enabled it additionally checks that the host-precompiled seed component was supplied
-//! (via the `EO9_SEED_CWASM` environment variable set by `cargo xtask build-kernel`), so a
-//! bad invocation fails here with a clear message instead of deep inside `include_bytes!`.
+//! the image out for QEMU's aarch64 `virt` machine. When the `wasm-seed` / `wasm-hello`
+//! features are enabled it additionally checks that the host-precompiled artifacts were
+//! supplied (via the `EO9_SEED_CWASM` / `EO9_HELLO_CWASM` environment variables set by
+//! `cargo xtask build-kernel`), so a bad invocation fails here with a clear message
+//! instead of deep inside `include_bytes!`.
 
 use std::env;
 use std::path::Path;
@@ -23,15 +24,24 @@ fn main() {
     println!("cargo:rerun-if-changed={}", linker_script.display());
     println!("cargo:rustc-link-arg-bins=-T{}", linker_script.display());
 
-    println!("cargo:rerun-if-env-changed=EO9_SEED_CWASM");
-    if env::var("CARGO_FEATURE_WASM_SEED").is_ok() {
-        match env::var("EO9_SEED_CWASM") {
-            Ok(path) => println!("cargo:rerun-if-changed={path}"),
-            Err(_) => panic!(
-                "the `wasm-seed` feature needs the EO9_SEED_CWASM environment variable to point \
-                 at the host-precompiled seed component; build the kernel via \
-                 `cargo xtask build-kernel aarch64`, which precompiles the seed and sets it"
-            ),
-        }
+    require_artifact_env("WASM_SEED", "EO9_SEED_CWASM", "seed component");
+    require_artifact_env("WASM_HELLO", "EO9_HELLO_CWASM", "eo9-example-hello program");
+}
+
+/// If the cargo feature named by `CARGO_FEATURE_<feature>` is enabled, require `env_var`
+/// to point at the host-precompiled artifact it embeds, failing with a clear message
+/// otherwise.
+fn require_artifact_env(feature: &str, env_var: &str, what: &str) {
+    println!("cargo:rerun-if-env-changed={env_var}");
+    if env::var(format!("CARGO_FEATURE_{feature}")).is_err() {
+        return;
+    }
+    match env::var(env_var) {
+        Ok(path) => println!("cargo:rerun-if-changed={path}"),
+        Err(_) => panic!(
+            "this feature needs the {env_var} environment variable to point at the \
+             host-precompiled {what}; build the kernel via `cargo xtask build-kernel aarch64`, \
+             which precompiles it and sets the variable"
+        ),
     }
 }

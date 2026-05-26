@@ -1,12 +1,12 @@
-# The Eo9 bare-metal kernel (area 12, spike step 1: aarch64 / QEMU `virt` only).
+# The Eo9 bare-metal kernel (area 12: aarch64 / QEMU `virt` only so far).
 #
 # Build and run it via xtask — `cargo xtask build-kernel aarch64` and `cargo xtask qemu
-# aarch64` — which supply the target, the linker script, and (for the `wasm-seed` feature)
-# the host-precompiled seed component. A plain host build (as done by `cargo test` in this
+# aarch64` — which supply the target, the linker script, and (for the `wasm-*` features)
+# the host-precompiled artifacts. A plain host build (as done by `cargo test` in this
 # workspace) compiles to a stub binary so the workspace stays testable on the host triple.
 [package]
 name = "eo9-kernel"
-description = "Eo9 bare-metal kernel: boot, serial, heap, timer, and a wasmtime-based seed runner for QEMU aarch64 virt."
+description = "Eo9 bare-metal kernel: boot, serial, heap, timer, kernel-side eo9 root providers, and a wasmtime-based runner for precompiled components on QEMU aarch64 virt."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -15,6 +15,10 @@ publish.workspace = true
 # Embed the host-precompiled seed wasm component (built by `cargo xtask build-kernel
 # aarch64`, passed in via the EO9_SEED_CWASM environment variable) and run it at boot.
 wasm-seed = ["dep:wasmtime"]
+# Embed the host-precompiled eo9-example-hello program (EO9_HELLO_CWASM) and run it at
+# boot against the kernel's root providers: text -> PL011 serial, time -> generic timer +
+# PL031 RTC, entropy -> counter-seeded splitmix64.
+wasm-hello = ["dep:wasmtime"]
 
 # These dependencies are only used by the real bare-metal build; host-triple builds (unit
 # tests, `cargo check` without --target) compile the stub entry point and need neither.

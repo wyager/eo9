@@ -5,7 +5,7 @@
 //! for the scheduler milestone — the spike polls `CNTP_CTL_EL0.ISTATUS` instead, which
 //! exercises the same timer hardware without needing the interrupt controller.
 
-use crate::ticks::ticks_to_us;
+use crate::ticks::{ticks_to_ns, ticks_to_us};
 
 /// Counter-timer frequency in Hz (CNTFRQ_EL0, set by QEMU).
 pub fn frequency() -> u64 {
@@ -27,7 +27,30 @@ pub fn counter() -> u64 {
 
 /// Microseconds since the counter started (effectively: since the machine powered on).
 pub fn uptime_us() -> u64 {
-    ticks_to_us(counter(), frequency())
+    uptime_ns() / 1_000
+}
+
+/// Nanoseconds since the counter started; the kernel's monotonic clock.
+pub fn uptime_ns() -> u64 {
+    ticks_to_ns(counter(), frequency())
+}
+
+/// Nanoseconds into the current second, for the sub-second part of the wall clock.
+pub fn subsecond_ns() -> u32 {
+    let frequency = frequency();
+    if frequency == 0 {
+        return 0;
+    }
+    ticks_to_ns(counter() % frequency, frequency) as u32
+}
+
+/// Nominal counter resolution in nanoseconds (at least 1).
+pub fn resolution_ns() -> u64 {
+    let frequency = frequency();
+    if frequency == 0 {
+        return 1;
+    }
+    u64::max(1, 1_000_000_000 / frequency)
 }
 
 /// Print counter readings and run a polled 10 ms timer-condition check.
@@ -36,7 +59,8 @@ pub fn self_test() {
     let first = counter();
     let second = counter();
     crate::kprintln!(
-        "generic timer: counter advancing ({first} -> {second}), uptime {} us",
+        "generic timer: counter advancing ({first} -> {second}), resolution {} ns, uptime {} us",
+        resolution_ns(),
         ticks_to_us(second, frequency)
     );
 

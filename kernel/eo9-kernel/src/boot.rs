@@ -11,11 +11,11 @@
 //! 4. points the stack at `__stack_top` (linker script), zeroes `.bss`, and
 //! 5. calls the Rust entry point [`kmain`](crate::kmain).
 //!
-//! The MMU stays off for the spike: the `aarch64-unknown-none` target builds all Rust code
-//! with `+strict-align`, so Device-memory alignment rules are respected, and QEMU does not
-//! require cache maintenance for code executed from the heap. Identity-mapped translation
-//! tables are the first follow-up when this grows beyond the spike (see plan/12-kernel.md
-//! Decisions).
+//! The stub itself leaves the MMU off (the `aarch64-unknown-none` target builds all Rust
+//! code with `+strict-align`, so that is safe); `kmain` then builds the identity map and
+//! turns on the MMU and caches via [`crate::mmu::enable_identity_map`] before any wasm
+//! code runs, because Cranelift-generated programs perform unaligned accesses that are
+//! only legal on Normal memory.
 
 use core::arch::global_asm;
 

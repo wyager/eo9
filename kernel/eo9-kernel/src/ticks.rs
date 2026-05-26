@@ -14,9 +14,27 @@ pub fn ticks_to_us(ticks: u64, frequency_hz: u64) -> u64 {
     (u128::from(ticks) * 1_000_000 / u128::from(frequency_hz)) as u64
 }
 
+/// Convert a tick count of a counter running at `frequency_hz` into nanoseconds.
+pub fn ticks_to_ns(ticks: u64, frequency_hz: u64) -> u64 {
+    if frequency_hz == 0 {
+        return 0;
+    }
+    (u128::from(ticks) * 1_000_000_000 / u128::from(frequency_hz)) as u64
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ticks_to_us;
+    use super::{ticks_to_ns, ticks_to_us};
+
+    #[test]
+    fn nanosecond_conversion_matches_the_frequency() {
+        // One full second of ticks at 62.5 MHz and at the 1 GHz QEMU `virt` frequency.
+        assert_eq!(ticks_to_ns(62_500_000, 62_500_000), 1_000_000_000);
+        assert_eq!(ticks_to_ns(1_000_000_000, 1_000_000_000), 1_000_000_000);
+        // A single tick at 62.5 MHz is 16 ns; zero frequency stays defined.
+        assert_eq!(ticks_to_ns(1, 62_500_000), 16);
+        assert_eq!(ticks_to_ns(12345, 0), 0);
+    }
 
     #[test]
     fn one_second_of_ticks_is_a_million_microseconds() {
