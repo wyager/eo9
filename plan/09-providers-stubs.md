@@ -65,3 +65,34 @@ Match the priority order above; (1)+(2) unblock I2.
 6. **Async `configure` works as specified.** The config-interface exports async-lift, componentize, and
    validate (`--features cm-async`); actually invoking them needs the host runtime's CM-async support
    (area 04), same as the examples that await futures.
+7. **Round 2 (branch `area/09-stubs-2`).** Decision 5's escalation was resolved by the async-operations
+   migration (plan/02-wit.md, decision 12): blocking operations are now `async func(...) -> T`, so a guest
+   provider implements them as ordinary async trait methods — compute immediately (the deterministic stubs)
+   or await its own imports (the attenuators). Shipped: `fs.memfs`, `disk.mem`, `time.frozen`,
+   `time.monotonic-stub`, `net.deny`, `fs.readonly`, `text.null`, `time.fuzzy` — same crate layout and
+   conventions as round 1, no changes to `eo9-guest` beyond refreshing the provider-module docs.
+8. **Verified import lists** (`wasm-tools component wit` on the built components):
+   `time.frozen`, `time.monotonic-stub`, `text.null` import nothing; `disk.mem`, `fs.memfs`, `net.deny`
+   import only `eo9:io/buffers` (structurally required: the exported API's signatures use the buffer
+   resource, so the world elaborates that import); `fs.readonly` imports `eo9:fs/fs`, `eo9:fs/types`, and
+   `eo9:io/buffers`; `time.fuzzy` imports `eo9:time/time` and `eo9:time/types`. Attenuators share the
+   underlying provider's root-handle type, per the stub-world design (plan/02, decision 7).
+9. **Behavioural choices the WIT leaves open** (documented in each crate's docs): memfs — `/`-separated
+   paths with `.`/`..` normalization, create-requires-existing-parent, truncate clears, Unix unlink
+   semantics for open files, reads return what is available, writes zero-fill gaps and extend, remove only
+   deletes empty directories, open-exec snapshots contents (immutability by copying); disk.mem — fixed-size
+   device, out-of-range whenever the full range does not fit (no partial I/O); time.frozen —
+   `resolution() = u64::MAX`, sleep returns immediately; time.monotonic-stub — each observation answers then
+   advances by the step, sleep advances by the requested duration, `resolution()` reports the step;
+   time.fuzzy — field-wise floor quantization, `resolution() = max(underlying, granularity)`, sleep rounds
+   the duration up to the granularity; net.deny — connect/listen/bind-udp fail `denied`, the
+   connection/listener/socket resources are uninhabited; fs.readonly — open with write/create/truncate,
+   create-directory, remove, and write fail `read-only`, everything else forwards.
+10. **Still deferred.** `net.loopback`: a correct loopback needs `accept`/`recv` to suspend until the
+    matching `connect`/`send` arrives in another concurrently-running export task of the same (fused)
+    instance. Expressing that requires an intra-provider waker registry plus wit-bindgen's
+    `inter-task-wakeup` feature (a change to the shared guest dependency pins) and host-side support for
+    concurrent tasks within one instance (area 04) — neither verifiable from this area; a non-blocking
+    approximation would be semantically wrong, and a yield-spin loop would be a hack. Escalated: either
+    approve enabling the feature once the host side exists, or keep net.loopback queued behind area 13's
+    execution harness. `text.capture` still waits on the Message API (eo9:message).

@@ -1,0 +1,15 @@
+[package]
+name = "eo9-stub-time-monotonic-stub"
+description = "Eo9 standard stub provider `time.monotonic-stub`: exports eo9:time/time as a deterministic stand-in clock advancing by a fixed step per observation from a configured start."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }
