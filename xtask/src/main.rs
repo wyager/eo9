@@ -318,10 +318,10 @@ const KERNEL_QEMU_MEMORY: &str = "512M";
 /// Assemble the kernel's read-only store image (kernel/eo9-kernel/src/wasm/store.rs
 /// documents the format): each listed guest component is built, componentized, and
 /// host-AOT precompiled for the bare-metal target, then packed as
-/// `name + component bytes + artifact bytes`.
+/// `name + component bytes + artifact bytes + metadata text`.
 fn build_store_image(root: &Path) -> Result<PathBuf, String> {
     let mut image: Vec<u8> = Vec::new();
-    image.extend_from_slice(b"EO9STOR1");
+    image.extend_from_slice(b"EO9STOR2");
     image.extend_from_slice(
         &u32::try_from(KERNEL_STORE_COMPONENTS.len())
             .unwrap()
@@ -339,6 +339,7 @@ fn build_store_image(root: &Path) -> Result<PathBuf, String> {
         )?;
         let artifact = std::fs::read(&artifact_path)
             .map_err(|err| format!("failed to read {}: {err}", artifact_path.display()))?;
+        let metadata = component_metadata(shell_name, &component)?;
 
         let name = shell_name.as_bytes();
         image.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
@@ -347,6 +348,9 @@ fn build_store_image(root: &Path) -> Result<PathBuf, String> {
         image.extend_from_slice(&component);
         image.extend_from_slice(&u32::try_from(artifact.len()).unwrap().to_le_bytes());
         image.extend_from_slice(&artifact);
+        let metadata = metadata.as_bytes();
+        image.extend_from_slice(&u32::try_from(metadata.len()).unwrap().to_le_bytes());
+        image.extend_from_slice(metadata);
     }
 
     let out_dir = root.join("kernel").join("target").join("precompiled");
@@ -362,6 +366,57 @@ fn build_store_image(root: &Path) -> Result<PathBuf, String> {
         KERNEL_STORE_COMPONENTS.len()
     );
     Ok(out_path)
+}
+
+/// Describe one store component as the plain-text metadata block the kernel embeds next to
+/// it (kernel/eo9-kernel/src/wasm/store.rs documents the line format). The kernel cannot
+/// parse component binaries itself yet (no on-target codegen or wasm-tools), so `describe`
+/// runs here, at image-assembly time, through the same `eo9-component` crate the usermode
+/// runtime uses — the kernel's `describe` then simply replays this.
+fn component_metadata(shell_name: &str, component: &[u8]) -> Result<String, String> {
+    let component = eo9_component::Component::load(component.to_vec()).map_err(|err| {
+        format!("store component `{shell_name}` does not load as an eo9 module: {err:?}")
+    })?;
+    let info = component.describe();
+    // Space-separated records; an empty field is spelled `-` so the kernel-side parser
+    // never has to disambiguate consecutive separators.
+    let field = |text: &str| {
+        if text.is_empty() {
+            "-".to_string()
+        } else {
+            text.to_string()
+        }
+    };
+    let mut meta = String::new();
+    meta.push_str(match info.kind {
+        eo9_component::ComponentKind::Binary => "kind binary\n",
+        eo9_component::ComponentKind::Provider => "kind provider\n",
+    });
+    for need in &info.imports {
+        meta.push_str(&format!(
+            "import {} {} {} {}\n",
+            if need.required {
+                "required"
+            } else {
+                "optional"
+            },
+            field(&need.slot),
+            field(&need.interface),
+            field(&need.version),
+        ));
+    }
+    for slot in &info.exports {
+        meta.push_str(&format!(
+            "export {} {} {}\n",
+            field(&slot.name),
+            field(&slot.interface),
+            field(&slot.version)
+        ));
+    }
+    for arg in &info.args {
+        meta.push_str(&format!("arg {} {}\n", field(&arg.name), arg.ty));
+    }
+    Ok(meta)
 }
 
 /// Build the bootable kernel image for `arch` and return its path.

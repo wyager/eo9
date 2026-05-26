@@ -45,6 +45,12 @@ const MAX_ENTROPY_REQUEST_BYTES: u64 = 64 * 1024;
 pub struct KernelState {
     /// Deterministic splitmix64 stream behind `eo9:entropy/entropy`.
     entropy_state: u64,
+    /// Resource limits enforced where wasm asks the host for memory/tables (set at spawn).
+    limits: KernelLimits,
+    /// The shell session's state (fs view, buffers, exec tables) — present only on the
+    /// store that runs eosh; ordinary programs and children carry `None`.
+    #[cfg(feature = "wasm-store")]
+    pub shell: Option<alloc::boxed::Box<super::shell::ShellState>>,
 }
 
 impl KernelState {
@@ -52,6 +58,9 @@ impl KernelState {
     pub fn new() -> Self {
         KernelState {
             entropy_state: crate::timer::counter() ^ 0x9e37_79b9_7f4a_7c15,
+            limits: KernelLimits::default(),
+            #[cfg(feature = "wasm-store")]
+            shell: None,
         }
     }
 
@@ -62,6 +71,54 @@ impl KernelState {
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
+    }
+
+    /// Set the per-task linear-memory ceiling (`eo9:exec/task.spawn-limits.max-memory`),
+    /// enforced through [`KernelState::limiter`].
+    pub fn set_max_memory(&mut self, max_memory: u64) {
+        self.limits.max_memory = Some(max_memory);
+        // A memory-limited task must not grow tables without bound either (same derived
+        // rule as the usermode runtime: one element per 8 bytes of allowed memory).
+        self.limits.max_table_elements = Some((max_memory / 8).max(1));
+    }
+
+    /// The store's resource limiter (`Store::limiter` plumbing).
+    pub fn limiter(&mut self) -> &mut KernelLimits {
+        &mut self.limits
+    }
+}
+
+/// Resource limits enforced at `memory.grow` / `table.grow` (the kernel-side counterpart
+/// of the usermode `StoreLimits`). Unlimited unless a spawn set a ceiling.
+#[derive(Default)]
+pub struct KernelLimits {
+    max_memory: Option<u64>,
+    max_table_elements: Option<u64>,
+}
+
+impl wasmtime::ResourceLimiter for KernelLimits {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> Result<bool> {
+        Ok(match self.max_memory {
+            Some(max) => desired as u64 <= max,
+            None => true,
+        })
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> Result<bool> {
+        Ok(match self.max_table_elements {
+            Some(max) => desired as u64 <= max,
+            None => true,
+        })
     }
 }
 
@@ -243,6 +300,11 @@ fn add_time(linker: &mut Linker<KernelState>) -> Result<()> {
     Ok(())
 }
 
+/// Upper bound on a single `read-line` line, so unbounded input cannot grow the line
+/// buffer without limit. Bytes beyond the cap are dropped (not echoed) until the line is
+/// ended; backspace still works at the boundary.
+const MAX_READ_LINE_BYTES: usize = 4096;
+
 /// Future that reads one line from the PL011, echoing input as it arrives.
 ///
 /// Resolves to `Some(line)` on CR/LF (without the terminator) and to `None` (end of
@@ -272,7 +334,7 @@ impl Future for ReadLine {
                         crate::kprint!("\u{8} \u{8}");
                     }
                 }
-                0x20..=0x7e => {
+                0x20..=0x7e if this.line.len() < MAX_READ_LINE_BYTES => {
                     let ch = char::from(byte);
                     this.line.push(ch);
                     crate::kprint!("{ch}");

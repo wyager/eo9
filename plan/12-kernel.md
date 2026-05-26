@@ -228,4 +228,45 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
    from a host function, same as usermode), plus a small scalar WAVE parse/render for arguments and
    outcomes. GIC/timer interrupts, fuel on metal, and eo9-sched adoption are also still open — the executor
    remains a polling loop.
+22. **Kernel milestone 4 is done: the unmodified eosh boots as the bare-metal shell.** `cargo xtask qemu
+   aarch64` (no arguments, or `program=eosh`) now boots to an interactive `eosh>` prompt on the serial
+   console; programs from the baked-in store run as children with WAVE-rendered outcomes (`hello`,
+   `cruncher`, `outcomes` — including the failure path), `env` shows the session's capability picture from
+   a kernel-written manifest, `describe`/`imports` work from the store metadata, and `exit` powers the
+   machine off. The original demo sequence stays reachable via the bare `demo` cmdline token, and
+   `program=<name> [arg=value …]` headless selection is unchanged. Note the behavioral consequence: the
+   no-argument boot is now interactive and does not power off by itself; automated runs should use `demo`
+   or `program=…`.
+23. **Store image v2 carries component metadata (and the format is versioned).** The image magic is now
+   `EO9STOR2`; each entry carries, alongside the component bytes and the host-AOT artifact, a plain-text
+   metadata block — the component's `describe` output (kind, imports, exports, `main`'s arg specs) computed
+   at image-assembly time by xtask through the same `eo9-component` crate the usermode runtime uses (xtask
+   gained that workspace dependency). The kernel cannot parse component binaries itself before on-target
+   codegen, so `describe` on metal replays this metadata. Hardening from the last review landed here too:
+   the parser caps the declared entry count before allocating, and `read-line` bounds its line buffer.
+24. **How the shell session is provided (src/wasm/shell.rs, shellfs.rs, shellexec.rs, wave.rs).** eosh runs
+   unmodified against: (a) **fs** — a read-only view of the store image (`/bin/<name>.wasm` per entry plus
+   the `/session` manifest in the `eo9-session 1` format), with the same WIT shapes, owned-buffer
+   round-trip, and buffer-table bounds as the usermode runtime; writes answer `read-only`. (b) **exec** —
+   `load` recognises exactly the baked-in components (matched by content), `describe` replays the image
+   metadata, `compile` is a lookup that deserializes the baked-in artifact (a provider answers
+   `not-a-binary`), and `spawn` instantiates the artifact against the kernel root providers
+   (text/time/entropy — children never receive fs or exec, the usermode child policy), binds `main`'s
+   arguments with a small kernel-side WAVE codec (scalars, strings, enums, options; richer shapes are
+   rejected with a clear message), and parks the child in a registry. The algebra combinators
+   (`$`/`&`/`only`/`rename`/`configure`) fail with an explicit "not implemented on the bare-metal kernel
+   yet" error — they need the component tooling that arrives with on-target codegen. (c) **the drive
+   loop** — the kernel polls eosh's `main` and, between polls, every running child once (the bare-metal
+   counterpart of usermode children executing inside their parent's resume; wasmtime forbids re-entering
+   the event loop from a host function). `wait`/`runnable`/`kill` observe the registry; `resume` is
+   unsupported exactly as in usermode (E5). There is no watchdog on the interactive session — it is paced
+   by the user at the console.
+25. **Milestone-4 follow-ups (deliberately not in this change).** GIC bring-up (the executor and
+   `read-line` still busy-poll), fuel metering for children (`consume_fuel` is compile-relevant, so it must
+   land together with re-precompiled artifacts and the scheduler work), eo9-sched adoption (the registry
+   handles multiple children but eosh's flow is sequential today), linking `eo9:io/buffers` and the
+   types-only `eo9:fs/types` for children (the always-available convention; today a child that imports
+   them, e.g. `readwrite`, is refused at instantiation with the linker's missing-import message rather than
+   the friendlier missing-fs story), session manifests for headless `program=` runs, and the riscv64/x86_64
+   ports. On-target codegen remains the next rung and is what unlocks composition in the bare-metal shell.
 

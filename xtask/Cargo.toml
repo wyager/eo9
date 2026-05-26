@@ -9,7 +9,9 @@ publish.workspace = true
 # std::process, plus exactly what `build-kernel` needs to precompile the bare-metal seed
 # component — `wat` to assemble kernel/seed/hello.wat and `wasmtime` (the pinned foundation
 # dependency, already built for this workspace via eo9-runtime) to precompile it for the
-# aarch64-unknown-none target.
+# aarch64-unknown-none target — and `eo9-component` (a workspace crate) to describe each
+# store component so the kernel's read-only store image carries its metadata.
 [dependencies]
+eo9-component = { path = "../crates/eo9-component" }
 wasmtime = { workspace = true, features = ["cranelift", "component-model"] }
 wat = { workspace = true }

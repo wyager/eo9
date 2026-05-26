@@ -28,7 +28,15 @@ pub mod runner;
 #[cfg(feature = "wasm-seed")]
 pub mod seed;
 #[cfg(feature = "wasm-store")]
+pub mod shell;
+#[cfg(feature = "wasm-store")]
+pub mod shellexec;
+#[cfg(feature = "wasm-store")]
+pub mod shellfs;
+#[cfg(feature = "wasm-store")]
 pub mod store;
+#[cfg(feature = "wasm-store")]
+pub mod wave;
 
 use alloc::sync::Arc;
 use alloc::task::Wake;
