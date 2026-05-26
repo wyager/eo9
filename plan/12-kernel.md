@@ -371,3 +371,42 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
     at the offending edge): `arbitrary` (via `cranelift-control/fuzz`), `termcolor` (via `wasmprinter`),
     `wasm-encoder` `std` default, `thiserror` `std` default.
 
+29. **On-target codegen works — checkpoints 2 and 3 are done: the kernel compiles a component with Cranelift
+    on the machine and runs it.** Under `cargo xtask qemu aarch64` (in the `demo` sequence) the kernel now
+    prints, after the existing deserialize/async demos:
+    ```
+    wasm codegen: compiling a 298 byte component on-target with Cranelift…
+    wasm codegen: compiled on-target in ~83 ms
+    wasm codegen: hello() -> "Hello from a WebAssembly component on bare-metal Eo9!"
+    wasm codegen: add(17, 25) -> 42
+    ```
+    i.e. the seed component is handed to `Component::new` (not `Component::deserialize`), Cranelift emits
+    native aarch64 into a heap allocation, the cache-maintenance publisher (Decision 27) makes it executable,
+    and the resulting code runs and returns correct results. This retires the plan's single riskiest
+    assumption (that Cranelift runs under the kernel's `no_std + alloc`). The seed is a real component, so
+    this is checkpoint 3 as well.
+    - **Implementation:** `kernel/src/wasm/codegen.rs` (behind `wasm-codegen`) plus `new_engine` setting
+      `target("aarch64-unknown-none")` and the OS-less tunables. xtask ships the un-precompiled seed wasm
+      (`EO9_SEED_WASM`) and enables `wasm-codegen` in `build-kernel`. The no_std source port of the five
+      vendored crates is detailed in `kernel/vendor/README.md`; the headline subtleties were the
+      hashbrown-vs-std `Equivalent`/`get` and `#[may_dangle]` dropck differences, a local no_std `Mutex` for
+      the compiler-context pool, and switching the `clif_dir`/`Path` debug surfaces to `String`/`&str` with
+      the actual filesystem writes gated behind `std`.
+    - **Native-host check (the gotcha):** linking the compiler makes wasmtime run its
+      `check_compatible_with_native_host` on *every* engine, including the deserialize ones. It passes
+      because the kernel is built **for** `aarch64-unknown-none`, so `target_lexicon::Triple::host()` equals
+      the explicitly-set target; the OS-less tunables (no signals, no VM reservations/guards, no CoW) are
+      what the rest of that check verifies. `cranelift-native` stays disabled (host CPU inference needs
+      `std`), which is why the target must be named rather than inferred.
+    - **Numbers:** kernel image **7.8 MB → 16.4 MB** with `wasm-codegen` on (Cranelift + the compile layers
+      add ~8.6 MB). On-target compile of the ~300-byte seed component ≈ 83 ms under QEMU TCG (vs ≈ 28 ms to
+      *deserialize* the host-AOT artifact of the same component — codegen is the slower path, as expected,
+      but it is real and removes the host-AOT dependency). Determinism not yet measured bit-for-bit; the
+      seed compiles to a fixed result across runs but a cross-run artifact-hash comparison is future work.
+    - **CI stays lean:** `wasm-codegen` is off by default, so `cargo xtask ci` (featureless kernel) does not
+      compile Cranelift; it stays green. `build-kernel`/`qemu`/`demo`/`program=`/interactive-eosh all work.
+    - **Next (checkpoint 4):** wire the shell's `compile` to actually compile (today it deserializes a baked
+      AOT artifact) and enable `$`/`&` composition in the bare-metal eosh (currently a clean "not
+      implemented on the bare-metal kernel yet" error). That makes on-target codegen reachable interactively
+      rather than only in the boot demo. Then: optional fuel-on-metal and a determinism check.
+

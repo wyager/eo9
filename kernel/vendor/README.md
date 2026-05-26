@@ -87,7 +87,35 @@ two of the four vendored crates exist only to change those dependency lines.
 
 The existing `wasmtime` patch gained the `cranelift` feature on the kernel build path without
 `std`. Cranelift emits native aarch64 (not Pulley), so the publisher's cache maintenance above
-is what makes freshly generated code executable. Status: the codegen backend builds no_std;
-`wasmtime-internal-cranelift`'s own source + the `clif_dir` touchpoint + the in-kernel compile
-demo remain (plan/12 Decision 28 has the full punch list). All of this is behind `wasm-codegen`
+is what makes freshly generated code executable. All of this is behind `wasm-codegen`
 (off by default), so the standard builds are unaffected.
+
+**Status: the on-target codegen path works** (plan/12 Decision 29). The full no_std source port
+landed; the remaining source-level changes beyond the dependency-feature edits above were:
+
+- **`wasmtime-environ`** — `component/` module mechanical `std::`→`core`/`alloc`/`hashbrown`
+  swaps (its `compile`/`fact` modules were already done); `IndexMap` given an explicit
+  `hashbrown::DefaultHashBuilder` (the registry default `RandomState` is std-only); one
+  `HashMap::get` made to pass `&K` explicitly (hashbrown's `Equivalent` get doesn't deref-coerce
+  like std's); a declaration-order fix in the component inliner so `inliner`'s drop does not
+  outlive a `types_ref` borrow (std's `HashMap` has a `#[may_dangle]` dropck eyepatch that
+  hashbrown lacks); `WasmFileInfo.path`/`clif_dir` switched from `PathBuf`/`&Path` to
+  `String`/`&str` so the trait is no_std-expressible.
+- **`wasmtime-internal-cranelift`** — `#[macro_use]` on `extern crate alloc` (for `vec!`/`format!`)
+  + a `hashbrown` dependency + per-module `use crate::*;` so `Vec`/`String`/`Box` resolve under
+  `#![no_std]`; mechanical `std::`→`core`/`alloc`/`hashbrown` swaps; a small `sync::Mutex`
+  (non-blocking spinlock, mirroring the vendored `wasmtime`'s) for the compiler-context pool
+  since there is no `std::sync::Mutex`; the CLIF-dump filesystem write gated behind
+  `feature = "std"` (the `clif_dir`/`emit_clif` path types are `String`/`&str`, the DWARF
+  synthetic-path `PathBuf` became `String`); `cranelift_codegen::timing::take_current` (only
+  exists with the std-only `timing` feature) dropped from the two compile-time log lines.
+- **`cranelift-frontend`** — `#[macro_use]` on `extern crate alloc` and a few `std::`→`core::`
+  swaps (`error::Error`, `num::NonZeroU8`, `iter::once`) the upstream no_std path had missed.
+- **`wasmtime`** — its own `compile` module + `config.rs` `std::`→`core`/`alloc` swaps; the
+  file-reading `CodeBuilder` methods (`wasm_binary_file`, `dwarf_package_file`, the `.dwp`
+  auto-probe) and `Config::emit_clif` gated behind `feature = "std"`, with the source-path
+  fields carried as `str`/`String`; `precompile_compatibility_hash`'s `std::hash::Hash` →
+  `core::hash::Hash`. The kernel engine now sets `target("aarch64-unknown-none")` explicitly
+  (host CPU inference needs the std-only `cranelift-native`) and the OS-less tunables, so
+  wasmtime's native-host compatibility check — which the linked compiler runs on *every*
+  engine, deserialize and on-target alike — passes (`Triple::host()` equals the build target).
