@@ -144,6 +144,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-stub-pci-none"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-stub-perf-none"
 version = "0.0.0"
 dependencies = [
