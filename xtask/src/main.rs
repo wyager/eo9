@@ -233,11 +233,7 @@ fn build_web_demo(root: &Path) -> Result<(), String> {
     build_guest(root)?;
     let manifest = root.join("www").join("try-build").join("Cargo.toml");
     let components = root.join("guest").join("target").join("components");
-    let out = root
-        .join("www")
-        .join("site")
-        .join("try")
-        .join("components");
+    let out = root.join("www").join("site").join("try").join("components");
     run(
         root,
         "cargo",
