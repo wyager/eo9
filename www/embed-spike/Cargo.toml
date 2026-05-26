@@ -1,0 +1,37 @@
+# Feasibility spike for the "wasm32 embed" direction of the in-browser demo (/try v2) and
+# the future `eo9-embed` bundle milestone: can the real Eo9 stack — wasmtime included,
+# using the Pulley interpreter backend — run with wasm32 as the *host* architecture?
+#
+# This is a standalone workspace (like www/ itself and www/try-build): nothing here enters
+# the OS dependency tree, and `cargo xtask ci` neither builds nor needs it. See README.md
+# for how to run the experiment and plan/15-website.md for the recorded findings.
+[workspace]
+resolver = "3"
+members = ["native-driver", "wasm-host-probe"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+# Same pinned wasmtime as the rest of the repository (root Cargo.toml pin table).
+wasmtime = { version = "45.0.0" }
+
+# The probe needs wasmtime's component-model-async machinery WITHOUT the `std` feature
+# (wasmtime-fiber refuses to compile for wasm32 when `std` is enabled — there is no
+# stack-switching backend for that platform — while its no_std backend compiles and defers
+# the error to fiber creation at run time). Upstream gates component-model-async on `std`,
+# so this reuses the kernel's minimal vendored relaxation (kernel/vendor/README.md), exactly
+# as the bare-metal build does. The driver also resolves to this copy; std builds are
+# unchanged by the patch.
+[patch.crates-io]
+wasmtime = { path = "../../kernel/vendor/wasmtime" }
+
+# Size-realistic settings for the wasm32 probe blob (the measurement the spike reports);
+# they also apply to the native driver, which is fine.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = "symbols"

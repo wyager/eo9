@@ -1,0 +1,37 @@
+# The wasm32 half of the embed spike: wasmtime as a library, compiled *to* wasm32, loading
+# and running pre-AOT'd Pulley artifacts of real Eo9 components. Built as a cdylib for
+# `wasm32-unknown-unknown`; it imports a single `env.host_log` function from the driver and
+# exports `run() -> i32` (the number of failed steps).
+[package]
+name = "wasm-host-probe"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["cmasync"]
+# The component-model-async host machinery (what every real Eo9 guest needs). wasmtime's
+# `std` feature must stay OFF for this on wasm32: wasmtime-fiber has no wasm32 stack-switching
+# backend and emits a compile error under `std`, while its no_std backend compiles and defers
+# the error to fiber creation at run time. Without `std`, component-model-async needs the
+# kernel's vendored relaxation (see the workspace [patch.crates-io]).
+cmasync = ["wasmtime/async", "wasmtime/component-model-async"]
+# Feasibility data point only (cargo check, never run): wasmtime's `std` feature on wasm32.
+wasmtime-std = ["wasmtime/std"]
+# Feasibility data point only (cargo check, never run): the in-blob compiler path
+# (cranelift requires `std`).
+compile-check = ["wasmtime/cranelift", "wasmtime-std"]
+
+[dependencies]
+# Declared directly (not via workspace inheritance) because this crate needs
+# `default-features = false`; the version matches the workspace/root pin. No `std`: the
+# probe binary itself uses std, but wasmtime runs on its custom platform layer (the same
+# configuration as the bare-metal kernel), with the embedder symbols provided in lib.rs.
+wasmtime = { version = "45.0.0", default-features = false, features = [
+    "runtime",
+    "component-model",
+    "pulley",
+] }
