@@ -19,9 +19,21 @@ wasm-seed = ["dep:wasmtime"]
 # boot against the kernel's root providers: text -> PL011 serial, time -> generic timer +
 # PL031 RTC, entropy -> counter-seeded splitmix64.
 wasm-hello = ["dep:wasmtime"]
+# Embed the host-precompiled async artifacts (EO9_SLEEPY_CWASM — the kernel-local async
+# canary that awaits `eo9:time/time.sleep` — and EO9_ENTROPY_SEEDED_CWASM — the unmodified
+# `entropy.seeded` stub from the guest workspace, whose `configure` export uses the async
+# canonical ABI) and run them at boot through the component-model-async machinery.
+wasm-async = ["dep:wasmtime"]
 
 # These dependencies are only used by the real bare-metal build; host-triple builds (unit
 # tests, `cargo check` without --target) compile the stub entry point and need neither.
+# `async` + `component-model-async` come from the patched vendor/wasmtime copy (the
+# upstream feature graph requires `std` for component-model-async; see vendor/README.md).
 [target.'cfg(target_os = "none")'.dependencies]
 linked_list_allocator = { workspace = true }
-wasmtime = { workspace = true, optional = true, features = ["runtime", "component-model"] }
+wasmtime = { workspace = true, optional = true, features = [
+    "runtime",
+    "component-model",
+    "async",
+    "component-model-async",
+] }

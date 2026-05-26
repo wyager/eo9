@@ -59,7 +59,10 @@ fn try_run() -> Result<String, wasmtime::Error> {
     providers::add_providers(&mut linker)?;
 
     let mut store = Store::new(&engine, KernelState::new());
-    let instance = linker.instantiate(&mut store, &component)?;
+    let instance = super::block_on(
+        "hello instantiation",
+        linker.instantiate_async(&mut store, &component),
+    )??;
 
     let main = instance
         .get_func(&mut store, "main")
@@ -67,7 +70,10 @@ fn try_run() -> Result<String, wasmtime::Error> {
 
     let params = [Val::String(NAME_ARG.to_string()), Val::Bool(EXCITED_ARG)];
     let mut results = [Val::Bool(false)];
-    main.call(&mut store, &params, &mut results)?;
+    super::block_on(
+        "hello main()",
+        main.call_async(&mut store, &params, &mut results),
+    )??;
 
     Ok(render_outcome(&results[0]))
 }

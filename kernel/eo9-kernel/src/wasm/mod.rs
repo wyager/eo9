@@ -17,16 +17,22 @@
 //! * [`hello`] — the real `eo9-example-hello` program from the guest workspace, linked
 //!   against the kernel's own root [`providers`] (`wasm-hello` feature).
 
+#[cfg(feature = "wasm-async")]
+pub mod async_demo;
 #[cfg(feature = "wasm-hello")]
 pub mod hello;
-#[cfg(feature = "wasm-hello")]
+#[cfg(any(feature = "wasm-hello", feature = "wasm-async"))]
 pub mod providers;
 #[cfg(feature = "wasm-seed")]
 pub mod seed;
 
 use alloc::sync::Arc;
+use alloc::task::Wake;
+use core::future::Future;
+use core::pin::pin;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
+use core::task::{Context, Poll, Waker};
 
 use wasmtime::{Config, CustomCodeMemory, Engine};
 
@@ -39,6 +45,13 @@ use wasmtime::{Config, CustomCodeMemory, Engine};
 pub fn new_engine() -> Result<Engine, wasmtime::Error> {
     let mut config = Config::new();
     config.wasm_component_model(true);
+    // The component-model async ABI plus the two sub-features the eo9 guest SDK relies on
+    // (stackful async lifts and the extra async built-ins behind waitable-set waits).
+    // These are wasm features and therefore compile-relevant: the host-side precompile
+    // configuration in xtask sets exactly the same flags so the embedded artifacts load.
+    config.wasm_component_model_async(true);
+    config.wasm_component_model_async_stackful(true);
+    config.wasm_component_model_more_async_builtins(true);
     // Without virtual memory wasmtime cannot flip page protections itself, so it asks the
     // embedder to "publish" code memory; on this machine that is a no-op (see below).
     config.with_custom_code_memory(Some(Arc::new(BareMetalCodeMemory)));
@@ -91,4 +104,65 @@ extern "C" fn wasmtime_tls_get() -> *mut u8 {
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_tls_set(pointer: *mut u8) {
     WASMTIME_TLS.store(pointer, Ordering::Relaxed);
+}
+
+// The component-model-async ("concurrent") machinery keeps a second single-pointer TLS
+// slot of its own, reached through the custom platform layer in the patched wasmtime
+// (kernel/vendor/README.md). Same contract as `wasmtime_tls_get/set` above: one static
+// cell is exactly thread-local on a single core with interrupts masked.
+
+static WASMTIME_CONCURRENT_TLS: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_concurrent_tls_get() -> *mut u8 {
+    WASMTIME_CONCURRENT_TLS.load(Ordering::Relaxed)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_concurrent_tls_set(pointer: *mut u8) {
+    WASMTIME_CONCURRENT_TLS.store(pointer, Ordering::Relaxed);
+}
+
+// --- The kernel's executor ----------------------------------------------------------------
+
+/// How long [`block_on`] lets a single wasm operation run before declaring it wedged.
+/// Generous because QEMU TCG is slow; a healthy operation finishes in milliseconds.
+const BLOCK_ON_WATCHDOG_NS: u64 = 30_000_000_000;
+
+/// Drive a wasmtime future (`instantiate_async`, `call_async`, …) to completion on the
+/// kernel's single thread.
+///
+/// This is a polling executor: every pending host operation on this machine is
+/// time-driven (the only async root-provider operation today is `time.sleep`, whose
+/// future re-arms its own waker on each poll), so the loop polls until the future
+/// resolves, with a watchdog so a wedged guest cannot hang the boot. Once timer
+/// interrupts (GIC) are wired up, the busy poll becomes a wait-for-interrupt.
+pub fn block_on<F: Future>(what: &str, future: F) -> Result<F::Output, wasmtime::Error> {
+    let mut future = pin!(future);
+    let waker = Waker::from(Arc::new(Doorbell));
+    let mut cx = Context::from_waker(&waker);
+    let deadline = crate::timer::uptime_ns().saturating_add(BLOCK_ON_WATCHDOG_NS);
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => return Ok(value),
+            Poll::Pending => {
+                if crate::timer::uptime_ns() > deadline {
+                    return Err(wasmtime::Error::msg(alloc::format!(
+                        "{what} did not complete within the kernel executor's watchdog"
+                    )));
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// Waker for [`block_on`]. The executor polls again on every loop iteration regardless,
+/// but wasmtime's internal machinery only re-polls sub-futures whose waker was rung, so
+/// this must be a real, cloneable waker for those wake-ups to be recorded.
+struct Doorbell;
+
+impl Wake for Doorbell {
+    fn wake(self: Arc<Self>) {}
+    fn wake_by_ref(self: &Arc<Self>) {}
 }

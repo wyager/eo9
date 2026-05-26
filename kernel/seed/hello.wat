@@ -2,8 +2,8 @@
 ;;
 ;; A deliberately tiny, dependency-free Component Model component written directly in the
 ;; component text format: it exports `hello: func() -> string` and `add: func(a: u32,
-;; b: u32) -> u32` through synchronous canonical lifts (the Component Model async ABI needs
-;; wasmtime's `std`-only machinery, so the seed stays sync). `cargo xtask build-kernel
+;; b: u32) -> u32` through synchronous canonical lifts (kernel/seed/sleepy.wat is the async
+;; counterpart exercising the Component Model async ABI). `cargo xtask build-kernel
 ;; aarch64` assembles this file, precompiles it for `aarch64-unknown-none` with the host
 ;; wasmtime/Cranelift, and embeds the resulting artifact in the kernel image, where the
 ;; no_std wasmtime runtime deserializes, instantiates, and calls it.

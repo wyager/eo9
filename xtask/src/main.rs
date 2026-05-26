@@ -111,7 +111,7 @@ COMMANDS:
     test                 Run host workspace tests and kernel workspace tests (host triple)
     build-guest          Build guest crates for {GUEST_TARGET} and componentize them with
                          `wasm-tools component new` into guest/target/components/*.wasm
-    build-kernel <arch>  Precompile the seed component and the eo9-example-hello program for
+    build-kernel <arch>  Precompile the seed/async canaries, eo9-example-hello, and entropy.seeded for
                          bare metal and build the bootable kernel image (aarch64 only so far;
                          ELF for QEMU's -kernel loader)
     qemu <arch>          Build the kernel image and boot it under QEMU with serial on stdio
@@ -270,11 +270,29 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
         .map_err(|err| format!("failed to assemble {}: {err}", seed_wat.display()))?;
     let seed = precompile_for_kernel(root, &seed_wasm, "seed component", "seed.cwasm")?;
 
+    // The async canary (awaits time.sleep against the kernel timer), assembled from WAT.
+    let sleepy_wat = root.join("kernel").join("seed").join("sleepy.wat");
+    let sleepy_wasm = wat::parse_file(&sleepy_wat)
+        .map_err(|err| format!("failed to assemble {}: {err}", sleepy_wat.display()))?;
+    let sleepy = precompile_for_kernel(root, &sleepy_wasm, "sleepy canary", "sleepy.cwasm")?;
+
     // The real hello program, built from the guest workspace.
     let hello_component = build_guest_component(root, "eo9-example-hello")?;
     let hello_wasm = std::fs::read(&hello_component)
         .map_err(|err| format!("failed to read {}: {err}", hello_component.display()))?;
     let hello = precompile_for_kernel(root, &hello_wasm, "eo9-example-hello", "hello.cwasm")?;
+
+    // The unmodified entropy.seeded stub from the guest workspace: a real SDK-built
+    // component whose `configure` export uses the async canonical ABI.
+    let entropy_component = build_guest_component(root, "eo9-stub-entropy-seeded")?;
+    let entropy_wasm = std::fs::read(&entropy_component)
+        .map_err(|err| format!("failed to read {}: {err}", entropy_component.display()))?;
+    let entropy = precompile_for_kernel(
+        root,
+        &entropy_wasm,
+        "eo9-stub-entropy-seeded",
+        "entropy-seeded.cwasm",
+    )?;
 
     let kernel_dir = root.join("kernel");
     run_with_env(
@@ -288,11 +306,13 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
             "--target",
             KERNEL_CHECK_TARGET,
             "--features",
-            "wasm-seed,wasm-hello",
+            "wasm-seed,wasm-hello,wasm-async",
         ],
         &[
             ("EO9_SEED_CWASM", seed.as_os_str()),
             ("EO9_HELLO_CWASM", hello.as_os_str()),
+            ("EO9_SLEEPY_CWASM", sleepy.as_os_str()),
+            ("EO9_ENTROPY_SEEDED_CWASM", entropy.as_os_str()),
         ],
     )?;
 
@@ -330,12 +350,18 @@ fn precompile_for_kernel(
         .target(KERNEL_CHECK_TARGET)
         .map_err(|err| format!("wasmtime rejected target {KERNEL_CHECK_TARGET}: {err:#}"))?;
     config.wasm_component_model(true);
+    // The component-model async ABI (plus stackful lifts and the extra async built-ins
+    // the eo9 guest SDK uses). Compile-relevant: the kernel engine enables exactly the
+    // same wasm features (kernel/eo9-kernel/src/wasm/mod.rs).
+    config.wasm_component_model_async(true);
+    config.wasm_component_model_async_stackful(true);
+    config.wasm_component_model_more_async_builtins(true);
     config.signals_based_traps(false);
     config.memory_reservation(0);
     config.memory_reservation_for_growth(1 << 20);
     config.memory_guard_size(0);
     config.memory_init_cow(false);
-    config.concurrency_support(false);
+    config.concurrency_support(true);
     config.gc_support(false);
     config.wasm_threads(false);
     let engine = wasmtime::Engine::new(&config)

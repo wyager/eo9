@@ -40,13 +40,16 @@ fn try_run() -> Result<(String, u32), wasmtime::Error> {
 
     let linker: Linker<()> = Linker::new(&engine);
     let mut store = Store::new(&engine, ());
-    let instance = linker.instantiate(&mut store, &component)?;
+    let instance = super::block_on(
+        "seed instantiation",
+        linker.instantiate_async(&mut store, &component),
+    )??;
 
     let hello = instance.get_typed_func::<(), (String,)>(&mut store, "hello")?;
-    let (greeting,) = hello.call(&mut store, ())?;
+    let (greeting,) = super::block_on("seed hello()", hello.call_async(&mut store, ()))??;
 
     let add = instance.get_typed_func::<(u32, u32), (u32,)>(&mut store, "add")?;
-    let (sum,) = add.call(&mut store, (17, 25))?;
+    let (sum,) = super::block_on("seed add()", add.call_async(&mut store, (17, 25)))??;
 
     Ok((greeting, sum))
 }
