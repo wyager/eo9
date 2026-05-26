@@ -42,10 +42,12 @@ backtrace = [
     "std",
     "wasmtime-core/backtrace",
 ]
+# no_std: the kernel's on-target codegen builds `compile` without std (plan/12 D26-28).
+# object/write_core + gimli/write are the alloc-only write paths; wasm-encoder + wasmprinter
+# are alloc-capable. Residual std::-only helpers in the compile module are cfg(std)-gated.
 compile = [
     "gimli/write",
     "object/write_core",
-    "std",
     "dep:wasm-encoder",
     "dep:wasmprinter",
 ]

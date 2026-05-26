@@ -32,7 +32,19 @@ impl<T> IsaBuilder<T> {
         let triple = triple.unwrap_or_else(Triple::host);
         let mut isa_flags = lookup(triple)?;
         if !triple_specified {
+            // Inferring flags from the running CPU needs cranelift-native, which is std-only
+            // (runtime feature detection). On no_std embeddings (e.g. the Eo9 kernel) it is
+            // not compiled and the caller must specify a target triple. plan/12 D26-28.
+            #[cfg(feature = "cranelift-native")]
             cranelift_native::infer_native_flags(&mut isa_flags).unwrap();
+            #[cfg(not(feature = "cranelift-native"))]
+            {
+                let _ = &mut isa_flags;
+                return Err(wasmtime_environ::error::format_err!(
+                    "host target inference requires the `cranelift-native` feature; \
+                     specify a target triple explicitly on no_std targets"
+                ));
+            }
         }
 
         Ok(Self {

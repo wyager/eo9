@@ -67,13 +67,15 @@ path = "src/lib.rs"
 [dependencies.cfg-if]
 version = "1.0"
 
+# no_std (plan/12 D26-28): drop `std` and `timing` (std::time::Instant), keep the codegen
+# core + unwind + the aarch64 (host) backend. `pulley` is added by this crate's own `pulley`
+# feature when enabled.
 [dependencies.cranelift-codegen]
 version = "0.132.0"
 features = [
-    "std",
+    "core",
     "unwind",
     "host-arch",
-    "timing",
 ]
 default-features = false
 
@@ -86,20 +88,27 @@ version = "0.132.0"
 
 [dependencies.cranelift-frontend]
 version = "0.132.0"
+features = ["core"]
+default-features = false
 
+# no_std: cranelift-native does host-CPU feature detection and is std-only. It is only used
+# to infer flags when NO target triple is specified; the kernel always specifies its target,
+# so we make it optional (off in the kernel build) and gate the call (src/isa_builder.rs).
 [dependencies.cranelift-native]
 version = "0.132.0"
+optional = true
 
 [dependencies.gimli]
 version = "0.33.0"
 features = [
     "read",
-    "std",
 ]
 default-features = false
 
 [dependencies.itertools]
 version = "0.14.0"
+features = ["use_alloc"]
+default-features = false
 
 [dependencies.log]
 version = "0.4.28"
@@ -110,8 +119,7 @@ version = "0.39.0"
 features = [
     "read_core",
     "elf",
-    "write",
-    "std",
+    "write_core",
 ]
 default-features = false
 
