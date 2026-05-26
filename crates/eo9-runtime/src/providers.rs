@@ -9,7 +9,7 @@
 //! doorbell — completing the operation from another thread and waking that waker is all a
 //! provider has to do.
 //!
-//! The shapes mirror `wit/text`, `wit/time`, and `wit/entropy` directly; see
+//! The shapes mirror `wit/text`, `wit/time`, `wit/entropy`, and `wit/fs` directly; see
 //! plan/04-runtime.md § Decisions for the trait-surface rationale.
 
 use std::future::Future;
@@ -80,6 +80,112 @@ pub trait EntropyProvider: Send + 'static {
     fn get_u64(&mut self) -> u64;
 }
 
+/// Identifier a filesystem provider assigns to an open `file` or `immutable-handle`.
+/// It doubles as the Component Model resource `rep`, so it must stay unique for the life
+/// of the handle; the runtime calls [`FsProvider::close_file`] / [`FsProvider::close_exec`]
+/// when the guest drops the handle.
+pub type FsHandle = u32;
+
+/// Node kind (`eo9:fs/fs.node-kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    File,
+    Directory,
+}
+
+/// Node metadata (`eo9:fs/fs.node-stat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeStat {
+    pub kind: NodeKind,
+    /// Size in bytes (0 for directories).
+    pub size: u64,
+}
+
+/// Error type for filesystem operations (`eo9:fs/fs.fs-error`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FsError {
+    NotFound,
+    AlreadyExists,
+    NotADirectory,
+    IsADirectory,
+    Denied,
+    ReadOnly,
+    NoSpace,
+    NotImmutable,
+    Io(String),
+}
+
+/// Open flags (`eo9:fs/fs.open-flags`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpenFlags {
+    pub read: bool,
+    pub write: bool,
+    pub create: bool,
+    pub truncate: bool,
+}
+
+/// Root provider for `eo9:fs/fs`.
+///
+/// File I/O follows the owned-buffer round-trip of the WIT: `read`/`write`/`exec_read`
+/// take the buffer's bytes by value and give them back when the operation completes, on
+/// both the success and the error path, so the provider has exclusive possession of the
+/// bytes for the life of the operation.
+pub trait FsProvider: Send + 'static {
+    /// Open (or create) the file at `path`, yielding a provider-assigned handle.
+    fn open(&mut self, path: &str, flags: OpenFlags) -> BoxOp<Result<FsHandle, FsError>>;
+
+    /// Open the file at `path` *for execution*, yielding an immutable handle whose
+    /// contents are stable for the life of the handle.
+    fn open_exec(&mut self, path: &str) -> BoxOp<Result<FsHandle, FsError>>;
+
+    /// Names of the entries of the directory at `path`.
+    fn list_directory(&mut self, path: &str) -> BoxOp<Result<Vec<String>, FsError>>;
+
+    /// Metadata of the node at `path`.
+    fn stat(&mut self, path: &str) -> BoxOp<Result<NodeStat, FsError>>;
+
+    /// Create a directory at `path`.
+    fn create_directory(&mut self, path: &str) -> BoxOp<Result<(), FsError>>;
+
+    /// Remove a file or an empty directory at `path`.
+    fn remove(&mut self, path: &str) -> BoxOp<Result<(), FsError>>;
+
+    /// Read from an open file at `offset` into `dst`, returning the buffer and the number
+    /// of bytes read.
+    fn read(
+        &mut self,
+        file: FsHandle,
+        offset: u64,
+        dst: Vec<u8>,
+    ) -> BoxOp<(Vec<u8>, Result<u64, FsError>)>;
+
+    /// Write `src` to an open file at `offset`, returning the buffer and the number of
+    /// bytes written.
+    fn write(
+        &mut self,
+        file: FsHandle,
+        offset: u64,
+        src: Vec<u8>,
+    ) -> BoxOp<(Vec<u8>, Result<u64, FsError>)>;
+
+    /// Size in bytes of an immutable handle.
+    fn exec_size(&mut self, handle: FsHandle) -> u64;
+
+    /// Read from an immutable handle at `offset` into `dst`.
+    fn exec_read(
+        &mut self,
+        handle: FsHandle,
+        offset: u64,
+        dst: Vec<u8>,
+    ) -> BoxOp<(Vec<u8>, Result<u64, FsError>)>;
+
+    /// The guest dropped an open `file` handle.
+    fn close_file(&mut self, file: FsHandle);
+
+    /// The guest dropped an `immutable-handle`.
+    fn close_exec(&mut self, handle: FsHandle);
+}
+
 /// The set of root providers wired into one task at spawn.
 ///
 /// Every field is optional: a task's component is linked only against the interfaces it
@@ -90,6 +196,7 @@ pub struct Providers {
     pub text: Option<Box<dyn TextProvider>>,
     pub time: Option<Box<dyn TimeProvider>>,
     pub entropy: Option<Box<dyn EntropyProvider>>,
+    pub fs: Option<Box<dyn FsProvider>>,
 }
 
 impl Providers {
@@ -227,5 +334,245 @@ impl EntropyProvider for SeededEntropy {
 
     fn get_u64(&mut self) -> u64 {
         self.next()
+    }
+}
+
+/// In-memory filesystem provider: a deterministic scratch filesystem for tests (the
+/// host-side analogue of the `fs.memfs` stub). Cloning shares the underlying state, so a
+/// test can keep a clone to pre-populate files or inspect what the task wrote.
+#[derive(Default, Clone)]
+pub struct MemFs {
+    inner: std::sync::Arc<std::sync::Mutex<MemFsInner>>,
+}
+
+#[derive(Default)]
+struct MemFsInner {
+    /// Path -> file contents. Directories are tracked separately; "/" always exists.
+    files: std::collections::BTreeMap<String, Vec<u8>>,
+    dirs: std::collections::BTreeSet<String>,
+    /// Open file handles -> path.
+    open_files: std::collections::BTreeMap<FsHandle, String>,
+    /// Immutable (exec) handles -> snapshotted contents.
+    exec_handles: std::collections::BTreeMap<FsHandle, Vec<u8>>,
+    next_handle: FsHandle,
+}
+
+impl MemFs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pre-populate a file (for tests).
+    pub fn insert_file(&self, path: &str, contents: impl Into<Vec<u8>>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .files
+            .insert(path.to_string(), contents.into());
+    }
+
+    /// Pre-create a directory (for tests).
+    pub fn insert_dir(&self, path: &str) {
+        self.inner.lock().unwrap().dirs.insert(path.to_string());
+    }
+
+    /// The current contents of a file, if it exists (for test assertions).
+    pub fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
+        self.inner.lock().unwrap().files.get(path).cloned()
+    }
+}
+
+impl MemFsInner {
+    fn alloc_handle(&mut self) -> FsHandle {
+        let handle = self.next_handle;
+        self.next_handle += 1;
+        handle
+    }
+}
+
+fn ready<T: Send + 'static>(value: T) -> BoxOp<T> {
+    Box::pin(std::future::ready(value))
+}
+
+impl FsProvider for MemFs {
+    fn open(&mut self, path: &str, flags: OpenFlags) -> BoxOp<Result<FsHandle, FsError>> {
+        let mut inner = self.inner.lock().unwrap();
+        let result = if inner.dirs.contains(path) || path == "/" {
+            Err(FsError::IsADirectory)
+        } else if inner.files.contains_key(path) {
+            if flags.truncate {
+                inner.files.insert(path.to_string(), Vec::new());
+            }
+            let handle = inner.alloc_handle();
+            inner.open_files.insert(handle, path.to_string());
+            Ok(handle)
+        } else if flags.create {
+            inner.files.insert(path.to_string(), Vec::new());
+            let handle = inner.alloc_handle();
+            inner.open_files.insert(handle, path.to_string());
+            Ok(handle)
+        } else {
+            Err(FsError::NotFound)
+        };
+        ready(result)
+    }
+
+    fn open_exec(&mut self, path: &str) -> BoxOp<Result<FsHandle, FsError>> {
+        let mut inner = self.inner.lock().unwrap();
+        let result = match inner.files.get(path).cloned() {
+            // Snapshotting the contents gives the immutability the handle promises.
+            Some(contents) => {
+                let handle = inner.alloc_handle();
+                inner.exec_handles.insert(handle, contents);
+                Ok(handle)
+            }
+            None if inner.dirs.contains(path) => Err(FsError::IsADirectory),
+            None => Err(FsError::NotFound),
+        };
+        ready(result)
+    }
+
+    fn list_directory(&mut self, path: &str) -> BoxOp<Result<Vec<String>, FsError>> {
+        let inner = self.inner.lock().unwrap();
+        let prefix = if path == "/" {
+            "/".to_string()
+        } else if inner.dirs.contains(path) {
+            format!("{path}/")
+        } else if inner.files.contains_key(path) {
+            return ready(Err(FsError::NotADirectory));
+        } else {
+            return ready(Err(FsError::NotFound));
+        };
+        let mut entries: Vec<String> = Vec::new();
+        for name in inner.files.keys().chain(inner.dirs.iter()) {
+            if let Some(rest) = name.strip_prefix(&prefix)
+                && !rest.is_empty()
+                && !rest.contains('/')
+                && !entries.contains(&rest.to_string())
+            {
+                entries.push(rest.to_string());
+            }
+        }
+        ready(Ok(entries))
+    }
+
+    fn stat(&mut self, path: &str) -> BoxOp<Result<NodeStat, FsError>> {
+        let inner = self.inner.lock().unwrap();
+        let result = if let Some(contents) = inner.files.get(path) {
+            Ok(NodeStat {
+                kind: NodeKind::File,
+                size: contents.len() as u64,
+            })
+        } else if inner.dirs.contains(path) || path == "/" {
+            Ok(NodeStat {
+                kind: NodeKind::Directory,
+                size: 0,
+            })
+        } else {
+            Err(FsError::NotFound)
+        };
+        ready(result)
+    }
+
+    fn create_directory(&mut self, path: &str) -> BoxOp<Result<(), FsError>> {
+        let mut inner = self.inner.lock().unwrap();
+        let result = if inner.dirs.contains(path) || inner.files.contains_key(path) || path == "/" {
+            Err(FsError::AlreadyExists)
+        } else {
+            inner.dirs.insert(path.to_string());
+            Ok(())
+        };
+        ready(result)
+    }
+
+    fn remove(&mut self, path: &str) -> BoxOp<Result<(), FsError>> {
+        let mut inner = self.inner.lock().unwrap();
+        let result = if inner.files.remove(path).is_some() || inner.dirs.remove(path) {
+            Ok(())
+        } else {
+            Err(FsError::NotFound)
+        };
+        ready(result)
+    }
+
+    fn read(
+        &mut self,
+        file: FsHandle,
+        offset: u64,
+        mut dst: Vec<u8>,
+    ) -> BoxOp<(Vec<u8>, Result<u64, FsError>)> {
+        let inner = self.inner.lock().unwrap();
+        let Some(path) = inner.open_files.get(&file) else {
+            return ready((dst, Err(FsError::NotFound)));
+        };
+        let Some(contents) = inner.files.get(path) else {
+            return ready((dst, Err(FsError::NotFound)));
+        };
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(contents.len());
+        let count = dst.len().min(contents.len() - start);
+        dst[..count].copy_from_slice(&contents[start..start + count]);
+        ready((dst, Ok(count as u64)))
+    }
+
+    fn write(
+        &mut self,
+        file: FsHandle,
+        offset: u64,
+        src: Vec<u8>,
+    ) -> BoxOp<(Vec<u8>, Result<u64, FsError>)> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(path) = inner.open_files.get(&file).cloned() else {
+            return ready((src, Err(FsError::NotFound)));
+        };
+        let Some(contents) = inner.files.get_mut(&path) else {
+            return ready((src, Err(FsError::NotFound)));
+        };
+        let Ok(start) = usize::try_from(offset) else {
+            return ready((src, Err(FsError::NoSpace)));
+        };
+        if contents.len() < start + src.len() {
+            contents.resize(start + src.len(), 0);
+        }
+        contents[start..start + src.len()].copy_from_slice(&src);
+        let written = src.len() as u64;
+        ready((src, Ok(written)))
+    }
+
+    fn exec_size(&mut self, handle: FsHandle) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .exec_handles
+            .get(&handle)
+            .map(|contents| contents.len() as u64)
+            .unwrap_or(0)
+    }
+
+    fn exec_read(
+        &mut self,
+        handle: FsHandle,
+        offset: u64,
+        mut dst: Vec<u8>,
+    ) -> BoxOp<(Vec<u8>, Result<u64, FsError>)> {
+        let inner = self.inner.lock().unwrap();
+        let Some(contents) = inner.exec_handles.get(&handle) else {
+            return ready((dst, Err(FsError::NotFound)));
+        };
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(contents.len());
+        let count = dst.len().min(contents.len() - start);
+        dst[..count].copy_from_slice(&contents[start..start + count]);
+        ready((dst, Ok(count as u64)))
+    }
+
+    fn close_file(&mut self, file: FsHandle) {
+        self.inner.lock().unwrap().open_files.remove(&file);
+    }
+
+    fn close_exec(&mut self, handle: FsHandle) {
+        self.inner.lock().unwrap().exec_handles.remove(&handle);
     }
 }

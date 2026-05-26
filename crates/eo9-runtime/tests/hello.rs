@@ -135,7 +135,7 @@ fn run(image: &Image, name_wave: &str) -> (Outcome, CaptureText) {
     let providers = Providers {
         text: Some(Box::new(capture.clone())),
         time: Some(Box::new(FrozenTime::new(1_748_000_000, 0))),
-        entropy: None,
+        ..Providers::none()
     };
     let mut task = Task::spawn(
         image,

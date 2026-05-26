@@ -194,12 +194,57 @@ on waitable-sets (`CannotBlockSyncTask`, spike finding D1), and `wit-bindgen 0.5
 itself make wit-bindgen guests runnable; `main` (or the guest SDK's wait strategy) must
 become async-capable too (escalation E1).
 
+### D10. Milestone-3 follow-up (branch `area/04-runtime-m3`): async reconciliation, fs/io linking, loader rule
+
+**Toolchain encoding finding (important).** The WIT now declares blocking operations as
+`async func(...) -> T`, but the pinned guest toolchain (wit-bindgen 0.57.1 / wasm-tools
+1.250, verified against the built `eo9-example-readwrite` component) encodes them at the
+component-type level as plain functions returning `future<T>`, and encodes `main: async
+func` as a *sync-lifted* export driven by `wit_bindgen::block_on`. wasmtime 45's
+`func_wrap_concurrent` (an async-typed host function) therefore does **not** match what
+these components import; the runtime keeps the host-created-future wiring (sync host
+functions returning a `FutureReader` whose producer polls the provider's `BoxOp`). The
+embedded WAT fixtures use the same encoding so they exercise what real guests carry.
+
+**fs / io-buffers linking.** `FsProvider` (open, open-exec, list-directory, stat,
+create-directory, remove, owned-buffer read/write/exec-read, exec-size, close hooks) joins
+the provider traits, with `MemFs` as the in-memory test provider. `eo9:io/buffers` is
+backed by a per-task buffer table in the runtime (buffers are host memory, so they carry
+their own caps: 16 MiB per buffer, 64 MiB per task, enforced before allocation); the
+owned-buffer round-trip takes the bytes out of the table for the life of an operation and
+restores them on completion, success or error. `file`/`immutable-handle` resource drops are
+forwarded to the provider. Tests: `tests/fs_api.rs` (buffer table; awaiting fs operations
+from an async-lifted guest), plus the provider-blocking test in `tests/task_api.rs`.
+**Disk is not included**: it is the same pattern (one more provider trait + ~an hour of
+wiring) but nothing consumes it yet; it can follow with the unix providers.
+
+**Loader rule for optional imports.** The always-registered `eo9:X/X-optional` flavors
+answer `default() -> some(handle)` when the capability was granted and `none` otherwise,
+so a program importing an optional capability it was not granted spawns fine and observes
+absence (observationally `X.none`); required imports still fail at spawn. Types-only
+interfaces and `eo9:io/buffers` are always available (they carry no authority). Test:
+`optional_import_is_auto_sealed_when_not_granted`.
+
+**Task API reconciliation.** Host-side `Task::wait()` (future resolving with the outcome)
+joins `runnable()`/`kill()` to mirror the now-async `eo9:exec/task` operations; `kill`
+remains synchronous on the host side since it resolves immediately.
+
+**readwrite status (definition of done).** The merged `eo9-example-readwrite` component
+links, instantiates, and runs against the fs wiring, but traps at its first await with
+`CannotBlockSyncTask`: the guest SDK's sync-lifted `main` + `block_on` parks on
+`waitable-set.wait`, which wasmtime 45 refuses (escalation E1, now the single blocker).
+`tests/readwrite.rs` pins this exact behaviour and says how to flip it once the guest SDK
+async-lifts `main`; the fs wiring itself is proven by the async-lifted WAT guests.
+
 ### Escalations for the planner
 
-- **E1 (wit/, area 02 + 07):** for a binary to await anything, its `main` must be an
-  `async` function at the component level under wasmtime 45. Proposal: declare `main` (and
-  probably provider `configure`) as `async func` in the WIT sketches/worlds, and have the
-  guest SDK lift accordingly.
+- **E1 (area 07 + upstream, still open after the async-operations migration):** for a
+  binary to await anything its `main` must be *async-lifted* under wasmtime 45. The WIT now
+  says `main: async func`, but the pinned wit-bindgen encodes that as a sync-lifted export
+  whose `block_on` parks on `waitable-set.wait` — so `eo9-example-readwrite` still traps at
+  its first await (see D10). Resolution needs the guest SDK to emit genuinely async-lifted
+  exports (wit-bindgen native async exports / callback ABI) or an upstream wasmtime change
+  allowing sync tasks to wait.
 - **E2 (wit/, area 02):** `program-outcome` has no arm for abnormal termination (trap,
   kill, out-of-fuel death). `wait`/`kill` return `future<program-outcome>`, which today
   cannot express "killed". Proposal: add a third arm (e.g. `aborted(abort-reason)`).

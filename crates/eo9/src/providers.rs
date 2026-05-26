@@ -173,6 +173,9 @@ pub fn root_providers() -> Providers {
         entropy: Some(Box::new(HostEntropy {
             inner: UnixEntropy::new(),
         })),
+        // No root fs provider yet: the unix-backed filesystem provider is area 08/11
+        // follow-up work; programs importing eo9:fs keep failing at spawn until then.
+        fs: None,
     }
 }
 

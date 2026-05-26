@@ -25,6 +25,7 @@ pub use engine::{EngineOptions, compatibility_hash, new_engine};
 pub use image::{CompileError, Image};
 pub use outcome::{Outcome, WaveValue};
 pub use providers::{
-    Datetime, EntropyProvider, OutputStream, Providers, TextError, TextProvider, TimeProvider,
+    Datetime, EntropyProvider, FsError, FsHandle, FsProvider, MemFs, NodeKind, NodeStat, OpenFlags,
+    OutputStream, Providers, TextError, TextProvider, TimeProvider,
 };
 pub use task::{NamedArg, ResumeOutcome, SpawnError, SpawnLimits, Task};

@@ -59,72 +59,42 @@ const GROW_WAT: &str = r#"
 )
 "#;
 
-/// Guest that imports `eo9:time/time`, calls `sleep(1ms)`, awaits the returned future, and
-/// returns 7. `main` is an async function (sync-lifted exports cannot block in wasmtime 45).
+/// Guest that imports `eo9:time/time`, calls the async `sleep(1ms)` operation, and returns
+/// 7. `sleep` is sync-lowered from an async-lifted `main`: the call parks the task until
+/// the host's concurrent implementation completes (sync-lifted exports cannot block in
+/// wasmtime 45, hence the async lift).
 const SLEEP_WAT: &str = r#"
 (component
   (import "eo9:time/types@0.1.0" (instance $time-types
     (export "time-impl" (type (sub resource)))))
   (alias export $time-types "time-impl" (type $time-impl))
   (import "eo9:time/time@0.1.0" (instance $time
-    (export "default" (func (result (own $time-impl))))
-    (export "sleep" (func (param "t" (borrow $time-impl)) (param "duration-ns" u64) (result (future))))))
-
-  (core module $libc (memory (export "memory") 1))
-  (core instance $libc (instantiate $libc))
+    (export "time-impl" (type $ti (eq $time-impl)))
+    (export "default" (func (result (own $ti))))
+    (export "sleep" (func async (param "t" (borrow $ti)) (param "duration-ns" u64)))))
 
   (alias export $time "default" (func $default))
   (alias export $time "sleep" (func $sleep))
 
-  (type $ft (future))
   (core func $default-lowered (canon lower (func $default)))
   (core func $sleep-lowered (canon lower (func $sleep)))
-  (core func $future-read (canon future.read $ft async (memory $libc "memory")))
-  (core func $ws-new (canon waitable-set.new))
-  (core func $ws-join (canon waitable.join))
-  (core func $ws-wait (canon waitable-set.wait (memory $libc "memory")))
-  (core func $future-drop (canon future.drop-readable $ft))
-  (core func $ws-drop (canon waitable-set.drop))
   (core func $task-return (canon task.return (result u32)))
 
   (core module $m
-    (import "libc" "memory" (memory 1))
     (import "host" "default" (func $default (result i32)))
-    (import "host" "sleep" (func $sleep (param i32 i64) (result i32)))
-    (import "host" "future-read" (func $future-read (param i32 i32) (result i32)))
-    (import "host" "waitable-set-new" (func $ws-new (result i32)))
-    (import "host" "waitable-join" (func $ws-join (param i32 i32)))
-    (import "host" "waitable-set-wait" (func $ws-wait (param i32 i32) (result i32)))
-    (import "host" "future-drop" (func $future-drop (param i32)))
-    (import "host" "waitable-set-drop" (func $ws-drop (param i32)))
+    (import "host" "sleep" (func $sleep (param i32 i64)))
     (import "host" "task-return" (func $task-return (param i32)))
 
     (func (export "main")
-      (local $h i32) (local $f i32) (local $ws i32) (local $status i32)
-      (local.set $h (call $default))
-      (local.set $f (call $sleep (local.get $h) (i64.const 1000000)))
-      (local.set $status (call $future-read (local.get $f) (i32.const 16)))
-      (if (i32.eq (local.get $status) (i32.const -1))
-        (then
-          (local.set $ws (call $ws-new))
-          (call $ws-join (local.get $f) (local.get $ws))
-          (drop (call $ws-wait (local.get $ws) (i32.const 32)))
-          (call $ws-join (local.get $f) (i32.const 0))
-          (call $ws-drop (local.get $ws))))
-      (call $future-drop (local.get $f))
+      ;; The sync-lowered call to the async `sleep` operation blocks this (async-lifted)
+      ;; task until the host completes it.
+      (call $sleep (call $default) (i64.const 1000000))
       (call $task-return (i32.const 7))))
 
   (core instance $i (instantiate $m
-    (with "libc" (instance $libc))
     (with "host" (instance
       (export "default" (func $default-lowered))
       (export "sleep" (func $sleep-lowered))
-      (export "future-read" (func $future-read))
-      (export "waitable-set-new" (func $ws-new))
-      (export "waitable-join" (func $ws-join))
-      (export "waitable-set-wait" (func $ws-wait))
-      (export "future-drop" (func $future-drop))
-      (export "waitable-set-drop" (func $ws-drop))
       (export "task-return" (func $task-return))))))
 
   (func (export "main") async (result u32) (canon lift (core func $i "main") async))
@@ -443,4 +413,75 @@ fn unsatisfied_import_is_a_spawn_error() {
         }
         other => panic!("expected an internal spawn error, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Loader rule: optional imports are auto-sealed with the absent provider
+// ---------------------------------------------------------------------------------------
+
+/// Guest that imports only the *optional* text flavor and reports what `default()`
+/// answered: 1 when the capability is present, 0 when it is absent.
+const OPTIONAL_TEXT_WAT: &str = r#"
+(component
+  (import "eo9:text/types@0.1.0" (instance $text-types
+    (export "text-impl" (type (sub resource)))))
+  (alias export $text-types "text-impl" (type $text-impl))
+  (import "eo9:text/text-optional@0.1.0" (instance $text-opt
+    (export "text-impl" (type $ti (eq $text-impl)))
+    (export "default" (func (result (option (own $ti)))))))
+
+  (alias export $text-opt "default" (func $default))
+
+  (core module $libc (memory (export "memory") 1))
+  (core instance $libc (instantiate $libc))
+  (core func $default-lowered (canon lower (func $default) (memory $libc "memory")))
+
+  (core module $m
+    (import "libc" "memory" (memory 1))
+    ;; option<own<text-impl>> does not fit in one flat result: the lowered import takes a
+    ;; return pointer and writes (discriminant, handle) there.
+    (import "host" "default" (func $default (param i32)))
+    (func (export "main") (result i32)
+      (call $default (i32.const 16))
+      (i32.load (i32.const 16))))
+
+  (core instance $i (instantiate $m
+    (with "libc" (instance $libc))
+    (with "host" (instance (export "default" (func $default-lowered))))))
+
+  (func (export "main") (result u32) (canon lift (core func $i "main")))
+)
+"#;
+
+#[test]
+fn optional_import_is_auto_sealed_when_not_granted() {
+    use eo9_runtime::providers::CaptureText;
+
+    let image = compile(OPTIONAL_TEXT_WAT);
+
+    // Not granted: the spawn still succeeds (the loader auto-seals the optional import
+    // with the absent provider) and the program observes `none`.
+    let mut task = Task::spawn(&image, &[], SpawnLimits::default(), Providers::none()).unwrap();
+    let outcome = match task.resume(10 * FUEL_QUANTUM) {
+        ResumeOutcome::Done(outcome) => outcome,
+        other => panic!("expected done, got {other:?}"),
+    };
+    assert_eq!(success_value(&outcome), "0");
+
+    // Granted: the same program observes `some`.
+    let mut task = Task::spawn(
+        &image,
+        &[],
+        SpawnLimits::default(),
+        Providers {
+            text: Some(Box::new(CaptureText::new())),
+            ..Providers::none()
+        },
+    )
+    .unwrap();
+    let outcome = match task.resume(10 * FUEL_QUANTUM) {
+        ResumeOutcome::Done(outcome) => outcome,
+        other => panic!("expected done, got {other:?}"),
+    };
+    assert_eq!(success_value(&outcome), "1");
 }
