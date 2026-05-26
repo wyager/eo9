@@ -67,6 +67,7 @@ rung. Pending owner decisions: /try v2 path and `eo9-embed` go/no-go (see Next u
 | eosh (full grammar, evaluator, env/envinfo, component) | `guest/eosh` | done for current scope; runs as the `eo9 shell` |
 | Integration suites (capability laws, determinism, invoker-configured env, kill/linearity, CLI transcripts) | `tests/eo9-integration` + `crates/eo9/tests` | 30+ tests; QEMU tier not started |
 | Usermode binary `eo9` | `crates/eo9` | run/store/describe/compile/cache/shell/demo-seeding done |
+| Embeddable runtime (`Eo9` builder, Sandbox + Host backends behind a `ProviderSource` seam, safe capability defaults) | `crates/eo9-embed` | complete; foundation for `eo9 bundle` and the deferred wasm32 backend; sandbox-only builds with `--no-default-features` |
 | Website + server + /try in-browser demo | `www/` | complete, deployable; /try v2 (eosh in browser) pending |
 | Bare-metal kernel (aarch64: boot, heap, timer, MMU, kernel providers, sync + async guests, baked-in store, **boot-to-interactive-eosh**, vendored CM-async no_std patch) | `kernel/` | milestones 1–4 merged; on-target codegen (unlocks composition) is the next + last MVP rung; GIC/fuel/sched + riscv64/x86_64 deferred |
 
@@ -77,8 +78,6 @@ rung. Pending owner decisions: /try v2 path and `eo9-embed` go/no-go (see Next u
   upstream) so the kernel compiles components on the machine and the bare-metal shell gains `$`/`&`
   composition. Checkpoints: crates build for the kernel target → trivial module compiled on-target →
   real component on-target → wired into the shell.
-- **`eo9-embed`** (`area/16-embed`): the embeddable-runtime library (runtime + host providers behind a
-  one-call API) — green-lit; foundation for `eo9 bundle` and the /try v2 browser blob.
 
 ## Next up (rough order)
 

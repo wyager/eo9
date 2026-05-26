@@ -114,4 +114,9 @@ xtask-order / web-try wave)._
 - Empty per-process exec-copy directories are never cleaned from the temp dir.
 - Scheduler crate (`eo9-sched`) not yet adopted by the CLI drive loop (single-task loop suffices so far).
 - Root host workspace manifest lacks a `license = "MIT"` field (guest/www have it; LICENSE file is MIT).
+- `eo9-embed::render_outcome` maps abnormal (trapped and killed alike) to exit code 2 — 0/1/2 vs the CLI's
+  0/1/2/3 (killed=3); fine as a library convenience (the embedder owns exit mapping), align if it matters.
+- `eo9-embed` follow-ups (plan/16): consolidate the `eo9` binary onto eo9-embed to delete the duplicated
+  completion→future bridge (D1); engine reuse + optional compile-cache integration (D5); an
+  exec-through-Host end-to-end test (D6).
 - Nothing has been pushed to origin yet.
