@@ -243,6 +243,11 @@ fn add_time(linker: &mut Linker<KernelState>) -> Result<()> {
     Ok(())
 }
 
+/// Upper bound on a single `read-line` line, so unbounded input cannot grow the line
+/// buffer without limit. Bytes beyond the cap are dropped (not echoed) until the line is
+/// ended; backspace still works at the boundary.
+const MAX_READ_LINE_BYTES: usize = 4096;
+
 /// Future that reads one line from the PL011, echoing input as it arrives.
 ///
 /// Resolves to `Some(line)` on CR/LF (without the terminator) and to `None` (end of
@@ -272,7 +277,7 @@ impl Future for ReadLine {
                         crate::kprint!("\u{8} \u{8}");
                     }
                 }
-                0x20..=0x7e => {
+                0x20..=0x7e if this.line.len() < MAX_READ_LINE_BYTES => {
                     let ch = char::from(byte);
                     this.line.push(ch);
                     crate::kprint!("{ch}");
