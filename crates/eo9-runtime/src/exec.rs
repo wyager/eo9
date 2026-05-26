@@ -207,12 +207,7 @@ mod tests {
     fn component_byte_budget_rejects_an_over_limit_load() {
         let engine = crate::engine::new_engine(&crate::engine::EngineOptions::default()).unwrap();
         let mut exec = ExecProvider::new(&engine, ChildPolicy::no_providers());
-        let tiny = eo9_component::Component::load(
-            wasmtime::component::Component::new(&engine, "(component)")
-                .map(|_| wat_bytes())
-                .unwrap(),
-        )
-        .unwrap();
+        let tiny = eo9_component::Component::load(wat_bytes()).unwrap();
         // A component whose claimed size exceeds the budget is refused before insertion.
         let err = exec
             .insert_component(tiny, MAX_COMPONENT_BYTES + 1)

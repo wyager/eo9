@@ -485,3 +485,21 @@ fn optional_import_is_auto_sealed_when_not_granted() {
     };
     assert_eq!(success_value(&outcome), "1");
 }
+
+#[test]
+fn kill_in_place_then_outcome_reports_killed_without_trapping() {
+    let image = compile(COMPUTE_WAT);
+    let mut task = Task::spawn(&image, &[], SpawnLimits::default(), Providers::none()).unwrap();
+    // Partially run it, then kill it in place (the exec provider's guest-facing `kill`).
+    assert_eq!(task.resume(FUEL_QUANTUM), ResumeOutcome::OutOfFuel);
+    assert_eq!(task.kill_in_place(), Outcome::Killed);
+    // The same handle keeps answering: `outcome`/`wait`-style observation and even another
+    // resume see the killed outcome (this is what `wait` after `kill` maps to
+    // `abnormal(killed)` through eo9:exec/task).
+    assert_eq!(task.outcome(), Some(&Outcome::Killed));
+    assert_eq!(
+        task.resume(FUEL_QUANTUM),
+        ResumeOutcome::Done(Outcome::Killed)
+    );
+    assert!(!task.is_runnable());
+}
