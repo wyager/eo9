@@ -14,12 +14,11 @@
 //! capability that `configure` returned, so the state cannot live inside any single
 //! resource instance.
 //!
-//! Note (toolchain constraint, see plan/09-providers-stubs.md Decisions): a wasm guest
-//! provider currently cannot implement an exported operation that returns a `future<T>`
-//! it would have to complete itself — only `async func` exports may be async-lifted, so
-//! a plain `func(...) -> future<T>` export has no live task left to deliver the value
-//! after it returns. The shipped stubs therefore cover the interfaces whose operations
-//! are synchronous; the rest are deferred pending that escalation.
+//! Blocking API operations are `async func`s (plan/02-wit.md, decision 12), so a
+//! provider implements them as ordinary async trait methods — computing immediately
+//! (the deterministic stubs) or awaiting its own imports (the attenuators); no future
+//! plumbing is involved. One discipline to keep: never hold a [`ProviderState`] borrow
+//! across an `await` — take what you need out of the state first.
 
 use core::cell::RefCell;
 

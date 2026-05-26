@@ -1,0 +1,15 @@
+[package]
+name = "eo9-stub-time-frozen"
+description = "Eo9 standard stub provider `time.frozen`: exports eo9:time/time with both clocks frozen at the instant bound by configure; sleep returns immediately."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }
