@@ -54,25 +54,40 @@ The kernel additionally provides, as the embedder: `wasmtime_tls_get/set`,
 `wasmtime_concurrent_tls_get/set`, and a `CustomCodeMemory` publisher (D-cache clean +
 I-cache invalidate over published code) — see `kernel/eo9-kernel/src/wasm/mod.rs`.
 
-## On-target codegen (planned, not yet vendored) — plan/12 Decision 26
+## On-target codegen (in progress) — plan/12 Decisions 26 & 28
 
-The next rung (the kernel compiling components on the machine, behind an off-by-default
-`wasm-codegen` cargo feature) will add two more vendored crates here, both kept
-kernel-workspace-only via `[patch.crates-io]`. The fork surface was surveyed before
-vendoring (so the diff stays minimal):
+The on-target-codegen rung (the kernel compiling components on the machine, behind the
+off-by-default `wasm-codegen` cargo feature) adds **four** vendored crates here, all kept
+kernel-workspace-only via `[patch.crates-io]`. `cranelift-codegen` 0.132 and the small
+cranelift sub-crates (entity, bitset, control) are **not** vendored — they build no_std purely
+via features. The surprise (Decision 28) was that no_std-clean leaf crates are not enough:
+some *dependents* hardcode `std` in their `cranelift-codegen` dependency feature list, and
+Cargo feature unification then forces `std` (and std-only crates like `arbitrary` via
+`cranelift-control/fuzz`, and `termcolor` via `wasmprinter`) back onto the no_std target. So
+two of the four vendored crates exist only to change those dependency lines.
 
-- **`wasmtime-environ` 45.0.0** — already `#![no_std]`; its `compile` feature currently
-  requires `std`. Planned changes: drop `std` from the `compile` feature (it already pulls
-  the alloc-friendly `object/write_core` + `gimli/write` paths) and fix the residual
-  `std::` in the `compile` module — almost all mechanical core/alloc swaps, with a small
-  number of genuine touchpoints (notably `std::path::PathBuf` in `compile/module_environ.rs`).
-- **`wasmtime-internal-cranelift` 45.0.0** — not yet `#![no_std]` (~43 `std::` lines); the
-  `Compiler` glue. Planned: add `#![no_std]` + `extern crate alloc`, convert std→core/alloc,
-  and drive `object`/`gimli` through their alloc-only write paths.
+- **`wasmtime-environ` 45.0.0** — already `#![no_std]`; its `compile` feature required `std`.
+  Changes: `compile` no longer pulls `std`; `wasm-encoder` taken `default-features = false`;
+  `wasmprinter` dropped from `compile` (it pulled the std-only `termcolor`; its one
+  Trace-level use in `component/translate/adapt.rs` became a byte-count log); mechanical
+  `std::`→`core`/`alloc`/`hashbrown` swaps across the `compile` and `fact` modules. Remaining:
+  the `std::path` debug touchpoints (`CompilerBuilder::clif_dir`, `ModuleTranslation.path`).
+- **`wasmtime-internal-cranelift` 45.0.0** — the `Compiler` glue. Changes so far: `#![no_std]`
+  + `extern crate alloc` + re-export of `wasmtime_environ::prelude`; dependency features
+  de-std'd (`cranelift-codegen` → `core`/`unwind`/`host-arch`; `cranelift-frontend` → `core`;
+  `gimli` → `read`; `object` → `write_core`; `itertools` → `use_alloc`; `thiserror`
+  `default-features = false`); `cranelift-native` made optional and the host-flag-inference
+  call (`isa_builder.rs`) gated behind it — the kernel always specifies its target triple, so
+  it is never reached, and cranelift-native is std-only. Remaining: the crate's own ~43
+  `std::` lines + per-module `use crate::*;` prelude threading.
+- **`cranelift-frontend` 0.132.0** and **`wasmtime-internal-unwinder` 45.0.0** — vendored
+  *only* to change their `cranelift-codegen` dependency from `features = ["std", …]` to the
+  `core` profile. Without this, either edge forces `cranelift-codegen/std` → `gimli/std` +
+  `cranelift-control/fuzz` → `arbitrary` onto the target and the build fails.
 
-`cranelift-codegen` 0.132 and the small cranelift sub-crates are **not** vendored: they build
-no_std purely via features (`default-features = false` + `core`, no `std`/`timing`/
-`souper-harvest`; hashbrown is the no_std `HashMap` fallback). The existing `wasmtime` patch
-will gain the `cranelift`/`compile` features on the kernel build path. Cranelift emits native
-aarch64 (not Pulley), so the publisher's cache maintenance above is what makes freshly
-generated code executable.
+The existing `wasmtime` patch gained the `cranelift` feature on the kernel build path without
+`std`. Cranelift emits native aarch64 (not Pulley), so the publisher's cache maintenance above
+is what makes freshly generated code executable. Status: the codegen backend builds no_std;
+`wasmtime-internal-cranelift`'s own source + the `clif_dir` touchpoint + the in-kernel compile
+demo remain (plan/12 Decision 28 has the full punch list). All of this is behind `wasm-codegen`
+(off by default), so the standard builds are unaffected.

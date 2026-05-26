@@ -6,10 +6,8 @@ use crate::{
     collections::{TryClone as _, TryCow},
     wasm_unsupported,
 };
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    ops::Index,
-};
+use core::ops::Index;
+use hashbrown::{HashMap, hash_map::Entry};
 use wasmparser::{UnpackedIndex, Validator, ValidatorId};
 
 /// A type marking the start of a recursion group's definition.

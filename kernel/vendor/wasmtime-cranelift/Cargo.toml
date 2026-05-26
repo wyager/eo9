@@ -134,8 +134,11 @@ features = ["union"]
 [dependencies.target-lexicon]
 version = "0.13.3"
 
+# no_std (plan/12 D28): thiserror's `std` default does `extern crate std`; take it without
+# defaults (it is no_std-clean) so this edge doesn't unify std onto the codegen graph.
 [dependencies.thiserror]
 version = "2.0.17"
+default-features = false
 
 [dependencies.wasmparser]
 version = "0.248.0"

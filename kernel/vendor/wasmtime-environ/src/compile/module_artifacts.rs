@@ -10,7 +10,7 @@ use crate::{
 };
 use object::SectionKind;
 use object::write::{Object, SectionId, StandardSegment, WritableBuffer};
-use std::ops::Range;
+use core::ops::Range;
 
 /// Helper structure to create an ELF file as a compilation artifact.
 ///

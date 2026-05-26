@@ -13,7 +13,7 @@ use crate::{
     FuncKey, ModulePC, WasmHeapTopType, WasmValType, prelude::*,
 };
 use object::{LittleEndian, U32};
-use std::collections::{HashMap, hash_map::Entry};
+use hashbrown::{HashMap, hash_map::Entry};
 
 /// Builder for a stackslot descriptor.
 pub struct FrameStateSlotBuilder {

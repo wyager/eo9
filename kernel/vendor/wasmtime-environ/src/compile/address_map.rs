@@ -5,7 +5,7 @@ use crate::obj::ELF_WASMTIME_ADDRMAP;
 use crate::prelude::*;
 use object::write::{Object, StandardSegment};
 use object::{LittleEndian, SectionKind, U32};
-use std::ops::Range;
+use core::ops::Range;
 
 /// Builder for the address map section of a wasmtime compilation image.
 ///

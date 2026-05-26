@@ -9,11 +9,11 @@ use crate::{
 };
 use object::write::{Object, SymbolId};
 use object::{Architecture, BinaryFormat, FileFlags};
-use std::any::Any;
-use std::borrow::Cow;
-use std::fmt;
+use core::any::Any;
+use alloc::borrow::Cow;
+use core::fmt;
 use std::path;
-use std::sync::Arc;
+use alloc::sync::Arc;
 
 mod address_map;
 mod frame_table;
@@ -76,7 +76,7 @@ impl core::error::Error for CompileError {
 /// In theory, this could just be Cranelift's `CacheKvStore` trait, but it is not as we want to
 /// make sure that wasmtime isn't too tied to Cranelift internals (and as a matter of fact, we
 /// can't depend on the Cranelift trait here).
-pub trait CacheStore: Send + Sync + std::fmt::Debug {
+pub trait CacheStore: Send + Sync + core::fmt::Debug {
     /// Try to retrieve an arbitrary cache key entry, and returns a reference to bytes that were
     /// inserted via `Self::insert` before.
     fn get(&self, key: &[u8]) -> Option<Cow<'_, [u8]>>;

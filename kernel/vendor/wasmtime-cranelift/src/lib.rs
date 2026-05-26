@@ -13,6 +13,19 @@
 // See documentation in crates/wasmtime/src/runtime.rs for why this is
 // selectively enabled here.
 #![warn(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// no_std (plan/12 D26-28): this crate is the Cranelift compile glue; it builds for the Eo9
+// kernel's `aarch64-unknown-none` target. `std` is only needed by the test modules and the
+// optional `cranelift-native` host-inference path.
+#![no_std]
+
+extern crate alloc;
+#[cfg(any(feature = "cranelift-native", test))]
+extern crate std;
+
+// Bring the alloc-based String/Vec/Box/format!/vec!/ToString/ToOwned and the wasmtime error
+// helpers (bail!/format_err!/Context) into every module via `use crate::*;`, mirroring the
+// wasmtime-environ prelude convention so the modules below need no per-item alloc imports.
+pub use wasmtime_environ::prelude::*;
 
 use cranelift_codegen::{
     FinalizedMachReloc, FinalizedRelocTarget, MachTrap, binemit,

@@ -28,6 +28,10 @@ wasm-async = ["dep:wasmtime"]
 # components plus their host-AOT artifacts) and the headless runner that the kernel
 # command line's `program=<name> [arg=value …]` selects from.
 wasm-store = ["dep:wasmtime"]
+# On-target codegen (plan/12 Decisions 26–28): compile WebAssembly into native aarch64 on the
+# machine itself, via Cranelift + the wasmtime compile layers built no_std (see
+# kernel/vendor). Off by default so `cargo xtask ci` (featureless kernel) stays lean.
+wasm-codegen = ["dep:wasmtime", "wasmtime/cranelift"]
 
 # These dependencies are only used by the real bare-metal build; host-triple builds (unit
 # tests, `cargo check` without --target) compile the stub entry point and need neither.

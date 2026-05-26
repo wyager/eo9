@@ -221,11 +221,11 @@ impl<'data> Translator<'_, 'data> {
             // transform `wasm` into `&'data [u8]` which is much easier to work
             // with here.
             let wasm = &*self.scope_vec.push(wasm);
+            // no_std (plan/12 D28): the optional wasmprinter-based trace dump of the adapter
+            // module pulled in `termcolor` (std-only) through wasmprinter. It is a Trace-level
+            // debugging aid only; drop the textual dump and just note the size.
             if log::log_enabled!(log::Level::Trace) {
-                match wasmprinter::print_bytes(wasm) {
-                    Ok(s) => log::trace!("generated adapter module:\n{s}"),
-                    Err(e) => log::trace!("failed to print adapter module: {e}"),
-                }
+                log::trace!("generated adapter module: {} bytes", wasm.len());
             }
 
             // With the wasm binary this is then pushed through general

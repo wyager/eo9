@@ -14,11 +14,11 @@ use crate::{
 };
 use cranelift_entity::SecondaryMap;
 use cranelift_entity::packed_option::ReservedValue;
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::mem;
+use alloc::borrow::Cow;
+use hashbrown::HashMap;
+use core::mem;
 use std::path::PathBuf;
-use std::sync::Arc;
+use alloc::sync::Arc;
 use wasmparser::{
     CustomSectionReader, DataKind, ElementItems, ElementKind, Encoding, ExternalKind,
     FuncToValidate, FunctionBody, KnownCustom, NameSectionReader, Naming, Parser, Payload, TypeRef,

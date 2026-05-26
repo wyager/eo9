@@ -39,3 +39,8 @@ wasmtime = { path = "vendor/wasmtime" }
 # cranelift crate is only compiled when `wasm-codegen` (→ wasmtime `cranelift`) is on.
 wasmtime-environ = { path = "vendor/wasmtime-environ" }
 wasmtime-internal-cranelift = { path = "vendor/wasmtime-cranelift" }
+# cranelift-frontend and wasmtime-internal-unwinder hardcode `cranelift-codegen/std` in
+# their dependency feature lists, which (via feature unification) forces std on the whole
+# codegen graph. Vendored only to change those dep lines to the `core` profile (D28).
+cranelift-frontend = { path = "vendor/cranelift-frontend" }
+wasmtime-internal-unwinder = { path = "vendor/wasmtime-unwinder" }

@@ -30,7 +30,7 @@ use crate::{
     EntityRef, FuncIndex, GlobalIndex, IndexType, Memory, MemoryIndex, ModuleInternedTypeIndex,
     PrimaryMap, Tunables,
 };
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use wasm_encoder::*;
 
 mod core_types;
