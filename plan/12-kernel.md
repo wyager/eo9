@@ -196,3 +196,36 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
    /chosen/bootargs FDT walk and capturing x0 in boot.rs), and adopting `eo9-sched` once more than one task
    runs at a time. These are plain plumbing with no open design questions and are the natural next kernel
    change before boot-to-eosh.
+19. **The milestone-3 "supporting pieces" are done: a baked-in read-only store image and command-line
+   program selection.** `cargo xtask build-kernel <arch>` assembles `store.img` — magic `EO9STOR1`, entry
+   count, then per entry `name + component bytes + host-AOT artifact`, keyed by the same shell names the
+   usermode store seeds (`hello`, `entropy.seeded`, `eosh`, …; list in xtask's `KERNEL_STORE_COMPONENTS`,
+   currently eosh, the four examples, entropy.seeded, time.frozen) — and the kernel embeds and parses it
+   (src/wasm/store.rs). The kernel command line selects what to run: `cargo xtask qemu aarch64
+   program=<name> [arg=value …]` passes everything after the arch as QEMU `-append`; the kernel reads
+   `/chosen/bootargs` with a minimal FDT walk (src/fdt.rs — the boot stub preserves x0, and the parser falls
+   back to probing the DTB at the base of RAM since ELF entry does not get it in x0), runs the named entry
+   headless against the kernel root providers with `key=value` arguments matched against `main`'s named,
+   typed parameters (scalar types parsed; richer types reported as unsupported), prints the outcome, and
+   powers off. Without `program=` the default demo sequence still runs. Verified: `program=hello
+   name="bare metal" excited=true` → `success(greeted)`, `program=cruncher seed=9 rounds=200000` →
+   `success(digest(…))`.
+20. **Serial input works: PL011 receive + a real `text.read-line`.** `uart::try_get_byte` polls the RX FIFO
+   and the `read-line` provider is a polled future that echoes printable characters, handles
+   backspace/DEL, ends the line on CR/LF, and treats Ctrl-D on an empty line as end of input — the same
+   busy-poll-with-self-waking shape as `time.sleep`, to be replaced by GIC-driven wakeups later.
+21. **What remains for kernel milestone 4 (boot-to-eosh), with the surveyed requirements.** eosh imports
+   `eo9:exec/{component-algebra, compile, task}`, `eo9:text/text`, and `eo9:fs/fs`; its concrete call
+   surface (guest/eosh/eosh/src/lib.rs) is: fs `open-exec`/`exec-size`/`exec-read` of `/bin/<name>.wasm`
+   (plus `stat`/`open`/`read` for the optional session manifest) using `eo9:io/buffers`, algebra
+   `load`/`save`/`describe` (compose/extend/restrict/rename/configure only for algebra expressions),
+   `compile`, and task `spawn` + `wait`. The planned kernel implementation (not started on this branch):
+   an fs provider serving `/bin` read-only from the store image plus the io-buffers interface; algebra
+   `load`/`describe` backed by metadata precomputed by xtask (content-hash keyed), `compile` as a lookup
+   from content hash to the baked-in AOT artifact (a real compile is the on-target-codegen rung; unknown
+   bytes get a clear codegen error), and `spawn`/`wait` instantiating the artifact against the kernel root
+   providers with the child driven from the embedder loop (wasmtime forbids re-entering `run_concurrent`
+   from a host function, same as usermode), plus a small scalar WAVE parse/render for arguments and
+   outcomes. GIC/timer interrupts, fuel on metal, and eo9-sched adoption are also still open — the executor
+   remains a polling loop.
+
