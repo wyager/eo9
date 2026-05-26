@@ -158,3 +158,41 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
    the bridge while the upstream PR is in flight. Not attempted in this branch: it is a focused workstream of
    its own (it also unlocks fuel-sliced resumable tasks on metal, which eo9-runtime's task model needs).
    Planner input wanted on sequencing this against the shell milestone and on who drives the upstream PR.
+15. **Kernel milestone 3 (first rung of the ladder) is done: the component-model-async machinery runs on
+   no_std, and async eo9 guests run on bare metal.** Demonstrated under `cargo xtask qemu aarch64` by two new
+   artifacts embedded behind the `wasm-async` feature: (a) `kernel/seed/sleepy.wat`, a hand-written async
+   canary whose async-lifted `run` export awaits `eo9:time/time.sleep` for 50 ms against the kernel's generic
+   timer and returns the measured elapsed time (serial shows `sleepy.run() -> ~51.5e6 ns elapsed across the
+   await, ok`); and (b) the **unmodified `entropy.seeded` stub from the guest workspace** — a real SDK-built
+   component whose `configure` export uses the async canonical ABI — configured with a seed on the kernel and
+   then sampled twice (`get-u64` returns the exact SplitMix64 sequence for the seed). The seed canary and the
+   real hello program continue to run unchanged. Boot-to-eosh (milestone 4) now needs exec/store plumbing,
+   not new execution machinery.
+16. **How CM-async-on-no_std was achieved (the vendored patch).** The kernel workspace patches wasmtime 45
+   via `[patch.crates-io]` → `kernel/vendor/wasmtime` (kernel workspace only; host/guest workspaces keep the
+   registry crate). The patch is the minimal, upstream-shaped relaxation anticipated in Decision 14: the
+   `component-model-async` cargo feature no longer requires `std`/`futures/std`; the concurrent host
+   machinery uses core/alloc and the crate's own `crate::sync`/`crate::hash_set` types (a `Mutex` was added
+   to `sync_nostd.rs` mirroring its existing philosophy); the internal host-buffer cursor no longer uses
+   `std::io::Cursor`; the `std::io::Read`/`Write` convenience impls are `cfg(std)`; the two
+   oneshot-`Canceled` conversions construct errors explicitly; and the concurrent TLS slot goes through the
+   custom platform layer (`wasmtime_concurrent_tls_get/set` — a new embedder-provided pair, same contract as
+   the existing `wasmtime_tls_get/set`) when `std` is off. `wasmtime-fiber` needed no changes (upstream
+   already ships the no_std backend with the aarch64 stack switch). Every change is listed in
+   `kernel/vendor/README.md`; upstreaming should be offered (the diff is small and behavior-preserving for
+   std builds), at which point the vendor copy is dropped. Who drives the upstream PR is the planner's call.
+17. **Execution model on metal for async guests.** The engine enables `wasm_component_model_async`,
+   `_async_stackful`, and `_more_async_builtins` (matching xtask's precompile config — these are
+   compile-relevant, so all embedded artifacts are precompiled with the same flags, and
+   `concurrency_support` is on for both). Instantiation and calls go through `instantiate_async`/`call_async`
+   driven by `wasm::block_on`, a single-threaded polling executor with a 30 s watchdog; the kernel's
+   `time.sleep` future re-arms its waker each poll, so the busy poll is the only scheduling needed until the
+   GIC/timer-interrupt work lands (then it becomes wait-for-interrupt). The root providers now register the
+   async interface members: `time.sleep` (a real await on the generic timer) and `text.read-line` (reports
+   end-of-input — no UART RX path yet). Fuel metering on metal is still not enabled; it arrives with the
+   scheduler/multi-task milestone.
+18. **Still open for kernel milestone 3's "supporting pieces" (not done on this branch):** the baked-in
+   read-only store image and headless program selection via the QEMU `-append` cmdline (needs a minimal
+   /chosen/bootargs FDT walk and capturing x0 in boot.rs), and adopting `eo9-sched` once more than one task
+   runs at a time. These are plain plumbing with no open design questions and are the natural next kernel
+   change before boot-to-eosh.

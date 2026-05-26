@@ -110,7 +110,7 @@ COMMANDS:
     test                 Run host workspace tests and kernel workspace tests (host triple)
     build-guest          Build guest crates for {GUEST_TARGET} and componentize them with
                          `wasm-tools component new` into guest/target/components/*.wasm
-    build-kernel <arch>  Precompile the seed component and the eo9-example-hello program for
+    build-kernel <arch>  Precompile the seed/async canaries, eo9-example-hello, and entropy.seeded for
                          bare metal and build the bootable kernel image (aarch64 only so far;
                          ELF for QEMU's -kernel loader)
     qemu <arch>          Build the kernel image and boot it under QEMU with serial on stdio
