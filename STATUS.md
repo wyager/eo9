@@ -3,12 +3,14 @@
 Maintained by the planner; refreshed when merges land. Companion docs: `PLAN.md` (how work is organized),
 `plan/*.md` (per-area briefs + decisions), `GAPS.md` (known gaps and deferred items), `SPEC.md` (the design).
 
-_Last updated: 2026-05-26, master at a72abfb. Headline: **Eo9 now boots to an interactive eosh shell on
-bare metal (aarch64/QEMU).** This wave also merged eo9:pci, shell tab-completion + capability-aware `env`,
-the interactive-prompt fix, configure for async-API providers, kernel milestones 3–4 (component-model-async
-on no_std; async guests; baked-in store; boot-to-eosh), the xtask test-ordering fix, the eo9.org `/try`
-in-browser demo, and the wasm32+Pulley embed feasibility spike. On-target codegen is the last MVP-gating
-rung. Pending owner decisions: /try v2 path and `eo9-embed` go/no-go (see Next up)._
+_Last updated: 2026-05-26, master at e31cc5f. Headline: **Eo9 compiles WebAssembly to native code on bare
+metal, on the machine itself, with Cranelift** — the riskiest assumption in the whole plan, retired. Eo9
+also boots to an interactive eosh shell on bare metal. This run merged eo9:pci, shell tab-completion +
+capability-aware `env`, the interactive-prompt fix, configure for async-API providers, kernel milestones 3–4
+(CM-async on no_std; async guests; baked-in store; boot-to-eosh), on-target Cranelift codegen, the
+`eo9-embed` embeddable-runtime library, the xtask test-ordering fix, the eo9.org `/try` in-browser demo, and
+the wasm32+Pulley embed spike. Remaining for the metal MVP: wire on-target compile into the interactive
+shell so `$`/`&` compose there (checkpoint 4, in flight). /try v2 is deferred; nothing pushed to origin._
 
 ## Works today (usermode, on master, CI-gated)
 
@@ -42,9 +44,15 @@ rung. Pending owner decisions: /try v2 path and `eo9-embed` go/no-go (see Next u
   kernel timer; the unmodified `entropy.seeded` stub runs through its async-lifted `configure`. CM-async runs
   on the no_std kernel via a minimal vendored wasmtime patch (15 files, ~329 lines, kernel-workspace-only).
   Headless modes: `cargo xtask qemu aarch64 demo` (the m1–m3 sequence) and `program=<name> [k=v …]` both
-  self-power-off; the no-argument boot is interactive and does not self-terminate. Not yet on metal:
-  composition (`$`/`&`) — `compile` is an AOT-artifact lookup today, so composition arrives with on-target
-  codegen — plus GIC (executor still polls) and child fuel.
+  self-power-off; the no-argument boot is interactive and does not self-terminate.
+- **On-target codegen on bare metal:** with the `wasm-codegen` feature, the kernel compiles a WebAssembly
+  component to native aarch64 *on the machine* with Cranelift (`Component::new`, not deserialize) — the boot
+  demo shows `wasm codegen: compiled on-target in ~90 ms → hello() → "…" / add(17,25) → 42`, code generated
+  inside the kernel and published through real I-cache/D-cache maintenance. Achieved by vendoring + de-std'ing
+  five wasmtime/cranelift compile crates under kernel/vendor (provenance-reviewed: no codegen/safety logic
+  changed); cranelift-codegen itself builds no_std as-is. Feature is off by default so CI stays lean; image
+  grows ~7.8→~17 MB with it on. Still to come: reaching it from the interactive shell so `$`/`&` compose
+  there (checkpoint 4, in flight), plus GIC (executor still polls), child fuel, and a determinism check.
 - The eo9.org website (`www/`): static site + logo + standalone Rust server with built-in ACME TLS, and the
   `/try` page — real example components (hello, outcomes, cruncher, readwrite incl. async/JSPI) transpiled
   at build time and run client-side in the visitor's browser, with a live grant/revoke capability demo.
@@ -69,15 +77,13 @@ rung. Pending owner decisions: /try v2 path and `eo9-embed` go/no-go (see Next u
 | Usermode binary `eo9` | `crates/eo9` | run/store/describe/compile/cache/shell/demo-seeding done |
 | Embeddable runtime (`Eo9` builder, Sandbox + Host backends behind a `ProviderSource` seam, safe capability defaults) | `crates/eo9-embed` | complete; foundation for `eo9 bundle` and the deferred wasm32 backend; sandbox-only builds with `--no-default-features` |
 | Website + server + /try in-browser demo | `www/` | complete, deployable; /try v2 (eosh in browser) pending |
-| Bare-metal kernel (aarch64: boot, heap, timer, MMU, kernel providers, sync + async guests, baked-in store, **boot-to-interactive-eosh**, vendored CM-async no_std patch) | `kernel/` | milestones 1–4 merged; on-target codegen (unlocks composition) is the next + last MVP rung; GIC/fuel/sched + riscv64/x86_64 deferred |
+| Bare-metal kernel (aarch64: boot, heap, timer, MMU, kernel providers, sync + async guests, baked-in store, boot-to-interactive-eosh, **on-target Cranelift codegen**, vendored CM-async + compile-layer no_std forks) | `kernel/` | milestones 1–4 + on-target codegen merged; remaining: wire compile/`$`/`&` into the interactive shell (checkpoint 4, in flight), then GIC/fuel/sched + riscv64/x86_64 |
 
 ## In progress right now (area branches, agents active)
 
-- **On-target codegen** (`area/12-codegen`): the last MVP-gating rung — forking cranelift + the
-  wasmtime-environ compile layers into a no_std+alloc state (owner ruling: fork now, don't wait for
-  upstream) so the kernel compiles components on the machine and the bare-metal shell gains `$`/`&`
-  composition. Checkpoints: crates build for the kernel target → trivial module compiled on-target →
-  real component on-target → wired into the shell.
+- **Compose on metal** (`area/12-compose-on-metal`): checkpoint 4 — wire the kernel shell's `compile` to the
+  on-target codegen path and enable `$`/`&`/`only`/`configure` in the interactive eosh, so a user at the
+  bare-metal prompt can compose and compile programs on the machine (eosh stays unmodified).
 
 ## Next up (rough order)
 

@@ -76,24 +76,23 @@ xtask-order / web-try wave)._
   recommended); a child's unterminated output line is not repainted while editing. (plan/10 D9, plan/11 D12)
 
 ### Bare metal
-- **On-target codegen still blocked by std requirements upstream:** wasmtime's `cranelift` feature and
-  wasmtime-environ's `compile` feature require `std`. CM-async is solved on metal (vendored patch); the
-  compile layers are the remaining rung — port them for no_std+alloc (required for MVP; Pulley stopgap
-  only). Good news from the 2026-05-26 upstream survey: cranelift no_std work is actively landing upstream
-  (cranelift-codegen/isle/frontend no_std PRs #12222/#12236/#12947/#13401/#13479, wasmtime-environ refactors
-  #12507/#12565, a no_std CI gate #12812) — the port should build on those rather than duplicate them.
-  (plan/12 D8, D14, D16)
+- **On-target codegen: DONE in the boot demo, not yet in the shell.** The kernel compiles components to
+  native aarch64 on-target with Cranelift (merged e31cc5f) by vendoring + de-std'ing five compile crates
+  under kernel/vendor (provenance-reviewed clean). Remaining: wire it into the interactive shell so `$`/`&`
+  compose there (currently the shell deserializes a baked artifact / returns a clean "not implemented"
+  error) — checkpoint 4, in flight on area/12-compose-on-metal. Determinism not yet measured bit-for-bit.
+  (plan/12 D26–29)
 - **Wasmtime version bumps are not free:** CM-async internals are churning upstream, so any future bump off
   45 requires re-verifying the binder's ABI-constants block (and the kernel executor's mirrored encodings)
   and re-AOT-ing all cached/baked artifacts.
-- **Kernel current limits (post boot-to-eosh):** the bare-metal shell can *run* baked-in store programs but
-  cannot *compose* them — `compile` is an AOT-artifact lookup, so `$`/`&` return a clean "arrives with
-  on-target codegen" error; composition on metal unlocks with the codegen rung. Also: executor and read-line
-  still busy-poll (no GIC); no child fuel yet (compile-relevant — lands with re-precompiled artifacts +
+- **Kernel current limits (post on-target-codegen):** on-target compilation works in the boot demo;
+  reaching it from the interactive shell so `$`/`&` compose there is checkpoint 4 (in flight). Also:
+  executor and read-line still busy-poll (no GIC); no child fuel yet (compile-relevant — lands with the
   scheduler work); eo9-sched not yet adopted; children lack io/buffers + fs/types wiring, so an fs-needing
   child gets the raw linker missing-import error instead of the friendly missing-fs story; no session
-  manifest for headless runs. Behavioral note: the no-argument boot is now interactive and does not
-  self-power-off — automation uses `demo` or `program=<name>`. (plan/12 D22–25)
+  manifest for headless runs; the image is ~17 MB with `wasm-codegen` on. Behavioral note: the no-argument
+  boot is interactive and does not self-power-off — automation uses `demo` or `program=<name>`.
+  (plan/12 D22–29)
 - **Kernel hardening debt:** identity-map MMU without D/I-cache maintenance on code publication or W^X for
   wasm code pages (QEMU tolerates it, real hardware will not); polled timer; exceptions are fatal.
   (plan/12 D3–4)
