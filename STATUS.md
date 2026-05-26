@@ -3,7 +3,8 @@
 Maintained by the planner; refreshed when merges land. Companion docs: `PLAN.md` (how work is organized),
 `plan/*.md` (per-area briefs + decisions), `GAPS.md` (known gaps and deferred items), `SPEC.md` (the design).
 
-_Last updated: 2026-05-25, master at the configure-binder-fix merge (a9e3669)._
+_Last updated: 2026-05-26, master at the kernel-spike merge (27bb1af); one finished branch
+(`area/12-async-on-metal`, the real hello example on bare metal) is awaiting review/merge._
 
 ## Works today (usermode, on master, CI-gated)
 
@@ -19,6 +20,12 @@ _Last updated: 2026-05-25, master at the configure-binder-fix merge (a9e3669)._
   (and the `&` form) runs byte-identically and is sealed against ambient providers (integration suite).
 - Invoker-side provider configuration: `configure(entropy.seeded, seed=…)` via the algebra works end to end
   (program observes the seed, no program-side setup).
+- The out-of-box demo flow: bare `eo9` boots to the shell and, on an empty store, seeds ~22 components
+  embedded in the binary (hello, the stubs, eosh itself); `eo9 <name-or-path> [--flags]` is an implicit run.
+- **Bare metal (aarch64/QEMU):** `cargo xtask build-kernel aarch64 && cargo xtask qemu aarch64` boots Eo9 on
+  the `virt` machine — serial banner, heap, timer, and a host-AOT'd wasm component executing on the metal.
+  (The follow-up branch running the real `hello` example against kernel-side text/time/entropy providers is
+  finished and awaiting merge.)
 - The eo9.org website (`www/`): static site + logo + standalone Rust server with built-in ACME TLS.
 - `cargo xtask ci` — one gate over the host, guest, and kernel workspaces.
 
@@ -38,6 +45,7 @@ _Last updated: 2026-05-25, master at the configure-binder-fix merge (a9e3669)._
 | Integration suites (capability laws, determinism, kill/linearity, CLI transcripts) | `tests/eo9-integration` | 30 tests; QEMU tier not started |
 | Usermode binary `eo9` | `crates/eo9` | run/store/describe/compile/cache done; `shell` in progress |
 | Website + server | `www/` | complete, deployable |
+| Bare-metal kernel (aarch64 spike: boot, heap, timer, MMU, wasm-on-metal, xtask build/qemu) | `kernel/` | spike merged; real-example branch pending merge; riscv64/x86_64 not started |
 
 Also working now: **`eo9 shell`** — an interactive eosh REPL (and `-c` one-shot mode) with the exec
 capability granted to the shell only, store-backed bare-name resolution via a session bin view, provider
@@ -47,19 +55,24 @@ practice `entropy.seeded`/`perf.null`; see GAPS.md.)
 
 ## In progress right now
 
-- **Bare-metal kernel spike** (area 12): aarch64 boot + serial + heap on QEMU, wasm-on-target feasibility.
-- **Demo polish** (area 11): bare `eo9` → shell, `eo9 <file>` → implicit run, embedded-component store
-  seeding (the `cargo install eo9; eo9` experience).
+- **Kernel milestone 2** (`area/12-async-on-metal`): finished on its branch — the unmodified `hello` example
+  runs on bare metal against kernel text/time/entropy providers — review/merge pending (delayed only by
+  agent-infrastructure stalls, not by the work).
 
 ## Next up (rough order)
 
-1. Demo milestone: store seeding from components embedded in the `eo9` binary, CLI defaults (bare `eo9` →
-   shell, path → implicit run), a few demo tools. Then `cargo install eo9; eo9` works.
-2. Bundle milestone: `eo9-embed` library + `eo9 bundle` (native executables for other OSes).
-3. Exec follow-ups: guest-facing `resume`/fuel donation (E5), configure for resource-owning providers.
-4. Net: unix net provider linking, `net.loopback`, Message API (unblocks `text.capture`, pipes).
-5. eofs milestone 2+: the `eo9:fs` provider component, `eofs.mkfs`, store-on-eofs, content-hash queries.
-6. Bare metal (area 12): not started — kernel spike, QEMU images, boot-to-shell; plus the QEMU test tier.
+1. Bare metal, owner-approved ladder: CM-async no_std support (upstream-friendly) → boot-to-shell on metal
+   with host-AOT → the wasmtime-environ/cranelift no_std port for **on-target codegen (required for MVP;
+   Pulley only as a stopgap)**; then riscv64/x86_64 ports and the QEMU test tier.
+2. Shell UX: tab-completion over session names/builtins; richer `env` (show granted capabilities, what
+   children receive, a program's absent/optional imports).
+3. Configure-binder extension so async/resource-owning providers (time.frozen, fs.memfs, …) can be
+   invoker-configured — unlocks the fully invoker-configured deterministic environment.
+4. Demo packaging: ship prebuilt components with the published crate so `cargo install eo9; eo9` works
+   without a checkout; xtask build-guest-before-test ordering fix.
+5. Bundle milestone: `eo9-embed` library + `eo9 bundle` (native executables for other OSes).
+6. Exec follow-ups: guest-facing `resume`/fuel donation (E5); net provider linking, `net.loopback`,
+   Message API; eofs milestone 2+ (provider, mkfs, store-on-eofs, content hashes).
 7. Housekeeping: push to origin, crates.io name, Message/perf/threads API design.
 
 See `GAPS.md` for known limitations and deferred decisions.

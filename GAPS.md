@@ -3,7 +3,7 @@
 Tracked by the planner so nothing gets lost. Each item notes where it is recorded and what unblocks it.
 Items are removed when closed; design questions move to SPEC.md when resolved.
 
-_Last updated: 2026-05-25 (master at a9e3669)._
+_Last updated: 2026-05-26 (master at 27bb1af)._
 
 ## Design decisions deliberately parked
 
@@ -40,6 +40,14 @@ _Last updated: 2026-05-25 (master at a9e3669)._
 - **Configure binder leans on the CM async ABI's packed subtask-status encoding** — must track wasmtime revs.
   (plan/03 D12)
 - **Indirect-params ABI case** (>16 flattened configure params) rejected gracefully, not supported.
+
+- **Bare metal: wasmtime's `component-model-async` and compile features require `std` upstream.** Consequence:
+  async eo9 guests (eosh, readwrite, configured stubs) and on-target codegen don't run on metal yet; the
+  sync-ABI `hello` does. Owner-approved sequence: port/upstream CM-async for no_std → boot-to-shell with
+  host-AOT → port the compile layers for on-target codegen (required for MVP; Pulley stopgap only).
+  (plan/12 Decisions 8–9, 11, 14)
+- **Kernel spike hardening debt:** identity-map MMU only (cache maintenance needed for real hardware), polled
+  timer (no GIC), exceptions are fatal. (plan/12 Decisions 3–4)
 
 ## Minor nits / housekeeping
 
