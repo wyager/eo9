@@ -1,5 +1,8 @@
 //! Heaps to implement WebAssembly linear memories.
 
+#[allow(unused_imports)]
+use crate::*;
+
 use cranelift_codegen::ir::{self, GlobalValue, Type};
 use cranelift_entity::entity_impl;
 use wasmtime_environ::{IndexType, Memory};

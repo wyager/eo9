@@ -1,4 +1,7 @@
 //! Helper functions and structures for the translation.
+#[allow(unused_imports)]
+use crate::*;
+
 use crate::translate::environ::TargetEnvironment;
 use core::u32;
 use cranelift_codegen::ir;
@@ -19,11 +22,11 @@ where
 {
     return Ok(match ty {
         wasmparser::BlockType::Empty => (
-            itertools::Either::Left(std::iter::empty()),
+            itertools::Either::Left(core::iter::empty()),
             itertools::Either::Left(None.into_iter()),
         ),
         wasmparser::BlockType::Type(ty) => (
-            itertools::Either::Left(std::iter::empty()),
+            itertools::Either::Left(core::iter::empty()),
             itertools::Either::Left(Some(ty).into_iter()),
         ),
         wasmparser::BlockType::FuncType(ty_index) => {

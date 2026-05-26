@@ -1,5 +1,8 @@
 //! `GcCompiler` implementation when GC support is disabled.
 
+#[allow(unused_imports)]
+use crate::*;
+
 use super::GcCompiler;
 use crate::func_environ::{Extension, FuncEnvironment};
 use cranelift_codegen::ir;

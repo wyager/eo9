@@ -4,6 +4,9 @@
 //! maps inside this module, because the null collector doesn't ever collect
 //! anything.
 
+#[allow(unused_imports)]
+use crate::*;
+
 use super::*;
 use crate::func_environ::FuncEnvironment;
 use crate::trap::TranslateTrap;

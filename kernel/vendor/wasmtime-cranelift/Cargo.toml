@@ -67,6 +67,13 @@ path = "src/lib.rs"
 [dependencies.cfg-if]
 version = "1.0"
 
+# no_std (plan/12 D29): the no_std `HashMap`/`HashSet` used across the compile glue
+# (upstream uses `std::collections` here). Matches wasmtime-environ's pin/features.
+[dependencies.hashbrown]
+version = "0.17"
+features = ["default-hasher"]
+default-features = false
+
 # no_std (plan/12 D26-28): drop `std` and `timing` (std::time::Instant), keep the codegen
 # core + unwind + the aarch64 (host) backend. `pulley` is added by this crate's own `pulley`
 # feature when enabled.

@@ -17,7 +17,6 @@ use cranelift_entity::packed_option::ReservedValue;
 use alloc::borrow::Cow;
 use hashbrown::HashMap;
 use core::mem;
-use std::path::PathBuf;
 use alloc::sync::Arc;
 use wasmparser::{
     CustomSectionReader, DataKind, ElementItems, ElementKind, Encoding, ExternalKind,
@@ -191,7 +190,7 @@ pub struct NameSection<'a> {
 #[derive(Debug, Default)]
 #[expect(missing_docs, reason = "self-describing fields")]
 pub struct WasmFileInfo {
-    pub path: Option<PathBuf>,
+    pub path: Option<String>,
     pub code_section_offset: u64,
     pub imported_func_count: u32,
     pub funcs: Vec<FunctionMetadata>,

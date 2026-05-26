@@ -4,8 +4,6 @@ use bitflags::Flags;
 use core::fmt;
 use core::num::{NonZeroU32, NonZeroUsize};
 use core::str::FromStr;
-#[cfg(any(feature = "cranelift", feature = "winch"))]
-use std::path::Path;
 pub use wasmparser::WasmFeatures;
 use wasmtime_environ::{ConfigTunables, OperatorCost, OperatorCostStrategy, TripleExt, Tunables};
 
@@ -211,7 +209,9 @@ struct CompilerConfig {
     flags: crate::hash_set::HashSet<String>,
     #[cfg(all(feature = "incremental-cache", feature = "cranelift"))]
     cache_store: Option<Arc<dyn CacheStore>>,
-    clif_dir: Option<std::path::PathBuf>,
+    // A directory path as a `String` rather than `std::path::PathBuf` so this
+    // builds under `no_std`; `emit_clif` (std-gated) is what populates it.
+    clif_dir: Option<String>,
     wmemcheck: bool,
 }
 
@@ -2817,7 +2817,7 @@ impl Config {
         };
 
         if let Some(path) = &self.compiler_config_mut().clif_dir {
-            compiler.clif_dir(path)?;
+            compiler.clif_dir(path.as_str())?;
         }
 
         // If probestack is enabled for a target, Wasmtime will always use the
@@ -2945,9 +2945,12 @@ impl Config {
     }
 
     /// Enables clif output when compiling a WebAssembly module.
-    #[cfg(any(feature = "cranelift", feature = "winch"))]
-    pub fn emit_clif(&mut self, path: &Path) -> &mut Self {
-        self.compiler_config_mut().clif_dir = Some(path.to_path_buf());
+    ///
+    /// Takes a filesystem path, so this is only available under `std`; the
+    /// directory is stored as a `String` internally (see `CompilerConfig`).
+    #[cfg(all(feature = "std", any(feature = "cranelift", feature = "winch")))]
+    pub fn emit_clif(&mut self, path: &std::path::Path) -> &mut Self {
+        self.compiler_config_mut().clif_dir = path.to_str().map(|s| s.to_string());
         self
     }
 

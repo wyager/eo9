@@ -118,7 +118,7 @@
 use crate::component::translate::*;
 use crate::fact;
 use crate::{EntityType, Memory};
-use std::collections::HashSet;
+use hashbrown::HashSet;
 
 /// Metadata information about a fused adapter.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]

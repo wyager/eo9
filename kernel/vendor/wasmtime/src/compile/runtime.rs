@@ -4,7 +4,7 @@ use crate::prelude::*;
 use crate::runtime::vm::MmapVec;
 use crate::{CodeBuilder, CodeMemory, Engine, Module};
 use object::write::WritableBuffer;
-use std::sync::Arc;
+use alloc::sync::Arc;
 use wasmtime_environ::{FinishedObject, ObjectBuilder};
 
 impl<'a> CodeBuilder<'a> {
@@ -84,8 +84,8 @@ impl<'a> CodeBuilder<'a> {
 
             struct NotHashed<T>(T);
 
-            impl<T> std::hash::Hash for NotHashed<T> {
-                fn hash<H: std::hash::Hasher>(&self, _hasher: &mut H) {}
+            impl<T> core::hash::Hash for NotHashed<T> {
+                fn hash<H: core::hash::Hasher>(&self, _hasher: &mut H) {}
             }
         }
 

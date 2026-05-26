@@ -242,7 +242,7 @@ impl fmt::Display for UseVariableError {
     }
 }
 
-impl std::error::Error for UseVariableError {}
+impl core::error::Error for UseVariableError {}
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 /// An error encountered when defining the initial value of a variable.
@@ -1107,8 +1107,8 @@ impl<'a> FunctionBuilder<'a> {
         left: Value,
         right: Value,
         size: u64,
-        left_align: std::num::NonZeroU8,
-        right_align: std::num::NonZeroU8,
+        left_align: core::num::NonZeroU8,
+        right_align: core::num::NonZeroU8,
         flags: MemFlags,
     ) -> Value {
         use IntCC::*;
@@ -1645,7 +1645,7 @@ block0:
 
     #[test]
     fn small_memcmp_zero_size() {
-        let align_eight = std::num::NonZeroU8::new(8).unwrap();
+        let align_eight = core::num::NonZeroU8::new(8).unwrap();
         small_memcmp_helper(
             "
 block0:
@@ -1672,7 +1672,7 @@ block0:
 
     #[test]
     fn small_memcmp_byte_ugt() {
-        let align_one = std::num::NonZeroU8::new(1).unwrap();
+        let align_one = core::num::NonZeroU8::new(1).unwrap();
         small_memcmp_helper(
             "
 block0:
@@ -1701,7 +1701,7 @@ block0:
 
     #[test]
     fn small_memcmp_aligned_eq() {
-        let align_four = std::num::NonZeroU8::new(4).unwrap();
+        let align_four = core::num::NonZeroU8::new(4).unwrap();
         small_memcmp_helper(
             "
 block0:
@@ -1730,7 +1730,7 @@ block0:
 
     #[test]
     fn small_memcmp_ipv6_ne() {
-        let align_two = std::num::NonZeroU8::new(2).unwrap();
+        let align_two = core::num::NonZeroU8::new(2).unwrap();
         small_memcmp_helper(
             "
 block0:
@@ -1759,7 +1759,7 @@ block0:
 
     #[test]
     fn small_memcmp_odd_size_uge() {
-        let one = std::num::NonZeroU8::new(1).unwrap();
+        let one = core::num::NonZeroU8::new(1).unwrap();
         small_memcmp_helper(
             "
     sig0 = (i64, i64, i64) -> i32 system_v

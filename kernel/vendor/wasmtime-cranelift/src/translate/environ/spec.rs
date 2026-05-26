@@ -6,6 +6,9 @@
 //!
 //! [Wasmtime]: https://github.com/bytecodealliance/wasmtime
 
+#[allow(unused_imports)]
+use crate::*;
+
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::immediates::Offset32;
 use cranelift_codegen::isa::TargetFrontendConfig;

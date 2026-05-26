@@ -51,7 +51,7 @@
 //! layer once its unprocessed-dependencies count reaches zero.
 
 use super::*;
-use std::{fmt::Debug, ops::Range};
+use core::{fmt::Debug, ops::Range};
 use wasmtime_environ::{
     EntityRef, SecondaryMap,
     graphs::{Graph, Scc, StronglyConnectedComponents},
@@ -153,7 +153,7 @@ impl<Node> Strata<Node> {
                     .flat_map(|scc| components.nodes(scc).iter().copied()),
             ));
 
-            std::mem::swap(&mut next_layer, &mut current_layer);
+            core::mem::swap(&mut next_layer, &mut current_layer);
         }
 
         debug_assert!(

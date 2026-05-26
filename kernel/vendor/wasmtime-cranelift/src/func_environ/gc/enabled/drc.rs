@@ -1,6 +1,9 @@
 //! Compiler for the deferred reference-counting (DRC) collector and its
 //! barriers.
 
+#[allow(unused_imports)]
+use crate::*;
+
 use super::*;
 use crate::translate::TargetEnvironment;
 use crate::trap::TranslateTrap;

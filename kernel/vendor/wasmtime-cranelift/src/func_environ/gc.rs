@@ -5,6 +5,9 @@
 //! to have just a single `cfg(feature = "gc")` for the whole crate, which
 //! selects between these two implementations.
 
+#[allow(unused_imports)]
+use crate::*;
+
 use crate::func_environ::FuncEnvironment;
 use cranelift_codegen::ir;
 use cranelift_frontend::FunctionBuilder;

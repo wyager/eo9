@@ -32,11 +32,14 @@ use crate::error::Result;
 use crate::prelude::*;
 use crate::{EntityIndex, EntityRef, ModuleInternedTypeIndex, PrimaryMap, WasmValType};
 use cranelift_entity::packed_option::PackedOption;
-use indexmap::IndexMap;
+// `indexmap`'s default `RandomState` hasher is std-only; under `no_std`
+// (default-features off) the hasher must be named explicitly, so use hashbrown's.
+use indexmap::IndexMap as IndexMapImpl;
+type IndexMap<K, V> = IndexMapImpl<K, V, hashbrown::DefaultHashBuilder>;
 use info::LinearMemoryOptions;
-use std::collections::HashMap;
-use std::hash::Hash;
-use std::ops::Index;
+use hashbrown::HashMap;
+use core::hash::Hash;
+use core::ops::Index;
 use wasmparser::component_types::ComponentCoreModuleTypeId;
 
 /// High-level representation of a component as a "data-flow graph".

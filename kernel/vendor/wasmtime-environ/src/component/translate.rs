@@ -10,9 +10,12 @@ use crate::{
 use core::str::FromStr;
 use cranelift_entity::SecondaryMap;
 use cranelift_entity::packed_option::PackedOption;
-use indexmap::IndexMap;
-use std::collections::HashMap;
-use std::mem;
+// `indexmap`'s default `RandomState` hasher is std-only; under `no_std`
+// (default-features off) the hasher must be named explicitly, so use hashbrown's.
+use indexmap::IndexMap as IndexMapImpl;
+type IndexMap<K, V> = IndexMapImpl<K, V, hashbrown::DefaultHashBuilder>;
+use hashbrown::HashMap;
+use core::mem;
 use wasmparser::component_types::{
     AliasableResourceId, ComponentCoreModuleTypeId, ComponentDefinedTypeId, ComponentEntityType,
     ComponentFuncTypeId, ComponentInstanceTypeId, ComponentValType,

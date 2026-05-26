@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use crate::*;
+
 use super::address_transform::AddressTransform;
 use super::attr::{EntryAttributesContext, clone_die_attributes};
 use super::debug_transform_logging::{
@@ -14,7 +17,7 @@ use cranelift_codegen::ir::Endianness;
 use cranelift_codegen::isa::TargetIsa;
 use gimli::AttributeValue;
 use gimli::write;
-use std::collections::HashSet;
+use hashbrown::HashSet;
 use wasmtime_environ::StaticModuleIndex;
 use wasmtime_environ::error::{Context, Error};
 use wasmtime_versioned_export_macros::versioned_stringify_ident;

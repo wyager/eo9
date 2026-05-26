@@ -72,7 +72,7 @@ use crate::component::{
     TypeResourceTable, TypeResourceTableIndex,
 };
 use crate::prelude::*;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use wasmparser::component_types::{ComponentAnyTypeId, ComponentEntityType, ResourceId};
 use wasmparser::types::TypesRef;
 

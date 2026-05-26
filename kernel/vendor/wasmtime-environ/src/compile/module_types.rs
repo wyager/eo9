@@ -154,7 +154,7 @@ impl ModuleTypesBuilder {
         let sub_ty = &self.types[for_func_ty];
         let trampoline = sub_ty.unwrap_func().trampoline_type().panic_on_oom();
 
-        if let Some(idx) = self.trampoline_types.get(&trampoline) {
+        if let Some(idx) = self.trampoline_types.get(trampoline.as_ref()) {
             // We've already interned this trampoline type; reuse it.
             *idx
         } else {

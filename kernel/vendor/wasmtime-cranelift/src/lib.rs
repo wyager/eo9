@@ -18,6 +18,7 @@
 // optional `cranelift-native` host-inference path.
 #![no_std]
 
+#[macro_use]
 extern crate alloc;
 #[cfg(any(feature = "cranelift-native", test))]
 extern crate std;
@@ -43,6 +44,8 @@ use wasmtime_environ::{
 };
 
 pub use builder::builder;
+
+mod sync;
 
 pub mod isa_builder;
 mod obj;

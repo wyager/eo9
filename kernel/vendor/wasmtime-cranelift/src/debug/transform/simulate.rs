@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use crate::*;
+
 use super::AddressTransform;
 use super::expression::{CompiledExpression, FunctionFrameInfo};
 use super::utils::append_vmctx_info;
@@ -6,9 +9,8 @@ use crate::translate::get_vmctx_value_label;
 use cranelift_codegen::isa::TargetIsa;
 use gimli::LineEncoding;
 use gimli::write;
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use hashbrown::{HashMap, HashSet};
+use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use wasmtime_environ::error::{Context, Error};
 use wasmtime_environ::{
     DebugInfoData, EntityRef, FunctionMetadata, PrimaryMap, StaticModuleIndex, WasmFileInfo,
@@ -106,7 +108,7 @@ fn check_invalid_chars_in_name(s: &str) -> Option<&str> {
     if s.contains('\x00') { None } else { Some(s) }
 }
 
-fn autogenerate_dwarf_wasm_path(di: &DebugInfoData) -> PathBuf {
+fn autogenerate_dwarf_wasm_path(di: &DebugInfoData) -> String {
     static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
     let module_name = di
         .name_section
@@ -114,8 +116,7 @@ fn autogenerate_dwarf_wasm_path(di: &DebugInfoData) -> PathBuf {
         .and_then(check_invalid_chars_in_name)
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("<gen-{}>.wasm", NEXT_ID.fetch_add(1, SeqCst)));
-    let path = format!("/<wasm-module>/{module_name}");
-    PathBuf::from(path)
+    format!("/<wasm-module>/{module_name}")
 }
 
 struct WasmTypesDieRefs {
@@ -278,10 +279,8 @@ fn generate_vars(
     Ok(())
 }
 
-fn check_invalid_chars_in_path(path: PathBuf) -> Option<PathBuf> {
-    path.clone()
-        .to_str()
-        .and_then(move |s| if s.contains('\x00') { None } else { Some(path) })
+fn check_invalid_chars_in_path(path: String) -> Option<String> {
+    if path.contains('\x00') { None } else { Some(path) }
 }
 
 /// Generate "simulated" native DWARF for functions lacking WASM-level DWARF.
@@ -307,17 +306,14 @@ pub fn generate_simulated_dwarf(
     };
 
     let (unit, root_id, file_id) = {
-        let comp_dir_id = out_strings.add(assert_dwarf_str!(
-            path.parent()
-                .context("path dir")?
-                .to_str()
-                .context("path dir encoding")?
-        ));
-        let name = path
-            .file_name()
-            .context("path name")?
-            .to_str()
-            .context("path name encoding")?;
+        // `path` is a plain string (no `std::path`); split it on the last `/` to
+        // recover the directory and file-name components for DWARF.
+        let (dir, name) = match path.rsplit_once('/') {
+            Some(("", name)) => ("/", name),
+            Some((dir, name)) => (dir, name),
+            None => (".", path.as_str()),
+        };
+        let comp_dir_id = out_strings.add(assert_dwarf_str!(dir));
         let name_id = out_strings.add(assert_dwarf_str!(name));
 
         let (out_program, file_id) = generate_line_info(

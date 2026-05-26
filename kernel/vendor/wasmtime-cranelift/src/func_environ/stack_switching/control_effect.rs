@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use crate::*;
+
 use cranelift_codegen::ir;
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_codegen::ir::types::{I32, I64};

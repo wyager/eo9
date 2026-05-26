@@ -5,6 +5,9 @@
 //! no concurrent mutation during collection) but we do need stack maps so the
 //! collector can find and update roots when it relocates objects.
 
+#[allow(unused_imports)]
+use crate::*;
+
 use super::*;
 use crate::TRAP_INTERNAL_ASSERT;
 use crate::func_environ::FuncEnvironment;

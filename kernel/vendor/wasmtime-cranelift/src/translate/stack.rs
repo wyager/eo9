@@ -4,9 +4,12 @@
 //! track of the WebAssembly value and control stacks during the translation of
 //! a single function.
 
+#[allow(unused_imports)]
+use crate::*;
+
 use cranelift_codegen::ir::{self, Block, ExceptionTag, Inst, Value};
 use cranelift_frontend::FunctionBuilder;
-use std::vec::Vec;
+use alloc::vec::Vec;
 use wasmtime_environ::FrameStackShape;
 
 /// Information about the presence of an associated `else` for an `if`, or the

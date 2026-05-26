@@ -1,7 +1,10 @@
+#[allow(unused_imports)]
+use crate::*;
+
 use crate::FunctionAddressMap;
 use crate::debug::Compilation;
 use gimli::write;
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
 use wasmtime_environ::{DefinedFuncIndex, FilePos, PrimaryMap, StaticModuleIndex};
 
 pub type GeneratedAddress = usize;
@@ -178,7 +181,7 @@ fn build_function_lookup(
             sorted_ranges.sort();
             index.insert(position, sorted_ranges.into_boxed_slice());
         }
-        active_ranges.retain(|r| ranges[*r].wasm_end.cmp(&wasm_start) != std::cmp::Ordering::Less);
+        active_ranges.retain(|r| ranges[*r].wasm_end.cmp(&wasm_start) != core::cmp::Ordering::Less);
         active_ranges.push(range_index);
         last_wasm_pos = Some(wasm_start);
     }
@@ -669,7 +672,7 @@ mod tests {
     use crate::{CompiledFunctionMetadata, FunctionAddressMap};
     use cranelift_entity::PrimaryMap;
     use gimli::write::Address;
-    use std::mem;
+    use core::mem;
     use wasmtime_environ::{FilePos, InstructionAddressMap, WasmFileInfo};
 
     #[test]

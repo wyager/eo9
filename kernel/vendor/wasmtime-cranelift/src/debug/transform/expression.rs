@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use crate::*;
+
 use super::address_transform::AddressTransform;
 use super::dbi_log;
 use crate::debug::ModuleMemoryOffset;
@@ -12,10 +15,10 @@ use cranelift_codegen::ir::ValueLabel;
 use cranelift_codegen::isa::TargetIsa;
 use gimli::{Expression, Operation, Reader, ReaderOffset, write};
 use itertools::Itertools;
-use std::cmp::PartialEq;
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
-use std::rc::Rc;
+use core::cmp::PartialEq;
+use hashbrown::{HashMap, HashSet};
+use core::hash::{Hash, Hasher};
+use alloc::rc::Rc;
 use wasmtime_environ::error::{Context, Error, Result};
 
 #[derive(Debug)]
@@ -387,8 +390,11 @@ impl CompiledExpression {
                                     jump_positions.push((target.clone(), code_buf.len()));
                                 }
                                 CompiledExpressionPart::Local { label, trailing } => {
+                                    // `label` is already `&ValueLabel`; pass it directly so
+                                    // hashbrown's `Equivalent`-based `get` resolves (std's
+                                    // `get` accepted `&&ValueLabel` via deref coercion).
                                     let loc =
-                                        *label_location.get(&label).context("label_location")?;
+                                        *label_location.get(label).context("label_location")?;
                                     if let Some(expr) = translate_loc(loc, isa, *trailing)? {
                                         code_buf.extend_from_slice(&expr)
                                     } else {
@@ -879,8 +885,8 @@ impl Hash for JumpTargetMarker {
         hasher.write_u32(*self.0);
     }
 }
-impl std::fmt::Debug for JumpTargetMarker {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
+impl core::fmt::Debug for JumpTargetMarker {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::result::Result<(), core::fmt::Error> {
         write!(
             f,
             "JumpMarker<{:08x}>",
@@ -1276,7 +1282,7 @@ mod tests {
     fn create_mock_value_ranges() -> (ValueLabelsRanges, (ValueLabel, ValueLabel, ValueLabel)) {
         use cranelift_codegen::{LabelValueLoc, ValueLocRange};
         use cranelift_entity::EntityRef;
-        use std::collections::HashMap;
+        use hashbrown::HashMap;
         let mut value_ranges = HashMap::new();
         let value_0 = ValueLabel::new(0);
         let value_1 = ValueLabel::new(1);

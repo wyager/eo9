@@ -4,6 +4,9 @@
 //! function to Cranelift IR guided by a `FuncEnvironment` which provides information about the
 //! WebAssembly module and the runtime environment.
 
+#[allow(unused_imports)]
+use crate::*;
+
 use crate::func_environ::FuncEnvironment;
 use crate::translate::TargetEnvironment;
 use crate::translate::code_translator::{bitcast_wasm_returns, translate_operator};

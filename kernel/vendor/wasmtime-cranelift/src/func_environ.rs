@@ -1,6 +1,9 @@
 mod gc;
 pub(crate) mod stack_switching;
 
+#[allow(unused_imports)]
+use crate::*;
+
 use crate::BuiltinFunctionSignatures;
 use crate::compiler::Compiler;
 use crate::translate::{
@@ -22,7 +25,7 @@ use cranelift_entity::{EntityRef, PrimaryMap, SecondaryMap};
 use cranelift_frontend::Variable;
 use cranelift_frontend::{FuncInstBuilder, FunctionBuilder};
 use smallvec::{SmallVec, smallvec};
-use std::mem;
+use core::mem;
 use wasmparser::{FuncValidator, Operator, WasmFeatures, WasmModuleResources};
 use wasmtime_core::math::f64_cvt_to_int_bounds;
 use wasmtime_environ::{
@@ -145,7 +148,7 @@ pub struct FuncEnvironment<'module_environment> {
     pub(crate) stacks: FuncTranslationStacks,
 
     #[cfg(feature = "gc")]
-    ty_to_gc_layout: std::collections::HashMap<
+    ty_to_gc_layout: hashbrown::HashMap<
         wasmtime_environ::ModuleInternedTypeIndex,
         wasmtime_environ::GcLayout,
     >,
@@ -259,7 +262,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             stacks: FuncTranslationStacks::new(),
 
             #[cfg(feature = "gc")]
-            ty_to_gc_layout: std::collections::HashMap::new(),
+            ty_to_gc_layout: hashbrown::HashMap::new(),
             #[cfg(feature = "gc")]
             gc_heap: None,
             #[cfg(feature = "gc")]

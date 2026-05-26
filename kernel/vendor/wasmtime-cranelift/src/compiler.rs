@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use crate::*;
+
 use crate::TRAP_INTERNAL_ASSERT;
 use crate::debug::DwarfSectionRelocTarget;
 use crate::func_environ::FuncEnvironment;
@@ -22,14 +25,14 @@ use cranelift_entity::PrimaryMap;
 use cranelift_frontend::FunctionBuilder;
 use object::write::{Object, StandardSegment, SymbolId};
 use object::{RelocationEncoding, RelocationFlags, RelocationKind, SectionKind};
-use std::any::Any;
-use std::borrow::Cow;
-use std::cmp;
-use std::collections::HashMap;
-use std::mem;
-use std::ops::Range;
-use std::path;
-use std::sync::{Arc, Mutex};
+use core::any::Any;
+use alloc::borrow::Cow;
+use core::cmp;
+use hashbrown::HashMap;
+use core::mem;
+use core::ops::Range;
+use alloc::sync::Arc;
+use crate::sync::Mutex;
 use wasmparser::{FuncValidatorAllocations, FunctionBody};
 use wasmtime_environ::error::{Context as _, Result};
 use wasmtime_environ::obj::{ELF_WASMTIME_EXCEPTIONS, ELF_WASMTIME_FRAMES};
@@ -84,7 +87,9 @@ pub struct Compiler {
     emit_debug_checks: bool,
     linkopts: LinkOptions,
     cache_store: Option<Arc<dyn CacheStore>>,
-    clif_dir: Option<path::PathBuf>,
+    // A directory path as a `String` rather than `std::path::PathBuf` so this
+    // builds under `no_std`; the actual filesystem write is `std`-gated below.
+    clif_dir: Option<String>,
     #[cfg(feature = "wmemcheck")]
     pub(crate) wmemcheck: bool,
 }
@@ -124,7 +129,7 @@ impl Compiler {
         cache_store: Option<Arc<dyn CacheStore>>,
         emit_debug_checks: bool,
         linkopts: LinkOptions,
-        clif_dir: Option<path::PathBuf>,
+        clif_dir: Option<String>,
         wmemcheck: bool,
     ) -> Compiler {
         let _ = wmemcheck;
@@ -214,7 +219,7 @@ fn box_dyn_any_compiler_context(ctx: Option<CompilerContext>) -> Box<dyn Any + S
 fn box_dyn_any(x: impl Any + Send + Sync) -> Box<dyn Any + Send + Sync> {
     log::trace!(
         "making Box<dyn Any + Send + Sync> of {}",
-        std::any::type_name_of_val(&x)
+        core::any::type_name_of_val(&x)
     );
     let b = Box::new(x);
     let r: &(dyn Any + Sync + Send) = &*b;
@@ -340,9 +345,10 @@ impl wasmtime_environ::Compiler for Compiler {
             compiler.cx.debug_slot_descriptor = Some(slot_builder);
         }
 
-        let timing = cranelift_codegen::timing::take_current();
-        log::debug!("`{symbol}` translated to CLIF in {:?}", timing.total());
-        log::trace!("`{symbol}` timing info\n{timing}");
+        // Cranelift's pass-timing profiler (`timing::take_current`) requires the
+        // `timing` feature, which needs `std::time::Instant`; it is unavailable on
+        // the no_std kernel build, so detailed timing is not logged here.
+        log::debug!("`{symbol}` translated to CLIF");
 
         Ok(CompiledFunctionBody {
             code: box_dyn_any_compiler_context(Some(compiler.cx)),
@@ -977,9 +983,8 @@ impl InliningCompiler for Compiler {
             compiler.finish(&symbol)?
         };
 
-        let timing = cranelift_codegen::timing::take_current();
-        log::debug!("`{symbol}` compiled in {:?}", timing.total());
-        log::trace!("`{symbol}` timing info\n{timing}");
+        // See the note above: pass-timing is std-only and disabled on the kernel.
+        log::debug!("`{symbol}` compiled");
 
         func_body.code = box_dyn_any_compiled_function(compiled_func);
         Ok(())
@@ -993,7 +998,7 @@ mod incremental_cache {
     struct CraneliftCacheStore(Arc<dyn CacheStore>);
 
     impl cranelift_codegen::incremental_cache::CacheKvStore for CraneliftCacheStore {
-        fn get(&self, key: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+        fn get(&self, key: &[u8]) -> Option<alloc::borrow::Cow<'_, [u8]>> {
             self.0.get(key)
         }
         fn insert(&mut self, key: &[u8], val: Vec<u8>) {
@@ -1485,10 +1490,14 @@ impl FunctionCompiler<'_> {
         let compilation_result =
             compile_maybe_cached(context, isa, self.cx.incremental_cache_ctx.as_mut());
 
-        if let Some(path) = &self.compiler.clif_dir {
+        // CLIF dumping is a debug aid that writes to the filesystem, which only
+        // exists under `std`; on the bare-metal kernel build the directory is
+        // never set and this whole block is compiled out.
+        #[cfg(feature = "std")]
+        if let Some(dir) = &self.compiler.clif_dir {
             use std::io::Write;
 
-            let mut path = path.join(symbol.replace(":", "-"));
+            let mut path = std::path::Path::new(dir).join(symbol.replace(":", "-"));
             path.set_extension("clif");
 
             let mut output = std::fs::File::create(path).unwrap();

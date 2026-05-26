@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use crate::*;
+
 use crate::func_environ::FuncEnvironment;
 use crate::trap::TranslateTrap;
 use cranelift_codegen::cursor::FuncCursor;

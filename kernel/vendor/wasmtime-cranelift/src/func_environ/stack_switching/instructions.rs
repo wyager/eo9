@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use crate::*;
+
 use cranelift_codegen::ir::BlockArg;
 use itertools::{Either, Itertools};
 
@@ -23,6 +26,8 @@ use super::fatpointer;
 
 /// This module contains compile-time counterparts to types defined elsewhere.
 pub(crate) mod stack_switching_helpers {
+    #[allow(unused_imports)]
+    use crate::*;
     use core::marker::PhantomData;
     use cranelift_codegen::ir;
     use cranelift_codegen::ir::InstBuilder;
@@ -1632,7 +1637,7 @@ pub(crate) fn translate_suspend<'a>(
     // 2. Afterwards, the tag return values
     let values = active_contref.values(env, builder);
     let required_capacity =
-        u32::try_from(std::cmp::max(suspend_args.len(), tag_return_types.len()))
+        u32::try_from(core::cmp::max(suspend_args.len(), tag_return_types.len()))
             .expect("Number of stack switching payloads should fit in u32");
 
     if required_capacity > 0 {

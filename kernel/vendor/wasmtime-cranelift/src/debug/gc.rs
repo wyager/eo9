@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use crate::*;
+
 use crate::debug::Reader;
 use crate::debug::transform::AddressTransform;
 use gimli::constants;

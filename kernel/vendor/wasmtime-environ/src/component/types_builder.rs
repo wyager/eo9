@@ -6,9 +6,9 @@ use crate::{
     PrimaryMap, TypeConvert, WasmHeapType, WasmValType,
 };
 use cranelift_entity::EntityRef;
-use std::collections::HashMap;
-use std::hash::Hash;
-use std::ops::Index;
+use hashbrown::HashMap;
+use core::hash::Hash;
+use core::ops::Index;
 use wasmparser::component_types::{
     ComponentAnyTypeId, ComponentCoreModuleTypeId, ComponentDefinedType, ComponentDefinedTypeId,
     ComponentEntityType, ComponentFuncTypeId, ComponentInstanceTypeId, ComponentTypeId,

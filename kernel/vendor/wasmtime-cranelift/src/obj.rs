@@ -13,6 +13,9 @@
 //! function body, the imported wasm function do not. The trampolines symbol
 //! names have format "_trampoline_N", where N is `SignatureIndex`.
 
+#[allow(unused_imports)]
+use crate::*;
+
 use crate::CompiledFunction;
 use cranelift_codegen::TextSectionBuilder;
 use cranelift_codegen::isa::unwind::{UnwindInfo, systemv};
@@ -21,7 +24,7 @@ use gimli::RunTimeEndian;
 use gimli::write::{Address, EhFrame, EndianVec, FrameTable, Writer};
 use object::write::{Object, SectionId, StandardSegment, Symbol, SymbolId, SymbolSection};
 use object::{Architecture, SectionFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope};
-use std::ops::Range;
+use core::ops::Range;
 use wasmtime_environ::error::Result;
 use wasmtime_environ::{Compiler, TripleExt};
 use wasmtime_environ::{FuncKey, obj};

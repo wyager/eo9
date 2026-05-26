@@ -9,11 +9,14 @@
     reason = "haven't had a chance to fix these yet"
 )]
 
+#[allow(unused_imports)]
+use crate::*;
+
 use crate::CompiledFunctionMetadata;
 use core::fmt;
 use cranelift_codegen::isa::TargetIsa;
 use object::write::SymbolId;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use wasmtime_environ::{
     DefinedFuncIndex, DefinedMemoryIndex, EntityRef, MemoryIndex, ModuleTranslation,
     OwnedMemoryIndex, PrimaryMap, PtrSize, StaticModuleIndex, Tunables, VMOffsets,

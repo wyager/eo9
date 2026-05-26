@@ -12,7 +12,6 @@ use object::{Architecture, BinaryFormat, FileFlags};
 use core::any::Any;
 use alloc::borrow::Cow;
 use core::fmt;
-use std::path;
 use alloc::sync::Arc;
 
 mod address_map;
@@ -96,7 +95,11 @@ pub trait CompilerBuilder: Send + Sync + fmt::Debug {
     fn target(&mut self, target: target_lexicon::Triple) -> Result<()>;
 
     /// Enables clif output in the directory specified.
-    fn clif_dir(&mut self, _path: &path::Path) -> Result<()> {
+    ///
+    /// The directory is taken as a string rather than a `std::path::Path` so the
+    /// trait is expressible under `no_std`; the actual filesystem write (in the
+    /// Cranelift backend) is gated on the `std` feature.
+    fn clif_dir(&mut self, _path: &str) -> Result<()> {
         bail!("clif output not supported");
     }
 

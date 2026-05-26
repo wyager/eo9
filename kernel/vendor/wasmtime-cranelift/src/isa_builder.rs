@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use crate::*;
+
 use cranelift_codegen::isa::IsaBuilder as Builder;
 use cranelift_codegen::settings::{self, Configurable, Flags, SetError};
 use target_lexicon::Triple;

@@ -1,4 +1,7 @@
-use std::ops::Range;
+#[allow(unused_imports)]
+use crate::*;
+
+use core::ops::Range;
 
 use crate::{Relocation, mach_reloc_to_reloc, mach_trap_to_trap};
 use cranelift_codegen::{

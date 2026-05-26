@@ -1,5 +1,8 @@
 //! Compilation support for the component model.
 
+#[allow(unused_imports)]
+use crate::*;
+
 use crate::func_environ::BuiltinFunctions;
 use crate::trap::TranslateTrap;
 use crate::{TRAP_CANNOT_LEAVE_COMPONENT, TRAP_INTERNAL_ASSERT, compiler::Compiler};

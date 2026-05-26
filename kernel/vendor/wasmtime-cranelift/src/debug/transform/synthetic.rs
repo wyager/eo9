@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use crate::*;
+
 use gimli::write::{
     AttributeValue, DebugInfoRef, LineProgram, StringTable, Unit, UnitEntryId, UnitId, UnitTable,
 };

@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use crate::*;
+
 use super::{ArrayInit, GcCompiler};
 use crate::bounds_checks::BoundsCheck;
 use crate::func_environ::{Extension, FuncEnvironment};

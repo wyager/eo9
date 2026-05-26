@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use crate::*;
+
 use self::debug_transform_logging::dbi_log;
 use self::simulate::generate_simulated_dwarf;
 use self::unit::clone_unit;
@@ -5,7 +8,7 @@ use crate::debug::Compilation;
 use crate::debug::gc::build_dependencies;
 use cranelift_codegen::isa::TargetIsa;
 use gimli::{DwarfPackage, LittleEndian, Section, write};
-use std::collections::HashSet;
+use hashbrown::HashSet;
 use synthetic::ModuleSyntheticUnit;
 use wasmtime_environ::error::Error;
 use wasmtime_environ::{

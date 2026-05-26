@@ -48,7 +48,7 @@
 use crate::component::translate::*;
 use crate::{EntityType, Memory};
 use core::str::FromStr;
-use std::borrow::Cow;
+use alloc::borrow::Cow;
 use wasmparser::component_types::{ComponentAnyTypeId, ComponentCoreModuleTypeId};
 
 pub(super) fn run(
@@ -57,6 +57,14 @@ pub(super) fn run(
     nested_modules: &PrimaryMap<StaticModuleIndex, ModuleTranslation<'_>>,
     nested_components: &PrimaryMap<StaticComponentIndex, Translation<'_>>,
 ) -> Result<dfg::ComponentDfg> {
+    // Bound before `inliner` so that, in drop order (reverse of declaration),
+    // `inliner`'s destructor runs while this borrow of `result` is still live.
+    // Under `no_std` `args` below is a `hashbrown::HashMap`, which (unlike
+    // `std::collections::HashMap`) has no `#[may_dangle]` dropck eyepatch, so the
+    // borrow checker otherwise reports `types_ref` as dropped while still
+    // borrowed by `inliner`'s drop. (See plan/12 Decision 29.)
+    let types_ref = result.types_ref();
+
     let mut inliner = Inliner {
         nested_modules,
         nested_components,
@@ -77,7 +85,6 @@ pub(super) fn run(
     let mut args = HashMap::with_capacity(result.exports.len());
     let mut path = Vec::new();
     types.resources_mut().set_current_instance(index);
-    let types_ref = result.types_ref();
     for init in result.initializers.iter() {
         let (name, ty) = match *init {
             LocalInitializer::Import(name, ty) => (name, ty),
@@ -182,7 +189,7 @@ struct InlinerFrame<'a> {
     instance: RuntimeComponentInstanceIndex,
 
     /// The remaining initializers to process when instantiating this component.
-    initializers: std::slice::Iter<'a, LocalInitializer<'a>>,
+    initializers: core::slice::Iter<'a, LocalInitializer<'a>>,
 
     /// The component being instantiated.
     translation: &'a Translation<'a>,
@@ -1203,13 +1210,13 @@ impl<'a> Inliner<'a> {
                         )
                     }
                     ModuleDef::Import(path, ty) => {
-                        let mut defs = IndexMap::new();
+                        let mut defs = IndexMap::default();
                         for ((module, name), _) in types[*ty].imports.iter() {
                             let instance = args[module.as_str()];
                             let def =
                                 self.core_def_of_module_instance_export(frame, instance, name);
                             defs.entry(module.to_string())
-                                .or_insert(IndexMap::new())
+                                .or_insert(IndexMap::default())
                                 .insert(name.to_string(), def);
                         }
                         let index = self.runtime_import(path);
@@ -1655,7 +1662,7 @@ impl<'a> Inliner<'a> {
             },
 
             ComponentItemDef::Instance(instance) => {
-                let mut exports = IndexMap::new();
+                let mut exports = IndexMap::default();
                 match instance {
                     ComponentInstanceDef::Intrinsics => {
                         bail!(
