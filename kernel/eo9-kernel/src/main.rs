@@ -25,6 +25,8 @@ mod boot;
 #[cfg(target_os = "none")]
 mod exceptions;
 #[cfg(target_os = "none")]
+mod fdt;
+#[cfg(target_os = "none")]
 mod heap;
 #[cfg(target_os = "none")]
 mod mmu;
@@ -50,7 +52,7 @@ mod wasm;
 /// finally the machine powers off so QEMU exits cleanly.
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
-extern "C" fn kmain() -> ! {
+extern "C" fn kmain(dtb: *const u8) -> ! {
     kprintln!();
     kprintln!("Eo9 kernel — aarch64 (QEMU virt)");
     kprintln!("  exception level: EL{}", current_el());
@@ -72,14 +74,27 @@ extern "C" fn kmain() -> ! {
     // Generic timer: readable counter plus a polled 10 ms timer condition.
     timer::self_test();
 
-    #[cfg(feature = "wasm-seed")]
-    wasm::seed::run();
-    #[cfg(feature = "wasm-hello")]
-    wasm::hello::run();
-    #[cfg(feature = "wasm-async")]
-    wasm::async_demo::run();
-    #[cfg(not(any(feature = "wasm-seed", feature = "wasm-hello", feature = "wasm-async")))]
-    kprintln!("wasm: no components embedded (build with `cargo xtask build-kernel aarch64`)");
+    // The kernel command line (QEMU -append) selects what to run; without a `program=`
+    // token the kernel runs its default boot sequence below.
+    let bootargs = fdt::bootargs(dtb);
+    if let Some(bootargs) = bootargs {
+        kprintln!("cmdline: {bootargs}");
+    }
+    #[cfg(feature = "wasm-store")]
+    let handled = wasm::runner::boot(bootargs);
+    #[cfg(not(feature = "wasm-store"))]
+    let handled = false;
+
+    if !handled {
+        #[cfg(feature = "wasm-seed")]
+        wasm::seed::run();
+        #[cfg(feature = "wasm-hello")]
+        wasm::hello::run();
+        #[cfg(feature = "wasm-async")]
+        wasm::async_demo::run();
+        #[cfg(not(any(feature = "wasm-seed", feature = "wasm-hello", feature = "wasm-async")))]
+        kprintln!("wasm: no components embedded (build with `cargo xtask build-kernel aarch64`)");
+    }
 
     kprintln!(
         "[{:>8} us] kernel run complete; requesting PSCI SYSTEM_OFF",

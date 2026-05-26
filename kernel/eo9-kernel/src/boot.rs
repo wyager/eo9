@@ -24,6 +24,9 @@ global_asm!(
 .section .text.boot, "ax"
 .globl _start
 _start:
+    // Preserve the DTB pointer QEMU passes in x0 (callee-saved x19 survives the stub;
+    // see crate::fdt for the consumer). Parked secondary cores never use it.
+    mov     x19, x0
     // Park everything except core 0.
     mrs     x0, mpidr_el1
     and     x0, x0, #0xff
@@ -57,7 +60,8 @@ _start:
     b.hs    3f
     str     xzr, [x1], #8
     b       2b
-3:
+3:  // Hand the preserved DTB pointer to the Rust entry point.
+    mov     x0, x19
     bl      kmain
     // kmain never returns; if it somehow does, park the core.
 4:  wfe

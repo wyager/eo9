@@ -21,10 +21,14 @@
 pub mod async_demo;
 #[cfg(feature = "wasm-hello")]
 pub mod hello;
-#[cfg(any(feature = "wasm-hello", feature = "wasm-async"))]
+#[cfg(any(feature = "wasm-hello", feature = "wasm-async", feature = "wasm-store"))]
 pub mod providers;
+#[cfg(feature = "wasm-store")]
+pub mod runner;
 #[cfg(feature = "wasm-seed")]
 pub mod seed;
+#[cfg(feature = "wasm-store")]
+pub mod store;
 
 use alloc::sync::Arc;
 use alloc::task::Wake;
