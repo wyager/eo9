@@ -25,6 +25,7 @@ use crate::cli::{Config, vlog};
 use crate::compile;
 use crate::providers;
 use crate::run;
+use crate::seed;
 use crate::source::{self, ProgramSource};
 
 /// Where `cargo xtask build-guest` puts components in a development tree, relative to the
@@ -34,6 +35,12 @@ const DEV_COMPONENTS_DIR: &str = "guest/target/components";
 
 pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
     let store = cfg.open_store()?;
+
+    // First run against an empty store: seed it from the embedded components so the
+    // shell has programs to offer. A seeding problem never blocks the shell itself.
+    if let Err(err) = seed::seed_store_if_empty(cfg, &store) {
+        eprintln!("eo9: warning: could not seed the module store: {err}");
+    }
 
     let eosh = resolve_eosh(cfg, &store)?;
     let session_root = materialize_session(cfg, &store)?;
@@ -68,8 +75,9 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
 }
 
 /// Locate the eosh component. Lookup order: the store-bound name `eosh` (the installed
-/// form), then the dev-tree artifact `guest/target/components/eosh.wasm` relative to the
-/// current directory (the checkout convenience).
+/// form — first-run seeding normally provides it), then the dev-tree artifact
+/// `guest/target/components/eosh.wasm` relative to the current directory (the checkout
+/// convenience), then the copy embedded in this binary.
 fn resolve_eosh(cfg: &Config, store: &Store) -> Result<ProgramSource, String> {
     let name = Name::parse("eosh").expect("`eosh` is a valid store name");
     let bound = store
@@ -82,6 +90,15 @@ fn resolve_eosh(cfg: &Config, store: &Store) -> Result<ProgramSource, String> {
     let dev = Path::new(DEV_COMPONENTS_DIR).join("eosh.wasm");
     if dev.is_file() {
         return source::resolve_program(cfg, &dev.display().to_string());
+    }
+
+    if let Some(bytes) = seed::embedded("eosh") {
+        vlog!(cfg, "using the eosh component embedded in this binary");
+        return Ok(ProgramSource {
+            bytes: bytes.to_vec(),
+            hash: eo9_store::ObjectHash::of(bytes),
+            origin: "eosh (embedded in the eo9 binary)".to_string(),
+        });
     }
 
     Err(format!(
@@ -135,7 +152,7 @@ fn materialize_session(cfg: &Config, store: &Store) -> Result<PathBuf, String> {
             let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
             };
-            let Some(shell_name) = dev_shell_name(stem) else {
+            let Some(shell_name) = seed::shell_name_for(stem) else {
                 continue;
             };
             let target = bin.join(format!("{shell_name}.wasm"));
@@ -167,49 +184,4 @@ fn place(source: &Path, target: &Path) -> Result<(), String> {
             source.display()
         )
     })
-}
-
-/// The shell name a dev-tree component file answers to: `eo9-example-hello` → `hello`,
-/// `eo9-stub-time-frozen` → `time.frozen`, anything else (`eosh`) verbatim. `None` when
-/// the result would not be a valid dotted name.
-fn dev_shell_name(stem: &str) -> Option<String> {
-    let name = if let Some(example) = stem.strip_prefix("eo9-example-") {
-        example.to_string()
-    } else if let Some(stub) = stem.strip_prefix("eo9-stub-") {
-        match stub.split_once('-') {
-            Some((api, flavor)) => format!("{api}.{flavor}"),
-            None => stub.to_string(),
-        }
-    } else {
-        stem.to_string()
-    };
-    Name::parse(&name).ok().map(|_| name)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dev_components_answer_to_their_shell_names() {
-        assert_eq!(
-            dev_shell_name("eo9-example-hello").as_deref(),
-            Some("hello")
-        );
-        assert_eq!(
-            dev_shell_name("eo9-example-readwrite").as_deref(),
-            Some("readwrite")
-        );
-        assert_eq!(
-            dev_shell_name("eo9-stub-entropy-seeded").as_deref(),
-            Some("entropy.seeded")
-        );
-        assert_eq!(
-            dev_shell_name("eo9-stub-time-monotonic-stub").as_deref(),
-            Some("time.monotonic-stub")
-        );
-        assert_eq!(dev_shell_name("eosh").as_deref(), Some("eosh"));
-        // Something that cannot be a dotted name is skipped rather than mis-bound.
-        assert_eq!(dev_shell_name("Not A Name"), None);
-    }
 }
