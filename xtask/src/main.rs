@@ -71,6 +71,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         }
         "test" => {
             expect_no_args("test", rest)?;
+            // Refresh the guest components first: the host integration tests consume the
+            // prebuilt components under guest/target/components, and running them against
+            // stale artifacts has bitten before (see plan/01 Decisions).
+            build_guest(&root)?;
             test(&root)
         }
         "build-guest" => {
@@ -108,7 +112,8 @@ USAGE:
 
 COMMANDS:
     build                Build the host workspace and the kernel workspace ({KERNEL_CHECK_TARGET})
-    test                 Run host workspace tests and kernel workspace tests (host triple)
+    test                 Refresh the guest components (build-guest), then run host workspace
+                         tests and kernel workspace tests (host triple)
     build-guest          Build guest crates for {GUEST_TARGET} and componentize them with
                          `wasm-tools component new` into guest/target/components/*.wasm
     build-kernel <arch>  Precompile the seed/async canaries, eo9-example-hello, and entropy.seeded for
@@ -118,7 +123,7 @@ COMMANDS:
                          (aarch64 only so far; exits when the kernel powers off, Ctrl-A X to quit)
     fmt [--check]        Run `cargo fmt --all` in all three workspaces
     lint                 Run `cargo clippy -D warnings` in all three workspaces
-    ci                   The merge gate: fmt --check, lint, build, test, build-guest
+    ci                   The merge gate: fmt --check, lint, build, build-guest, test
     help                 Show this message
 
 ARCHES: {}",
@@ -469,13 +474,15 @@ fn lint(root: &Path) -> Result<(), String> {
 }
 
 /// The merge gate (plan/01-workspace.md): everything a reviewer agent runs before merging.
+/// build-guest runs before test so the host integration tests never see stale prebuilt
+/// components under guest/target/components.
 fn ci(root: &Path) -> Result<(), String> {
     fmt(root, true)?;
     lint(root)?;
     build(root)?;
-    test(root)?;
     build_guest(root)?;
-    println!("xtask: ci passed (fmt, lint, build, test, build-guest)");
+    test(root)?;
+    println!("xtask: ci passed (fmt, lint, build, build-guest, test)");
     Ok(())
 }
 
