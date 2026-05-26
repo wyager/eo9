@@ -12,6 +12,10 @@
 //! * `shell`    — run eosh (the Eo9 shell, itself a guest component) against a session:
 //!   a `/bin` name view of the store, the terminal, and the exec capability.
 //!
+//! Without a command, `eo9` is the shell (`eo9 -c "<line>"` for one command), and a
+//! program reference (`eo9 <name-or-path> …`) runs directly; the first shell start
+//! against an empty store seeds it from the components embedded in the binary.
+//!
 //! Exit codes for `run` and `shell` mirror the three-way program outcome: 0 success,
 //! 1 failure, 2 abnormal (trap or kill); 3 means eo9 itself failed before an outcome
 //! existed.
@@ -21,6 +25,7 @@ mod compile;
 mod describe;
 mod providers;
 mod run;
+mod seed;
 mod shell;
 mod source;
 mod storecmd;
@@ -28,6 +33,7 @@ mod storecmd;
 use std::process::ExitCode;
 
 use cli::{ArgStream, Config, EXIT_ERROR, EXIT_SUCCESS};
+use eo9_store::Name;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -45,9 +51,9 @@ fn dispatch(args: Vec<String>) -> Result<u8, String> {
     let mut cfg = Config::default();
     cli::consume_global_options(&mut stream, &mut cfg)?;
 
+    // Bare `eo9` is the shell: the out-of-box entry point.
     let Some(command) = stream.next() else {
-        print_help();
-        return Ok(EXIT_ERROR);
+        return shell::cmd_shell(&cfg, None);
     };
     match command.as_str() {
         "run" => {
@@ -77,6 +83,21 @@ fn dispatch(args: Vec<String>) -> Result<u8, String> {
             print_help();
             Ok(EXIT_SUCCESS)
         }
+        // `eo9 -c "<command>"`: the default-to-shell one-shot form.
+        "-c" | "--command" => {
+            let line = stream
+                .next()
+                .ok_or_else(|| format!("option `{command}` needs a command line"))?;
+            cli::consume_global_options(&mut stream, &mut cfg)?;
+            cli::expect_end(&mut stream, "shell")?;
+            shell::cmd_shell(&cfg, Some(line))
+        }
+        // `eo9 <name-or-path> [--flag value …]`: the implicit-run form — anything that
+        // reads as a program reference (a path, or a bare dotted name) is run directly.
+        other if source::is_path(other) || Name::parse(other).is_ok() => {
+            let flags = cli::parse_program_flags(&mut stream)?;
+            run::cmd_run(&cfg, other, &flags)
+        }
         other => Err(format!("unknown command `{other}`; run `eo9 help`")),
     }
 }
@@ -95,7 +116,13 @@ fn print_help() {
         "eo9 — a usermode Eo9 instance: compile and run Eo9 programs on the host OS
 
 USAGE:
-    eo9 [OPTIONS] <COMMAND> [ARGS]
+    eo9 [OPTIONS] [COMMAND] [ARGS]
+
+DEFAULTS (no command):
+    eo9                              the Eo9 shell (same as `eo9 shell`); a first run seeds
+                                     an empty store with the bundled programs
+    eo9 -c \"<command>\"               run one shell command line and exit
+    eo9 <name-or-path> [--flag <v>]  run a program directly (same as `eo9 run …`)
 
 COMMANDS:
     run <name-or-path> [--<flag> <value> ...]

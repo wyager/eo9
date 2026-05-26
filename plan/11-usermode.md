@@ -97,9 +97,10 @@ its first milestones, and to be the place where cross-area seams get found.
    (the REPL's blocking `read-line` goes through the terminal text provider, so piped stdin works too), one
    command line when present; exit codes follow the shell's own outcome (clean exit 0, `command-failed`/io 1,
    abnormal 2), and a clean exit prints nothing beyond what eosh already printed.
-   *eosh lookup order:* the store-bound name `eosh` first, then the dev-tree artifact
-   `guest/target/components/eosh.wasm` relative to the current directory; neither present ⇒ a clear error
-   telling the user to `store add … --name eosh` or `cargo xtask build-guest`.
+   *eosh lookup order:* the store-bound name `eosh` first (first-run seeding normally provides it), then the
+   dev-tree artifact `guest/target/components/eosh.wasm` relative to the current directory, then the copy
+   embedded in the binary; none present ⇒ a clear error telling the user to `store add … --name eosh` or
+   `cargo xtask build-guest`.
    *Session layout:* `<store-root>/shell/` is the session directory granted to eosh as its fs root;
    `shell/bin/<name>.wasm` is rebuilt on every shell start from (a) every bound store name (hard-linked to
    the store object, copied if linking fails) and (b) the dev-tree components under their shell names
@@ -116,19 +117,36 @@ its first milestones, and to be the place where cross-area seams get found.
    eosh's compose-time `configure` support (area 10, in flight), so the composed-stub test uses an
    unconfigured compose (`entropy.seeded $ cruncher`) and a configured transcript is a follow-up.
 9. **Tests.** Unit tests cover the argv parser, cache-key construction, WAVE string quoting/arg binding, the
-   outcome→exit-code mapping, the oneshot bridge, the fs-grant check, and the dev-component shell-name
-   mapping. Integration tests (`crates/eo9/tests/cli.rs`) drive the real binary against the built example
-   components: hello/outcomes (all arms incl. trap→abnormal)/cruncher end to end, second-run launch from the
-   cached image (stderr + use-count evidence, and no codegen diagnostics on the hit), a tampered cache entry
-   being refused and recompiled, a read-only cache never failing a run (cold-cache insert failure and
-   use-count-bump failure both degrade to warnings), memory-limit enforcement, store add/ls/gc + run-by-name,
-   describe, compile warm, `readwrite` end to end through the unix fs provider (write + read-back against a
-   temp `--fs-root`, fs failures staying in the program's own vocabulary, escape attempts denied inside the
-   root, and a run *without* `--fs-root` being refused with the grant hint), and shell transcripts (bare-name
-   run, `describe`, an unconfigured compose checked against `eo9 run`'s digest, child failure / unknown name
-   ⇒ exit 1, a piped interactive `let` session, and store-bound names incl. eosh itself). The test harness
-   builds the components via `cargo xtask build-guest` only when they are missing, so stale pre-existing
-   components must be rebuilt by hand after guest-facing WIT changes.
+   outcome→exit-code mapping, the oneshot bridge, the fs-grant check, the component shell-name mapping, and
+   the embedded component set. Integration tests (`crates/eo9/tests/cli.rs`) drive the real binary against
+   the built example components: hello/outcomes (all arms incl. trap→abnormal)/cruncher end to end,
+   second-run launch from the cached image (stderr + use-count evidence, and no codegen diagnostics on the
+   hit), a tampered cache entry being refused and recompiled, a read-only cache never failing a run
+   (cold-cache insert failure and use-count-bump failure both degrade to warnings), memory-limit enforcement,
+   store add/ls/gc + run-by-name, describe, compile warm, `readwrite` end to end through the unix fs provider
+   (write + read-back against a temp `--fs-root`, fs failures staying in the program's own vocabulary, escape
+   attempts denied inside the root, and a run *without* `--fs-root` being refused with the grant hint), shell
+   transcripts (bare-name run, `describe`, an unconfigured compose checked against `eo9 run`'s digest, child
+   failure / unknown name ⇒ exit 1, a piped interactive `let` session, and store-bound names incl. eosh
+   itself), and the demo defaults (bare `eo9 -c …` through the default-to-shell path, implicit `run` by path
+   and by seeded bare name, first-run seeding being idempotent and never clobbering user bindings). The test
+   harness builds the components via `cargo xtask build-guest` only when they are missing — and then rebuilds
+   the eo9 binary so its embedded set picks them up — so stale pre-existing components must be rebuilt by
+   hand after guest-facing WIT changes.
 10. **xtask touch (authorized follow-up).** `xtask build` (and therefore `ci`) now also runs
     `cargo check -p eo9-sched --target aarch64-unknown-none`, after the kernel build so the pinned toolchain
     already has that target installed.
+11. **Demo defaults, embedded components, first-run seeding.** Bare `eo9` is the shell; `eo9 -c "<line>"` is
+    the shell's one-shot form; a first argument that reads as a program reference (a path, or a bare dotted
+    name per decision 2) is an implicit `eo9 run`; explicit subcommands are unchanged and anything else is
+    still a usage error. `build.rs` embeds every component present under `guest/target/components/` at build
+    time (eosh, examples, stubs — ~1 MiB total); when the directory is absent the set is empty and the
+    dev-tree fallbacks still work, so **packaged/release builds must run `cargo xtask build-guest` before
+    building `crates/eo9`** (escalation: area 01 may want `xtask ci` to run build-guest before build/test so
+    fresh checkouts embed the set on the first pass; the test harness compensates by rebuilding eo9 after it
+    builds missing components). On a shell start against a store with **no name bindings at all**, the
+    embedded components are added to the object store and bound under their shell names (`hello`, `cruncher`,
+    `eosh`, `entropy.seeded`, `fs.memfs`, …) with a one-line notice; a store with any existing binding is
+    never touched, so seeding is idempotent and user bindings are never clobbered. Seeding failures degrade
+    to a warning, and the embedded eosh also serves as the last-resort shell component when neither the store
+    nor a dev tree provides one.
