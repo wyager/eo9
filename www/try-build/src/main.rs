@@ -1,0 +1,411 @@
+//! Build-time helper for the eo9.org `/try` page.
+//!
+//! Reads the guest components produced by `cargo xtask build-guest`, transpiles each one into
+//! browser-runnable ES modules + core wasm with `js-component-bindgen` (the transpiler library
+//! inside jco), extracts the world metadata the in-page launcher needs (imports, `main`'s
+//! signature, the outcome variants), and writes everything plus `manifest.json` into the static
+//! site tree. Run it via `cargo xtask build-web-demo`; the output is committed so deploying the
+//! site needs neither this tool nor node.
+//!
+//! Usage: `eo9-try-build --components <dir> --out <dir>`
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
+use wit_parser::{Resolve, Type, TypeDefKind, WorldId, WorldItem, WorldKey};
+
+/// One component shipped to the `/try` page.
+struct Shipped {
+    /// Short name the launcher uses (`run hello`), also the output directory and module stem.
+    name: &'static str,
+    /// File stem of the component under the components directory (xtask's `GUEST_COMPONENTS`).
+    component: &'static str,
+    /// One-line description shown by `list` / `describe`.
+    summary: &'static str,
+    /// A suggested invocation, shown by `list` and on the page.
+    example: &'static str,
+}
+
+/// The v1 set: the example binaries that run against the browser host's root providers.
+/// Stub providers are deliberately absent for now — composing them in the browser needs their
+/// `configure` exports, which trip an upstream transpiler bug (plan/15-website.md, Decisions).
+const SHIPPED: &[Shipped] = &[
+    Shipped {
+        name: "hello",
+        component: "eo9-example-hello",
+        summary: "Greets you over the eo9:text capability, timestamped via eo9:time.",
+        example: "hello --name browser --excited true",
+    },
+    Shipped {
+        name: "outcomes",
+        component: "eo9-example-outcomes",
+        summary: "Exercises the typed outcome convention: pick the success or failure variant it reports.",
+        example: "outcomes --mode succeed --detail \"all good\"",
+    },
+    Shipped {
+        name: "cruncher",
+        component: "eo9-example-cruncher",
+        summary: "Pure compute with no imports at all — a fully closed program; same inputs, same digest, anywhere.",
+        example: "cruncher --seed 7 --rounds 100000",
+    },
+    Shipped {
+        name: "readwrite",
+        component: "eo9-example-readwrite",
+        summary: "Round-trips a file through the eo9:fs capability (async main; the fs here is the browser host's in-memory fs).",
+        example: "readwrite --path /notes/hello.txt --contents \"written from wasm\"",
+    },
+];
+
+fn main() -> Result<()> {
+    let (components_dir, out_dir) = parse_args()?;
+    if !components_dir.is_dir() {
+        bail!(
+            "components directory `{}` does not exist — run `cargo xtask build-guest` first",
+            components_dir.display()
+        );
+    }
+
+    // Start from a clean output directory so removed components never linger in the site tree.
+    if out_dir.exists() {
+        fs::remove_dir_all(&out_dir)
+            .with_context(|| format!("failed to clear {}", out_dir.display()))?;
+    }
+    fs::create_dir_all(&out_dir)
+        .with_context(|| format!("failed to create {}", out_dir.display()))?;
+
+    let mut manifest_entries = Vec::new();
+    let mut total_bytes: u64 = 0;
+
+    for shipped in SHIPPED {
+        let input = components_dir.join(format!("{}.wasm", shipped.component));
+        let bytes = fs::read(&input)
+            .with_context(|| format!("failed to read component {}", input.display()))?;
+
+        let meta = describe_component(&bytes)
+            .with_context(|| format!("failed to decode the world of {}", input.display()))?;
+        let written = transpile_component(shipped.name, &bytes, &out_dir.join(shipped.name))
+            .with_context(|| format!("failed to transpile {}", input.display()))?;
+        total_bytes += written;
+
+        manifest_entries.push(json!({
+            "name": shipped.name,
+            "module": format!("{0}/{0}.js", shipped.name),
+            "summary": shipped.summary,
+            "example": shipped.example,
+            "asyncMain": meta.async_main,
+            "imports": meta.imports.iter().map(|import| json!({
+                "interface": import.interface,
+                "required": import.required,
+            })).collect::<Vec<_>>(),
+            "params": meta.params.iter().map(|(name, ty)| json!({
+                "name": name,
+                "ty": ty,
+            })).collect::<Vec<_>>(),
+            "success": meta.success_cases,
+            "failure": meta.failure_cases,
+        }));
+
+        println!(
+            "try-build: {} <- {} ({} import(s), async main: {})",
+            shipped.name,
+            shipped.component,
+            meta.imports.len(),
+            meta.async_main
+        );
+    }
+
+    let manifest = json!({
+        "note": "Generated by www/try-build (cargo xtask build-web-demo); do not edit by hand.",
+        "components": Value::Array(manifest_entries),
+    });
+    let manifest_path = out_dir.join("manifest.json");
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest)? + "\n",
+    )
+    .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+
+    println!(
+        "try-build: wrote {} components ({} KiB) and {} to {}",
+        SHIPPED.len(),
+        total_bytes / 1024,
+        manifest_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
+        out_dir.display()
+    );
+    Ok(())
+}
+
+fn parse_args() -> Result<(PathBuf, PathBuf)> {
+    let mut components = None;
+    let mut out = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let mut value = |flag: &str| {
+            args.next()
+                .ok_or_else(|| anyhow::anyhow!("{flag} requires a value"))
+        };
+        match arg.as_str() {
+            "--components" => components = Some(PathBuf::from(value("--components")?)),
+            "--out" => out = Some(PathBuf::from(value("--out")?)),
+            other => bail!("unrecognized argument `{other}` (expected --components/--out)"),
+        }
+    }
+    match (components, out) {
+        (Some(components), Some(out)) => Ok((components, out)),
+        _ => bail!("usage: eo9-try-build --components <dir> --out <dir>"),
+    }
+}
+
+/// What the in-page launcher needs to know about one component.
+struct ComponentMeta {
+    imports: Vec<ImportMeta>,
+    params: Vec<(String, String)>,
+    success_cases: Vec<String>,
+    failure_cases: Vec<String>,
+    async_main: bool,
+}
+
+struct ImportMeta {
+    interface: String,
+    required: bool,
+}
+
+/// Decode the component's world and pull out the launcher-facing metadata.
+fn describe_component(bytes: &[u8]) -> Result<ComponentMeta> {
+    let decoded = wit_component::decode(bytes).context("wit-component failed to decode")?;
+    let (resolve, world_id): (&Resolve, WorldId) = match &decoded {
+        wit_component::DecodedWasm::Component(resolve, world) => (resolve, *world),
+        wit_component::DecodedWasm::WitPackage(..) => {
+            bail!("expected a component, found a WIT package")
+        }
+    };
+    let world = &resolve.worlds[world_id];
+
+    let mut imports = Vec::new();
+    for (key, item) in &world.imports {
+        // Only interface (and freestanding function) imports are capabilities; the world's own
+        // value types (the outcome variants) also appear in the encoded world as type imports
+        // and must not show up in the capability list.
+        if matches!(item, WorldItem::Type { .. }) {
+            continue;
+        }
+        let interface = match (key, item) {
+            (WorldKey::Interface(id), _) | (_, WorldItem::Interface { id, .. }) => resolve
+                .id_of(*id)
+                .unwrap_or_else(|| "<unnamed interface>".to_owned()),
+            (WorldKey::Name(name), _) => name.clone(),
+        };
+        // Per the capability conventions, optionality is in the import list itself: a program
+        // that merely *can use* an API imports its `-optional` flavor.
+        let required = !interface_name(&interface).ends_with("-optional");
+        imports.push(ImportMeta {
+            interface,
+            required,
+        });
+    }
+    imports.sort_by(|a, b| a.interface.cmp(&b.interface));
+
+    let main = world
+        .exports
+        .iter()
+        .find_map(|(_, item)| match item {
+            WorldItem::Function(f) if f.name == "main" => Some(f),
+            _ => None,
+        })
+        .context("the component exports no `main` (only binaries are shipped to /try)")?;
+
+    let params = main
+        .params
+        .iter()
+        .map(|param| (param.name.clone(), render_type(resolve, &param.ty)))
+        .collect();
+
+    let (success_cases, failure_cases) = match &main.result {
+        Some(ty) => outcome_cases(resolve, ty),
+        None => (Vec::new(), Vec::new()),
+    };
+
+    Ok(ComponentMeta {
+        imports,
+        params,
+        success_cases,
+        failure_cases,
+        async_main: main.kind.is_async(),
+    })
+}
+
+/// The interface part of a fully-qualified name: `eo9:text/text-optional@0.1.0` -> `text-optional`.
+fn interface_name(qualified: &str) -> &str {
+    let after_slash = qualified.rsplit('/').next().unwrap_or(qualified);
+    after_slash.split('@').next().unwrap_or(after_slash)
+}
+
+/// The success/failure variant case names of `main`'s `result<program-success, program-failure>`.
+fn outcome_cases(resolve: &Resolve, ty: &Type) -> (Vec<String>, Vec<String>) {
+    let Type::Id(id) = ty else {
+        return (Vec::new(), Vec::new());
+    };
+    let TypeDefKind::Result(result) = &resolve.types[*id].kind else {
+        return (Vec::new(), Vec::new());
+    };
+    (
+        variant_cases(resolve, result.ok.as_ref()),
+        variant_cases(resolve, result.err.as_ref()),
+    )
+}
+
+fn variant_cases(resolve: &Resolve, ty: Option<&Type>) -> Vec<String> {
+    let Some(Type::Id(id)) = ty else {
+        return Vec::new();
+    };
+    let TypeDefKind::Variant(variant) = &resolve.types[*id].kind else {
+        return Vec::new();
+    };
+    variant
+        .cases
+        .iter()
+        .map(|case| match &case.ty {
+            Some(payload) => format!("{}({})", case.name, render_type(resolve, payload)),
+            None => case.name.clone(),
+        })
+        .collect()
+}
+
+/// Render a WIT type for display and for the launcher's typed-flag parsing. Named types render
+/// as their name; anonymous constructors render structurally; anything exotic falls back to a
+/// kind label (the launcher only parses primitives, which is all the shipped examples use).
+fn render_type(resolve: &Resolve, ty: &Type) -> String {
+    match ty {
+        Type::Bool => "bool".into(),
+        Type::U8 => "u8".into(),
+        Type::U16 => "u16".into(),
+        Type::U32 => "u32".into(),
+        Type::U64 => "u64".into(),
+        Type::S8 => "s8".into(),
+        Type::S16 => "s16".into(),
+        Type::S32 => "s32".into(),
+        Type::S64 => "s64".into(),
+        Type::F32 => "f32".into(),
+        Type::F64 => "f64".into(),
+        Type::Char => "char".into(),
+        Type::String => "string".into(),
+        Type::ErrorContext => "error-context".into(),
+        Type::Id(id) => {
+            let def = &resolve.types[*id];
+            if let Some(name) = &def.name {
+                return name.clone();
+            }
+            match &def.kind {
+                TypeDefKind::List(t) => format!("list<{}>", render_type(resolve, t)),
+                TypeDefKind::Option(t) => format!("option<{}>", render_type(resolve, t)),
+                TypeDefKind::Result(r) => format!(
+                    "result<{}, {}>",
+                    r.ok.as_ref()
+                        .map_or_else(|| "_".into(), |t| render_type(resolve, t)),
+                    r.err
+                        .as_ref()
+                        .map_or_else(|| "_".into(), |t| render_type(resolve, t)),
+                ),
+                TypeDefKind::Tuple(t) => format!(
+                    "tuple<{}>",
+                    t.types
+                        .iter()
+                        .map(|t| render_type(resolve, t))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                TypeDefKind::Type(t) => render_type(resolve, t),
+                other => other.as_str().to_owned(),
+            }
+        }
+    }
+}
+
+/// Transpile one component into `out_dir`, returning the number of bytes written.
+fn transpile_component(name: &str, bytes: &[u8], out_dir: &Path) -> Result<u64> {
+    let opts = js_component_bindgen::TranspileOpts {
+        name: name.to_owned(),
+        no_typescript: true,
+        instantiation_mode: Some(js_component_bindgen::InstantiationMode::Async),
+        import_bindings: None,
+        map: None,
+        nodejs_compat_disabled: false,
+        base64_cutoff: 0,
+        tla_compat: false,
+        valid_lifting_optimization: false,
+        tracing: false,
+        no_namespaced_exports: false,
+        multi_memory: false,
+        guest: false,
+        async_mode: None,
+        strict: false,
+        asmjs: false,
+    };
+    let transpiled = js_component_bindgen::transpile(bytes, opts)
+        .map_err(|err| anyhow::anyhow!("js-component-bindgen failed: {err:?}"))?;
+
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("failed to create {}", out_dir.display()))?;
+    let mut written = 0u64;
+    for (file, contents) in &transpiled.files {
+        let path = out_dir.join(file);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        written += contents.len() as u64;
+    }
+    Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `render_type` and the optional-import naming rule are the only logic the manifest's
+    /// correctness hangs on; check them against a small hand-fed WIT document.
+    #[test]
+    fn type_rendering_and_optionality() {
+        let mut resolve = Resolve::new();
+        resolve
+            .push_str(
+                "test.wit",
+                r#"
+                package demo:demo;
+                interface api {
+                    f: func(name: string, count: u64, fast: bool) -> result<u32, string>;
+                }
+                world w {
+                    export api;
+                }
+                "#,
+            )
+            .unwrap();
+        let (_, function) = resolve
+            .interfaces
+            .iter()
+            .find_map(|(_, iface)| iface.functions.iter().find(|(name, _)| *name == "f"))
+            .unwrap();
+        let rendered: Vec<String> = function
+            .params
+            .iter()
+            .map(|p| render_type(&resolve, &p.ty))
+            .collect();
+        assert_eq!(rendered, ["string", "u64", "bool"]);
+        assert_eq!(
+            render_type(&resolve, function.result.as_ref().unwrap()),
+            "result<u32, string>"
+        );
+
+        assert_eq!(interface_name("eo9:net/net-optional@0.1.0"), "net-optional");
+        assert_eq!(interface_name("eo9:net/net@0.1.0"), "net");
+        assert!(interface_name("eo9:net/net-optional@0.1.0").ends_with("-optional"));
+        assert!(!interface_name("eo9:net/net@0.1.0").ends_with("-optional"));
+    }
+}
