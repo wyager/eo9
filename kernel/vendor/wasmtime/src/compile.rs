@@ -26,7 +26,8 @@ use crate::Engine;
 use crate::hash_map::HashMap;
 use crate::hash_set::HashSet;
 use crate::prelude::*;
-use std::{any::Any, borrow::Cow, collections::BTreeMap, mem, ops::Range};
+use core::{any::Any, mem, ops::Range};
+use alloc::{borrow::Cow, collections::BTreeMap};
 use wasmtime_environ::{
     Abi, CompiledFunctionBody, CompiledFunctionsTable, CompiledFunctionsTableBuilder,
     CompiledModuleInfo, Compiler, DefinedFuncIndex, FilePos, FinishedObject, FuncKey,
@@ -115,12 +116,12 @@ pub(crate) fn build_module_artifacts<T: FinishedObject>(
         object,
         engine,
         compiled_funcs,
-        std::iter::once(translation).collect(),
+        core::iter::once(translation).collect(),
         dwarf_package,
     )?;
 
     if tunables.debug_guest {
-        object.append_wasm_bytecode(std::iter::once(wasm));
+        object.append_wasm_bytecode(core::iter::once(wasm));
     }
 
     let (info, index) = compilation_artifacts.unwrap_as_module_info();

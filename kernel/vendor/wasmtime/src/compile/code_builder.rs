@@ -1,6 +1,9 @@
 use crate::Engine;
 use crate::prelude::*;
-use std::borrow::Cow;
+use alloc::borrow::Cow;
+// Path types are needed only by the filesystem-based builder methods, which are
+// `std`-gated; the no_std build carries source paths as plain `str`/`String`.
+#[cfg(feature = "std")]
 use std::path::Path;
 
 #[cfg(feature = "compile-time-builtins")]
@@ -43,9 +46,9 @@ mod compile_time_builtins;
 pub struct CodeBuilder<'a> {
     pub(super) engine: &'a Engine,
     wasm: Option<Cow<'a, [u8]>>,
-    wasm_path: Option<Cow<'a, Path>>,
+    wasm_path: Option<Cow<'a, str>>,
     dwarf_package: Option<Cow<'a, [u8]>>,
-    dwarf_package_path: Option<Cow<'a, Path>>,
+    dwarf_package_path: Option<Cow<'a, str>>,
     unsafe_intrinsics_import: Option<String>,
 
     /// A map from import name to the Wasm bytes of the associated compile-time
@@ -102,7 +105,7 @@ impl<'a> CodeBuilder<'a> {
     pub fn wasm_binary(
         &mut self,
         wasm_bytes: impl Into<Cow<'a, [u8]>>,
-        wasm_path: Option<&'a Path>,
+        wasm_path: Option<&'a str>,
     ) -> Result<&mut Self> {
         if self.wasm.is_some() {
             bail!("cannot configure wasm bytes twice");
@@ -110,6 +113,9 @@ impl<'a> CodeBuilder<'a> {
         self.wasm = Some(wasm_bytes.into());
         self.wasm_path = wasm_path.map(|p| p.into());
 
+        // DWARF-package auto-probing reads a sibling `.dwp` file from disk, which
+        // only exists under `std`.
+        #[cfg(feature = "std")]
         if self.wasm_path.is_some() {
             self.dwarf_package_from_wasm_path()?;
         }
@@ -134,7 +140,7 @@ impl<'a> CodeBuilder<'a> {
     pub fn wasm_binary_or_text(
         &mut self,
         wasm_bytes: &'a [u8],
-        wasm_path: Option<&'a Path>,
+        wasm_path: Option<&'a str>,
     ) -> Result<&mut Self> {
         #[cfg(feature = "wat")]
         let wasm_bytes = wat::parse_bytes(wasm_bytes).map_err(|mut e| {
@@ -166,10 +172,11 @@ impl<'a> CodeBuilder<'a> {
     ///
     /// If DWARF fusion is performed and the DWARF packaged file cannot be read
     /// then an error will be returned.
+    #[cfg(feature = "std")]
     pub fn wasm_binary_file(&mut self, file: &'a Path) -> Result<&mut Self> {
         let wasm = std::fs::read(file)
             .with_context(|| format!("failed to read input file: {}", file.display()))?;
-        self.wasm_binary(wasm, Some(file))
+        self.wasm_binary(wasm, file.to_str())
     }
 
     /// Equivalent of [`CodeBuilder::wasm_binary_file`] that also accepts the
@@ -184,11 +191,12 @@ impl<'a> CodeBuilder<'a> {
     ///
     /// In addition to the errors returned by [`CodeBuilder::wasm_binary_file`]
     /// this may also fail if the text format is read and the syntax is invalid.
+    #[cfg(feature = "std")]
     pub fn wasm_binary_or_text_file(&mut self, file: &'a Path) -> Result<&mut Self> {
         #[cfg(feature = "wat")]
         {
             let wasm = wat::parse_file(file)?;
-            self.wasm_binary(wasm, Some(file))
+            self.wasm_binary(wasm, file.to_str())
         }
         #[cfg(not(feature = "wat"))]
         {
@@ -676,6 +684,7 @@ impl<'a> CodeBuilder<'a> {
     /// [`CodeBuilder::wasm_binary_file`].
     ///
     /// This method will also return an error if `file` cannot be read.
+    #[cfg(feature = "std")]
     pub fn dwarf_package_file(&mut self, file: &Path) -> Result<&mut Self> {
         if self.dwarf_package.is_some() {
             bail!("cannot call `dwarf_package` or `dwarf_package_file` twice");
@@ -683,14 +692,18 @@ impl<'a> CodeBuilder<'a> {
 
         let dwarf_package = std::fs::read(file)
             .with_context(|| format!("failed to read dwarf input file: {}", file.display()))?;
-        self.dwarf_package_path = Some(Cow::Owned(file.to_owned()));
+        self.dwarf_package_path = file.to_str().map(|s| Cow::Owned(s.to_string()));
         self.dwarf_package = Some(dwarf_package.into());
 
         Ok(self)
     }
 
+    // Sibling `.dwp` auto-probing reads the filesystem, so it only exists under
+    // `std`; on the kernel build no source path is set and DWARF fusion is unused.
+    #[cfg(feature = "std")]
     fn dwarf_package_from_wasm_path(&mut self) -> Result<&mut Self> {
-        let dwarf_package_path_buf = self.wasm_path.as_ref().unwrap().with_extension("dwp");
+        let wasm_path = self.wasm_path.as_ref().unwrap();
+        let dwarf_package_path_buf = Path::new(wasm_path.as_ref()).with_extension("dwp");
         if dwarf_package_path_buf.exists() {
             return self.dwarf_package_file(dwarf_package_path_buf.as_path());
         }
@@ -805,8 +818,8 @@ impl<'a> CodeBuilder<'a> {
 /// of this hash dictate when artifacts are or aren't re-used.
 pub struct HashedEngineCompileEnv<'a>(pub &'a Engine);
 
-impl std::hash::Hash for HashedEngineCompileEnv<'_> {
-    fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+impl core::hash::Hash for HashedEngineCompileEnv<'_> {
+    fn hash<H: core::hash::Hasher>(&self, hasher: &mut H) {
         // Hash the compiler's state based on its target and configuration.
         if let Some(compiler) = self.0.compiler() {
             compiler.triple().hash(hasher);

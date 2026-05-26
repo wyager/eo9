@@ -861,7 +861,7 @@ impl Engine {
     /// compatible [`Config`]s. If this Hash matches between two [`Engine`]s then binaries
     /// from one are guaranteed to deserialize in the other.
     #[cfg(any(feature = "cranelift", feature = "winch"))]
-    pub fn precompile_compatibility_hash(&self) -> impl std::hash::Hash + '_ {
+    pub fn precompile_compatibility_hash(&self) -> impl core::hash::Hash + '_ {
         crate::compile::HashedEngineCompileEnv(self)
     }
 

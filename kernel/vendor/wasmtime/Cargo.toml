@@ -89,9 +89,10 @@ coredump = [
     "runtime",
     "std",
 ]
+# no_std: the kernel enables `cranelift` for on-target codegen without std (plan/12 D26-28).
+# The compile glue in this crate that genuinely needs std is cfg(feature = "std")-gated.
 cranelift = [
     "dep:wasmtime-cranelift",
-    "std",
     "wasmtime-unwinder/cranelift",
 ]
 custom-native-signals = []

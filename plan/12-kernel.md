@@ -270,3 +270,143 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
    the friendlier missing-fs story), session manifests for headless `program=` runs, and the riscv64/x86_64
    ports. On-target codegen remains the next rung and is what unlocks composition in the bare-metal shell.
 
+26. **On-target codegen — checkpoint 1: the fork surface is mapped and far smaller than feared (no_std
+    cranelift + wasmtime compile layers).** Owner ruling (2026-05-26): fork cranelift now rather than wait
+    for upstream's in-flight no_std work; keep forks under `kernel/vendor`, kernel-workspace-only, behind a
+    new off-by-default `wasm-codegen` cargo feature so `cargo xtask ci` (which builds the kernel workspace
+    featureless — wasmtime isn't compiled) stays untouched. Survey of the wasmtime 45 / cranelift 0.132
+    compile path, by crate:
+    - **cranelift-codegen 0.132 — no source edits needed; controlled by features.** Already `#![no_std]`
+      with a `core` feature and a hashbrown fallback for `HashMap`/`HashSet`; `extern crate std` is
+      `#[cfg(feature = "std")]`; the only non-`core`/`alloc` uses are `souper_harvest` (behind
+      `#[cfg(feature = "souper-harvest")]`) and `timing`'s `std::time::Instant` (behind
+      `#[cfg(feature = "timing")]`). Building with `default-features = false` + `["core", "host-arch",
+      "pulley"]` (no `std`/`timing`/`souper-harvest`) is no_std-clean. Its `build.rs` runs ISLE codegen at
+      build time on the host — fine. **Do not vendor it.** Same expectation for the small cranelift
+      sub-crates (frontend, entity, bforest, bitset, control, assembler-x64): no_std-capable via features.
+    - **wasmtime-environ 45 — vendor + edit (bounded).** Already `#![no_std]`, but its `compile` feature
+      requires `std` and pulls alloc-friendly deps deliberately (`object/write_core`, `gimli/write`,
+      `wasm-encoder`, `wasmprinter`). The `compile` module's residual `std::` (~79 lines / 21 files) is
+      mostly mechanical core/alloc swaps (`std::ops::Range`→`core::ops::Range`, `std::mem`→`core::mem`,
+      `std::borrow::Cow`→`alloc::borrow::Cow`, `std::collections::HashMap`→the crate's hashbrown alias,
+      `std::sync::Arc`→`alloc::sync::Arc`, `std::any::Any`→`core::any::Any`). The genuine std touchpoints to
+      resolve are few — notably `std::path::PathBuf` in `compile/module_environ.rs` (module-name/debug
+      paths during translation; replace with an `alloc` string or feature-gate). Work: drop `std` from the
+      `compile` feature and fix those residuals.
+    - **wasmtime-internal-cranelift 45 — vendor + edit (the main work crate).** Not yet `#![no_std]`; ~43
+      `std::` lines / 16 files. Work: add `#![no_std]` + `extern crate alloc`, convert std→core/alloc, and
+      drive `object`/`gimli` through their alloc-only write paths. This is where the bulk of the elbow grease
+      is; nothing here looked fundamentally std-bound on inspection (it's the `Compiler` impl glue, not OS
+      services).
+    - **wasmtime (already vendored) — extend the existing patch.** Add the `cranelift`/`compile` features to
+      the kernel build path and make `cranelift` not transitively force `std`. object/gimli/target-lexicon/
+      wasmprinter/wasm-encoder are controlled via features in the dependents, not vendored.
+    Net vendor set for the rung: **two new crates** (wasmtime-environ, wasmtime-internal-cranelift) plus the
+    existing wasmtime patch — cranelift proper stays from the registry behind feature flags. cranelift emits
+    **native aarch64** (not Pulley); Pulley is only a diagnostic fallback that would skip the code-publication
+    work (it needs the same compile crates, so it does not avoid this fork). Recommended sequence:
+    feature-degate → no_std-ify the two crates → compile a trivial module in-kernel under QEMU (checkpoint 2,
+    + real code publication, Decision 27) → full component (checkpoint 3) → wire the shell's `compile`/`$`/`&`
+    (checkpoint 4). Risk note: a 45→newer wasmtime bump would re-touch the CM-async ABI constants the binder
+    and kernel mirror, so this fork should ride the same pin (45) until a deliberate bump.
+
+27. **On-target codegen — code publication / cache maintenance (checkpoint 2 runtime side).** Cranelift in
+    the kernel emits real aarch64 machine code into a heap allocation that must be made coherent before it is
+    executed. The current `BareMetalCodeMemory::publish_executable` only issued `dsb ish; isb` (correct for
+    QEMU TCG, which keeps I-fetch coherent with stores, and for the flat everything-executable identity map).
+    This change makes it correct for real hardware: clean the D-cache to the point of unification by
+    `CTR_EL0.DminLine` (`dc cvau`), `dsb ish`, invalidate the I-cache to PoU by `CTR_EL0.IminLine`
+    (`ic ivau`), `dsb ish; isb`, over the published range. W^X (mapping code read-only/executable and data
+    non-executable) remains a separate MMU hardening item (Decision 3); cache maintenance is the part that is
+    required even under the current flat map and is independently correct, so it lands now (it also already
+    runs for the deserialized AOT artifacts). The publisher's `required_alignment` stays 1 until W^X
+    introduces page granularity.
+
+28. **On-target codegen — checkpoint 2 in progress: the real blocker is feature unification, not the
+    crates themselves.** Decision 26's per-crate survey was right that `cranelift-codegen` 0.132 and the
+    cranelift sub-crates build no_std via features — confirmed: with the dependency graph fixed (below), the
+    whole codegen backend (cranelift-codegen, cranelift-frontend, cranelift-entity/bitset/control, the ISLE
+    output, gimli read/write, object write_core) compiles clean for `aarch64-unknown-none`. What Decision 26
+    missed is that several *dependents* hardcode `std` in their dependency feature lists, so Cargo feature
+    unification drags `std` (and std-only crates) back onto the no_std target no matter what the leaf crates
+    support. The vendor set is therefore **five crates**, not two:
+    - `wasmtime` (already vendored) — `cranelift` feature no longer pulls `std`.
+    - `wasmtime-environ` — `compile` feature no longer pulls `std`; `wasm-encoder` taken `default-features =
+      false`; `wasmprinter` dropped from `compile` (it pulled `termcolor`, which is std-only — the single
+      `wasmprinter::print_bytes` use was a Trace-level adapter-module dump, replaced with a byte-count log);
+      the `compile`/`fact` modules' mechanical `std::`→`core`/`alloc`/`hashbrown` swaps are done.
+    - `wasmtime-internal-cranelift` — `#![no_std]` + `extern crate alloc` added; `cranelift-codegen` taken
+      `core` (not `std`)+`unwind`+`host-arch`; `cranelift-frontend` `core`; `gimli` `read`-only; `object`
+      `write_core`; `itertools` `use_alloc`; `thiserror` `default-features = false`; `cranelift-native` made
+      optional + the host-flag-inference call gated (the kernel always specifies its target triple, so it is
+      never needed — and cranelift-native is std-only).
+    - `cranelift-frontend` and `wasmtime-internal-unwinder` — vendored *only* to change their
+      `cranelift-codegen` dependency from `features = ["std", …]` to the `core` profile. This is the crux:
+      either of those edges alone forces `cranelift-codegen/std`, which in turn pulls `gimli/std` and
+      `cranelift-control/fuzz` → `arbitrary` (a std crate) onto the target and breaks the build. Likewise
+      `thiserror`'s `std` default arrived via `wasmtime-internal-cranelift`.
+    All of the above is committed and verified not to disturb the existing builds (`wasm-codegen` is
+    off-by-default; `cargo xtask ci`, the featureless kernel, and `build-kernel` with the runtime features
+    stay green). The codegen build (`cargo build -p eo9-kernel --target aarch64-unknown-none --features
+    wasm-codegen`) now proceeds through the entire cranelift backend and into `wasmtime-environ`'s own source.
+    **Remaining to reach checkpoint 2 (precise punch list):**
+    a. The `clif_dir`/`emit_clif` CLIF-dump debugging feature is the last `std::path` touchpoint, and it is
+       genuinely cross-crate: `CompilerBuilder::clif_dir(&path::Path)` (environ `compile/mod.rs`), the impl +
+       `Option<PathBuf>` field + the `std::fs` write block (`wasmtime-cranelift` `builder.rs`/`compiler.rs`),
+       and `Config::emit_clif`/the `clif_dir` field (`wasmtime` `config.rs`). Gate the whole feature behind a
+       `std`/`compile-debug` cargo feature (off for the kernel), or switch the path types to `&str`/`String`
+       and gate only the `std::fs` write. Also `ModuleTranslation.path: Option<PathBuf>` (environ
+       `compile/module_environ.rs`) → `Option<String>` or gate.
+    b. `wasmtime-internal-cranelift`'s own source no_std-ification: ~43 `std::` lines across ~16 modules,
+       plus prelude threading — each module needs `use crate::*;` (the crate root now re-exports
+       `wasmtime_environ::prelude::*`) so `Vec`/`String`/`Box`/`format!`/`vec!` resolve under `#![no_std]`,
+       and `object`/`gimli` driven through their alloc-only `write_core`/`write` paths.
+    c. The in-kernel demo + verification: a `wasm-codegen`-gated `kernel/src/wasm/codegen.rs` that builds a
+       compiling engine (target `aarch64-unknown-none`, the same compile-relevant flags as xtask's
+       `precompile_for_kernel`, plus the existing `BareMetalCodeMemory` publisher — Decision 27), compiles a
+       trivial module from embedded wasm bytes via `Module::new` on-target, publishes it, and calls it. That
+       run under QEMU is checkpoint 2; the full component path + wiring `compile`/`$`/`&` into the shell is
+       checkpoint 3–4.
+    Std-crate intruders to watch for as the build advances (all resolved so far by `default-features = false`
+    at the offending edge): `arbitrary` (via `cranelift-control/fuzz`), `termcolor` (via `wasmprinter`),
+    `wasm-encoder` `std` default, `thiserror` `std` default.
+
+29. **On-target codegen works — checkpoints 2 and 3 are done: the kernel compiles a component with Cranelift
+    on the machine and runs it.** Under `cargo xtask qemu aarch64` (in the `demo` sequence) the kernel now
+    prints, after the existing deserialize/async demos:
+    ```
+    wasm codegen: compiling a 298 byte component on-target with Cranelift…
+    wasm codegen: compiled on-target in ~83 ms
+    wasm codegen: hello() -> "Hello from a WebAssembly component on bare-metal Eo9!"
+    wasm codegen: add(17, 25) -> 42
+    ```
+    i.e. the seed component is handed to `Component::new` (not `Component::deserialize`), Cranelift emits
+    native aarch64 into a heap allocation, the cache-maintenance publisher (Decision 27) makes it executable,
+    and the resulting code runs and returns correct results. This retires the plan's single riskiest
+    assumption (that Cranelift runs under the kernel's `no_std + alloc`). The seed is a real component, so
+    this is checkpoint 3 as well.
+    - **Implementation:** `kernel/src/wasm/codegen.rs` (behind `wasm-codegen`) plus `new_engine` setting
+      `target("aarch64-unknown-none")` and the OS-less tunables. xtask ships the un-precompiled seed wasm
+      (`EO9_SEED_WASM`) and enables `wasm-codegen` in `build-kernel`. The no_std source port of the five
+      vendored crates is detailed in `kernel/vendor/README.md`; the headline subtleties were the
+      hashbrown-vs-std `Equivalent`/`get` and `#[may_dangle]` dropck differences, a local no_std `Mutex` for
+      the compiler-context pool, and switching the `clif_dir`/`Path` debug surfaces to `String`/`&str` with
+      the actual filesystem writes gated behind `std`.
+    - **Native-host check (the gotcha):** linking the compiler makes wasmtime run its
+      `check_compatible_with_native_host` on *every* engine, including the deserialize ones. It passes
+      because the kernel is built **for** `aarch64-unknown-none`, so `target_lexicon::Triple::host()` equals
+      the explicitly-set target; the OS-less tunables (no signals, no VM reservations/guards, no CoW) are
+      what the rest of that check verifies. `cranelift-native` stays disabled (host CPU inference needs
+      `std`), which is why the target must be named rather than inferred.
+    - **Numbers:** kernel image **7.8 MB → 16.4 MB** with `wasm-codegen` on (Cranelift + the compile layers
+      add ~8.6 MB). On-target compile of the ~300-byte seed component ≈ 83 ms under QEMU TCG (vs ≈ 28 ms to
+      *deserialize* the host-AOT artifact of the same component — codegen is the slower path, as expected,
+      but it is real and removes the host-AOT dependency). Determinism not yet measured bit-for-bit; the
+      seed compiles to a fixed result across runs but a cross-run artifact-hash comparison is future work.
+    - **CI stays lean:** `wasm-codegen` is off by default, so `cargo xtask ci` (featureless kernel) does not
+      compile Cranelift; it stays green. `build-kernel`/`qemu`/`demo`/`program=`/interactive-eosh all work.
+    - **Next (checkpoint 4):** wire the shell's `compile` to actually compile (today it deserializes a baked
+      AOT artifact) and enable `$`/`&` composition in the bare-metal eosh (currently a clean "not
+      implemented on the bare-metal kernel yet" error). That makes on-target codegen reachable interactively
+      rather than only in the boot demo. Then: optional fuel-on-metal and a determinism check.
+

@@ -19,6 +19,8 @@
 
 #[cfg(feature = "wasm-async")]
 pub mod async_demo;
+#[cfg(feature = "wasm-codegen")]
+pub mod codegen;
 #[cfg(feature = "wasm-hello")]
 pub mod hello;
 #[cfg(any(feature = "wasm-hello", feature = "wasm-async", feature = "wasm-store"))]
@@ -56,6 +58,11 @@ use wasmtime::{Config, CustomCodeMemory, Engine};
 /// them from the `aarch64-unknown-none` target.
 pub fn new_engine() -> Result<Engine, wasmtime::Error> {
     let mut config = Config::new();
+    // With the compiler (`wasm-codegen`) linked in, wasmtime would otherwise try to infer
+    // the host target through `cranelift-native`, which needs `std` and is disabled here.
+    // The kernel is built *for* this triple, so `Triple::host()` equals it and execution of
+    // both deserialized and on-target-compiled code is accepted as native.
+    config.target("aarch64-unknown-none")?;
     config.wasm_component_model(true);
     // The component-model async ABI plus the two sub-features the eo9 guest SDK relies on
     // (stackful async lifts and the extra async built-ins behind waitable-set waits).
@@ -64,38 +71,98 @@ pub fn new_engine() -> Result<Engine, wasmtime::Error> {
     config.wasm_component_model_async(true);
     config.wasm_component_model_async_stackful(true);
     config.wasm_component_model_more_async_builtins(true);
+    // The OS-less tunables. These match xtask's `precompile_for_kernel` so deserialized
+    // artifacts load, and — now that the compiler (`wasm-codegen`) is linked, which makes
+    // wasmtime run its native-host compatibility check on every engine — they are also what
+    // make this engine pass that check (no native signals, no virtual-memory reservations or
+    // guards, no copy-on-write memory initialization).
+    config.signals_based_traps(false);
+    config.memory_reservation(0);
+    config.memory_reservation_for_growth(1 << 20);
+    config.memory_guard_size(0);
+    config.memory_init_cow(false);
+    config.concurrency_support(true);
     // Without virtual memory wasmtime cannot flip page protections itself, so it asks the
-    // embedder to "publish" code memory; on this machine that is a no-op (see below).
+    // embedder to "publish" code memory; on this machine that is D-cache clean + I-cache
+    // invalidate over the range (see below), no page-permission flips.
     config.with_custom_code_memory(Some(Arc::new(BareMetalCodeMemory)));
     Engine::new(&config)
 }
 
 /// Executable-memory "publisher" for this kernel's flat identity map.
 ///
-/// Precompiled code lands in an ordinary heap allocation, and the identity map
-/// (src/mmu.rs) keeps all of RAM readable, writable, and executable, so there are no page
-/// permissions to flip; publishing only needs barriers so the new instructions are visible
-/// before they are jumped to. QEMU's TCG keeps the instruction stream coherent with memory
-/// writes, but real hardware (and any future W^X mapping) needs D-cache clean + I-cache
-/// invalidate over the range here.
+/// Code — whether deserialized from an AOT artifact today or emitted on-target by Cranelift
+/// once `wasm-codegen` lands (plan/12 Decisions 26–27) — lands in an ordinary heap
+/// allocation, and the identity map (src/mmu.rs) keeps all of RAM readable, writable, and
+/// executable, so there are no page permissions to flip. Making the new instructions
+/// visible to the fetch path is real cache maintenance, not just barriers: QEMU's TCG keeps
+/// the instruction stream coherent with stores, but on real hardware the freshly written
+/// bytes sit in the D-cache while the I-cache may hold stale lines, so we clean D to the
+/// point of unification then invalidate I over the published range (W^X page protections
+/// remain a separate MMU item, Decision 3).
 struct BareMetalCodeMemory;
 
 impl CustomCodeMemory for BareMetalCodeMemory {
     fn required_alignment(&self) -> usize {
-        // The whole map is executable; no page-granularity requirement applies.
+        // The whole map is executable; no page-granularity requirement applies (until W^X).
         1
     }
 
-    fn publish_executable(&self, _ptr: *const u8, _len: usize) -> wasmtime::Result<()> {
-        // SAFETY: barriers have no side effects beyond ordering. (Cache maintenance is not
-        // needed under QEMU TCG; see the type-level docs.)
-        unsafe { core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
+    fn publish_executable(&self, ptr: *const u8, len: usize) -> wasmtime::Result<()> {
+        // SAFETY: the [ptr, ptr+len) range is the code memory wasmtime just wrote and is
+        // about to execute; cache-maintenance ops over it have no effect beyond making the
+        // I-fetch path observe those writes. A zero-length publish is a no-op.
+        unsafe { publish_code_range(ptr, len) };
         Ok(())
     }
 
     fn unpublish_executable(&self, _ptr: *const u8, _len: usize) -> wasmtime::Result<()> {
         Ok(())
     }
+}
+
+/// Make `[ptr, ptr+len)` coherent with the instruction-fetch path on aarch64: clean the
+/// D-cache to the point of unification by line, then invalidate the I-cache to PoU by line,
+/// with the barriers the architecture requires between and after. Line sizes come from
+/// `CTR_EL0` (`DminLine`/`IminLine`, each `log2` of the line size in 32-bit words).
+///
+/// # Safety
+/// `ptr`/`len` must describe a readable range that the caller owns; the ops are otherwise
+/// side-effect-free.
+unsafe fn publish_code_range(ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let start = ptr as usize;
+    let end = start + len;
+
+    let ctr: usize;
+    // SAFETY: CTR_EL0 is readable at EL1 and has no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags))
+    };
+    let dminline = 4usize << ((ctr >> 16) & 0xf); // D-cache line, bytes
+    let iminline = 4usize << (ctr & 0xf); // I-cache line, bytes
+
+    // Clean D-cache to PoU by line, then ensure completion before invalidating I.
+    let mut addr = start & !(dminline - 1);
+    while addr < end {
+        // SAFETY: `dc cvau` is a clean-by-VA op over owned memory.
+        unsafe { core::arch::asm!("dc cvau, {}", in(reg) addr, options(nostack, preserves_flags)) };
+        addr += dminline;
+    }
+    // SAFETY: ordering barrier only.
+    unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
+
+    // Invalidate I-cache to PoU by line.
+    addr = start & !(iminline - 1);
+    while addr < end {
+        // SAFETY: `ic ivau` is an invalidate-by-VA op over owned memory.
+        unsafe { core::arch::asm!("ic ivau, {}", in(reg) addr, options(nostack, preserves_flags)) };
+        addr += iminline;
+    }
+    // SAFETY: ordering + context-synchronization so the new instructions are fetched.
+    unsafe { core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
 }
 
 // --- wasmtime custom-platform hooks ------------------------------------------------------
