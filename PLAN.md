@@ -85,6 +85,12 @@ eo9/
 - **I4** — bare metal: first arch boots in QEMU, runs a headless program, output over serial (on-target
   codegen lands as the immediately following kernel milestone).
 - **I5** — all three arches boot to eosh; usermode + QEMU test suites green in CI.
+- **Demo** (usermode showcase; slots in after I2, independent of bare metal) — `cargo install eo9; eo9` drops the
+  user into a usermode Eo9 "VM": bare `eo9` boots to eosh against the host-OS-backed root providers with a
+  store seeded from components bundled inside the binary (eosh, the standard stubs, the examples, and a few
+  small demo tools), and `eo9 <file> [args…]` runs an arbitrary component from the host filesystem (implicit
+  `run`). Pieces: runtime exec-to-guests, eosh store-backed resolution, CLI defaults (bare → shell,
+  path → run), store seeding from embedded components, demo tools.
 
 ## Review & merge workflow
 
