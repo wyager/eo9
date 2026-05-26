@@ -2,7 +2,8 @@
 //! (plan/11-usermode.md): `run` of hello / outcomes / cruncher with the three-way
 //! outcome and exit codes, compile-cache behaviour on a second run, the memory-limit
 //! flag, store-resolved names, `describe`, `compile`, `store` subcommands, and the
-//! readwrite end to end through the unix fs provider, and the `shell` stub.
+//! readwrite end to end through the unix fs provider, and `shell` transcripts (one-shot
+//! `-c` commands and a piped interactive session) running eosh against the session view.
 //!
 //! The tests drive the real binary (`CARGO_BIN_EXE_eo9`) as a subprocess, with the
 //! module store pointed at a per-test directory under `CARGO_TARGET_TMPDIR`. Example
@@ -69,12 +70,39 @@ struct Run {
 
 /// Run the eo9 binary with `args`, using `store` as the module store root.
 fn eo9(store: &Path, args: &[&str]) -> Run {
+    eo9_with_stdin(store, args, None)
+}
+
+/// Run the eo9 binary, optionally feeding `stdin` (used for interactive-shell
+/// transcripts; the text provider reads the piped stream like any stdin).
+fn eo9_with_stdin(store: &Path, args: &[&str], stdin: Option<&str>) -> Run {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
     ensure_components();
-    let output = Command::new(env!("CARGO_BIN_EXE_eo9"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_eo9"));
+    command
         .args(args)
         .env("EO9_STORE", store)
         .current_dir(repo_root())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    let mut child = command.spawn().expect("failed to start the eo9 binary");
+    if let Some(script) = stdin {
+        child
+            .stdin
+            .take()
+            .expect("stdin was piped")
+            .write_all(script.as_bytes())
+            .expect("failed to write the shell transcript");
+    }
+    let output = child
+        .wait_with_output()
         .expect("failed to run the eo9 binary");
     Run {
         code: output.status.code().expect("eo9 exited without a code"),
@@ -561,16 +589,162 @@ fn missing_arguments_are_a_spawn_error() {
     );
 }
 
+// -----------------------------------------------------------------------------------
+// The shell (eosh running under `eo9 shell`)
+// -----------------------------------------------------------------------------------
+
 #[test]
-fn shell_is_a_clear_stub() {
-    let store = temp_store("shell");
-    let run = eo9(&store, &["shell"]);
-    assert_eq!(run.code, 3);
-    assert!(
-        run.stderr.contains("not available yet"),
-        "unexpected stub message: {}",
-        run.stderr
+fn shell_runs_a_program_by_bare_name() {
+    // One-shot mode: eosh resolves `hello` as /bin/hello.wasm on the session fs (seeded
+    // from the dev-tree components here), composes nothing, compiles, spawns it as a
+    // child with the session root providers, and renders the child's own outcome.
+    let store = temp_store("shell-hello");
+    let run = eo9(
+        &store,
+        &["shell", "-c", "hello --name shell --excited true"],
     );
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(run.stdout.contains("Hello, shell!"), "{}", run.stdout);
+    assert!(run.stdout.contains("ok: greeted"), "{}", run.stdout);
+}
+
+#[test]
+fn shell_describe_builtin_inspects_without_running() {
+    let store = temp_store("shell-describe");
+    let run = eo9(&store, &["shell", "-c", "describe hello"]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(run.stdout.contains("kind: binary"), "{}", run.stdout);
+    assert!(run.stdout.contains("--name: string"), "{}", run.stdout);
+    assert!(run.stdout.contains("eo9:text/text"), "{}", run.stdout);
+    // Describing does not run the program.
+    assert!(!run.stdout.contains("Hello"), "{}", run.stdout);
+}
+
+#[test]
+fn shell_composes_with_the_algebra() {
+    // An (unconfigured) provider composed onto a pure-compute binary: `$` goes through
+    // eosh's algebra imports, the result compiles and runs, and the digest matches what
+    // the same seed produces under `eo9 run` (composition with an unused provider is the
+    // identity on behaviour).
+    let store = temp_store("shell-compose");
+    let run = eo9(
+        &store,
+        &[
+            "shell",
+            "-c",
+            "entropy.seeded $ cruncher --seed 3 --rounds 100",
+        ],
+    );
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(run.stdout.contains("ok: digest("), "{}", run.stdout);
+
+    let direct = eo9(
+        &store,
+        &[
+            "run",
+            &component_arg("cruncher"),
+            "--seed",
+            "3",
+            "--rounds",
+            "100",
+        ],
+    );
+    let digest = |text: &str| {
+        text.lines()
+            .find_map(|line| {
+                let start = line.find("digest(")?;
+                line[start..]
+                    .strip_prefix("digest(")?
+                    .split(')')
+                    .next()
+                    .map(str::to_owned)
+            })
+            .expect("a digest in the output")
+    };
+    assert_eq!(digest(&run.stdout), digest(&direct.stdout));
+}
+
+#[test]
+fn shell_maps_child_failures_to_exit_code_1() {
+    let store = temp_store("shell-fail");
+    let failed = eo9(
+        &store,
+        &["shell", "-c", "outcomes --mode fail --detail boom"],
+    );
+    assert_eq!(failed.code, 1, "stdout: {}", failed.stdout);
+    assert!(
+        failed.stdout.contains("error: requested-failure(\"boom\")"),
+        "{}",
+        failed.stdout
+    );
+    assert!(
+        failed.stdout.contains("failure(command-failed("),
+        "the shell's own outcome should be a failure: {}",
+        failed.stdout
+    );
+
+    let unknown = eo9(&store, &["shell", "-c", "nosuchprogram"]);
+    assert_eq!(unknown.code, 1, "stdout: {}", unknown.stdout);
+    assert!(
+        unknown.stdout.contains("cannot resolve `nosuchprogram`"),
+        "{}",
+        unknown.stdout
+    );
+}
+
+#[test]
+fn shell_interactive_transcript_with_let_bindings() {
+    // Interactive mode over a piped stdin (no TTY needed): a `let` binding, a use of it
+    // with flags, and a clean exit.
+    let store = temp_store("shell-interactive");
+    let run = eo9_with_stdin(
+        &store,
+        &["shell"],
+        Some("let h = hello\nh --name fromlet --excited true\nexit\n"),
+    );
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(run.stdout.contains("eosh>"), "{}", run.stdout);
+    assert!(run.stdout.contains("Hello, fromlet!"), "{}", run.stdout);
+    assert!(run.stdout.contains("ok: greeted"), "{}", run.stdout);
+}
+
+#[test]
+fn shell_resolves_store_bound_names_and_eosh_from_the_store() {
+    // Bind eosh and a program under a name that exists only in the store: the session
+    // bin view must come from the store bindings (hardlinks to store objects), not from
+    // the dev tree, and eosh itself must be found via its store binding.
+    let store = temp_store("shell-store-names");
+    let add_eosh = eo9(
+        &store,
+        &[
+            "store",
+            "add",
+            &component_path("hello")
+                .with_file_name("eosh.wasm")
+                .display()
+                .to_string(),
+            "--name",
+            "eosh",
+        ],
+    );
+    assert_eq!(add_eosh.code, 0, "stderr: {}", add_eosh.stderr);
+    let add_greeter = eo9(
+        &store,
+        &["store", "add", &component_arg("hello"), "--name", "greeter"],
+    );
+    assert_eq!(add_greeter.code, 0, "stderr: {}", add_greeter.stderr);
+
+    let run = eo9(
+        &store,
+        &["shell", "-c", "greeter --name store --excited false"],
+    );
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(run.stdout.contains("Hello, store."), "{}", run.stdout);
+    assert!(run.stdout.contains("ok: greeted"), "{}", run.stdout);
+
+    // The session bin view lives under the store root and holds the bound names.
+    assert!(store.join("shell/bin/greeter.wasm").is_file());
+    assert!(store.join("shell/bin/eosh.wasm").is_file());
 }
 
 // -----------------------------------------------------------------------------------

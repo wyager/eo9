@@ -67,20 +67,7 @@ pub fn cmd_run(cfg: &Config, reference: &str, flags: &[(String, String)]) -> Res
     )
     .map_err(|err| format!("cannot spawn {}: {err}", source.origin))?;
 
-    // The built-in drive loop: donate, run, park on I/O, repeat.
-    let mut resumes: u64 = 0;
-    let outcome = loop {
-        resumes += 1;
-        match task.resume(RESUME_DONATION) {
-            ResumeOutcome::Done(outcome) => break outcome,
-            ResumeOutcome::OutOfFuel => {}
-            ResumeOutcome::Blocked => providers::wait_until_runnable(&task),
-        }
-    };
-    vlog!(
-        cfg,
-        "task finished after {resumes} resume donation(s) of {RESUME_DONATION} fuel"
-    );
+    let outcome = drive_to_completion(cfg, &mut task);
     if let Outcome::Success(value) | Outcome::Failure(value) = &outcome
         && !value.ty.is_empty()
     {
@@ -90,6 +77,25 @@ pub fn cmd_run(cfg: &Config, reference: &str, flags: &[(String, String)]) -> Res
     let (rendered, code) = render_outcome(&outcome);
     println!("{rendered}");
     Ok(code)
+}
+
+/// The built-in drive loop: donate fuel, run, park the thread on I/O, repeat until the
+/// task finishes. Shared by `eo9 run` and `eo9 shell`.
+pub(crate) fn drive_to_completion(cfg: &Config, task: &mut Task) -> Outcome {
+    let mut resumes: u64 = 0;
+    let outcome = loop {
+        resumes += 1;
+        match task.resume(RESUME_DONATION) {
+            ResumeOutcome::Done(outcome) => break outcome,
+            ResumeOutcome::OutOfFuel => {}
+            ResumeOutcome::Blocked => providers::wait_until_runnable(task),
+        }
+    };
+    vlog!(
+        cfg,
+        "task finished after {resumes} resume donation(s) of {RESUME_DONATION} fuel"
+    );
+    outcome
 }
 
 /// Bind `--flag value` pairs to `main`'s parameters. A flag filling a `string`-typed
@@ -124,7 +130,7 @@ fn requires_fs(imports: &[ImportNeed]) -> bool {
 
 /// Render the executor's view of how the task ended as the spec's three-way
 /// `program-outcome` (success / failure / abnormal) in WAVE, plus the process exit code.
-fn render_outcome(outcome: &Outcome) -> (String, u8) {
+pub(crate) fn render_outcome(outcome: &Outcome) -> (String, u8) {
     match outcome {
         Outcome::Success(value) => (render_arm("success", value), EXIT_SUCCESS),
         Outcome::Failure(value) => (render_arm("failure", value), EXIT_FAILURE),
@@ -145,7 +151,7 @@ fn render_arm(arm: &str, value: &WaveValue) -> String {
 }
 
 /// Encode text as a WAVE string literal.
-fn wave_string(text: &str) -> String {
+pub(crate) fn wave_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
     for ch in text.chars() {

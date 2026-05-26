@@ -92,20 +92,43 @@ its first milestones, and to be the place where cross-area seams get found.
    the same path (and, since it goes through `Image::compile`, rejects providers as not-a-binary — the cache
    holds closed binaries per the spec); when the artifact could not actually be cached it says so instead of
    claiming "cached".
-8. **`eo9 shell` is stubbed** with a clear message: it needs the runtime to expose `eo9:exec` to guests
-   (plan 04 deferred) and eosh itself (area 10).
+8. **`eo9 shell` runs eosh against a session.** `eo9 shell [-c <command>]` spawns the eosh component as an
+   ordinary Eo9 program and drives it with the same built-in loop as `run`; interactive when `-c` is absent
+   (the REPL's blocking `read-line` goes through the terminal text provider, so piped stdin works too), one
+   command line when present; exit codes follow the shell's own outcome (clean exit 0, `command-failed`/io 1,
+   abnormal 2), and a clean exit prints nothing beyond what eosh already printed.
+   *eosh lookup order:* the store-bound name `eosh` first, then the dev-tree artifact
+   `guest/target/components/eosh.wasm` relative to the current directory; neither present ⇒ a clear error
+   telling the user to `store add … --name eosh` or `cargo xtask build-guest`.
+   *Session layout:* `<store-root>/shell/` is the session directory granted to eosh as its fs root;
+   `shell/bin/<name>.wasm` is rebuilt on every shell start from (a) every bound store name (hard-linked to
+   the store object, copied if linking fails) and (b) the dev-tree components under their shell names
+   (`eo9-example-hello`→`hello`, `eo9-stub-entropy-seeded`→`entropy.seeded`, `eosh` verbatim), with store
+   bindings winning on collision — because eosh resolves program names as `/bin/<name>.wasm` on its granted
+   fs (plan 10 D4).
+   *Grants:* eosh gets terminal stdio, host clocks, OS RNG, the session fs, and the exec capability
+   (`ExecProvider` over the image's engine); its `ChildPolicy` hands children exactly the session root
+   providers a direct `eo9 run` would get (text/time/entropy, fs only when `--fs-root` was given) and never
+   exec itself. Known limitations, documented not solved: children execute inside the shell's own fuel
+   donations (runtime escalation E5), so a long-running child throttles the shell; the shell and its
+   children share the raw stdin/stdout streams (no multiplexing); and configured-provider transcripts
+   (`fs.memfs $ readwrite`, `time.frozen $ hello`) currently trap inside the unconfigured stub — they need
+   eosh's compose-time `configure` support (area 10, in flight), so the composed-stub test uses an
+   unconfigured compose (`entropy.seeded $ cruncher`) and a configured transcript is a follow-up.
 9. **Tests.** Unit tests cover the argv parser, cache-key construction, WAVE string quoting/arg binding, the
-   outcome→exit-code mapping, and the oneshot bridge. Integration tests (`crates/eo9/tests/cli.rs`) drive the
-   real binary against the built example components: hello/outcomes (all arms incl. trap→abnormal)/cruncher
-   end to end, second-run launch from the cached image (stderr + use-count evidence, and no codegen
-   diagnostics on the hit), a tampered cache entry being refused and recompiled, a read-only cache never
-   failing a run (cold-cache insert failure and use-count-bump failure both degrade to warnings),
-   memory-limit enforcement, store add/ls/gc + run-by-name, describe, compile warm, `readwrite` end to end
-   through the unix fs provider (write + read-back against a temp `--fs-root`, fs failures staying in the
-   program's own vocabulary, escape attempts denied inside the root, and a run *without* `--fs-root` being
-   refused with the grant hint), and the shell stub. The test harness builds the components via
-   `cargo xtask build-guest` only when they are missing, so stale pre-existing components must be rebuilt by
-   hand after guest-facing WIT changes.
+   outcome→exit-code mapping, the oneshot bridge, the fs-grant check, and the dev-component shell-name
+   mapping. Integration tests (`crates/eo9/tests/cli.rs`) drive the real binary against the built example
+   components: hello/outcomes (all arms incl. trap→abnormal)/cruncher end to end, second-run launch from the
+   cached image (stderr + use-count evidence, and no codegen diagnostics on the hit), a tampered cache entry
+   being refused and recompiled, a read-only cache never failing a run (cold-cache insert failure and
+   use-count-bump failure both degrade to warnings), memory-limit enforcement, store add/ls/gc + run-by-name,
+   describe, compile warm, `readwrite` end to end through the unix fs provider (write + read-back against a
+   temp `--fs-root`, fs failures staying in the program's own vocabulary, escape attempts denied inside the
+   root, and a run *without* `--fs-root` being refused with the grant hint), and shell transcripts (bare-name
+   run, `describe`, an unconfigured compose checked against `eo9 run`'s digest, child failure / unknown name
+   ⇒ exit 1, a piped interactive `let` session, and store-bound names incl. eosh itself). The test harness
+   builds the components via `cargo xtask build-guest` only when they are missing, so stale pre-existing
+   components must be rebuilt by hand after guest-facing WIT changes.
 10. **xtask touch (authorized follow-up).** `xtask build` (and therefore `ci`) now also runs
     `cargo check -p eo9-sched --target aarch64-unknown-none`, after the kernel build so the pinned toolchain
     already has that target installed.
