@@ -67,7 +67,8 @@ impl<T: Send + 'static> Future for Oneshot<T> {
 /// A one-shot operation: the [`BoxOp`] future the runtime polls, and the completion
 /// closure handed to the provider. The unix providers guarantee exactly-once completion
 /// (on the success and error path alike), so the future can never be left dangling.
-fn oneshot<T: Send + 'static>() -> (BoxOp<T>, impl FnOnce(T) + Send + 'static) {
+/// (Also used by the interactive shell's text provider in `interactive.rs`.)
+pub(crate) fn oneshot<T: Send + 'static>() -> (BoxOp<T>, impl FnOnce(T) + Send + 'static) {
     let state = Arc::new(Mutex::new(OneshotState {
         value: None,
         waker: None,
@@ -464,19 +465,59 @@ pub fn child_root_providers(cfg: &Config) -> Providers {
 /// resolves programs from), and the exec capability — the one grant that makes eosh a
 /// native executor. Children spawned through that capability receive
 /// [`child_root_providers`], never exec itself.
+///
+/// `editor` replaces the plain stdio text provider with the interactive line editor
+/// (history + tab completion) when the session is interactive; it changes how the
+/// shell's input is typed, not what is granted.
 pub fn shell_providers(
     cfg: &Config,
     session_root: &Path,
     image: &Image,
+    editor: Option<crate::interactive::InteractiveText>,
 ) -> Result<Providers, String> {
     let child_cfg = cfg.clone();
     let policy = ChildPolicy::with_providers(move || child_root_providers(&child_cfg));
     let fs: Option<Box<dyn FsProvider>> =
         Some(Box::new(HostFs::new(session_root, cfg.exec_snapshot)?));
-    Ok(assemble(
-        fs,
-        Some(ExecProvider::new(image.engine(), policy)),
-    ))
+    let mut providers = assemble(fs, Some(ExecProvider::new(image.engine(), policy)));
+    if let Some(editor) = editor {
+        providers.text = Some(Box::new(editor));
+    }
+    Ok(providers)
+}
+
+/// The session manifest `eo9 shell` leaves at `<session>/session` for eosh's `env`
+/// builtin: a plain-text description of what the shell session holds and what programs
+/// started from it receive. Purely informational — the linking rules above are the
+/// authority. Keep this in sync with [`shell_providers`] / [`child_root_providers`]
+/// (it describes exactly the grants they assemble) and with eosh-core's `envinfo`
+/// parser (the `eo9-session 1` format).
+pub fn session_manifest(cfg: &Config) -> String {
+    let mut lines = vec![
+        "eo9-session 1".to_string(),
+        "shell text terminal standard streams".to_string(),
+        "shell time host clocks".to_string(),
+        "shell entropy host OS RNG".to_string(),
+        "shell fs the session directory (program names under /bin)".to_string(),
+        "shell exec spawn programs as children".to_string(),
+        "child text terminal standard streams (shared with the shell)".to_string(),
+        "child time host clocks".to_string(),
+        "child entropy host OS RNG".to_string(),
+    ];
+    match &cfg.fs_root {
+        Some(root) => lines.push(format!(
+            "child fs host directory {} (from --fs-root)",
+            root.display()
+        )),
+        None => lines.push(
+            "note programs get no filesystem: start the shell with --fs-root <dir> to grant one"
+                .to_string(),
+        ),
+    }
+    lines.push("note children never receive the exec capability".to_string());
+    let mut manifest = lines.join("\n");
+    manifest.push('\n');
+    manifest
 }
 
 /// The fixed part of every provider set this binary hands out: terminal stdio, host
@@ -559,6 +600,25 @@ mod tests {
         let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
         let mut context = Context::from_waker(&waker);
         assert_eq!(op.as_mut().poll(&mut context), Poll::Ready("done"));
+    }
+
+    #[test]
+    fn session_manifest_reflects_the_fs_grant() {
+        let without = session_manifest(&Config::default());
+        assert!(without.starts_with("eo9-session 1\n"));
+        assert!(without.contains("shell exec "));
+        assert!(without.contains("child entropy "));
+        assert!(!without.contains("child fs "));
+        assert!(without.contains("--fs-root"));
+
+        let cfg = Config {
+            fs_root: Some(std::path::PathBuf::from("/tmp/data")),
+            ..Config::default()
+        };
+        let with = session_manifest(&cfg);
+        assert!(with.contains("child fs host directory /tmp/data"));
+        assert!(!with.contains("programs get no filesystem"));
+        assert!(with.contains("never receive the exec capability"));
     }
 
     #[test]

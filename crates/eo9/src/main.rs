@@ -22,7 +22,10 @@
 
 mod cli;
 mod compile;
+mod complete;
 mod describe;
+mod editor;
+mod interactive;
 mod providers;
 mod run;
 mod seed;
