@@ -9,9 +9,7 @@
 
 use eo9_component::{ArgSpec, Component, ComponentKind};
 use eo9_runtime::task::FUEL_QUANTUM;
-use eo9_runtime::{
-    Image, NamedArg, Outcome, ResumeOutcome, SpawnLimits, Task, WaveValue, new_engine,
-};
+use eo9_runtime::{NamedArg, Outcome, ResumeOutcome, SpawnLimits, Task, WaveValue};
 
 use crate::cli::{Config, EXIT_ABNORMAL, EXIT_FAILURE, EXIT_SUCCESS, vlog};
 use crate::compile;
@@ -39,17 +37,10 @@ pub fn cmd_run(cfg: &Config, reference: &str, flags: &[(String, String)]) -> Res
     }
     let args = bind_args(&info.args, flags);
 
-    // Compile, keeping the store's compile cache warm (plan 06 key inputs).
+    // Obtain the image through the compile cache: a hit is deserialized without codegen,
+    // a miss compiles once and caches the very image that runs below (plan 06).
     let store = cfg.open_store()?;
-    let engine = new_engine(&compile::engine_options(cfg))
-        .map_err(|err| format!("cannot create the engine: {err:#}"))?;
-    compile::ensure_cached(cfg, &store, &source, |bytes| {
-        engine
-            .precompile_component(bytes)
-            .map_err(|err| format!("compilation of {} failed: {err:#}", source.origin))
-    })?;
-    let image = Image::compile(&engine, &source.bytes)
-        .map_err(|err| format!("{}: {err}", source.origin))?;
+    let loaded = compile::load_image(cfg, &store, &source)?;
 
     // Spawn against the unix root providers. Only interfaces the component imports are
     // linked; an import beyond what the runtime can provide is rejected here.
@@ -57,7 +48,7 @@ pub fn cmd_run(cfg: &Config, reference: &str, flags: &[(String, String)]) -> Res
         max_memory: cfg.max_memory,
         max_table_elements: None,
     };
-    let mut task = Task::spawn(&image, &args, limits, providers::root_providers())
+    let mut task = Task::spawn(&loaded.image, &args, limits, providers::root_providers())
         .map_err(|err| format!("cannot spawn {}: {err}", source.origin))?;
 
     // The built-in drive loop: donate, run, park on I/O, repeat.
