@@ -1,15 +1,21 @@
 # Bare-metal workspace: the no_std (+ alloc) kernel core and per-arch ports (area 12).
-# Built with explicit --target flags via xtask; `cargo test` here runs on the host triple
-# (the placeholder is no_std except under test).
+# Built with explicit --target flags via xtask (`cargo xtask build-kernel <arch>`); plain
+# `cargo test` here runs on the host triple, where the kernel crate compiles to a stub.
 [workspace]
 resolver = "3"
-members = ["eo9-kernel-placeholder"]
+members = ["eo9-kernel"]
 
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
 publish = false
 
-# Dependency pins for kernel crates go here as area 12 lands; keep any versions shared
-# with the host side in sync with the authoritative table in the repo-root Cargo.toml.
+# Dependency pins for kernel crates. Keep any versions shared with the host side in sync
+# with the authoritative table in the repo-root Cargo.toml (wasmtime is pinned to the same
+# 45.0.0 there; here it is taken without default features because the kernel is no_std).
 [workspace.dependencies]
+wasmtime = { version = "45.0.0", default-features = false }
+# Small, well-known free-list allocator behind `#[global_allocator]` (plan/12-kernel.md
+# Decisions). Pulls only `lock_api`/`spinning_top`, which is fine on a single core with
+# interrupts masked.
+linked_list_allocator = "0.10.5"
