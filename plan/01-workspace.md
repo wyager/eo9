@@ -69,8 +69,9 @@ None. Everything else depends on this.
 7. **xtask is dependency-free** (std-only argument parsing and `std::process`). Child cargo invocations drop
    `RUSTUP_TOOLCHAIN` so each workspace's own `rust-toolchain.toml` governs, and `cargo test` is not run in
    the guest workspace (no wasm test runner; guest code is exercised by host-side integration tests).
-8. **LICENSE is a placeholder** — no license chosen yet (project-owner decision); Cargo manifests carry no
-   `license` field until then.
+8. **License: MIT** (owner decision; the repo `LICENSE` file is the MIT text). The guest and www workspace
+   manifests carry `license = "MIT"`; the root host workspace manifest does not yet — add it when touching
+   the root manifest next.
 9. **Guest components are refreshed before tests run.** Host integration tests consume the prebuilt
    components under `guest/target/components` and only rebuild *missing* ones, so running tests against a
    stale tree after a guest source change produced false failures (it bit a reviewer on master). Both the

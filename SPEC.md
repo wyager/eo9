@@ -599,6 +599,19 @@ TODO
 
 Standard stubs: `perf.none`, `perf.null` (accept and discard). Note: perf counters are themselves a timing side channel — gate them like time.
 
+### PCI API
+
+Raw PCI/PCIe device access for drivers (`eo9:pci`): enumeration, configuration-space and BAR register access
+(width-explicit rather than buffer-oriented, since register access is width-sensitive), MSI/MSI-X/INTx
+interrupts awaited as ordinary async calls, and per-device DMA buffer allocation. It carries no device-class
+semantics and no policy — which devices are visible is entirely the provider's choice, and `pci.filtered`
+makes "exactly this one device" grants an ordinary compose-time attenuation. A PCI capability that can enable
+bus mastering is, absent an IOMMU, effectively full-memory authority, so hardware-root providers are expected
+to hand out the narrowest device handle that works and to contain DMA with the IOMMU where one exists; like
+all hardware roots, the real capability is satisfied only by the OS core at instantiation.
+
+Standard stubs: `pci.none`, `pci.deny`, `pci.filtered` (allow-listed device addresses).
+
 ### TODO - other APIs
 
 
