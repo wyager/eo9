@@ -110,8 +110,9 @@ COMMANDS:
     test                 Run host workspace tests and kernel workspace tests (host triple)
     build-guest          Build guest crates for {GUEST_TARGET} and componentize them with
                          `wasm-tools component new` into guest/target/components/*.wasm
-    build-kernel <arch>  Precompile the seed wasm component and build the bootable kernel
-                         image (aarch64 only so far; ELF for QEMU's -kernel loader)
+    build-kernel <arch>  Precompile the seed component and the eo9-example-hello program for
+                         bare metal and build the bootable kernel image (aarch64 only so far;
+                         ELF for QEMU's -kernel loader)
     qemu <arch>          Build the kernel image and boot it under QEMU with serial on stdio
                          (aarch64 only so far; exits when the kernel powers off, Ctrl-A X to quit)
     fmt [--check]        Run `cargo fmt --all` in all three workspaces
@@ -176,44 +177,71 @@ fn build_guest(root: &Path) -> Result<(), String> {
         ],
     )?;
 
+    for package in GUEST_COMPONENTS {
+        componentize_guest_package(root, package)?;
+    }
+    Ok(())
+}
+
+/// Turn one already-built guest crate into a validated component under
+/// guest/target/components, returning the component's path.
+fn componentize_guest_package(root: &Path, package: &str) -> Result<PathBuf, String> {
+    let guest = root.join("guest");
     let components_dir = guest.join("target").join("components");
     std::fs::create_dir_all(&components_dir)
         .map_err(|err| format!("failed to create {}: {err}", components_dir.display()))?;
 
-    for package in GUEST_COMPONENTS {
-        let module = guest
-            .join("target")
-            .join(GUEST_TARGET)
-            .join("release")
-            .join(format!("{}.wasm", package.replace('-', "_")));
-        let component = components_dir.join(format!("{package}.wasm"));
-        run(
-            &guest,
-            "wasm-tools",
-            [
-                OsStr::new("component"),
-                OsStr::new("new"),
-                module.as_os_str(),
-                OsStr::new("-o"),
-                component.as_os_str(),
-            ],
-        )?;
-        // The eo9 APIs return Component Model futures, so components built from them
-        // use the async canonical built-ins; the validator only accepts those with the
-        // cm-async feature enabled.
-        run(
-            &guest,
-            "wasm-tools",
-            [
-                OsStr::new("validate"),
-                OsStr::new("--features"),
-                OsStr::new("cm-async"),
-                component.as_os_str(),
-            ],
-        )?;
-        println!("xtask: built component {}", component.display());
-    }
-    Ok(())
+    let module = guest
+        .join("target")
+        .join(GUEST_TARGET)
+        .join("release")
+        .join(format!("{}.wasm", package.replace('-', "_")));
+    let component = components_dir.join(format!("{package}.wasm"));
+    run(
+        &guest,
+        "wasm-tools",
+        [
+            OsStr::new("component"),
+            OsStr::new("new"),
+            module.as_os_str(),
+            OsStr::new("-o"),
+            component.as_os_str(),
+        ],
+    )?;
+    // The eo9 APIs return Component Model futures, so components built from them
+    // use the async canonical built-ins; the validator only accepts those with the
+    // cm-async feature enabled.
+    run(
+        &guest,
+        "wasm-tools",
+        [
+            OsStr::new("validate"),
+            OsStr::new("--features"),
+            OsStr::new("cm-async"),
+            component.as_os_str(),
+        ],
+    )?;
+    println!("xtask: built component {}", component.display());
+    Ok(component)
+}
+
+/// Build one guest crate and componentize it (the targeted version of [`build_guest`],
+/// used by `build-kernel` to refresh just the program it embeds).
+fn build_guest_component(root: &Path, package: &str) -> Result<PathBuf, String> {
+    let guest = root.join("guest");
+    run(
+        &guest,
+        "cargo",
+        [
+            "build",
+            "-p",
+            package,
+            "--release",
+            "--target",
+            GUEST_TARGET,
+        ],
+    )?;
+    componentize_guest_package(root, package)
 }
 
 /// Amount of RAM given to the QEMU guest. Must stay in sync with `RAM_SIZE` in
@@ -222,19 +250,31 @@ const KERNEL_QEMU_MEMORY: &str = "512M";
 
 /// Build the bootable kernel image for `arch` and return its path.
 ///
-/// For aarch64 this precompiles the seed wasm component (kernel/seed/hello.wat) for the
-/// bare-metal target with the host wasmtime, then builds `eo9-kernel` in release mode with
-/// the `wasm-seed` feature so the artifact is embedded in the image. The result is an ELF
-/// that QEMU's `-kernel` loader boots directly.
+/// For aarch64 this precompiles the wasm artifacts the kernel embeds — the hand-written
+/// seed component (kernel/seed/hello.wat) and the real `eo9-example-hello` program from
+/// the guest workspace — for the bare-metal target with the host wasmtime, then builds
+/// `eo9-kernel` in release mode with the `wasm-seed` and `wasm-hello` features so both are
+/// embedded in the image. The result is an ELF that QEMU's `-kernel` loader boots directly.
 fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
     if arch != "aarch64" {
         return Err(format!(
-            "`build-kernel {arch}` is not implemented yet: the bare-metal spike covers aarch64 \
+            "`build-kernel {arch}` is not implemented yet: the bare-metal kernel covers aarch64 \
              only so far (plan/12-kernel.md)"
         ));
     }
 
-    let seed = precompile_seed(root)?;
+    // The seed canary, assembled from WAT.
+    let seed_wat = root.join("kernel").join("seed").join("hello.wat");
+    let seed_wasm = wat::parse_file(&seed_wat)
+        .map_err(|err| format!("failed to assemble {}: {err}", seed_wat.display()))?;
+    let seed = precompile_for_kernel(root, &seed_wasm, "seed component", "seed.cwasm")?;
+
+    // The real hello program, built from the guest workspace.
+    let hello_component = build_guest_component(root, "eo9-example-hello")?;
+    let hello_wasm = std::fs::read(&hello_component)
+        .map_err(|err| format!("failed to read {}: {err}", hello_component.display()))?;
+    let hello = precompile_for_kernel(root, &hello_wasm, "eo9-example-hello", "hello.cwasm")?;
+
     let kernel_dir = root.join("kernel");
     run_with_env(
         &kernel_dir,
@@ -247,9 +287,12 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
             "--target",
             KERNEL_CHECK_TARGET,
             "--features",
-            "wasm-seed",
+            "wasm-seed,wasm-hello",
         ],
-        &[("EO9_SEED_CWASM", seed.as_os_str())],
+        &[
+            ("EO9_SEED_CWASM", seed.as_os_str()),
+            ("EO9_HELLO_CWASM", hello.as_os_str()),
+        ],
     )?;
 
     let image = kernel_dir
@@ -267,19 +310,20 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
     Ok(image)
 }
 
-/// Assemble and precompile the seed component for the bare-metal target.
+/// Precompile a component for the bare-metal target, writing `kernel/target/precompiled/<name>`.
 ///
 /// The artifact must be loadable by the kernel's `no_std` wasmtime engine, so the
 /// compilation config mirrors what that engine computes for itself on an OS-less target:
 /// no signals-based traps, no virtual-memory reservations or guards, no copy-on-write
 /// memory initialization, and no wasm proposals beyond what the kernel build enables
-/// (feature unification gives this host build GC and threads support via eo9-runtime's
-/// wasmtime features; the kernel build has neither).
-fn precompile_seed(root: &Path) -> Result<PathBuf, String> {
-    let wat_path = root.join("kernel").join("seed").join("hello.wat");
-    let component = wat::parse_file(&wat_path)
-        .map_err(|err| format!("failed to assemble {}: {err}", wat_path.display()))?;
-
+/// (feature unification gives this host build GC, threads, and component-model-async
+/// support via eo9-runtime's wasmtime features; the kernel build has none of those).
+fn precompile_for_kernel(
+    root: &Path,
+    component: &[u8],
+    what: &str,
+    file_name: &str,
+) -> Result<PathBuf, String> {
     let mut config = wasmtime::Config::new();
     config
         .target(KERNEL_CHECK_TARGET)
@@ -294,19 +338,19 @@ fn precompile_seed(root: &Path) -> Result<PathBuf, String> {
     config.gc_support(false);
     config.wasm_threads(false);
     let engine = wasmtime::Engine::new(&config)
-        .map_err(|err| format!("failed to build the seed-precompile engine: {err:#}"))?;
+        .map_err(|err| format!("failed to build the kernel-precompile engine: {err:#}"))?;
     let artifact = engine
-        .precompile_component(&component)
-        .map_err(|err| format!("failed to precompile the seed component: {err:#}"))?;
+        .precompile_component(component)
+        .map_err(|err| format!("failed to precompile {what}: {err:#}"))?;
 
-    let out_dir = root.join("kernel").join("target").join("seed");
+    let out_dir = root.join("kernel").join("target").join("precompiled");
     std::fs::create_dir_all(&out_dir)
         .map_err(|err| format!("failed to create {}: {err}", out_dir.display()))?;
-    let out_path = out_dir.join("hello.cwasm");
+    let out_path = out_dir.join(file_name);
     std::fs::write(&out_path, &artifact)
         .map_err(|err| format!("failed to write {}: {err}", out_path.display()))?;
     println!(
-        "xtask: precompiled seed component {} ({} bytes, target {KERNEL_CHECK_TARGET})",
+        "xtask: precompiled {what} -> {} ({} bytes, target {KERNEL_CHECK_TARGET})",
         out_path.display(),
         artifact.len()
     );
