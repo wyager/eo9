@@ -1,12 +1,13 @@
-//! The Eo9 bare-metal kernel — spike step 1 (plan/12-kernel.md): aarch64 on QEMU `virt`.
+//! The Eo9 bare-metal kernel (plan/12-kernel.md): aarch64 on QEMU `virt`.
 //!
 //! Boot path: QEMU's `-kernel` loader reads the ELF produced by `cargo xtask build-kernel
 //! aarch64` and jumps to `_start` (src/boot.rs) at EL1 with the MMU off. The assembly stub
 //! parks secondary cores, enables FP/SIMD for later wasm code, installs the exception
 //! vectors, sets up the boot stack, zeroes `.bss`, and calls [`kmain`]. From there
 //! everything is Rust: PL011 serial output, a global heap (no_std + alloc), the generic
-//! timer, and — behind the `wasm-seed` feature — a wasmtime embedding that runs a
-//! host-precompiled wasm component and prints its greeting over serial.
+//! timer and PL031 RTC, and — behind the `wasm-seed` / `wasm-hello` features — a wasmtime
+//! embedding that runs host-precompiled components: the hand-written seed canary and the
+//! real `eo9-example-hello` program linked against the kernel's own eo9 root providers.
 //!
 //! On the host triple (where the kernel workspace's unit tests run) this crate compiles to
 //! a stub `main` so the workspace stays buildable and testable without a cross target.
@@ -26,27 +27,40 @@ mod exceptions;
 #[cfg(target_os = "none")]
 mod heap;
 #[cfg(target_os = "none")]
+mod mmu;
+#[cfg(target_os = "none")]
 mod panic;
 #[cfg(target_os = "none")]
 mod psci;
 #[cfg(target_os = "none")]
+mod rtc;
+#[cfg(target_os = "none")]
 mod timer;
 #[cfg(target_os = "none")]
 mod uart;
-#[cfg(all(target_os = "none", feature = "wasm-seed"))]
+#[cfg(all(target_os = "none", any(feature = "wasm-seed", feature = "wasm-hello")))]
 mod wasm;
 
 /// Rust entry point, called from the assembly boot stub with the stack set up and `.bss`
-/// zeroed. Walks the spike ladder: banner, heap self-test, generic-timer readings, and
-/// (with `wasm-seed`) the embedded wasm component — then powers the machine off so QEMU
-/// exits cleanly.
+/// zeroed. Banner, heap self-test, generic-timer readings, then the embedded wasm
+/// artifacts (the seed canary and the eo9-example-hello program, when built in) — and
+/// finally the machine powers off so QEMU exits cleanly.
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
     kprintln!();
-    kprintln!("Eo9 kernel — aarch64 spike (QEMU virt)");
+    kprintln!("Eo9 kernel — aarch64 (QEMU virt)");
     kprintln!("  exception level: EL{}", current_el());
     kprintln!("  counter-timer frequency: {} Hz", timer::frequency());
+    kprintln!(
+        "  wall clock: {}.{:09} s since the Unix epoch (PL031 + generic timer)",
+        rtc::seconds(),
+        timer::subsecond_ns()
+    );
+
+    // Identity-map the machine and turn on the MMU and caches: compiled wasm programs
+    // perform unaligned accesses, which are only legal on Normal memory.
+    mmu::enable_identity_map();
 
     // Heap: everything from the end of the kernel image to the top of RAM.
     heap::init();
@@ -56,12 +70,14 @@ extern "C" fn kmain() -> ! {
     timer::self_test();
 
     #[cfg(feature = "wasm-seed")]
-    wasm::run_seed();
-    #[cfg(not(feature = "wasm-seed"))]
-    kprintln!("wasm seed: not embedded (build with `cargo xtask build-kernel aarch64`)");
+    wasm::seed::run();
+    #[cfg(feature = "wasm-hello")]
+    wasm::hello::run();
+    #[cfg(not(any(feature = "wasm-seed", feature = "wasm-hello")))]
+    kprintln!("wasm: no components embedded (build with `cargo xtask build-kernel aarch64`)");
 
     kprintln!(
-        "[{:>8} us] spike complete; requesting PSCI SYSTEM_OFF",
+        "[{:>8} us] kernel run complete; requesting PSCI SYSTEM_OFF",
         timer::uptime_us()
     );
     psci::system_off()
