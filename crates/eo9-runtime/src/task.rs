@@ -219,10 +219,134 @@ impl wasmtime::ResourceLimiter for StoreLimits {
     }
 }
 
-/// Per-task store data: the task's root providers and its resource limits.
+/// Per-task store data: the task's root providers, its resource limits, and the host-side
+/// table backing `eo9:io/buffers` handles.
 pub(crate) struct TaskState {
     pub(crate) providers: Providers,
+    pub(crate) buffers: BufferTable,
     limits: StoreLimits,
+}
+
+// ---------------------------------------------------------------------------------------
+// Host-side buffer table (eo9:io/buffers)
+// ---------------------------------------------------------------------------------------
+
+/// Per-buffer allocation ceiling for `eo9:io/buffers.buffer` (bytes). I/O buffers are
+/// host-side memory, outside the guest's linear-memory ceiling, so their size must be
+/// bounded before allocation (same rule as the entropy request cap).
+pub const MAX_BUFFER_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Ceiling on the total bytes held by all live buffers of one task.
+pub const MAX_TOTAL_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The backing store for the guest's `eo9:io/buffers.buffer` handles: resource rep ->
+/// bytes. A slot whose bytes have been handed to a provider for an in-flight owned-buffer
+/// round-trip stays reserved (`InFlight`) until the operation completes and the bytes come
+/// back.
+#[derive(Default)]
+pub(crate) struct BufferTable {
+    slots: Vec<BufferSlot>,
+    total_bytes: u64,
+}
+
+enum BufferSlot {
+    Free,
+    /// Bytes currently owned by the guest-visible handle.
+    Held(Vec<u8>),
+    /// Bytes handed to a provider for an in-flight operation; the slot (and its byte
+    /// budget) stays reserved until they come back.
+    InFlight(u64),
+}
+
+impl BufferTable {
+    /// Allocate a zero-filled buffer of `len` bytes, returning its rep.
+    pub(crate) fn alloc(&mut self, len: u64) -> wasmtime::Result<u32> {
+        if len > MAX_BUFFER_BYTES {
+            return Err(wasmtime::Error::msg(format!(
+                "buffer of {len} bytes exceeds the per-buffer cap of {MAX_BUFFER_BYTES} bytes"
+            )));
+        }
+        if self.total_bytes + len > MAX_TOTAL_BUFFER_BYTES {
+            return Err(wasmtime::Error::msg(format!(
+                "task buffer budget exceeded: {len} more bytes would pass the \
+                 {MAX_TOTAL_BUFFER_BYTES}-byte ceiling"
+            )));
+        }
+        let bytes = vec![0; len as usize];
+        self.total_bytes += len;
+        let slot = self
+            .slots
+            .iter()
+            .position(|slot| matches!(slot, BufferSlot::Free));
+        let index = match slot {
+            Some(index) => {
+                self.slots[index] = BufferSlot::Held(bytes);
+                index
+            }
+            None => {
+                self.slots.push(BufferSlot::Held(bytes));
+                self.slots.len() - 1
+            }
+        };
+        u32::try_from(index).map_err(|_| wasmtime::Error::msg("buffer table full"))
+    }
+
+    fn slot(&mut self, rep: u32) -> wasmtime::Result<&mut BufferSlot> {
+        self.slots
+            .get_mut(rep as usize)
+            .ok_or_else(|| wasmtime::Error::msg(format!("unknown buffer handle {rep}")))
+    }
+
+    /// Borrow the bytes held by a buffer (for the guest-facing accessors).
+    pub(crate) fn bytes(&mut self, rep: u32) -> wasmtime::Result<&mut Vec<u8>> {
+        match self.slot(rep)? {
+            BufferSlot::Held(bytes) => Ok(bytes),
+            BufferSlot::InFlight(_) => Err(wasmtime::Error::msg(
+                "buffer is owned by an in-flight operation",
+            )),
+            BufferSlot::Free => Err(wasmtime::Error::msg("buffer handle is not live")),
+        }
+    }
+
+    /// Take the bytes out for an owned-buffer round-trip, leaving the slot reserved.
+    pub(crate) fn take(&mut self, rep: u32) -> wasmtime::Result<Vec<u8>> {
+        let slot = self.slot(rep)?;
+        match std::mem::replace(slot, BufferSlot::Free) {
+            BufferSlot::Held(bytes) => {
+                *slot = BufferSlot::InFlight(bytes.len() as u64);
+                Ok(bytes)
+            }
+            other => {
+                *slot = other;
+                Err(wasmtime::Error::msg(
+                    "buffer is not available for a new operation",
+                ))
+            }
+        }
+    }
+
+    /// Give the bytes back to a slot reserved by [`BufferTable::take`].
+    pub(crate) fn restore(&mut self, rep: u32, bytes: Vec<u8>) {
+        if let Some(slot) = self.slots.get_mut(rep as usize)
+            && let BufferSlot::InFlight(reserved) = *slot
+        {
+            self.total_bytes = self.total_bytes - reserved + bytes.len() as u64;
+            *slot = BufferSlot::Held(bytes);
+        }
+    }
+
+    /// Drop a buffer (guest dropped the handle).
+    pub(crate) fn free(&mut self, rep: u32) {
+        if let Some(slot) = self.slots.get_mut(rep as usize) {
+            let released = match slot {
+                BufferSlot::Held(bytes) => bytes.len() as u64,
+                BufferSlot::InFlight(reserved) => *reserved,
+                BufferSlot::Free => 0,
+            };
+            self.total_bytes = self.total_bytes.saturating_sub(released);
+            *slot = BufferSlot::Free;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -289,6 +413,7 @@ impl Task {
 
         let state = TaskState {
             providers,
+            buffers: BufferTable::default(),
             limits: StoreLimits::new(&limits),
         };
         let mut store = Store::new(&engine, state);
@@ -443,6 +568,9 @@ impl Task {
             }
         };
         self.state = LifeState::Done(outcome.clone());
+        // Wake anyone parked in `wait()` (the doorbell's waiter list doubles as the
+        // completion notification channel).
+        self.doorbell.ring();
         outcome
     }
 
@@ -481,6 +609,25 @@ impl Task {
             LifeState::Done(outcome) => Some(outcome),
             LifeState::Running => None,
         }
+    }
+
+    /// Wait (as a plain future) until the task has finished, yielding its outcome — the
+    /// host-side counterpart of `eo9:exec/task.wait`, which is now an `async func`.
+    ///
+    /// Like the WIT operation, this only observes completion: the task still only makes
+    /// progress when someone donates fuel through [`Task::resume`].
+    pub fn wait(&self) -> impl Future<Output = Outcome> + '_ {
+        std::future::poll_fn(move |cx| {
+            if let Some(outcome) = self.outcome() {
+                return Poll::Ready(outcome.clone());
+            }
+            self.doorbell.register(cx.waker());
+            // Re-check to close the race between the check above and registration.
+            match self.outcome() {
+                Some(outcome) => Poll::Ready(outcome.clone()),
+                None => Poll::Pending,
+            }
+        })
     }
 
     /// Kill the task and return its final outcome.

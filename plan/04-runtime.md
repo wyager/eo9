@@ -194,12 +194,67 @@ on waitable-sets (`CannotBlockSyncTask`, spike finding D1), and `wit-bindgen 0.5
 itself make wit-bindgen guests runnable; `main` (or the guest SDK's wait strategy) must
 become async-capable too (escalation E1).
 
+### D10. Milestone-3 follow-up (branch `area/04-runtime-m3`): async reconciliation, fs/io linking, loader rule
+
+**Async-operation host implementations.** With the async-operations migration, blocking
+operations are `async func`s end to end: freshly built guest components import them as
+async function types and lift `main` with the async callback ABI. The host side now
+implements every such operation as a wasmtime *concurrent* host function
+(`func_wrap_concurrent`): the returned future awaits the provider's `BoxOp` directly and
+the waker that reaches the provider is the task's doorbell. This replaced the
+milestone-1-era host-created `future<T>` wiring (`FutureReader` + producer), which no
+longer matches what the toolchain emits. One trap worth recording: a stale
+`guest/target/components` artifact from before the migration still carried the old
+`func(...) -> future<T>` encoding and initially sent this work down the wrong path —
+always rebuild guest components (`cargo xtask build-guest`) after a WIT change, since
+wit-bindgen's generated bindings do not reliably retrigger cargo rebuilds on `wit/` edits.
+
+**fs / io-buffers linking.** `FsProvider` (open, open-exec, list-directory, stat,
+create-directory, remove, owned-buffer read/write/exec-read, exec-size, close hooks) joins
+the provider traits, with `MemFs` as the in-memory test provider. `eo9:io/buffers` is
+backed by a per-task buffer table in the runtime (buffers are host memory, so they carry
+their own caps: 16 MiB per buffer, 64 MiB per task, enforced before allocation); the
+owned-buffer round-trip takes the bytes out of the table for the life of an operation and
+restores them on completion, success or error. `file`/`immutable-handle` resource drops are
+forwarded to the provider. Tests: `tests/fs_api.rs` (buffer table; sync-lowered async fs
+operations from an async-lifted WAT guest) and `tests/readwrite.rs` (below).
+**Disk is not included**: it is the same pattern (one more provider trait + ~an hour of
+wiring) but nothing consumes it yet; it can follow with the unix providers.
+
+**Loader rule for optional imports.** The always-registered `eo9:X/X-optional` flavors
+answer `default() -> some(handle)` when the capability was granted and `none` otherwise,
+so a program importing an optional capability it was not granted spawns fine and observes
+absence (observationally `X.none`); required imports still fail at spawn. Types-only
+interfaces and `eo9:io/buffers` are always available (they carry no authority). Test:
+`optional_import_is_auto_sealed_when_not_granted`.
+
+**Task API reconciliation.** Host-side `Task::wait()` (future resolving with the outcome)
+joins `runnable()`/`kill()` to mirror the now-async `eo9:exec/task` operations; `kill`
+remains synchronous on the host side since it resolves immediately.
+
+**readwrite (definition of done): runs end to end.** The merged `eo9-example-readwrite`
+component — async `main` awaiting async fs operations, owned buffers round-tripping
+through `eo9:io/buffers` — runs to completion against `MemFs` in `tests/readwrite.rs`,
+covering both its success vocabulary (`round-tripped(n)`, bytes verified in the provider)
+and its failure vocabulary (fs error surfaced by the program). This also closes
+escalation E1 for practical purposes: wit-bindgen now emits genuinely async-lifted
+exports, which is exactly what wasmtime 45 requires for a guest that awaits.
+`tests/readwrite.rs` builds the component via the guest workspace if it is missing
+(normally `cargo xtask build-guest` has already produced it).
+
+**Cross-crate touch-ups (disclosed).** Adding the `fs` field to `Providers` required a
+one-line `fs: None` addition at the two existing construction sites outside this area
+(`crates/eo9/src/providers.rs`, `tests/eo9-integration/tests/determinism.rs`), and area
+13's kill/linearity sleeper fixture was mechanically re-synced to the async `sleep`
+operation (its old future-returning import no longer links). Areas 11/13 own both files
+and may adjust further.
+
 ### Escalations for the planner
 
-- **E1 (wit/, area 02 + 07):** for a binary to await anything, its `main` must be an
-  `async` function at the component level under wasmtime 45. Proposal: declare `main` (and
-  probably provider `configure`) as `async func` in the WIT sketches/worlds, and have the
-  guest SDK lift accordingly.
+- **E1 (resolved by the async-operations migration):** binaries that await must have an
+  async-lifted `main` under wasmtime 45. The WIT now declares `main: async func`, wit-bindgen
+  emits the async callback lift for it, and `eo9-example-readwrite` runs end to end (D10).
+  No further action needed; kept here for the record.
 - **E2 (wit/, area 02):** `program-outcome` has no arm for abnormal termination (trap,
   kill, out-of-fuel death). `wait`/`kill` return `future<program-outcome>`, which today
   cannot express "killed". Proposal: add a third arm (e.g. `aborted(abort-reason)`).
