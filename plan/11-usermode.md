@@ -170,6 +170,18 @@ its first milestones, and to be the place where cross-area seams get found.
     interactive line is typed, never what is granted. Known cosmetic limit: output a child printed without a
     trailing newline is not part of the tracked prompt, so a mid-edit repaint redraws only the shell's own
     prompt. The editor and completer are unit-tested against in-memory streams (no TTY in CI).
+    *Prompt ownership (fixed after the first merge):* eosh owns the prompt — it writes `eosh> ` like any
+    other output and never knows whether an editor exists. The host editor owns only the **line repaint**,
+    and the prompt prefix it repaints is single-sourced from `InteractiveText`'s tracker: "whatever stdout
+    holds since the most recent newline". Both writers keep that tracker honest — guest writes update it in
+    `write` (newline resets, partial line extends), and the editor, which always ends an edit by emitting
+    its own newline, resets it when `read-line` completes. The original code missed the second half, so
+    after any line with no stdout of its own (an empty Enter, a parse error on stderr) the next prompt was
+    appended to the stale prefix and the repaint showed `eosh> eosh> …`, growing by one per Enter.
+    Regression coverage: `shell_interactive_pty_prompt_is_not_duplicated` drives the real interactive path
+    inside a pseudo-terminal via `script(1)` (macOS-only invocation, which is where local CI runs) with
+    empty Enters, a command with output, and a parse error, and asserts no repaint ever contains
+    `eosh> eosh>`.
 13. **Session manifest for `env`.** Every shell start writes `<session>/session` (`providers::
     session_manifest`, format `eo9-session 1` — see plan/10 Decision 9): the shell's grants, what children
     receive (fs only when `--fs-root` was given, never exec), and notes. It is generated next to
