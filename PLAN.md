@@ -20,6 +20,12 @@ agents, with the planner acting as mediator and integrator.
 4. Everything gets tests. Algebraic laws from the spec become property tests (see `plan/13-tests.md`).
 5. Record decisions you make inside your area in a `## Decisions` section at the bottom of your plan file.
 6. Small, reviewable commits with plain descriptive messages.
+7. Build only inside the repository tree. The dev machine's security policy (Santa, lockdown mode) kills
+   freshly built native executables — including cargo `build-script-build` binaries — when they live outside
+   the normal dev tree (e.g. under `/tmp`/`$TMPDIR`), and exceptions cannot be granted. Builds under
+   `/Users/wy/code/eo9` (including `.claude/worktrees/*`) run fine. So: never create scratch cargo projects or
+   target dirs outside the repo; if a tool wants a temp build location, point it (e.g. `CARGO_TARGET_DIR`)
+   at a directory inside the repo and clean it up. Never attempt to work around the security policy itself.
 
 ## Repository layout (target)
 
