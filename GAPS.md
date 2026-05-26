@@ -19,9 +19,12 @@ _Last updated: 2026-05-25 (master at a9e3669)._
 
 ## Functional gaps (implementation exists, coverage incomplete)
 
-- **`configure` rejects resource-owning / async-API providers** (fs.memfs-, net-style): the bind-on-first-use
-  binder only forwards freestanding sync APIs today; such providers fail with a clean error. Unblock:
-  resource-proxying in the binder, or a runtime-side configuration path. (plan/03 D12)
+- **`configure` rejects resource-owning / async-API providers** (fs.memfs-, disk.mem-, time.frozen-, net-style):
+  the bind-on-first-use binder only forwards freestanding sync APIs today; such providers fail with a clean
+  error. Practical impact: invoker-side configuration currently works only for `entropy.seeded`/`perf.null`,
+  so the fully invoker-configured deterministic environment is not yet possible — the highest-value algebra
+  follow-up. Unblock: async-capable forwarders + resource proxying in the binder, or a runtime-side
+  configuration path. (plan/03 D12)
 - **Guest-facing `resume` unsupported (E5):** children are fuel-sliced out of the parent's own donation, so a
   guest scheduler cannot direct CPU itself and long-running children throttle the shell. Unblock: upstream
   wasmtime support or an embedder-brokered donation design. (plan/04 D11/E5)

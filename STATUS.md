@@ -39,11 +39,17 @@ _Last updated: 2026-05-25, master at the configure-binder-fix merge (a9e3669)._
 | Usermode binary `eo9` | `crates/eo9` | run/store/describe/compile/cache done; `shell` in progress |
 | Website + server | `www/` | complete, deployable |
 
+Also working now: **`eo9 shell`** — an interactive eosh REPL (and `-c` one-shot mode) with the exec
+capability granted to the shell only, store-backed bare-name resolution via a session bin view, provider
+flags binding `configure` at compose time, and children receiving exactly the session's root providers.
+(Caveat: invoker-side `configure` currently works only for providers with sync, freestanding APIs — in
+practice `entropy.seeded`/`perf.null`; see GAPS.md.)
+
 ## In progress right now
 
-- **eosh configure support** (area 10): provider flags → `configure` before composition.
-- **`eo9 shell`** (area 11): grant eosh the exec capability, session bin-view name resolution, interactive
-  REPL + `-c` one-shot mode.
+- **Bare-metal kernel spike** (area 12): aarch64 boot + serial + heap on QEMU, wasm-on-target feasibility.
+- **Demo polish** (area 11): bare `eo9` → shell, `eo9 <file>` → implicit run, embedded-component store
+  seeding (the `cargo install eo9; eo9` experience).
 
 ## Next up (rough order)
 
