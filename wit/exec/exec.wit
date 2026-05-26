@@ -50,6 +50,14 @@ interface component-algebra {
         ty: string,
     }
 
+    /// One named, constant argument value, WAVE-encoded: a `configure` argument bound at
+    /// compose time (here) or a `main` argument bound at spawn time (`task.spawn`). Always
+    /// checked against the target's declared signature (its `arg-spec`s).
+    record named-arg {
+        name: string,
+        value: string,
+    }
+
     /// Kind, imports, exports, and argument signature of a component.
     record component-info {
         kind: component-kind,
@@ -95,6 +103,18 @@ interface component-algebra {
         internal(string),
     }
 
+    variant configure-error {
+        /// The component is not a provider.
+        not-a-provider,
+        /// The provider exports no config interface — it is unconfigurable, or was already
+        /// configured (a configured provider no longer exposes one).
+        no-config-interface,
+        /// An argument failed WAVE parsing or type-checking against the configure signature,
+        /// or a required argument is missing / an unknown one was given.
+        invalid-args(string),
+        internal(string),
+    }
+
     load:     func(image: list<u8>) -> result<component, load-error>;
     save:     func(c: borrow<component>) -> list<u8>;
     describe: func(c: borrow<component>) -> component-info;
@@ -108,6 +128,12 @@ interface component-algebra {
     /// `rename a b` — relabel slot `old-name` to `new-name`, on imports and exports alike.
     /// (`from` is a WIT keyword, hence the longer parameter names.)
     rename:   func(c: component, old-name: string, new-name: string) -> result<component, rename-error>;
+    /// Bind a provider's exported config interface with constant, WAVE-typed argument values:
+    /// returns a new provider with those constants baked in that re-exports only the API — the
+    /// config interface is no longer visible, so the consumer can neither observe nor re-run the
+    /// configuration. An invalid or ill-typed argument fails here, at compose time, before the
+    /// consumer ever runs (see SPEC: Binary or provider, never both).
+    configure: func(p: component, args: list<named-arg>) -> result<component, configure-error>;
 }
 
 /// Opaque compiled-artifact type, shared by `compile` (which mints images) and
@@ -145,15 +171,10 @@ interface compile {
 
 /// Spawning and driving native tasks (privileged, paired with `compile`).
 interface task {
+    use component-algebra.{named-arg};
     use images.{image};
 
     resource task;
-
-    /// One named `main` argument, WAVE-encoded; checked against main's signature at spawn.
-    record named-arg {
-        name: string,
-        value: string,
-    }
 
     /// A WAVE-encoded value carrying its WIT type text, so an outcome can outlive its component.
     record wave-value {

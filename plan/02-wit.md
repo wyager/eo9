@@ -138,3 +138,14 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
     example (async `main`, no more block_on), eosh component (one owned-String call site). The runtime and
     integration-test crates embed their own WIT copies and were left untouched — area 04 reconciles the
     host side (async-lifted task.wait/kill/runnable and provider ops) when it syncs its copy.
+13. **`configure` as a component-algebra operation (SPEC commit bd74868, branch `area/02-configure-op`):**
+    added `configure: func(p: component, args: list<named-arg>) -> result<component, configure-error>` to
+    `eo9:exec/component-algebra` — binds a provider's exported config interface with constant, WAVE-typed
+    argument values and returns an already-configured provider that re-exports only the API (the config
+    interface is no longer visible); invalid or ill-typed arguments fail at compose time. `configure-error`
+    cases: `not-a-provider`, `no-config-interface`, `invalid-args(string)`, `internal(string)`. The
+    `named-arg` record moved from `task` into `component-algebra` (next to `arg-spec`, its dual) so both
+    operations share one type; `task` now `use`s it, which makes a world importing `task` also implicitly
+    import `component-algebra` — acceptable because component-algebra is unprivileged by the spec's own
+    judgment (flag if the planner prefers a separate record-only vocabulary interface instead). Host-side
+    implementation of the new function falls to areas 03/04; eosh's generated bindings already require it.
