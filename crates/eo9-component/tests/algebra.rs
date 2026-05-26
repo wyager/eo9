@@ -15,7 +15,8 @@ use eo9_component::{
     RenameError, RestrictError, compose, configure, extend, rename, restrict,
 };
 use fixtures::{
-    eo9_fixture, kit, kit_bytes, kit_mismatched, seeded_provider, ver_consumer, ver_provider,
+    clock_user, eo9_fixture, frozen_provider, kit, kit_bytes, kit_mismatched, memfs_provider,
+    seeded_provider, ver_consumer, ver_provider,
 };
 
 /// The normalized form of `describe()`: kind, sorted import slots, sorted export slots,
@@ -743,4 +744,76 @@ fn configure_is_deterministic() {
     let once = configure(&seeded_provider(), &[("seed", "7")]).unwrap();
     let twice = configure(&seeded_provider(), &[("seed", "7")]).unwrap();
     assert_eq!(once.save(), twice.save());
+}
+
+// ---------------------------------------------------------------------------
+// configure -- providers with async API functions (the time.frozen shape)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn configure_binds_an_async_api_provider_and_seals_its_config_interface() {
+    let frozen = frozen_provider();
+
+    // The fixture mirrors the real time.frozen stub: an async `sleep` in the API, an
+    // async `configure` in the config interface, two declared parameters.
+    let info = frozen.describe();
+    assert_eq!(info.kind, ComponentKind::Provider);
+    let args: Vec<(&str, &str)> = info
+        .args
+        .iter()
+        .map(|a| (a.name.as_str(), a.ty.as_str()))
+        .collect();
+    assert_eq!(args, vec![("now-seconds", "s64"), ("monotonic-ns", "u64")]);
+
+    let configured = configure(
+        &frozen,
+        &[("now-seconds", "1111"), ("monotonic-ns", "2222")],
+    )
+    .unwrap();
+    let info = configured.describe();
+
+    // Still an ordinary provider; the config surface is gone, the API (including the
+    // async `sleep`) and the types interface remain.
+    assert_eq!(info.kind, ComponentKind::Provider);
+    let exports = export_slots(&info);
+    assert!(exports.contains("eo9:time/time"));
+    assert!(exports.contains("eo9:time/types"));
+    assert!(!exports.contains("eo9:time/frozen-config"));
+    assert!(info.args.is_empty());
+
+    // It composes like any provider: the consumer's time need is sealed and the config
+    // interface never reaches it.
+    let bound = compose(&configured, &clock_user()).unwrap();
+    assert_eq!(bound.kind(), ComponentKind::Binary);
+    assert!(!import_slots(&bound.describe()).contains("eo9:time/time"));
+    assert!(!import_slots(&bound.describe()).contains("eo9:time/frozen-config"));
+}
+
+#[test]
+fn configure_of_an_async_api_provider_is_deterministic() {
+    let bind = || {
+        configure(
+            &frozen_provider(),
+            &[("now-seconds", "1111"), ("monotonic-ns", "2222")],
+        )
+        .unwrap()
+    };
+    assert_eq!(bind().save(), bind().save());
+}
+
+#[test]
+fn configure_still_rejects_resource_owning_providers_with_a_clear_error() {
+    // fs.memfs's API interface defines its own resources (`file`, `immutable-handle`);
+    // binding it needs resource proxying in the binder, which is not implemented yet
+    // (plan/03 Decisions) -- the rejection must stay a clear, named error.
+    let err = configure(&memfs_provider(), &[] as &[(&str, &str)]).unwrap_err();
+    match err {
+        ConfigureError::Internal(message) => {
+            assert!(
+                message.contains("defines its own resources"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected a clear internal error, got {other:?}"),
+    }
 }
