@@ -62,8 +62,8 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
    Area 11's store-backed resolution replaces only `Backend::resolve` in the component crate.
 5. **`let` bindings are duplicated per use.** The WIT algebra consumes components, so bound values are copied
    (`save` + `load` in the component backend) each time a binding or the granted environment is used.
-6. **Deferred / escalations.** (a) Provider `configure` arguments: the algebra has no compose-time configure
-   binding, so `virtualfs --dir …` parses but reports "not supported yet" — needs a cross-area decision.
+6. **Deferred / escalations.** (a) Provider `configure` arguments — resolved: the `eo9:exec`
+   `component-algebra.configure` operation landed and the shell now uses it (see decision 8).
    (b) Component-typed arguments (`interpret (…)`) are classified correctly but rejected at argument-encoding
    time: `spawn` takes WAVE text only. (c) `only <world-name>` (named policy worlds) needs store resolution.
    (d) `save`/`load` builtins, unmatched-export warnings, and history recall/line editing beyond in-memory
@@ -74,3 +74,12 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
    shell awaits (`fs.open-exec`/`exec-read`, `text.read-line`, `task.wait`) are now `async func` imports;
    call sites and eosh-core are unchanged except one owned-String argument in `Backend::resolve`
    (`open-exec` takes its path by value).
+8. **Provider flags mean `configure`.** Flags applied to a provider term are its configure arguments: the
+   evaluator WAVE-encodes them against the provider's config signature (from `describe`, the same
+   type-directed rules as `main` flags), fills omitted `option<…>` arguments with `none`, errors on missing
+   required or unknown ones, and calls `component-algebra.configure` to bake them in as compose-time
+   constants — before the provider is used by `$`, `&`, `with … as`, or `let`. A provider with no flags is
+   used as-is (left unconfigured). The configured value carries no run-time arguments, so it composes,
+   extends, and binds exactly like any other provider. The old "configure not supported" error path is gone
+   (`EvalError::ProviderArguments` removed; the specific flag errors — unknown flag, expression for a data
+   parameter, missing required argument — surface instead).

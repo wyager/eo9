@@ -240,6 +240,23 @@ impl Backend for MockBackend {
         Ok(id)
     }
 
+    fn configure(&mut self, provider: u32, args: &[NamedArg]) -> Result<u32, BackendError> {
+        // A configured provider keeps its exports but no longer exposes a config
+        // signature (the config interface is sealed by configuration).
+        let mut info = self.info(provider);
+        info.args = Vec::new();
+        let id = self.fresh(info);
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|arg| format!("{}={}", arg.name, arg.value))
+            .collect();
+        self.log.push(format!(
+            "configure(c{provider}, [{}]) -> c{id}",
+            rendered.join(", ")
+        ));
+        Ok(id)
+    }
+
     fn rename(&mut self, component: u32, from: &str, to: &str) -> Result<u32, BackendError> {
         let mut info = self.info(component);
         for export in &mut info.exports {

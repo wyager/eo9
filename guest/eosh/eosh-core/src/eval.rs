@@ -6,9 +6,12 @@
 //! `only` is `restrict`, `rename` is `rename`, and `with p as n` is "rename `p`'s
 //! single export slot to `n`, then compose". Argument application is type-directed by
 //! the callee's `describe`d signature: data-typed parameters take WAVE text
-//! ([`crate::wave`]), component-typed parameters take program expressions. Naming or
-//! composing a program never runs it — running is the session's top-level rule
-//! ([`crate::session`]), not the evaluator's.
+//! ([`crate::wave`]), component-typed parameters take program expressions. A binary's
+//! flags are `main` arguments, carried alongside the component and bound at spawn time;
+//! a provider's flags are `configure` arguments, bound immediately as compose-time
+//! constants via [`Backend::configure`] — before the provider is used by `$`, `&`,
+//! `with`, or `let`. Naming or composing a program never runs it — running is the
+//! session's top-level rule ([`crate::session`]), not the evaluator's.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -44,15 +47,13 @@ pub enum EvalError {
     DuplicateArgument { name: String },
     /// More positional arguments than unfilled parameters.
     TooManyPositional,
-    /// A required parameter was not provided (checked at the top level).
+    /// A required parameter was not provided (checked where the signature is final:
+    /// the top level for `main` arguments, the application site for `configure` ones).
     MissingArgument { name: String, ty: String },
     /// A data-typed parameter was given a parenthesized program expression.
     ExpressionForDataParameter { name: String, ty: String },
     /// A component-typed parameter: understood, but not yet supported end to end.
     ComponentArgumentUnsupported { name: String },
-    /// Arguments were applied to a provider (configure-at-compose-time is not yet
-    /// supported by the component algebra).
-    ProviderArguments,
     /// Arguments are not allowed in this position (e.g. on an `&` operand).
     ArgumentsNotAllowed { context: &'static str },
     /// An `only` entry that is a bare world name (policy worlds are not resolvable yet).
@@ -102,11 +103,6 @@ impl fmt::Display for EvalError {
                 f,
                 "parameter `{name}` is component-typed; passing programs as arguments is not \
                  supported yet (the task API takes only WAVE-encoded data arguments)"
-            ),
-            EvalError::ProviderArguments => write!(
-                f,
-                "configure arguments on providers are not supported yet: the component algebra \
-                 has no compose-time configure binding"
             ),
             EvalError::ArgumentsNotAllowed { context } => {
                 write!(f, "arguments cannot be applied to {context}")
@@ -245,7 +241,11 @@ impl<'a, B: Backend> Evaluator<'a, B> {
         Ok(self.backend.resolve(name).await?)
     }
 
-    /// Argument application, type-directed by the callee's argument signature.
+    /// Argument application, type-directed by the callee's argument signature. For a
+    /// binary the flags are `main` arguments, carried alongside the component and bound
+    /// at spawn time; for a provider they are `configure` arguments, bound right here as
+    /// compose-time constants via [`Backend::configure`], before the provider is used
+    /// by `$`, `&`, or `with`.
     async fn eval_app(
         &mut self,
         callee: &Expr,
@@ -253,31 +253,20 @@ impl<'a, B: Backend> Evaluator<'a, B> {
     ) -> Result<EvalOutput<B::Component>, EvalError> {
         let callee_out = self.eval_boxed(callee).await?;
         let info = self.backend.describe(&callee_out.component);
+        let named = collect_named_args(callee_out.args, &info.args, args)?;
 
-        if info.kind == ComponentKind::Provider && !args.is_empty() {
-            return Err(EvalError::ProviderArguments);
-        }
-
-        let mut named = callee_out.args;
-        for arg in args {
-            match arg {
-                Arg::Flag { name, value } => {
-                    let spec = info
-                        .args
-                        .iter()
-                        .find(|spec| spec.name == *name)
-                        .ok_or_else(|| EvalError::UnknownFlag { name: name.clone() })?;
-                    push_arg(&mut named, spec, value)?;
-                }
-                Arg::Positional(value) => {
-                    let spec = info
-                        .args
-                        .iter()
-                        .find(|spec| !named.iter().any(|arg| arg.name == spec.name))
-                        .ok_or(EvalError::TooManyPositional)?;
-                    push_arg(&mut named, spec, value)?;
-                }
-            }
+        if info.kind == ComponentKind::Provider {
+            // The configure signature is final here, so omitted optional arguments are
+            // filled with `none` and missing required ones fail now, before anything is
+            // composed. A provider with no flags never reaches this point (the parser
+            // only builds an application when arguments are present) and is used as-is.
+            let mut named = named;
+            complete_args(&mut named, &info.args)?;
+            let configured = self.backend.configure(callee_out.component, &named)?;
+            return Ok(EvalOutput {
+                component: configured,
+                args: Vec::new(),
+            });
         }
 
         Ok(EvalOutput {
@@ -310,6 +299,36 @@ impl<'a, B: Backend> Evaluator<'a, B> {
     }
 }
 
+/// Match flags and positional arguments against a declared signature, WAVE-encoding
+/// each value per its parameter's type; `initial` carries arguments already bound by an
+/// inner application.
+fn collect_named_args(
+    initial: Vec<NamedArg>,
+    specs: &[ArgSpec],
+    args: &[Arg],
+) -> Result<Vec<NamedArg>, EvalError> {
+    let mut named = initial;
+    for arg in args {
+        match arg {
+            Arg::Flag { name, value } => {
+                let spec = specs
+                    .iter()
+                    .find(|spec| spec.name == *name)
+                    .ok_or_else(|| EvalError::UnknownFlag { name: name.clone() })?;
+                push_arg(&mut named, spec, value)?;
+            }
+            Arg::Positional(value) => {
+                let spec = specs
+                    .iter()
+                    .find(|spec| !named.iter().any(|arg| arg.name == spec.name))
+                    .ok_or(EvalError::TooManyPositional)?;
+                push_arg(&mut named, spec, value)?;
+            }
+        }
+    }
+    Ok(named)
+}
+
 /// Fill one parameter, encoding the value per the parameter's declared type.
 fn push_arg(named: &mut Vec<NamedArg>, spec: &ArgSpec, value: &ArgValue) -> Result<(), EvalError> {
     if named.iter().any(|arg| arg.name == spec.name) {
@@ -338,9 +357,10 @@ fn push_arg(named: &mut Vec<NamedArg>, spec: &ArgSpec, value: &ArgValue) -> Resu
     Ok(())
 }
 
-/// Check an argument list for completeness against the program's signature: missing
+/// Check an argument list for completeness against a declared signature: missing
 /// optional parameters are filled with `none`, missing required ones are an error.
-/// Used by the top-level run rule, where the final signature is known.
+/// Used where the signature is final — the top-level run rule for `main` arguments,
+/// the application site for a provider's `configure` arguments.
 pub fn complete_args(args: &mut Vec<NamedArg>, specs: &[ArgSpec]) -> Result<(), EvalError> {
     for spec in specs {
         if args.iter().any(|arg| arg.name == spec.name) {
@@ -681,12 +701,144 @@ mod tests {
     }
 
     #[test]
-    fn provider_arguments_are_rejected() {
+    fn provider_flags_configure_before_composition() {
         let mut backend = MockBackend::new();
         backend.program_with_args("virtualfs", provider(&["eo9:fs/fs"]), &[("dir", "string")]);
         backend.program("browser", binary(&[]));
-        let err = eval(&mut backend, "virtualfs --dir /tmp/sandbox $ browser").unwrap_err();
-        assert_eq!(err, EvalError::ProviderArguments);
+        let out = eval(&mut backend, "virtualfs --dir /tmp/sandbox $ browser").expect("evaluates");
+        // Configure arguments are bound at compose time; nothing rides along to spawn.
+        assert!(out.args.is_empty());
+        assert_eq!(
+            backend.log,
+            vec![
+                "resolve(virtualfs) -> c1",
+                "describe(c1)",
+                "configure(c1, [dir=\"/tmp/sandbox\"]) -> c2",
+                "resolve(browser) -> c3",
+                "compose(c2, c3) -> c4",
+            ]
+        );
+    }
+
+    #[test]
+    fn providers_without_flags_are_not_configured() {
+        let mut backend = MockBackend::new();
+        backend.program_with_args("virtualfs", provider(&["eo9:fs/fs"]), &[("dir", "string")]);
+        backend.program("browser", binary(&[]));
+        eval(&mut backend, "virtualfs $ browser").expect("evaluates");
+        assert!(
+            !backend.log.iter().any(|line| line.starts_with("configure")),
+            "an unflagged provider must be used as-is, log: {:?}",
+            backend.log
+        );
+    }
+
+    #[test]
+    fn provider_configure_arguments_are_type_directed_and_completed() {
+        let mut backend = MockBackend::new();
+        backend.program_with_args(
+            "entropy.seeded",
+            provider(&["eo9:entropy/entropy"]),
+            &[("seed", "u64"), ("label", "option<string>")],
+        );
+        backend.program("app", binary(&[]));
+        eval(&mut backend, "entropy.seeded --seed 42 $ app").expect("evaluates");
+        // The u64 passes through as WAVE text and the omitted optional is filled with none.
+        assert!(
+            backend
+                .log
+                .iter()
+                .any(|line| line == "configure(c1, [seed=42, label=none]) -> c2"),
+            "log: {:?}",
+            backend.log
+        );
+    }
+
+    #[test]
+    fn provider_configure_flag_errors_are_specific() {
+        let mut backend = MockBackend::new();
+        backend.program_with_args("virtualfs", provider(&["eo9:fs/fs"]), &[("dir", "string")]);
+        backend.program_with_args(
+            "virtualdisk",
+            provider(&["eo9:disk/disk"]),
+            &[("path", "string"), ("size", "u64")],
+        );
+        backend.program("app", binary(&[]));
+        assert_eq!(
+            eval(&mut backend, "virtualfs --dri /tmp/sandbox $ app").unwrap_err(),
+            EvalError::UnknownFlag {
+                name: "dri".to_string()
+            }
+        );
+        assert_eq!(
+            eval(&mut backend, "virtualfs --dir (net.none $ x) $ app").unwrap_err(),
+            EvalError::ExpressionForDataParameter {
+                name: "dir".to_string(),
+                ty: "string".to_string()
+            }
+        );
+        // A required configure argument left out fails here, before anything composes.
+        assert_eq!(
+            eval(&mut backend, "virtualdisk --path /disk.img $ app").unwrap_err(),
+            EvalError::MissingArgument {
+                name: "size".to_string(),
+                ty: "u64".to_string()
+            }
+        );
+        assert!(
+            !backend.log.iter().any(|line| line.starts_with("configure")),
+            "no configure call may happen on a flag error, log: {:?}",
+            backend.log
+        );
+    }
+
+    #[test]
+    fn configured_providers_work_inside_extend() {
+        let mut backend = MockBackend::new();
+        backend.program_with_args(
+            "entropy.seeded",
+            provider(&["eo9:entropy/entropy"]),
+            &[("seed", "u64")],
+        );
+        backend.program("virtualnet", provider(&["eo9:net/net"]));
+        backend.program("app", binary(&[]));
+        eval(&mut backend, "entropy.seeded --seed 7 & virtualnet $ app").expect("evaluates");
+        assert_eq!(
+            backend.log,
+            vec![
+                "resolve(entropy.seeded) -> c1",
+                "describe(c1)",
+                "configure(c1, [seed=7]) -> c2",
+                "resolve(virtualnet) -> c3",
+                "extend(c2, c3) -> c4",
+                "resolve(app) -> c5",
+                "compose(c4, c5) -> c6",
+            ]
+        );
+    }
+
+    #[test]
+    fn configured_providers_work_inside_with_bindings() {
+        let mut backend = MockBackend::new();
+        backend.program_with_args("virtualfs", provider(&["eo9:fs/fs"]), &[("dir", "string")]);
+        backend.program("tool", binary(&[]));
+        eval(
+            &mut backend,
+            "with virtualfs --dir /scratch as scratch-fs $ tool",
+        )
+        .expect("evaluates");
+        assert_eq!(
+            backend.log,
+            vec![
+                "resolve(tool) -> c1",
+                "resolve(virtualfs) -> c2",
+                "describe(c2)",
+                "configure(c2, [dir=\"/scratch\"]) -> c3",
+                "describe(c3)",
+                "rename(c3, eo9:fs/fs -> scratch-fs) -> c4",
+                "compose(c4, c1) -> c5",
+            ]
+        );
     }
 
     #[test]
