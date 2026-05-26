@@ -378,6 +378,15 @@ fn component_metadata(shell_name: &str, component: &[u8]) -> Result<String, Stri
         format!("store component `{shell_name}` does not load as an eo9 module: {err:?}")
     })?;
     let info = component.describe();
+    // Space-separated records; an empty field is spelled `-` so the kernel-side parser
+    // never has to disambiguate consecutive separators.
+    let field = |text: &str| {
+        if text.is_empty() {
+            "-".to_string()
+        } else {
+            text.to_string()
+        }
+    };
     let mut meta = String::new();
     meta.push_str(match info.kind {
         eo9_component::ComponentKind::Binary => "kind binary\n",
@@ -386,20 +395,26 @@ fn component_metadata(shell_name: &str, component: &[u8]) -> Result<String, Stri
     for need in &info.imports {
         meta.push_str(&format!(
             "import {} {} {} {}\n",
-            if need.required { "required" } else { "optional" },
-            need.slot,
-            need.interface,
-            need.version,
+            if need.required {
+                "required"
+            } else {
+                "optional"
+            },
+            field(&need.slot),
+            field(&need.interface),
+            field(&need.version),
         ));
     }
     for slot in &info.exports {
         meta.push_str(&format!(
             "export {} {} {}\n",
-            slot.name, slot.interface, slot.version
+            field(&slot.name),
+            field(&slot.interface),
+            field(&slot.version)
         ));
     }
     for arg in &info.args {
-        meta.push_str(&format!("arg {} {}\n", arg.name, arg.ty));
+        meta.push_str(&format!("arg {} {}\n", field(&arg.name), arg.ty));
     }
     Ok(meta)
 }

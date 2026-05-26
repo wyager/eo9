@@ -42,7 +42,12 @@ mod timer;
 mod uart;
 #[cfg(all(
     target_os = "none",
-    any(feature = "wasm-seed", feature = "wasm-hello", feature = "wasm-async")
+    any(
+        feature = "wasm-seed",
+        feature = "wasm-hello",
+        feature = "wasm-async",
+        feature = "wasm-store"
+    )
 ))]
 mod wasm;
 
@@ -74,8 +79,9 @@ extern "C" fn kmain(dtb: *const u8) -> ! {
     // Generic timer: readable counter plus a polled 10 ms timer condition.
     timer::self_test();
 
-    // The kernel command line (QEMU -append) selects what to run; without a `program=`
-    // token the kernel runs its default boot sequence below.
+    // The kernel command line (QEMU -append) selects what to run: `program=<name>` runs a
+    // store entry headless, `demo` runs the original demo sequence below, and nothing at
+    // all boots to the interactive eosh shell.
     let bootargs = fdt::bootargs(dtb);
     if let Some(bootargs) = bootargs {
         kprintln!("cmdline: {bootargs}");

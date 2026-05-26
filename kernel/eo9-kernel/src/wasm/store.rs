@@ -69,8 +69,8 @@ impl StoreImage {
             let (metadata_len, r) = read_u32(r).ok_or("store image: truncated metadata length")?;
             let (metadata, r) =
                 split(r, metadata_len as usize).ok_or("store image: truncated metadata")?;
-            let metadata = core::str::from_utf8(metadata)
-                .map_err(|_| "store image: metadata is not UTF-8")?;
+            let metadata =
+                core::str::from_utf8(metadata).map_err(|_| "store image: metadata is not UTF-8")?;
             entries.push(StoreEntry {
                 name,
                 component,
@@ -83,16 +83,6 @@ impl StoreImage {
             return Err("store image: trailing bytes after the last entry");
         }
         Ok(StoreImage { entries })
-    }
-
-    /// Look an entry up by its shell name.
-    pub fn find(&self, name: &str) -> Option<&StoreEntry> {
-        self.entries.iter().find(|entry| entry.name == name)
-    }
-
-    /// All entries, in image order.
-    pub fn entries(&self) -> &[StoreEntry] {
-        &self.entries
     }
 
     /// Parse once and hand back a `'static` view of the entries (the backing image is

@@ -1,15 +1,17 @@
-//! Headless program selection: run a named component from the baked-in store.
+//! Boot program selection: run a named component from the baked-in store, or eosh.
 //!
 //! The kernel command line (QEMU `-append`, surfaced through `/chosen/bootargs` — see
-//! `crate::fdt`) selects what to run at boot: `program=<name> [arg=value …]` runs that
-//! store entry headless against the kernel root providers, prints its outcome, and the
-//! machine powers off. Without a `program=` token the kernel falls back to its default
-//! boot program (today the demo sequence; eosh once boot-to-shell lands).
+//! `crate::fdt`) selects what to run at boot:
 //!
-//! Arguments are matched against `main`'s named, typed parameters (the same convention
-//! as `eo9 run` in usermode): `name="bare metal" excited=true`. The kernel parses the
-//! scalar types (strings, booleans, integers, floats, chars); anything richer needs the
-//! WAVE machinery and is reported as unsupported rather than guessed at.
+//! * `program=<name> [arg=value …]` — run that store entry headless against the kernel
+//!   root providers, print its outcome, and power off (`program=eosh` starts the shell).
+//! * `demo` — run the original demo sequence (seed canary, hello, the async demos).
+//! * nothing — boot to the interactive eosh shell on the serial console.
+//!
+//! Headless arguments are matched against `main`'s named, typed parameters (the same
+//! convention as `eo9 run` in usermode): `name="bare metal" excited=true`. The kernel
+//! parses the scalar types (strings, booleans, integers, floats, chars); anything richer
+//! needs the WAVE machinery and is reported as unsupported rather than guessed at.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -24,20 +26,21 @@ use super::store::{StoreEntry, StoreImage};
 /// The store image assembled and injected by `cargo xtask build-kernel <arch>`.
 static STORE_IMAGE: &[u8] = include_bytes!(env!("EO9_STORE_IMAGE"));
 
-/// Parse the boot arguments and, if they select a program, run it. Returns `true` when a
-/// `program=` token was present (i.e. the boot was "handled" and the default demo
-/// sequence should not run), `false` otherwise.
+/// Parse the boot arguments and run what they select. Returns `true` when the boot was
+/// handled here (a headless program or the shell ran), `false` when the caller should run
+/// the default demo sequence instead (the `demo` token, or a store image that fails to
+/// parse).
 pub fn boot(bootargs: Option<&str>) -> bool {
-    let store = match StoreImage::parse(STORE_IMAGE) {
-        Ok(store) => store,
+    let entries = match StoreImage::parse_static(STORE_IMAGE) {
+        Ok(entries) => entries,
         Err(error) => {
             crate::kprintln!("store: FAILED to parse the baked-in image: {error}");
             return false;
         }
     };
-    let names: Vec<&str> = store.entries().iter().map(|entry| entry.name).collect();
-    let component_bytes: usize = store.entries().iter().map(|e| e.component.len()).sum();
-    let artifact_bytes: usize = store.entries().iter().map(|e| e.artifact.len()).sum();
+    let names: Vec<&str> = entries.iter().map(|entry| entry.name).collect();
+    let component_bytes: usize = entries.iter().map(|e| e.component.len()).sum();
+    let artifact_bytes: usize = entries.iter().map(|e| e.artifact.len()).sum();
     crate::kprintln!(
         "store: {} components baked in ({} KiB components, {} KiB artifacts): {}",
         names.len(),
@@ -46,21 +49,30 @@ pub fn boot(bootargs: Option<&str>) -> bool {
         names.join(", ")
     );
 
-    let Some(bootargs) = bootargs else {
-        return false;
-    };
+    let bootargs = bootargs.unwrap_or("");
     let (program, args) = parse_command_line(bootargs);
-    let Some(program) = program else {
-        return false;
-    };
 
-    crate::kprintln!("runner: selected `{program}` from the kernel command line");
-    match store.find(&program) {
-        Some(entry) => run_entry(entry, &args),
-        None => crate::kprintln!(
-            "runner: `{program}` is not in the baked-in store (have: {})",
-            names.join(", ")
-        ),
+    // The bare `demo` token keeps the original boot sequence reachable:
+    // `cargo xtask qemu aarch64 demo`.
+    if program.is_none() && tokenize(bootargs).iter().any(|token| token == "demo") {
+        return false;
+    }
+
+    match program.as_deref() {
+        // The default boot program is the shell; `program=eosh` spells the same thing.
+        None | Some("eosh") => {
+            super::shell::boot_to_eosh(entries);
+        }
+        Some(program) => {
+            crate::kprintln!("runner: selected `{program}` from the kernel command line");
+            match entries.iter().find(|entry| entry.name == program) {
+                Some(entry) => run_entry(entry, &args),
+                None => crate::kprintln!(
+                    "runner: `{program}` is not in the baked-in store (have: {})",
+                    names.join(", ")
+                ),
+            }
+        }
     }
     true
 }
