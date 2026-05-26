@@ -934,9 +934,17 @@ fn synthesize_binder_module(plan: &BinderPlan) -> Vec<u8> {
         types.ty().function([ValType::I32, ValType::I32], []);
 
         let root_intrinsics: [(&str, u32, &mut u32); 6] = [
-            ("[waitable-set-new]", returns_i32, &mut root.waitable_set_new),
+            (
+                "[waitable-set-new]",
+                returns_i32,
+                &mut root.waitable_set_new,
+            ),
             ("[waitable-join]", takes_two_i32, &mut root.waitable_join),
-            ("[waitable-set-drop]", takes_i32, &mut root.waitable_set_drop),
+            (
+                "[waitable-set-drop]",
+                takes_i32,
+                &mut root.waitable_set_drop,
+            ),
             ("[subtask-drop]", takes_i32, &mut root.subtask_drop),
             ("[context-set-0]", takes_i32, &mut root.context_set),
             ("[context-get-0]", returns_i32, &mut root.context_get),
@@ -1321,7 +1329,10 @@ fn sync_forward_body(
 /// `configure` has run, allocate a per-call frame, make the async-lowered call, and
 /// either complete the task immediately (the provider already returned) or park the
 /// provider's subtask in a fresh waitable set and wait for the callback.
-#[expect(clippy::too_many_arguments, reason = "one-shot generator, plain data in")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one-shot generator, plain data in"
+)]
 fn async_entry_body(
     forward: &ForwardFunction,
     async_forward: &AsyncForward,
