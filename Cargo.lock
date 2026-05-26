@@ -468,6 +468,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-embed"
+version = "0.0.0"
+dependencies = [
+ "eo9-component",
+ "eo9-providers-unix",
+ "eo9-runtime",
+]
+
+[[package]]
 name = "eo9-integration"
 version = "0.0.0"
 dependencies = [
