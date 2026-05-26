@@ -525,6 +525,179 @@ pub fn sleeper_wat() -> &'static str {
 }
 
 // -----------------------------------------------------------------------------------------
+// The invoker-configured environment fixture (raw component WAT)
+// -----------------------------------------------------------------------------------------
+
+/// The fixed line [`invoker_env_guest`] writes to stdout (followed by one entropy-derived
+/// character).
+pub const INVOKER_ENV_OUTPUT_LINE: &str = "invoker-env-ok";
+
+/// The guest of the invoker-configured environment suite: a binary that imports the real
+/// `eo9:time`, `eo9:entropy`, and `eo9:text` interfaces and **none of the stub config
+/// interfaces** -- configuration is entirely the invoker's business (the algebra's
+/// `configure` operation), and the program only observes the result.
+///
+/// Its async `main`:
+/// 1. reads the wall clock and the monotonic clock,
+/// 2. sleeps through the (frozen) clock -- the call completing at all is what proves the
+///    configured provider forwards its async API,
+/// 3. draws two samples from the seeded entropy,
+/// 4. writes [`INVOKER_ENV_OUTPUT_LINE`] plus one entropy-derived character through
+///    `eo9:text` (left residual, so the ambient text provider captures it), and
+/// 5. returns `(x ^ y) + now.seconds + monotonic-now` -- every provider observation is
+///    folded into the rendered outcome.
+pub fn invoker_env_guest() -> Component {
+    let bytes = wat::parse_str(invoker_env_wat())
+        .expect("invoker-env fixture must be valid component WAT")
+        .to_vec();
+    Component::load(bytes).expect("invoker-env fixture should load")
+}
+
+fn invoker_env_wat() -> &'static str {
+    r#"
+(component
+  ;; ----- time: the API only (no frozen-config import) ---------------------------------------
+  (import "eo9:time/types@0.1.0" (instance $time-types
+    (export "time-impl" (type (sub resource)))))
+  (alias export $time-types "time-impl" (type $time-impl))
+  (import "eo9:time/time@0.1.0" (instance $time
+    (export "time-impl" (type $ti (eq $time-impl)))
+    (type $datetime-def (record (field "seconds" s64) (field "nanoseconds" u32)))
+    (export "datetime" (type $datetime (eq $datetime-def)))
+    (type $instant-def (record (field "nanoseconds" u64)))
+    (export "instant" (type $instant (eq $instant-def)))
+    (export "default" (func (result (own $ti))))
+    (export "now" (func (param "t" (borrow $ti)) (result $datetime)))
+    (export "monotonic-now" (func (param "t" (borrow $ti)) (result $instant)))
+    (export "sleep" (func async (param "t" (borrow $ti)) (param "duration-ns" u64)))))
+
+  ;; ----- entropy: the API only (no seeded-config import) ------------------------------------
+  (import "eo9:entropy/types@0.1.0" (instance $entropy-types
+    (export "entropy-impl" (type (sub resource)))))
+  (alias export $entropy-types "entropy-impl" (type $entropy-impl))
+  (import "eo9:entropy/entropy@0.1.0" (instance $entropy
+    (export "entropy-impl" (type $ei (eq $entropy-impl)))
+    (export "default" (func (result (own $ei))))
+    (export "get-u64" (func (param "e" (borrow $ei)) (result u64)))))
+
+  ;; ----- text: left residual so the ambient text provider captures the output --------------
+  (import "eo9:text/types@0.1.0" (instance $text-types
+    (export "text-impl" (type (sub resource)))))
+  (alias export $text-types "text-impl" (type $text-impl))
+  (import "eo9:text/text@0.1.0" (instance $text
+    (export "text-impl" (type $txi (eq $text-impl)))
+    (type $output-stream-def (enum "out" "err"))
+    (export "output-stream" (type $output-stream (eq $output-stream-def)))
+    (type $text-error-def (variant (case "closed") (case "io" string)))
+    (export "text-error" (type $text-error (eq $text-error-def)))
+    (export "default" (func (result (own $txi))))
+    (export "write" (func
+      (param "t" (borrow $txi))
+      (param "to" $output-stream)
+      (param "text" string)
+      (result (result (error $text-error)))))))
+
+  ;; ----- libc: memory, bump realloc, string constants --------------------------------------
+  (core module $libc
+    (memory (export "memory") 1)
+    (global $heap (mut i32) (i32.const 4096))
+    (data (i32.const 16) "invoker-env-ok")
+    (func (export "realloc") (param $old i32) (param $old-size i32) (param $align i32) (param $new-size i32) (result i32)
+      (local $ptr i32)
+      (local.set $ptr
+        (i32.and
+          (i32.add (global.get $heap) (i32.sub (local.get $align) (i32.const 1)))
+          (i32.sub (i32.const 0) (local.get $align))))
+      (global.set $heap (i32.add (local.get $ptr) (local.get $new-size)))
+      (local.get $ptr)))
+  (core instance $libc (instantiate $libc))
+
+  ;; ----- lowered imports --------------------------------------------------------------------
+  (alias export $time "default" (func $time-default))
+  (alias export $time "now" (func $now))
+  (alias export $time "monotonic-now" (func $monotonic-now))
+  (alias export $time "sleep" (func $sleep))
+  (alias export $entropy "default" (func $entropy-default))
+  (alias export $entropy "get-u64" (func $get-u64))
+  (alias export $text "default" (func $text-default))
+  (alias export $text "write" (func $text-write))
+
+  (core func $time-default-lowered (canon lower (func $time-default)))
+  (core func $now-lowered (canon lower (func $now) (memory $libc "memory")))
+  (core func $monotonic-now-lowered (canon lower (func $monotonic-now)))
+  (core func $sleep-lowered (canon lower (func $sleep)))
+  (core func $entropy-default-lowered (canon lower (func $entropy-default)))
+  (core func $get-u64-lowered (canon lower (func $get-u64)))
+  (core func $text-default-lowered (canon lower (func $text-default)))
+  (core func $text-write-lowered (canon lower (func $text-write)
+    (memory $libc "memory") (realloc (func $libc "realloc"))))
+  (core func $task-return (canon task.return (result u64)))
+
+  ;; ----- the program --------------------------------------------------------------------------
+  (core module $m
+    (import "libc" "memory" (memory 1))
+    (import "host" "time-default" (func $time-default (result i32)))
+    ;; now(handle, retptr): datetime { seconds: s64 @0, nanoseconds: u32 @8 }
+    (import "host" "now" (func $now (param i32 i32)))
+    (import "host" "monotonic-now" (func $monotonic-now (param i32) (result i64)))
+    ;; sleep(handle, duration-ns)
+    (import "host" "sleep" (func $sleep (param i32 i64)))
+    (import "host" "entropy-default" (func $entropy-default (result i32)))
+    (import "host" "get-u64" (func $get-u64 (param i32) (result i64)))
+    (import "host" "text-default" (func $text-default (result i32)))
+    ;; write(handle, stream, text-ptr, text-len, retptr)
+    (import "host" "write" (func $write (param i32 i32 i32 i32 i32)))
+    (import "host" "task-return" (func $task-return (param i64)))
+
+    (func (export "main")
+      (local $t i32) (local $e i32) (local $txt i32)
+      (local $x i64) (local $y i64)
+
+      ;; 1. observe the clock the invoker configured
+      (local.set $t (call $time-default))
+      (call $now (local.get $t) (i32.const 256))
+
+      ;; 2. sleep through it -- on a frozen clock the wait is over immediately, and the
+      ;;    call completing at all proves the configured provider forwards its async API
+      (call $sleep (local.get $t) (i64.const 1000000))
+
+      ;; 3. two samples from the seeded entropy
+      (local.set $e (call $entropy-default))
+      (local.set $x (call $get-u64 (local.get $e)))
+      (local.set $y (call $get-u64 (local.get $e)))
+
+      ;; 4. observable output: the fixed line plus one entropy-derived character
+      (local.set $txt (call $text-default))
+      (call $write (local.get $txt) (i32.const 0) (i32.const 16) (i32.const 14) (i32.const 320))
+      (i32.store8 (i32.const 48)
+        (i32.add (i32.const 97) (i32.and (i32.wrap_i64 (local.get $x)) (i32.const 15))))
+      (call $write (local.get $txt) (i32.const 0) (i32.const 48) (i32.const 1) (i32.const 320))
+
+      ;; 5. the outcome folds every observation
+      (call $task-return
+        (i64.add
+          (i64.add (i64.xor (local.get $x) (local.get $y)) (i64.load (i32.const 256)))
+          (call $monotonic-now (local.get $t))))))
+
+  (core instance $i (instantiate $m
+    (with "libc" (instance $libc))
+    (with "host" (instance
+      (export "time-default" (func $time-default-lowered))
+      (export "now" (func $now-lowered))
+      (export "monotonic-now" (func $monotonic-now-lowered))
+      (export "sleep" (func $sleep-lowered))
+      (export "entropy-default" (func $entropy-default-lowered))
+      (export "get-u64" (func $get-u64-lowered))
+      (export "text-default" (func $text-default-lowered))
+      (export "write" (func $text-write-lowered))
+      (export "task-return" (func $task-return))))))
+
+  (func (export "main") async (result u64) (canon lift (core func $i "main") async))
+)
+"#
+}
+
+// -----------------------------------------------------------------------------------------
 // The deterministic-environment fixture (raw component WAT, milestone 2 / gate I2)
 // -----------------------------------------------------------------------------------------
 
