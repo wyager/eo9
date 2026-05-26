@@ -1,0 +1,181 @@
+/* eo9.org — one small hand-written stylesheet, no frameworks, no external assets. */
+
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbf9;
+  --fg: #1d2a33;
+  --muted: #5a6b76;
+  --accent: #217a6e;
+  --accent-strong: #185e55;
+  --rule: #dce3e6;
+  --code-bg: #f0f2f1;
+  --note-bg: #f2efe6;
+  --note-edge: #cdbf96;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131a1f;
+    --fg: #dbe4ea;
+    --muted: #93a4af;
+    --accent: #4fc0af;
+    --accent-strong: #7ed6c8;
+    --rule: #2a363e;
+    --code-bg: #1b242b;
+    --note-bg: #1d2229;
+    --note-edge: #5d5436;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  line-height: 1.6;
+  font-size: 1.05rem;
+}
+
+main,
+header.hero > div,
+footer > div {
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 0 1.25rem;
+}
+
+/* Header */
+
+header.hero {
+  border-bottom: 1px solid var(--rule);
+  padding: 3rem 0 2.25rem;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+}
+
+.brand img {
+  width: 56px;
+  height: 56px;
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 2.4rem;
+  letter-spacing: 0.01em;
+}
+
+.tagline {
+  margin: 1rem 0 1.5rem;
+  font-size: 1.25rem;
+  color: var(--muted);
+  max-width: 36rem;
+}
+
+.links a {
+  display: inline-block;
+  margin: 0 0.9rem 0.5rem 0;
+  padding: 0.45rem 0.9rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.4rem;
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.links a:hover,
+.links a:focus {
+  color: var(--bg);
+  background: var(--accent);
+}
+
+/* Body text */
+
+main {
+  padding-top: 1.5rem;
+  padding-bottom: 3rem;
+}
+
+h2 {
+  margin-top: 2.5rem;
+  font-size: 1.4rem;
+}
+
+a {
+  color: var(--accent);
+}
+
+a:hover,
+a:focus {
+  color: var(--accent-strong);
+}
+
+p,
+li {
+  max-width: 42rem;
+}
+
+ul {
+  padding-left: 1.2rem;
+}
+
+li {
+  margin-bottom: 0.35rem;
+}
+
+.note {
+  background: var(--note-bg);
+  border-left: 3px solid var(--note-edge);
+  border-radius: 0 0.3rem 0.3rem 0;
+  padding: 0.75rem 1rem;
+  margin: 1.75rem 0;
+}
+
+.note p {
+  margin: 0;
+}
+
+code,
+pre {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+}
+
+code {
+  background: var(--code-bg);
+  padding: 0.1em 0.3em;
+  border-radius: 0.25em;
+}
+
+pre {
+  background: var(--code-bg);
+  padding: 0.9rem 1rem;
+  border-radius: 0.4rem;
+  overflow-x: auto;
+  line-height: 1.5;
+}
+
+pre code {
+  background: none;
+  padding: 0;
+}
+
+/* Footer */
+
+footer {
+  border-top: 1px solid var(--rule);
+  padding: 1.5rem 0 2.5rem;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+footer p {
+  margin: 0.3rem 0;
+}

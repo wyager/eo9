@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Eo9 — a capability-secure operating system</title>
+  <meta name="description"
+        content="Eo9 is a capability-secure operating system built on the WebAssembly Component Model: a program's imports are its capability set, and composition, sandboxing, and virtualization are the same zero-overhead operation.">
+  <link rel="icon" type="image/svg+xml" href="/logo.svg">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="hero">
+  <div>
+    <div class="brand">
+      <img src="/logo.svg" alt="Eo9 logo" width="56" height="56">
+      <h1>Eo9</h1>
+    </div>
+    <p class="tagline">
+      A capability-secure operating system built on the WebAssembly Component Model.
+    </p>
+    <p class="links">
+      <a href="https://github.com/wyager/eo9">Source on GitHub</a>
+      <a href="https://github.com/wyager/eo9/blob/master/SPEC.md">Read the spec</a>
+    </p>
+  </div>
+</header>
+
+<main>
+
+  <div class="note">
+    <p>
+      <strong>Status:</strong> Eo9 is in early, active development. Nothing described here is stable,
+      and every concrete design choice is provisional. The
+      <a href="https://github.com/wyager/eo9/blob/master/SPEC.md">spec</a> is the source of truth.
+    </p>
+  </div>
+
+  <h2>What Eo9 is</h2>
+  <p>
+    Eo9 is an operating system built on language-theoretic principles for security, performance, and
+    composability. Programs are distributed as WebAssembly Component Model components rather than
+    native binaries, and the OS itself is, at its core, a set of typed APIs plus a compiler for
+    programs that use them.
+  </p>
+  <p>
+    A WebAssembly component's only channel to the outside world is its imports — there are no
+    syscalls and no ambient I/O. The import set therefore <em>is</em> the capability set: everything
+    a program can do is statically enumerable from its imports before it ever runs. Eo9 does not
+    rely on hardware privilege domains for isolation; it is secure by construction, with a small,
+    explicit trusted computing base (the compiler, the root scheduler, and the hardware-root
+    capabilities held by the OS core).
+  </p>
+
+  <h2>Composition is the whole interface</h2>
+  <p>
+    Granting, attenuating, and replacing capabilities are all the same operation: composing providers
+    onto a program. <code>$</code> composes a provider into a consumer, satisfying and sealing the
+    imports it matches; <code>&amp;</code> extends one provider environment with another, so
+    reusable environments are ordinary values. Dropping a capability (<code>net.none</code>),
+    refusing it (<code>net.deny</code>), or bounding a whole composition to an allow-list
+    (<code>only</code>) are part of the same small algebra.
+  </p>
+  <pre><code>&gt; net.none $ browser                        # browser observes "no network"
+&gt; time.monotonic-stub &amp; virtualnet $ app    # a packaged environment, applied to app
+&gt; only eo9:time,eo9:fs $ cruncher --input data.bin   # allow-list; anything else is a compose-time error</code></pre>
+  <p>
+    Arguments are named and typed — there is no untyped <code>argv</code> — and a program reports its
+    outcome in its own typed vocabulary rather than a numeric exit code.
+  </p>
+
+  <h2>Virtualization and sandboxing by substitution</h2>
+  <p>
+    Every OS API a program uses can be substituted at composition time: a virtual filesystem,
+    loopback-only networking, a frozen clock, seeded entropy. There is no separate hypervisor
+    mechanism — a sandbox is just a different set of providers. Because providers are compiled
+    together with the program, substitution has zero overhead: a layer that does nothing compiles
+    away entirely.
+  </p>
+
+  <h2>Deterministic execution</h2>
+  <p>
+    Compose a program with a deterministic environment —
+    <code>fs.memfs &amp; time.frozen &amp; entropy.seeded</code> — and its runs become reproducible.
+    Scheduling is fuel-metered, so the CPU interleaving is fixed, and with deterministic providers the
+    completion order is too: deterministic tests go all the way down.
+  </p>
+
+  <h2>Performance</h2>
+  <p>
+    Programs are compiled from bytecode to the native architecture with their providers inlined.
+    There is no kernel-mode/user-mode boundary and no context switch except scheduler switches
+    between programs, and no MMU or nested address translation is needed for isolation. One honest
+    caveat: on MMU-less targets, linear-memory safety is paid for with the bounds checks the
+    optimizer cannot prove away.
+  </p>
+
+  <h2>eofs, the native filesystem</h2>
+  <p>
+    Eo9 bundles its own filesystem, <code>eofs</code>, and it is just a provider: it imports the disk
+    API and exports the filesystem API, so the same component runs over a real block device on bare
+    metal and over a file-backed or in-memory disk under usermode Eo9. It is copy-on-write and never
+    overwrites in place, with atomic root flips — crash consistency by construction, no fsck. It is a
+    Merkle tree throughout, so every file and directory carries a precomputed content hash up to the
+    root: integrity checking, cheap change detection, and hash-guided incremental backup. Snapshots
+    are retained roots, and block compression is on by default.
+  </p>
+
+  <h2>Bare metal and hosted</h2>
+  <p>
+    Eo9 targets bare metal — AArch64, RISC-V, and x86-64, including MMU-less hardware — and, because
+    it is fundamentally a WebAssembly compiler plus a set of APIs, the same system also runs as an
+    ordinary usermode program on an existing OS (or on Eo9 itself).
+  </p>
+
+  <h2>Roadmap</h2>
+  <p>The MVP being built in the open right now aims at:</p>
+  <ul>
+    <li>the core OS API specs (execution, disk, filesystem, net, text, messages, entropy, time, perf);</li>
+    <li>a usermode <code>eo9</code> binary backed by standard *nix APIs;</li>
+    <li>bootable QEMU images for AMD64, AArch64, and rv64gc — headless programs and boot-to-shell;</li>
+    <li><code>eosh</code>, a shell built around the composition operators;</li>
+    <li>usermode and in-QEMU test suites.</li>
+  </ul>
+  <p>
+    Progress, plans, and the full design live in the repository:
+    <a href="https://github.com/wyager/eo9">github.com/wyager/eo9</a>.
+  </p>
+
+</main>
+
+<footer>
+  <div>
+    <p>Eo9 is MIT-licensed and developed in the open.</p>
+    <p>
+      <a href="https://github.com/wyager/eo9">Source</a> ·
+      <a href="https://github.com/wyager/eo9/blob/master/SPEC.md">Spec</a>
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>

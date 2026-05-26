@@ -1,0 +1,489 @@
+//! The listeners and request handlers: plain-HTTP site serving, HTTPS site serving
+//! (manual or ACME certificates), and the HTTP→HTTPS redirect listener.
+//!
+//! Every listener applies the same connection hygiene (see [`Limits`]): a cap on concurrent
+//! connections, a TLS-handshake deadline, a header-read deadline, and an overall per-connection
+//! lifetime, so stalled or hostile clients cannot pin tasks or sockets indefinitely.
+
+use std::convert::Infallible;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use http_body_util::Full;
+use hyper::body::{Bytes, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode, Uri, header};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use rustls_acme::is_tls_alpn_challenge;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
+use tokio_rustls::LazyConfigAcceptor;
+use tokio_rustls::server::TlsStream;
+
+use crate::tls::TlsSettings;
+use crate::{Config, Mode, ResolveError, cache_control, content_type, resolve, tls};
+
+type Body = Full<Bytes>;
+
+/// Connection limits applied to every listener. Defaults are generous for a small static
+/// site; tests use smaller values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Maximum concurrent connections per listener; further connections wait in the kernel
+    /// accept backlog until a slot frees up.
+    pub max_connections: usize,
+    /// Time allowed for a TLS handshake to complete before the connection is dropped.
+    pub tls_handshake_timeout: Duration,
+    /// Time allowed for a client to send its request headers (also bounds how long an idle
+    /// keep-alive connection waits for its next request).
+    pub header_read_timeout: Duration,
+    /// Overall lifetime of one connection; when it expires the connection is dropped even
+    /// mid-request. Keep-alive is fine within this bound.
+    pub max_connection_lifetime: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_connections: 256,
+            tls_handshake_timeout: Duration::from_secs(10),
+            header_read_timeout: Duration::from_secs(10),
+            max_connection_lifetime: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Run the configured server until failure. This is the whole program after argument parsing.
+pub async fn run(config: Config) -> Result<(), String> {
+    if !config.site_root.is_dir() {
+        return Err(format!(
+            "site directory `{}` does not exist or is not a directory",
+            config.site_root.display()
+        ));
+    }
+    let Config {
+        site_root,
+        http_bind,
+        https_bind,
+        mode,
+    } = config;
+    let limits = Limits::default();
+
+    match mode {
+        Mode::PlainHttp => {
+            let listener = bind(&http_bind).await?;
+            println!(
+                "eo9-www: serving {} on http://{}/",
+                site_root.display(),
+                local_addr(&listener, &http_bind)
+            );
+            serve_site_http(listener, site_root, limits)
+                .await
+                .map_err(|e| format!("http server failed: {e}"))
+        }
+        Mode::ManualTls { cert, key } => {
+            let settings = tls::manual_tls(&cert, &key)?;
+            run_tls(&site_root, &http_bind, &https_bind, settings, None, limits).await
+        }
+        Mode::Acme {
+            domains,
+            email,
+            cache_dir,
+            staging,
+        } => {
+            let (settings, mut state) = tls::acme_tls(&domains, &email, &cache_dir, staging)?;
+            println!(
+                "eo9-www: acme: certificates for {} cached in {} ({})",
+                domains.join(", "),
+                cache_dir.display(),
+                if staging {
+                    "Let's Encrypt staging"
+                } else {
+                    "Let's Encrypt production"
+                }
+            );
+            // Drive certificate acquisition and renewal in the background for the lifetime
+            // of the server; the resolver inside `settings` picks up each new certificate.
+            tokio::spawn(async move {
+                loop {
+                    match state.next().await {
+                        Some(Ok(event)) => println!("eo9-www: acme: {event:?}"),
+                        Some(Err(error)) => eprintln!("eo9-www: acme error: {error}"),
+                        None => break,
+                    }
+                }
+            });
+            run_tls(
+                &site_root,
+                &http_bind,
+                &https_bind,
+                settings,
+                domains.into_iter().next(),
+                limits,
+            )
+            .await
+        }
+    }
+}
+
+/// Run the HTTPS site listener plus the HTTP redirect listener.
+async fn run_tls(
+    site_root: &Path,
+    http_bind: &str,
+    https_bind: &str,
+    settings: TlsSettings,
+    canonical_host: Option<String>,
+    limits: Limits,
+) -> Result<(), String> {
+    let https_listener = bind(https_bind).await?;
+    let http_listener = bind(http_bind).await?;
+    println!(
+        "eo9-www: serving {} on https://{}/ (http://{}/ redirects)",
+        site_root.display(),
+        local_addr(&https_listener, https_bind),
+        local_addr(&http_listener, http_bind)
+    );
+    tokio::try_join!(
+        serve_site_https(https_listener, settings, site_root.to_path_buf(), limits),
+        serve_redirect(http_listener, canonical_host, limits),
+    )
+    .map(|_| ())
+    .map_err(|e| format!("server failed: {e}"))
+}
+
+async fn bind(addr: &str) -> Result<TcpListener, String> {
+    TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("failed to bind {addr}: {e}"))
+}
+
+/// The address to print at startup: the real local address (useful with port 0), falling
+/// back to the configured string.
+fn local_addr(listener: &TcpListener, configured: &str) -> String {
+    listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| configured.to_owned())
+}
+
+/// Serve the site over plain HTTP (development mode).
+pub async fn serve_site_http(
+    listener: TcpListener,
+    site_root: PathBuf,
+    limits: Limits,
+) -> io::Result<()> {
+    let site_root = Arc::new(site_root);
+    let permits = Arc::new(Semaphore::new(limits.max_connections));
+    loop {
+        let permit = acquire(&permits).await;
+        let stream = accept(&listener).await;
+        let site_root = site_root.clone();
+        tokio::spawn(async move {
+            let _permit = permit; // released when the connection is done
+            serve_site_connection(stream, site_root, limits).await;
+        });
+    }
+}
+
+/// Serve the site over HTTPS. In ACME mode, TLS-ALPN-01 challenge handshakes from the
+/// certificate authority are answered here too (that is the whole challenge: completing a
+/// handshake with a special certificate — no content is served on such connections).
+pub async fn serve_site_https(
+    listener: TcpListener,
+    settings: TlsSettings,
+    site_root: PathBuf,
+    limits: Limits,
+) -> io::Result<()> {
+    let settings = Arc::new(settings);
+    let site_root = Arc::new(site_root);
+    let permits = Arc::new(Semaphore::new(limits.max_connections));
+    loop {
+        let permit = acquire(&permits).await;
+        let stream = accept(&listener).await;
+        let settings = settings.clone();
+        let site_root = site_root.clone();
+        tokio::spawn(async move {
+            let _permit = permit; // released when the connection is done
+            if let Err(error) = serve_tls_connection(stream, &settings, site_root, limits).await {
+                eprintln!("eo9-www: tls connection error: {error}");
+            }
+        });
+    }
+}
+
+/// Redirect every plain-HTTP request to HTTPS (used in the TLS modes). The target host is
+/// taken from the request's `Host` header, falling back to `canonical_host`.
+pub async fn serve_redirect(
+    listener: TcpListener,
+    canonical_host: Option<String>,
+    limits: Limits,
+) -> io::Result<()> {
+    let canonical_host = Arc::new(canonical_host);
+    let permits = Arc::new(Semaphore::new(limits.max_connections));
+    loop {
+        let permit = acquire(&permits).await;
+        let stream = accept(&listener).await;
+        let canonical_host = canonical_host.clone();
+        tokio::spawn(async move {
+            let _permit = permit; // released when the connection is done
+            let service = service_fn(move |request: Request<Incoming>| {
+                let canonical_host = canonical_host.clone();
+                async move {
+                    let host = request
+                        .headers()
+                        .get(header::HOST)
+                        .and_then(|value| value.to_str().ok());
+                    Ok::<_, Infallible>(redirect_response(
+                        host,
+                        request.uri(),
+                        canonical_host.as_deref(),
+                    ))
+                }
+            });
+            drive_connection(stream, service, limits).await;
+        });
+    }
+}
+
+/// Wait for a free connection slot. The semaphore is never closed, so this cannot fail.
+async fn acquire(permits: &Arc<Semaphore>) -> tokio::sync::OwnedSemaphorePermit {
+    permits
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("connection semaphore is never closed")
+}
+
+/// Accept the next connection; transient accept failures are logged and retried after a
+/// short pause so a burst of errors (e.g. file-descriptor exhaustion) cannot kill the loop.
+async fn accept(listener: &TcpListener) -> TcpStream {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _peer)) => return stream,
+            Err(error) => {
+                eprintln!("eo9-www: accept failed: {error}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// Complete the TLS handshake (within the handshake deadline) and serve the site over the
+/// resulting stream.
+async fn serve_tls_connection(
+    stream: TcpStream,
+    settings: &TlsSettings,
+    site_root: Arc<PathBuf>,
+    limits: Limits,
+) -> io::Result<()> {
+    let accepted = timeout(limits.tls_handshake_timeout, tls_accept(stream, settings))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tls handshake timed out"))??;
+    match accepted {
+        // An ACME validation connection: already answered and closed in `tls_accept`.
+        None => Ok(()),
+        Some(tls) => {
+            serve_site_connection(tls, site_root, limits).await;
+            Ok(())
+        }
+    }
+}
+
+/// Run the TLS handshake. Returns `None` for ACME TLS-ALPN-01 validation connections (the
+/// handshake with the challenge certificate *is* the whole exchange — nothing is served).
+async fn tls_accept(
+    stream: TcpStream,
+    settings: &TlsSettings,
+) -> io::Result<Option<TlsStream<TcpStream>>> {
+    let handshake = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await?;
+    match &settings.challenge_config {
+        Some(challenge_config) if is_tls_alpn_challenge(&handshake.client_hello()) => {
+            let mut tls = handshake.into_stream(challenge_config.clone()).await?;
+            tls.shutdown().await?;
+            Ok(None)
+        }
+        _ => Ok(Some(
+            handshake
+                .into_stream(settings.server_config.clone())
+                .await?,
+        )),
+    }
+}
+
+/// Serve HTTP/1.1 on one (plain or TLS) connection, answering every request from the site.
+async fn serve_site_connection<IO>(stream: IO, site_root: Arc<PathBuf>, limits: Limits)
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let service = service_fn(move |request: Request<Incoming>| {
+        let site_root = site_root.clone();
+        async move {
+            Ok::<_, Infallible>(site_response(request.method(), request.uri(), &site_root).await)
+        }
+    });
+    drive_connection(stream, service, limits).await;
+}
+
+/// Drive one HTTP/1.1 connection with the configured deadlines: hyper's header-read timeout
+/// covers each request's headers (and idle keep-alive waits), and the whole connection is
+/// dropped once its lifetime budget is spent.
+async fn drive_connection<IO, S>(stream: IO, service: S, limits: Limits)
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+    S: hyper::service::Service<Request<Incoming>, Response = Response<Body>, Error = Infallible>,
+{
+    let connection = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.header_read_timeout)
+        .serve_connection(TokioIo::new(stream), service);
+    match timeout(limits.max_connection_lifetime, connection).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("eo9-www: http connection error: {error}"),
+        // Lifetime budget spent: dropping the connection future closes the socket.
+        Err(_elapsed) => {}
+    }
+}
+
+/// Build the response for one request against the site directory. GET and HEAD are served
+/// (hyper omits the body for HEAD itself); every other method gets 405. Resolution failures
+/// get 400 or 404 with a small HTML body.
+pub async fn site_response(method: &Method, uri: &Uri, site_root: &Path) -> Response<Body> {
+    if method != Method::GET && method != Method::HEAD {
+        let mut response = error_response(StatusCode::METHOD_NOT_ALLOWED);
+        response
+            .headers_mut()
+            .insert(header::ALLOW, header::HeaderValue::from_static("GET, HEAD"));
+        return response;
+    }
+    match resolve(site_root, uri.path()) {
+        Ok(file) => match tokio::fs::read(&file).await {
+            Ok(contents) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, content_type(&file))
+                .header(header::CACHE_CONTROL, cache_control(&file))
+                .body(Full::new(Bytes::from(contents)))
+                .expect("statically valid response"),
+            // The file vanished between resolution and reading; treat it as not found.
+            Err(_) => error_response(StatusCode::NOT_FOUND),
+        },
+        Err(ResolveError::BadRequest) => error_response(StatusCode::BAD_REQUEST),
+        Err(ResolveError::NotFound) => error_response(StatusCode::NOT_FOUND),
+    }
+}
+
+/// Build the 301 redirect to HTTPS for one plain-HTTP request. `host_header` is the raw
+/// `Host` header value; `canonical_host` is the fallback when it is missing.
+pub fn redirect_response(
+    host_header: Option<&str>,
+    uri: &Uri,
+    canonical_host: Option<&str>,
+) -> Response<Body> {
+    let host = host_header
+        .map(strip_port)
+        .filter(|host| is_valid_host(host))
+        .or(canonical_host);
+    let Some(host) = host else {
+        return error_response(StatusCode::BAD_REQUEST);
+    };
+    let path_and_query = uri.path_and_query().map_or("/", |pq| pq.as_str());
+    let location = format!("https://{host}{path_and_query}");
+    Response::builder()
+        .status(StatusCode::MOVED_PERMANENTLY)
+        .header(header::LOCATION, location.as_str())
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Full::new(Bytes::from(format!(
+            "<!doctype html>\n<html><body><a href=\"{location}\">{location}</a></body></html>\n"
+        ))))
+        .expect("statically valid response")
+}
+
+/// Drop a trailing `:port` from a Host header value, leaving IPv6 literals intact.
+fn strip_port(host: &str) -> &str {
+    if let Some(end) = host.find(']') {
+        return &host[..=end]; // "[::1]:8080" -> "[::1]"
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if port.chars().all(|c| c.is_ascii_digit()) => name,
+        _ => host,
+    }
+}
+
+/// A conservative validity check on a redirect target host, so a hostile `Host` header can
+/// never smuggle anything surprising into the `Location` header.
+fn is_valid_host(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+}
+
+fn error_response(status: StatusCode) -> Response<Body> {
+    let reason = status.canonical_reason().unwrap_or("error");
+    let body = format!(
+        "<!doctype html>\n<html><head><title>{status}</title></head>\
+         <body><h1>{} {reason}</h1><p><a href=\"/\">eo9.org</a></p></body></html>\n",
+        status.as_u16()
+    );
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Full::new(Bytes::from(body)))
+        .expect("statically valid response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_port_handles_names_and_literals() {
+        assert_eq!(strip_port("eo9.org"), "eo9.org");
+        assert_eq!(strip_port("eo9.org:8080"), "eo9.org");
+        assert_eq!(strip_port("[::1]:8080"), "[::1]");
+        assert_eq!(strip_port("[::1]"), "[::1]");
+        assert_eq!(strip_port("127.0.0.1:80"), "127.0.0.1");
+    }
+
+    #[test]
+    fn redirect_uses_host_header_then_fallback() {
+        let uri: Uri = "/style.css?v=1".parse().unwrap();
+
+        let location = |response: &Response<Body>| {
+            response.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+
+        let from_header = redirect_response(Some("eo9.org:8080"), &uri, Some("fallback.example"));
+        assert_eq!(from_header.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(location(&from_header), "https://eo9.org/style.css?v=1");
+
+        let from_fallback = redirect_response(None, &uri, Some("eo9.org"));
+        assert_eq!(location(&from_fallback), "https://eo9.org/style.css?v=1");
+
+        // A hostile Host header is ignored in favor of the canonical host.
+        let hostile = redirect_response(Some("evil.example/path"), &uri, Some("eo9.org"));
+        assert_eq!(location(&hostile), "https://eo9.org/style.css?v=1");
+
+        // No usable host at all: refuse rather than guess.
+        let none = redirect_response(None, &uri, None);
+        assert_eq!(none.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn default_limits_are_sane() {
+        let limits = Limits::default();
+        assert!(limits.max_connections >= 64);
+        assert!(limits.tls_handshake_timeout <= limits.max_connection_lifetime);
+        assert!(limits.header_read_timeout <= limits.max_connection_lifetime);
+    }
+}

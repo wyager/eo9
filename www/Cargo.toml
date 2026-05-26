@@ -1,0 +1,31 @@
+# Website workspace: the eo9.org static site and the server that serves it directly to the
+# internet (HTTP + HTTPS with built-in ACME certificates — no reverse proxy).
+# Deliberately its own workspace (like guest/ and kernel/) so its dependencies never
+# enter the OS dependency tree; build and test it with plain `cargo` from this directory.
+[workspace]
+
+[package]
+name = "eo9-www"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Web server for eo9.org: static site, HTTPS, ACME certificates"
+
+# Stack rationale lives in README.md ("Server choice"). Everything TLS uses rustls with the
+# ring provider (no OpenSSL linkage, no cmake); certificates come from Let's Encrypt via
+# rustls-acme (TLS-ALPN-01) or from PEM files in manual mode.
+[dependencies]
+hyper = { version = "1.9.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+http-body-util = "0.1.3"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "sync", "time"] }
+futures-util = "0.3.32"
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pki-types = { version = "1.14.1", features = ["std"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-acme = { version = "0.15.2", default-features = false, features = ["ring", "tls12", "webpki-roots"] }
+
+[dev-dependencies]
+# Self-signed certificates for the manual-TLS integration tests.
+rcgen = "0.14.8"
