@@ -71,3 +71,10 @@ None. Everything else depends on this.
    the guest workspace (no wasm test runner; guest code is exercised by host-side integration tests).
 8. **LICENSE is a placeholder** — no license chosen yet (project-owner decision); Cargo manifests carry no
    `license` field until then.
+9. **Guest components are refreshed before tests run.** Host integration tests consume the prebuilt
+   components under `guest/target/components` and only rebuild *missing* ones, so running tests against a
+   stale tree after a guest source change produced false failures (it bit a reviewer on master). Both the
+   `ci` gate and the standalone `test` subcommand now run `build-guest` before the test step; the gate order
+   is fmt → lint → build → build-guest → test. The no-change overhead is ~1.5–2 s (an incremental no-op
+   guest build plus re-componentize/validate of every component); a content-hash freshness check was
+   deliberately not added — predictable ordering over cleverness.
