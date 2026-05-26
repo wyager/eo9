@@ -270,6 +270,30 @@ impl Backend for WitBackend {
         outcome_from_wit(task::wait(&task).await)
     }
 
+    async fn session_manifest(&mut self) -> Option<String> {
+        // The embedder that built this session (usermode `eo9 shell`, later the kernel's
+        // boot-to-shell) leaves a small manifest on the session filesystem describing
+        // the grants (see eosh-core's `envinfo`). A missing or unreadable file just
+        // means the information is unavailable; `env` says so and carries on.
+        let path = eosh_core::SESSION_MANIFEST_PATH;
+        let stat = fs::stat(&self.fs, path.to_string()).await.ok()?;
+        let file = fs::open(&self.fs, path.to_string(), fs::OpenFlags::READ)
+            .await
+            .ok()?;
+        let mut bytes: Vec<u8> = Vec::with_capacity(stat.size as usize);
+        while (bytes.len() as u64) < stat.size {
+            let offset = bytes.len() as u64;
+            let chunk = buffer::with_capacity(stat.size - offset);
+            let (chunk, result) = fs::read(&file, offset, chunk).await;
+            let read = result.ok()?;
+            if read.bytes_read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer::prefix_to_vec(&chunk, read.bytes_read));
+        }
+        String::from_utf8(bytes).ok()
+    }
+
     fn print(&mut self, line: &str) {
         self.write(text::OutputStream::Out, line);
     }

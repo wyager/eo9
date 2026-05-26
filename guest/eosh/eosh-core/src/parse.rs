@@ -194,7 +194,15 @@ impl Parser {
                     return Ok(Command::Let { name, expr });
                 }
                 "help" => return self.builtin_no_args(Command::Help),
-                "env" => return self.builtin_no_args(Command::Env),
+                "env" => {
+                    // Bare `env` is the session view; `env <expr>` is the capability
+                    // view of one expression.
+                    self.next();
+                    if self.peek().is_none() {
+                        return Ok(Command::Env);
+                    }
+                    return Ok(Command::EnvOf(self.expr()?));
+                }
                 "history" => return self.builtin_no_args(Command::History),
                 "exit" | "quit" => return self.builtin_no_args(Command::Exit),
                 "describe" => {
@@ -841,6 +849,14 @@ mod tests {
         );
         assert_eq!(parse_command("help").expect("parses"), Command::Help);
         assert_eq!(parse_command("env").expect("parses"), Command::Env);
+        assert_eq!(
+            parse_command("env readwrite").expect("parses"),
+            Command::EnvOf(name("readwrite"))
+        );
+        assert_eq!(
+            parse_command("env net.deny $ fetcher").expect("parses"),
+            Command::EnvOf(compose(name("net.deny"), name("fetcher")))
+        );
         assert_eq!(parse_command("history").expect("parses"), Command::History);
         assert_eq!(parse_command("exit").expect("parses"), Command::Exit);
         assert_eq!(parse_command("quit").expect("parses"), Command::Exit);

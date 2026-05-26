@@ -83,3 +83,21 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
    extends, and binds exactly like any other provider. The old "configure not supported" error path is gone
    (`EvalError::ProviderArguments` removed; the specific flag errors — unknown flag, expression for a data
    parameter, missing required argument — surface instead).
+9. **`env` shows the session's capability picture; `env <expr>` shows one expression's.** The shell has no
+   private way to ask the runtime what its session holds (it is an ordinary program), so the embedder that
+   builds the session writes a small plain-text **session manifest** where the shell can read it with a
+   capability it already has — the session filesystem, at `/session` (`eosh-core::envinfo`, format
+   `eo9-session 1` + `shell|child <capability> <description>` + `note …` lines; unknown record kinds are
+   skipped so the format can grow). `env` renders it: capabilities granted to the shell, what programs
+   started from the shell receive, embedder notes, then the granted environment (if an embedder passed one)
+   and the `let` bindings as before. `env <expr>` evaluates the expression like `describe` (nothing is
+   compiled or spawned) and marks every residual import with how this session would treat it: *satisfied by
+   the session (cap)*, *always available* (types-only and `eo9:io/*` — no authority), *absent — observes
+   absence* (optional), or *missing — would be refused at spawn* with the `cap.none $ …` hint (required).
+   The manifest is informational only — the runtime's linking rules remain the authority — and a missing or
+   malformed manifest degrades to "no session capability information available". Backend gains one method
+   (`session_manifest`, async; the component backend reads the file, the mock returns a canned string).
+   *Escalation (proper fix, needs planner/WIT):* a real introspection surface — e.g. an `eo9:exec/session`
+   interface with `grants: func() -> list<grant-info>` describing the caller's own providers and its
+   children's policy — would replace the file convention; the manifest format was chosen to be trivially
+   replaceable by it.

@@ -86,8 +86,12 @@ pub enum Command {
     Describe(Expr),
     /// `imports <expr>` — print the residual imports.
     Imports(Expr),
-    /// `env` — show the shell's granted environment.
+    /// `env` — show the session's capability picture (what the shell holds, what
+    /// children receive) and the granted environment, if any.
     Env,
+    /// `env <expr>` — show how this session would treat the expression's imports
+    /// (satisfied, optional-and-absent, or refused at spawn).
+    EnvOf(Expr),
     /// `history` — show the lines entered this session.
     History,
     /// `help`.
