@@ -51,5 +51,28 @@ or are re-exports). `wasmtime-fiber` needed no changes: upstream already ships a
 backend with the aarch64 stack-switching code.
 
 The kernel additionally provides, as the embedder: `wasmtime_tls_get/set`,
-`wasmtime_concurrent_tls_get/set`, and a `CustomCodeMemory` publisher — see
-`kernel/eo9-kernel/src/wasm/mod.rs`.
+`wasmtime_concurrent_tls_get/set`, and a `CustomCodeMemory` publisher (D-cache clean +
+I-cache invalidate over published code) — see `kernel/eo9-kernel/src/wasm/mod.rs`.
+
+## On-target codegen (planned, not yet vendored) — plan/12 Decision 26
+
+The next rung (the kernel compiling components on the machine, behind an off-by-default
+`wasm-codegen` cargo feature) will add two more vendored crates here, both kept
+kernel-workspace-only via `[patch.crates-io]`. The fork surface was surveyed before
+vendoring (so the diff stays minimal):
+
+- **`wasmtime-environ` 45.0.0** — already `#![no_std]`; its `compile` feature currently
+  requires `std`. Planned changes: drop `std` from the `compile` feature (it already pulls
+  the alloc-friendly `object/write_core` + `gimli/write` paths) and fix the residual
+  `std::` in the `compile` module — almost all mechanical core/alloc swaps, with a small
+  number of genuine touchpoints (notably `std::path::PathBuf` in `compile/module_environ.rs`).
+- **`wasmtime-internal-cranelift` 45.0.0** — not yet `#![no_std]` (~43 `std::` lines); the
+  `Compiler` glue. Planned: add `#![no_std]` + `extern crate alloc`, convert std→core/alloc,
+  and drive `object`/`gimli` through their alloc-only write paths.
+
+`cranelift-codegen` 0.132 and the small cranelift sub-crates are **not** vendored: they build
+no_std purely via features (`default-features = false` + `core`, no `std`/`timing`/
+`souper-harvest`; hashbrown is the no_std `HashMap` fallback). The existing `wasmtime` patch
+will gain the `cranelift`/`compile` features on the kernel build path. Cranelift emits native
+aarch64 (not Pulley), so the publisher's cache maintenance above is what makes freshly
+generated code executable.

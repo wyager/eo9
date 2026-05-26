@@ -270,3 +270,55 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
    the friendlier missing-fs story), session manifests for headless `program=` runs, and the riscv64/x86_64
    ports. On-target codegen remains the next rung and is what unlocks composition in the bare-metal shell.
 
+26. **On-target codegen — checkpoint 1: the fork surface is mapped and far smaller than feared (no_std
+    cranelift + wasmtime compile layers).** Owner ruling (2026-05-26): fork cranelift now rather than wait
+    for upstream's in-flight no_std work; keep forks under `kernel/vendor`, kernel-workspace-only, behind a
+    new off-by-default `wasm-codegen` cargo feature so `cargo xtask ci` (which builds the kernel workspace
+    featureless — wasmtime isn't compiled) stays untouched. Survey of the wasmtime 45 / cranelift 0.132
+    compile path, by crate:
+    - **cranelift-codegen 0.132 — no source edits needed; controlled by features.** Already `#![no_std]`
+      with a `core` feature and a hashbrown fallback for `HashMap`/`HashSet`; `extern crate std` is
+      `#[cfg(feature = "std")]`; the only non-`core`/`alloc` uses are `souper_harvest` (behind
+      `#[cfg(feature = "souper-harvest")]`) and `timing`'s `std::time::Instant` (behind
+      `#[cfg(feature = "timing")]`). Building with `default-features = false` + `["core", "host-arch",
+      "pulley"]` (no `std`/`timing`/`souper-harvest`) is no_std-clean. Its `build.rs` runs ISLE codegen at
+      build time on the host — fine. **Do not vendor it.** Same expectation for the small cranelift
+      sub-crates (frontend, entity, bforest, bitset, control, assembler-x64): no_std-capable via features.
+    - **wasmtime-environ 45 — vendor + edit (bounded).** Already `#![no_std]`, but its `compile` feature
+      requires `std` and pulls alloc-friendly deps deliberately (`object/write_core`, `gimli/write`,
+      `wasm-encoder`, `wasmprinter`). The `compile` module's residual `std::` (~79 lines / 21 files) is
+      mostly mechanical core/alloc swaps (`std::ops::Range`→`core::ops::Range`, `std::mem`→`core::mem`,
+      `std::borrow::Cow`→`alloc::borrow::Cow`, `std::collections::HashMap`→the crate's hashbrown alias,
+      `std::sync::Arc`→`alloc::sync::Arc`, `std::any::Any`→`core::any::Any`). The genuine std touchpoints to
+      resolve are few — notably `std::path::PathBuf` in `compile/module_environ.rs` (module-name/debug
+      paths during translation; replace with an `alloc` string or feature-gate). Work: drop `std` from the
+      `compile` feature and fix those residuals.
+    - **wasmtime-internal-cranelift 45 — vendor + edit (the main work crate).** Not yet `#![no_std]`; ~43
+      `std::` lines / 16 files. Work: add `#![no_std]` + `extern crate alloc`, convert std→core/alloc, and
+      drive `object`/`gimli` through their alloc-only write paths. This is where the bulk of the elbow grease
+      is; nothing here looked fundamentally std-bound on inspection (it's the `Compiler` impl glue, not OS
+      services).
+    - **wasmtime (already vendored) — extend the existing patch.** Add the `cranelift`/`compile` features to
+      the kernel build path and make `cranelift` not transitively force `std`. object/gimli/target-lexicon/
+      wasmprinter/wasm-encoder are controlled via features in the dependents, not vendored.
+    Net vendor set for the rung: **two new crates** (wasmtime-environ, wasmtime-internal-cranelift) plus the
+    existing wasmtime patch — cranelift proper stays from the registry behind feature flags. cranelift emits
+    **native aarch64** (not Pulley); Pulley is only a diagnostic fallback that would skip the code-publication
+    work (it needs the same compile crates, so it does not avoid this fork). Recommended sequence:
+    feature-degate → no_std-ify the two crates → compile a trivial module in-kernel under QEMU (checkpoint 2,
+    + real code publication, Decision 27) → full component (checkpoint 3) → wire the shell's `compile`/`$`/`&`
+    (checkpoint 4). Risk note: a 45→newer wasmtime bump would re-touch the CM-async ABI constants the binder
+    and kernel mirror, so this fork should ride the same pin (45) until a deliberate bump.
+
+27. **On-target codegen — code publication / cache maintenance (checkpoint 2 runtime side).** Cranelift in
+    the kernel emits real aarch64 machine code into a heap allocation that must be made coherent before it is
+    executed. The current `BareMetalCodeMemory::publish_executable` only issued `dsb ish; isb` (correct for
+    QEMU TCG, which keeps I-fetch coherent with stores, and for the flat everything-executable identity map).
+    This change makes it correct for real hardware: clean the D-cache to the point of unification by
+    `CTR_EL0.DminLine` (`dc cvau`), `dsb ish`, invalidate the I-cache to PoU by `CTR_EL0.IminLine`
+    (`ic ivau`), `dsb ish; isb`, over the published range. W^X (mapping code read-only/executable and data
+    non-executable) remains a separate MMU hardening item (Decision 3); cache maintenance is the part that is
+    required even under the current flat map and is independently correct, so it lands now (it also already
+    runs for the deserialized AOT artifacts). The publisher's `required_alignment` stays 1 until W^X
+    introduces page granularity.
+
