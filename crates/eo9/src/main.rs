@@ -117,8 +117,8 @@ COMMANDS:
 OPTIONS (before the program name; `--<flag> <value>` after it belongs to the program):
     -v, --verbose             Diagnostics on stderr
         --store <path>        Module store root (default: $EO9_STORE, else ~/.eo9/store)
-        --fs-root <dir>       Directory the program's eo9:fs capability is rooted at
-                              (default: the current directory; guest paths cannot escape it)
+        --fs-root <dir>       Grant the program the eo9:fs capability, rooted at <dir>
+                              (no filesystem access without it; guest paths cannot escape it)
         --exec-snapshot <clone-or-refuse|clone-or-copy>
                               How open-exec snapshots a path (default: clone-or-refuse)
         --max-memory <bytes>  Linear-memory ceiling for the spawned task

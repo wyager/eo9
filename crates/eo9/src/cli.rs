@@ -27,9 +27,9 @@ pub struct Config {
     pub verbose: bool,
     /// `--store`: module store root; defaults to `$EO9_STORE`, then `~/.eo9/store`.
     pub store_root: Option<PathBuf>,
-    /// `--fs-root`: host directory the program's `eo9:fs` capability is rooted at;
-    /// defaults to the process's current working directory. Guest paths can never escape
-    /// this root (the unix fs provider enforces containment).
+    /// `--fs-root`: grant the program the `eo9:fs` capability, rooted at this host
+    /// directory. Without the flag no filesystem is granted at all (no ambient default);
+    /// guest paths can never escape the root (the unix fs provider enforces containment).
     pub fs_root: Option<PathBuf>,
     /// `--exec-snapshot`: how `open-exec` snapshots a path (default: clone-or-refuse).
     pub exec_snapshot: ExecSnapshotPolicy,

@@ -57,13 +57,16 @@ its first milestones, and to be the place where cross-area seams get found.
 5. **Providers.** The runtime's provider traits are implemented in this crate as thin adapters over
    `eo9-providers-unix` (text→stdio, time→host clocks, entropy→OS RNG, fs→host directory tree), bridging its
    completion callbacks into the runtime's `BoxOp` futures with a one-shot cell; the waker that reaches the
-   provider is the task's doorbell. The fs adapter (`HostFs`) wraps the unix fs provider rooted at
-   `--fs-root` — **default: the process's current working directory** — and owns the handle tables mapping
-   the runtime's `u32` handles to the unix provider's open-file / immutable-handle objects; containment is
-   the unix provider's guarantee (guest paths can never escape the root) and nothing in the adapter widens
-   it, so `--fs-root` *is* the program's filesystem capability. All four root providers are handed to every
-   spawn — the runtime links only what the component imports, so this never widens a capability set. Disk and
-   net are still not linked by the runtime, so programs importing those fail at spawn with the loader rule.
+   provider is the task's doorbell. The fs adapter (`HostFs`) wraps the unix fs provider and owns the handle
+   tables mapping the runtime's `u32` handles to the unix provider's open-file / immutable-handle objects;
+   containment is the unix provider's guarantee (guest paths can never escape the root) and nothing in the
+   adapter widens it, so `--fs-root` *is* the program's filesystem capability. **The filesystem is granted
+   only when `--fs-root` is given explicitly — there is no ambient default root.** Without the flag
+   `Providers.fs` stays `None`: a program with a *required* `eo9:fs` import is refused before it runs with a
+   hint to pass `--fs-root <dir>`, and optional fs imports simply observe absence (runtime auto-seal).
+   Text/time/entropy are handed to every spawn — the runtime links only what the component imports, so this
+   never widens a capability set. Disk and net are still not linked by the runtime, so programs importing
+   those fail at spawn with the loader rule.
 6. **Drive loop.** `run` uses the simple built-in loop from milestone 1: donate fuel in fixed 100-quantum
    slices, park the thread on the task's `runnable()` future when it blocks on I/O, stop at `Done`. Adopting
    `eo9-sched` run queues is deferred until there is more than one task to schedule.
@@ -98,10 +101,11 @@ its first milestones, and to be the place where cross-area seams get found.
    diagnostics on the hit), a tampered cache entry being refused and recompiled, a read-only cache never
    failing a run (cold-cache insert failure and use-count-bump failure both degrade to warnings),
    memory-limit enforcement, store add/ls/gc + run-by-name, describe, compile warm, `readwrite` end to end
-   through the unix fs provider (write + read-back against a temp `--fs-root`, plus fs failures staying in
-   the program's own vocabulary and escape attempts being denied inside the root), and the shell stub. The
-   test harness builds the components via `cargo xtask build-guest` only when they are missing, so stale
-   pre-existing components must be rebuilt by hand after guest-facing WIT changes.
+   through the unix fs provider (write + read-back against a temp `--fs-root`, fs failures staying in the
+   program's own vocabulary, escape attempts denied inside the root, and a run *without* `--fs-root` being
+   refused with the grant hint), and the shell stub. The test harness builds the components via
+   `cargo xtask build-guest` only when they are missing, so stale pre-existing components must be rebuilt by
+   hand after guest-facing WIT changes.
 10. **xtask touch (authorized follow-up).** `xtask build` (and therefore `ci`) now also runs
     `cargo check -p eo9-sched --target aarch64-unknown-none`, after the kernel build so the pinned toolchain
     already has that target installed.

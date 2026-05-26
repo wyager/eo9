@@ -421,22 +421,22 @@ impl FsProvider for HostFs {
 }
 
 /// The root providers of a usermode run: text on the process's standard streams, the
-/// host's real clocks, the OS RNG, and the host filesystem rooted at `--fs-root`
-/// (defaulting to the process's current working directory).
+/// host's real clocks, the OS RNG, and — only when `--fs-root` was given — the host
+/// filesystem rooted at that directory.
 ///
-/// Handing all four to `spawn` never widens a program's capability set: the runtime only
+/// Handing these to `spawn` never widens a program's capability set: the runtime only
 /// links the interfaces the component actually imports (the loader rule), and an import
-/// with no provider — today, anything beyond text/time/entropy/fs — is a spawn error.
-/// The fs capability is bounded by its root: the unix provider refuses any path that
-/// would escape it.
+/// with no provider is a spawn error. The fs capability is bounded by its root: the unix
+/// provider refuses any path that would escape it.
 pub fn root_providers(cfg: &Config) -> Result<Providers, String> {
-    let fs_root = match &cfg.fs_root {
-        Some(root) => root.clone(),
-        None => std::env::current_dir().map_err(|err| {
-            format!("cannot determine the current directory for the fs root: {err}")
-        })?,
+    // The filesystem is granted only when the user names a root explicitly — there is no
+    // ambient default (handing out, say, the current directory unasked would be ambient
+    // authority). Without `--fs-root`, a required fs import is refused at spawn and an
+    // optional one observes absence.
+    let fs: Option<Box<dyn FsProvider>> = match &cfg.fs_root {
+        Some(root) => Some(Box::new(HostFs::new(root, cfg.exec_snapshot)?)),
+        None => None,
     };
-    let fs = HostFs::new(&fs_root, cfg.exec_snapshot)?;
     Ok(Providers {
         text: Some(Box::new(StdioText {
             inner: UnixText::stdio(),
@@ -447,7 +447,7 @@ pub fn root_providers(cfg: &Config) -> Result<Providers, String> {
         entropy: Some(Box::new(HostEntropy {
             inner: UnixEntropy::new(),
         })),
-        fs: Some(Box::new(fs)),
+        fs,
     })
 }
 

@@ -516,6 +516,39 @@ fn readwrite_failures_stay_in_the_programs_vocabulary_and_inside_the_root() {
 }
 
 #[test]
+fn fs_is_not_granted_without_an_explicit_fs_root() {
+    // No ambient filesystem authority: without --fs-root there is no fs provider at all,
+    // and a program that requires eo9:fs is refused before it runs, with a hint that
+    // names the flag.
+    let store = temp_store("readwrite-no-grant");
+    let readwrite = component_arg("readwrite");
+    let run = eo9(
+        &store,
+        &[
+            "run",
+            &readwrite,
+            "--path",
+            "note.txt",
+            "--contents",
+            "should never land",
+        ],
+    );
+    assert_eq!(run.code, 3, "stdout: {}", run.stdout);
+    assert!(
+        run.stderr.contains("--fs-root"),
+        "the refusal should point at --fs-root: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("eo9:fs"),
+        "the refusal should name the missing capability: {}",
+        run.stderr
+    );
+    // And nothing was written anywhere (the repo root is eo9's cwd in these tests).
+    assert!(!repo_root().join("note.txt").exists());
+}
+
+#[test]
 fn missing_arguments_are_a_spawn_error() {
     let store = temp_store("missing-args");
     let hello = component_arg("hello");
