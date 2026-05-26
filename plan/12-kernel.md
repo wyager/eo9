@@ -106,3 +106,55 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
      This matches the plan's expectation that the compiler half is the risky part; step 1 required no
      patches at all.
 
+9. **Owner ruling on execution strategy (recorded for the record).** True on-target codegen — the
+   wasmtime-environ / cranelift-layer no_std port — is **required for the MVP**. It is its own workstream,
+   scheduled after (1) the CM-async-on-no_std runtime work and (2) boot-to-shell on metal via host AOT.
+   Pulley (wasmtime's interpreter backend) is acceptable only as a stopgap, not as the MVP execution
+   strategy.
+10. **Milestone 2 is done: the real `eo9-example-hello` runs on bare metal.** `cargo xtask build-kernel
+   aarch64` now builds the hello example from the guest workspace, precompiles it (unmodified) for
+   `aarch64-unknown-none` alongside the seed, and embeds both; at boot the kernel instantiates hello against
+   its own root providers and calls its typed `main(name, excited)`, and the program's greeting — timestamped
+   via the kernel's time provider — appears on serial followed by `outcome = success(greeted)`
+   (instantiate + main ≈ 14 ms under TCG; 302 KB artifact). Arguments are fixed in the kernel for now;
+   feeding them from the QEMU `-append` cmdline belongs to the "headless program selection" milestone.
+11. **No CM-async port was needed for hello — because hello is sync at the canonical ABI level.** Despite
+   the WIT convention that entrypoints are async, the merged `eo9-example-hello` component lifts `main`
+   synchronously and lowers its text/time imports synchronously (it validates without the `cm-async`
+   feature and contains zero async canonical built-ins). It therefore runs on the already-working no_std
+   wasmtime configuration from the spike. This is *not* a sync-profile fallback: the artifact is byte-for-byte
+   the merged component. The components that do use the async ABI today are readwrite, eosh, and the
+   configure-style stubs (fs.memfs, time.frozen, entropy.seeded, net.deny, …) — i.e. everything needed for
+   boot-to-shell and for composed environments — so the CM-async-on-no_std work (decision 8, first bullet)
+   remains the gate for kernel milestones 3–4, just not for this one.
+12. **Kernel root providers (hardware roots).** `eo9:text/text` → PL011 (both output streams go to the one
+   serial console), `eo9:time/time` → PL031 RTC for wall-clock seconds + generic timer for sub-second,
+   monotonic-now, and resolution, `eo9:entropy/entropy` → splitmix64 seeded from the cycle counter at boot
+   (explicitly a stub, not a CSPRNG; virtio-rng is the later real source). The linking mirrors
+   `eo9-runtime::link` (same resource/`default()` token shape, same WIT-shaped host types, same 64 KiB
+   get-bytes cap); that crate itself is std-only, so the shapes are mirrored rather than reused, as small and
+   structurally identical code. Async interface members (`text.read-line`, `time.sleep`) and the `configure`
+   interfaces are not registered yet — they arrive with the CM-async port.
+13. **The MMU is now on (flat identity map).** Cranelift-generated programs perform unaligned accesses,
+   which fault on Device-nGnRnE memory with translation off, so the kernel builds a one-table identity map
+   (low 1 GiB Device non-executable for MMIO, 1–2 GiB Normal write-back cacheable for DRAM) and enables the
+   MMU, D-cache, and I-cache before running wasm. Known caveat for real hardware (not QEMU): publishing code
+   into cacheable memory needs DC CVAU / IC IVAU maintenance in the code-memory publisher, and a W^X mapping
+   policy is future work once the map gets finer-grained.
+14. **CM-async under no_std: findings and recommended path (escalation).** What blocks it in wasmtime 45 is
+   narrower than feared:
+   - The `component-model-async` cargo feature hard-requires `std` and `futures/std` (still true on upstream
+     `main` as of this writing). The `futures` items actually used (oneshot channels, `FuturesUnordered`,
+     `StreamExt`) are all available with `futures/alloc` in no_std.
+   - `wasmtime-fiber` already ships a `no_std` backend (`src/nostd.rs`): heap-allocated stacks, no mmap/guard
+     pages, and the hand-written aarch64 stack-switch asm is shared with the unix backend — so the `async`
+     feature's fiber layer is not a blocker.
+   - The concurrent machinery's direct `std::` surface is small and mostly mechanical (`std::io::Read/Write`
+     convenience impls on stream endpoints, a test-only `LazyLock`, `std::` paths that are really core/alloc).
+   - The embedder side needs a tiny no_std executor (a block_on that polls `run_concurrent` with a no-op
+     waker, interleaved with servicing hardware) — straightforward in the kernel.
+   Recommended path: feature/cfg work that can be upstreamed (relax the feature graph, alloc-ify the
+   concurrent module, cfg the io impls), prototyped against a `[patch.crates-io]` copy pinned to v45 only as
+   the bridge while the upstream PR is in flight. Not attempted in this branch: it is a focused workstream of
+   its own (it also unlocks fuel-sliced resumable tasks on metal, which eo9-runtime's task model needs).
+   Planner input wanted on sequencing this against the shell milestone and on who drives the upstream PR.
