@@ -254,8 +254,9 @@ and may adjust further.
 **Granted surface.** A new optional `exec` provider (None by default) links
 `eo9:exec/{component-algebra, images, compile, task}` for the task that holds it.
 Component-algebra operations delegate to `eo9-component` (load/save/describe/compose/
-extend/restrict/rename; the configure-binding operation has not landed in that crate or
-the WIT yet, so nothing is stubbed); `compile` delegates to `Image::compile` on the same
+extend/restrict/rename; `configure` is registered but
+answers `configure-error::internal` until area 03's implementation lands — small
+follow-up); `compile` delegates to `Image::compile` on the same
 pinned engine. Per-task handle tables carry caps: 32 components / 64 MiB total component
 bytes / 16 images / 8 children, enforced before allocation.
 

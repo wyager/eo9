@@ -903,6 +903,20 @@ enum WitRenameError {
     Internal(String),
 }
 
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(variant)]
+#[allow(dead_code)]
+enum WitConfigureError {
+    #[component(name = "not-a-provider")]
+    NotAProvider,
+    #[component(name = "no-config-interface")]
+    NoConfigInterface,
+    #[component(name = "invalid-args")]
+    InvalidArgs(String),
+    #[component(name = "internal")]
+    Internal(String),
+}
+
 #[derive(Clone, Copy, ComponentType, Lift, Lower)]
 #[component(record)]
 struct WitCompileOpts {
@@ -1204,6 +1218,28 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
             ))
         },
     )?;
+
+    algebra.func_wrap(
+        "configure",
+        |mut store: StoreContextMut<'_, TaskState>,
+         (component, _args): (Resource<AlgComponentRes>, Vec<WitNamedArg>)|
+         -> Result<(Result<Resource<AlgComponentRes>, WitConfigureError>,)> {
+            // eo9-component does not implement configure binding yet (it landed in the WIT
+            // first); fail in-band so guests importing the new interface still link and get
+            // a structured error. Delegation is a small follow-up once area 03 ships it.
+            let exec = store.data_mut().exec_provider()?;
+            let _consumed = take_component(exec, component.rep())?;
+            Ok((Err(WitConfigureError::Internal(
+                "configure is not yet implemented host-side; delegation to eo9-component \
+                 lands as a follow-up"
+                    .to_string(),
+            )),))
+        },
+    )?;
+
+    // The record-only args interface carries no functions or resources, but rebuilt guests
+    // import it as an instance; make sure the linker has a definition for it.
+    let _ = linker.instance("eo9:exec/args@0.1.0")?;
 
     // ----- images + compile --------------------------------------------------------------
     let mut images = linker.instance("eo9:exec/images@0.1.0")?;
