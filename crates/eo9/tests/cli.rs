@@ -303,6 +303,56 @@ fn corrupted_cache_entries_are_ignored_not_trusted() {
 }
 
 #[test]
+fn an_unwritable_cache_never_fails_a_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn set_mode(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .unwrap_or_else(|err| panic!("cannot chmod {}: {err}", path.display()));
+    }
+
+    let store = temp_store("cache-readonly");
+    let cruncher = component_arg("cruncher");
+    let args = ["-v", "run", &cruncher, "--seed", "5", "--rounds", "10"];
+
+    // Cold cache, read-only cache directory: the insert after compiling fails, the run
+    // still succeeds with a warning.
+    let cache_dir = store.join("cache");
+    fs::create_dir_all(&cache_dir).expect("create the cache directory");
+    set_mode(&cache_dir, 0o555);
+    let cold = eo9(&store, &args);
+    set_mode(&cache_dir, 0o755);
+    assert_eq!(cold.code, 0, "stderr: {}", cold.stderr);
+    assert!(
+        cold.stderr.contains("could not be cached"),
+        "expected an insert warning: {}",
+        cold.stderr
+    );
+    assert!(cold.stdout.trim().starts_with("success(digest("));
+
+    // Populate the cache normally, then make the entry read-only: the lookup's
+    // use-count bump fails, which is treated as a miss (warn + recompile), not an error.
+    let warm = eo9(&store, &args);
+    assert_eq!(warm.code, 0, "stderr: {}", warm.stderr);
+    let entry_dir = fs::read_dir(&cache_dir)
+        .expect("cache directory must exist")
+        .next()
+        .expect("one cache entry")
+        .expect("readable cache entry")
+        .path();
+    set_mode(&entry_dir, 0o555);
+    let bumped = eo9(&store, &args);
+    set_mode(&entry_dir, 0o755);
+    assert_eq!(bumped.code, 0, "stderr: {}", bumped.stderr);
+    assert!(
+        bumped.stderr.contains("compile-cache lookup failed"),
+        "expected a lookup warning: {}",
+        bumped.stderr
+    );
+    assert_eq!(bumped.stdout, cold.stdout);
+}
+
+#[test]
 fn compile_warms_the_cache_for_a_later_run() {
     let store = temp_store("compile-warm");
     let outcomes = component_arg("outcomes");

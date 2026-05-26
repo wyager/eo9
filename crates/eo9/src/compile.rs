@@ -88,6 +88,9 @@ pub struct LoadedImage {
     pub key: CacheKey,
     /// True when the image was deserialized from the compile cache (no codegen ran).
     pub from_cache: bool,
+    /// True when the cache now holds this image (it was already there, or the insert on
+    /// a miss succeeded).
+    pub stored: bool,
 }
 
 /// Obtain a runnable [`Image`] for `source`, preferring the compile cache.
@@ -97,6 +100,11 @@ pub struct LoadedImage {
 ///   compatibility check) is ignored with a warning and the source is compiled instead.
 /// * **Miss:** the component is compiled exactly once; that same image is serialized,
 ///   sealed, inserted into the cache, and returned.
+///
+/// The cache is an optimization only: a broken, unreadable, or unwritable cache never
+/// fails this function — every cache error degrades to a warning and the component is
+/// simply compiled from source. The only genuine errors are engine creation and
+/// compilation of the component itself.
 pub fn load_image(
     cfg: &Config,
     store: &Store,
@@ -107,9 +115,17 @@ pub fn load_image(
     let params = cache_key_params(cfg, source, compatibility_hash(&engine));
     let key = params.key();
 
-    let cached = store
-        .lookup_image(&key)
-        .map_err(|err| format!("compile-cache lookup failed: {err}"))?;
+    // A lookup failure (unreadable entry, corrupt metadata, or a read-only cache that
+    // cannot take the use-count bump) is treated as a miss, never as a fatal error.
+    let cached = match store.lookup_image(&key) {
+        Ok(cached) => cached,
+        Err(err) => {
+            eprintln!(
+                "eo9: warning: compile-cache lookup failed for key {key}: {err}; compiling from source"
+            );
+            None
+        }
+    };
     match cached {
         Some(entry) => {
             let launch = unseal_artifact(&entry.image).and_then(|artifact| {
@@ -130,6 +146,7 @@ pub fn load_image(
                         image,
                         key,
                         from_cache: true,
+                        stored: true,
                     });
                 }
                 Err(reason) => {
@@ -143,30 +160,39 @@ pub fn load_image(
         None => vlog!(cfg, "compile cache miss: key {key}; compiling"),
     }
 
-    // Compile once, cache the very image we are about to run.
+    // Compile once, then try to cache the very image we are about to run. A run must
+    // not fail just because the cache could not be written (read-only store, full disk,
+    // serialization trouble): those paths warn and carry on with the compiled image.
     let image = Image::compile(&engine, &source.bytes)
         .map_err(|err| format!("{}: {err}", source.origin))?;
-    match image.serialize() {
-        Ok(artifact) => {
-            store
-                .insert_image(&params, &seal_artifact(&artifact))
-                .map_err(|err| format!("compile-cache insert failed: {err}"))?;
-            vlog!(
-                cfg,
-                "compiled {}: cached image ({} bytes) under key {key}",
-                source.origin,
-                artifact.len()
-            );
-        }
+    let stored = match image.serialize() {
+        Ok(artifact) => match store.insert_image(&params, &seal_artifact(&artifact)) {
+            Ok(_) => {
+                vlog!(
+                    cfg,
+                    "compiled {}: cached image ({} bytes) under key {key}",
+                    source.origin,
+                    artifact.len()
+                );
+                true
+            }
+            Err(err) => {
+                eprintln!(
+                    "eo9: warning: compiled image could not be cached under key {key}: {err}"
+                );
+                false
+            }
+        },
         Err(err) => {
-            // A run should not fail just because the cache could not be written.
             eprintln!("eo9: warning: compiled image could not be serialized for caching: {err}");
+            false
         }
-    }
+    };
     Ok(LoadedImage {
         image,
         key,
         from_cache: false,
+        stored,
     })
 }
 
@@ -178,8 +204,10 @@ pub fn cmd_compile(cfg: &Config, reference: &str) -> Result<u8, String> {
     let loaded = load_image(cfg, &store, &source)?;
     if loaded.from_cache {
         println!("compile cache hit: {}", loaded.key);
-    } else {
+    } else if loaded.stored {
         println!("compiled and cached: {}", loaded.key);
+    } else {
+        println!("compiled (not cached — see warning above): {}", loaded.key);
     }
     Ok(EXIT_SUCCESS)
 }

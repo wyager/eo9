@@ -77,19 +77,25 @@ its first milestones, and to be the place where cross-area seams get found.
    hash before the bytes are handed to `unsafe Image::deserialize` (the deserialize trust contract), and the
    run launches with **no codegen**; a miss compiles exactly once and caches the very image it runs. An entry
    that fails the integrity or engine-compatibility check is ignored with a warning and the source is
-   recompiled — it is never trusted with native code. `-v` distinguishes "compile cache miss … compiling /
-   cached image" from "launched from cached image". `eo9 compile` now warms the cache with the same path
-   (and, since it goes through `Image::compile`, rejects providers as not-a-binary — the cache holds closed
-   binaries per the spec).
+   recompiled — it is never trusted with native code. More generally the cache is an optimization only:
+   lookup and insert failures (a broken, unreadable, or unwritable cache — including the use-count bump on a
+   read-only entry) degrade to warnings and the component is compiled from source, so a run can only fail on
+   genuine resolution/compile/spawn errors or the program's own outcome. `-v` distinguishes "compile cache
+   miss … compiling / cached image" from "launched from cached image". `eo9 compile` now warms the cache with
+   the same path (and, since it goes through `Image::compile`, rejects providers as not-a-binary — the cache
+   holds closed binaries per the spec); when the artifact could not actually be cached it says so instead of
+   claiming "cached".
 8. **`eo9 shell` is stubbed** with a clear message: it needs the runtime to expose `eo9:exec` to guests
    (plan 04 deferred) and eosh itself (area 10).
 9. **Tests.** Unit tests cover the argv parser, cache-key construction, WAVE string quoting/arg binding, the
    outcome→exit-code mapping, and the oneshot bridge. Integration tests (`crates/eo9/tests/cli.rs`) drive the
    real binary against the built example components: hello/outcomes (all arms incl. trap→abnormal)/cruncher
    end to end, second-run launch from the cached image (stderr + use-count evidence, and no codegen
-   diagnostics on the hit), a tampered cache entry being refused and recompiled, memory-limit enforcement,
-   store add/ls/gc + run-by-name, describe, compile warm, readwrite's documented refusal, and the shell
-   stub. The test harness builds the components via `cargo xtask build-guest` if they are missing.
+   diagnostics on the hit), a tampered cache entry being refused and recompiled, a read-only cache never
+   failing a run (cold-cache insert failure and use-count-bump failure both degrade to warnings),
+   memory-limit enforcement, store add/ls/gc + run-by-name, describe, compile warm, readwrite's documented
+   refusal, and the shell stub. The test harness builds the components via `cargo xtask build-guest` if they
+   are missing.
 10. **xtask touch (authorized follow-up).** `xtask build` (and therefore `ci`) now also runs
     `cargo check -p eo9-sched --target aarch64-unknown-none`, after the kernel build so the pinned toolchain
     already has that target installed.
