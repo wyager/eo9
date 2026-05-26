@@ -76,6 +76,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("build-guest", rest)?;
             build_guest(&root)
         }
+        "build-web-demo" => {
+            expect_no_args("build-web-demo", rest)?;
+            build_web_demo(&root)
+        }
         "build-kernel" => {
             build_kernel(&root, &arch_arg("build-kernel", rest)?)?;
             Ok(())
@@ -110,6 +114,9 @@ COMMANDS:
     test                 Run host workspace tests and kernel workspace tests (host triple)
     build-guest          Build guest crates for {GUEST_TARGET} and componentize them with
                          `wasm-tools component new` into guest/target/components/*.wasm
+    build-web-demo       Build the guest components, then transpile the /try page's set into
+                         www/site/try/components/ via www/try-build (commit the result; the
+                         deployed site needs no extra tooling). Not part of `ci`.
     build-kernel <arch>  Precompile the seed wasm component and build the bootable kernel
                          image (aarch64 only so far; ELF for QEMU's -kernel loader)
     qemu <arch>          Build the kernel image and boot it under QEMU with serial on stdio
@@ -214,6 +221,38 @@ fn build_guest(root: &Path) -> Result<(), String> {
         println!("xtask: built component {}", component.display());
     }
     Ok(())
+}
+
+/// Build the guest components and regenerate the eo9.org `/try` page's transpiled bundle.
+///
+/// The transpiler (`www/try-build`, its own workspace) turns the example components into
+/// browser-runnable ES modules + core wasm and writes them, plus the launcher manifest, into
+/// `www/site/try/components/`. The output is committed, so this only needs re-running when the
+/// shipped components (or the transpiler pin) change; `ci` deliberately does not depend on it.
+fn build_web_demo(root: &Path) -> Result<(), String> {
+    build_guest(root)?;
+    let manifest = root.join("www").join("try-build").join("Cargo.toml");
+    let components = root.join("guest").join("target").join("components");
+    let out = root
+        .join("www")
+        .join("site")
+        .join("try")
+        .join("components");
+    run(
+        root,
+        "cargo",
+        [
+            OsStr::new("run"),
+            OsStr::new("--release"),
+            OsStr::new("--manifest-path"),
+            manifest.as_os_str(),
+            OsStr::new("--"),
+            OsStr::new("--components"),
+            components.as_os_str(),
+            OsStr::new("--out"),
+            out.as_os_str(),
+        ],
+    )
 }
 
 /// Amount of RAM given to the QEMU guest. Must stay in sync with `RAM_SIZE` in
