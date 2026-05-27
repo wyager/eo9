@@ -100,6 +100,84 @@ fn algebra_error(operation: &str, err: impl core::fmt::Debug) -> BackendError {
     BackendError::new(format!("{operation} failed: {err:?}"))
 }
 
+/// Render an `only` failure as a sentence naming the offending imports, not as the raw
+/// error variant (user studies flagged the debug form as unreadable).
+fn restrict_error(err: component_algebra::RestrictError) -> BackendError {
+    use component_algebra::RestrictError as E;
+    BackendError::new(match err {
+        E::RequiredOutsideAllowList(needs) => format!(
+            "`only` refused: the program still requires {}, which the allow-list does not \
+             include (allow it, compose a provider for it, or drop the requirement)",
+            needs.join(", ")
+        ),
+        E::InvalidAllowList(msg) => format!("`only` refused: invalid allow-list: {msg}"),
+        E::Internal(msg) => format!("`only` failed: {msg}"),
+    })
+}
+
+/// Render a `$` / `&` failure in plain language.
+fn compose_error(operation: &str, err: component_algebra::ComposeError) -> BackendError {
+    use component_algebra::ComposeError as E;
+    BackendError::new(match err {
+        E::NotAProvider => format!(
+            "{operation} refused: the left operand is not a provider (only providers can \
+             satisfy imports)"
+        ),
+        E::TypeMismatch(msg) => {
+            format!("{operation} refused: capability types do not match: {msg}")
+        }
+        E::Internal(msg) => format!("{operation} failed: {msg}"),
+    })
+}
+
+/// Render a `configure` failure in plain language.
+fn configure_error(err: component_algebra::ConfigureError) -> BackendError {
+    use component_algebra::ConfigureError as E;
+    BackendError::new(match err {
+        E::NotAProvider => {
+            "configure refused: only providers can be configured (this is a binary)".to_string()
+        }
+        E::NoConfigInterface => "configure refused: this provider takes no configuration \
+             (or it was already configured)"
+            .to_string(),
+        E::InvalidArgs(msg) => format!("configure refused: {msg}"),
+        E::Internal(msg) => format!("configure failed: {msg}"),
+    })
+}
+
+/// Render a spawn failure. Linker-level "missing import" internals are translated into
+/// the capability story (which interface the program needs and that this session does
+/// not provide it) instead of leaking the raw instantiation error.
+fn spawn_error(err: task::SpawnError) -> BackendError {
+    use task::SpawnError as E;
+    BackendError::new(match err {
+        E::BadArguments(msg) => format!("bad arguments: {msg}"),
+        E::Internal(msg) => match missing_capability(&msg) {
+            Some(text) => text,
+            None => format!("spawn failed: {msg}"),
+        },
+    })
+}
+
+/// If an internal spawn/instantiation error is about an unsatisfied `eo9:*` import,
+/// describe it as a missing capability instead of leaking the raw linker text.
+fn missing_capability(msg: &str) -> Option<String> {
+    let capability = if msg.contains("eo9:exec/") {
+        ("exec", "compose, compile, or spawn other programs")
+    } else if msg.contains("eo9:fs/") || msg.contains("eo9:io/") {
+        ("fs", "use a filesystem")
+    } else if msg.contains("eo9:net/") {
+        ("net", "use the network")
+    } else {
+        return None;
+    };
+    Some(format!(
+        "the program requires the {} capability ({}), which this session does not provide \
+         to it — grant it explicitly or compose a provider/stub for it",
+        capability.0, capability.1
+    ))
+}
+
 /// Map the generated `component-info` record into `eosh-core`'s mirror types.
 fn info_from_wit(info: component_algebra::ComponentInfo) -> ComponentInfo {
     ComponentInfo {
@@ -192,7 +270,7 @@ impl Backend for WitBackend {
         provider: Self::Component,
         consumer: Self::Component,
     ) -> Result<Self::Component, BackendError> {
-        component_algebra::compose(provider, consumer).map_err(|err| algebra_error("`$`", err))
+        component_algebra::compose(provider, consumer).map_err(|err| compose_error("`$`", err))
     }
 
     fn extend(
@@ -200,7 +278,7 @@ impl Backend for WitBackend {
         base: Self::Component,
         layer: Self::Component,
     ) -> Result<Self::Component, BackendError> {
-        component_algebra::extend(base, layer).map_err(|err| algebra_error("`&`", err))
+        component_algebra::extend(base, layer).map_err(|err| compose_error("`&`", err))
     }
 
     fn restrict(
@@ -215,7 +293,7 @@ impl Backend for WitBackend {
                 version: entry.version.clone(),
             })
             .collect();
-        component_algebra::restrict(component, &allow).map_err(|err| algebra_error("`only`", err))
+        component_algebra::restrict(component, &allow).map_err(restrict_error)
     }
 
     fn rename(
@@ -239,7 +317,7 @@ impl Backend for WitBackend {
                 value: arg.value.clone(),
             })
             .collect();
-        component_algebra::configure(provider, &args).map_err(|err| algebra_error("configure", err))
+        component_algebra::configure(provider, &args).map_err(configure_error)
     }
 
     fn compile(&mut self, component: Self::Component) -> Result<Self::Image, BackendError> {
@@ -263,7 +341,7 @@ impl Backend for WitBackend {
             })
             .collect();
         let limits = task::SpawnLimits { max_memory: None };
-        task::spawn(image, &args, limits).map_err(|err| algebra_error("spawn", err))
+        task::spawn(image, &args, limits).map_err(spawn_error)
     }
 
     async fn wait(&mut self, task: Self::Task) -> Outcome {
