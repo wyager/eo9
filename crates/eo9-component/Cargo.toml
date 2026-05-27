@@ -22,6 +22,23 @@ wac-graph = { workspace = true }
 # `configure` parses compose-time constants with it against the config signature.
 wasm-wave = { workspace = true }
 
+[features]
+# The default `std` feature keeps every host build byte-identical to before. With `std`
+# off, the crate is `#![no_std]` + `alloc` (its own source uses only core/alloc), so the
+# bare-metal kernel can run the algebra on-target. `std` forwards to the `std` feature of
+# the dependencies that gate it. The dependencies that are std-only in their published
+# form (`wac-graph`, `wit-component`, `wac-types`) and the std-gated feature paths of
+# `wit-parser`/`wasm-wave` are swapped for no_std copies by the kernel workspace's
+# `[patch.crates-io]` (see kernel/vendor/); turning those into clean no_std builds is the
+# remaining work of the algebra fork — see plan/12-kernel.md Decision 31.
+default = ["std"]
+std = [
+    "wasmparser/std",
+    "wasm-encoder/std",
+    "wit-parser/std",
+    "wasm-wave/std",
+]
+
 [dev-dependencies]
 # Test fixtures are tiny components generated in-process from WIT text: a dummy core
 # module (`dummy-module` feature) is wrapped into a component with wit-component, so no

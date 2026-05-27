@@ -464,3 +464,49 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
       kernel-only re-implementation that would drift from the spec/usermode sealing+type-checking semantics,
       which the brief forbids.
 
+31. **Checkpoint 4 — step 1 done: `eo9-component` is now `no_std`-capable in its own source, behind a
+    default-on `std` feature; usermode is byte-identical.** The crown-jewel algebra crate is made
+    `#![cfg_attr(not(feature = "std"), no_std)]` + `extern crate alloc` IN PLACE (single-source, no second
+    copy): its entire std surface was just five lines — `std::error::Error`/`std::fmt` (→ `core`),
+    `std::borrow::Cow` and two `std::collections::BTreeMap` (→ `alloc`) — plus prelude types
+    (`Vec`/`String`/`ToString`) now imported from `alloc` per module and `format!`/`vec!` via
+    `#[macro_use] extern crate alloc`. A new `[features] default = ["std"]` makes every host build identical
+    to before; `std` forwards to the `std` feature of the four leaf deps that gate it (`wasmparser`,
+    `wasm-encoder`, `wit-parser`, `wasm-wave`). Verified: `cargo build -p eo9-component --no-default-features`
+    compiles the crate as `no_std` (against std-built deps on the host — proving the source is core/alloc
+    clean), and `cargo xtask ci` stays green (usermode unaffected). The dependency closure is **not** yet
+    `no_std`, so the kernel cannot link the algebra yet — that is the remaining work below.
+
+    **Sharpening of Decision 30 (the dep work is larger than "3 mechanical vendors"):** the leaf crates are
+    not all "just flip `std=false`". The exact features `eo9-component` uses hardcode `std`:
+    - `wit-parser`'s `decoding` feature is `["std", "dep:wasmparser"]` — and `eo9-component` needs `decoding`
+      (`wit_parser::decoding::decode` in describe.rs/configure.rs). So **wit-parser must be vendored** (or its
+      `decoding` feature edited) to make `decode` available without `std`, not merely feature-flagged.
+    - `wasm-wave`'s `wit` feature is `["dep:wit-parser", "std"]` — `eo9-component` uses `wasm_wave::wasm`/
+      `value`; confirm whether the `wit` feature is actually required (it may not be, since only `value`/`wasm`
+      are imported) — if not, plain `wasm-wave` (no `wit`) is `no_std` via its `std` feature; if so, vendor it.
+    - `wasmparser`/`wasm-encoder` have clean `std` features but their *default* sets (component-model,
+      validate, hash-collections, …) must be re-added as always-on when switching to `default-features =
+      false`, and the feature-unification trap (Decision 28) applies: every consumer in the kernel graph
+      (incl. the vendored `wasmtime-environ`, which also uses `wasmparser`) must agree on `default-features =
+      false`, or std unifies back on.
+    So the corrected vendor/patch set for the algebra is: **vendor + de-std** `wac-types`, `wac-graph`,
+    `wit-component`, and `wit-parser` (for `decoding`), **probably** `wasm-wave` (TBD on the `wit` feature),
+    plus `default-features = false` feature surgery on `wasmparser`/`wasm-encoder` at every kernel-graph edge;
+    and **excise `wasm-metadata`** from vendored `wac-graph`/`wit-component` (it pulls clap/flate2/url/
+    serde_json/spdx/auditable-serde — confirmed in the dep tree of the `--no-default-features` build above),
+    and **verify/replace `petgraph` no_std** in `wac-graph`. The eo9-component manifest's per-dep
+    `default-features = false` + always-on-feature lines are deferred to that session because they are only
+    meaningful once the vendored no_std deps exist (doing them now, with std deps, would gain nothing and risk
+    usermode); the `std` feature hook is in place for them to hang off.
+
+    **Remaining sequence (unchanged from Decision 30, now with the corrected dep set):** vendor + de-std the
+    crates above under `kernel/vendor` (via the kernel `[patch.crates-io]`); set the eo9-component deps
+    `default-features = false` with std forwarded; have `eo9-kernel` depend on `eo9-component`
+    (`default-features = false`) via a cross-workspace path dep (the kernel `[patch]` will redirect the
+    vendored deps in eo9-component's own closure, exactly as it already does for `wasmtime-environ`); then
+    wire `compose`/`extend`/`restrict`/`rename`/`configure` into `shellexec.rs` over the `/bin` store
+    components, route a *fused* component through `codegen.rs` (Decision 29) while plain baked programs keep
+    the AOT fast path, run against the kernel roots with the existing child/capability rules, and test
+    `entropy.seeded $ cruncher …` interactively with containment intact.
+

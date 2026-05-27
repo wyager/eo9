@@ -17,6 +17,9 @@
 //! interfaces (no functions -- e.g. the `eo9:*/types` interfaces that `use` drags in)
 //! carry no authority and are always admitted.
 
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 use wasm_encoder::{
     CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, FunctionSection, Instruction,
     MemorySection, MemoryType, Module, TypeSection, ValType,

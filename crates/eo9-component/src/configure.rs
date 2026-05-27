@@ -42,6 +42,9 @@
 //! the same operands. The configured behavior end-to-end is exercised by the runtime and
 //! integration suites.
 
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, FunctionSection,
     GlobalSection, GlobalType, ImportSection, Instruction, MemArg, MemorySection, MemoryType,

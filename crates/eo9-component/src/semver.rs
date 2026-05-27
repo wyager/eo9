@@ -8,6 +8,8 @@
 //! and `0.0.x` is only satisfied by exactly `0.0.x`. Recorded in
 //! plan/03-component-algebra.md Decisions.
 
+use alloc::string::{String, ToString};
+
 /// A parsed `major.minor.patch` version.
 ///
 /// Deliberately minimal: pre-release/build suffixes are carried verbatim and make a

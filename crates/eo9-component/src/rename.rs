@@ -11,6 +11,8 @@
 //! `import system-fs: eo9:fs/fs`, and it is what keeps the interface identity visible to
 //! `describe` after the rename.
 
+use alloc::string::{String, ToString};
+
 use crate::Component;
 use crate::describe::{ExportMeta, ImportMeta};
 use crate::error::RenameError;

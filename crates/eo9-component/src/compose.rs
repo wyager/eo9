@@ -6,7 +6,9 @@
 //! the imports of the result (wac merges identically-named residuals), which is exactly
 //! the residual formula from SPEC.md "Composition and the `$` operator".
 
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 use wac_graph::types::{ItemKind, Package};
 use wac_graph::{CompositionGraph, EncodeOptions, InstantiationArgumentError, NodeId, PackageId};
