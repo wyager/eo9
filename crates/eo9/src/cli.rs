@@ -37,6 +37,10 @@ pub struct Config {
     pub max_memory: Option<u64>,
     /// `--debug-info`: compile images with debug info.
     pub debug_info: bool,
+    /// `--max-fuel`: total fuel budget for the run; when it is exhausted the task is
+    /// killed and the run ends as `abnormal(killed)`. `None` means unlimited (the
+    /// default), matching the previous behavior.
+    pub max_fuel: Option<u64>,
 }
 
 impl Config {
@@ -123,6 +127,13 @@ pub fn consume_global_options(stream: &mut ArgStream, cfg: &mut Config) -> Resul
                 let value = stream.value_of("--max-memory")?;
                 cfg.max_memory = Some(value.parse().map_err(|err| {
                     format!("invalid --max-memory value {value:?} (bytes expected): {err}")
+                })?);
+            }
+            "--max-fuel" => {
+                stream.next();
+                let value = stream.value_of("--max-fuel")?;
+                cfg.max_fuel = Some(value.parse().map_err(|err| {
+                    format!("invalid --max-fuel value {value:?} (fuel units expected): {err}")
                 })?);
             }
             _ => break,

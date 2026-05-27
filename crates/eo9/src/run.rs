@@ -83,8 +83,19 @@ pub fn cmd_run(cfg: &Config, reference: &str, flags: &[(String, String)]) -> Res
 /// task finishes. Shared by `eo9 run` and `eo9 shell`.
 pub(crate) fn drive_to_completion(cfg: &Config, task: &mut Task) -> Outcome {
     let mut resumes: u64 = 0;
+    let mut donated: u64 = 0;
     let outcome = loop {
+        // `--max-fuel`: a hard budget on donated fuel. When the budget is exhausted the
+        // task is killed (the run ends as `abnormal(killed)`) instead of spinning forever
+        // on a busy loop (user-study finding: CPU was the weakest limit).
+        if let Some(max_fuel) = cfg.max_fuel
+            && donated.saturating_sub(task.unspent_fuel()) >= max_fuel
+        {
+            vlog!(cfg, "fuel budget of {max_fuel} exhausted; killing the task");
+            break task.kill_in_place();
+        }
         resumes += 1;
+        donated += RESUME_DONATION;
         match task.resume(RESUME_DONATION) {
             ResumeOutcome::Done(outcome) => break outcome,
             ResumeOutcome::OutOfFuel => {}

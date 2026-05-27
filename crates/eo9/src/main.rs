@@ -152,6 +152,8 @@ OPTIONS (before the program name; `--<flag> <value>` after it belongs to the pro
         --exec-snapshot <clone-or-refuse|clone-or-copy>
                               How open-exec snapshots a path (default: clone-or-refuse)
         --max-memory <bytes>  Linear-memory ceiling for the spawned task
+        --max-fuel <units>    Total fuel budget; an exhausted budget kills the task
+                              (abnormal(killed), exit 2). Default: unlimited
         --debug-info          Compile with debug info
 
 EXIT CODES (run):
