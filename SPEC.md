@@ -564,6 +564,15 @@ Also needed: **immutable handles** — opening a file *for execution* yields an 
 
 Standard stubs: `fs.none`, `fs.deny`, `fs.readonly`, `fs.memfs`.
 
+**Overlay filesystems.** Layering one filesystem over another is not a special kernel feature — it is an ordinary `eo9:fs` provider. `fs.overlay` imports two `eo9:fs` slots (`upper` and `lower`, plain-named slots of the same interface, wired with `with … as …`) and exports `eo9:fs`, so it is middleware in the algebra and composes/stacks like anything else (an overlay's `lower` may itself be an overlay). Semantics:
+
+- **Reads** — `open` (read), `stat`, `list-directory`, and `open-exec` resolve in `upper` first and fall through to `lower`; `upper` shadows `lower` on a name collision. `list-directory` returns the union of both layers' entries (upper winning on collisions).
+- **Writes** — `open` (write), `write`, `create-directory`, and `remove` are routed to `lower`; an overlay never mutates `upper`. So the canonical shape is "an immutable layer of shared, read-only stuff over your writable data," with the read-only layer un-clobberable by construction.
+
+An **immutable-fs provider** is a read-only `eo9:fs` whose contents are a fixed, content-addressed image; every write op returns the not-permitted error. The **standard programs overlay** is one such provider carrying the bundled tools as `/bin/<name>.wasm`; the default shell environment composes it as the `upper` layer over the session's writable `lower` (the `--fs-root` grant, or nothing), so program name-resolution (`open-exec /bin/<name>.wasm`) and the user's own data coexist in one `eo9:fs` capability — and a child (including a nested `eosh`) inherits exactly that composed filesystem. This replaces the earlier host-special-cased `/bin` session view with plain composition. Because the overlay is just a provider, `only`/sealing and per-command restriction apply to it unchanged.
+
+Standard stubs: `fs.overlay`, `fs.immutable` (and the shipped `programs`/coreutils overlay built on it).
+
 ### Net API
 
 TODO - similar goals to disk
