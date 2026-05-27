@@ -111,6 +111,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("build-web-demo", rest)?;
             build_web_demo(&root)
         }
+        "build-web-vm" => {
+            expect_no_args("build-web-vm", rest)?;
+            build_web_vm(&root)
+        }
         "build-kernel" => {
             build_kernel(&root, &arch_arg("build-kernel", rest)?)?;
             Ok(())
@@ -162,6 +166,9 @@ COMMANDS:
     build-web-demo       Build the guest components, then transpile the /try page's set into
                          www/site/try/components/ via www/try-build (commit the result; the
                          deployed site needs no extra tooling). Not part of `ci`.
+    build-web-vm         Pre-AOT the web-VM demo components to pulley32, build the wasm32
+                         blob (www/web-eo9, the real runtime stack for the /vm page), and
+                         install it into www/site/vm/ (commit the result; ci does not need it)
     build-kernel <arch>  Precompile the seed/async canaries, eo9-example-hello, and entropy.seeded for
                          bare metal and build the bootable kernel image (aarch64 only so far;
                          ELF for QEMU's -kernel loader)
@@ -322,6 +329,147 @@ fn build_web_demo(root: &Path) -> Result<(), String> {
             out.as_os_str(),
         ],
     )
+}
+
+/// Build the in-browser Eo9 VM page's wasm blob (`www/web-eo9`, served at `/vm/`).
+///
+/// Steps: build the guest components (for `entropy.seeded`), pre-AOT the demo set to
+/// `pulley32` artifacts the blob embeds, build the blob for `wasm32-unknown-unknown` in its
+/// own workspace (which patches in the vendored wasmtime with the fiberless
+/// component-model-async path — wasm32 has no fiber backend), and copy the result to
+/// `www/site/vm/web-eo9.wasm`. The output is committed, so this only needs re-running when
+/// the demo components, the vendored wasmtime, or the blob source change; `ci` deliberately
+/// does not depend on it.
+fn build_web_vm(root: &Path) -> Result<(), String> {
+    build_guest(root)?;
+
+    // Pre-AOT the demo components to pulley32 with the same compile-relevant settings the
+    // blob's engine uses at load time (www/web-eo9/blob/src/lib.rs::base_config).
+    let artifacts = root
+        .join("www")
+        .join("web-eo9")
+        .join("blob")
+        .join("artifacts");
+    std::fs::create_dir_all(&artifacts)
+        .map_err(|err| format!("failed to create {}: {err}", artifacts.display()))?;
+
+    let seed_wat = root.join("kernel").join("seed").join("hello.wat");
+    let seed_wasm = wat::parse_file(&seed_wat)
+        .map_err(|err| format!("failed to assemble {}: {err}", seed_wat.display()))?;
+    let entropy_path = root
+        .join("guest")
+        .join("target")
+        .join("components")
+        .join("eo9-stub-entropy-seeded.wasm");
+    let entropy_wasm = std::fs::read(&entropy_path)
+        .map_err(|err| format!("failed to read {}: {err}", entropy_path.display()))?;
+
+    preaot_for_web(
+        &artifacts,
+        &seed_wasm,
+        "seed component",
+        "seed.cwasm",
+        false,
+    )?;
+    preaot_for_web(
+        &artifacts,
+        &seed_wasm,
+        "seed component (fuel)",
+        "seed-fuel.cwasm",
+        true,
+    )?;
+    preaot_for_web(
+        &artifacts,
+        &entropy_wasm,
+        "entropy.seeded",
+        "entropy-seeded.cwasm",
+        false,
+    )?;
+
+    // Build the blob in its own workspace for wasm32-unknown-unknown.
+    let manifest = root.join("www").join("web-eo9").join("Cargo.toml");
+    run(
+        root,
+        "cargo",
+        [
+            OsStr::new("build"),
+            OsStr::new("--release"),
+            OsStr::new("--target"),
+            OsStr::new("wasm32-unknown-unknown"),
+            OsStr::new("--manifest-path"),
+            manifest.as_os_str(),
+            OsStr::new("-p"),
+            OsStr::new("web-eo9-blob"),
+        ],
+    )?;
+
+    let built = root
+        .join("www")
+        .join("web-eo9")
+        .join("target")
+        .join("wasm32-unknown-unknown")
+        .join("release")
+        .join("web_eo9_blob.wasm");
+    let site_dir = root.join("www").join("site").join("vm");
+    std::fs::create_dir_all(&site_dir)
+        .map_err(|err| format!("failed to create {}: {err}", site_dir.display()))?;
+    let installed = site_dir.join("web-eo9.wasm");
+    std::fs::copy(&built, &installed).map_err(|err| {
+        format!(
+            "failed to copy {} -> {}: {err}",
+            built.display(),
+            installed.display()
+        )
+    })?;
+    let size = std::fs::metadata(&installed).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "xtask: installed the web VM blob at {} ({size} bytes)",
+        installed.display()
+    );
+    Ok(())
+}
+
+/// Pre-AOT one component to a `pulley32` artifact for the web VM blob. The configuration
+/// mirrors `precompile_for_kernel` apart from the target (and must stay in sync with the
+/// blob's `base_config`).
+fn preaot_for_web(
+    out_dir: &Path,
+    component: &[u8],
+    what: &str,
+    file_name: &str,
+    consume_fuel: bool,
+) -> Result<(), String> {
+    let mut config = wasmtime::Config::new();
+    config
+        .target("pulley32")
+        .map_err(|err| format!("wasmtime rejected target pulley32: {err:#}"))?;
+    config.wasm_component_model(true);
+    config.wasm_component_model_async(true);
+    config.wasm_component_model_async_stackful(true);
+    config.wasm_component_model_more_async_builtins(true);
+    config.signals_based_traps(false);
+    config.memory_reservation(0);
+    config.memory_reservation_for_growth(1 << 20);
+    config.memory_guard_size(0);
+    config.memory_init_cow(false);
+    config.concurrency_support(true);
+    config.gc_support(false);
+    config.wasm_threads(false);
+    config.consume_fuel(consume_fuel);
+    let engine = wasmtime::Engine::new(&config)
+        .map_err(|err| format!("failed to build the pulley32 pre-AOT engine: {err:#}"))?;
+    let artifact = engine
+        .precompile_component(component)
+        .map_err(|err| format!("failed to precompile {what} for pulley32: {err:#}"))?;
+    let out_path = out_dir.join(file_name);
+    std::fs::write(&out_path, &artifact)
+        .map_err(|err| format!("failed to write {}: {err}", out_path.display()))?;
+    println!(
+        "xtask: precompiled {what} -> {} ({} bytes, target pulley32, consume_fuel = {consume_fuel})",
+        out_path.display(),
+        artifact.len()
+    );
+    Ok(())
 }
 
 /// Amount of RAM given to the QEMU guest. Must stay in sync with `RAM_SIZE` in

@@ -19,6 +19,11 @@ default = ["cmasync"]
 # the error to fiber creation at run time. Without `std`, component-model-async needs the
 # kernel's vendored relaxation (see the workspace [patch.crates-io]).
 cmasync = ["wasmtime/async", "wasmtime/component-model-async"]
+# Run guest calls directly on the current stack instead of on a worker fiber (no fiber
+# backend exists for wasm32). Enables the vendored wasmtime's opt-in fiberless path; the
+# probe's cm-async step is expected to PASS with this on (and fail with the fiber error
+# without it).
+fiberless = ["cmasync", "wasmtime/component-model-async-fiberless"]
 # Feasibility data point only (cargo check, never run): wasmtime's `std` feature on wasm32.
 wasmtime-std = ["wasmtime/std"]
 # Feasibility data point only (cargo check, never run): the in-blob compiler path
