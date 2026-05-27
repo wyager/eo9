@@ -96,33 +96,40 @@ Match the priority order above; (1)+(2) unblock I2.
     approximation would be semantically wrong, and a yield-spin loop would be a hack. Escalated: either
     approve enabling the feature once the host side exists, or keep net.loopback queued behind area 13's
     execution harness. `text.capture` still waits on the Message API (eo9:message).
-11. **`fs.overlay` — design done + validated, but blocked on a wit-bindgen bump (DRAFT committed,
-    excluded from the build).** Implements SPEC.md "Overlay filesystems": a middleware provider that
-    imports two `eo9:fs/fs` instances under the named slots `upper` and `lower` (wired with
-    `with <a> as upper, <b> as lower $ fs.overlay`) and exports one `eo9:fs/fs` — reads resolve
-    upper-first and fall through to lower (open(read)/stat/open-exec; list-directory unions both, upper
-    winning), writes route to lower (open(write)/write/create-directory/remove); it exports its own
-    `eo9:fs/types` so the root handle captures both underlying filesystems. The world
-    (`guest/stubs/fs-overlay/wit/overlay.wit`) is **valid and resolves** under the repo's `wasm-tools`
-    1.250 (verified: `wasm-tools component wit` elaborates it to `import upper/lower: eo9:fs/fs`,
-    `import eo9:fs/types`, `export eo9:fs/types`+`fs`).
-    **Blocker:** the pinned **wit-bindgen 0.57.1 bundles wit-parser 0.247**, which cannot parse a named
-    import of a foreign interface — `import upper: eo9:fs/fs@0.1.0;` fails with "expected `/`, found `:`",
-    and the `use eo9:fs/fs;` alias form fails with "expected `.`, found `;`". So the bindings cannot be
-    generated with the current guest toolchain. (Existing stubs never hit this: they import `eo9:fs` once,
-    via the default `import fs;`.)
-    **Unblock:** bump `wit-bindgen` (guest `[workspace.dependencies]`) to a release whose `wit-parser` is
-    >= 0.250 (the version the repo's `wasm-tools` CLI already uses), then re-validate ALL guest bindings
-    (shared-pin change — broad blast radius; planner call). After the bump: remove the `exclude` in
-    guest/Cargo.toml, restore the crate's workspace-inherited metadata, add `eo9-stub-fs-overlay` to
-    xtask GUEST_COMPONENTS, and verify the generated binding module paths (the draft assumes distinct
-    `upper`/`lower` modules sharing the imported resource types — UNVERIFIED until bindings generate) and
-    the import/export-`types` split. The full forwarding logic is already written in
-    `guest/stubs/fs-overlay/src/lib.rs` (excluded draft).
-    Alternatives if the bump is undesirable: (a) hand-author the overlay at the component level
-    (WAT/wac-graph) rather than from WIT source — heavier, off-convention; (b) keep the host-special-cased
-    `/bin` session view instead of an overlay provider — rejected by the owner (wants overlay providers
-    with algebraic semantics). The bump is the clean path. `fs.immutable`: not separately needed — the
-    existing `fs.readonly` already provides read-only-over-an-imported-fs semantics; the shipped
-    programs/coreutils overlay (a later phase) composes `fs.readonly`-wrapped program bytes as the
-    overlay's immutable `upper`.
+11. **`fs.overlay` — implemented and built.** Implements SPEC.md "Overlay filesystems": a middleware
+    provider importing two `eo9:fs/fs` instances under the named slots `upper` and `lower` (the
+    `with <a> as upper, <b> as lower $ fs.overlay` shape) and exporting one `eo9:fs/fs` — reads resolve
+    upper-first and fall through to lower on not-found (`open`(read)/`stat`/`open-exec`; `list-directory`
+    unions both layers, upper winning on collisions), writes route to lower
+    (`open`(write)/`write`/`create-directory`/`remove`); the overlay never mutates `upper`. It exports its
+    own `eo9:fs/types`, so the root handle is a compound capturing both underlying roots; open files and
+    immutable handles are per-layer-tagged enums so each `read`/`write`/`exec-read` dispatches back to the
+    layer that served the open (a write through a read-opened upper file is forwarded so the upper's own
+    policy answers — typically `read-only`). The crate keeps its own `wit/overlay.wit` package (deps
+    symlinked to the shared `wit/`), which needs the named-import syntax: this is what motivated the guest
+    workspace's wit-bindgen git pin (plan/07 Decisions 9–10). Binding-layout notes for future two-slot
+    providers: the slot modules generate at the crate root (`crate::upper`, `crate::lower`); the two slots
+    share the imported `eo9:fs/types.fs-impl` and the `eo9:io` buffer resource, but each slot has its own
+    nominal `file`/`immutable-handle`/error/record types. `fs.immutable` is not separately needed —
+    `fs.readonly` already provides read-only-over-an-imported-fs; the future programs/coreutils overlay
+    composes read-only program content as the overlay's `upper`.
+12. **Two-slot wiring needs a per-slot root-handle decision (escalation).** The overlay component builds,
+    validates, and describes correctly (integration test `overlay_component_exposes_upper_and_lower_slots`
+    covers the surface incl. renaming the named slots), but composing two *independent* component leaves
+    into its slots is ill-typed today: the world's two `fs` imports `use` the single imported
+    `eo9:fs/types`, so both slots' `fs-impl` is the *same* imported resource type, while every standalone
+    fs provider (`fs.memfs`, `fs.deny`, …) exports its *own* fresh `types` resource. Verified empirically:
+    `rename(memfs,fs→upper/lower)` then any wiring order (`$` partial, `&` env then `&`/`$`) fails with
+    eo9-component's `Internal("encoding produced a component that failed validation")` — and the overlay
+    binary's import types confirm the `(eq imported-types.fs-impl)` constraint on both slots, so this is
+    inherent to the WIT shape, not an encoder bug (though eo9-component could diagnose it before encoding —
+    minor follow-up). The end-to-end test (`readwrite_through_the_overlay_round_trips`) is committed
+    `#[ignore]`d, ready to enable. Options for the planner: (a) for the real Phase-2 use (the standard
+    programs overlay over `--fs-root`), link both slots host-side in the runtime/shell from one host
+    `eo9:fs/types` instance — no WIT change, but the runtime must learn to link two named fs slots;
+    (b) move `fs-impl` out of `eo9:fs/types` into the `fs` interface (or otherwise give each fs import its
+    own root-handle type) so independent component leaves wire cleanly — a cross-area WIT change (area 02)
+    that would also touch every existing fs stub; (c) only ever feed the overlay layers that share a types
+    lineage (attenuators over one base) — too restrictive to be the answer. Until one lands, `fs.overlay`
+    ships as a built, validated component with its semantics implemented but not yet composable from
+    independent component leaves.

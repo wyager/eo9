@@ -216,6 +216,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-stub-fs-overlay"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-stub-fs-readonly"
 version = "0.0.0"
 dependencies = [

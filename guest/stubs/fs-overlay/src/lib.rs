@@ -10,19 +10,14 @@
 //! * writes — `open`(write), `write`, `create-directory`, `remove` are routed to
 //!   `lower`; the overlay never mutates `upper`.
 //!
-//! The overlay owns its exported `fs-impl`: `default()` builds one that captures the two
-//! underlying root handles (`upper::default()` / `lower::default()`). Open files and
-//! immutable handles are this provider's own resources tagging which layer served the
-//! open, so each subsequent `read`/`write`/`exec-read` is dispatched back to that layer.
-//!
-//! STATUS: DRAFT, not yet built — this crate is excluded from the guest workspace
-//! (guest/Cargo.toml) and blocked on a toolchain bump. The world below imports two
-//! `eo9:fs/fs` instances under named slots (`upper`, `lower`), which `wasm-tools` 1.250
-//! accepts and resolves, but the pinned `wit-bindgen` 0.57.1 (wit-parser 0.247) cannot
-//! parse (`import upper: eo9:fs/fs@0.1.0;` → "expected `/`, found `:`"; the `use`-alias
-//! form fails too). The forwarding logic below is complete, but the generated binding
-//! module paths (`upper_fs`/`lower_fs`) and whether the two imports share resource types
-//! are UNVERIFIED until bindings can actually be generated. See plan/09 for the unblock.
+//! The overlay exports its own `eo9:fs/types`, so its `fs-impl` is a compound root
+//! handle capturing the two underlying roots (`upper::default()` / `lower::default()`).
+//! Open files and immutable handles are this provider's own resources tagging which
+//! layer served the open, so each subsequent `read`/`write`/`exec-read` is dispatched
+//! back to that layer. Binding-type notes: the two import slots share the imported
+//! `eo9:fs/types.fs-impl` and the `eo9:io` buffer resource, but each slot has its own
+//! nominal `file`/`immutable-handle`/error/record types — hence the per-layer enums and
+//! the per-layer mapping helpers below.
 
 #![no_std]
 
@@ -41,51 +36,73 @@ wit_bindgen::generate!({
 });
 
 use exports::eo9::fs::fs::{self, Buffer, FsError, NodeStat, OpenFlags, ReadResult, WriteResult};
-use exports::eo9::fs::types::FsImpl;
+use exports::eo9::fs::types as export_types;
 
-// The two imported filesystems. Named slots become distinct binding modules.
-use eo9::fs::fs as lower_fs;
-use upper::eo9::fs::fs as upper_fs;
-
-/// Which underlying layer a handle came from, so reads/writes dispatch correctly.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Layer {
-    Upper,
-    Lower,
-}
-
-/// Map an underlying provider's fs-error onto this provider's (structurally identical)
-/// exported error type. Both imported interfaces are the same `eo9:fs/fs`, so they share
-/// the imported error type.
-fn map_error(error: lower_fs::FsError) -> FsError {
+/// Map the `upper` slot's error onto the exported (structurally identical) error type.
+fn upper_error(error: upper::FsError) -> FsError {
     match error {
-        lower_fs::FsError::NotFound => FsError::NotFound,
-        lower_fs::FsError::AlreadyExists => FsError::AlreadyExists,
-        lower_fs::FsError::NotADirectory => FsError::NotADirectory,
-        lower_fs::FsError::IsADirectory => FsError::IsADirectory,
-        lower_fs::FsError::Denied => FsError::Denied,
-        lower_fs::FsError::ReadOnly => FsError::ReadOnly,
-        lower_fs::FsError::NoSpace => FsError::NoSpace,
-        lower_fs::FsError::NotImmutable => FsError::NotImmutable,
-        lower_fs::FsError::Io(message) => FsError::Io(message),
+        upper::FsError::NotFound => FsError::NotFound,
+        upper::FsError::AlreadyExists => FsError::AlreadyExists,
+        upper::FsError::NotADirectory => FsError::NotADirectory,
+        upper::FsError::IsADirectory => FsError::IsADirectory,
+        upper::FsError::Denied => FsError::Denied,
+        upper::FsError::ReadOnly => FsError::ReadOnly,
+        upper::FsError::NoSpace => FsError::NoSpace,
+        upper::FsError::NotImmutable => FsError::NotImmutable,
+        upper::FsError::Io(message) => FsError::Io(message),
     }
 }
 
-fn map_stat(stat: lower_fs::NodeStat) -> NodeStat {
+/// Map the `lower` slot's error onto the exported error type.
+fn lower_error(error: lower::FsError) -> FsError {
+    match error {
+        lower::FsError::NotFound => FsError::NotFound,
+        lower::FsError::AlreadyExists => FsError::AlreadyExists,
+        lower::FsError::NotADirectory => FsError::NotADirectory,
+        lower::FsError::IsADirectory => FsError::IsADirectory,
+        lower::FsError::Denied => FsError::Denied,
+        lower::FsError::ReadOnly => FsError::ReadOnly,
+        lower::FsError::NoSpace => FsError::NoSpace,
+        lower::FsError::NotImmutable => FsError::NotImmutable,
+        lower::FsError::Io(message) => FsError::Io(message),
+    }
+}
+
+fn upper_stat(stat: upper::NodeStat) -> NodeStat {
     NodeStat {
         kind: match stat.kind {
-            lower_fs::NodeKind::File => fs::NodeKind::File,
-            lower_fs::NodeKind::Directory => fs::NodeKind::Directory,
+            upper::NodeKind::File => fs::NodeKind::File,
+            upper::NodeKind::Directory => fs::NodeKind::Directory,
         },
         size: stat.size,
     }
 }
 
-fn map_flags(options: OpenFlags) -> lower_fs::OpenFlags {
-    lower_fs::OpenFlags::from_bits_truncate(options.bits())
+fn lower_stat(stat: lower::NodeStat) -> NodeStat {
+    NodeStat {
+        kind: match stat.kind {
+            lower::NodeKind::File => fs::NodeKind::File,
+            lower::NodeKind::Directory => fs::NodeKind::Directory,
+        },
+        size: stat.size,
+    }
 }
 
-fn map_read(result: lower_fs::ReadResult) -> ReadResult {
+fn upper_flags(options: OpenFlags) -> upper::OpenFlags {
+    upper::OpenFlags::from_bits_truncate(options.bits())
+}
+
+fn lower_flags(options: OpenFlags) -> lower::OpenFlags {
+    lower::OpenFlags::from_bits_truncate(options.bits())
+}
+
+fn upper_read(result: upper::ReadResult) -> ReadResult {
+    ReadResult {
+        bytes_read: result.bytes_read,
+    }
+}
+
+fn lower_read(result: lower::ReadResult) -> ReadResult {
     ReadResult {
         bytes_read: result.bytes_read,
     }
@@ -97,24 +114,31 @@ fn is_write(options: OpenFlags) -> bool {
 }
 
 /// The exported root handle: captures both underlying filesystems' root handles.
+/// (`upper`/`lower` share the imported `eo9:fs/types.fs-impl` resource type.)
 struct OverlayImpl {
-    upper: upper_fs::FsImpl,
-    lower: lower_fs::FsImpl,
+    upper: upper::FsImpl,
+    lower: lower::FsImpl,
 }
 
-/// An open file of the overlay: the underlying file plus the layer it lives on.
-struct OverlayFile {
-    layer: Layer,
-    inner: lower_fs::File,
+/// An open file of the overlay, tagged with the layer that served the open.
+enum OverlayFile {
+    Upper(upper::File),
+    Lower(lower::File),
 }
 
-/// An immutable execution handle of the overlay: the underlying handle plus its layer.
-struct OverlayExec {
-    layer: Layer,
-    inner: lower_fs::ImmutableHandle,
+/// An immutable execution handle of the overlay, tagged with its layer.
+enum OverlayExec {
+    Upper(upper::ImmutableHandle),
+    Lower(lower::ImmutableHandle),
 }
 
 struct Stub;
+
+impl export_types::Guest for Stub {
+    type FsImpl = OverlayImpl;
+}
+
+impl export_types::GuestFsImpl for OverlayImpl {}
 
 impl fs::GuestFile for OverlayFile {}
 impl fs::GuestImmutableHandle for OverlayExec {}
@@ -123,69 +147,64 @@ impl fs::Guest for Stub {
     type File = OverlayFile;
     type ImmutableHandle = OverlayExec;
 
-    fn default() -> FsImpl {
-        FsImpl::new(OverlayImpl {
-            upper: upper_fs::default(),
-            lower: lower_fs::default(),
+    fn default() -> export_types::FsImpl {
+        export_types::FsImpl::new(OverlayImpl {
+            upper: upper::default(),
+            lower: lower::default(),
         })
     }
 
-    async fn open(fs: &FsImpl, path: String, options: OpenFlags) -> Result<fs::File, FsError> {
+    async fn open(
+        fs: export_types::FsImplBorrow<'_>,
+        path: String,
+        options: OpenFlags,
+    ) -> Result<fs::File, FsError> {
         let overlay = fs.get::<OverlayImpl>();
         if is_write(options) {
             // Writes (and create/truncate) always go to the writable lower layer.
-            let inner = lower_fs::open(&overlay.lower, path, map_flags(options))
+            let inner = lower::open(&overlay.lower, path, lower_flags(options))
                 .await
-                .map_err(map_error)?;
-            return Ok(fs::File::new(OverlayFile {
-                layer: Layer::Lower,
-                inner,
-            }));
+                .map_err(lower_error)?;
+            return Ok(fs::File::new(OverlayFile::Lower(inner)));
         }
         // Read-only open: try upper, fall through to lower on not-found.
-        match upper_fs::open(&overlay.upper, path.clone(), map_flags(options)).await {
-            Ok(inner) => Ok(fs::File::new(OverlayFile {
-                layer: Layer::Upper,
-                inner,
-            })),
-            Err(upper_fs::FsError::NotFound) => {
-                let inner = lower_fs::open(&overlay.lower, path, map_flags(options))
+        match upper::open(&overlay.upper, path.clone(), upper_flags(options)).await {
+            Ok(inner) => Ok(fs::File::new(OverlayFile::Upper(inner))),
+            Err(upper::FsError::NotFound) => {
+                let inner = lower::open(&overlay.lower, path, lower_flags(options))
                     .await
-                    .map_err(map_error)?;
-                Ok(fs::File::new(OverlayFile {
-                    layer: Layer::Lower,
-                    inner,
-                }))
+                    .map_err(lower_error)?;
+                Ok(fs::File::new(OverlayFile::Lower(inner)))
             }
-            Err(other) => Err(map_error(other)),
+            Err(other) => Err(upper_error(other)),
         }
     }
 
-    async fn open_exec(fs: &FsImpl, path: String) -> Result<fs::ImmutableHandle, FsError> {
+    async fn open_exec(
+        fs: export_types::FsImplBorrow<'_>,
+        path: String,
+    ) -> Result<fs::ImmutableHandle, FsError> {
         let overlay = fs.get::<OverlayImpl>();
-        match upper_fs::open_exec(&overlay.upper, path.clone()).await {
-            Ok(inner) => Ok(fs::ImmutableHandle::new(OverlayExec {
-                layer: Layer::Upper,
-                inner,
-            })),
-            Err(upper_fs::FsError::NotFound) => {
-                let inner = lower_fs::open_exec(&overlay.lower, path)
+        match upper::open_exec(&overlay.upper, path.clone()).await {
+            Ok(inner) => Ok(fs::ImmutableHandle::new(OverlayExec::Upper(inner))),
+            Err(upper::FsError::NotFound) => {
+                let inner = lower::open_exec(&overlay.lower, path)
                     .await
-                    .map_err(map_error)?;
-                Ok(fs::ImmutableHandle::new(OverlayExec {
-                    layer: Layer::Lower,
-                    inner,
-                }))
+                    .map_err(lower_error)?;
+                Ok(fs::ImmutableHandle::new(OverlayExec::Lower(inner)))
             }
-            Err(other) => Err(map_error(other)),
+            Err(other) => Err(upper_error(other)),
         }
     }
 
-    async fn list_directory(fs: &FsImpl, path: String) -> Result<Vec<String>, FsError> {
+    async fn list_directory(
+        fs: export_types::FsImplBorrow<'_>,
+        path: String,
+    ) -> Result<Vec<String>, FsError> {
         let overlay = fs.get::<OverlayImpl>();
-        let upper = upper_fs::list_directory(&overlay.upper, path.clone()).await;
-        let lower = lower_fs::list_directory(&overlay.lower, path).await;
-        match (upper, lower) {
+        let upper_entries = upper::list_directory(&overlay.upper, path.clone()).await;
+        let lower_entries = lower::list_directory(&overlay.lower, path).await;
+        match (upper_entries, lower_entries) {
             // Union both layers' entries (upper wins on collisions — entries are names,
             // so the union is just a dedup).
             (Ok(mut up), Ok(low)) => {
@@ -200,32 +219,37 @@ impl fs::Guest for Stub {
             (Err(_), Ok(low)) => Ok(low),
             // Neither layer has the directory: report the upper's error (typically
             // not-found), matching read-through precedence.
-            (Err(up), Err(_)) => Err(map_error(up)),
+            (Err(up), Err(_)) => Err(upper_error(up)),
         }
     }
 
-    async fn stat(fs: &FsImpl, path: String) -> Result<NodeStat, FsError> {
+    async fn stat(fs: export_types::FsImplBorrow<'_>, path: String) -> Result<NodeStat, FsError> {
         let overlay = fs.get::<OverlayImpl>();
-        match upper_fs::stat(&overlay.upper, path.clone()).await {
-            Ok(stat) => Ok(map_stat(stat)),
-            Err(upper_fs::FsError::NotFound) => lower_fs::stat(&overlay.lower, path)
+        match upper::stat(&overlay.upper, path.clone()).await {
+            Ok(stat) => Ok(upper_stat(stat)),
+            Err(upper::FsError::NotFound) => lower::stat(&overlay.lower, path)
                 .await
-                .map(map_stat)
-                .map_err(map_error),
-            Err(other) => Err(map_error(other)),
+                .map(lower_stat)
+                .map_err(lower_error),
+            Err(other) => Err(upper_error(other)),
         }
     }
 
-    async fn create_directory(fs: &FsImpl, path: String) -> Result<(), FsError> {
+    async fn create_directory(
+        fs: export_types::FsImplBorrow<'_>,
+        path: String,
+    ) -> Result<(), FsError> {
         let overlay = fs.get::<OverlayImpl>();
-        lower_fs::create_directory(&overlay.lower, path)
+        lower::create_directory(&overlay.lower, path)
             .await
-            .map_err(map_error)
+            .map_err(lower_error)
     }
 
-    async fn remove(fs: &FsImpl, path: String) -> Result<(), FsError> {
+    async fn remove(fs: export_types::FsImplBorrow<'_>, path: String) -> Result<(), FsError> {
         let overlay = fs.get::<OverlayImpl>();
-        lower_fs::remove(&overlay.lower, path).await.map_err(map_error)
+        lower::remove(&overlay.lower, path)
+            .await
+            .map_err(lower_error)
     }
 
     async fn read(
@@ -233,15 +257,14 @@ impl fs::Guest for Stub {
         offset: u64,
         dst: Buffer,
     ) -> (Buffer, Result<ReadResult, FsError>) {
-        let file = f.get::<OverlayFile>();
-        match file.layer {
-            Layer::Upper => {
-                let (dst, result) = upper_fs::read(&file.inner, offset, dst).await;
-                (dst, result.map(map_read).map_err(map_error))
+        match f.get::<OverlayFile>() {
+            OverlayFile::Upper(inner) => {
+                let (dst, result) = upper::read(inner, offset, dst).await;
+                (dst, result.map(upper_read).map_err(upper_error))
             }
-            Layer::Lower => {
-                let (dst, result) = lower_fs::read(&file.inner, offset, dst).await;
-                (dst, result.map(map_read).map_err(map_error))
+            OverlayFile::Lower(inner) => {
+                let (dst, result) = lower::read(inner, offset, dst).await;
+                (dst, result.map(lower_read).map_err(lower_error))
             }
         }
     }
@@ -251,41 +274,39 @@ impl fs::Guest for Stub {
         offset: u64,
         src: Buffer,
     ) -> (Buffer, Result<WriteResult, FsError>) {
-        let file = f.get::<OverlayFile>();
-        match file.layer {
+        match f.get::<OverlayFile>() {
             // A file opened for writing lives on lower; this is the normal path.
-            Layer::Lower => {
-                let (src, result) = lower_fs::write(&file.inner, offset, src).await;
+            OverlayFile::Lower(inner) => {
+                let (src, result) = lower::write(inner, offset, src).await;
                 (
                     src,
                     result
                         .map(|w| WriteResult {
                             bytes_written: w.bytes_written,
                         })
-                        .map_err(map_error),
+                        .map_err(lower_error),
                 )
             }
             // Writing through a read-opened upper file: forward so upper's own policy
             // (typically read-only) decides — the overlay never special-cases it.
-            Layer::Upper => {
-                let (src, result) = upper_fs::write(&file.inner, offset, src).await;
+            OverlayFile::Upper(inner) => {
+                let (src, result) = upper::write(inner, offset, src).await;
                 (
                     src,
                     result
                         .map(|w| WriteResult {
                             bytes_written: w.bytes_written,
                         })
-                        .map_err(map_error),
+                        .map_err(upper_error),
                 )
             }
         }
     }
 
     fn exec_size(h: fs::ImmutableHandleBorrow<'_>) -> u64 {
-        let exec = h.get::<OverlayExec>();
-        match exec.layer {
-            Layer::Upper => upper_fs::exec_size(&exec.inner),
-            Layer::Lower => lower_fs::exec_size(&exec.inner),
+        match h.get::<OverlayExec>() {
+            OverlayExec::Upper(inner) => upper::exec_size(inner),
+            OverlayExec::Lower(inner) => lower::exec_size(inner),
         }
     }
 
@@ -294,15 +315,14 @@ impl fs::Guest for Stub {
         offset: u64,
         dst: Buffer,
     ) -> (Buffer, Result<ReadResult, FsError>) {
-        let exec = h.get::<OverlayExec>();
-        match exec.layer {
-            Layer::Upper => {
-                let (dst, result) = upper_fs::exec_read(&exec.inner, offset, dst).await;
-                (dst, result.map(map_read).map_err(map_error))
+        match h.get::<OverlayExec>() {
+            OverlayExec::Upper(inner) => {
+                let (dst, result) = upper::exec_read(inner, offset, dst).await;
+                (dst, result.map(upper_read).map_err(upper_error))
             }
-            Layer::Lower => {
-                let (dst, result) = lower_fs::exec_read(&exec.inner, offset, dst).await;
-                (dst, result.map(map_read).map_err(map_error))
+            OverlayExec::Lower(inner) => {
+                let (dst, result) = lower::exec_read(inner, offset, dst).await;
+                (dst, result.map(lower_read).map_err(lower_error))
             }
         }
     }

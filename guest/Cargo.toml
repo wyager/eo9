@@ -4,11 +4,6 @@
 [workspace]
 resolver = "3"
 members = ["eo9-guest", "eosh/*", "examples/*", "coreutils/*", "stubs/*"]
-# `fs.overlay` is a committed DRAFT blocked on a toolchain bump (its world imports two
-# `eo9:fs/fs` named slots, which wasm-tools 1.250 accepts but the pinned wit-bindgen
-# 0.57.1 / wit-parser 0.247 cannot parse). Excluded so the workspace keeps building;
-# re-include it once wit-bindgen is bumped. See plan/09-providers-stubs.md.
-exclude = ["stubs/fs-overlay"]
 
 [workspace.package]
 version = "0.0.0"
