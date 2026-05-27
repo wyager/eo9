@@ -44,3 +44,16 @@ wasmtime-internal-cranelift = { path = "vendor/wasmtime-cranelift" }
 # codegen graph. Vendored only to change those dep lines to the `core` profile (D28).
 cranelift-frontend = { path = "vendor/cranelift-frontend" }
 wasmtime-internal-unwinder = { path = "vendor/wasmtime-unwinder" }
+# The component-algebra closure (plan/12 Decisions 30–35): eo9-component (the kernel's
+# `eo9:exec` compose/$/&/only/configure surface, behind `wasm-codegen`) pulls these four
+# crates, which are std-only (or std-gated) in their published form. The vendored copies are
+# de-std'd (no_std + alloc); wac-types/wac-graph stay on the 0.247 wasmparser family to avoid
+# a risky 0.250 decoder port. Kernel-workspace-only; host/guest keep the registry crates.
+wit-parser = { path = "vendor/wit-parser" }
+wac-types = { path = "vendor/wac-types" }
+wac-graph = { path = "vendor/wac-graph" }
+wit-component = { path = "vendor/wit-component" }
+# wasm-wave is already no_std; the vendored copy only stops its `wit` feature from
+# force-enabling `std` (eo9-component's `configure` needs `value::resolve_wit_type`, which
+# lives behind `wit`). See vendor/README.md.
+wasm-wave = { path = "vendor/wasm-wave" }
