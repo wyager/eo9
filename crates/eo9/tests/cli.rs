@@ -199,9 +199,9 @@ fn run_outcomes_covers_success_failure_and_abnormal() {
         trapped.stderr
     );
     assert!(
-        trapped.stdout.contains("unreachable"),
+        trapped.stderr.contains("unreachable"),
         "trap reason missing: {}",
-        trapped.stdout
+        trapped.stderr
     );
 }
 
@@ -365,7 +365,15 @@ fn an_unwritable_cache_never_fails_a_run() {
         "expected an insert warning: {}",
         cold.stderr
     );
-    assert!(cold.stderr.trim().starts_with("success(digest("));
+    assert!(
+        cold.stderr
+            .lines()
+            .last()
+            .unwrap_or("")
+            .starts_with("success(digest("),
+        "outcome line missing from stderr: {}",
+        cold.stderr
+    );
 
     // Populate the cache normally, then make the entry read-only: the lookup's
     // use-count bump fails, which is treated as a miss (warn + recompile), not an error.
@@ -670,7 +678,7 @@ fn shell_composes_with_the_algebra() {
             })
             .expect("a digest in the output")
     };
-    assert_eq!(digest(&run.stdout), digest(&direct.stdout));
+    assert_eq!(digest(&run.stdout), digest(&direct.stderr));
 }
 
 #[test]
@@ -695,9 +703,9 @@ fn shell_maps_child_failures_to_exit_code_1() {
     let unknown = eo9(&store, &["shell", "-c", "nosuchprogram"]);
     assert_eq!(unknown.code, 1, "stdout: {}", unknown.stdout);
     assert!(
-        unknown.stdout.contains("cannot resolve `nosuchprogram`"),
+        unknown.stderr.contains("cannot resolve `nosuchprogram`"),
         "{}",
-        unknown.stdout
+        unknown.stderr
     );
 }
 
