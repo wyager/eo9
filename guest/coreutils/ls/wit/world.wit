@@ -1,0 +1,16 @@
+// ls — list a directory's entries, one per line. Capabilities: eo9:fs, eo9:text.
+package eo9-coreutils:ls@0.1.0;
+world ls {
+    import eo9:fs/fs@0.1.0;
+    import eo9:text/text@0.1.0;
+    variant program-success {
+        /// Number of entries listed.
+        listed(u32),
+    }
+    variant program-failure {
+        bad-arguments(string),
+        fs(string),
+        io(string),
+    }
+    export main: async func(path: string) -> result<program-success, program-failure>;
+}

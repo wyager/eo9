@@ -1,0 +1,13 @@
+// touch — create an empty file if it does not exist. Capability: eo9:fs only.
+package eo9-coreutils:touch@0.1.0;
+world touch {
+    import eo9:fs/fs@0.1.0;
+    variant program-success {
+        touched,
+    }
+    variant program-failure {
+        bad-arguments(string),
+        fs(string),
+    }
+    export main: async func(path: string) -> result<program-success, program-failure>;
+}

@@ -1,0 +1,16 @@
+// rng — print `count` random u64s, one per line. Capabilities: eo9:entropy, eo9:text.
+// Imports entropy, so `entropy.seeded $ rng --count 5` is deterministic.
+package eo9-coreutils:rng@0.1.0;
+world rng {
+    import eo9:entropy/entropy@0.1.0;
+    import eo9:text/text@0.1.0;
+    variant program-success {
+        /// Number of values printed.
+        generated(u32),
+    }
+    variant program-failure {
+        bad-arguments(string),
+        io(string),
+    }
+    export main: func(count: u64) -> result<program-success, program-failure>;
+}

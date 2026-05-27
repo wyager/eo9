@@ -1,0 +1,16 @@
+// head — print the first `lines` lines of a file. Capabilities: eo9:fs, eo9:text.
+package eo9-coreutils:head@0.1.0;
+world head {
+    import eo9:fs/fs@0.1.0;
+    import eo9:text/text@0.1.0;
+    variant program-success {
+        /// Number of lines printed.
+        printed(u32),
+    }
+    variant program-failure {
+        bad-arguments(string),
+        fs(string),
+        io(string),
+    }
+    export main: async func(path: string, lines: u64) -> result<program-success, program-failure>;
+}

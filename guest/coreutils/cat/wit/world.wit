@@ -1,0 +1,16 @@
+// cat — print a file's contents to stdout. Capabilities: eo9:fs (read), eo9:text.
+package eo9-coreutils:cat@0.1.0;
+world cat {
+    import eo9:fs/fs@0.1.0;
+    import eo9:text/text@0.1.0;
+    variant program-success {
+        /// Number of bytes written to stdout.
+        printed(u64),
+    }
+    variant program-failure {
+        bad-arguments(string),
+        fs(string),
+        io(string),
+    }
+    export main: async func(path: string) -> result<program-success, program-failure>;
+}

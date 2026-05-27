@@ -26,11 +26,13 @@ pub fn embedded(stem: &str) -> Option<&'static [u8]> {
 }
 
 /// The shell name a built component file answers to: `eo9-example-hello` → `hello`,
-/// `eo9-stub-time-frozen` → `time.frozen`, anything else (`eosh`) verbatim. `None` when
-/// the result would not be a valid dotted name.
+/// `eo9-coreutil-cat` → `cat`, `eo9-stub-time-frozen` → `time.frozen`, anything else
+/// (`eosh`) verbatim. `None` when the result would not be a valid dotted name.
 pub fn shell_name_for(stem: &str) -> Option<String> {
     let name = if let Some(example) = stem.strip_prefix("eo9-example-") {
         example.to_string()
+    } else if let Some(coreutil) = stem.strip_prefix("eo9-coreutil-") {
+        coreutil.to_string()
     } else if let Some(stub) = stem.strip_prefix("eo9-stub-") {
         match stub.split_once('-') {
             Some((api, flavor)) => format!("{api}.{flavor}"),
@@ -94,6 +96,8 @@ mod tests {
             shell_name_for("eo9-example-readwrite").as_deref(),
             Some("readwrite")
         );
+        assert_eq!(shell_name_for("eo9-coreutil-cat").as_deref(), Some("cat"));
+        assert_eq!(shell_name_for("eo9-coreutil-rng").as_deref(), Some("rng"));
         assert_eq!(
             shell_name_for("eo9-stub-entropy-seeded").as_deref(),
             Some("entropy.seeded")

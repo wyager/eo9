@@ -1,0 +1,15 @@
+[package]
+name = "eo9-coreutil-cat"
+description = "Eo9 coreutil: print a file's contents to stdout (eo9:fs + eo9:text)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }
