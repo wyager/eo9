@@ -723,3 +723,36 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
       entropy — the composition simply supplies an unused provider, which is correct). Remaining metal work is
       unchanged: GIC/interrupts (executor still polls), child fuel + eo9-sched, friendlier missing-fs errors
       for children, riscv64/x86_64.
+
+36. **Idle CPU fix — GICv2 + timer IRQ + `wfi` (no more 100% spin).** The kernel previously
+    busy-spun whenever a guest awaited a host operation: the interactive shell's drive loop
+    (`shell.rs::run_eosh`) and the headless executor (`mod.rs::block_on`) both `core::hint::spin_loop()`
+    on `Poll::Pending`, and the `read-line`/`time.sleep` futures (`providers.rs`) self-woke
+    (`cx.waker().wake_by_ref()`), so even at the idle eosh prompt a host CPU sat pegged at ~100%
+    (owner-reported). Fix:
+    - **GICv2 bring-up (`gic.rs`).** Minimal distributor + CPU-interface enable (`GICD_CTLR`,
+      `GICC_PMR=0xff`, `GICC_CTLR`), `configure_intid` (priority) + `enable_intid` for the generic-timer
+      PPIs (26/27/29/30), and `acknowledge`/`end_of_interrupt` (IAR/EOIR). QEMU `-cpu max` defaults to
+      GICv3, whose CPU interface is system-register-based, so xtask now pins `-M virt,gic-version=2`.
+    - **IRQ handler (`boot.rs __irq_entry` → `exceptions.rs kirq`).** The two current-EL IRQ vectors branch
+      to a stub that saves the caller-saved integer registers (x0–x18, x30) — the handler is built without
+      FP so it never touches the v registers, leaving interrupted Cranelift/wasm SIMD state intact — calls
+      `kirq` (ack at the GIC, disable the timer so its level line drops, EOI), and `eret`s. Every other
+      exception stays fatal. `kmain` unmasks IRQ (`msr daifclr, #2`) after the GIC is up.
+    - **`wfi` idle (`mod.rs::idle_wait`, used by both drive loops).** On `Poll::Pending`: arm the EL1
+      physical timer ~`IDLE_WAKE_INTERVAL_NS` (10 ms) ahead unmasked (`timer::arm_wake`), `wfi` (the GIC
+      forwards the timer interrupt, which the handler EOIs), then wake the parked host future. The
+      `read-line`/`time.sleep` futures no longer self-wake; they register their waker
+      (`mod.rs::register_idle_waker`, a single-slot spinlock cell) which `idle_wait` wakes after each `wfi`,
+      so wasmtime re-polls them on the next iteration instead of busy-re-polling inside one poll.
+    - **Result.** Idle host CPU at the eosh prompt drops from ~100% to **~1%** (measured via `top -pid`
+      against a kernel sitting at the prompt on an empty stdin). Heavy guest compute (cruncher rounds,
+      on-target codegen) runs inside a single poll, so it is unthrottled; only await-point latency is bounded
+      by the 10 ms wake interval (serial input feels immediate; the demo's 50 ms sleepy measures ~52 ms).
+      Verified: interactive `hello` + `entropy.seeded $ cruncher` (on-target), `demo` (sleepy, entropy,
+      on-target codegen, clean power-off), and `program=` headless all unchanged; `cargo xtask ci` green.
+    - **Limits / next.** Wake is timer-periodic (10 ms), not yet UART-RX-interrupt-driven, so an idle prompt
+      still wakes ~100×/s (cheap — ~1% — but not a true event-driven 0%); a PL011 RX interrupt would make it
+      fully event-driven. The IRQ path handles only the timer; a real scheduler/preemption tick is future
+      work. The masked-`wfi`-wake shortcut (no handler) did not work under QEMU here, hence the real
+      handler.

@@ -27,6 +27,8 @@ mod exceptions;
 #[cfg(target_os = "none")]
 mod fdt;
 #[cfg(target_os = "none")]
+mod gic;
+#[cfg(target_os = "none")]
 mod heap;
 #[cfg(target_os = "none")]
 mod mmu;
@@ -78,6 +80,18 @@ extern "C" fn kmain(dtb: *const u8) -> ! {
 
     // Generic timer: readable counter plus a polled 10 ms timer condition.
     timer::self_test();
+
+    // Interrupt controller: bring up the GICv2 and forward the EL1 physical timer PPI
+    // (INTID 30) so the executor can `wfi`-idle and be woken by the timer instead of
+    // busy-polling. The IRQ vector (src/boot.rs `__irq_entry` → `kirq`) acknowledges and
+    // EOIs the timer; every other exception stays fatal. Then unmask IRQ so it is taken.
+    gic::init();
+    for intid in [26u32, 27, 29, 30] {
+        gic::configure_intid(intid);
+        gic::enable_intid(intid);
+    }
+    // SAFETY: clearing PSTATE.I (DAIF.I) enables IRQ delivery; the IRQ vector is installed.
+    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };
 
     // The kernel command line (QEMU -append) selects what to run: `program=<name>` runs a
     // store entry headless, `demo` runs the original demo sequence below, and nothing at

@@ -342,7 +342,10 @@ impl Future for ReadLine {
                 _ => {}
             }
         }
-        cx.waker().wake_by_ref();
+        // Park instead of self-waking: registering the waker lets `block_on` re-drive this
+        // future after its timer-interrupt `wfi` wake, so the core idles rather than
+        // wasmtime busy-re-polling here (which would never return to `block_on`'s `wfi`).
+        super::register_idle_waker(cx.waker());
         Poll::Pending
     }
 }
@@ -359,9 +362,9 @@ impl Future for SleepUntil {
         if crate::timer::uptime_ns() >= self.deadline {
             Poll::Ready(())
         } else {
-            // Polled-timer kernel: ask to be polled again right away. The wake is what
-            // makes wasmtime's internal future queue re-poll this future.
-            cx.waker().wake_by_ref();
+            // Park; `block_on` re-polls after its periodic timer `wfi` wake (which fires at
+            // least as often as the wake interval, so the deadline is observed promptly).
+            super::register_idle_waker(cx.waker());
             Poll::Pending
         }
     }
