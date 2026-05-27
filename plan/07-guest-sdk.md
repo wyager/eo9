@@ -90,3 +90,25 @@ example programs used by every other area's tests.
    moved to an async `main` and dropped `block_on`; hello/outcomes/cruncher are untouched. The decision-7
    constraint on future-returning exports is now moot for the standard APIs (no ops return `future<T>`
    anymore), which unblocks the deferred async stubs/examples once area 04's host side catches up.
+9. **wit-bindgen bump for `fs.overlay`: investigated, not possible yet (no qualifying release exists).**
+   The `fs.overlay` world needs a *named import of a foreign interface* (`import upper: eo9:fs/fs@0.1.0`,
+   twice for `upper`/`lower` — see plan/09 D11 on `area/09-fs-overlay`), and the planned unblock was to bump
+   the guest `wit-bindgen` pin to a release whose bundled `wit-parser` can parse it. Verified findings
+   (2026-05-27):
+   * The pinned wit-bindgen 0.57.1 bundles the **0.247** wasm-tools family; its text grammar has no
+     `ExternKind::NamedPath` (`import <id>: <pkg:iface>` falls into the `UsePath` arm and fails with
+     "expected `/`, found `:`"), and its binary decoder rejects the new named-import-name encoding
+     ("invalid leading byte (0x2) for import name"), so feeding it a 1.250-encoded binary WIT package does
+     not work either (probed with a scratch crate against the elaborated `overlay` world).
+   * The feature landed in the **0.249** wasm-tools family (`ExternKind::NamedPath` is present in
+     wit-parser 0.249/0.250; absent in 0.247/0.248).
+   * **wit-bindgen 0.57.1 is the newest published release** (crates.io has nothing newer as of 2026-05-27;
+     the Artifactory mirror agrees), so there is no release to bump to; wit-bindgen's git `main` pins
+     wit-parser **0.249** and would work, but that is an unreleased git pin, not a release.
+   Options, in preference order: (a) wait for the next wit-bindgen release (≥ 0.58 will bundle ≥ 0.249) and
+   then run the originally-planned bump + full ABI re-validation against the wasmtime-45 host (integration
+   suites, CLI transcripts, QEMU smoke — the generated async/callback ABI must keep matching wasmtime 45);
+   (b) if `fs.overlay` becomes urgent before that, take a planner decision to pin wit-bindgen to a git rev
+   of `main` (dependency-policy change + the same full re-validation); (c) keep `fs.overlay` parked (its
+   draft stays excluded on `area/09-fs-overlay`). No pins, sources, or generated components were changed by
+   this investigation; the guest workspace still builds with 0.57.1 exactly as before.
