@@ -96,3 +96,40 @@ Match the priority order above; (1)+(2) unblock I2.
     approximation would be semantically wrong, and a yield-spin loop would be a hack. Escalated: either
     approve enabling the feature once the host side exists, or keep net.loopback queued behind area 13's
     execution harness. `text.capture` still waits on the Message API (eo9:message).
+11. **`fs.overlay` — implemented and built.** Implements SPEC.md "Overlay filesystems": a middleware
+    provider importing two `eo9:fs/fs` instances under the named slots `upper` and `lower` (the
+    `with <a> as upper, <b> as lower $ fs.overlay` shape) and exporting one `eo9:fs/fs` — reads resolve
+    upper-first and fall through to lower on not-found (`open`(read)/`stat`/`open-exec`; `list-directory`
+    unions both layers, upper winning on collisions), writes route to lower
+    (`open`(write)/`write`/`create-directory`/`remove`); the overlay never mutates `upper`. It exports its
+    own `eo9:fs/types`, so the root handle is a compound capturing both underlying roots; open files and
+    immutable handles are per-layer-tagged enums so each `read`/`write`/`exec-read` dispatches back to the
+    layer that served the open (a write through a read-opened upper file is forwarded so the upper's own
+    policy answers — typically `read-only`). The crate keeps its own `wit/overlay.wit` package (deps
+    symlinked to the shared `wit/`), which needs the named-import syntax: this is what motivated the guest
+    workspace's wit-bindgen git pin (plan/07 Decisions 9–10). Binding-layout notes for future two-slot
+    providers: the slot modules generate at the crate root (`crate::upper`, `crate::lower`); the two slots
+    share the imported `eo9:fs/types.fs-impl` and the `eo9:io` buffer resource, but each slot has its own
+    nominal `file`/`immutable-handle`/error/record types. `fs.immutable` is not separately needed —
+    `fs.readonly` already provides read-only-over-an-imported-fs; the future programs/coreutils overlay
+    composes read-only program content as the overlay's `upper`.
+12. **Two-slot wiring needs a per-slot root-handle decision (escalation).** The overlay component builds,
+    validates, and describes correctly (integration test `overlay_component_exposes_upper_and_lower_slots`
+    covers the surface incl. renaming the named slots), but composing two *independent* component leaves
+    into its slots is ill-typed today: the world's two `fs` imports `use` the single imported
+    `eo9:fs/types`, so both slots' `fs-impl` is the *same* imported resource type, while every standalone
+    fs provider (`fs.memfs`, `fs.deny`, …) exports its *own* fresh `types` resource. Verified empirically:
+    `rename(memfs,fs→upper/lower)` then any wiring order (`$` partial, `&` env then `&`/`$`) fails with
+    eo9-component's `Internal("encoding produced a component that failed validation")` — and the overlay
+    binary's import types confirm the `(eq imported-types.fs-impl)` constraint on both slots, so this is
+    inherent to the WIT shape, not an encoder bug (though eo9-component could diagnose it before encoding —
+    minor follow-up). The end-to-end test (`readwrite_through_the_overlay_round_trips`) is committed
+    `#[ignore]`d, ready to enable. Options for the planner: (a) for the real Phase-2 use (the standard
+    programs overlay over `--fs-root`), link both slots host-side in the runtime/shell from one host
+    `eo9:fs/types` instance — no WIT change, but the runtime must learn to link two named fs slots;
+    (b) move `fs-impl` out of `eo9:fs/types` into the `fs` interface (or otherwise give each fs import its
+    own root-handle type) so independent component leaves wire cleanly — a cross-area WIT change (area 02)
+    that would also touch every existing fs stub; (c) only ever feed the overlay layers that share a types
+    lineage (attenuators over one base) — too restrictive to be the answer. Until one lands, `fs.overlay`
+    ships as a built, validated component with its semantics implemented but not yet composable from
+    independent component leaves.

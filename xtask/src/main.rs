@@ -38,6 +38,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-entropy-seeded",
     "eo9-stub-fs-memfs",
     "eo9-stub-fs-none",
+    "eo9-stub-fs-overlay",
     "eo9-stub-fs-readonly",
     "eo9-stub-net-deny",
     "eo9-stub-net-none",
@@ -269,14 +270,16 @@ fn componentize_guest_package(root: &Path, package: &str) -> Result<PathBuf, Str
     )?;
     // The eo9 APIs return Component Model futures, so components built from them
     // use the async canonical built-ins; the validator only accepts those with the
-    // cm-async feature enabled.
+    // cm-async feature enabled. Named same-interface import slots (e.g. fs.overlay's
+    // `upper`/`lower`) carry the `implements` annotation — the same encoding the
+    // algebra's `rename` produces — which the validator gates behind cm-implements.
     run(
         &guest,
         "wasm-tools",
         [
             OsStr::new("validate"),
             OsStr::new("--features"),
-            OsStr::new("cm-async"),
+            OsStr::new("cm-async,cm-implements"),
             component.as_os_str(),
         ],
     )?;

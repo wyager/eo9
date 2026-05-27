@@ -1,0 +1,15 @@
+/// eo9:fs-overlay — the overlay filesystem provider world (SPEC.md, "Overlay filesystems").
+///
+/// `fs.overlay` imports two eo9:fs filesystems under the named slots `upper` and `lower`
+/// (wired with `with <a> as upper, <b> as lower $ fs.overlay`) and exports a single
+/// eo9:fs that layers them: reads resolve upper-first and fall through to lower; writes
+/// route to lower. It exports its own `eo9:fs/types` so the root handle can capture both
+/// underlying filesystems.
+package eo9:fs-overlay@0.1.0;
+
+world overlay {
+    import upper: eo9:fs/fs@0.1.0;
+    import lower: eo9:fs/fs@0.1.0;
+    export eo9:fs/types@0.1.0;
+    export eo9:fs/fs@0.1.0;
+}

@@ -1,0 +1,15 @@
+[package]
+name = "eo9-stub-fs-overlay"
+description = "Eo9 standard middleware provider `fs.overlay`: imports two eo9:fs filesystems (upper, lower) and exports their overlay — reads resolve upper-first, writes route to lower."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }
