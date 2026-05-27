@@ -589,7 +589,7 @@ fn precompile_for_kernel(
 
 /// Build the kernel image for `arch` and boot it under QEMU with serial on stdio.
 ///
-/// The exact invocation (aarch64): `qemu-system-aarch64 -M virt -cpu max -smp 1 -m 512M
+/// The exact invocation (aarch64): `qemu-system-aarch64 -M virt,gic-version=2 -cpu max -smp 1 -m 512M
 /// -nographic -kernel <image>`. The kernel powers the machine off via PSCI when its run
 /// completes (or on panic), so QEMU exits by itself; to quit earlier press Ctrl-A then X.
 fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
@@ -601,8 +601,13 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         image.display()
     );
     let mut args: Vec<std::ffi::OsString> = [
+        // Pin GICv2: the kernel brings up the GIC distributor + CPU interface over MMIO
+        // (src/gic.rs) to forward the generic-timer interrupt so the executor can wfi-idle.
+        // With `-cpu max` QEMU would otherwise default to GICv3 (a system-register CPU
+        // interface with per-PE redistributors), which that minimal MMIO bring-up does not
+        // drive.
         "-M",
-        "virt",
+        "virt,gic-version=2",
         "-cpu",
         "max",
         "-smp",

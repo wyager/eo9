@@ -156,7 +156,13 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
                 Poll::Ready(Err(err)) => return Err(err),
                 Poll::Pending => {
                     shellexec::drive_children();
-                    core::hint::spin_loop();
+                    // Idle the core between polls instead of spinning at 100%: give every
+                    // running child a turn (above), then sleep in `wfi` until the generic
+                    // timer fires (src/wasm/mod.rs arms it + the GIC/IRQ wakes us). Heavy
+                    // guest compute runs inside a single poll, so this only bounds the
+                    // latency at an await point (a child finishing, serial input arriving),
+                    // not throughput. `wake_idle` re-drives eosh's parked `read-line` future.
+                    super::idle_wait();
                 }
             }
         }
