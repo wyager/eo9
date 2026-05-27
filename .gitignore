@@ -7,3 +7,7 @@
 *.rs.bk
 .DS_Store
 .claude
+
+# vendored crates are [patch] sources, never built in place except for standalone checks
+kernel/vendor/**/target/
+.fork-staging/
