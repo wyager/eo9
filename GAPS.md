@@ -8,7 +8,13 @@ xtask-order / web-try wave)._
 
 ## Decisions pending with the owner
 
-- _(no open owner decisions right now — /try v2 was settled, see below.)_
+- **User-study findings (2026-05-27)** — full triage in `docs/user-studies/00-synthesis.md`; every item is
+  dispositioned fix-now / tracked / owner-decision. Open owner decisions from it: (1) unconfigured-provider
+  semantics (defaults vs refuse-before-run vs hybrid — the "used before configure" trap); (2) package-level
+  `only eo9:text` shorthand vs requiring full interface refs; (3) a `describe` wiring/layer view for
+  auditing interposed attenuators; (4) roadmap ordering — metal preemption/fuel next, and real-board
+  bring-up vs riscv64/x86_64; (5) outcome-line placement (planner default: move to stderr + flag) and
+  entropy-opt-in for children if wanted. Tracked items added below; fix-now items are being dispatched.
 - **Compose-time vs run-time provider parameters.** Changing a seed currently changes the composed artifact
   and forces a recompile, same as changing a structural choice. Owner parked the "late-bound parameter"
   idea until there is a clean design; revisit if deterministic sweeps start thrashing the compile cache.
@@ -108,6 +114,20 @@ xtask-order / web-try wave)._
   browser is blocked by an upstream js-component-bindgen TDZ bug (issue text drafted in plan/15 D11); JSPI is
   required for async-main programs (Chromium fine; Safari/Firefox to re-check); keystrokes typed while a run
   is in flight are dropped. (plan/15 D8–14)
+
+## Tracked from the user studies (2026-05-27, see docs/user-studies/00-synthesis.md)
+
+- Debugging: source-line backtraces and a documented debugger workflow (panic-message preservation and the
+  --debug-info cache-key bug are fix-now items).
+- Security: signed/authenticated stores and provider provenance; hostile-component CI suite + fuzzing of the
+  fs provider and ABI boundary; symlink-target-existence oracle (align Denied/NotFound); openat2-style fs
+  resolution remains the real TOCTOU fix (fd re-verification is the dispatched interim).
+- Metal: child fuel + eo9-sched (preemption) promoted to the next kernel milestone pending owner confirm;
+  writable storage + fused-artifact cache on metal; instrumentation (peak heap during on-target compile,
+  compose/compile/run timing split, cache-hit reasons); on-target vs host-AOT codegen quality parity check;
+  fused-composition cache-hit investigation in usermode.
+- Usermode UX: `eo9 new` scaffold and per-package guest builds; optional/defaulted args (existing WAVE-binder
+  gap, priority bumped); spawn-time grant visibility for children.
 
 ## Minor nits / housekeeping
 
