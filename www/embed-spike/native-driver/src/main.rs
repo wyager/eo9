@@ -47,6 +47,10 @@ fn preaot_config(consume_fuel: bool) -> Result<Config> {
     config.gc_support(false);
     config.wasm_threads(false);
     config.consume_fuel(consume_fuel);
+    // The vendored wasmtime family (used via [patch] so the probe gets the CM-async/no_std
+    // relaxation) carries the kernel's single-core compile-context lock, which panics on
+    // contention; compile single-threaded here, it's a handful of small artifacts.
+    config.parallel_compilation(false);
     Ok(config)
 }
 
@@ -88,8 +92,26 @@ fn preaot() -> Result<()> {
     Ok(())
 }
 
+/// The vendored compile crates gate host-target inference (`cranelift-native`) off, so the
+/// driver names its own host triple explicitly when compiling the probe module.
+fn host_triple() -> &'static str {
+    if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        "aarch64-apple-darwin"
+    } else if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
+        "x86_64-apple-darwin"
+    } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+        "aarch64-unknown-linux-gnu"
+    } else {
+        "x86_64-unknown-linux-gnu"
+    }
+}
+
 fn run_probe(probe_path: &Path) -> Result<()> {
-    let engine = Engine::default();
+    // Single-threaded compilation for the same reason as `preaot_config`.
+    let mut config = Config::new();
+    config.parallel_compilation(false);
+    config.target(host_triple())?;
+    let engine = Engine::new(&config)?;
     let module = Module::from_file(&engine, probe_path)
         .map_err(|error| msg(format!("loading probe {}: {error:?}", probe_path.display())))?;
 
@@ -131,6 +153,72 @@ fn run_probe(probe_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Drive the web VM blob (www/web-eo9) the same way the /vm page's JavaScript does: provide
+/// `env.host_write`, then call `boot`, `run_hello`, `run_fuel`, and
+/// `run_entropy(seed, count)`. This is the manual-equivalent check for the page when no
+/// scriptable browser with WebAssembly is at hand; the blob bytes are exactly the ones the
+/// site serves.
+fn verify_blob(blob_path: &Path) -> Result<()> {
+    let mut config = Config::new();
+    config.parallel_compilation(false);
+    config.target(host_triple())?;
+    let engine = Engine::new(&config)?;
+    let module = Module::from_file(&engine, blob_path)
+        .map_err(|error| msg(format!("loading blob {}: {error:?}", blob_path.display())))?;
+
+    let mut linker: Linker<()> = Linker::new(&engine);
+    linker.func_wrap(
+        "env",
+        "host_write",
+        |mut caller: Caller<'_, ()>, ptr: u32, len: u32| -> Result<()> {
+            let memory = caller
+                .get_export("memory")
+                .and_then(|export| export.into_memory())
+                .ok_or_else(|| msg("blob has no exported memory"))?;
+            let mut buffer = vec![0u8; len as usize];
+            memory
+                .read(&caller, ptr as usize, &mut buffer)
+                .map_err(|error| msg(format!("reading host_write message: {error}")))?;
+            println!("[blob] {}", String::from_utf8_lossy(&buffer));
+            Ok(())
+        },
+    )?;
+
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module)?;
+    let mut failures = 0i32;
+    for (name, args) in [
+        ("boot", vec![]),
+        ("run_hello", vec![]),
+        ("run_fuel", vec![]),
+        // seed 0xe09 (lo, hi) and 4 draws — the page's defaults.
+        ("run_entropy", vec![0xe09i32, 0, 4]),
+    ] {
+        let func = instance
+            .get_func(&mut store, name)
+            .ok_or_else(|| msg(format!("blob does not export `{name}`")))?;
+        let params: Vec<wasmtime::Val> = args
+            .iter()
+            .map(|value| wasmtime::Val::I32(*value))
+            .collect();
+        let mut results = [wasmtime::Val::I32(-1)];
+        func.call(&mut store, &params, &mut results)
+            .map_err(|error| msg(format!("calling `{name}`: {error:?}")))?;
+        let code = match results[0] {
+            wasmtime::Val::I32(code) => code,
+            _ => -1,
+        };
+        println!("driver: {name} -> {code}");
+        if code != 0 {
+            failures += 1;
+        }
+    }
+    if failures != 0 {
+        return Err(msg(format!("{failures} blob call(s) failed")));
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -141,6 +229,14 @@ fn main() -> Result<()> {
                 .ok_or_else(|| msg("usage: native-driver run <probe.wasm>"))?;
             run_probe(Path::new(probe))
         }
-        _ => Err(msg("usage: native-driver <preaot | run <probe.wasm>>")),
+        Some("verify-blob") => {
+            let blob = args
+                .get(1)
+                .ok_or_else(|| msg("usage: native-driver verify-blob <web-eo9.wasm>"))?;
+            verify_blob(Path::new(blob))
+        }
+        _ => Err(msg(
+            "usage: native-driver <preaot | run <probe.wasm> | verify-blob <web-eo9.wasm>>",
+        )),
     }
 }

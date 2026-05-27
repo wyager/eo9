@@ -90,3 +90,52 @@ example programs used by every other area's tests.
    moved to an async `main` and dropped `block_on`; hello/outcomes/cruncher are untouched. The decision-7
    constraint on future-returning exports is now moot for the standard APIs (no ops return `future<T>`
    anymore), which unblocks the deferred async stubs/examples once area 04's host side catches up.
+9. **wit-bindgen bump for `fs.overlay`: investigated, not possible yet (no qualifying release exists).**
+   The `fs.overlay` world needs a *named import of a foreign interface* (`import upper: eo9:fs/fs@0.1.0`,
+   twice for `upper`/`lower` — see plan/09 D11 on `area/09-fs-overlay`), and the planned unblock was to bump
+   the guest `wit-bindgen` pin to a release whose bundled `wit-parser` can parse it. Verified findings
+   (2026-05-27):
+   * The pinned wit-bindgen 0.57.1 bundles the **0.247** wasm-tools family; its text grammar has no
+     `ExternKind::NamedPath` (`import <id>: <pkg:iface>` falls into the `UsePath` arm and fails with
+     "expected `/`, found `:`"), and its binary decoder rejects the new named-import-name encoding
+     ("invalid leading byte (0x2) for import name"), so feeding it a 1.250-encoded binary WIT package does
+     not work either (probed with a scratch crate against the elaborated `overlay` world).
+   * The feature landed in the **0.249** wasm-tools family (`ExternKind::NamedPath` is present in
+     wit-parser 0.249/0.250; absent in 0.247/0.248).
+   * **wit-bindgen 0.57.1 is the newest published release** (crates.io has nothing newer as of 2026-05-27;
+     the Artifactory mirror agrees), so there is no release to bump to; wit-bindgen's git `main` pins
+     wit-parser **0.249** and would work, but that is an unreleased git pin, not a release.
+   Options, in preference order: (a) wait for the next wit-bindgen release (≥ 0.58 will bundle ≥ 0.249) and
+   then run the originally-planned bump + full ABI re-validation against the wasmtime-45 host (integration
+   suites, CLI transcripts, QEMU smoke — the generated async/callback ABI must keep matching wasmtime 45);
+   (b) if `fs.overlay` becomes urgent before that, take a planner decision to pin wit-bindgen to a git rev
+   of `main` (dependency-policy change + the same full re-validation); (c) keep `fs.overlay` parked (its
+   draft stays excluded on `area/09-fs-overlay`). No pins, sources, or generated components were changed by
+   this investigation; the guest workspace still builds with 0.57.1 exactly as before.
+10. **wit-bindgen: temporary git pin to upstream main (owner-approved option (b) of decision 9).** The guest
+    workspace now pins `wit-bindgen` to upstream main rev `ea49687c8db0c6abb5de9fa3ea3c7c298587c8f3`
+    (2026-05-22, "fix: async lifted exports with direct results"), which bundles the **0.249** wasm-tools
+    family (wit-parser/wasmparser/wit-component/wasm-metadata 0.249.0) — the first family whose grammar has
+    `ExternKind::NamedPath`, i.e. named imports of a foreign interface, which the `fs.overlay` world needs.
+    The root Cargo.toml pin-table line mirrors the git pin (no host crate consumes wit-bindgen). **Switch
+    back to a crates.io version pin with the first published release whose bundled wit-parser is ≥ 0.249.**
+    Validation against the wasmtime-45 host (the one real risk):
+    * Zero guest source changes were needed — the whole guest workspace (SDK, 18 stubs, examples, eosh,
+      coreutils) compiles unchanged and all 35 components componentize and validate (`--features cm-async`)
+      under wasm-tools 1.250.
+    * Full `cargo xtask ci` green; explicitly re-ran `deterministic_env` (5/5), `invoker_configured_env`
+      (4/4, async-lifted `configure` through the binder), and the CLI transcript suite (31/31, incl. shell,
+      env, coreutils, rng). Manual spot checks: `hello`, `readwrite`/`cat` under `--fs-root`, the
+      missing-fs refusal, `entropy.seeded --seed 43 $ rng`, `only … $ hello`, and
+      `time.frozen --now-seconds … $ hello` (configured frozen clock observed by the program).
+    * Bare metal: `build-kernel aarch64` re-AOTs the regenerated components; QEMU `demo` reproduces the
+      full sequence (sync seed, hello `success(greeted)`, async sleepy ≈51 ms, entropy.seeded SplitMix64
+      values unchanged, on-target Cranelift codegen), and an interactive smoke ran `hello` plus a fused
+      `time.frozen --… $ hello` composition compiled on-target — all with the new-bindgen components.
+    * `fs.overlay` unblock confirmed: against the extracted draft (branch `area/09-fs-overlay`), `generate!`
+      now succeeds for the two named same-interface imports. The generated layout is `crate::upper` and
+      `crate::lower` (modules named after the slots), with the shared default-named imports under
+      `crate::eo9::…` and exports under `crate::exports::eo9::fs::…`; exported trait methods take
+      `FsImplBorrow<'_>` rather than `&FsImpl`. The draft's hand-written forwarding code (written blind)
+      needs a mechanical pass against that real layout — area 09's follow-up; nothing was changed on its
+      branch.

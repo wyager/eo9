@@ -20,9 +20,14 @@ xtask-order / web-try wave)._
   plus (the infeasible-drop-in-backend → fiberless-callback-surgery problem above) and is not MVP-critical.
   Keep v1; revisit the fiberless work — or upstream it — after the MVP. The wasm32 findings live in
   plan/15 D15–20; `eo9-embed` (area 16) remains the shared foundation for whenever it's picked back up.
-- **No upstreaming until a compelling MVP** (owner ruling 2026-05-26). The no_std CM-async patch and the new
-  cranelift no_std fork stay as in-tree vendored forks under kernel/vendor; revisit offering anything to
-  wasmtime/cranelift upstream only once Eo9 has a compelling MVP.
+- **No upstreaming until a compelling MVP** (owner ruling 2026-05-26). All ten vendored forks stay in-tree
+  under kernel/vendor until then. Per-family feasibility reports are written (`docs/upstreaming/*.md`,
+  2026-05-27): the CM-async no_std relaxation is the highest-value first PR (~8–14 days, upstream has an
+  explicit no_std program); the environ/cranelift compile-layer no_std port is genuinely novel (upstream's
+  push covers the code generator, not the compile drivers); wit-parser/wasm-wave are tiny completions of
+  already-merged upstream no_std work; wit-component should go via a "make wasm-metadata no_std" design
+  issue; wac needs an appetite-check issue first. Free prep recorded in the reports (keep vendor README
+  current — it's missing the algebra-crate section — and rebase rather than re-derive on version bumps).
 - **On-target codegen: fork cranelift now** (owner ruling 2026-05-26), do not wait for upstream's in-flight
   no_std work to finish. Vendor/fork the compile layers (cranelift-codegen and the wasm→CLIF + emission /
   loader path) into a no_std+alloc state under kernel/vendor; build on upstream's no_std PRs where they

@@ -26,6 +26,26 @@ const VECTOR_NAMES: [&str; 16] = [
     "lower EL, aarch32: SError",
 ];
 
+/// IRQ handler, called from the IRQ vector stub (`__irq_entry` in src/boot.rs) with the
+/// caller-saved registers already preserved. Acknowledges the pending interrupt at the GIC,
+/// services the generic timer (disabling it so its level-sensitive line drops — the executor
+/// re-arms it before the next `wfi`), and signals end-of-interrupt. The timer is the only
+/// enabled interrupt source; its sole purpose is to wake the executor's `wfi` idle path.
+#[unsafe(no_mangle)]
+extern "C" fn kirq() {
+    let iar = crate::gic::acknowledge();
+    let intid = iar & 0x3ff;
+    // 1020-1023 are spurious / special and must not be EOI'd.
+    if intid >= 1020 {
+        return;
+    }
+    // Generic-timer PPIs (26/27/29/30): drop the level-sensitive line before the EOI.
+    if matches!(intid, 26 | 27 | 29 | 30) {
+        crate::timer::disable();
+    }
+    crate::gic::end_of_interrupt(iar);
+}
+
 /// Called from every exception vector (src/boot.rs) with the vector index and the
 /// syndrome/return/fault-address registers already read.
 #[unsafe(no_mangle)]

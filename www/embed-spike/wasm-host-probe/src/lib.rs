@@ -239,9 +239,9 @@ mod cmasync {
             .ok_or_else(|| {
                 wasmtime::Error::msg(format!("`{interface}` does not export `{func}`"))
             })?;
-        instance.get_func(&mut *store, func_index).ok_or_else(|| {
-            wasmtime::Error::msg(format!("`{interface}.{func}` is not a function"))
-        })
+        instance
+            .get_func(&mut *store, func_index)
+            .ok_or_else(|| wasmtime::Error::msg(format!("`{interface}.{func}` is not a function")))
     }
 
     fn configured_handle(configured: &Val) -> wasmtime::Result<Val> {
@@ -348,11 +348,18 @@ fn step_cmasync() -> u32 {
     let mut failures = 0;
     for (name, result) in [
         ("sync instantiate + call_async", cmasync::kernel_style()),
-        ("sync instantiate + run_concurrent/call_concurrent", cmasync::runtime_style()),
+        (
+            "sync instantiate + run_concurrent/call_concurrent",
+            cmasync::runtime_style(),
+        ),
     ] {
         match result {
             Ok(draws) => {
-                let verdict = if draws == EXPECTED_DRAWS { "matches" } else { "DOES NOT match" };
+                let verdict = if draws == EXPECTED_DRAWS {
+                    "matches"
+                } else {
+                    "DOES NOT match"
+                };
                 logf!(
                     "cm-async ({name}): entropy.seeded configure({ENTROPY_SEED:#x}) then get-u64 twice -> \
                      {:#x}, {:#x} ({verdict} the kernel/native sequence)",
@@ -380,10 +387,7 @@ pub extern "C" fn run() -> i32 {
         env!("CARGO_PKG_VERSION"),
         cfg!(feature = "cmasync")
     );
-    for (name, result) in [
-        ("seed sync", step_seed_sync()),
-        ("fuel", step_fuel()),
-    ] {
+    for (name, result) in [("seed sync", step_seed_sync()), ("fuel", step_fuel())] {
         if let Err(error) = result {
             logf!("{name}: FAILED: {error:?}");
             failures += 1;

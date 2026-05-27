@@ -54,6 +54,33 @@ The kernel additionally provides, as the embedder: `wasmtime_tls_get/set`,
 `wasmtime_concurrent_tls_get/set`, and a `CustomCodeMemory` publisher (D-cache clean +
 I-cache invalidate over published code) — see `kernel/eo9-kernel/src/wasm/mod.rs`.
 
+## Fiberless component-model-async (browser/wasm32 hosts)
+
+For the in-browser Eo9 (wasm32 as the *host* architecture, plan/15 "wasm32 embed spike" /
+area 18), `wasmtime/` additionally gains an **opt-in** `component-model-async-fiberless`
+feature (off by default; never enabled by the kernel or host builds — with it off the code
+is unchanged):
+
+- `Cargo.toml` — declares the feature (depends on `component-model-async` only).
+- `src/runtime/component/concurrent.rs` — `run_on_worker` gains a feature-gated arm that
+  executes the worker item (a guest call or a queued worker function) directly on the
+  current stack instead of creating/resuming a worker fiber. Callback-ABI ("stackless")
+  guests — which is what every Eo9 guest is — return to the host with a status code rather
+  than blocking mid-frame, so they do not need a fiber; code that genuinely needs to block
+  mid-guest-frame already checks `can_block()` (false here, no fiber context installed) and
+  fails cleanly. wasmtime-fiber has no wasm32 stack-switching backend, which is what this
+  works around.
+- `src/runtime/module.rs` — one line: `Module::from_trusted_file` passes the path to
+  `wasm_binary_or_text` as `to_str()` (the debug-path surface is `&str` since the on-target
+  codegen changes); std-only path, only compiled by std builds of the vendored copy (the
+  embed-spike / web blob native driver).
+
+Verified by `www/embed-spike` with `--features fiberless`: the unmodified
+`entropy.seeded` stub (async-lifted `configure` + `get-u64`) runs to completion on a
+wasm32-hosted wasmtime via Pulley with the exact SplitMix64 sequence the kernel/native
+embeddings produce, through both the `call_async` and `run_concurrent`/`call_concurrent`
+entry points.
+
 ## On-target codegen (in progress) — plan/12 Decisions 26 & 28
 
 The on-target-codegen rung (the kernel compiling components on the machine, behind the

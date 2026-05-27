@@ -44,6 +44,17 @@ pub fn subsecond_ns() -> u32 {
     ticks_to_ns(counter() % frequency, frequency) as u32
 }
 
+/// Disable the EL1 physical timer (clear ENABLE), deasserting its interrupt. The IRQ handler
+/// calls this so the level-sensitive timer line drops before the EOI; the executor re-arms it
+/// with [`arm_wake`] before the next `wfi`.
+#[cfg(target_os = "none")]
+pub fn disable() {
+    // SAFETY: writing the EL1 physical timer control register at EL1 only affects that timer.
+    unsafe {
+        core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 0_u64, options(nomem, nostack));
+    }
+}
+
 /// Nominal counter resolution in nanoseconds (at least 1).
 pub fn resolution_ns() -> u64 {
     let frequency = frequency();
@@ -51,6 +62,36 @@ pub fn resolution_ns() -> u64 {
         return 1;
     }
     u64::max(1, 1_000_000_000 / frequency)
+}
+
+/// Arm the EL1 physical timer to assert its interrupt `delay_ns` from now, *unmasked* so it
+/// reaches the GIC and can wake a `wfi`. The kernel executor's idle path arms a short wake,
+/// executes `wfi`, and re-arms on the next loop — which, the generic-timer PPI being
+/// level-sensitive, deasserts the previous signal and clears the GIC pending state with no
+/// EOI needed (the interrupt is never taken as an exception; PSTATE.I stays masked).
+// Used only by the wasm executor's idle path (src/wasm/mod.rs), which the feature-less CI
+// kernel build does not compile; keep it unconditional like the rest of the timer MMIO.
+#[cfg(target_os = "none")]
+#[allow(dead_code)]
+pub fn arm_wake(delay_ns: u64) {
+    let frequency = frequency();
+    if frequency == 0 {
+        return;
+    }
+    // ticks = delay_ns * frequency / 1e9, at least one, clamped to the 32-bit TVAL counter.
+    let ticks = (u128::from(delay_ns) * u128::from(frequency) / 1_000_000_000) as u64;
+    let tval = u64::from(u32::try_from(ticks.max(1)).unwrap_or(u32::MAX));
+    // ENABLE = 1, IMASK = 0 (assert to the GIC).
+    // SAFETY: programming the EL1 physical timer at EL1 only affects that timer.
+    unsafe {
+        core::arch::asm!(
+            "msr cntp_tval_el0, {tval}",
+            "msr cntp_ctl_el0, {ctl}",
+            tval = in(reg) tval,
+            ctl = in(reg) 0b01_u64,
+            options(nomem, nostack),
+        );
+    }
 }
 
 /// Print counter readings and run a polled 10 ms timer-condition check.

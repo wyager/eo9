@@ -42,10 +42,11 @@ pub mod wave;
 
 use alloc::sync::Arc;
 use alloc::task::Wake;
+use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::pin;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use wasmtime::{Config, CustomCodeMemory, Engine};
@@ -208,14 +209,81 @@ extern "C" fn wasmtime_concurrent_tls_set(pointer: *mut u8) {
 /// Generous because QEMU TCG is slow; a healthy operation finishes in milliseconds.
 const BLOCK_ON_WATCHDOG_NS: u64 = 30_000_000_000;
 
+/// How long the executor sleeps in `wfi` between re-polls while a host operation is pending.
+/// It bounds two things: the latency before a guest sleep deadline or freshly-arrived serial
+/// input is noticed, and the idle re-poll rate (host CPU cost at the prompt). 10 ms keeps the
+/// interactive shell feeling immediate while letting QEMU's vCPU sit idle between wakes.
+const IDLE_WAKE_INTERVAL_NS: u64 = 10_000_000;
+
+/// Where a parked host-import future ([`providers`]' `read-line`/`time.sleep`) leaves the
+/// waker it wants woken. [`block_on`] takes and wakes it after each `wfi`, so wasmtime
+/// re-polls the future on the next loop. Single-core: the lock is uncontended (the IRQ
+/// handler never touches it), but kept explicit so the access is sound.
+struct IdleWaker {
+    locked: AtomicBool,
+    waker: UnsafeCell<Option<Waker>>,
+}
+
+// SAFETY: all access goes through the `locked` flag below, on the kernel's single core.
+unsafe impl Sync for IdleWaker {}
+
+static IDLE_WAKER: IdleWaker = IdleWaker {
+    locked: AtomicBool::new(false),
+    waker: UnsafeCell::new(None),
+};
+
+impl IdleWaker {
+    fn lock(&self) {
+        while self.locked.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+    fn unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+}
+
+/// Register the waker to re-drive after the next `wfi` (called by a parked host future).
+pub(crate) fn register_idle_waker(waker: &Waker) {
+    IDLE_WAKER.lock();
+    // SAFETY: exclusive while `locked` is held.
+    unsafe { *IDLE_WAKER.waker.get() = Some(waker.clone()) };
+    IDLE_WAKER.unlock();
+}
+
+/// Wake (and clear) the registered idle waker, so wasmtime re-polls the parked future.
+fn wake_idle() {
+    IDLE_WAKER.lock();
+    // SAFETY: exclusive while `locked` is held.
+    let waker = unsafe { (*IDLE_WAKER.waker.get()).take() };
+    IDLE_WAKER.unlock();
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+/// One idle step for a polling drive loop ([`block_on`] and the interactive shell): arm the
+/// generic timer a short interval ahead (the GIC forwards it; src/exceptions.rs `kirq`
+/// EOIs it), halt the core in `wfi` until it (or other input) fires, then re-drive any
+/// parked host-import future. This is what turns the kernel's busy-poll into an idle wait —
+/// QEMU's vCPU (and a real core) sleeps between polls instead of spinning at 100%.
+pub(crate) fn idle_wait() {
+    crate::timer::arm_wake(IDLE_WAKE_INTERVAL_NS);
+    // SAFETY: `wfi` has no memory/register effects; it halts the core until an interrupt.
+    unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) };
+    wake_idle();
+}
+
 /// Drive a wasmtime future (`instantiate_async`, `call_async`, …) to completion on the
 /// kernel's single thread.
 ///
-/// This is a polling executor: every pending host operation on this machine is
-/// time-driven (the only async root-provider operation today is `time.sleep`, whose
-/// future re-arms its own waker on each poll), so the loop polls until the future
-/// resolves, with a watchdog so a wedged guest cannot hang the boot. Once timer
-/// interrupts (GIC) are wired up, the busy poll becomes a wait-for-interrupt.
+/// This is a polling executor: every pending host operation on this machine is time- or
+/// input-driven (`time.sleep` against the generic timer, `read-line` against the PL011),
+/// and those futures re-arm their waker on each poll, so the loop re-polls the top future
+/// until it resolves, with a watchdog so a wedged guest cannot hang the boot. Between polls
+/// the core idles in `wfi` (woken by a short generic-timer interrupt forwarded through the
+/// GIC) rather than spinning, so an idle kernel — at the eosh prompt, or waiting out a
+/// guest sleep — no longer pins a host CPU.
 pub fn block_on<F: Future>(what: &str, future: F) -> Result<F::Output, wasmtime::Error> {
     let mut future = pin!(future);
     let waker = Waker::from(Arc::new(Doorbell));
@@ -230,7 +298,19 @@ pub fn block_on<F: Future>(what: &str, future: F) -> Result<F::Output, wasmtime:
                         "{what} did not complete within the kernel executor's watchdog"
                     )));
                 }
-                core::hint::spin_loop();
+                // Idle the core instead of spinning at 100%: arm the generic timer to fire
+                // shortly (forwarded by the GIC), then `wfi`. PSTATE.I stays masked, so the
+                // interrupt is never *taken* — `wfi` simply wakes on it as a pending
+                // interrupt — and the next `arm_wake` deasserts the level-sensitive timer,
+                // clearing the GIC pending state with no EOI. The wake bound (2 ms) caps the
+                // latency at which a ready future (sleep deadline reached, input arrived) is
+                // re-polled; the only pending host operations on this machine are time- or
+                // input-driven, so this loses no useful work.
+                // Idle in `wfi` until the timer (or other input) wakes us, then re-drive the
+                // parked host future, instead of busy-spinning. A guest awaiting `time.sleep`
+                // or `read-line` registered its waker rather than self-waking, so this is what
+                // lets the core actually sleep between polls.
+                idle_wait();
             }
         }
     }

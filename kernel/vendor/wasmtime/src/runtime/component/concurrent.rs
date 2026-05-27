@@ -1479,33 +1479,50 @@ impl<T> StoreContextMut<'_, T> {
     }
 
     /// Execute the specified guest call on a worker fiber.
+    ///
+    /// eo9 local change (kernel/vendor/README.md): with the
+    /// `component-model-async-fiberless` feature the embedder has opted into running the
+    /// item directly on the current stack instead, for hosts with no fiber backend
+    /// (a wasm32 host in the browser). Callback-ABI ("stackless") guests never need to
+    /// block mid-guest-frame, so this is sufficient for them; code that genuinely needs to
+    /// block checks `can_block()` (false here, since no fiber context is installed) and
+    /// fails cleanly rather than switching stacks.
     async fn run_on_worker(self, item: WorkerItem) -> Result<()>
     where
         T: Send,
     {
-        let worker = if let Some(fiber) = self.0.concurrent_state_mut().worker.take() {
-            fiber
-        } else {
-            fiber::make_fiber(self.0, move |store| {
-                loop {
-                    let Some(item) = store.concurrent_state_mut().worker_item.take() else {
-                        bail_bug!("worker_item not present when resuming fiber")
-                    };
-                    match item {
-                        WorkerItem::GuestCall(call) => handle_guest_call(store, call)?,
-                        WorkerItem::Function(fun) => fun.into_inner()(store)?,
-                    }
-
-                    store.suspend(SuspendReason::NeedWork)?;
-                }
-            })?
+        #[cfg(feature = "component-model-async-fiberless")]
+        return match item {
+            WorkerItem::GuestCall(call) => handle_guest_call(self.0, call),
+            WorkerItem::Function(fun) => fun.into_inner()(self.0),
         };
 
-        let worker_item = &mut self.0.concurrent_state_mut().worker_item;
-        assert!(worker_item.is_none());
-        *worker_item = Some(item);
+        #[cfg(not(feature = "component-model-async-fiberless"))]
+        {
+            let worker = if let Some(fiber) = self.0.concurrent_state_mut().worker.take() {
+                fiber
+            } else {
+                fiber::make_fiber(self.0, move |store| {
+                    loop {
+                        let Some(item) = store.concurrent_state_mut().worker_item.take() else {
+                            bail_bug!("worker_item not present when resuming fiber")
+                        };
+                        match item {
+                            WorkerItem::GuestCall(call) => handle_guest_call(store, call)?,
+                            WorkerItem::Function(fun) => fun.into_inner()(store)?,
+                        }
 
-        self.0.resume_fiber(worker).await
+                        store.suspend(SuspendReason::NeedWork)?;
+                    }
+                })?
+            };
+
+            let worker_item = &mut self.0.concurrent_state_mut().worker_item;
+            assert!(worker_item.is_none());
+            *worker_item = Some(item);
+
+            self.0.resume_fiber(worker).await
+        }
     }
 
     /// Wrap the specified host function in a future which will call it, passing

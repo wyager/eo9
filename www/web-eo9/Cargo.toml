@@ -1,0 +1,38 @@
+# The in-browser Eo9 blob (area 18, "web-based Eo9"): the real runtime stack — wasmtime
+# with the Pulley interpreter backend inside — compiled *to* wasm32 and run by the visitor's
+# browser, with a thin JS shim providing only the page terminal. This is the productized
+# successor of the `www/embed-spike` feasibility probe (plan/15 "wasm32 embed spike"); the
+# spike stays as the reference harness and regression probe.
+#
+# Standalone workspace (like www/, www/try-build, www/embed-spike): nothing here enters the
+# OS dependency tree, and `cargo xtask ci` neither builds nor needs it. Build via
+# `cargo xtask build-web-vm`.
+[workspace]
+resolver = "3"
+members = ["blob"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+# Same pinned wasmtime as the rest of the repository (root Cargo.toml pin table).
+wasmtime = { version = "45.0.0" }
+
+# wasm32 has no fiber backend and upstream gates component-model-async on `std`, so the blob
+# uses the kernel's vendored relaxation plus its opt-in fiberless execution path
+# (kernel/vendor/README.md, "Fiberless component-model-async"). The whole vendored wasmtime
+# family is patched together so the types agree (same note as www/embed-spike).
+[patch.crates-io]
+wasmtime = { path = "../../kernel/vendor/wasmtime" }
+wasmtime-environ = { path = "../../kernel/vendor/wasmtime-environ" }
+wasmtime-internal-cranelift = { path = "../../kernel/vendor/wasmtime-cranelift" }
+cranelift-frontend = { path = "../../kernel/vendor/cranelift-frontend" }
+wasmtime-internal-unwinder = { path = "../../kernel/vendor/wasmtime-unwinder" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = "symbols"

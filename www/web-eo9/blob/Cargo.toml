@@ -1,0 +1,27 @@
+# The blob itself: a cdylib for `wasm32-unknown-unknown` that embeds wasmtime (custom
+# platform layer, Pulley interpreter, fiberless component-model-async) plus pre-AOT'd
+# pulley32 artifacts of real Eo9 components, and exposes a handful of plain exports the
+# page's JS calls. Its only import is `env.host_write` (terminal output).
+[package]
+name = "web-eo9-blob"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Declared directly (not via workspace inheritance) because this crate needs
+# `default-features = false`: wasmtime's `std` feature does not build for wasm32 (its std
+# platform layer assumes mmap), so the blob uses the custom platform layer exactly like the
+# bare-metal kernel, plus the vendored fiberless opt-in so callback-ABI guest calls run
+# without a worker fiber (wasm32 has no fiber backend).
+wasmtime = { version = "45.0.0", default-features = false, features = [
+    "runtime",
+    "component-model",
+    "pulley",
+    "async",
+    "component-model-async",
+    "component-model-async-fiberless",
+] }
