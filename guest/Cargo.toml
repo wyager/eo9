@@ -15,7 +15,14 @@ publish = false
 [workspace.dependencies]
 # Guest crates are no_std + alloc (plan/07-guest-sdk.md, Decisions): default features are
 # disabled to drop `std`; `async` is kept for Component Model future/stream support.
-wit-bindgen = { version = "0.57.1", default-features = false, features = [
+#
+# TEMPORARY GIT PIN (plan/07-guest-sdk.md, Decisions 9-10): the fs.overlay world needs
+# named imports of a foreign interface (`import upper: eo9:fs/fs`), which requires a
+# wit-parser >= 0.249 inside the bindings generator; the newest published wit-bindgen
+# (0.57.1) still bundles 0.247, so we pin a specific upstream main revision (bundles the
+# 0.249 family). Return to a crates.io version pin with the first published release
+# whose bundled wit-parser is >= 0.249.
+wit-bindgen = { git = "https://github.com/bytecodealliance/wit-bindgen", rev = "ea49687c8db0c6abb5de9fa3ea3c7c298587c8f3", default-features = false, features = [
     "macros",
     "realloc",
     "bitflags",
