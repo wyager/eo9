@@ -146,10 +146,10 @@ fn run_hello_by_path_end_to_end() {
         run.stdout
     );
     assert_eq!(
-        run.stdout.lines().last(),
+        run.stderr.lines().last(),
         Some("success(greeted)"),
-        "outcome line missing from stdout: {}",
-        run.stdout
+        "outcome line missing from stderr: {}",
+        run.stderr
     );
 }
 
@@ -167,36 +167,36 @@ fn run_outcomes_covers_success_failure_and_abnormal() {
     let ok = run_mode("ok", "all good");
     assert_eq!(ok.code, 0, "stderr: {}", ok.stderr);
     assert_eq!(
-        ok.stdout.lines().last(),
+        ok.stderr.lines().last(),
         Some("success(completed(\"all good\"))")
     );
 
     let quiet = run_mode("quiet", "");
     assert_eq!(quiet.code, 0, "stderr: {}", quiet.stderr);
-    assert_eq!(quiet.stdout.trim(), "success(quiet)");
+    assert_eq!(quiet.stderr.trim(), "success(quiet)");
 
     let fail = run_mode("fail", "went wrong");
     assert_eq!(fail.code, 1, "stderr: {}", fail.stderr);
     assert_eq!(
-        fail.stdout.lines().last(),
+        fail.stderr.lines().last(),
         Some("failure(requested-failure(\"went wrong\"))")
     );
 
     let rejected = run_mode("nonsense", "");
     assert_eq!(rejected.code, 1, "stderr: {}", rejected.stderr);
     assert!(
-        rejected.stdout.trim().starts_with("failure(bad-arguments("),
+        rejected.stderr.trim().starts_with("failure(bad-arguments("),
         "unexpected outcome: {}",
-        rejected.stdout
+        rejected.stderr
     );
 
     // A guest panic lowers to a wasm trap: the executor's abnormal arm, exit code 2.
     let trapped = run_mode("trap", "");
     assert_eq!(trapped.code, 2, "stderr: {}", trapped.stderr);
     assert!(
-        trapped.stdout.trim().starts_with("abnormal(trapped("),
+        trapped.stderr.trim().starts_with("abnormal(trapped("),
         "unexpected outcome: {}",
-        trapped.stdout
+        trapped.stderr
     );
     assert!(
         trapped.stdout.contains("unreachable"),
@@ -224,7 +224,7 @@ fn run_cruncher_is_deterministic_pure_compute() {
         &["run", &cruncher, "--seed", "9", "--rounds", "1000"],
     );
     assert_eq!(first.code, 0, "stderr: {}", first.stderr);
-    assert_eq!(first.stdout.trim(), format!("success(digest({expected}))"));
+    assert_eq!(first.stderr.trim(), format!("success(digest({expected}))"));
 
     // Pure compute with fixed arguments is bit-deterministic run to run.
     let second = eo9(
@@ -232,12 +232,12 @@ fn run_cruncher_is_deterministic_pure_compute() {
         &["run", &cruncher, "--seed", "9", "--rounds", "1000"],
     );
     assert_eq!(second.code, 0, "stderr: {}", second.stderr);
-    assert_eq!(second.stdout, first.stdout);
+    assert_eq!(second.stderr, first.stderr);
 
     // Zero rounds is rejected in the program's own failure vocabulary.
     let rejected = eo9(&store, &["run", &cruncher, "--seed", "9", "--rounds", "0"]);
     assert_eq!(rejected.code, 1);
-    assert!(rejected.stdout.trim().starts_with("failure(bad-arguments("));
+    assert!(rejected.stderr.trim().starts_with("failure(bad-arguments("));
 }
 
 // -----------------------------------------------------------------------------------
@@ -365,7 +365,7 @@ fn an_unwritable_cache_never_fails_a_run() {
         "expected an insert warning: {}",
         cold.stderr
     );
-    assert!(cold.stdout.trim().starts_with("success(digest("));
+    assert!(cold.stderr.trim().starts_with("success(digest("));
 
     // Populate the cache normally, then make the entry read-only: the lookup's
     // use-count bump fails, which is treated as a miss (warn + recompile), not an error.
@@ -488,7 +488,7 @@ fn readwrite_round_trips_through_the_unix_fs() {
         ],
     );
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
-    assert_eq!(run.stdout.trim(), "success(round-tripped(10))");
+    assert_eq!(run.stderr.trim(), "success(round-tripped(10))");
 
     // The write really landed on the host filesystem, under the fs root.
     assert_eq!(
@@ -523,14 +523,14 @@ fn readwrite_failures_stay_in_the_programs_vocabulary_and_inside_the_root() {
     let escape = run_with_path("../escaped.txt");
     assert_eq!(escape.code, 1, "stderr: {}", escape.stderr);
     assert!(
-        escape.stdout.trim().starts_with("failure(fs("),
+        escape.stderr.trim().starts_with("failure(fs("),
         "expected the program's fs failure: {}",
-        escape.stdout
+        escape.stderr
     );
     assert!(
-        escape.stdout.contains("Denied"),
+        escape.stderr.contains("Denied"),
         "expected a denied error: {}",
-        escape.stdout
+        escape.stderr
     );
     assert!(
         !fs_root
@@ -546,9 +546,9 @@ fn readwrite_failures_stay_in_the_programs_vocabulary_and_inside_the_root() {
     let missing = run_with_path("no-such-dir/note.txt");
     assert_eq!(missing.code, 1, "stderr: {}", missing.stderr);
     assert!(
-        missing.stdout.trim().starts_with("failure(fs("),
+        missing.stderr.trim().starts_with("failure(fs("),
         "expected the program's fs failure: {}",
-        missing.stdout
+        missing.stderr
     );
 }
 
@@ -687,9 +687,9 @@ fn shell_maps_child_failures_to_exit_code_1() {
         failed.stdout
     );
     assert!(
-        failed.stdout.contains("failure(command-failed("),
+        failed.stderr.contains("failure(command-failed("),
         "the shell's own outcome should be a failure: {}",
-        failed.stdout
+        failed.stderr
     );
 
     let unknown = eo9(&store, &["shell", "-c", "nosuchprogram"]);
@@ -958,7 +958,7 @@ fn store_add_ls_gc_and_run_by_name() {
         "stdout: {}",
         run.stdout
     );
-    assert_eq!(run.stdout.lines().last(), Some("success(greeted)"));
+    assert_eq!(run.stderr.lines().last(), Some("success(greeted)"));
 
     let unknown = eo9(&store, &["run", "nosuchname"]);
     assert_eq!(unknown.code, 3);
@@ -1076,7 +1076,7 @@ fn default_invocations_run_the_shell_and_programs() {
         "{}",
         by_path.stdout
     );
-    assert_eq!(by_path.stdout.lines().last(), Some("success(greeted)"));
+    assert_eq!(by_path.stderr.lines().last(), Some("success(greeted)"));
 
     // And so is `eo9 <bare-name> …` once the name is bound (here: by the seeding above).
     let by_name = eo9(&store, &["hello", "--name", "byname", "--excited", "true"]);

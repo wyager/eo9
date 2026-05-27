@@ -11,7 +11,7 @@ use eo9_component::{ArgSpec, Component, ComponentKind, ImportNeed};
 use eo9_runtime::task::FUEL_QUANTUM;
 use eo9_runtime::{NamedArg, Outcome, ResumeOutcome, SpawnLimits, Task, WaveValue};
 
-use crate::cli::{Config, EXIT_ABNORMAL, EXIT_FAILURE, EXIT_SUCCESS, vlog};
+use crate::cli::{Config, EXIT_ABNORMAL, EXIT_FAILURE, EXIT_SUCCESS, OutcomeChannel, vlog};
 use crate::compile;
 use crate::providers;
 use crate::source;
@@ -75,8 +75,18 @@ pub fn cmd_run(cfg: &Config, reference: &str, flags: &[(String, String)]) -> Res
     }
 
     let (rendered, code) = render_outcome(&outcome);
-    println!("{rendered}");
+    print_outcome(cfg, &rendered);
     Ok(code)
+}
+
+/// Write the rendered outcome line to the channel selected by `--outcome` (stderr by
+/// default: program output owns stdout, the exit code already encodes the outcome).
+pub(crate) fn print_outcome(cfg: &Config, rendered: &str) {
+    match cfg.outcome {
+        OutcomeChannel::Stderr => eprintln!("{rendered}"),
+        OutcomeChannel::Stdout => println!("{rendered}"),
+        OutcomeChannel::Quiet => {}
+    }
 }
 
 /// The built-in drive loop: donate fuel, run, park the thread on I/O, repeat until the

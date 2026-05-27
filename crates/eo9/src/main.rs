@@ -154,6 +154,8 @@ OPTIONS (before the program name; `--<flag> <value>` after it belongs to the pro
         --max-memory <bytes>  Linear-memory ceiling for the spawned task
         --max-fuel <units>    Total fuel budget; an exhausted budget kills the task
                               (abnormal(killed), exit 2). Default: unlimited
+        --outcome <where>     Where the typed outcome line is printed: stderr (default),
+                              stdout, or quiet (exit codes always carry the outcome)
         --debug-info          Compile with debug info
 
 EXIT CODES (run):
