@@ -60,6 +60,9 @@ pub fn read_component(cfg: &Config, reference: &str) -> Result<(Vec<u8>, String)
     } else {
         let name = parse_name(reference)?;
         let store = cfg.open_store()?;
+        if let Err(err) = crate::seed::seed_store_if_empty(cfg, &store) {
+            vlog!(cfg, "could not seed the empty store: {err}");
+        }
         let resolved = store.resolve(&name).map_err(|err| err.to_string())?;
         let bytes = store
             .read_object(&resolved.hash)
@@ -80,6 +83,12 @@ fn parse_name(reference: &str) -> Result<Name, String> {
 fn resolve_store_name(cfg: &Config, reference: &str) -> Result<ProgramSource, String> {
     let name = parse_name(reference)?;
     let store = cfg.open_store()?;
+    // First run against a brand-new store: seed it from the embedded components, exactly
+    // like the shell path does, so `eo9 hello ...` works out of the box (a non-empty
+    // store is left untouched). A seeding problem only matters if resolution then fails.
+    if let Err(err) = crate::seed::seed_store_if_empty(cfg, &store) {
+        vlog!(cfg, "could not seed the empty store: {err}");
+    }
     let resolved = store.resolve(&name).map_err(|err| err.to_string())?;
     let bytes = resolved.handle.bytes().map_err(|err| err.to_string())?;
     let hash = ObjectHash::of(&bytes);
