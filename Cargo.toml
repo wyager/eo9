@@ -34,7 +34,14 @@ wasm-wave = "0.250.0"
 # components from hand-written core modules.
 wat = "1.250.0"
 wac-graph = "0.10.0"
-wit-bindgen = "0.57.1"
+# wit-bindgen is consumed only by the guest workspace (no host crate uses it); the guest
+# pin is currently a TEMPORARY GIT PIN to upstream main rev ea49687c8db0c6abb5de9fa3ea3c
+# (bundles the 0.249 wasm-tools family) because fs.overlay needs named imports of a
+# foreign interface, which no published wit-bindgen release can parse yet (newest, 0.57.1,
+# bundles 0.247). Return both this line and guest/Cargo.toml to a crates.io version pin
+# with the first release whose bundled wit-parser is >= 0.249. See plan/07-guest-sdk.md
+# Decisions 9-10.
+wit-bindgen = { git = "https://github.com/bytecodealliance/wit-bindgen", rev = "ea49687c8db0c6abb5de9fa3ea3c7c298587c8f3" }
 # blake3 is pinned without default features so no_std crates (eofs-core, later the kernel) can
 # use it; the hashing API used by std crates is identical, they just don't get the std-only
 # io::Write/Error impls.
