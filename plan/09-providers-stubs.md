@@ -96,3 +96,33 @@ Match the priority order above; (1)+(2) unblock I2.
     approximation would be semantically wrong, and a yield-spin loop would be a hack. Escalated: either
     approve enabling the feature once the host side exists, or keep net.loopback queued behind area 13's
     execution harness. `text.capture` still waits on the Message API (eo9:message).
+11. **`fs.overlay` — design done + validated, but blocked on a wit-bindgen bump (DRAFT committed,
+    excluded from the build).** Implements SPEC.md "Overlay filesystems": a middleware provider that
+    imports two `eo9:fs/fs` instances under the named slots `upper` and `lower` (wired with
+    `with <a> as upper, <b> as lower $ fs.overlay`) and exports one `eo9:fs/fs` — reads resolve
+    upper-first and fall through to lower (open(read)/stat/open-exec; list-directory unions both, upper
+    winning), writes route to lower (open(write)/write/create-directory/remove); it exports its own
+    `eo9:fs/types` so the root handle captures both underlying filesystems. The world
+    (`guest/stubs/fs-overlay/wit/overlay.wit`) is **valid and resolves** under the repo's `wasm-tools`
+    1.250 (verified: `wasm-tools component wit` elaborates it to `import upper/lower: eo9:fs/fs`,
+    `import eo9:fs/types`, `export eo9:fs/types`+`fs`).
+    **Blocker:** the pinned **wit-bindgen 0.57.1 bundles wit-parser 0.247**, which cannot parse a named
+    import of a foreign interface — `import upper: eo9:fs/fs@0.1.0;` fails with "expected `/`, found `:`",
+    and the `use eo9:fs/fs;` alias form fails with "expected `.`, found `;`". So the bindings cannot be
+    generated with the current guest toolchain. (Existing stubs never hit this: they import `eo9:fs` once,
+    via the default `import fs;`.)
+    **Unblock:** bump `wit-bindgen` (guest `[workspace.dependencies]`) to a release whose `wit-parser` is
+    >= 0.250 (the version the repo's `wasm-tools` CLI already uses), then re-validate ALL guest bindings
+    (shared-pin change — broad blast radius; planner call). After the bump: remove the `exclude` in
+    guest/Cargo.toml, restore the crate's workspace-inherited metadata, add `eo9-stub-fs-overlay` to
+    xtask GUEST_COMPONENTS, and verify the generated binding module paths (the draft assumes distinct
+    `upper`/`lower` modules sharing the imported resource types — UNVERIFIED until bindings generate) and
+    the import/export-`types` split. The full forwarding logic is already written in
+    `guest/stubs/fs-overlay/src/lib.rs` (excluded draft).
+    Alternatives if the bump is undesirable: (a) hand-author the overlay at the component level
+    (WAT/wac-graph) rather than from WIT source — heavier, off-convention; (b) keep the host-special-cased
+    `/bin` session view instead of an overlay provider — rejected by the owner (wants overlay providers
+    with algebraic semantics). The bump is the clean path. `fs.immutable`: not separately needed — the
+    existing `fs.readonly` already provides read-only-over-an-imported-fs semantics; the shipped
+    programs/coreutils overlay (a later phase) composes `fs.readonly`-wrapped program bytes as the
+    overlay's immutable `upper`.

@@ -1,0 +1,22 @@
+# NOTE: this crate is intentionally EXCLUDED from the guest workspace (see
+# guest/Cargo.toml `exclude`) and is NOT yet built/componentized. It is a draft of the
+# `fs.overlay` provider that is blocked on a toolchain bump: the world imports two
+# `eo9:fs/fs` instances under named slots, which the repo's `wasm-tools` (1.250) accepts
+# but the pinned `wit-bindgen` 0.57.1 (wit-parser 0.247) cannot parse. See
+# plan/09-providers-stubs.md (the fs.overlay decision). Metadata is concrete here rather
+# than inherited because an excluded crate has no workspace to inherit from.
+[package]
+name = "eo9-stub-fs-overlay"
+description = "Eo9 standard middleware provider `fs.overlay`: imports two eo9:fs filesystems (upper, lower) and exports their overlay — reads resolve upper-first, writes route to lower. (Draft; blocked on a wit-bindgen bump.)"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }
