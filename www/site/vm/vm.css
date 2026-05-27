@@ -1,0 +1,57 @@
+/* Eo9 web VM page (work in progress). Mirrors the /try terminal look, kept minimal. */
+
+#vm-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: center;
+  margin: 1rem 0;
+}
+
+#vm-controls button {
+  font: inherit;
+  padding: 0.35rem 0.8rem;
+  border: 1px solid #888;
+  border-radius: 4px;
+  background: #f4f4f4;
+  cursor: pointer;
+}
+
+#vm-controls button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+#entropy-controls {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+#entropy-controls input {
+  font: inherit;
+  padding: 0.2rem 0.4rem;
+}
+
+#vm-output {
+  background: #111;
+  color: #d6d6d6;
+  padding: 1rem;
+  border-radius: 6px;
+  min-height: 14rem;
+  max-height: 28rem;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+#vm-output .vm-cmd {
+  color: #8ec07c;
+}
+
+#vm-output .vm-error {
+  color: #fb6962;
+}

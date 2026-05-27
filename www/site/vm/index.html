@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Eo9 web VM (work in progress)</title>
+  <meta name="description"
+        content="The real Eo9 runtime stack — wasmtime with the Pulley interpreter — compiled to WebAssembly and running real Eo9 components inside your browser.">
+  <link rel="icon" type="image/svg+xml" href="/logo.svg">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/vm/vm.css">
+</head>
+<body>
+
+<header class="hero try-header">
+  <div>
+    <div class="brand">
+      <a href="/"><img src="/logo.svg" alt="Eo9 logo" width="40" height="40"></a>
+      <h1><a href="/">Eo9</a> / web&nbsp;VM</h1>
+    </div>
+    <p class="tagline">
+      The real Eo9 runtime stack, compiled to WebAssembly, running inside your browser.
+      <strong>Work in progress.</strong>
+    </p>
+  </div>
+</header>
+
+<main>
+
+  <div id="vm-controls">
+    <button id="btn-hello" disabled>Run hello + add (Pulley)</button>
+    <button id="btn-fuel" disabled>Run with fuel metering</button>
+    <span id="entropy-controls">
+      <label for="seed">seed</label>
+      <input id="seed" type="text" value="0xe09" size="8" spellcheck="false">
+      <label for="count">draws</label>
+      <input id="count" type="number" value="4" min="1" max="64" size="3">
+      <button id="btn-entropy" disabled>Run entropy.seeded (async ABI)</button>
+    </span>
+  </div>
+
+  <pre id="vm-output">loading the Eo9 blob…</pre>
+
+  <h2>What this is</h2>
+  <p>
+    The buttons above drive a single ~1&nbsp;MB WebAssembly module: <em>the same wasmtime the
+    native Eo9 runtime and the bare-metal kernel embed</em>, compiled for wasm32, with its
+    <a href="https://docs.wasmtime.dev/examples-pulley.html">Pulley</a> interpreter executing
+    pre-compiled images of unmodified Eo9 components. The page's JavaScript only provides this
+    output box; no Eo9 semantics are re-implemented in JS.
+  </p>
+  <ul>
+    <li><strong>hello + add</strong> — the kernel's seed component (the first thing Eo9 ever ran on
+      bare metal), executed by Pulley inside your browser.</li>
+    <li><strong>fuel metering</strong> — the same call with wasmtime's fuel accounting on, the
+      mechanism Eo9 uses to meter CPU.</li>
+    <li><strong>entropy.seeded</strong> — an unmodified Eo9 provider stub using the Component Model
+      <em>async</em> ABI: its <code>configure</code> and <code>get-u64</code> are async-lifted calls,
+      executed here without fibers (wasm32 has none) via Eo9's fiberless execution path. Same seed,
+      same sequence as native Eo9 and the bare-metal kernel.</li>
+  </ul>
+  <p>
+    What is <em>not</em> here yet: the shell (eosh), the capability algebra, the store, and programs
+    that block on real I/O. Those are the next milestones for this page; the
+    <a href="/try/">/try page</a> remains the polished demo in the meantime.
+  </p>
+
+</main>
+
+<footer>
+  <p><a href="/">eo9.org</a> · <a href="/try/">try the component demo</a></p>
+</footer>
+
+<script type="module" src="/vm/vm.js"></script>
+</body>
+</html>
