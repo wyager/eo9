@@ -575,3 +575,50 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
 
     This session committed only this analysis (docs-only; the tree stays green) rather than a half-vendored
     non-building closure — same discipline as the codegen rung's survey checkpoints.
+
+33. **Checkpoint 4 — execution begun: wit-parser green, wac-types de-std'd, and the family-collapse plan
+    needs revisiting.** Two crates vendored under `kernel/vendor`; both are inert (not yet in any `[patch]`
+    table), so `cargo xtask ci` is unaffected and the branch HEAD still builds.
+
+    - **`wit-parser` 0.250 — done and standalone-green for `aarch64-unknown-none`** (commit
+      `kernel/vendor: vendor + de-std wit-parser`). It was already `#![no_std]`; the only real work was that
+      the `decoding` feature hard-required `std`. Fix: drop `std` from the `decoding` feature, gate the
+      streaming `Read`-based `from_reader`/`decode_reader` behind `std`, and add a no_std `from_bytes` that
+      drives the parser with `eof = true` over a complete slice (`decode(&[u8])` — what eo9-component calls —
+      now routes through it). Also de-hardcoded `wasmparser/std` from the dep feature list and forward it via
+      wit-parser's own `std` feature (the D28 unification fix). Verified with a temporary `[workspace]` table
+      for the standalone target build, then removed.
+
+    - **`wac-types` 0.10 — de-std'd, but bumping it to the 0.250 family turns out to require a *type-decoder
+      port*, not call-site drift (this revises D32's "handful of fixes").** The de-std itself was
+      straightforward and is committed (WIP): `#![no_std]`, `hashbrown` for `HashMap`/`HashSet`, crate-level
+      `IndexMap`/`IndexSet` aliases with a no_std default hasher (the wit-parser pattern), core/alloc swaps,
+      `Package::from_file` std-gated, `anyhow` bumped to 1.0.100 (older anyhow lacks the no_std
+      `core::error::Error` `From` impl, which is why `?` on `BinaryReaderError` failed), and deps set to
+      `default-features = false` with a forwarding `std` feature. **The blocker:** wasmparser 0.247→0.250
+      reshaped the component type model — a component's imports/exports are now
+      `IndexMap<String, ComponentItem>` (was `IndexMap<String, ComponentEntityType>`), and the
+      `Types::component_entity_type_of_import/export(name)` accessors were removed. wac-types'
+      `Package::from_bytes` `TypeConverter` (`entity()` / `component_entity_type()` / the import/export decode
+      loop) is written against `ComponentEntityType`, so the family bump forces porting that decoder to
+      `ComponentItem` — careful semantic work that must not be rushed (a wrong port silently corrupts
+      composition's type checking).
+
+    - **Strategic consequence — the family-collapse recommendation in D32 should be reconsidered.** D32
+      advised bumping the wac crates to the 0.250 family to "halve the de-std surface". But the cost of that
+      bump is now known to include a wac-types type-decoder rewrite. The alternative D32 rejected — keep the
+      wac crates on the **0.247 family** and de-std a *second* `wasmparser`/`wasm-encoder` set (both 0.247 and
+      0.250) — avoids the decoder rewrite entirely, and that second de-std is mechanical (0.247 wasmparser is
+      also `#![no_std]`-capable, same feature-surgery as 0.250). Net trade for the next session: **"de-std a
+      second wasmparser/wasm-encoder family (mechanical)" vs "port wac-types' decoder to the 0.250
+      ComponentItem model (semantic, risky)"** — the former is very likely the cheaper, safer path. Decide
+      this before continuing; if the 0.247-family route is taken, revert wac-types' Cargo.toml version bumps
+      (keep all the de-std source edits, which are family-independent) and instead make the closure depend on
+      a de-std'd 0.247 wasmparser/wasm-encoder.
+
+    - **Remaining closure after the wac decision:** `wac-graph` (de-std + `thiserror`→2 + excise
+      `wasm-metadata` + verify/replace `petgraph` no_std) and `wit-component` (de-std + excise
+      `wasm-metadata` + drop `wat`/`wast`), then Checkpoint A (flip eo9-component deps to
+      `default-features = false`, add the kernel `[patch]` entries + `eo9-kernel → eo9-component` dep, link
+      under `wasm-codegen`) and Checkpoint B (wire `$`/`&` into `shellexec.rs`). `wasm-wave` looks free
+      without its `wit` feature (per D32) and `wit-parser` is already done.
