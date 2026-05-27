@@ -4,14 +4,16 @@
 //! The semantics mirror the usermode runtime (`crates/eo9-runtime`), restricted to what
 //! the bare-metal kernel can honestly do today (plan/12-kernel.md Decision 21):
 //!
-//! * **component-algebra** — `load` recognises exactly the components baked into the
-//!   read-only store image (matched by content); `describe` replays the metadata xtask
-//!   computed at image-assembly time with the same `eo9-component` crate usermode uses;
-//!   `save` returns the original bytes. The combinators (`compose`, `extend`, `restrict`,
-//!   `rename`, `configure`) are not implemented on metal yet — they need the component
-//!   tooling that arrives with the on-target-codegen rung — and fail with a clear error.
-//! * **compile** — a content lookup, not codegen: the component's baked-in host-AOT
-//!   artifact *is* its image. Anything not in the store gets a clean `codegen` error.
+//! * **component-algebra** — `load` recognises the components baked into the read-only
+//!   store image by content (and, with `wasm-codegen`, validates arbitrary component bytes
+//!   too); `describe` replays the metadata xtask computed at image-assembly time for store
+//!   entries and decodes fused results with the same `eo9-component` crate usermode uses;
+//!   `save` returns the bytes. With `wasm-codegen` the combinators (`compose`, `extend`,
+//!   `restrict`, `rename`, `configure`) run the real `eo9-component` algebra, producing a
+//!   fused component compiled on-target; without it they fail with a clear error.
+//! * **compile** — for a pristine store entry, a content lookup of its baked-in host-AOT
+//!   artifact (the fast path); for a fused algebra result, on-target Cranelift codegen
+//!   (`Component::new`, plan/12 Decision 29). Providers are rejected with `not-a-binary`.
 //! * **task** — `spawn` instantiates the artifact against the kernel root providers
 //!   (text/time/entropy — children never receive fs or exec, same policy as usermode) and
 //!   binds `main`'s WAVE arguments against its signature; the child then executes on the
@@ -528,9 +530,13 @@ fn spawn_child(
 // Shell exec state (component / image tables) and metadata
 // -----------------------------------------------------------------------------------------
 
-/// One open component value: an index into the baked-in store entries.
+/// One open component value: its bytes, plus the originating store entry when it is a
+/// pristine baked-in component (which enables the host-AOT fast path in `compile` and the
+/// baked metadata in `describe`). Algebra results (`compose`/`extend`/…) carry `entry =
+/// None` and are compiled on-target.
 struct KComponent {
-    entry: usize,
+    bytes: Vec<u8>,
+    entry: Option<usize>,
 }
 
 /// One compiled image: the deserialized baked-in artifact.
@@ -679,13 +685,94 @@ fn parse_metadata(metadata: &str) -> WitComponentInfo {
     info
 }
 
-/// The clear refusal used by every algebra combinator the kernel cannot perform yet.
+/// The clear refusal used by every algebra combinator when on-target codegen is off.
+#[cfg(not(feature = "wasm-codegen"))]
 fn unsupported(operation: &str) -> String {
     format!(
         "the bare-metal kernel does not implement `{operation}` yet: the component algebra \
-         needs the component tooling that arrives with on-target codegen; only programs \
-         baked into the read-only store can be run as-is"
+         needs on-target codegen (the `wasm-codegen` feature); only programs baked into the \
+         read-only store can be run as-is"
     )
+}
+
+/// Runs a two-operand algebra op (`compose`/`extend`) over component bytes and stores the
+/// fused result as a new component handle (compiled on-target by `compile`).
+#[cfg(feature = "wasm-codegen")]
+fn alg_binary_op(
+    store: &mut StoreContextMut<'_, KernelState>,
+    a: Vec<u8>,
+    b: Vec<u8>,
+    op: impl Fn(
+        &eo9_component::Component,
+        &eo9_component::Component,
+    ) -> core::result::Result<eo9_component::Component, eo9_component::ComposeError>,
+) -> core::result::Result<Resource<AlgComponentRes>, WitComposeError> {
+    let load = |bytes| {
+        eo9_component::Component::load(bytes)
+            .map_err(|err| WitComposeError::Internal(format!("operand is not a component: {err}")))
+    };
+    let a = load(a)?;
+    let b = load(b)?;
+    let fused = op(&a, &b).map_err(|err| WitComposeError::Internal(format!("{err}")))?;
+    let rep = store
+        .data_mut()
+        .shell_exec()
+        .map_err(|err| WitComposeError::Internal(format!("{err}")))?
+        .insert_component(KComponent {
+            bytes: fused.into_bytes(),
+            entry: None,
+        });
+    Ok(Resource::new_own(rep))
+}
+
+/// Describes a (non-store) fused component by loading it with the eo9-component crate and
+/// converting its `ComponentInfo` into the WIT record.
+#[cfg(feature = "wasm-codegen")]
+fn wit_info_from_eo9(bytes: &[u8]) -> Result<WitComponentInfo> {
+    let component = eo9_component::Component::load(bytes.to_vec())
+        .map_err(|err| wasmtime::Error::msg(format!("failed to describe component: {err}")))?;
+    let info = component.describe();
+    Ok(WitComponentInfo {
+        kind: match info.kind {
+            eo9_component::ComponentKind::Binary => WitComponentKind::Binary,
+            eo9_component::ComponentKind::Provider => WitComponentKind::Provider,
+        },
+        imports: info
+            .imports
+            .into_iter()
+            .map(|need| WitImportNeed {
+                slot: need.slot,
+                interface: need.interface,
+                version: need.version,
+                required: need.required,
+            })
+            .collect(),
+        exports: info
+            .exports
+            .into_iter()
+            .map(|slot| WitExportSlot {
+                name: slot.name,
+                interface: slot.interface,
+                version: slot.version,
+            })
+            .collect(),
+        args: info
+            .args
+            .into_iter()
+            .map(|arg| WitArgSpec {
+                name: arg.name,
+                ty: arg.ty,
+            })
+            .collect(),
+    })
+}
+
+/// Whether a fused component is a binary (vs a provider) — for the `compile` binary check.
+#[cfg(feature = "wasm-codegen")]
+fn fused_is_provider(bytes: &[u8]) -> bool {
+    eo9_component::Component::load(bytes.to_vec())
+        .map(|component| matches!(component.kind(), eo9_component::ComponentKind::Provider))
+        .unwrap_or(false)
 }
 
 // -----------------------------------------------------------------------------------------
@@ -745,15 +832,32 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                 .position(|entry| entry.component == bytes.as_slice());
             Ok((match entry {
                 Some(entry) => {
-                    let rep = store
-                        .data_mut()
-                        .shell_exec()?
-                        .insert_component(KComponent { entry });
+                    let rep = store.data_mut().shell_exec()?.insert_component(KComponent {
+                        bytes: entries[entry].component.to_vec(),
+                        entry: Some(entry),
+                    });
                     Ok(Resource::new_own(rep))
                 }
+                // With on-target codegen the kernel can also load components that are not in
+                // the baked-in store (e.g. algebra results round-tripped through `save`),
+                // validating them with the same `eo9-component` loader usermode uses.
+                #[cfg(feature = "wasm-codegen")]
+                None => match eo9_component::Component::load(bytes) {
+                    Ok(component) => {
+                        let rep = store.data_mut().shell_exec()?.insert_component(KComponent {
+                            bytes: component.into_bytes(),
+                            entry: None,
+                        });
+                        Ok(Resource::new_own(rep))
+                    }
+                    Err(err) => Err(WitLoadError::NotAnEo9Module(format!(
+                        "not a loadable Eo9 component: {err}"
+                    ))),
+                },
+                #[cfg(not(feature = "wasm-codegen"))]
                 None => Err(WitLoadError::NotAnEo9Module(
                     "this component is not in the kernel's baked-in store; the bare-metal \
-                     kernel cannot load arbitrary components until on-target codegen lands"
+                     kernel cannot load arbitrary components without on-target codegen"
                         .to_string(),
                 )),
             },))
@@ -765,13 +869,13 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
         |mut store: StoreContextMut<'_, KernelState>,
          (component,): (Resource<AlgComponentRes>,)|
          -> Result<(Vec<u8>,)> {
-            let entries = store.data_mut().shell_entries()?;
-            let entry = store
+            let bytes = store
                 .data_mut()
                 .shell_exec()?
                 .component(component.rep())?
-                .entry;
-            Ok((entries[entry].component.to_vec(),))
+                .bytes
+                .clone();
+            Ok((bytes,))
         },
     )?;
 
@@ -781,12 +885,21 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
          (component,): (Resource<AlgComponentRes>,)|
          -> Result<(WitComponentInfo,)> {
             let entries = store.data_mut().shell_entries()?;
-            let entry = store
-                .data_mut()
-                .shell_exec()?
-                .component(component.rep())?
-                .entry;
-            Ok((parse_metadata(entries[entry].metadata),))
+            let kc = store.data_mut().shell_exec()?.component(component.rep())?;
+            match kc.entry {
+                // Pristine store entry: replay the metadata xtask precomputed.
+                Some(entry) => Ok((parse_metadata(entries[entry].metadata),)),
+                // Algebra result: describe the fused bytes with the eo9-component loader.
+                #[cfg(feature = "wasm-codegen")]
+                None => {
+                    let info = wit_info_from_eo9(&kc.bytes)?;
+                    Ok((info,))
+                }
+                #[cfg(not(feature = "wasm-codegen"))]
+                None => Err(wasmtime::Error::msg(
+                    "cannot describe a composed component without on-target codegen",
+                )),
+            }
         },
     )?;
 
@@ -795,10 +908,22 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
         |mut store: StoreContextMut<'_, KernelState>,
          (provider, consumer): (Resource<AlgComponentRes>, Resource<AlgComponentRes>)|
          -> Result<(Result<Resource<AlgComponentRes>, WitComposeError>,)> {
-            let exec = store.data_mut().shell_exec()?;
-            let _ = exec.take_component(provider.rep());
-            let _ = exec.take_component(consumer.rep());
-            Ok((Err(WitComposeError::Internal(unsupported("$ (compose)"))),))
+            let (pb, cb) = {
+                let exec = store.data_mut().shell_exec()?;
+                (
+                    exec.take_component(provider.rep())?.bytes,
+                    exec.take_component(consumer.rep())?.bytes,
+                )
+            };
+            #[cfg(feature = "wasm-codegen")]
+            {
+                Ok((alg_binary_op(&mut store, pb, cb, eo9_component::compose),))
+            }
+            #[cfg(not(feature = "wasm-codegen"))]
+            {
+                let _ = (pb, cb);
+                Ok((Err(WitComposeError::Internal(unsupported("$ (compose)"))),))
+            }
         },
     )?;
 
@@ -807,45 +932,144 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
         |mut store: StoreContextMut<'_, KernelState>,
          (base, layer): (Resource<AlgComponentRes>, Resource<AlgComponentRes>)|
          -> Result<(Result<Resource<AlgComponentRes>, WitComposeError>,)> {
-            let exec = store.data_mut().shell_exec()?;
-            let _ = exec.take_component(base.rep());
-            let _ = exec.take_component(layer.rep());
-            Ok((Err(WitComposeError::Internal(unsupported("& (extend)"))),))
+            let (bb, lb) = {
+                let exec = store.data_mut().shell_exec()?;
+                (
+                    exec.take_component(base.rep())?.bytes,
+                    exec.take_component(layer.rep())?.bytes,
+                )
+            };
+            #[cfg(feature = "wasm-codegen")]
+            {
+                Ok((alg_binary_op(&mut store, bb, lb, eo9_component::extend),))
+            }
+            #[cfg(not(feature = "wasm-codegen"))]
+            {
+                let _ = (bb, lb);
+                Ok((Err(WitComposeError::Internal(unsupported("& (extend)"))),))
+            }
         },
     )?;
 
     algebra.func_wrap(
         "restrict",
         |mut store: StoreContextMut<'_, KernelState>,
-         (component, _allow): (Resource<AlgComponentRes>, Vec<WitInterfaceRef>)|
+         (component, allow): (Resource<AlgComponentRes>, Vec<WitInterfaceRef>)|
          -> Result<(Result<Resource<AlgComponentRes>, WitRestrictError>,)> {
-            let exec = store.data_mut().shell_exec()?;
-            let _ = exec.take_component(component.rep());
-            Ok((Err(WitRestrictError::Internal(unsupported(
-                "only (restrict)",
-            ))),))
+            let bytes = store
+                .data_mut()
+                .shell_exec()?
+                .take_component(component.rep())?
+                .bytes;
+            #[cfg(feature = "wasm-codegen")]
+            {
+                let allow: Vec<eo9_component::InterfaceRef> = allow
+                    .into_iter()
+                    .map(|r| eo9_component::InterfaceRef {
+                        interface: r.interface,
+                        version: r.version,
+                    })
+                    .collect();
+                let result = (|| -> core::result::Result<Resource<AlgComponentRes>, WitRestrictError> {
+                    let c = eo9_component::Component::load(bytes)
+                        .map_err(|e| WitRestrictError::Internal(format!("{e}")))?;
+                    let restricted = eo9_component::restrict(&c, &allow)
+                        .map_err(|e| WitRestrictError::Internal(format!("{e}")))?;
+                    let rep = store
+                        .data_mut()
+                        .shell_exec()
+                        .map_err(|e| WitRestrictError::Internal(format!("{e}")))?
+                        .insert_component(KComponent {
+                            bytes: restricted.into_bytes(),
+                            entry: None,
+                        });
+                    Ok(Resource::new_own(rep))
+                })();
+                Ok((result,))
+            }
+            #[cfg(not(feature = "wasm-codegen"))]
+            {
+                let _ = (bytes, allow);
+                Ok((Err(WitRestrictError::Internal(unsupported(
+                    "only (restrict)",
+                ))),))
+            }
         },
     )?;
 
     algebra.func_wrap(
         "rename",
         |mut store: StoreContextMut<'_, KernelState>,
-         (component, _old, _new): (Resource<AlgComponentRes>, String, String)|
+         (component, old, new): (Resource<AlgComponentRes>, String, String)|
          -> Result<(Result<Resource<AlgComponentRes>, WitRenameError>,)> {
-            let exec = store.data_mut().shell_exec()?;
-            let _ = exec.take_component(component.rep());
-            Ok((Err(WitRenameError::Internal(unsupported("rename"))),))
+            let bytes = store
+                .data_mut()
+                .shell_exec()?
+                .take_component(component.rep())?
+                .bytes;
+            #[cfg(feature = "wasm-codegen")]
+            {
+                let result = (|| -> core::result::Result<Resource<AlgComponentRes>, WitRenameError> {
+                    let c = eo9_component::Component::load(bytes)
+                        .map_err(|e| WitRenameError::Internal(format!("{e}")))?;
+                    let renamed = eo9_component::rename(&c, &old, &new)
+                        .map_err(|e| WitRenameError::Internal(format!("{e}")))?;
+                    let rep = store
+                        .data_mut()
+                        .shell_exec()
+                        .map_err(|e| WitRenameError::Internal(format!("{e}")))?
+                        .insert_component(KComponent {
+                            bytes: renamed.into_bytes(),
+                            entry: None,
+                        });
+                    Ok(Resource::new_own(rep))
+                })();
+                Ok((result,))
+            }
+            #[cfg(not(feature = "wasm-codegen"))]
+            {
+                let _ = (bytes, old, new);
+                Ok((Err(WitRenameError::Internal(unsupported("rename"))),))
+            }
         },
     )?;
 
     algebra.func_wrap(
         "configure",
         |mut store: StoreContextMut<'_, KernelState>,
-         (component, _args): (Resource<AlgComponentRes>, Vec<WitNamedArg>)|
+         (component, args): (Resource<AlgComponentRes>, Vec<WitNamedArg>)|
          -> Result<(Result<Resource<AlgComponentRes>, WitConfigureError>,)> {
-            let exec = store.data_mut().shell_exec()?;
-            let _ = exec.take_component(component.rep());
-            Ok((Err(WitConfigureError::Internal(unsupported("configure"))),))
+            let bytes = store
+                .data_mut()
+                .shell_exec()?
+                .take_component(component.rep())?
+                .bytes;
+            #[cfg(feature = "wasm-codegen")]
+            {
+                let pairs: Vec<(String, String)> =
+                    args.into_iter().map(|a| (a.name, a.value)).collect();
+                let result = (|| -> core::result::Result<Resource<AlgComponentRes>, WitConfigureError> {
+                    let c = eo9_component::Component::load(bytes)
+                        .map_err(|e| WitConfigureError::Internal(format!("{e}")))?;
+                    let configured = eo9_component::configure(&c, &pairs)
+                        .map_err(|e| WitConfigureError::Internal(format!("{e}")))?;
+                    let rep = store
+                        .data_mut()
+                        .shell_exec()
+                        .map_err(|e| WitConfigureError::Internal(format!("{e}")))?
+                        .insert_component(KComponent {
+                            bytes: configured.into_bytes(),
+                            entry: None,
+                        });
+                    Ok(Resource::new_own(rep))
+                })();
+                Ok((result,))
+            }
+            #[cfg(not(feature = "wasm-codegen"))]
+            {
+                let _ = (bytes, args);
+                Ok((Err(WitConfigureError::Internal(unsupported("configure"))),))
+            }
         },
     )?;
 
@@ -874,18 +1098,45 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
          -> Result<(Result<Resource<ExecImageRes>, WitCompileError>,)> {
             let entries = store.data_mut().shell_entries()?;
             let engine = store.data_mut().shell_engine()?;
-            let exec = store.data_mut().shell_exec()?;
-            let component = exec.take_component(component.rep())?;
-            let entry = &entries[component.entry];
-            if parse_metadata(entry.metadata).kind == WitComponentKind::Provider {
-                return Ok((Err(WitCompileError::NotABinary),));
-            }
-            // "Compilation" on the kernel is a lookup: the baked-in host-AOT artifact is
-            // the image (real codegen is the on-target-codegen rung).
-            // SAFETY: the artifact comes from the store image produced by `cargo xtask
-            // build-kernel` with the same wasmtime version and engine configuration.
-            let deserialized = unsafe { Component::deserialize(&engine, entry.artifact) };
-            Ok((match deserialized {
+            let component = store
+                .data_mut()
+                .shell_exec()?
+                .take_component(component.rep())?;
+
+            let image = match component.entry {
+                // Pristine store entry: deserialize the baked-in host-AOT artifact (the
+                // fast path / cache; no codegen needed).
+                Some(entry) => {
+                    let entry = &entries[entry];
+                    if parse_metadata(entry.metadata).kind == WitComponentKind::Provider {
+                        return Ok((Err(WitCompileError::NotABinary),));
+                    }
+                    // SAFETY: the artifact comes from the store image produced by `cargo
+                    // xtask build-kernel` with the same wasmtime version and engine config.
+                    unsafe { Component::deserialize(&engine, entry.artifact) }.map_err(|err| {
+                        WitCompileError::Codegen(format!(
+                            "the baked-in artifact for this component failed to load: {err:?}"
+                        ))
+                    })
+                }
+                // Algebra result (fused, not in the store): compile it on-target with
+                // Cranelift, exactly like the codegen demo (plan/12 Decision 29).
+                #[cfg(feature = "wasm-codegen")]
+                None => {
+                    if fused_is_provider(&component.bytes) {
+                        return Ok((Err(WitCompileError::NotABinary),));
+                    }
+                    Component::new(&engine, &component.bytes).map_err(|err| {
+                        WitCompileError::Codegen(format!("on-target compilation failed: {err:?}"))
+                    })
+                }
+                #[cfg(not(feature = "wasm-codegen"))]
+                None => Err(WitCompileError::Codegen(
+                    "composed components require on-target codegen".to_string(),
+                )),
+            };
+
+            Ok((match image {
                 Ok(image) => {
                     let rep = store
                         .data_mut()
@@ -893,9 +1144,7 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                         .insert_image(KImage { component: image });
                     Ok(Resource::new_own(rep))
                 }
-                Err(err) => Err(WitCompileError::Codegen(format!(
-                    "the baked-in artifact for this component failed to load: {err:?}"
-                ))),
+                Err(err) => Err(err),
             },))
         },
     )?;

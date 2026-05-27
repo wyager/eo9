@@ -675,3 +675,51 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
       build-kernel aarch64` links eo9-component under `wasm-codegen`.
     - **Then Checkpoint B:** wire `$`/`&`/`only`/`configure` into `shellexec.rs` and route fused components
       through `codegen.rs` (Decision 29).
+
+35. **Checkpoint 4 COMPLETE — interactive composition + compilation on bare metal.** The algebra
+    dependency closure is fully no_std and linked into the kernel under `wasm-codegen`, and the shell's
+    `eo9:exec/component-algebra` now runs the real `eo9-component` algebra. A user at the bare-metal eosh
+    prompt can compose and run programs that are compiled on-target; verified transcript:
+    ```
+    eosh> hello --name metal --excited true
+    [..] Hello, metal!
+    ok: greeted
+    eosh> entropy.seeded $ cruncher --seed 9 --rounds 200000
+    ok: digest(14341732361190694547)
+    eosh> exit
+    eosh: session ended, outcome = ok(exited)
+    ```
+    `entropy.seeded $ cruncher` is fused by `eo9_component::compose`, compiled by Cranelift on-target
+    (`Component::new`), instantiated against the kernel root providers, and run — no host-prefused artifact.
+
+    - **The closure (Checkpoint A, commit "link the no_std component algebra…").** Five crates are vendored
+      under kernel/vendor and de-std'd: `wit-parser`, `wac-types`, `wac-graph` (0.247 family, petgraph 0.8.3,
+      thiserror 2, wasm-metadata behind an off-by-default `metadata` feature), plus now **`wit-component`**
+      (0.250; `#![no_std]`+alloc prelude, hashbrown/indexmap no_std hashers, the unused serde/serde_json deps
+      dropped, the `wasm-metadata` producers sections gated behind `metadata` and the serde-only
+      package-metadata section behind a `wit-package-metadata` feature, `libdl.so` data file carried over,
+      and explicit ordered `drop`s where hashbrown's lack of the std `#[may_dangle]` dropck eyepatch kept
+      `self`-borrowing maps alive past `encode`'s `self`-move) and **`wasm-wave`** (already no_std; its `wit`
+      feature no longer force-enables `std`, needed for `value::resolve_wit_type`). `eo9-component` itself was
+      already no_std-capable (Decision 31); its deps are declared directly with `default-features = false`
+      (functional features kept on, only `std` toggled) so the host build is byte-identical — usermode
+      `cargo test -p eo9-component` stays green (56 tests). The kernel depends on eo9-component
+      (`default-features = false`) under `wasm-codegen`, and the kernel `[patch.crates-io]` redirects the
+      whole closure.
+
+    - **The shell wiring (Checkpoint B).** `KComponent` now carries the component bytes plus an
+      `Option<store-entry>` (the originating baked entry, when pristine). `compose`/`extend`/`restrict`/
+      `rename`/`configure` call the matching `eo9_component` function on the operand bytes and store the fused
+      result as an entry-less component; `compile` deserializes the baked host-AOT artifact for store entries
+      (fast path) and runs `Component::new` on-target for fused ones; `describe` replays baked metadata for
+      store entries and decodes fused bytes via `eo9_component::Component::describe`; `load` also accepts
+      arbitrary valid component bytes now. All of this is `#[cfg(feature = "wasm-codegen")]`-gated, falling
+      back to the previous "needs on-target codegen" refusals when the feature is off, so every feature
+      combination still builds. Capability containment is unchanged: children still instantiate against the
+      fixed text/time/entropy provider linker and never receive fs or exec.
+
+    - **Determinism / limits.** Not bit-compared across runs (noted, not blocking); the digest is reproducible
+      by seed. `entropy.seeded $ cruncher` produces cruncher's deterministic digest (cruncher does not draw
+      entropy — the composition simply supplies an unused provider, which is correct). Remaining metal work is
+      unchanged: GIC/interrupts (executor still polls), child fuel + eo9-sched, friendlier missing-fs errors
+      for children, riscv64/x86_64.
