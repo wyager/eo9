@@ -16,6 +16,24 @@
 //! No execution and no I/O policy lives here -- this is math on bytes. Operations are
 //! deterministic: the same inputs produce byte-identical outputs, which is what the
 //! content-addressed store and compile cache key on.
+//!
+//! # `no_std`
+//!
+//! The crate is `#![no_std]` (with `alloc`) when its default `std` feature is disabled,
+//! so the bare-metal kernel can run the algebra on-target. With the default `std` feature
+//! (used by every host build) behaviour is byte-identical to before. `std` also forwards
+//! to the `std` feature of the dependencies that gate it; the dependencies that are
+//! `std`-only in their published form (`wac-graph`, `wit-component`, and the `std`-gated
+//! feature paths of `wit-parser`/`wasm-wave`) are swapped for `no_std` copies by the
+//! kernel workspace's `[patch.crates-io]` (see `kernel/vendor/`).
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[macro_use]
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
 
 mod component;
 mod compose;

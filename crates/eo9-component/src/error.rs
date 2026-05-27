@@ -4,8 +4,10 @@
 //! (`load-error`, `compose-error`, `restrict-error`, `rename-error`) so the runtime can
 //! translate between the two without losing information.
 
-use std::error::Error;
-use std::fmt;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::error::Error;
+use core::fmt;
 
 /// Errors from [`Component::load`](crate::Component::load).
 ///

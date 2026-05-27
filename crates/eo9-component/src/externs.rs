@@ -15,8 +15,10 @@
 //! afterwards. The annotation is purely descriptive -- wiring and validation never
 //! depend on it -- so stripping it inside the (embedded) operands is harmless.
 
-use std::borrow::Cow;
-use std::collections::BTreeMap;
+use alloc::borrow::Cow;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 use wasm_encoder::{
     Component as ComponentBuilder, ComponentExportSection, ComponentImportSection,

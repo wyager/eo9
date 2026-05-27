@@ -5,6 +5,9 @@
 //! argument signature of `main` (binary) or `configure` (provider) is extracted from the
 //! component type, per SPEC.md "Execution APIs" and "Arguments vs. imports".
 
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 use wit_parser::decoding::{DecodedWasm, decode};
 use wit_parser::{Function, Handle, InterfaceId, Resolve, Type, TypeDefKind, WorldId, WorldItem};
 

@@ -1,5 +1,7 @@
 //! The `Component` value: validated bytes plus the metadata `load` extracted from them.
 
+use alloc::vec::Vec;
+
 use crate::describe::Meta;
 use crate::error::LoadError;
 use crate::{ComponentInfo, ComponentKind};

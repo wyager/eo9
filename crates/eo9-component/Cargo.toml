@@ -11,16 +11,54 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-wasmparser = { workspace = true }
+# Every dep is `default-features = false`; the functional (non-std) features the algebra
+# needs are listed explicitly so they are on in BOTH the host (std) and kernel (no_std)
+# builds, and only `std` is toggled via this crate's `std` feature. With default features
+# (std on) the host build is byte-identical to before; with `--no-default-features` the
+# whole closure builds no_std for the bare-metal kernel (the std-only published crates are
+# swapped for no_std copies by the kernel workspace's `[patch.crates-io]`, see kernel/vendor/).
+# Declared directly (not `workspace = true`) so `default-features = false` can be set —
+# cargo forbids a member disabling default-features on an inherited workspace dependency.
+# Versions match the root [workspace.dependencies] pins, so the host build is unaffected.
+wasmparser = { version = "0.250.0", default-features = false, features = [
+    "validate",
+    "features",
+    "component-model",
+    "hash-collections",
+    "simd",
+] }
 # The `wasmparser` feature provides the parse-type -> encode-type conversions used by
 # `rename`'s section rewriting.
-wasm-encoder = { workspace = true, features = ["wasmparser"] }
-wit-parser = { workspace = true }
-wit-component = { workspace = true }
-wac-graph = { workspace = true }
+wasm-encoder = { version = "0.250.0", default-features = false, features = [
+    "component-model",
+    "wasmparser",
+] }
+wit-parser = { version = "0.250.0", default-features = false, features = ["decoding"] }
+wit-component = { version = "0.250.0", default-features = false }
+wac-graph = { version = "0.10.0", default-features = false }
 # WAVE is the canonical value encoding for invocations (SPEC "Arguments and outcomes");
-# `configure` parses compose-time constants with it against the config signature.
-wasm-wave = { workspace = true }
+# `configure` parses compose-time constants with it against the config signature. The `wit`
+# feature is needed for `value::resolve_wit_type` (enum params); the vendored kernel copy
+# makes `wit` no_std (it no longer force-enables `std`).
+wasm-wave = { version = "0.250.0", default-features = false, features = ["wit"] }
+
+[features]
+# The default `std` feature keeps every host build byte-identical to before. With `std`
+# off, the crate is `#![no_std]` + `alloc` and the whole algebra dependency closure builds
+# no_std for the bare-metal kernel (the std-only published crates — wit-component,
+# wac-graph, wac-types, and the std-gated paths of wit-parser/wasm-wave — are swapped for
+# no_std copies by the kernel workspace's `[patch.crates-io]`, see kernel/vendor/).
+default = ["std"]
+# Forwards `std` only to deps that actually gate it in BOTH their registry (host) and
+# vendored (kernel) forms. wac-graph and wit-component have no `std` feature on the registry
+# (they are std crates there); the kernel gets their no_std vendored copies purely via
+# `default-features = false` on the dep lines above, so they are not forwarded here.
+std = [
+    "wasmparser/std",
+    "wasm-encoder/std",
+    "wit-parser/std",
+    "wasm-wave/std",
+]
 
 [dev-dependencies]
 # Test fixtures are tiny components generated in-process from WIT text: a dummy core

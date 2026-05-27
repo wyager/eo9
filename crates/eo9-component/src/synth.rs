@@ -6,6 +6,9 @@
 //! `wasm-encoder`, embed the component metadata for a world carved out of the operand's
 //! own decoded `Resolve`, and wrap it with `wit-component` -- and share these helpers.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use wasm_encoder::{TypeSection, ValType};
 use wit_parser::abi::{WasmSignature, WasmType};
 use wit_parser::{Resolve, WorldId};

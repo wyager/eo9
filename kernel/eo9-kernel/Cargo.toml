@@ -31,7 +31,9 @@ wasm-store = ["dep:wasmtime"]
 # On-target codegen (plan/12 Decisions 26–28): compile WebAssembly into native aarch64 on the
 # machine itself, via Cranelift + the wasmtime compile layers built no_std (see
 # kernel/vendor). Off by default so `cargo xtask ci` (featureless kernel) stays lean.
-wasm-codegen = ["dep:wasmtime", "wasmtime/cranelift"]
+# Also links the no_std component algebra (eo9-component) so the shell can compose ($/&/
+# only/configure) and compile the fused result on-target (plan/12 Decisions 30–35).
+wasm-codegen = ["dep:wasmtime", "wasmtime/cranelift", "dep:eo9-component"]
 
 # These dependencies are only used by the real bare-metal build; host-triple builds (unit
 # tests, `cargo check` without --target) compile the stub entry point and need neither.
@@ -45,3 +47,7 @@ wasmtime = { workspace = true, optional = true, features = [
     "async",
     "component-model-async",
 ] }
+# The component algebra, built no_std (its dependency closure is redirected to the de-std'd
+# vendored copies by this workspace's [patch.crates-io]). Only linked under `wasm-codegen`,
+# since composing on metal requires the on-target compiler.
+eo9-component = { path = "../../crates/eo9-component", default-features = false, optional = true }
