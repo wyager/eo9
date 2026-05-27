@@ -1207,7 +1207,11 @@ fn coreutils_fs_tools_against_a_sandbox() {
 
     let cat = eo9(&store, &["--fs-root", sb, "-c", "cat --path /notes.txt"]);
     assert_eq!(cat.code, 0, "stderr: {}", cat.stderr);
-    assert!(cat.stdout.contains("alpha beta"), "cat output: {}", cat.stdout);
+    assert!(
+        cat.stdout.contains("alpha beta"),
+        "cat output: {}",
+        cat.stdout
+    );
 
     let wc = eo9(&store, &["--fs-root", sb, "-c", "wc --path /notes.txt"]);
     assert_eq!(wc.code, 0, "stderr: {}", wc.stderr);
@@ -1219,7 +1223,10 @@ fn coreutils_fs_tools_against_a_sandbox() {
         &["--fs-root", sb, "-c", "cp --src /notes.txt --dst /copy.txt"],
     );
     assert_eq!(cp.code, 0, "stderr: {}", cp.stderr);
-    assert!(sandbox.join("copy.txt").is_file(), "cp did not create copy.txt");
+    assert!(
+        sandbox.join("copy.txt").is_file(),
+        "cp did not create copy.txt"
+    );
 }
 
 #[test]
@@ -1228,7 +1235,11 @@ fn echo_needs_no_filesystem() {
     let store = temp_store("coreutils-echo");
     let run = eo9(&store, &["-c", "echo --text hello-coreutils"]);
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
-    assert!(run.stdout.contains("hello-coreutils"), "echo output: {}", run.stdout);
+    assert!(
+        run.stdout.contains("hello-coreutils"),
+        "echo output: {}",
+        run.stdout
+    );
 }
 
 #[test]
@@ -1250,7 +1261,11 @@ fn rng_with_seeded_entropy_is_deterministic() {
     assert_eq!(b.code, 0, "stderr: {}", b.stderr);
     let va = values(&a);
     assert_eq!(va.len(), 3, "expected three values: {}", a.stdout);
-    assert_eq!(va, values(&b), "seeded rng must be deterministic across runs");
+    assert_eq!(
+        va,
+        values(&b),
+        "seeded rng must be deterministic across runs"
+    );
 
     // A different seed changes the output.
     let c = eo9(&store, &["-c", "entropy.seeded --seed 99 $ rng --count 3"]);
