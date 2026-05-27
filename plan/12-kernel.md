@@ -510,3 +510,68 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
     the AOT fast path, run against the kernel roots with the existing child/capability rules, and test
     `entropy.seeded $ cruncher …` interactively with containment intact.
 
+
+32. **Checkpoint 4 — closure analysis (Decision 31 sharpened): it is a TWO-VERSION-FAMILY fork, and there is
+    no intermediate building checkpoint.** Inspecting `cargo tree -p eo9-component --no-default-features`
+    against the registry sources nails the real shape, which is materially larger than Decision 31 assumed:
+
+    - **Two parallel version families in one closure.** `wac-graph` 0.10.0 and `wac-types` 0.10.0 (the newest
+      published — only 0.9/0.10 exist) **hard-pin the 0.247 family**: `wasmparser = "0.247"`,
+      `wasm-encoder = "0.247"`, `wasm-metadata = "0.247"`. `eo9-component` itself pulls the **0.250 family**:
+      `wasmparser`/`wasm-encoder`/`wit-parser`/`wit-component`/`wasm-wave` 0.250 (and `wasm-metadata` 0.250 via
+      wit-component). `^0.247` does not accept 0.250, so a naive vendor would have to de-std BOTH families'
+      `wasmparser` + `wasm-encoder` (and excise BOTH `wasm-metadata` versions). **Recommended collapse:** since
+      we vendor `wac-types`/`wac-graph` anyway, bump their `wasmparser`/`wasm-encoder` deps to the 0.250 family
+      in the vendored manifests so the whole closure is single-family — at the cost of adapting `wac-types` to
+      any wasmparser/wasm-encoder API drift across 0.247→0.250 (3 minors; the surface wac-types touches is the
+      type/section reader, so expect a handful of call-site fixes, not a rewrite). This roughly halves the
+      de-std surface and removes the duplicate `wasm-metadata`. Do this first.
+
+    - **New sub-blockers not in Decision 30/31:**
+      - **`thiserror` 1.x is std-only.** `wac-graph` (and wac-types) use `thiserror = "1.0.x"` (edition 2021,
+        no `core::error::Error` path). no_std `thiserror` only exists in 2.x. Fix in the vendored wac crates:
+        bump to `thiserror = "2"` (`default-features = false`) — the derive surface is compatible — or drop the
+        few error enums to hand-written `core::fmt`/`core::error::Error` impls.
+      - **`wasm-wave` is nearly free, with one variable.** Its `std` feature is empty (`std = []`), `thiserror`
+        is already 2.x, and `logos` is already `default-features = false`. eo9-component uses `wasm_wave::wasm`/
+        `value`, NOT the `wit` module, so **build wasm-wave without the `wit` feature** (drops its `wit-parser`
+        edge and the `std` it forces). The one thing to verify is that `logos` 0.14 (`default-features=false`,
+        `export_derive`,`forbid_unsafe`) is genuinely no_std on our toolchain; if not, wasm-wave must be
+        vendored to gate/replace the WAVE lexer (the parser is only needed for `configure`-constant + arg
+        parsing, which the kernel does want).
+      - **`serde_json` / `serde` likely drop out.** `wit-parser`'s `decoding` path (what eo9-component needs —
+        `wit_parser::decoding::decode`) is binary, not serde; if the vendored `wit-parser`/`wit-component`/`wac`
+        crates are built with their `serde` features OFF, `serde_json` (and its `zmij`/`itoa`/`memchr`) leave
+        the closure. Confirm nothing in the used path requires `serde`.
+      - **`petgraph` 0.6.5** no_std still to verify (`default-features=false`); the used surface in wac-graph is
+        a DAG topo-sort — hand-roll in the vendored wac-graph if needed.
+
+    - **`wasm-metadata` excision still required** (now only the 0.250 copy after the family collapse): it pulls
+      `flate2`/`url`/`idna`/`icu_*`/`serde_json`/`spdx`/`auditable-serde` — none no_std. Feature-gate/delete the
+      producers/metadata-merging code paths in vendored `wit-component` (and wac-graph if it still references
+      it) so it leaves the closure.
+
+    - **No partial building checkpoint exists.** None of the vendored crates (`wac-types` → `wac-graph` →
+      `wit-component`, all sharing `wasmparser`/`wasm-encoder`) builds no_std until the *whole* closure is
+      no_std and the kernel `[patch.crates-io]` redirects every member at once; and the kernel cannot link
+      `eo9-component` until then. So this is one all-at-once session (committing only when the closure compiles
+      for `aarch64-unknown-none`), not a sequence of independently-green commits. Estimated size ≈ the codegen
+      rung (Decisions 26–29) given the family collapse + the wac-types API adaptation.
+
+    **Concrete ordered recipe for the next session:**
+    (a) Vendor `wac-types`, `wac-graph`, `wit-component`, `wit-parser` under `kernel/vendor`; add their
+    `[patch.crates-io]` entries to `kernel/Cargo.toml`.
+    (b) In vendored `wac-types`/`wac-graph` manifests, bump `wasmparser`/`wasm-encoder` to 0.250 and
+    `thiserror` to 2.x; fix any wac-types call-site drift; excise `wasm-metadata`.
+    (c) De-std all four vendored crates (`#![no_std]` + `extern crate alloc`, core/alloc swaps, prelude
+    `use crate::*;`), turn off `serde`/`wat`/`wast`/`wit` features, verify/replace `petgraph`, verify `logos`.
+    (d) Set eo9-component's per-dep `default-features = false` with `std` forwarding (the hook is already in
+    its manifest from Decision 31); add `eo9-kernel → eo9-component` (`default-features = false`) cross-
+    workspace path dep so the kernel `[patch]` redirects eo9-component's closure (as it does for
+    wasmtime-environ). **Checkpoint A** = featureless `cargo xtask ci` green (usermode unchanged) AND
+    `cargo xtask build-kernel aarch64` links eo9-component under `wasm-codegen`.
+    (e) Then wire `$`/`&`/`only`/`configure` into `shellexec.rs` over the `/bin` store and route fused
+    components through `codegen.rs` (Decision 29) — **Checkpoint B**, the interactive on-target composition.
+
+    This session committed only this analysis (docs-only; the tree stays green) rather than a half-vendored
+    non-building closure — same discipline as the codegen rung's survey checkpoints.
