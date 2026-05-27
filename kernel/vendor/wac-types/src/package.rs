@@ -231,13 +231,13 @@ impl Package {
                                 Payload::ComponentImportSection(s) => {
                                     imports.reserve(s.count() as usize);
                                     for import in s {
-                                        imports.push(import?.name.name);
+                                        imports.push(import?.name.0);
                                     }
                                 }
                                 Payload::ComponentExportSection(s) => {
                                     exports.reserve(s.count() as usize);
                                     for export in s {
-                                        exports.push(export?.name.name);
+                                        exports.push(export?.name.0);
                                     }
                                 }
                                 _ => {}
