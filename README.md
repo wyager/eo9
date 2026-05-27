@@ -1,6 +1,6 @@
 # Eo9
 
-**A capability-secure operating system where capabilities *are* components and granting authority *is* an algebra.** Built on the WebAssembly Component Model, in Rust.
+**A capability-secure operating system built on the WebAssembly Component Model, in Rust.
 
 ---
 
