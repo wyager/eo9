@@ -622,3 +622,56 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
       `default-features = false`, add the kernel `[patch]` entries + `eo9-kernel → eo9-component` dep, link
       under `wasm-codegen`) and Checkpoint B (wire `$`/`&` into `shellexec.rs`). `wasm-wave` looks free
       without its `wit` feature (per D32) and `wit-parser` is already done.
+
+34. **Checkpoint 4 — 0.247 route executed: wac-types and wac-graph are no_std-green; the petgraph blocker is
+    resolved (no hand-roll needed).** Two more crates of the algebra closure now build standalone for
+    `aarch64-unknown-none` and are committed; they remain inert (not yet in any `[patch]` table), so the
+    branch HEAD build state and featureless `cargo xtask ci` are unchanged.
+
+    - **wac-types — green on the 0.247 family.** Per the approved Decision-33 route, reverted its
+      `wasmparser`/`wasm-encoder` deps from 0.250 back to **0.247** and reverted the prior session's two
+      0.250-isms in `package.rs` (`import?.name.name`/`export?.name.name` → `.name.0`, the 0.247
+      `ComponentImportName`/`ComponentExportName` API). No decoder port needed — the original wac-types
+      decoder is written against 0.247. All the family-independent de-std edits from the prior session stay.
+      Verified: `cargo build -p wac-types --target aarch64-unknown-none --no-default-features` builds.
+
+    - **wac-graph — vendored + de-std'd, green.** no_std + alloc; `std::` → `core`/`alloc`/`hashbrown`
+      (HashMap/HashSet); crate-level `IndexMap` alias with a no_std default hasher (the wac-types pattern,
+      needed because indexmap's default `S = RandomState` is std-only); `thiserror` 1.x → **2** (no_std);
+      `wasm-metadata` made an optional dep behind an **off-by-default `metadata` feature** and its one
+      producers-section call site gated out (the kernel doesn't need a producers custom section); deps set
+      `default-features = false` with a forwarding `std` feature. Verified standalone-green.
+
+    - **petgraph resolved — bump to 0.8.3, NOT a hand-roll.** petgraph 0.6.4/0.6.5 are std-only (no
+      `#![no_std]`, no std feature), which was the feared wall. But **petgraph 0.8.3 is available in the
+      registry and is no_std-capable** (`default-features = false` + `stable_graph`); wac-graph's full API
+      surface (StableDiGraph, Dfs, toposort, visit maps, Direction, Reversed, Dot) compiled against 0.8.3
+      with zero source changes. So the hand-rolled-DAG contingency from D30/D32 is unnecessary. (The earlier
+      "registry unreachable" impression was a `cargo search` artifact; direct version resolution fetches
+      fine.)
+
+    - **Standalone-test note:** an `indexmap/std` unification error in the standalone build was a test
+      artifact — wac-graph's dev-dependencies pull the full std stack under a v1 resolver. Adding
+      `resolver = "2"` to the temporary `[workspace]` table (and dev-deps aren't built when wac-graph is a
+      normal lib dependency of eo9-component/the kernel) made it clean. Vendored `target/` dirs are now
+      gitignored (`kernel/vendor/**/target/`).
+
+    **Remaining to Checkpoint A (next session):**
+    - **wit-component (0.250) — the last and most delicate crate.** ~12k LOC, NOT no_std; std usage is
+      mechanical (33 sites: fmt/collections/mem/borrow/hash/str/ops/iter/error → core/alloc). The real work
+      is **excising `wasm-metadata`** (can't be ported — flate2/url/icu/spdx), which is woven through the
+      **encoder path eo9-component actually uses**: `base_producers()` (lib.rs:86) and `AddMetadata`
+      (encoding.rs:442) are in the `ComponentEncoder` path, plus `Producers::from_wasm/from_bytes`
+      (metadata.rs/gc.rs). eo9-component calls only `wit_component::embed_component_metadata` +
+      `ComponentEncoder::default()` (synth.rs), so the excision must keep the encoder producing a valid
+      component while dropping the (informational) producers section — careful, not mechanical. Drop the
+      `wat`/`wast` features. Give it its own `std` feature.
+    - **Then Checkpoint A:** in `crates/eo9-component`, set the per-dep `default-features = false` and extend
+      its `std` feature to also forward `wit-component/std` and `wac-graph/std` (currently it only forwards
+      wasmparser/wasm-encoder/wit-parser/wasm-wave). Add `eo9-kernel → eo9-component` (`default-features =
+      false`) as a cross-workspace path dep and extend the kernel `[patch.crates-io]` to redirect the whole
+      closure (wac-types, wac-graph, wit-component, wit-parser — wit-parser is already vendored/green) at
+      once. Target: featureless `cargo xtask ci` still green (usermode unchanged) AND `cargo xtask
+      build-kernel aarch64` links eo9-component under `wasm-codegen`.
+    - **Then Checkpoint B:** wire `$`/`&`/`only`/`configure` into `shellexec.rs` and route fused components
+      through `codegen.rs` (Decision 29).
