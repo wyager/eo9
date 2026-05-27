@@ -71,10 +71,18 @@ fn session_manifest(entries: &'static [StoreEntry]) -> String {
         String::from("child entropy counter-seeded splitmix64 (a stub, not a CSPRNG)"),
         String::from("note programs get no filesystem on bare metal yet"),
         String::from("note children never receive the exec capability"),
-        String::from(
-            "note the store is read-only and baked into the kernel image; composition and \
-             on-target codegen are not available yet",
-        ),
+        if cfg!(feature = "wasm-codegen") {
+            String::from(
+                "note the store is read-only and baked into the kernel image; compositions \
+                 (`$`, `&`, `only`, configure) are fused and compiled on-target",
+            )
+        } else {
+            String::from(
+                "note the store is read-only and baked into the kernel image; this kernel \
+                 was built without `wasm-codegen`, so composition and on-target codegen are \
+                 not available",
+            )
+        },
         format!("note programs available under /bin: {}", names.join(", ")),
     ];
     let mut manifest = String::new();

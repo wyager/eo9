@@ -37,6 +37,26 @@ pub struct Config {
     pub max_memory: Option<u64>,
     /// `--debug-info`: compile images with debug info.
     pub debug_info: bool,
+    /// `--max-fuel`: total fuel budget for the run; when it is exhausted the task is
+    /// killed and the run ends as `abnormal(killed)`. `None` means unlimited (the
+    /// default), matching the previous behavior.
+    pub max_fuel: Option<u64>,
+    /// `--outcome`: where the typed outcome line goes. The program's own output always
+    /// stays on stdout; the outcome line defaults to stderr so pipes carry only program
+    /// output (the exit code already encodes success/failure/abnormal).
+    pub outcome: OutcomeChannel,
+}
+
+/// Where `eo9 run` writes the rendered `program-outcome` line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeChannel {
+    /// Print the outcome line on stderr (the default).
+    #[default]
+    Stderr,
+    /// Print the outcome line on stdout (the pre-2026-05 behavior).
+    Stdout,
+    /// Do not print the outcome line at all; the exit code still reports it.
+    Quiet,
 }
 
 impl Config {
@@ -124,6 +144,26 @@ pub fn consume_global_options(stream: &mut ArgStream, cfg: &mut Config) -> Resul
                 cfg.max_memory = Some(value.parse().map_err(|err| {
                     format!("invalid --max-memory value {value:?} (bytes expected): {err}")
                 })?);
+            }
+            "--max-fuel" => {
+                stream.next();
+                let value = stream.value_of("--max-fuel")?;
+                cfg.max_fuel = Some(value.parse().map_err(|err| {
+                    format!("invalid --max-fuel value {value:?} (fuel units expected): {err}")
+                })?);
+            }
+            "--outcome" => {
+                stream.next();
+                cfg.outcome = match stream.value_of("--outcome")?.as_str() {
+                    "stderr" => OutcomeChannel::Stderr,
+                    "stdout" => OutcomeChannel::Stdout,
+                    "quiet" => OutcomeChannel::Quiet,
+                    other => {
+                        return Err(format!(
+                            "invalid --outcome value {other:?}: expected stderr, stdout, or quiet"
+                        ));
+                    }
+                };
             }
             _ => break,
         }

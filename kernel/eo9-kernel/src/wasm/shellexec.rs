@@ -457,7 +457,13 @@ fn spawn_child(
     args: &[WitNamedArg],
     max_memory: Option<u64>,
 ) -> Result<u32, WitSpawnError> {
-    let internal = |err: wasmtime::Error| WitSpawnError::Internal(format!("{err:?}"));
+    let internal = |err: wasmtime::Error| {
+        let text = format!("{err:?}");
+        WitSpawnError::Internal(match missing_capability(&text) {
+            Some(friendly) => friendly,
+            None => text,
+        })
+    };
 
     let mut linker: Linker<KernelState> = Linker::new(engine);
     providers::add_providers(&mut linker).map_err(internal)?;
@@ -1290,4 +1296,22 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+/// Translate a linker "missing import" instantiation error into the capability story
+/// instead of leaking the raw error text (user-study finding: an fs-needing child died
+/// with a raw `eo9:io/buffers` linker error).
+fn missing_capability(text: &str) -> Option<String> {
+    let capability = if text.contains("eo9:fs/") || text.contains("eo9:io/") {
+        "a filesystem, which the bare-metal session does not provide to children yet"
+    } else if text.contains("eo9:exec/") {
+        "the exec capability, which the bare-metal session does not provide to children yet"
+    } else if text.contains("eo9:net/") {
+        "the network, which the bare-metal session does not provide"
+    } else {
+        return None;
+    };
+    Some(alloc::format!(
+        "the program requires {capability} (refused at instantiation)"
+    ))
 }

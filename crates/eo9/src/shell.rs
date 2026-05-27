@@ -90,7 +90,7 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
         // A clean shell exit stays quiet: everything worth seeing was already printed by
         // eosh (and its children) through the text capability.
         Outcome::Success(_) => vlog!(cfg, "shell outcome: {rendered}"),
-        _ => println!("{rendered}"),
+        _ => run::print_outcome(cfg, &rendered),
     }
     Ok(code)
 }
