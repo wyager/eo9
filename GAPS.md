@@ -76,23 +76,24 @@ xtask-order / web-try wave)._
   recommended); a child's unterminated output line is not repainted while editing. (plan/10 D9, plan/11 D12)
 
 ### Bare metal
-- **On-target codegen: DONE in the boot demo, not yet in the shell.** The kernel compiles components to
-  native aarch64 on-target with Cranelift (merged e31cc5f) by vendoring + de-std'ing five compile crates
-  under kernel/vendor (provenance-reviewed clean). Remaining: wire it into the interactive shell so `$`/`&`
-  compose there (currently the shell deserializes a baked artifact / returns a clean "not implemented"
-  error) — checkpoint 4, in flight on area/12-compose-on-metal. Determinism not yet measured bit-for-bit.
-  (plan/12 D26–29)
+- **On-target codegen + interactive composition: DONE on metal.** The kernel compiles components to native
+  aarch64 on-target with Cranelift and the interactive eosh runs the full algebra (`$`/`&`/`only`/`configure`)
+  fused by the real `eo9_component` and compiled on the machine (merged 7821fbf). Achieved by vendoring +
+  de-std'ing the compile layers and the algebra closure under kernel/vendor and making `eo9-component`
+  no_std in place (provenance-reviewed clean; usermode byte-identical). Residual: determinism of on-target
+  codegen not yet bit-compared (output is reproducible by seed); kernel algebra errors map to each variant's
+  `Internal(String)` rather than the specific WIT variants. (plan/12 D26–35)
 - **Wasmtime version bumps are not free:** CM-async internals are churning upstream, so any future bump off
   45 requires re-verifying the binder's ABI-constants block (and the kernel executor's mirrored encodings)
   and re-AOT-ing all cached/baked artifacts.
-- **Kernel current limits (post on-target-codegen):** on-target compilation works in the boot demo;
-  reaching it from the interactive shell so `$`/`&` compose there is checkpoint 4 (in flight). Also:
-  executor and read-line still busy-poll (no GIC); no child fuel yet (compile-relevant — lands with the
-  scheduler work); eo9-sched not yet adopted; children lack io/buffers + fs/types wiring, so an fs-needing
-  child gets the raw linker missing-import error instead of the friendly missing-fs story; no session
-  manifest for headless runs; the image is ~17 MB with `wasm-codegen` on. Behavioral note: the no-argument
-  boot is interactive and does not self-power-off — automation uses `demo` or `program=<name>`.
-  (plan/12 D22–29)
+- **Kernel current limits (post bare-metal-MVP):** capability is complete (compose + on-target compile +
+  run from the interactive shell); what remains is hardening. Executor and read-line still busy-poll (no
+  GIC, no WFI idle); no child fuel yet (lands with the scheduler work); eo9-sched not yet adopted; children
+  lack io/buffers + fs/types wiring, so an fs-needing child gets the raw linker missing-import error instead
+  of the friendly missing-fs story; no session manifest for headless runs; W^X for JIT code pages still TODO
+  (cache maintenance is done); kernel ELF ~23 MB with `wasm-codegen` on (incl. debug info). Behavioral note:
+  the no-argument boot is interactive and does not self-power-off — automation uses `demo` or `program=<name>`.
+  (plan/12 D22–35)
 - **Kernel hardening debt:** identity-map MMU without D/I-cache maintenance on code publication or W^X for
   wasm code pages (QEMU tolerates it, real hardware will not); polled timer; exceptions are fatal.
   (plan/12 D3–4)
