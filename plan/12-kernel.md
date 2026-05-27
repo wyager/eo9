@@ -756,3 +756,9 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
       fully event-driven. The IRQ path handles only the timer; a real scheduler/preemption tick is future
       work. The masked-`wfi`-wake shortcut (no handler) did not work under QEMU here, hence the real
       handler.
+
+37. **Shell presentation fixes (2026-05-27).** The session manifest's note now tells the truth about
+    composition: with `wasm-codegen` it says compositions are fused and compiled on-target, without it it
+    says the kernel was built without the feature (it previously always claimed composition was unavailable).
+    Spawn instantiation errors that mention an unsatisfied `eo9:*` import are rendered as a friendly
+    missing-capability message instead of the raw linker error (the fs/io case from the user studies).

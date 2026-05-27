@@ -188,3 +188,13 @@ its first milestones, and to be the place where cross-area seams get found.
     `shell_providers`/`child_root_providers` and must be kept in sync with them; writing it is best-effort
     (a failure degrades to a warning and `env` just has less to say). Children cannot read it — their
     filesystem, if any, is `--fs-root`, not the session directory.
+
+14. **User-study fixes (2026-05-27).** (a) The typed outcome line is printed on **stderr** by default —
+    program output owns stdout, the exit code already encodes the outcome — with `--outcome
+    <stderr|stdout|quiet>` to override (the CLI transcripts assert the stderr form). (b) `--max-fuel <units>`
+    caps the fuel donated by the drive loop; an exhausted budget kills the task (`abnormal(killed)`, exit 2);
+    default unlimited. (c) Direct runs (`eo9 run <name>` / `eo9 <name>`) seed an empty store from the
+    embedded components exactly like the shell path, so the first README example works on a fresh install.
+    (d) Not done here, recorded as remaining: unifying eosh's `ok:`/`error:` per-command lines with `run`'s
+    WAVE outcome format, and propagating the child's 0/1/2/3 exit code through `shell -c` (today a failed or
+    trapped child both exit 1 via eosh's `command-failed`); needs a small eosh-world variant addition.

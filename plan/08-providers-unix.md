@@ -110,3 +110,9 @@ Each API section under Deliverables; "Execution APIs" (environments are just dat
 12. **Deferred.** `net` (milestone 3), `perf` (surface still a placeholder in WIT), and the runtime/linker
     wiring (plan 04). Stub/attenuated flavors (`fs.memfs`, `time.frozen`, …) are guest-side providers
     (plan 09), not part of this crate.
+
+13. **Interim TOCTOU hardening (2026-05-27).** After `open`/`open-exec` the provider re-verifies that the
+    opened descriptor's own path (fcntl `F_GETPATH` on macOS, `/proc/self/fd` on Linux) still lies under the
+    granted root, refusing with `Denied` otherwise; unnameable descriptors fall back to the pre-open
+    decision. This narrows the canonicalize-then-open race; `openat2(RESOLVE_BENEATH)`-style resolution
+    remains the real fix (GAPS).
