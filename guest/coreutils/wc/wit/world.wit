@@ -1,0 +1,16 @@
+// wc — print "<lines> <words> <bytes>" for a file. Capabilities: eo9:fs, eo9:text.
+package eo9-coreutils:wc@0.1.0;
+world wc {
+    import eo9:fs/fs@0.1.0;
+    import eo9:text/text@0.1.0;
+    variant program-success {
+        /// The counts were written to stdout.
+        counted,
+    }
+    variant program-failure {
+        bad-arguments(string),
+        fs(string),
+        io(string),
+    }
+    export main: async func(path: string) -> result<program-success, program-failure>;
+}

@@ -1,0 +1,16 @@
+// stat — print a node's kind and size. Capabilities: eo9:fs, eo9:text.
+package eo9-coreutils:stat@0.1.0;
+world stat {
+    import eo9:fs/fs@0.1.0;
+    import eo9:text/text@0.1.0;
+    variant program-success {
+        /// The node's kind and size were written to stdout.
+        described,
+    }
+    variant program-failure {
+        bad-arguments(string),
+        fs(string),
+        io(string),
+    }
+    export main: async func(path: string) -> result<program-success, program-failure>;
+}

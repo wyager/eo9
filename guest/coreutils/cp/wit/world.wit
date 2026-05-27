@@ -1,0 +1,14 @@
+// cp — copy a file from src to dst. Capability: eo9:fs only.
+package eo9-coreutils:cp@0.1.0;
+world cp {
+    import eo9:fs/fs@0.1.0;
+    variant program-success {
+        /// Number of bytes copied.
+        copied(u64),
+    }
+    variant program-failure {
+        bad-arguments(string),
+        fs(string),
+    }
+    export main: async func(src: string, dst: string) -> result<program-success, program-failure>;
+}

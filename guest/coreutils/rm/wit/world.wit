@@ -1,0 +1,13 @@
+// rm — remove a file or empty directory. Capability: eo9:fs only.
+package eo9-coreutils:rm@0.1.0;
+world rm {
+    import eo9:fs/fs@0.1.0;
+    variant program-success {
+        removed,
+    }
+    variant program-failure {
+        bad-arguments(string),
+        fs(string),
+    }
+    export main: async func(path: string) -> result<program-success, program-failure>;
+}

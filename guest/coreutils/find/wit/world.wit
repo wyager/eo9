@@ -1,0 +1,17 @@
+// find — recursively list paths under a directory, optionally filtered by a substring
+// (pass an empty name to match everything). Capabilities: eo9:fs, eo9:text.
+package eo9-coreutils:find@0.1.0;
+world find {
+    import eo9:fs/fs@0.1.0;
+    import eo9:text/text@0.1.0;
+    variant program-success {
+        /// Number of matching paths printed.
+        found(u32),
+    }
+    variant program-failure {
+        bad-arguments(string),
+        fs(string),
+        io(string),
+    }
+    export main: async func(path: string, name: string) -> result<program-success, program-failure>;
+}

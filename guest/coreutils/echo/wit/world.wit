@@ -1,0 +1,12 @@
+// echo — write text to stdout. Capability: eo9:text only (a minimal-capability tool).
+package eo9-coreutils:echo@0.1.0;
+world echo {
+    import eo9:text/text@0.1.0;
+    variant program-success {
+        done,
+    }
+    variant program-failure {
+        io(string),
+    }
+    export main: func(text: string) -> result<program-success, program-failure>;
+}

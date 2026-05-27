@@ -1178,3 +1178,111 @@ fn seeding_never_clobbers_user_bindings() {
     let listed = eo9(&store, &["store", "ls"]);
     assert!(listed.stdout.contains("names (1):"), "{}", listed.stdout);
 }
+
+// -----------------------------------------------------------------------------------
+// coreutils: the basic tool suite (guest/coreutils/*)
+// -----------------------------------------------------------------------------------
+
+/// A fresh sandbox directory the shell's children receive as their fs root.
+fn temp_sandbox(test: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("eo9-sandbox-{test}"));
+    if dir.exists() {
+        fs::remove_dir_all(&dir).expect("failed to clear the sandbox");
+    }
+    fs::create_dir_all(&dir).expect("failed to create the sandbox");
+    dir
+}
+
+#[test]
+fn coreutils_fs_tools_against_a_sandbox() {
+    let store = temp_store("coreutils-fs");
+    let sandbox = temp_sandbox("coreutils-fs");
+    fs::write(sandbox.join("notes.txt"), "alpha beta\ngamma\n").expect("write fixture");
+    let sb = sandbox.to_str().expect("utf-8 sandbox path");
+
+    // ls lists the directory; cat prints contents; wc reports "<lines> <words> <bytes>".
+    let ls = eo9(&store, &["--fs-root", sb, "-c", "ls --path /"]);
+    assert_eq!(ls.code, 0, "stderr: {}", ls.stderr);
+    assert!(ls.stdout.contains("notes.txt"), "ls output: {}", ls.stdout);
+
+    let cat = eo9(&store, &["--fs-root", sb, "-c", "cat --path /notes.txt"]);
+    assert_eq!(cat.code, 0, "stderr: {}", cat.stderr);
+    assert!(
+        cat.stdout.contains("alpha beta"),
+        "cat output: {}",
+        cat.stdout
+    );
+
+    let wc = eo9(&store, &["--fs-root", sb, "-c", "wc --path /notes.txt"]);
+    assert_eq!(wc.code, 0, "stderr: {}", wc.stderr);
+    assert!(wc.stdout.contains("2 3 17"), "wc output: {}", wc.stdout);
+
+    // cp copies a file; the copy appears on the host side of the fs root.
+    let cp = eo9(
+        &store,
+        &["--fs-root", sb, "-c", "cp --src /notes.txt --dst /copy.txt"],
+    );
+    assert_eq!(cp.code, 0, "stderr: {}", cp.stderr);
+    assert!(
+        sandbox.join("copy.txt").is_file(),
+        "cp did not create copy.txt"
+    );
+}
+
+#[test]
+fn echo_needs_no_filesystem() {
+    // echo imports only eo9:text, so it runs with no fs grant at all.
+    let store = temp_store("coreutils-echo");
+    let run = eo9(&store, &["-c", "echo --text hello-coreutils"]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(
+        run.stdout.contains("hello-coreutils"),
+        "echo output: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn rng_with_seeded_entropy_is_deterministic() {
+    let store = temp_store("coreutils-rng");
+    let values = |run: &Run| -> Vec<String> {
+        run.stdout
+            .lines()
+            .filter(|line| line.parse::<u64>().is_ok())
+            .map(str::to_owned)
+            .collect()
+    };
+
+    // The same seed yields the same draws across runs (rng imports eo9:entropy, which the
+    // composed entropy.seeded provider satisfies and seals).
+    let a = eo9(&store, &["-c", "entropy.seeded --seed 43 $ rng --count 3"]);
+    let b = eo9(&store, &["-c", "entropy.seeded --seed 43 $ rng --count 3"]);
+    assert_eq!(a.code, 0, "stderr: {}", a.stderr);
+    assert_eq!(b.code, 0, "stderr: {}", b.stderr);
+    let va = values(&a);
+    assert_eq!(va.len(), 3, "expected three values: {}", a.stdout);
+    assert_eq!(
+        va,
+        values(&b),
+        "seeded rng must be deterministic across runs"
+    );
+
+    // A different seed changes the output.
+    let c = eo9(&store, &["-c", "entropy.seeded --seed 99 $ rng --count 3"]);
+    assert_eq!(c.code, 0, "stderr: {}", c.stderr);
+    assert_ne!(values(&c), va, "a different seed must change the draws");
+}
+
+#[test]
+fn fs_coreutil_without_fs_root_is_refused() {
+    // A coreutil that requires eo9:fs is refused before running when no fs is granted.
+    let store = temp_store("coreutils-no-fs");
+    let _ = eo9(&store, &["-c", "help"]); // seed the store so `cat` resolves by name
+    let refused = eo9(&store, &["cat", "--path", "/x"]);
+    assert_eq!(refused.code, 3, "stderr: {}", refused.stderr);
+    assert!(
+        refused.stderr.contains("eo9:fs"),
+        "expected an fs-capability refusal: {}",
+        refused.stderr
+    );
+}

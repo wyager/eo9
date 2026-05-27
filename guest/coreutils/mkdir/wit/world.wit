@@ -1,0 +1,13 @@
+// mkdir — create a directory. Capability: eo9:fs only.
+package eo9-coreutils:mkdir@0.1.0;
+world mkdir {
+    import eo9:fs/fs@0.1.0;
+    variant program-success {
+        created,
+    }
+    variant program-failure {
+        bad-arguments(string),
+        fs(string),
+    }
+    export main: async func(path: string) -> result<program-success, program-failure>;
+}
