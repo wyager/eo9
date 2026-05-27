@@ -796,7 +796,6 @@ fn resolve_parent(root: &Path, path: &str) -> Result<PathBuf, FsError> {
     }
 }
 
-
 /// Interim TOCTOU hardening: after a file has been opened, re-verify that the path the
 /// open descriptor actually refers to still lies under `root`. The resolve-then-open
 /// sequence is not atomic, so a host-side actor can swap a path component for a symlink
@@ -830,10 +829,9 @@ fn fd_path(file: &File) -> std::io::Result<PathBuf> {
             return Err(std::io::Error::last_os_error());
         }
         let len = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
-        Ok(PathBuf::from(
-            std::str::from_utf8(&buf[..len])
-                .map_err(|_| std::io::Error::other("non-UTF-8 descriptor path"))?,
-        ))
+        Ok(PathBuf::from(std::str::from_utf8(&buf[..len]).map_err(
+            |_| std::io::Error::other("non-UTF-8 descriptor path"),
+        )?))
     }
     #[cfg(target_os = "linux")]
     {
@@ -1128,7 +1126,6 @@ mod tests {
         assert!(matches!(result.unwrap_err(), FsError::Io(_)));
     }
 
-
     #[test]
     fn fd_re_verification_accepts_inside_and_rejects_outside_the_root() {
         let root = TempDir::new();
@@ -1139,7 +1136,9 @@ mod tests {
         assert!(verify_fd_within_root(&inside_file, &canonical_root).is_ok());
 
         let elsewhere = TempDir::new();
-        let outside = std::fs::canonicalize(elsewhere.path()).unwrap().join("outside.txt");
+        let outside = std::fs::canonicalize(elsewhere.path())
+            .unwrap()
+            .join("outside.txt");
         std::fs::write(&outside, b"out").unwrap();
         let outside_file = File::open(&outside).unwrap();
         assert!(matches!(
