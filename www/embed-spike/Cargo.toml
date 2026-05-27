@@ -27,6 +27,13 @@ wasmtime = { version = "45.0.0" }
 # unchanged by the patch.
 [patch.crates-io]
 wasmtime = { path = "../../kernel/vendor/wasmtime" }
+# The on-target-codegen fork changed the vendored wasmtime/wasmtime-environ debug surface
+# (clif_dir is a string there); the std build of the native driver compiles those paths, so
+# the whole vendored wasmtime family must be used together for the types to agree.
+wasmtime-environ = { path = "../../kernel/vendor/wasmtime-environ" }
+wasmtime-internal-cranelift = { path = "../../kernel/vendor/wasmtime-cranelift" }
+cranelift-frontend = { path = "../../kernel/vendor/cranelift-frontend" }
+wasmtime-internal-unwinder = { path = "../../kernel/vendor/wasmtime-unwinder" }
 
 # Size-realistic settings for the wasm32 probe blob (the measurement the spike reports);
 # they also apply to the native driver, which is fine.

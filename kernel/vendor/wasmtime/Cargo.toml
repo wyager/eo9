@@ -84,6 +84,14 @@ component-model-async-bytes = [
     "component-model-async",
     "dep:bytes",
 ]
+# eo9 local change (kernel/vendor/README.md): opt-in for hosts that have no fiber backend
+# (a wasm32 host in the browser). Guest calls run directly on the current stack instead of
+# on a worker fiber, which is sufficient for callback-ABI ("stackless") guests; anything
+# that genuinely needs to block mid-guest-frame fails cleanly (no fiber to switch to)
+# instead of crashing. Off by default; never enabled by the kernel or host builds.
+component-model-async-fiberless = [
+    "component-model-async",
+]
 coredump = [
     "dep:wasm-encoder",
     "runtime",

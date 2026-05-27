@@ -358,7 +358,7 @@ impl Module {
         }
 
         crate::CodeBuilder::new(engine)
-            .wasm_binary_or_text(&mmap[..], Some(file.as_ref()))?
+            .wasm_binary_or_text(&mmap[..], file.as_ref().to_str())?
             .compile_module()
     }
 

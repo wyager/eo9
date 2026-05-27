@@ -47,6 +47,10 @@ fn preaot_config(consume_fuel: bool) -> Result<Config> {
     config.gc_support(false);
     config.wasm_threads(false);
     config.consume_fuel(consume_fuel);
+    // The vendored wasmtime family (used via [patch] so the probe gets the CM-async/no_std
+    // relaxation) carries the kernel's single-core compile-context lock, which panics on
+    // contention; compile single-threaded here, it's a handful of small artifacts.
+    config.parallel_compilation(false);
     Ok(config)
 }
 
@@ -88,8 +92,26 @@ fn preaot() -> Result<()> {
     Ok(())
 }
 
+/// The vendored compile crates gate host-target inference (`cranelift-native`) off, so the
+/// driver names its own host triple explicitly when compiling the probe module.
+fn host_triple() -> &'static str {
+    if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        "aarch64-apple-darwin"
+    } else if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
+        "x86_64-apple-darwin"
+    } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+        "aarch64-unknown-linux-gnu"
+    } else {
+        "x86_64-unknown-linux-gnu"
+    }
+}
+
 fn run_probe(probe_path: &Path) -> Result<()> {
-    let engine = Engine::default();
+    // Single-threaded compilation for the same reason as `preaot_config`.
+    let mut config = Config::new();
+    config.parallel_compilation(false);
+    config.target(host_triple())?;
+    let engine = Engine::new(&config)?;
     let module = Module::from_file(&engine, probe_path)
         .map_err(|error| msg(format!("loading probe {}: {error:?}", probe_path.display())))?;
 
