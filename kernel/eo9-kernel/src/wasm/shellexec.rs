@@ -970,21 +970,22 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                         version: r.version,
                     })
                     .collect();
-                let result = (|| -> core::result::Result<Resource<AlgComponentRes>, WitRestrictError> {
-                    let c = eo9_component::Component::load(bytes)
-                        .map_err(|e| WitRestrictError::Internal(format!("{e}")))?;
-                    let restricted = eo9_component::restrict(&c, &allow)
-                        .map_err(|e| WitRestrictError::Internal(format!("{e}")))?;
-                    let rep = store
-                        .data_mut()
-                        .shell_exec()
-                        .map_err(|e| WitRestrictError::Internal(format!("{e}")))?
-                        .insert_component(KComponent {
-                            bytes: restricted.into_bytes(),
-                            entry: None,
-                        });
-                    Ok(Resource::new_own(rep))
-                })();
+                let result =
+                    (|| -> core::result::Result<Resource<AlgComponentRes>, WitRestrictError> {
+                        let c = eo9_component::Component::load(bytes)
+                            .map_err(|e| WitRestrictError::Internal(format!("{e}")))?;
+                        let restricted = eo9_component::restrict(&c, &allow)
+                            .map_err(|e| WitRestrictError::Internal(format!("{e}")))?;
+                        let rep = store
+                            .data_mut()
+                            .shell_exec()
+                            .map_err(|e| WitRestrictError::Internal(format!("{e}")))?
+                            .insert_component(KComponent {
+                                bytes: restricted.into_bytes(),
+                                entry: None,
+                            });
+                        Ok(Resource::new_own(rep))
+                    })();
                 Ok((result,))
             }
             #[cfg(not(feature = "wasm-codegen"))]
@@ -1009,21 +1010,22 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                 .bytes;
             #[cfg(feature = "wasm-codegen")]
             {
-                let result = (|| -> core::result::Result<Resource<AlgComponentRes>, WitRenameError> {
-                    let c = eo9_component::Component::load(bytes)
-                        .map_err(|e| WitRenameError::Internal(format!("{e}")))?;
-                    let renamed = eo9_component::rename(&c, &old, &new)
-                        .map_err(|e| WitRenameError::Internal(format!("{e}")))?;
-                    let rep = store
-                        .data_mut()
-                        .shell_exec()
-                        .map_err(|e| WitRenameError::Internal(format!("{e}")))?
-                        .insert_component(KComponent {
-                            bytes: renamed.into_bytes(),
-                            entry: None,
-                        });
-                    Ok(Resource::new_own(rep))
-                })();
+                let result =
+                    (|| -> core::result::Result<Resource<AlgComponentRes>, WitRenameError> {
+                        let c = eo9_component::Component::load(bytes)
+                            .map_err(|e| WitRenameError::Internal(format!("{e}")))?;
+                        let renamed = eo9_component::rename(&c, &old, &new)
+                            .map_err(|e| WitRenameError::Internal(format!("{e}")))?;
+                        let rep = store
+                            .data_mut()
+                            .shell_exec()
+                            .map_err(|e| WitRenameError::Internal(format!("{e}")))?
+                            .insert_component(KComponent {
+                                bytes: renamed.into_bytes(),
+                                entry: None,
+                            });
+                        Ok(Resource::new_own(rep))
+                    })();
                 Ok((result,))
             }
             #[cfg(not(feature = "wasm-codegen"))]
@@ -1048,21 +1050,22 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
             {
                 let pairs: Vec<(String, String)> =
                     args.into_iter().map(|a| (a.name, a.value)).collect();
-                let result = (|| -> core::result::Result<Resource<AlgComponentRes>, WitConfigureError> {
-                    let c = eo9_component::Component::load(bytes)
-                        .map_err(|e| WitConfigureError::Internal(format!("{e}")))?;
-                    let configured = eo9_component::configure(&c, &pairs)
-                        .map_err(|e| WitConfigureError::Internal(format!("{e}")))?;
-                    let rep = store
-                        .data_mut()
-                        .shell_exec()
-                        .map_err(|e| WitConfigureError::Internal(format!("{e}")))?
-                        .insert_component(KComponent {
-                            bytes: configured.into_bytes(),
-                            entry: None,
-                        });
-                    Ok(Resource::new_own(rep))
-                })();
+                let result =
+                    (|| -> core::result::Result<Resource<AlgComponentRes>, WitConfigureError> {
+                        let c = eo9_component::Component::load(bytes)
+                            .map_err(|e| WitConfigureError::Internal(format!("{e}")))?;
+                        let configured = eo9_component::configure(&c, &pairs)
+                            .map_err(|e| WitConfigureError::Internal(format!("{e}")))?;
+                        let rep = store
+                            .data_mut()
+                            .shell_exec()
+                            .map_err(|e| WitConfigureError::Internal(format!("{e}")))?
+                            .insert_component(KComponent {
+                                bytes: configured.into_bytes(),
+                                entry: None,
+                            });
+                        Ok(Resource::new_own(rep))
+                    })();
                 Ok((result,))
             }
             #[cfg(not(feature = "wasm-codegen"))]
