@@ -190,21 +190,24 @@ fn store_add_and_run_by_name_golden_transcript() {
     ];
     let (rendered, stderrs) = transcript(&store, &steps);
 
-    let expected = format!(
-        "$ eo9 store add eo9-example-cruncher.wasm --name cruncher\n\
+    let expected = "$ eo9 store add eo9-example-cruncher.wasm --name cruncher\n\
          <hash>\n\
          cruncher -> <hash>\n\
          [exit 0]\n\
          $ eo9 run cruncher --seed 9 --rounds 3\n\
-         success(digest({digest}))\n\
          [exit 0]\n\
          $ eo9 run cruncher --seed 9 --rounds 3\n\
-         success(digest({digest}))\n\
          [exit 0]\n\
          $ eo9 run no-such-name\n\
          [exit 3]\n"
-    );
+        .to_string();
     assert_eq!(rendered, expected, "stderr of the steps: {stderrs:#?}");
+
+    // The outcome line lives on stderr now (program output owns stdout); both runs report
+    // the same digest there.
+    let outcome = format!("success(digest({digest}))");
+    assert_eq!(stderrs[1].trim(), outcome);
+    assert_eq!(stderrs[2].trim(), outcome);
 
     // The failing resolution explains itself on stderr (exit code 3 = eo9's own error,
     // before any program outcome existed).
@@ -253,22 +256,23 @@ fn outcome_arms_map_to_exit_codes_golden_transcript() {
          [exit 0]\n\
          $ eo9 run outcomes --mode ok --detail \"all good\"\n\
          outcomes: completing with \"all good\"\n\
-         success(completed(\"all good\"))\n\
          [exit 0]\n\
          $ eo9 run outcomes --mode fail --detail \"went wrong\"\n\
-         failure(requested-failure(\"went wrong\"))\n\
          [exit 1]\n\
          $ eo9 run outcomes --mode trap --detail \"\"\n\
-         abnormal(trapped(<reason>))\n\
          [exit 2]\n";
     assert_eq!(rendered, expected, "stderr of the steps: {stderrs:#?}");
 
-    // The failure mode's own diagnostic goes to the program's stderr stream, not stdout.
+    // The outcome line lives on stderr now: each arm reports its outcome there, alongside
+    // anything the program itself wrote to its own stderr stream.
+    assert!(stderrs[1].contains("success(completed(\"all good\"))"));
     assert!(
-        stderrs[2].contains("outcomes: failing with"),
-        "expected the program's stderr line: {}",
+        stderrs[2].contains("outcomes: failing with")
+            && stderrs[2].contains("failure(requested-failure(\"went wrong\"))"),
+        "expected the program's stderr line and the outcome: {}",
         stderrs[2]
     );
+    assert!(stderrs[3].contains("abnormal(trapped("));
 }
 
 #[test]
@@ -295,12 +299,20 @@ fn the_second_run_by_name_launches_from_the_cached_image() {
         "second run should launch from the cached image: {}",
         second.stderr
     );
+    let outcome_line = |stderr: &str| {
+        stderr
+            .lines()
+            .find(|line| line.starts_with("success(") || line.starts_with("failure("))
+            .map(str::to_owned)
+            .unwrap_or_default()
+    };
     assert_eq!(
-        second.stdout, first.stdout,
+        outcome_line(&second.stderr),
+        outcome_line(&first.stderr),
         "a cache hit must not change the program's outcome"
     );
     assert_eq!(
-        first.stdout.trim(),
+        outcome_line(&first.stderr),
         format!("success(digest({}))", cruncher_digest(4, 10))
     );
 }
