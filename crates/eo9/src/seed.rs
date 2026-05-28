@@ -257,9 +257,7 @@ fn refresh(
             // or a binding the user removed and wants back via `reseed`).
             (None, _) => true,
             // The binding is exactly what seeding put there — refresh it.
-            (Some(current), Managed::Recorded(record)) => {
-                record.get(shell_name) == Some(&current)
-            }
+            (Some(current), Managed::Recorded(record)) => record.get(shell_name) == Some(&current),
             // No provenance to consult: bundled names are the seeder's.
             (Some(_), Managed::AllBundled) => true,
         };
