@@ -8,7 +8,8 @@ import { dirname, join } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const vmDir = join(here, "..", "site", "vm");
 const assets = JSON.parse(readFileSync(join(vmDir, "assets.json"), "utf8"));
-const blobPath = join(vmDir, assets.blob.replace(/^\/vm\//, ""));
+const blobPath =
+  process.env.BLOB || join(vmDir, assets.blob.replace(/^\/vm\//, ""));
 
 const decoder = new TextDecoder();
 let memory = null;
@@ -40,6 +41,12 @@ const algebraDemo = WebAssembly.promising(x.algebra_demo);
 if (x.boot() !== 0) throw new Error("boot failed");
 const rc = await algebraDemo();
 
+// In-blob codegen: compile a raw component and an algebra-fused composition inside the blob
+// (Cranelift -> Pulley) and run them — fully client-side (every network/server import in this
+// harness is stubbed to "unavailable", so a pass proves no server involvement).
+const compileDemo = WebAssembly.promising(x.compile_demo);
+const rcCompile = await compileDemo();
+
 console.log(lines.join("\n"));
 const text = lines.join("\n");
 const checks = [
@@ -48,8 +55,13 @@ const checks = [
   ["imports eo9:time/time", /import eo9:time\/time/],
   ["only -> sealed component", /only .* -> a sealed component/],
   ["execution -> success(greeted)", /success\(greeted\)/],
+  ["in-blob codegen: hello compiled client-side", /hello compiled in [\d.]+ ms \(client-side, no server\)/],
+  ["in-blob codegen: compiled hello ran (greeted)", /compiled in-blob -> success\(greeted\)/],
+  ["in-blob codegen: fused composition compiled", /the fused composition compiled in [\d.]+ ms/],
+  ["in-blob codegen: fused composition ran (generated(3))", /fused and compiled in-blob -> success\(generated\(3\)\)/],
+  ["in-blob codegen: self-hosted line", /the browser VM is self-hosted/],
 ];
-let ok = rc === 0;
+let ok = rc === 0 && rcCompile === 0;
 for (const [label, re] of checks) {
   const pass = re.test(text);
   if (!pass) ok = false;

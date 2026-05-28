@@ -109,6 +109,11 @@
       providers: text → this terminal, time → the browser clocks, entropy →
       <code>crypto.getRandomValues</code>. Typed arguments in, a typed outcome out — the same
       contract as native <code>eo9 run</code>.</li>
+    <li><strong>compiler in the VM</strong> — the blob also carries the same Cranelift-based
+      compile layers the bare-metal kernel uses for on-target codegen, emitting Pulley bytecode:
+      a composition typed at the eosh prompt (e.g. <code>entropy.seeded $ rng</code>) is fused by
+      the real component algebra and <em>compiled inside your browser</em>, with no server
+      involved — the same compose → compile → run story as native Eo9 and bare metal.</li>
     <li><strong>park the VM / read a line</strong> — genuinely blocking operations: the VM (and any
       guest awaiting <code>time.sleep</code> or <code>read-line</code> inside it) is parked on a real
       browser timer or on the input box below the terminal, using JavaScript Promise Integration

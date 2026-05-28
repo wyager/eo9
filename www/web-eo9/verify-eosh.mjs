@@ -1,61 +1,23 @@
 // Node (v25, JSPI) verification harness for booting eosh in the /vm blob, mirroring
 // www/site/vm/vm.js's import glue. Not part of CI (needs node + JSPI); run after
-// `cargo xtask build-web-vm` and `cargo build --release -p eo9-www`:
+// `cargo xtask build-web-vm`:
 //   node www/web-eo9/verify-eosh.mjs
 //
-// This harness also exercises the real server round-trip: it spawns the eo9-www server in
-// plain-HTTP mode and points the blob's host_compile_len at its POST /vm/compile endpoint, so
-// `entropy.seeded $ rng` is genuinely fused + compiled on the server and run in the browser blob.
-import { readFileSync, existsSync } from "node:fs";
+// Everything here is offline: there is no server and no network import — compositions typed at
+// the eosh prompt are fused by the algebra and compiled *inside the blob* (Cranelift -> Pulley),
+// so a passing run is direct proof that compose -> compile -> run needs no server involvement.
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { spawn } from "node:child_process";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const vmDir = join(here, "..", "site", "vm");
-const siteDir = join(here, "..", "site");
 const assets = JSON.parse(readFileSync(join(vmDir, "assets.json"), "utf8"));
 const blobPath =
   process.env.BLOB || join(vmDir, assets.blob.replace(/^\/vm\//, ""));
 
-// --- spawn the real server (plain HTTP) so /vm/compile is a genuine network round-trip ------
-const serverBin =
-  process.env.EO9_WWW_BIN || join(here, "..", "target", "release", "eo9-www");
-if (!existsSync(serverBin)) {
-  console.error(
-    `eo9-www server binary not found at ${serverBin}\n` +
-      "build it first:  cargo build --release -p eo9-www",
-  );
-  process.exit(2);
-}
-const port = process.env.EO9_WWW_PORT || "38099";
-const base = `http://127.0.0.1:${port}`;
-const server = spawn(serverBin, ["--site", siteDir, "--bind", `127.0.0.1:${port}`], {
-  stdio: "inherit",
-});
-
 function finish(code) {
-  server.kill("SIGTERM");
   process.exit(code);
-}
-
-// Wait for the server to accept requests.
-let ready = false;
-for (let i = 0; i < 100; i++) {
-  try {
-    const r = await fetch(`${base}/vm/assets.json`);
-    if (r.ok) {
-      ready = true;
-      break;
-    }
-  } catch {
-    // not up yet
-  }
-  await new Promise((r) => setTimeout(r, 100));
-}
-if (!ready) {
-  console.error(`server did not become ready at ${base}`);
-  finish(2);
 }
 
 const decoder = new TextDecoder();
@@ -63,7 +25,6 @@ const encoder = new TextEncoder();
 let memory = null;
 const lines = [];
 let inputQueue = []; // command lines fed to the interactive eosh prompt via read-line
-let compiledImage = null; // most recent server-compiled image, copied by host_compile_copy
 
 const imports = {
   env: {
@@ -75,11 +36,6 @@ const imports = {
       for (let i = 0; i < len; i++) view[i] = (Math.random() * 256) | 0;
     },
     host_fetch_copy: () => {},
-    host_compile_copy: (destPtr, len) => {
-      if (compiledImage === null) return;
-      new Uint8Array(memory.buffer, destPtr, len).set(compiledImage.subarray(0, len));
-      compiledImage = null;
-    },
     host_sleep_ms: new WebAssembly.Suspending((ms) => new Promise((r) => setTimeout(r, ms))),
     host_read_line: new WebAssembly.Suspending(async (ptr, cap) => {
       if (inputQueue.length === 0) return -1; // end of input
@@ -89,23 +45,6 @@ const imports = {
       return bytes.length;
     }),
     host_fetch_len: new WebAssembly.Suspending(async () => -1),
-    // The real round-trip: POST the composition expression to the server, which fuses the
-    // named store programs with the algebra and compiles a pulley32 image.
-    host_compile_len: new WebAssembly.Suspending(async (exprPtr, exprLen) => {
-      const expr = decoder.decode(new Uint8Array(memory.buffer, exprPtr, exprLen));
-      try {
-        const r = await fetch(`${base}/vm/compile`, {
-          method: "POST",
-          headers: { "content-type": "text/plain" },
-          body: expr,
-        });
-        if (!r.ok) return -1;
-        compiledImage = new Uint8Array(await r.arrayBuffer());
-        return compiledImage.length;
-      } catch {
-        return -1;
-      }
-    }),
   },
 };
 
@@ -150,9 +89,9 @@ inputQueue = [
   "only eo9:text/text $ echo --text restricted",
   "only eo9:text/text $ hello --name nope --excited true",
   // a `provider $ consumer` composition: entropy.seeded (a /bin provider) feeds rng. The fused
-  // result has no in-blob artifact, so the blob POSTs `entropy.seeded $ rng` to the server,
-  // which compiles it; the blob runs the returned image. Run twice (marker between) to show the
-  // seeded provider makes it deterministic across runs.
+  // result has no pre-AOT'd artifact, so the blob compiles it *in-blob* (Cranelift -> Pulley) and
+  // runs it — no server, no network (none is wired in this harness). Run twice (marker between)
+  // to show the seeded provider makes it deterministic across runs.
   "entropy.seeded $ rng --count 3",
   "echo --text RNGMARK",
   "entropy.seeded $ rng --count 3",
@@ -184,8 +123,9 @@ const checks = [
   ["only admitting text+time runs hello", /Hello, boxed/.test(interactive)],
   ["only-text runs a text-only program", /restricted/.test(interactive)],
   ["only-text refuses hello (needs time)", !/Hello, nope/.test(interactive)],
-  // The composition was NOT refused — it compiled on the server and ran (3 rng numbers).
-  ["server compiled+ran entropy.seeded $ rng", run1.length === 3],
+  // The composition was NOT refused — it compiled inside the blob and ran (3 rng numbers),
+  // with no server reachable from this harness at all.
+  ["in-blob compiled+ran entropy.seeded $ rng (no server)", run1.length === 3],
   ["compose did not hit the codegen refusal", !/needs the compiler/.test(interactive)],
   ["seeded compose is deterministic across runs", deterministic],
   ["interactive: session exited", bootRc === 0 && /success\(exited\)/.test(interactive)],

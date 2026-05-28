@@ -333,6 +333,23 @@ pub extern "C" fn algebra_demo() -> i32 {
     report("algebra", exec::algebra_demo())
 }
 
+/// In-blob codegen demo: compile a raw component — and an algebra-fused composition — inside
+/// the blob with the same vendored Cranelift + wasmtime compile layers the bare-metal kernel
+/// uses for on-target codegen (Pulley as the emission target), then run what was just
+/// compiled. Fully client-side: no server, no pre-AOT'd artifact.
+#[unsafe(no_mangle)]
+pub extern "C" fn compile_demo() -> i32 {
+    #[cfg(feature = "inblob-codegen")]
+    {
+        report("in-blob codegen", exec::compile_demo())
+    }
+    #[cfg(not(feature = "inblob-codegen"))]
+    {
+        out("in-blob codegen is not built into this blob (feature `inblob-codegen` is off)");
+        1
+    }
+}
+
 /// Instantiate eosh against the in-browser exec/text/fs surface (the floor: the shell links).
 #[unsafe(no_mangle)]
 pub extern "C" fn eosh_instantiate() -> i32 {
