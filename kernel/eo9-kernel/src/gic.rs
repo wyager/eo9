@@ -1,19 +1,16 @@
-//! Minimal GICv2 bring-up — just enough to let the core sleep.
+//! Minimal GICv2 bring-up — enough to take timer and UART interrupts and let the core sleep.
 //!
 //! The kernel's executor used to busy-poll on `Poll::Pending` (a guest awaiting
 //! `time.sleep`, or eosh awaiting `read-line` at the prompt), pinning a host CPU at 100%.
-//! The fix is to `wfi` instead, but `wfi` only wakes on an interrupt that actually reaches
-//! the PE — and the generic timer routes its signal through the interrupt controller. So
-//! we bring up the GIC distributor + CPU interface enough to *forward* the EL1 physical
-//! timer PPI (INTID 30) to this core.
+//! The fix is to `wfi` instead, which only wakes on an interrupt that reaches the PE — so we
+//! bring up the GIC distributor + CPU interface and *forward* the EL1 physical timer PPI
+//! (INTID 30) and the PL011 UART SPI (INTID 33) to this core.
 //!
-//! We deliberately keep interrupts masked at PSTATE level (PSTATE.I = 1): we never take
-//! the interrupt as an exception, so there is no IRQ vector handler and synchronous
-//! exceptions stay fatal as before (src/exceptions.rs). `wfi` wakes on the *pending* timer
-//! interrupt even though it is masked, and the executor then re-arms the timer
-//! (src/timer.rs `arm_wake`), which — because the generic-timer PPI is level-sensitive —
-//! deasserts the signal and clears the GIC pending state without any EOI. The result: the
-//! core halts in `wfi` between timer ticks instead of spinning.
+//! Interrupts are taken as exceptions: IRQs are unmasked (PSTATE.I = 0) once the GIC is up,
+//! the EL1 IRQ vector dispatches to `exceptions::kirq`, which reads the IAR, services the
+//! source (re-arms/quiets the timer, drains the UART RX FIFO into a ring), and writes EOI.
+//! Synchronous exceptions stay fatal as before. The core halts in `wfi` at an idle prompt
+//! and wakes promptly on a keystroke or the armed timer deadline (src/timer.rs, src/uart.rs).
 //!
 //! This needs the QEMU `virt` machine to expose a GICv2 (`-M virt,gic-version=2` in xtask);
 //! GICv3 would use a system-register CPU interface and per-PE redistributors instead.

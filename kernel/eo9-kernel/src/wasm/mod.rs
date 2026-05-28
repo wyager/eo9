@@ -92,39 +92,58 @@ pub fn new_engine() -> Result<Engine, wasmtime::Error> {
     config.consume_fuel(true);
     // Without virtual memory wasmtime cannot flip page protections itself, so it asks the
     // embedder to "publish" code memory; on this machine that is D-cache clean + I-cache
-    // invalidate over the range (see below), no page-permission flips.
+    // invalidate over the range, then a W^X page-permission flip to executable/read-only
+    // (see `BareMetalCodeMemory` below).
     config.with_custom_code_memory(Some(Arc::new(BareMetalCodeMemory)));
     Engine::new(&config)
 }
 
-/// Executable-memory "publisher" for this kernel's flat identity map.
+/// Executable-memory "publisher" for this kernel's identity map, enforcing W^X.
 ///
-/// Code — whether deserialized from an AOT artifact today or emitted on-target by Cranelift
-/// once `wasm-codegen` lands (plan/12 Decisions 26–27) — lands in an ordinary heap
-/// allocation, and the identity map (src/mmu.rs) keeps all of RAM readable, writable, and
-/// executable, so there are no page permissions to flip. Making the new instructions
-/// visible to the fetch path is real cache maintenance, not just barriers: QEMU's TCG keeps
-/// the instruction stream coherent with stores, but on real hardware the freshly written
-/// bytes sit in the D-cache while the I-cache may hold stale lines, so we clean D to the
-/// point of unification then invalidate I over the published range (W^X page protections
-/// remain a separate MMU item, Decision 3).
+/// Code — whether deserialized from an AOT artifact or emitted on-target by Cranelift
+/// (plan/12 Decisions 26–27) — lands in an ordinary heap allocation, which the MMU maps
+/// writable-but-non-executable by default (src/mmu.rs), so it cannot be executed while
+/// wasmtime is writing it. Publishing does two things: (1) real cache maintenance — clean
+/// D to the point of unification then invalidate I over the range, so the I-fetch path sees
+/// the freshly written bytes (QEMU's TCG keeps coherency anyway, but physical hardware does
+/// not); then (2) flip the range to executable-and-read-only, so a code page is never
+/// simultaneously writable and executable. Unpublishing flips it back to writable/non-exec
+/// so the allocation can be reused. `required_alignment` is the page size, so wasmtime hands
+/// us whole pages that never share with non-code data.
 struct BareMetalCodeMemory;
 
 impl CustomCodeMemory for BareMetalCodeMemory {
     fn required_alignment(&self) -> usize {
-        // The whole map is executable; no page-granularity requirement applies (until W^X).
-        1
+        // Page granularity: code regions are whole pages so the W^X permission flip never
+        // touches adjacent non-code data.
+        4096
     }
 
     fn publish_executable(&self, ptr: *const u8, len: usize) -> wasmtime::Result<()> {
         // SAFETY: the [ptr, ptr+len) range is the code memory wasmtime just wrote and is
-        // about to execute; cache-maintenance ops over it have no effect beyond making the
-        // I-fetch path observe those writes. A zero-length publish is a no-op.
-        unsafe { publish_code_range(ptr, len) };
+        // about to execute. Cache-maintain it while it is still the writable heap default,
+        // then flip it to executable/read-only. A zero-length publish is a no-op.
+        unsafe {
+            publish_code_range(ptr, len);
+            crate::mmu::set_range_permissions(
+                ptr as usize,
+                len,
+                crate::mmu::PagePerm::ReadExecOnly,
+            );
+        }
         Ok(())
     }
 
-    fn unpublish_executable(&self, _ptr: *const u8, _len: usize) -> wasmtime::Result<()> {
+    fn unpublish_executable(&self, ptr: *const u8, len: usize) -> wasmtime::Result<()> {
+        // Return the pages to the writable, non-executable heap default so the allocation can
+        // be reused. SAFETY: wasmtime is done executing this region when it unpublishes.
+        unsafe {
+            crate::mmu::set_range_permissions(
+                ptr as usize,
+                len,
+                crate::mmu::PagePerm::ReadWriteNoExec,
+            );
+        }
         Ok(())
     }
 }
