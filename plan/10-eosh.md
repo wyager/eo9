@@ -108,4 +108,10 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
     that mention an unsatisfied `eo9:*` import are translated into "the program requires the <capability>
     capability, which this session does not provide to it". `load`/`rename`/`compile` keep the generic
     rendering for now. Guest-SDK panic messages are still discarded by the panic handler (preserving them
-    needs either a hidden import or a new diagnostic channel — owner design call, see GAPS).
+    needs either a hidden import or a new diagnostic channel — owner design call, see GAPS). **Update
+    (2026-05-27):** trap reasons are now cleaned (`crates/eo9-runtime/src/trap.rs`: trap kind + a
+    symbol-only demangled backtrace, no addresses/hashes) so a guest panic reads as
+    `abnormal(trapped("guest panicked — wasm \`unreachable\` …; guest backtrace: … ← panic_fmt ← main"))`
+    instead of raw escaped text. The panic *message* + source line still need the per-world post-trap
+    export proposed in plan/07 Decision 11 (an export, not an import — capability-clean), deferred behind
+    the configure-sync WIT churn.

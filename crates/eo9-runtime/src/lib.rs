@@ -20,6 +20,7 @@ mod link;
 pub mod outcome;
 pub mod providers;
 pub mod task;
+mod trap;
 pub mod wave;
 
 pub use engine::{EngineOptions, compatibility_hash, new_engine};

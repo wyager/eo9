@@ -801,3 +801,13 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
       console (input goes to the innermost active reader); eosh itself still has no interrupt key, so a
       foreground spinner still occupies the *prompt* even though the machine, other children, and the kill
       path all keep working; the idle-wake interval (10 ms) bounds await-point latency as before.
+
+## Follow-up — panic diagnostics on metal (2026-05-27)
+
+The usermode runtime now renders guest traps via a cleaned reason builder
+(`crates/eo9-runtime/src/trap.rs`: trap kind + a demangled, address/hash-free symbol backtrace; the panic
+*message* itself awaits the per-world post-trap export proposed in plan/07 Decision 11). The kernel's own
+trap/outcome path (`kernel/src/wasm`) still renders the raw wasmtime error. Follow-up: share or mirror the
+same cleaned-reason logic on metal so a bare-metal guest panic reads the same way, and adopt the panic-export
+once it lands. Deliberately not done in the panic-channel pass to avoid colliding with the concurrent kernel
+preemption/hardening work.
