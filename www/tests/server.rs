@@ -161,6 +161,46 @@ fn query_strings_are_ignored_for_resolution() {
 }
 
 #[test]
+fn every_response_carries_the_security_headers() {
+    // Pages, assets, and error responses all get the same security header set; HSTS is
+    // absent here because this listener is plain HTTP (the HTTPS tests assert its presence).
+    for target in ["/", "/style.css", "/no-such-page", "/try/", "/vm/"] {
+        let response = request(site_server_addr(), "GET", target);
+        assert_eq!(
+            response.header("X-Content-Type-Options"),
+            Some("nosniff"),
+            "target: {target}"
+        );
+        assert_eq!(
+            response.header("Referrer-Policy"),
+            Some("no-referrer"),
+            "target: {target}"
+        );
+        assert_eq!(
+            response.header("Cross-Origin-Opener-Policy"),
+            Some("same-origin"),
+            "target: {target}"
+        );
+        let csp = response
+            .header("Content-Security-Policy")
+            .unwrap_or_else(|| panic!("missing CSP on {target}"));
+        assert!(csp.contains("default-src 'self'"), "target: {target}");
+        assert!(csp.contains("'wasm-unsafe-eval'"), "target: {target}");
+        assert!(csp.contains("frame-ancestors 'none'"), "target: {target}");
+        assert_eq!(
+            response.header("Strict-Transport-Security"),
+            None,
+            "plain HTTP must not set HSTS (target: {target})"
+        );
+    }
+
+    // The redirect listener (also plain HTTP) carries them too.
+    let redirect = request(redirect_server_addr(), "GET", "/");
+    assert_eq!(redirect.header("X-Content-Type-Options"), Some("nosniff"));
+    assert_eq!(redirect.header("Strict-Transport-Security"), None);
+}
+
+#[test]
 fn precompressed_assets_are_served_by_content_negotiation() {
     // The committed site tree carries .br/.gz siblings for the heavyweight assets
     // (written by `cargo xtask precompress-site`); a client that accepts brotli gets the

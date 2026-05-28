@@ -36,6 +36,54 @@ use crate::{
 
 type Body = Full<Bytes>;
 
+/// Whether a response is being served over TLS. `Strict-Transport-Security` is only ever
+/// sent on TLS responses (per the HSTS spec, plain-HTTP responses must not set it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Plain,
+    Tls,
+}
+
+/// The Content-Security-Policy for every page: first-party only, with the one extra
+/// permission the demo pages need — `'wasm-unsafe-eval'` so the browser may compile
+/// WebAssembly fetched from this origin (`/try`'s transpiled components, `/vm`'s blob).
+/// There is no inline script or style anywhere on the site.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
+     style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; \
+     base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/// Two years, the conventional HSTS lifetime once a site is committed to HTTPS.
+const STRICT_TRANSPORT_SECURITY: &str = "max-age=63072000; includeSubDomains";
+
+/// Add the security headers every response carries (and HSTS on TLS responses). Applied to
+/// site responses, error responses, and redirects alike.
+fn with_standard_headers(mut response: Response<Body>, transport: Transport) -> Response<Body> {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("referrer-policy"),
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("content-security-policy"),
+        header::HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(
+        header::HeaderName::from_static("cross-origin-opener-policy"),
+        header::HeaderValue::from_static("same-origin"),
+    );
+    if transport == Transport::Tls {
+        headers.insert(
+            header::HeaderName::from_static("strict-transport-security"),
+            header::HeaderValue::from_static(STRICT_TRANSPORT_SECURITY),
+        );
+    }
+    response
+}
+
 /// Connection limits applied to every listener. Defaults are generous for a small static
 /// site; tests use smaller values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,7 +239,7 @@ pub async fn serve_site_http(
         let site_root = site_root.clone();
         tokio::spawn(async move {
             let _permit = permit; // released when the connection is done
-            serve_site_connection(stream, site_root, limits).await;
+            serve_site_connection(stream, site_root, limits, Transport::Plain).await;
         });
     }
 }
@@ -294,7 +342,7 @@ async fn serve_tls_connection(
         // An ACME validation connection: already answered and closed in `tls_accept`.
         None => Ok(()),
         Some(tls) => {
-            serve_site_connection(tls, site_root, limits).await;
+            serve_site_connection(tls, site_root, limits, Transport::Tls).await;
             Ok(())
         }
     }
@@ -322,8 +370,12 @@ async fn tls_accept(
 }
 
 /// Serve HTTP/1.1 on one (plain or TLS) connection, answering every request from the site.
-async fn serve_site_connection<IO>(stream: IO, site_root: Arc<PathBuf>, limits: Limits)
-where
+async fn serve_site_connection<IO>(
+    stream: IO,
+    site_root: Arc<PathBuf>,
+    limits: Limits,
+    transport: Transport,
+) where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     let service = service_fn(move |request: Request<Incoming>| {
@@ -335,6 +387,7 @@ where
                     request.uri(),
                     request.headers(),
                     &site_root,
+                    transport,
                 )
                 .await,
             )
@@ -368,8 +421,22 @@ where
 /// get 400 or 404 with a small HTML body. When the client accepts it and a fresh
 /// pre-compressed sibling exists (see `www/precompress`), that representation is served with
 /// the matching `Content-Encoding`; the `Content-Type` and cache policy are always those of
-/// the original file.
+/// the original file. Every response carries the standard security headers.
 pub async fn site_response(
+    method: &Method,
+    uri: &Uri,
+    request_headers: &HeaderMap,
+    site_root: &Path,
+    transport: Transport,
+) -> Response<Body> {
+    with_standard_headers(
+        site_file_response(method, uri, request_headers, site_root).await,
+        transport,
+    )
+}
+
+/// The content half of [`site_response`]: everything except the standard headers.
+async fn site_file_response(
     method: &Method,
     uri: &Uri,
     request_headers: &HeaderMap,
@@ -453,7 +520,8 @@ async fn select_precompressed(
 }
 
 /// Build the 301 redirect to HTTPS for one plain-HTTP request. `host_header` is the raw
-/// `Host` header value; `canonical_host` is the fallback when it is missing.
+/// `Host` header value; `canonical_host` is the fallback when it is missing. The redirect
+/// listener is plain HTTP, so the standard headers are added without HSTS.
 pub fn redirect_response(
     host_header: Option<&str>,
     uri: &Uri,
@@ -464,11 +532,11 @@ pub fn redirect_response(
         .filter(|host| is_valid_host(host))
         .or(canonical_host);
     let Some(host) = host else {
-        return error_response(StatusCode::BAD_REQUEST);
+        return with_standard_headers(error_response(StatusCode::BAD_REQUEST), Transport::Plain);
     };
     let path_and_query = uri.path_and_query().map_or("/", |pq| pq.as_str());
     let location = format!("https://{host}{path_and_query}");
-    Response::builder()
+    let response = Response::builder()
         .status(StatusCode::MOVED_PERMANENTLY)
         .header(header::LOCATION, location.as_str())
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -476,7 +544,8 @@ pub fn redirect_response(
         .body(Full::new(Bytes::from(format!(
             "<!doctype html>\n<html><body><a href=\"{location}\">{location}</a></body></html>\n"
         ))))
-        .expect("statically valid response")
+        .expect("statically valid response");
+    with_standard_headers(response, Transport::Plain)
 }
 
 /// Drop a trailing `:port` from a Host header value, leaving IPv6 literals intact.
