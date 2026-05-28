@@ -304,3 +304,39 @@ runnable on a host with no fiber backend.
     D14(d)), then boots and verifies an `eosh>` smoke. A server-side `/vm/compile` endpoint (the
     standalone server has the full toolchain) is the path to making `$`/`&` composition actually
     compile-and-run in the browser, since in-blob codegen is std/mmap-blocked.
+
+## Decision 17 — eosh boots in the browser (the in-blob eo9:exec surface)
+
+`blob/src/execsurface.rs` registers the `eo9:exec` surface eosh imports (component-algebra,
+images, compile, task) on the raw component `Linker`, hand-rolled like `providers.rs`/`fs.rs`
+(not `bindgen!` — the SDK path is finicky with the custom-platform + fiberless config). Design,
+as built and verified:
+
+- **component-algebra** is backed by the real `eo9-component` crate (load/save/describe/
+  compose/extend/restrict/rename/configure); `component` is a host resource over a table.
+- **compile** = artifact lookup: a loaded plain program's raw bytes are content-hashed to its
+  pre-AOT'd `.cwasm` (embedded). A binary is "closed" if its required imports are all served by
+  the browser root environment (text/time/entropy/fs/io) — exactly as a bare `hello` runs on the
+  kernel. `compose`/`extend`/`configure` results have no artifact → `compile` returns a clean
+  "composition needs the compiler, not available in the browser yet" (in-blob codegen is
+  std/mmap-blocked; the server-side `/vm/compile` endpoint is the path to running `$`/`&`).
+- **task** is single-child run-to-completion: `spawn` runs the child to completion immediately
+  via the existing run_program path (a fresh Store, instantiate_async, run `main` under
+  `run_concurrent`/`block_on`), stores the `program-outcome`; `wait`/`kill`/`resume` return it;
+  `runnable` is immediate. **Nested `run_concurrent` works** (eosh's `main` → `task.spawn` →
+  child `run_concurrent`) — the integration risk that stalled the prior passes is retired.
+- Args are bound with a WAVE-lite scalar parser keyed on the arg-spec type text (string/bool/
+  integers/char/option) — enough for the demo programs without pulling wasmtime's `wave` feature.
+- `/bin/<name>.wasm` is seeded into the blob's MemFs with raw component bytes so eosh's `resolve`
+  (fs `open-exec` + `load`) finds programs; today seeded with `hello` (more follow).
+
+**Verified** (`www/web-eo9/verify-eosh.mjs`, node v25/JSPI, and the committed fingerprinted blob):
+`eosh_instantiate` → eosh links against the in-blob exec/text/fs surface; `eosh_command("hello
+--name web --excited true")` → the program prints `Hello, web!`, eosh renders `ok: greeted`, and
+eosh's session outcome is `success(exited)`. featureless `cargo xtask ci` green; `check-web-vm`
+ok. Blob 5.20 MiB raw / 1.07 MiB brotli.
+
+**Remaining**: seed `/bin` with more programs (coreutils — embed/fetch their raw+`.cwasm`); wire
+the interactive `eosh>` prompt on the page (main(none) reading the terminal via JSPI read-line);
+`only`-attenuation via a linker restricted to the admitted interfaces (today the base artifact
+runs with full root providers); the server-side `/vm/compile` endpoint for `$`/`&`.

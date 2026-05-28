@@ -23,10 +23,11 @@ use std::sync::Arc;
 use wasmtime::component::{Component, Linker, Val};
 use wasmtime::{Config, CustomCodeMemory, Engine, Store};
 
+mod exec;
+mod execsurface;
 mod fs;
 mod host;
 mod providers;
-mod exec;
 mod store;
 
 fn out(message: &str) {
@@ -330,6 +331,26 @@ pub extern "C" fn run_entropy(seed_lo: u32, seed_hi: u32, count: u32) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn algebra_demo() -> i32 {
     report("algebra", exec::algebra_demo())
+}
+
+/// Instantiate eosh against the in-browser exec/text/fs surface (the floor: the shell links).
+#[unsafe(no_mangle)]
+pub extern "C" fn eosh_instantiate() -> i32 {
+    report("eosh", execsurface::boot_eosh_instantiate())
+}
+
+/// Boot eosh one-shot on a command line written into a `web_alloc` buffer by the page.
+#[unsafe(no_mangle)]
+pub extern "C" fn eosh_command(ptr: *const u8, len: usize) -> i32 {
+    let command = unsafe { page_str(ptr, len) }.to_owned();
+    report("eosh", execsurface::boot_eosh(&command))
+}
+
+/// Boot the interactive `eosh>` prompt: eosh reads command lines from the page terminal
+/// (JSPI read-line) until end-of-input or `exit`.
+#[unsafe(no_mangle)]
+pub extern "C" fn eosh_boot() -> i32 {
+    report("eosh", execsurface::boot_eosh_interactive())
 }
 
 // --- milestone 2: real programs from the HTTP store, awaits parked on the browser ---------
