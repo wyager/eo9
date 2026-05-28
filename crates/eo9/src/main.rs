@@ -168,6 +168,8 @@ COMMANDS:
     store ls                  List name bindings, objects, and compile-cache entries
     store gc [--max-cache-bytes <n>]
                               Evict compile-cache entries down to a size budget
+    store reseed              Re-bind the bundled program names to this binary's components
+                              (recovery for a store seeded by an older eo9; user bindings stay)
     shell [-c <command>]      Run eosh, the Eo9 shell: interactive REPL on the terminal, or
                               one command line with -c (programs resolve from the store's
                               bound names; --fs-root governs what children may touch)

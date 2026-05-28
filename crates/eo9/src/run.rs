@@ -65,7 +65,12 @@ pub fn cmd_run(cfg: &Config, reference: &str, flags: &[(String, String)]) -> Res
         limits,
         providers::root_providers(cfg)?,
     )
-    .map_err(|err| format!("cannot spawn {}: {err}", source.origin))?;
+    .map_err(|err| {
+        stale_store_hint(
+            &source.origin,
+            format!("cannot spawn {}: {err}", source.origin),
+        )
+    })?;
 
     let outcome = drive_to_completion(cfg, &mut task);
     if let Outcome::Success(value) | Outcome::Failure(value) = &outcome
@@ -77,6 +82,32 @@ pub fn cmd_run(cfg: &Config, reference: &str, flags: &[(String, String)]) -> Res
     let (rendered, code) = render_outcome(&outcome);
     print_outcome(cfg, &rendered);
     Ok(code)
+}
+
+/// When spawning a **store-resolved** component fails because its shape does not match
+/// what this runtime links — a missing interface instance or resource implementation —
+/// the most common cause is a binding made by an older eo9 (the bundled programs are
+/// auto-refreshed, but a name the user once re-bound, or a store the refresh chose not
+/// to touch, can still hold old bytes). Point at the recovery command instead of leaving
+/// only the raw linker text.
+pub(crate) fn stale_store_hint(origin: &str, message: String) -> String {
+    let looks_like_a_shape_mismatch = [
+        "resource implementation is missing",
+        "implementation is missing",
+        "matching implementation",
+        "imports instance",
+        "unknown import",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle));
+    if origin.contains("(store object") && looks_like_a_shape_mismatch {
+        format!(
+            "{message} (this component may have been built for an older eo9 — try \
+             `eo9 store reseed`)"
+        )
+    } else {
+        message
+    }
 }
 
 /// Write the rendered outcome line to the channel selected by `--outcome` (stderr by
