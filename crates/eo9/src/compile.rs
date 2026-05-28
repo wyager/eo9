@@ -163,8 +163,19 @@ pub fn load_image(
     // Compile once, then try to cache the very image we are about to run. A run must
     // not fail just because the cache could not be written (read-only store, full disk,
     // serialization trouble): those paths warn and carry on with the compiled image.
-    let image = Image::compile(&engine, &source.bytes)
-        .map_err(|err| format!("{}: {err}", source.origin))?;
+    // Compile the `implements`-stripped form: a stored/loaded component whose plain-named
+    // slots (a renamed residual import, a multi-instance consumer) carry an annotation the
+    // pinned runtime cannot parse would otherwise fail codegen with an opaque error. The
+    // store object's identity and cache key stay keyed on the full bytes (above); only the
+    // bytes fed to the compiler change, and they are identical when there is no annotation,
+    // so a plain program compiles and caches exactly as before. Falls back to the raw bytes
+    // if the form cannot be reparsed (it will then fail in `Image::compile` with the real
+    // error rather than here).
+    let exec_bytes = eo9_component::Component::load(source.bytes.clone())
+        .map(|component| component.executable_bytes())
+        .unwrap_or_else(|_| source.bytes.clone());
+    let image =
+        Image::compile(&engine, &exec_bytes).map_err(|err| format!("{}: {err}", source.origin))?;
     let stored = match image.serialize() {
         Ok(artifact) => match store.insert_image(&params, &seal_artifact(&artifact)) {
             Ok(_) => {
