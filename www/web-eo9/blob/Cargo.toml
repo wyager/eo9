@@ -11,6 +11,15 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# In-blob codegen (plan/18: the fully self-hosted browser VM): link the same vendored
+# no_std Cranelift + wasmtime compile layers the bare-metal kernel uses for on-target
+# codegen, with cranelift's Pulley backend as the emission target — so a fused composition
+# is compiled *inside the blob*, client-side, with no server involvement. On by default for
+# the shipped blob; turn off to measure the runtime-only blob size.
+default = ["inblob-codegen"]
+inblob-codegen = ["wasmtime/cranelift"]
+
 [dependencies]
 # Declared directly (not via workspace inheritance) because this crate needs
 # `default-features = false`: wasmtime's `std` feature does not build for wasm32 (its std

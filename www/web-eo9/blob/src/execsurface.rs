@@ -84,6 +84,12 @@ fn artifact_for(raw: &[u8]) -> Option<Vec<u8>> {
         .map(|p| p.pulley.to_vec())
 }
 
+/// The raw component bytes of a `/bin` program (used by the in-blob codegen demo).
+#[cfg(feature = "inblob-codegen")]
+pub(crate) fn bin_raw(name: &str) -> Option<&'static [u8]> {
+    BIN.iter().find(|p| p.name == name).map(|p| p.raw)
+}
+
 /// Identify a loaded component by content hash as one of the named `/bin` store programs. eosh
 /// `load`s raw bytes (it never tells the blob the name), so this is how the blob recovers the
 /// name needed to ask the server to compile a composition over store-program names.
@@ -119,9 +125,11 @@ impl Prov {
     /// Render the full expression in the endpoint's grammar (`[only <csv> $] name ($ name)*`).
     fn render(&self) -> Option<String> {
         match self {
-            Prov::Only(ifaces, inner) => {
-                Some(format!("only {} $ {}", ifaces.join(","), inner.render_chain()?))
-            }
+            Prov::Only(ifaces, inner) => Some(format!(
+                "only {} $ {}",
+                ifaces.join(","),
+                inner.render_chain()?
+            )),
             other => other.render_chain(),
         }
     }
