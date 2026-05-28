@@ -376,3 +376,32 @@ the blob grows by entropy.seeded's raw+cwasm (~6.05 MiB raw / ~1.19 MiB brotli) 
 trim (serve `/bin` raw+cwasm from the HTTP store instead of embedding) is the recorded
 blob-size follow-up. Nit: eosh renders the refusal as `CompileError::Codegen(...)` (raw enum
 prefix) — an eosh-side rendering follow-up.
+
+## Decision 20 — server-side `/vm/compile` for in-browser `$`/`&` (DESIGN; not yet implemented)
+
+In-blob codegen is std/mmap-blocked, so a fused composition can't be compiled client-side
+(Decision 19's clean refusal). The path to actually running `entropy.seeded $ rng` in the
+browser is a bounded compile endpoint on the standalone `www` server (which has the full host
+toolchain). Design for the next focused pass (NOT done here — it's a server + blob + page
+feature that can't be implemented *and* verified within one fork's budget without shipping
+unverified code; #1 (only-narrowing) and #2 (provider in /bin) are done and verified instead):
+
+- **Server (`www/src`)**: a POST `/vm/compile` route. Body is a composition expressed over
+  **store program names + algebra ops** (e.g. `entropy.seeded $ rng`), NOT uploaded bytes.
+  The server: parses the expression with a small host-side parser (a minimal `name [--flag v]
+  { ($|&) name … }` / `only … $` reader — the eosh grammar is no_std guest code, so a tiny
+  host reader is cleaner than reusing it), resolves each name against a fixed allow-set of the
+  `/vm` store programs (reject anything not in the set), fuses with `eo9-component` (compose/
+  extend/restrict/configure), and compiles to a pulley32 image with the same web-compatible
+  engine config `xtask::preaot_for_web` uses (new dep: eo9-component + eo9-runtime, host-side).
+  Returns the `.cwasm` bytes. **Security (required)**: names restricted to the known store set;
+  request-size cap; a compile timeout; a small concurrency limit (semaphore) — so it can't be a
+  compile-bomb/DoS. Keep the existing security headers; add `connect-src 'self'` to the CSP for
+  the POST and verify the page still loads.
+- **Blob (`execsurface.rs` compile)**: on a fused (artifact-None) component, instead of the
+  flat refusal, POST the composition to `/vm/compile` via a JSPI `Suspending` host import
+  (the blob already fetches the store over HTTP), receive the pulley image, and run it through
+  the existing run-to-completion `spawn` path — honestly labelled "compiled on the server".
+- **Verify**: `entropy.seeded $ rng --count 3` at the browser prompt → server compiles → eosh
+  runs it → typed outcome, deterministic across runs (extend verify-eosh.mjs with a stub/real
+  `/vm/compile` responder, and a www server integration test for the route + its bounds).
