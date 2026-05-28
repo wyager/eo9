@@ -65,10 +65,11 @@ pub fn resolution_ns() -> u64 {
 }
 
 /// Arm the EL1 physical timer to assert its interrupt `delay_ns` from now, *unmasked* so it
-/// reaches the GIC and can wake a `wfi`. The kernel executor's idle path arms a short wake,
-/// executes `wfi`, and re-arms on the next loop — which, the generic-timer PPI being
-/// level-sensitive, deasserts the previous signal and clears the GIC pending state with no
-/// EOI needed (the interrupt is never taken as an exception; PSTATE.I stays masked).
+/// reaches the GIC and can wake a `wfi`. The kernel executor's idle path arms a wake, runs
+/// `wfi` with IRQ masked (so a pending timer/UART interrupt still wakes it — no lost-wakeup
+/// race), then unmasks: the pending timer IRQ is taken as an exception and serviced by `kirq`
+/// (src/exceptions.rs), which calls [`disable`] to drop the level-sensitive PPI line before
+/// the EOI; the next idle iteration re-arms it.
 // Used only by the wasm executor's idle path (src/wasm/mod.rs), which the feature-less CI
 // kernel build does not compile; keep it unconditional like the rest of the timer MMIO.
 #[cfg(target_os = "none")]

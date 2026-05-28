@@ -40,7 +40,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use wasmtime::component::{
@@ -60,6 +60,12 @@ type ConcurrentFuture<'a, R> = Pin<Box<dyn Future<Output = Result<R>> + Send + '
 pub const FUEL_QUANTUM: u64 = 10_000;
 
 /// Fuel budget for a child's instantiation (start-time code), mirroring usermode
+/// Hard cap on concurrently-live (running or checked-out) children across the machine, so a
+/// fork-bomb-style shell can't exhaust memory/drive-loop time by spawning without bound. A
+/// spawn past the cap is refused with a clear error; finished children free a slot. Generous
+/// enough for normal nesting (plan/12 D38 item 4).
+pub const MAX_LIVE_CHILDREN: usize = 64;
+
 /// `SPAWN_FUEL`: enough for the trivial start sections eo9 components have, small enough
 /// that a hostile component cannot burn unbounded CPU before `spawn` even returns.
 pub const SPAWN_FUEL: u64 = 4 * FUEL_QUANTUM;
@@ -392,6 +398,79 @@ enum ChildSlot {
 /// the children while the shell's own store is mutably borrowed by its in-flight call.
 static CHILDREN: KLock<Vec<Option<ChildSlot>>> = KLock::new(Vec::new());
 
+/// Parent rep per child, parallel to [`CHILDREN`] by index (`None` = spawned by the
+/// top-level shell, which is not itself in the registry). Lets `kill` cascade to descendants
+/// so killing a foreground nested eosh takes its children/grandchildren down with it rather
+/// than orphaning them on the drive loop (plan/12 D38 item 3). Kept as a parallel vector so
+/// the `ChildSlot` enum and the many `CHILDREN.with` sites are untouched.
+static PARENTS: KLock<Vec<Option<u32>>> = KLock::new(Vec::new());
+
+/// The rep currently being polled by [`drive_children`], so a nested spawn during that poll
+/// records its parent. `u32::MAX` means "no current child" (top-level shell spawns). Single
+/// core, set/cleared around each unlocked child poll, never nested (children do not call
+/// `drive_children`).
+static CURRENT_PARENT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Kill task `rep` and all its descendants (transitively, via [`PARENTS`]). Running/checked-out
+/// slots become `Done(Killed)` (dropping a checked-out drive future happens when its poll
+/// returns and sees the slot is no longer `Polling`); already-finished slots keep their
+/// outcome. Returns the target's resulting outcome (`Killed` if it was running, else its
+/// existing outcome, or `Killed` if the handle is unknown). Used by `task.kill` and the
+/// Ctrl-C path.
+fn kill_task_tree(rep: usize) -> KOutcome {
+    // Kill descendants first (depth doesn't matter — the registry is flat; we just need to
+    // catch every transitive child). Iterate to a fixed point so grandchildren are caught.
+    loop {
+        let killed_any = CHILDREN.with(|children| {
+            PARENTS.with(|parents| {
+                let mut killed = false;
+                for i in 0..children.len() {
+                    let is_descendant = is_descendant_of(parents, i, rep);
+                    if !is_descendant {
+                        continue;
+                    }
+                    if let Some(slot @ (ChildSlot::Running(_) | ChildSlot::Polling)) =
+                        children.get_mut(i).and_then(Option::as_mut)
+                    {
+                        *slot = ChildSlot::Done(KOutcome::Killed);
+                        killed = true;
+                    }
+                }
+                killed
+            })
+        });
+        if !killed_any {
+            break;
+        }
+    }
+    // Then the target itself.
+    CHILDREN.with(|children| match children.get_mut(rep) {
+        Some(slot) => match slot {
+            Some(ChildSlot::Done(outcome)) => outcome.clone(),
+            Some(ChildSlot::Running(_) | ChildSlot::Polling) => {
+                *slot = Some(ChildSlot::Done(KOutcome::Killed));
+                KOutcome::Killed
+            }
+            None => KOutcome::Killed,
+        },
+        None => KOutcome::Killed,
+    })
+}
+
+/// Whether child index `i` is a (transitive) descendant of `ancestor`, walking [`PARENTS`].
+/// Bounded by the registry length to be safe against any accidental cycle.
+fn is_descendant_of(parents: &[Option<u32>], i: usize, ancestor: usize) -> bool {
+    let mut cur = i;
+    for _ in 0..parents.len() {
+        match parents.get(cur).copied().flatten() {
+            Some(p) if p as usize == ancestor => return true,
+            Some(p) => cur = p as usize,
+            None => return false,
+        }
+    }
+    false
+}
+
 /// Waker used when polling one child drive. wasmtime re-polls the sub-futures whose waker
 /// was rung; in addition, this records *whether* the waker was rung at all during the poll,
 /// which is how [`drive_children`] tells a child that yielded on fuel (wants an immediate
@@ -426,6 +505,8 @@ pub struct DriveStatus {
 /// stale handle from a previous session cannot alias a new child).
 pub fn reset_children() {
     CHILDREN.with(|children| children.clear());
+    PARENTS.with(|parents| parents.clear());
+    CURRENT_PARENT.store(u32::MAX, Ordering::Release);
 }
 
 /// What one registry index held when [`drive_children`] looked at it.
@@ -487,7 +568,11 @@ pub fn drive_children() -> DriveStatus {
         });
         let waker = Waker::from(child_waker.clone());
         let mut cx = Context::from_waker(&waker);
+        // Record which child is running so a nested spawn during this poll records its parent
+        // (for kill-cascade). Restored after the poll; never nested (children don't drive).
+        CURRENT_PARENT.store(index as u32, Ordering::Release);
         let polled = drive.as_mut().poll(&mut cx);
+        CURRENT_PARENT.store(u32::MAX, Ordering::Release);
 
         let still_running = CHILDREN.with(|children| {
             let slot = &mut children[index];
@@ -716,6 +801,21 @@ fn spawn_child(
         })
     };
 
+    // Refuse before doing any work if the machine is already at the live-children cap, so a
+    // runaway shell can't exhaust resources by spawning without bound (plan/12 D38 item 4).
+    let live = CHILDREN.with(|children| {
+        children
+            .iter()
+            .filter(|slot| matches!(slot, Some(ChildSlot::Running(_) | ChildSlot::Polling)))
+            .count()
+    });
+    if live >= MAX_LIVE_CHILDREN {
+        return Err(WitSpawnError::Internal(format!(
+            "spawn refused: the live-task cap of {MAX_LIVE_CHILDREN} is reached \
+             (a task must finish or be killed before another can start)"
+        )));
+    }
+
     let mut linker: Linker<KernelState> = Linker::new(engine);
     providers::add_providers(&mut linker).map_err(internal)?;
     super::shellfs::add_buffers(&mut linker).map_err(internal)?;
@@ -813,9 +913,13 @@ fn spawn_child(
         }
     });
 
+    let parent = match CURRENT_PARENT.load(Ordering::Acquire) {
+        u32::MAX => None,
+        rep => Some(rep),
+    };
     let rep = CHILDREN.with(|children| {
         let index = children.iter().position(Option::is_none);
-        let index = match index {
+        match index {
             Some(index) => {
                 children[index] = Some(ChildSlot::Running(drive));
                 index
@@ -824,10 +928,16 @@ fn spawn_child(
                 children.push(Some(ChildSlot::Running(drive)));
                 children.len() - 1
             }
-        };
-        index as u32
+        }
     });
-    Ok(rep)
+    // Keep PARENTS index-aligned with CHILDREN (grow to cover `rep`).
+    PARENTS.with(|parents| {
+        if parents.len() <= rep {
+            parents.resize(rep + 1, None);
+        }
+        parents[rep] = parent;
+    });
+    Ok(rep as u32)
 }
 
 // -----------------------------------------------------------------------------------------
@@ -1540,6 +1650,16 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                     match observed {
                         Some(result) => Poll::Ready(result),
                         None => {
+                            // Ctrl-C at the console interrupts the foreground job: the shell
+                            // is parked here (not in `read-line`) while waiting on the child,
+                            // so a Ctrl-C in the RX ring means "kill what I'm waiting on" and
+                            // return to the prompt. Kills the awaited task and its descendants
+                            // (a foreground nested eosh takes its own children down with it),
+                            // mirroring `task.kill`.
+                            if crate::uart::take_ctrl_c() {
+                                let outcome = kill_task_tree(rep);
+                                return Poll::Ready(Ok(outcome));
+                            }
                             // The child makes progress on the shell's drive loop between
                             // polls of the shell; stay runnable so that loop keeps turning.
                             cx.waker().wake_by_ref();
@@ -1584,22 +1704,16 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
          -> ConcurrentFuture<'_, (WitProgramOutcome,)> {
             Box::pin(async move {
                 let rep = child.rep() as usize;
-                let outcome = CHILDREN.with(|children| match children.get_mut(rep) {
-                    Some(slot) => match slot {
-                        Some(ChildSlot::Done(outcome)) => Ok(outcome.clone()),
-                        Some(ChildSlot::Running(_) | ChildSlot::Polling) => {
-                            // Dropping the drive future drops the child's store, guest
-                            // state, and in-flight work (SPEC "Kill and linearity") — for a
-                            // child currently checked out by `drive_children`, that drop
-                            // happens when the poll returns and sees the slot is no longer
-                            // `Polling`.
-                            *slot = Some(ChildSlot::Done(KOutcome::Killed));
-                            Ok(KOutcome::Killed)
-                        }
-                        None => Err(wasmtime::Error::msg(format!("unknown task handle {rep}"))),
-                    },
-                    None => Err(wasmtime::Error::msg(format!("unknown task handle {rep}"))),
-                })?;
+                // Reject an unknown handle; otherwise kill the task and its descendants.
+                // Dropping a drive future drops the child's store, guest state, and in-flight
+                // work (SPEC "Kill and linearity"); for a child currently checked out by
+                // `drive_children`, that drop happens when its poll returns and sees the slot
+                // is no longer `Polling`.
+                let known = CHILDREN.with(|children| matches!(children.get(rep), Some(Some(_))));
+                if !known {
+                    return Err(wasmtime::Error::msg(format!("unknown task handle {rep}")));
+                }
+                let outcome = kill_task_tree(rep);
                 Ok((wit_outcome(&outcome),))
             })
         },
