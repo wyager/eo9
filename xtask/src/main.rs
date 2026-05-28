@@ -1782,11 +1782,14 @@ fn package(root: &Path) -> Result<(), String> {
     build_guest(root)?;
     check_components_bundle(root)?;
 
-    for krate in PUBLISH_CRATES {
-        run(root, "cargo", ["package", "--no-verify", "-p", krate])?;
+    // Leaf crates (all dependencies already on crates.io): a full dry-run publish, which
+    // packages and build-verifies each one. The resulting .crate files land in
+    // target/package, so their upload sizes can be reported.
+    for krate in PUBLISH_LEAF_CRATES {
+        run(root, "cargo", ["publish", "--dry-run", "-p", krate])?;
     }
-    println!("xtask: packaged crates (target/package):");
-    for krate in PUBLISH_CRATES {
+    println!("xtask: dry-run-verified leaf crates (target/package):");
+    for krate in PUBLISH_LEAF_CRATES {
         let crate_file = root
             .join("target")
             .join("package")
@@ -1798,8 +1801,13 @@ fn package(root: &Path) -> Result<(), String> {
         );
     }
 
-    for krate in PUBLISH_LEAF_CRATES {
-        run(root, "cargo", ["publish", "--dry-run", "-p", krate])?;
+    // The remaining crates depend on the ones above, so cargo cannot package or verify
+    // them until those are live on crates.io; validate their manifests and file lists.
+    for krate in PUBLISH_CRATES {
+        if PUBLISH_LEAF_CRATES.contains(krate) {
+            continue;
+        }
+        run(root, "cargo", ["package", "--list", "-p", krate])?;
     }
 
     println!(
@@ -1810,8 +1818,9 @@ fn package(root: &Path) -> Result<(), String> {
         println!("xtask:   cargo publish -p {krate}");
     }
     println!(
-        "xtask: note: only the leaf crates are dry-run-verified here — the others can only\n\
-         xtask: be fully verified by `cargo publish` once their dependencies are live."
+        "xtask: note: only the leaf crates are dry-run-verified here — cargo cannot verify\n\
+         xtask: the dependent crates until their dependencies are live on crates.io, so\n\
+         xtask: `cargo publish` performs that verification at publish time."
     );
     Ok(())
 }
