@@ -138,6 +138,12 @@ Operational notes:
 
 ## Deploying eo9.org (standalone)
 
+> The live eo9.org deployment now runs **behind Cloudflare** with a manual Cloudflare Origin
+> CA certificate (manual TLS mode), not the standalone Let's Encrypt setup described here —
+> see [Updating the live deployment](#updating-the-live-deployment) for the current layout.
+> This section documents the self-contained, direct-to-internet ACME deployment the server
+> also supports (and the way eo9.org ran before the Cloudflare migration).
+
 1. **DNS.** Point an `A`/`AAAA` record for `eo9.org` (and any extra domains you pass with
    `--domain`) at the host. Let's Encrypt validates by connecting to port 443 on that name.
 2. **Ports.** The server needs to bind 80 and 443. Either run it as root (not recommended),
@@ -192,26 +198,37 @@ identical.
 
 ### Updating the live deployment
 
-The production host (`root@eo9.org`) runs the **clone-in-place** variant of the steps
-above: the repository is cloned to `/opt/eo9`, the server is built there with the
-repo-pinned toolchain, and the systemd unit `eo9-www` runs the binary straight out of
-that build tree as the unprivileged `eo9www` user. The layout:
+The production host runs the **clone-in-place** variant of the steps above, but it now sits
+**behind Cloudflare**: the Cloudflare proxy terminates TLS for visitors and caches assets, and
+the origin presents a long-lived **Cloudflare Origin CA certificate** (manual TLS mode) rather
+than running ACME. The repository is cloned to `/opt/eo9`, built there with the repo-pinned
+toolchain, and the systemd unit `eo9-www` runs the binary straight out of that build tree as
+the unprivileged `eo9www` user.
+
+> **SSH to the origin by IP, not by name.** `eo9.org` resolves to Cloudflare's proxy, which
+> only forwards HTTP/HTTPS — `ssh root@eo9.org` will time out. Reach the box at its origin IP:
+> `ssh root@64.177.116.122`.
+
+The layout:
 
 | Path | What |
 |------|------|
 | `/opt/eo9` | the git clone (tracks `origin/master`) |
 | `/opt/eo9/www/target/release/eo9-www` | the built binary (the unit's `ExecStart`) |
 | `/opt/eo9/www/site` | the served site (`--site`) |
-| `/srv/eo9-www/acme-cache` | the Let's Encrypt cache — **outside** the clone, so it survives rebuilds |
-| `/etc/systemd/system/eo9-www.service` | the unit (`systemctl enable`d; starts on boot) |
+| `/srv/eo9-www/tls/{cert.pem,key.pem}` | the Cloudflare Origin CA cert + key (manual TLS); `key.pem` is `0600 eo9www` |
+| `/etc/systemd/system/eo9-www.service` | the unit (`systemctl enable`d; starts on boot). `eo9-www.service.acme.bak` is the previous ACME unit, kept for rollback |
 
-**Site content only** (anything under `www/site/`) — no rebuild and no restart. The
-server reads files from disk per request, so a pull is enough and the new content is
-served immediately:
+**Site content only** (anything under `www/site/`) — no rebuild and no restart. The server
+reads files from disk per request, so a pull is enough:
 
 ```sh
 cd /opt/eo9 && git pull
 ```
+
+Cloudflare caches static assets at its edge, so after changing a file you may need to **purge
+the Cloudflare cache** (dashboard → Caching → Configuration → Purge) for visitors to see it
+before the edge TTL lapses. (HTML is not edge-cached; static assets are.)
 
 **Server code or dependencies** (`www/src/`, `www/Cargo.toml`, `www/Cargo.lock`) — rebuild,
 then restart. Build as root (the SSH user); cargo selects the repo-pinned nightly
@@ -224,27 +241,40 @@ cd /opt/eo9/www && cargo build --release   # if `cargo` isn't found: . "$HOME/.c
 systemctl restart eo9-www
 ```
 
-A restart reuses the cached certificate (logs `acme: DeployedCachedCert`, no new ACME
-order), so it is a sub-second blip while the listener rebinds and never touches Let's
-Encrypt's rate limits.
+A restart just re-reads the certificate from disk and rebinds — a sub-second blip, no ACME and
+no rate limits. The Origin CA certificate is valid for ~15 years, so there is nothing to renew
+on this host; to rotate it, replace `/srv/eo9-www/tls/{cert.pem,key.pem}` (keep `key.pem` at
+`0600 eo9www`) and `systemctl restart eo9-www`.
 
 **Confirm it worked:**
 
 ```sh
 systemctl status eo9-www --no-pager
-journalctl -u eo9-www -n 20 --no-pager        # startup line + any `acme:` events
-curl -sI https://eo9.org/ | head -1           # expect: HTTP/1.1 200 OK
+journalctl -u eo9-www -n 20 --no-pager           # expect the "serving … on https://…" line
+curl -sI https://eo9.org/ | head -1              # through Cloudflare; expect HTTP/2 200
+echo | openssl s_client -connect 64.177.116.122:443 -servername eo9.org 2>/dev/null \
+  | openssl x509 -noout -issuer                  # origin should present the CloudFlare Origin CA cert
 ```
 
-If `git pull` ever reports local changes (e.g. an out-of-band edit to `Cargo.lock`),
-reconcile the clone to the remote with `git fetch origin master && git reset --hard
-origin/master` — the build tree should carry nothing that diverges from `origin/master`,
-and the certificate cache lives outside it, so this is safe.
+If `git pull` ever reports local changes (e.g. an out-of-band edit to `Cargo.lock`), reconcile
+the clone to the remote with `git fetch origin master && git reset --hard origin/master` — the
+build tree should carry nothing that diverges from `origin/master`, and the certificate lives
+outside it (`/srv/eo9-www/tls`), so this is safe.
 
-> **Heads-up on `cargo update`.** `www/Cargo.lock` pins `http = 1.4.0` on purpose: `http`
-> 1.4.1 makes `async-web-client` (pulled in by `rustls-acme`) panic during a live ACME
-> order. Don't let a `cargo update` bump it back without re-validating certificate issuance
-> against Let's Encrypt staging (`--acme-staging`, a separate `--acme-cache`).
+**Cloudflare caching.** Cloudflare edge-caches `.js`/`.css`/images by file extension
+automatically, but **not `.wasm`** — including the eo9 VM at `/vm/web-eo9.wasm`. To cache the
+wasm blobs, add a Cache Rule (dashboard → Caching → Cache Rules) matching e.g.
+`ends_with(http.request.uri.path, ".wasm")` with *Cache eligibility: Eligible for cache*; the
+origin already sends `Cache-Control: public, max-age=86400`, which Cloudflare then honors.
+Keep the SSL/TLS mode at **Full (strict)** so the Origin CA cert is validated. Confirm with
+`curl -sI https://eo9.org/vm/web-eo9.wasm | grep -i cf-cache-status` (expect `HIT` after the
+first request).
+
+> **Heads-up on `cargo update` (ACME mode only).** `www/Cargo.lock` pins `http = 1.4.0` on
+> purpose: `http` 1.4.1 makes `async-web-client` (pulled in by `rustls-acme`) panic during a
+> live ACME order. The live host no longer uses ACME (it serves a Cloudflare Origin CA cert),
+> but ACME mode still exists in the binary, so don't let a `cargo update` bump `http` back
+> without re-validating ACME against Let's Encrypt staging (`--acme-staging`).
 
 **Built-in limits.** Each listener caps concurrent connections at 256 and applies deadlines:
 10 s for a TLS handshake, 10 s to read a request's headers (which also bounds idle
