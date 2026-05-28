@@ -57,6 +57,14 @@ pub fn encode_text(ty: &str, text: &str, bare: bool) -> String {
     if ty == "string" {
         return quote_string(text);
     }
+    if is_string_list(ty) && !text.trim_start().starts_with('[') {
+        // A single token for a `list<string>` parameter is the one-element list — the
+        // named-flag spelling of the variadic tail (`cat --paths a.txt`).
+        let mut out = String::from("[");
+        out.push_str(&quote_string(text));
+        out.push(']');
+        return out;
+    }
     String::from(text)
 }
 
@@ -72,6 +80,28 @@ pub fn encode_arg_value(ty: &str, value: &ArgValue) -> Option<String> {
 /// The WAVE text for an omitted `option<…>` parameter.
 pub fn none_value() -> String {
     String::from("none")
+}
+
+/// Is `ty` the `list<string>` shape the variadic-tail convention applies to?
+pub fn is_string_list(ty: &str) -> bool {
+    ty.trim()
+        .strip_prefix("list<")
+        .and_then(|rest| rest.strip_suffix(">"))
+        .map(|inner| inner.trim() == "string")
+        .unwrap_or(false)
+}
+
+/// Build the WAVE text for a `list<string>` value out of element tokens (each is quoted).
+pub fn string_list(elements: &[String]) -> String {
+    let mut out = String::from("[");
+    for (index, element) in elements.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&quote_string(element));
+    }
+    out.push(']');
+    out
 }
 
 /// Is `ty` an `option<…>` type? Returns the inner type text if so.
