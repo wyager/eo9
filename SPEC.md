@@ -103,7 +103,7 @@ A WASM module's only channel to the outside world is its imports: core WASM has 
 
 The WASM module imports the set of OS APIs it wants access to. Required OS APIs are imported directly; optional OS APIs are imported through the API's `-optional` flavor, so optionality is visible both in the import list and in the types (see *The capability algebra*). We use WIT (the Component Model's interface-definition language) for import/export specification; a WIT `world` is precisely the declaration of which APIs, by name and type, a program requires and provides.
 
-Every Eo9 module is exactly one of two kinds. A **binary** exports a `main` entrypoint, which we invoke to run it; `main` returns a `result<program-success, program-failure>` whose success and failure types are defined by the program itself (typically variants), so a program reports its outcome in its own structured vocabulary rather than through a lossy numeric exit code. A **provider** instead exports OS-API interfaces (plus a `configure` entry) for composition into other modules, and is never run directly. A module is never both — see *Composition and the `$` operator*. Both entrypoints — `main` and `configure` — are declared `async`: in the Component Model's async ABI, whether an export may block is part of its type, and anything that performs I/O must therefore be async-lifted.
+Every Eo9 module is exactly one of two kinds. A **binary** exports a `main` entrypoint, which we invoke to run it; `main` returns a `result<program-success, program-failure>` whose success and failure types are defined by the program itself (typically variants), so a program reports its outcome in its own structured vocabulary rather than through a lossy numeric exit code. A **provider** instead exports OS-API interfaces (plus a `configure` entry) for composition into other modules, and is never run directly. A module is never both — see *Composition and the `$` operator*. `main` is declared `async` (in the Component Model's async ABI, whether an export may block is part of its type, and anything that performs I/O must be async-lifted). `configure`, by contrast, is **synchronous and deliberately minimal**: it binds compile-time constants into a provider and must not block or perform I/O, so making it async bought nothing and in fact made nested-configured compositions untypable (a sync caller cannot wait on a parked async `configure`). `configure` is a wart we keep small on purpose — the less it can do, the better; anything a provider needs to do dynamically belongs in its API, lazily, not in `configure`.
 
 At load time, the OS scans the imports and ensures that, for each one, we know how to provide a resource of the specified name and type. Anything we cannot satisfy is rejected before execution.
 
@@ -312,7 +312,7 @@ package eo9:virtualfs@1.0.0 {
         // configuration is a small exported interface; its `configure` returns the fs-impl
         // handle that `default()` then hands out (a bare world-level export cannot mint
         // handles of a resource type the world merely `use`s from an import):
-        export config;   // config.configure: async func(dir: string) -> result<fs-impl, config-error>
+        export config;   // config.configure: func(dir: string) -> result<fs-impl, config-error>  (sync — binds constants)
     }
 
     // a binary tool — addressed as `virtualfs.create`

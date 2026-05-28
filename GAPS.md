@@ -8,28 +8,24 @@ nested-eosh-on-metal / web-hardening / CDN-caching batch)._
 
 ## Decisions pending with the owner
 
-- **Package-level `only` shorthand**: should `only eo9:text` be accepted (expanding to the package's
-  interfaces) or keep requiring full refs (`eo9:text/text`)? Every study persona tripped on it; README uses
-  the full form meanwhile. (synthesis #20)
-- **`describe` wiring/attenuator view**: `describe fs.readonly $ cat` is indistinguishable from
-  `describe cat` — interposed attenuators are invisible in the residual import surface. Security and PL
-  personas both want an audit view. (synthesis #7, study 05 #9)
-- **Roadmap ordering**: child-fuel/preemption is now done (the embedded persona's #1 blocker is closed); the
-  open question is whether real-board bring-up jumps ahead of the riscv64/x86_64 QEMU ports. (synthesis #14)
-- **Shell `-c` outcome format + exit codes**: unify eosh's `ok:`/`error:` rendering with `run`'s WAVE
-  format and propagate honest 0/1/2/3 exit codes through `shell -c` (needs a small eosh-world variant
-  addition). (plan/11 D14)
-- **Guest panic-message channel**: preserving panic text needs either a hidden import (violates the
-  capability model) or a small diagnostic ABI — design call. (plan/10 D10)
-- **Child-grant visibility / entropy opt-in**: children inherit the full session environment by design;
-  the embedded persona suggested printing the grant at spawn or making entropy opt-in. Decide whether
-  spawn-time visibility is enough. (synthesis #8)
 - **Compose-time vs run-time provider parameters.** Changing a seed changes the composed artifact and forces
   a recompile. Owner parked the "late-bound parameter" idea until there is a clean design; revisit if
   deterministic sweeps start thrashing the compile cache.
 
 ## Settled directions (recorded so they're not re-litigated)
 
+- **Owner rulings 2026-05-27 (the open design calls):** (1) **`configure` becomes synchronous and minimal** —
+  it binds compile-time constants, must not block/perform I/O; this fixes bug 1 and is the intended
+  minimization of a wart (SPEC updated; implementation in flight: wit `*-config` + stubs + binder).
+  (2) **Guest panic messages** via a minimal executor-mediated diagnostic surfaced through the existing
+  `abnormal(trapped(reason))` arm (no hidden import). (3) **`describe` gets a full composition/wiring tree**
+  (retain provenance through the algebra; show each layer, what it satisfies, what it seals/attenuates) —
+  queued behind the in-flight design-calls branch (eosh/CLI overlap). (4) **Entropy stays in the default
+  child set** — the grant is inert for programs that don't import it; spawn-time visibility (in flight)
+  handles the optics; no entropy-opt-in. (5) **Roadmap order: depth → breadth → real hardware** — finish the
+  D38 metal hardening first, then the riscv64/x86_64 QEMU ports, then real-board bring-up (owner will obtain
+  an aarch64 board once the demos look good). `only` package shorthand and `-c` exit-code/format unification
+  are owner-approved and in flight on the design-calls branch.
 - **The in-browser real-stack VM shipped** (supersedes the 2026-05-26 "/try v2 deferred" ruling): the owner
   re-opened it on 2026-05-27; the wasm32+Pulley blob runs on `/vm` through milestone 2 (fiberless callback
   execution behind an off-by-default vendored feature, browser root providers, HTTP program store, JSPI
