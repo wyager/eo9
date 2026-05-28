@@ -48,6 +48,20 @@
         <option value="cruncher">cruncher — pure compute</option>
         <option value="outcomes">outcomes — typed failure paths</option>
         <option value="readwrite">readwrite — in-memory filesystem (fs + io)</option>
+        <optgroup label="coreutils (real Eo9 programs, run against the in-memory fs)">
+          <option value="cat">cat — read a file (fs + text)</option>
+          <option value="ls">ls — list a directory (fs + text)</option>
+          <option value="echo">echo — text only</option>
+          <option value="rng">rng — entropy + text</option>
+          <option value="wc">wc — count lines/words/bytes (fs)</option>
+          <option value="head">head — first N lines (fs)</option>
+          <option value="cp">cp — copy a file (fs)</option>
+          <option value="mkdir">mkdir — create a directory (fs)</option>
+          <option value="rm">rm — remove a path (fs)</option>
+          <option value="touch">touch — create an empty file (fs)</option>
+          <option value="stat">stat — node metadata (fs)</option>
+          <option value="find">find — recursive search (fs)</option>
+        </optgroup>
       </select>
       <label for="program-args">args</label>
       <input id="program-args" type="text" value="browser true" size="22" spellcheck="false">

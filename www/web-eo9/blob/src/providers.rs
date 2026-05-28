@@ -51,7 +51,7 @@ pub struct WebState {
 impl WebState {
     pub fn new() -> Self {
         WebState {
-            fs: crate::fs::MemFs::new(),
+            fs: crate::fs::MemFs::seeded(),
             buffers: crate::fs::BufferTable::default(),
         }
     }
