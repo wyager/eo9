@@ -30,6 +30,15 @@ wasmtime-environ = { path = "../../kernel/vendor/wasmtime-environ" }
 wasmtime-internal-cranelift = { path = "../../kernel/vendor/wasmtime-cranelift" }
 cranelift-frontend = { path = "../../kernel/vendor/cranelift-frontend" }
 wasmtime-internal-unwinder = { path = "../../kernel/vendor/wasmtime-unwinder" }
+# The component-algebra closure (plan/18 D14): the blob hosts the `eo9:exec` surface eosh
+# imports, backed by `eo9-component`. Its no_std closure is the same de-std'd vendored set
+# the kernel uses (kernel/vendor/), patched here so the algebra builds for wasm32 alongside
+# the vendored wasmtime family (verified to coexist in the unified graph, plan/18 D14).
+wit-parser = { path = "../../kernel/vendor/wit-parser" }
+wac-types = { path = "../../kernel/vendor/wac-types" }
+wac-graph = { path = "../../kernel/vendor/wac-graph" }
+wit-component = { path = "../../kernel/vendor/wit-component" }
+wasm-wave = { path = "../../kernel/vendor/wasm-wave" }
 
 [profile.release]
 opt-level = "s"

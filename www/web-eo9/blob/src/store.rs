@@ -62,7 +62,7 @@ fn parse_args(kinds: &[ArgKind], raw: &[&str]) -> Result<Vec<Val>, String> {
 
 /// Render a component value the way the native CLI renders outcomes (close enough for the
 /// terminal: variant names with payloads, strings quoted).
-fn render_val(value: &Val) -> String {
+pub(crate) fn render_val(value: &Val) -> String {
     match value {
         Val::Bool(v) => v.to_string(),
         Val::U8(v) => v.to_string(),

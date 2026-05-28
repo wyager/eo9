@@ -1,5 +1,5 @@
 {
-  "blob": "/vm/web-eo9.6e39489de6c40bdc.wasm",
+  "blob": "/vm/web-eo9.499b4d73ea6bf72d.wasm",
   "store": {
     "cruncher": "/vm/store/cruncher.c9cd26b092f3ec15.cwasm",
     "hello": "/vm/store/hello.ad989e33ee2f4660.cwasm",
