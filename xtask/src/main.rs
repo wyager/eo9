@@ -63,6 +63,13 @@ const KERNEL_CHECK_TARGET: &str = "aarch64-unknown-none";
 /// Architectures accepted by `build-kernel` and `qemu` (QEMU bring-up order).
 const KERNEL_ARCHES: &[&str] = &["aarch64", "riscv64", "x86_64"];
 
+/// The wasm-tools CLI family the repo is pinned to (plan/01 Decisions: the 0.250 crate
+/// family ships as CLI 1.250.x). `doctor` warns — but does not fail — on a mismatch.
+const PINNED_WASM_TOOLS_CLI: &str = "1.250";
+
+/// Minimum node major version needed by the /vm verify harnesses (they rely on JSPI).
+const MIN_NODE_MAJOR: u32 = 25;
+
 /// Components baked into the kernel's read-only store image: (guest package, shell name).
 /// The shell names follow the same convention the usermode store seeding uses
 /// (`eo9-example-hello` → `hello`, `eo9-stub-entropy-seeded` → `entropy.seeded`).
@@ -155,6 +162,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("ci", rest)?;
             ci(&root)
         }
+        "doctor" => {
+            expect_no_args("doctor", rest)?;
+            doctor(&root)
+        }
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -204,6 +215,9 @@ COMMANDS:
     fmt [--check]        Run `cargo fmt --all` in all three workspaces
     lint                 Run `cargo clippy -D warnings` in all three workspaces
     ci                   The merge gate: fmt --check, lint, build, build-guest, test
+    doctor               Check the host prerequisites (rustup, the pinned nightly, the wasm32
+                         target, the wasm-tools CLI; QEMU and node are optional) and print
+                         install hints for anything missing
     help                 Show this message
 
 ARCHES: {}",
@@ -214,6 +228,184 @@ ARCHES: {}",
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
+
+/// `cargo xtask doctor`: check the host tools and toolchains the repo needs and print an
+/// install hint for anything missing. Required: rustup, the wasm32 guest target on the
+/// pinned toolchain, the `wasm-tools` CLI. Informational: the pinned nightly and the
+/// bare-metal target (rustup installs both automatically when first needed), QEMU (only for
+/// `make qemu`), and node ≥ {MIN_NODE_MAJOR} (only for the /vm verify harnesses).
+fn doctor(root: &Path) -> Result<(), String> {
+    println!("xtask doctor — checking the host tools and toolchains this repository needs\n");
+    let mut missing: Vec<&str> = Vec::new();
+
+    // rustup itself.
+    let have_rustup = probe(root, "rustup", &["--version"]).is_some();
+    if have_rustup {
+        println!("  ok       rustup");
+    } else {
+        println!("  MISSING  rustup — install it from https://rustup.rs");
+        missing.push("rustup");
+    }
+
+    // The pinned nightly (informational: rustup auto-installs it on the first build).
+    let channel = pinned_channel(root);
+    let mut toolchain_installed = false;
+    if have_rustup {
+        match &channel {
+            Some(channel) => {
+                toolchain_installed = probe(root, "rustup", &["toolchain", "list"])
+                    .map(|out| out.lines().any(|line| line.starts_with(channel.as_str())))
+                    .unwrap_or(false);
+                if toolchain_installed {
+                    println!("  ok       pinned toolchain {channel}");
+                } else {
+                    println!(
+                        "  note     pinned toolchain {channel} is not installed yet — rustup installs \
+                         it automatically on the first build (or run `rustup toolchain install {channel}`)"
+                    );
+                }
+            }
+            None => println!(
+                "  warn     could not read the pinned channel from rust-toolchain.toml — \
+                 toolchain checks skipped"
+            ),
+        }
+    }
+
+    // Targets on the pinned (root-resolved) toolchain. build-guest and the web demos need
+    // the wasm32 target on the root pin (guest/ and kernel/ declare their own targets in
+    // their rust-toolchain.toml, so rustup adds those automatically when they are used).
+    if have_rustup && toolchain_installed {
+        let installed_targets = probe(root, "rustup", &["target", "list", "--installed"]);
+        let has_target = |target: &str| {
+            installed_targets
+                .as_deref()
+                .map(|out| out.lines().any(|line| line.trim() == target))
+                .unwrap_or(false)
+        };
+        if has_target(GUEST_TARGET) {
+            println!("  ok       {GUEST_TARGET} target");
+        } else {
+            println!(
+                "  MISSING  {GUEST_TARGET} target — run `rustup target add {GUEST_TARGET}` \
+                 (or `make setup`)"
+            );
+            missing.push(GUEST_TARGET);
+        }
+        if has_target(KERNEL_CHECK_TARGET) {
+            println!("  ok       {KERNEL_CHECK_TARGET} target");
+        } else {
+            println!(
+                "  note     {KERNEL_CHECK_TARGET} target not installed yet — \
+                 kernel/rust-toolchain.toml declares it, so rustup adds it on the first \
+                 `make qemu` / `cargo xtask build-kernel`"
+            );
+        }
+    } else if have_rustup {
+        println!("  note     target checks skipped until the pinned toolchain is installed");
+    }
+
+    // The wasm-tools CLI componentizes and validates every guest crate (plan/01 D3).
+    match probe(root, "wasm-tools", &["--version"]) {
+        Some(version) => {
+            let version = version.trim().to_string();
+            let pinned_family = version
+                .strip_prefix("wasm-tools ")
+                .map(|v| v.starts_with(PINNED_WASM_TOOLS_CLI))
+                .unwrap_or(false);
+            if pinned_family {
+                println!("  ok       {version}");
+            } else {
+                println!(
+                    "  warn     {version} — the repo is pinned to the {PINNED_WASM_TOOLS_CLI}.x \
+                     family (plan/01 Decisions); a newer CLI usually works, but match the pin if \
+                     component validation flags complain"
+                );
+            }
+        }
+        None => {
+            println!(
+                "  MISSING  wasm-tools — run `cargo install --locked wasm-tools` (or `make setup`)"
+            );
+            missing.push("wasm-tools");
+        }
+    }
+
+    // Optional: QEMU, only needed to boot the bare-metal kernel.
+    match probe(root, "qemu-system-aarch64", &["--version"]) {
+        Some(version) => println!(
+            "  ok       {}",
+            version
+                .lines()
+                .next()
+                .unwrap_or("qemu-system-aarch64")
+                .trim()
+        ),
+        None => println!(
+            "  optional qemu-system-aarch64 not found — only needed for `make qemu`; install QEMU \
+             with your package manager (e.g. `brew install qemu` / `apt install qemu-system-arm`)"
+        ),
+    }
+
+    // Optional: node, only needed to run the /vm verify harnesses (they rely on JSPI).
+    match probe(root, "node", &["--version"]) {
+        Some(version) => {
+            let version = version.trim().to_string();
+            let major = version
+                .trim_start_matches('v')
+                .split('.')
+                .next()
+                .and_then(|m| m.parse::<u32>().ok())
+                .unwrap_or(0);
+            if major >= MIN_NODE_MAJOR {
+                println!("  ok       node {version}");
+            } else {
+                println!(
+                    "  optional node {version} found, but the /vm verify harnesses need \
+                     node >= {MIN_NODE_MAJOR} (JSPI)"
+                );
+            }
+        }
+        None => println!(
+            "  optional node not found — only needed to run the /vm verify harnesses \
+             (node >= {MIN_NODE_MAJOR})"
+        ),
+    }
+
+    println!();
+    if missing.is_empty() {
+        println!("xtask: doctor: everything required is installed");
+        Ok(())
+    } else {
+        Err(format!(
+            "doctor: missing required tools: {} — run `make setup` and re-check",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// Run a doctor probe, returning its stdout on success and `None` if the tool could not be
+/// spawned or exited non-zero. Probes never fail `doctor` directly — absence is reported.
+fn probe(dir: &Path, program: &str, args: &[&str]) -> Option<String> {
+    Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The `channel = "…"` line of the repo-root rust-toolchain.toml, if readable.
+fn pinned_channel(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("rust-toolchain.toml")).ok()?;
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("channel")?.trim_start();
+        let rest = rest.strip_prefix('=')?.trim();
+        Some(rest.trim_matches('"').to_string())
+    })
+}
 
 fn build(root: &Path) -> Result<(), String> {
     run(root, "cargo", ["build", "--workspace"])?;
@@ -1392,7 +1584,19 @@ where
         .env_remove("RUSTUP_TOOLCHAIN")
         .envs(envs.iter().map(|(key, value)| (key, *value)))
         .status()
-        .map_err(|err| format!("failed to run `{program} {shown}`: {err}"))?;
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                // A missing host tool (wasm-tools, qemu, …) used to surface as a bare
+                // "No such file or directory (os error 2)", which reads like a missing
+                // input file. Point at the setup path instead (plan/01 D10/D11).
+                format!(
+                    "`{program}` not found — run `make setup` (or `cargo xtask doctor`) to \
+                     install the host tools this command needs"
+                )
+            } else {
+                format!("failed to run `{program} {shown}`: {err}")
+            }
+        })?;
 
     if status.success() {
         Ok(())

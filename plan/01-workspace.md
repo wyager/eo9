@@ -90,3 +90,12 @@ None. Everything else depends on this.
     committed and reproducible); `make www-build` is the rebuild-from-source variant. README gained a
     "Quick start" table + a Prerequisites note. A `cargo xtask doctor` subcommand and friendlier xtask
     spawn errors remain a queued follow-up (xtask was owned by other work when this landed).
+11. **`cargo xtask doctor` + friendly missing-tool errors** (the D10 follow-up). `doctor` checks the host
+    prerequisites — rustup, the pinned nightly (informational; rustup auto-installs it), the
+    `wasm32-unknown-unknown` target on the root pin, the `aarch64-unknown-none` target (informational;
+    kernel/rust-toolchain.toml auto-adds it), the `wasm-tools` CLI (warning, not failing, when its version is
+    outside the pinned 1.250.x family), plus optional `qemu-system-aarch64` and node ≥ 25 for the /vm
+    harnesses — and exits non-zero with a per-item install hint when a required tool is missing. `make setup`
+    ends by printing the doctor summary. Every external tool xtask spawns now maps the could-not-spawn
+    (ENOENT) case to "`<tool>` not found — run `make setup` (or `cargo xtask doctor`)" instead of a raw
+    `os error 2`, closing the opaque-failure path from D10.
