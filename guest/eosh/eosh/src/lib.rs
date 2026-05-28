@@ -388,13 +388,17 @@ impl Guest for Eosh {
 
         match command {
             // One-shot mode: run the single command line and report its result as the
-            // shell's own outcome.
-            Some(line) => match session.execute_line(&line).await {
-                LineResult::Ok | LineResult::Exit => Ok(ProgramSuccess::Exited),
-                LineResult::ProgramFailed(rendered) | LineResult::Error(rendered) => {
-                    Err(ProgramFailure::CommandFailed(rendered))
+            // shell's own outcome. The per-command outcome line goes to stderr so a `-c`
+            // invocation's stdout carries only the program's own output (matching `eo9 run`).
+            Some(line) => {
+                session.route_outcome_to_stderr();
+                match session.execute_line(&line).await {
+                    LineResult::Ok | LineResult::Exit => Ok(ProgramSuccess::Exited),
+                    LineResult::ProgramFailed(rendered) | LineResult::Error(rendered) => {
+                        Err(ProgramFailure::CommandFailed(rendered))
+                    }
                 }
-            },
+            }
             // Interactive mode: read lines until end of input or `exit`.
             None => {
                 let text = text::default();

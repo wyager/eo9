@@ -622,7 +622,37 @@ fn shell_runs_a_program_by_bare_name() {
     );
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
     assert!(run.stdout.contains("Hello, shell!"), "{}", run.stdout);
-    assert!(run.stdout.contains("ok: greeted"), "{}", run.stdout);
+    // The program's output is on stdout; the per-command outcome line is on stderr in
+    // one-shot mode (so `-c` pipes carry only program output, like `eo9 run`).
+    assert!(run.stderr.contains("ok: greeted"), "{}", run.stderr);
+    assert!(!run.stdout.contains("ok: greeted"), "{}", run.stdout);
+}
+
+#[test]
+fn shell_verbose_announces_child_grants() {
+    // `-v` makes the capability set children inherit visible at spawn time (user-study
+    // finding #8); a default run stays quiet (the full picture is still in `env`).
+    let store = temp_store("shell-vgrants");
+    let verbose = eo9(
+        &store,
+        &["-v", "shell", "-c", "hello --name v --excited true"],
+    );
+    assert_eq!(verbose.code, 0, "stderr: {}", verbose.stderr);
+    assert!(
+        verbose
+            .stderr
+            .contains("children spawned from this shell inherit"),
+        "verbose run should announce child grants: {}",
+        verbose.stderr
+    );
+    let quiet = eo9(&store, &["shell", "-c", "hello --name v --excited true"]);
+    assert!(
+        !quiet
+            .stderr
+            .contains("children spawned from this shell inherit"),
+        "non-verbose run should stay quiet: {}",
+        quiet.stderr
+    );
 }
 
 #[test]
@@ -653,7 +683,7 @@ fn shell_composes_with_the_algebra() {
         ],
     );
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
-    assert!(run.stdout.contains("ok: digest("), "{}", run.stdout);
+    assert!(run.stderr.contains("ok: digest("), "{}", run.stderr);
 
     let direct = eo9(
         &store,
@@ -678,7 +708,7 @@ fn shell_composes_with_the_algebra() {
             })
             .expect("a digest in the output")
     };
-    assert_eq!(digest(&run.stdout), digest(&direct.stderr));
+    assert_eq!(digest(&run.stderr), digest(&direct.stderr));
 }
 
 #[test]
@@ -689,14 +719,17 @@ fn shell_maps_child_failures_to_exit_code_1() {
         &["shell", "-c", "outcomes --mode fail --detail boom"],
     );
     assert_eq!(failed.code, 1, "stdout: {}", failed.stdout);
+    // eosh surfaces the command's own outcome on stderr; the exit code (1) carries the
+    // failure. The embedder no longer re-prints a redundant `failure(command-failed(…))`
+    // wrapper "one layer down" (a user-study finding).
     assert!(
-        failed.stdout.contains("error: requested-failure(\"boom\")"),
+        failed.stderr.contains("error: requested-failure(\"boom\")"),
         "{}",
-        failed.stdout
+        failed.stderr
     );
     assert!(
-        failed.stderr.contains("failure(command-failed("),
-        "the shell's own outcome should be a failure: {}",
+        !failed.stderr.contains("command-failed"),
+        "the redundant command-failed wrapper should not be re-printed: {}",
         failed.stderr
     );
 
@@ -826,7 +859,7 @@ fn shell_resolves_store_bound_names_and_eosh_from_the_store() {
     );
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
     assert!(run.stdout.contains("Hello, store."), "{}", run.stdout);
-    assert!(run.stdout.contains("ok: greeted"), "{}", run.stdout);
+    assert!(run.stderr.contains("ok: greeted"), "{}", run.stderr);
 
     // The session bin view lives under the store root and holds the bound names.
     assert!(store.join("shell/bin/greeter.wasm").is_file());
@@ -1190,9 +1223,9 @@ fn default_invocations_run_the_shell_and_programs() {
         one_shot.stdout
     );
     assert!(
-        one_shot.stdout.contains("ok: greeted"),
+        one_shot.stderr.contains("ok: greeted"),
         "{}",
-        one_shot.stdout
+        one_shot.stderr
     );
 
     // `eo9 <path> [--flag value …]` is an implicit `run`.

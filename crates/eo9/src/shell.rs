@@ -72,6 +72,19 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
     let loaded = compile::load_image(cfg, &store, &eosh)?;
     let shell_providers = providers::shell_providers(cfg, &session_root, &loaded.image, editor)?;
 
+    // Spawn-time visibility of what children inherit (user-study finding #8): the full
+    // picture is in the session manifest that `env` renders, but a `-v` line states it up
+    // front so it is not silent. Children get exactly what `only` can then restrict.
+    vlog!(
+        cfg,
+        "children spawned from this shell inherit: text, time, entropy, fs ({}), and the \
+         full exec surface (component algebra, compile, spawn); restrict any command with `only`",
+        match &cfg.fs_root {
+            Some(root) => format!("/bin read-only + {} writable", root.display()),
+            None => "/bin read-only, no writable data root".to_string(),
+        }
+    );
+
     // eosh's single argument: `command: option<string>` — interactive REPL when absent,
     // one-shot command when present.
     let command_value = match &command {
@@ -89,12 +102,25 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
 
     let outcome = run::drive_to_completion(cfg, &mut task);
     let (rendered, code) = run::render_outcome(&outcome);
+    let one_shot = command.is_some();
     match &outcome {
         // A clean shell exit stays quiet: everything worth seeing was already printed by
         // eosh (and its children) through the text capability.
         Outcome::Success(_) => vlog!(cfg, "shell outcome: {rendered}"),
+        // One-shot (`-c`): eosh already surfaced the command's own outcome (on stderr) and
+        // the program's output, so re-printing eosh's `failure(command-failed(…))` wrapper
+        // here is the redundant "outcome one layer down" the user studies flagged — the
+        // exit code below carries it instead. An unexpected eosh trap/kill (which eosh
+        // could not report itself) still falls through to be surfaced.
+        Outcome::Failure(_) if one_shot => vlog!(cfg, "shell outcome: {rendered}"),
         _ => run::print_outcome(cfg, &rendered),
     }
+    // Exit-code contract for `-c`, matching `eo9 run`: 0 success, 1 the command failed,
+    // 2 eosh itself trapped/was killed, 3 an eo9-level error before eosh produced an
+    // outcome (returned earlier as `Err`). Honest failure-vs-abnormal granularity for the
+    // *inner* command (1 vs 2) and a distinct code for "eosh couldn't run it" (3) would
+    // need eosh's world to carry the inner command's three-way class — a WIT change to
+    // `eo9-eosh:eosh` recorded in plan/11 D14; today both collapse to this command-failed = 1.
     Ok(code)
 }
 

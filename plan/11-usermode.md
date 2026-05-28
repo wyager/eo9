@@ -199,6 +199,22 @@ its first milestones, and to be the place where cross-area seams get found.
     WAVE outcome format, and propagating the child's 0/1/2/3 exit code through `shell -c` (today a failed or
     trapped child both exit 1 via eosh's `command-failed`); needs a small eosh-world variant addition.
 
+16. **`shell -c` ergonomics + child-grant visibility (2026-05-27 design-call batch).** (a) **One-shot outcome
+    placement:** eosh routes its per-command outcome line (`ok:`/`error:`) to **stderr** in one-shot mode
+    (`Session::route_outcome_to_stderr`, set by eosh's `main` when `--command` is given) so a `-c` invocation's
+    stdout carries only the program's own output — matching `eo9 run`. Interactive mode keeps the outcome on
+    stdout. (b) **No redundant wrapper:** `cmd_shell` no longer re-prints eosh's `failure(command-failed(…))`
+    wrapper in one-shot mode (eosh already surfaced the command's outcome on stderr); the exit code carries
+    it. An unexpected eosh trap/kill is still surfaced. (c) **Exit codes:** `shell -c` already returns 0
+    success / 1 command-failed / 2 eosh-trapped / 3 eo9-error via `render_outcome`. The remaining gap — honest
+    1-vs-2 for the *inner* command's failure-vs-abnormal, and a distinct 3 for "eosh couldn't run it" — is
+    **blocked on a WIT change** to `eo9-eosh:eosh`'s `program-failure` (it must carry the inner command's
+    three-way class instead of the single `command-failed(string)`); recorded as the precise next step, not
+    done host-side because the class is unrecoverable from the rendered string. (d) **Child-grant visibility
+    (synthesis #8):** `cmd_shell` logs, under `-v`, the capability set children inherit at spawn time; the full
+    picture remains in the `env` manifest, and what children receive is unchanged (the entropy-opt-in question
+    stays an owner decision). CLI transcripts updated for the stderr outcome and the new `-v` line.
+
 15. **The layered session filesystem and the full child environment (Phase 2 of the overlay/recursive-eosh
     plan, 2026-05-27).** The session's filesystem is now an **overlay** (SPEC.md "Overlay filesystems"),
     assembled host-side in `providers::OverlayFs`: the *upper* layer is the session directory's read-only
