@@ -133,3 +133,17 @@ Match the priority order above; (1)+(2) unblock I2.
     lineage (attenuators over one base) — too restrictive to be the answer. Until one lands, `fs.overlay`
     ships as a built, validated component with its semantics implemented but not yet composable from
     independent component leaves.
+
+13. **fs stubs after the root-handle move (plan/02 D15) — and the remaining layering blocker is
+    configuration, not typing.** `fs.memfs`/`fs.readonly`/`fs.none`/`fs.overlay` were updated mechanically:
+    the exported `fs` interface's `Guest` trait now carries `type FsImpl`, `fs.readonly` mints its own root
+    token (it no longer re-exports the underlying provider's handle), and `fs.none` names the *imported*
+    `eo9:fs/fs.fs-impl` (a types-only use) in its `fs-optional` export. `fs.overlay` drops the shared-types
+    workaround: each slot mints its own root-handle type and the two-leaf composition validates. What still
+    cannot run end to end is configuring the leaves: a provider's config interface is dropped by the
+    composition that wires it into a slot (its handle type is tied to its own instance, so it cannot tunnel
+    through the overlay to the consumer either), so an unconfigured `fs.memfs` leaf traps on first use. The
+    behavioral round-trip test stays `#[ignore]`d on that reason. Options for the planner: default
+    configurations for the stubs (the pending owner decision on unconfigured-provider semantics would close
+    this for memfs, whose configure takes no arguments), a configuration-free static fs leaf for tests, or
+    compose-time configuration that survives slot wiring.
