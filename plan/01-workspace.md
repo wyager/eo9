@@ -99,3 +99,19 @@ None. Everything else depends on this.
     ends by printing the doctor summary. Every external tool xtask spawns now maps the could-not-spawn
     (ENOENT) case to "`<tool>` not found — run `make setup` (or `cargo xtask doctor`)" instead of a raw
     `os error 2`, closing the opaque-failure path from D10.
+12. **Publishing: `cargo install eo9` ships prebuilt components.** The publishable crates
+    (`eo9-component`, `eo9-store`, `eo9-providers-unix`, `eo9-components`, `eo9-runtime`,
+    `eo9-embed`, `eo9`) carry `publish = true`, version `0.1.0` (workspace-wide), MIT, and the
+    repository URL; the intra-workspace dependency entries in the root pin table carry
+    `version = "0.1.0"` alongside their paths so published manifests resolve from crates.io
+    while local builds keep using the tree. `crates/eo9-components` is a data-only crate holding
+    the prebuilt guest components (raw `.wasm`, not lz4 — cargo gzips the package anyway: 1.9 MiB
+    of components → a 628 KiB crate, far under the 10 MB limit, and the simpler form keeps xtask
+    dependency-free); `cargo xtask refresh-components` regenerates `data/` from
+    `guest/target/components`, and `cargo xtask package` is the publishing pre-flight:
+    build-guest → bundle drift check → `cargo publish --dry-run --registry crates-io` for the
+    leaf crates (the explicit registry sidesteps local mirror replacements) → `cargo package
+    --list` for the dependent crates (cargo cannot verify those until their dependencies are
+    live) → print the publish sequence. The host chain checks clean on stable Rust, so plain
+    `cargo install eo9` needs no nightly. Publishing itself is owner-run; nothing uploads from
+    xtask.

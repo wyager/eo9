@@ -3,7 +3,8 @@ name = "eo9-providers-unix"
 description = "Unix-backed root providers for the Eo9 OS APIs: text, time, entropy, fs, disk."
 version.workspace = true
 edition.workspace = true
-publish.workspace = true
+publish = true
+repository.workspace = true
 license = "MIT"
 
 [dependencies]

@@ -15,7 +15,8 @@ name = "eo9-runtime"
 description = "Wasmtime embedding for Eo9: engine configuration, the Compile and Task host APIs, fuel-metered resumable execution, and WAVE argument/outcome handling."
 version.workspace = true
 edition.workspace = true
-publish.workspace = true
+publish = true
+repository.workspace = true
 license = "MIT"
 
 [dependencies]

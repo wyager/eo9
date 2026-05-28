@@ -13,9 +13,10 @@
 //! under `guest/target/components/` at the time this crate is built: eosh, the examples,
 //! and the standard stubs, baked into the binary so a freshly installed `eo9` can seed an
 //! empty store and offer a working shell out of the box. When that directory is absent
-//! (a fresh checkout built before `build-guest`) the set is simply empty and the dev-tree
-//! fallbacks keep working; packaged/release builds must run `cargo xtask build-guest`
-//! before building this crate.
+//! (a fresh checkout built before `build-guest`, or a build from the published crate —
+//! `cargo install eo9`) the generated set is empty and `seed.rs` falls back to the
+//! prebuilt bundle in the `eo9-components` crate, so installed binaries still seed a
+//! working shell.
 
 use std::env;
 use std::fs;
@@ -28,7 +29,15 @@ fn main() {
     );
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
-    let lockfile = Path::new(&manifest_dir).join("../../Cargo.lock");
+    // Inside the repository the workspace lockfile lives two levels up; a published crate
+    // (cargo install) carries its own lockfile next to the manifest instead.
+    let workspace_lockfile = Path::new(&manifest_dir).join("../../Cargo.lock");
+    let packaged_lockfile = Path::new(&manifest_dir).join("Cargo.lock");
+    let lockfile = if workspace_lockfile.exists() {
+        workspace_lockfile
+    } else {
+        packaged_lockfile
+    };
     println!("cargo:rerun-if-changed={}", lockfile.display());
     println!(
         "cargo:rustc-env=EO9_WASMTIME_VERSION={}",

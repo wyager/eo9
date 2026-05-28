@@ -7,9 +7,13 @@ members = ["crates/*", "tests/eo9-integration", "xtask"]
 exclude = ["guest", "kernel"]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
+# Crates that are published to crates.io opt in with an explicit `publish = true`;
+# everything else (placeholder, xtask, tests, not-yet-published areas) stays private.
 publish = false
+repository = "https://github.com/wyager/eo9"
+license = "MIT"
 
 # ---------------------------------------------------------------------------------------
 # Foundation dependency pins (PLAN.md ground rule 3). This table is the authoritative
@@ -50,12 +54,15 @@ blake3 = { version = "1.8.5", default-features = false }
 # off; the safe encode/decode implementations are kept on.
 lz4_flex = { version = "0.13.0", default-features = false, features = ["safe-encode", "safe-decode"] }
 
-# Intra-workspace crates (add new crates/* entries here as areas land).
-eo9-component = { path = "crates/eo9-component" }
-eo9-embed = { path = "crates/eo9-embed" }
+# Intra-workspace crates (add new crates/* entries here as areas land). The published
+# crates carry a version alongside the path so `cargo publish` can resolve them from
+# crates.io while local builds keep using the in-tree sources.
+eo9-component = { path = "crates/eo9-component", version = "0.1.0" }
+eo9-components = { path = "crates/eo9-components", version = "0.1.0" }
+eo9-embed = { path = "crates/eo9-embed", version = "0.1.0" }
 eo9-placeholder = { path = "crates/eo9-placeholder" }
-eo9-providers-unix = { path = "crates/eo9-providers-unix" }
-eo9-runtime = { path = "crates/eo9-runtime" }
+eo9-providers-unix = { path = "crates/eo9-providers-unix", version = "0.1.0" }
+eo9-runtime = { path = "crates/eo9-runtime", version = "0.1.0" }
 eo9-sched = { path = "crates/eo9-sched" }
-eo9-store = { path = "crates/eo9-store" }
+eo9-store = { path = "crates/eo9-store", version = "0.1.0" }
 eofs-core = { path = "crates/eofs-core" }

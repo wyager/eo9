@@ -11,11 +11,15 @@ name = "eo9"
 description = "The usermode Eo9 binary: run, describe, and compile Eo9 programs against the module store and the unix root providers."
 version.workspace = true
 edition.workspace = true
-publish.workspace = true
+publish = true
+repository.workspace = true
 license = "MIT"
 
 [dependencies]
 eo9-component = { workspace = true }
+# The prebuilt guest components: the seed fallback for builds made outside the repo
+# (most importantly `cargo install eo9`), where guest/target/components does not exist.
+eo9-components = { workspace = true }
 eo9-providers-unix = { workspace = true }
 eo9-runtime = { workspace = true }
 eo9-store = { workspace = true }

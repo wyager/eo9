@@ -16,7 +16,8 @@ name = "eo9-embed"
 description = "Embed a usermode Eo9 instance in a Rust program: a pluggable root-provider backend plus the runtime behind a small builder API."
 version.workspace = true
 edition.workspace = true
-publish.workspace = true
+publish = true
+repository.workspace = true
 license = "MIT"
 
 [features]
