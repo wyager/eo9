@@ -72,3 +72,10 @@ usermode binary's fs mapping), 12 (store image).
 12. **Deferred.** Milestone 3 (read-only store-image builder for the kernel) and object-level GC (objects
     unreachable from any manifest/cache entry) are not implemented yet; runtime/CLI integration is consumed by
     plans 04 and 11 against the API above.
+13. **The CLI's `seed` marker file at the store root.** `crates/eo9` (not this crate) writes a small
+    line-oriented marker `<root>/seed` recording what first-run seeding last did (header `eo9-seed 1`, an
+    embedded-set fingerprint, and one `name hash` line per seed-managed binding) so an upgraded binary can
+    refresh exactly the bundled-program bindings it owns (plan/11 D18). The store crate neither reads nor
+    writes it and the store layout/version marker are unchanged; the file sits beside `version` at the root
+    and is ignored by `objects()`/`gc`/name resolution. If the store ever gains first-class metadata, this
+    is the first candidate to migrate.

@@ -255,3 +255,21 @@ its first milestones, and to be the place where cross-area seams get found.
     composed. Surfacing it there needs an `eo9:exec` addition — e.g. `component-info` gaining an optional
     wiring/provenance field (or a dedicated `wiring(component) -> string`) that the host fills from the
     algebra's `Wiring`. The CLI `describe --wiring` delivers the owner's full-tree ask now without that.
+18. **Stale-store upgrade refresh + `eo9 store reseed` (the post-upgrade footgun).** A store seeded by an
+    older eo9 broke under a newer binary (the old seeded eosh/components no longer match the runtime's WIT
+    shapes — e.g. the fs-impl move — and spawning them died with a raw "resource implementation is missing"
+    linker error; first hit on a fresh-laptop run, plan/01 D10). Seeding now leaves a **seed record** at the
+    store root (`<root>/seed`: header `eo9-seed 1`, the embedded-set fingerprint = blake3 over the sorted
+    `name hash` lines, then one `name hash` line per seed-managed binding; written by `crates/eo9`, ignored
+    by `eo9-store` — see plan/06 D13). On every start (`shell` and store-name resolution), `seed::ensure_seeded`
+    compares fingerprints and, on mismatch, re-binds exactly the names whose current binding is what seeding
+    put there; user-added names and user re-bound names are never touched, objects are never deleted (gc
+    reclaims), and one line announces it ("store: refreshed N bundled program(s) for this version of eo9").
+    A store with no record is refreshed only if it was clearly seeded (an `eosh` binding exists — the
+    legacy ~/.eo9 case); a store the user assembled by hand is left alone, preserving the original
+    "seeding never clobbers user bindings" contract. `eo9 store reseed` forces the same refresh explicitly
+    (recovery / scripting; on a record-less store it refreshes every bundled name, which is what the user
+    asked for). As a backstop, a spawn failure for a store-resolved component that looks like a shape
+    mismatch (missing interface instance / resource implementation) appends "this component may have been
+    built for an older eo9 — try `eo9 store reseed`". Covered by four CLI tests (upgrade refresh, user
+    bindings survive, legacy auto-refresh, reseed on a legacy store) plus seed-record/fingerprint unit tests.
