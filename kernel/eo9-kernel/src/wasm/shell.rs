@@ -178,14 +178,19 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
                 Poll::Ready(Ok(())) => break,
                 Poll::Ready(Err(err)) => return Err(err),
                 Poll::Pending => {
-                    shellexec::drive_children();
-                    // Idle the core between polls instead of spinning at 100%: give every
-                    // running child a turn (above), then sleep in `wfi` until the generic
-                    // timer fires (src/wasm/mod.rs arms it + the GIC/IRQ wakes us). Heavy
-                    // guest compute runs inside a single poll, so this only bounds the
-                    // latency at an await point (a child finishing, serial input arriving),
-                    // not throughput. `wake_idle` re-drives eosh's parked `read-line` future.
-                    super::idle_wait();
+                    // Give every running child a turn. If any is runnable (yielded on fuel,
+                    // wants to run again now), loop straight back and re-poll without a `wfi`
+                    // so a compute-bound child runs at full speed. Only when nothing is
+                    // runnable do we idle the core in `wfi` (src/wasm/mod.rs) — until a child's
+                    // sleep deadline or a keystroke (UART RX interrupt) wakes it, which
+                    // `wake_idle` then uses to re-drive eosh's parked `read-line`. With no
+                    // children running at all (the bare prompt) that idle is a ~1 s backstop
+                    // plus the keystroke interrupt, so the core sleeps near 0% instead of
+                    // waking every 10 ms.
+                    let status = shellexec::drive_children();
+                    if !status.any_runnable {
+                        super::idle_wait(status.any_running);
+                    }
                 }
             }
         }

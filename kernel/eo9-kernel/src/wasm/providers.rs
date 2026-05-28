@@ -321,7 +321,9 @@ impl Future for ReadLine {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        while let Some(byte) = crate::uart::try_get_byte() {
+        // Consume from the interrupt-filled input ring (src/uart.rs): the UART RX interrupt
+        // moves bytes in and wakes the `wfi`, so this just drains what has arrived.
+        while let Some(byte) = crate::uart::ring_get_byte() {
             match byte {
                 b'\r' | b'\n' => {
                     crate::kprint!("\n");
@@ -363,8 +365,11 @@ impl Future for SleepUntil {
         if crate::timer::uptime_ns() >= self.deadline {
             Poll::Ready(())
         } else {
-            // Park; `block_on` re-polls after its periodic timer `wfi` wake (which fires at
-            // least as often as the wake interval, so the deadline is observed promptly).
+            // Park, and tell the executor to arm its `wfi` timer for *this* deadline (it
+            // takes the earliest of all pending sleeps), so the wake is precise rather than a
+            // fixed polling tick — and so a purely input-bound idle prompt can sleep until a
+            // keystroke instead of waking on a timer it does not need.
+            super::request_timer_wake(self.deadline);
             super::register_idle_waker(cx.waker());
             Poll::Pending
         }

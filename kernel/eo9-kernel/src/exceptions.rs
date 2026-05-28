@@ -1,10 +1,11 @@
-//! Fatal exception reporting.
+//! IRQ dispatch and fatal exception reporting.
 //!
-//! The spike kernel has no legitimate exception traffic: interrupts stay masked (the timer
-//! is polled) and wasm traps are explicit checks in the generated code, not CPU
-//! exceptions. Any vector firing therefore indicates a kernel bug (bad pointer, unaligned
-//! Device-memory access, missing FP enable, …), and the most useful thing to do is dump
-//! the syndrome registers over serial and park so the output can be read.
+//! Two interrupt sources are taken as IRQs (forwarded by the GIC, src/gic.rs): the EL1
+//! generic timer (the executor's `wfi` wake) and the PL011 UART receive line (a keystroke
+//! wakes the core and is captured into the input ring). Every *other* exception is a kernel
+//! bug (bad pointer, unaligned Device-memory access, missing FP enable, wasm traps are
+//! explicit checks in generated code, not CPU exceptions): the handler dumps the syndrome
+//! registers over serial and parks so the output can be read.
 
 /// Names for the 16 vector-table entries, indexed by the value the stub passes in.
 const VECTOR_NAMES: [&str; 16] = [
@@ -28,9 +29,10 @@ const VECTOR_NAMES: [&str; 16] = [
 
 /// IRQ handler, called from the IRQ vector stub (`__irq_entry` in src/boot.rs) with the
 /// caller-saved registers already preserved. Acknowledges the pending interrupt at the GIC,
-/// services the generic timer (disabling it so its level-sensitive line drops — the executor
-/// re-arms it before the next `wfi`), and signals end-of-interrupt. The timer is the only
-/// enabled interrupt source; its sole purpose is to wake the executor's `wfi` idle path.
+/// services it (the generic timer is disabled so its level-sensitive line drops — the
+/// executor re-arms it before the next `wfi`; the UART's RX bytes are drained into the input
+/// ring and its interrupt cleared), and signals end-of-interrupt. Both sources exist to wake
+/// the executor's `wfi` idle path — the timer for sleep deadlines, the UART for input.
 #[unsafe(no_mangle)]
 extern "C" fn kirq() {
     let iar = crate::gic::acknowledge();
@@ -42,6 +44,12 @@ extern "C" fn kirq() {
     // Generic-timer PPIs (26/27/29/30): drop the level-sensitive line before the EOI.
     if matches!(intid, 26 | 27 | 29 | 30) {
         crate::timer::disable();
+    }
+    // PL011 UART (SPI 33 on `virt`): drain received bytes into the input ring and clear the
+    // UART's interrupt sources, so the keystroke that woke the core is captured and the
+    // level-sensitive line deasserts before the EOI.
+    if intid == 33 {
+        crate::uart::drain_rx();
     }
     crate::gic::end_of_interrupt(iar);
 }

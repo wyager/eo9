@@ -82,14 +82,17 @@ extern "C" fn kmain(dtb: *const u8) -> ! {
     timer::self_test();
 
     // Interrupt controller: bring up the GICv2 and forward the EL1 physical timer PPI
-    // (INTID 30) so the executor can `wfi`-idle and be woken by the timer instead of
-    // busy-polling. The IRQ vector (src/boot.rs `__irq_entry` → `kirq`) acknowledges and
-    // EOIs the timer; every other exception stays fatal. Then unmask IRQ so it is taken.
+    // (INTID 30) plus the PL011 UART (SPI 33 on `virt`) so the executor can `wfi`-idle and be
+    // woken either by the timer (a sleep deadline) or by a keystroke arriving on the console —
+    // instead of busy-polling. The IRQ vector (src/boot.rs `__irq_entry` → `kirq`) acknowledges
+    // and EOIs them (draining UART input into the ring); every other exception stays fatal.
     gic::init();
-    for intid in [26u32, 27, 29, 30] {
+    for intid in [26u32, 27, 29, 30, 33] {
         gic::configure_intid(intid);
         gic::enable_intid(intid);
     }
+    // Unmask the UART receive interrupt so an arriving byte asserts SPI 33.
+    uart::enable_rx_interrupt();
     // SAFETY: clearing PSTATE.I (DAIF.I) enables IRQ delivery; the IRQ vector is installed.
     unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };
 
