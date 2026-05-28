@@ -1393,7 +1393,15 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                     if fused_is_provider(&component.bytes) {
                         return Ok((Err(WitCompileError::NotABinary),));
                     }
-                    Component::new(&engine, &component.bytes).map_err(|err| {
+                    // Strip `implements` annotations before codegen: a renamed residual
+                    // import or a multi-instance consumer carries one the vendored runtime's
+                    // parser predates, so compiling the stored (annotated) bytes would fail
+                    // with an opaque parse error. Identical to the stored bytes when there is
+                    // no annotation; `describe`/the algebra keep the full form (`kc.bytes`).
+                    let exec_bytes = eo9_component::Component::load(component.bytes.clone())
+                        .map(|c| c.executable_bytes())
+                        .unwrap_or_else(|_| component.bytes.clone());
+                    Component::new(&engine, &exec_bytes).map_err(|err| {
                         WitCompileError::Codegen(format!("on-target compilation failed: {err:?}"))
                     })
                 }

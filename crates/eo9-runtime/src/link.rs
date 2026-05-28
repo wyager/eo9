@@ -1289,7 +1289,13 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
          -> Result<(Result<Resource<ExecImageRes>, WitCompileError>,)> {
             let exec = store.data_mut().exec_provider()?;
             let component = take_component(exec, component.rep())?;
-            let bytes = component.save();
+            // Feed the executor the `implements`-stripped form: plain-named slots (a
+            // renamed residual import, a multi-instance consumer) carry an annotation the
+            // pinned runtime's parser predates, so compiling the saved bytes would fail
+            // with an opaque parse error. `save`/`describe` keep the annotation; only the
+            // bytes handed to codegen drop it. (Identical to the saved bytes when there is
+            // no annotation, so a plain program is unaffected.)
+            let bytes = component.executable_bytes();
             Ok((match crate::image::Image::compile(&exec.engine, bytes) {
                 Ok(image) => {
                     let rep = exec.images.insert(image)?;

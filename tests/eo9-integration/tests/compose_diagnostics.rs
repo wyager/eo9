@@ -11,6 +11,7 @@
 use eo9_component::{Component, ComposeWarning, compose, compose_checked, rename};
 use eo9_integration::fixtures::build_component;
 use eo9_integration::{guest, run};
+use eo9_runtime::{EngineOptions, Image, new_engine};
 
 /// `fs.none $ cat`: the provider's optional-flavor export matches nothing `cat`
 /// imports, so per the drop law the composition succeeds, the consumer's own fs import
@@ -121,4 +122,17 @@ fn renamed_residual_import_still_compiles() {
     let executable = Component::load(renamed.executable_bytes())
         .expect("the executable form is still a valid component");
     let _image = run::compile_component(&executable);
+
+    // The distinction the production compile paths rely on: the exec provider and `eo9
+    // run` hand the executor `executable_bytes()`, never the saved bytes. Prove both ends
+    // directly — the *annotated* saved bytes are rejected by the pinned runtime's parser
+    // (the study-3 bug), the stripped form compiles.
+    let engine = new_engine(&EngineOptions::default()).expect("pinned engine config is valid");
+    assert!(
+        Image::compile(&engine, renamed.bytes()).is_err(),
+        "the annotated saved bytes must fail the runtime's component parser \
+         (the opaque codegen error this fix removes)"
+    );
+    Image::compile(&engine, renamed.executable_bytes())
+        .expect("the implements-stripped form compiles in the runtime");
 }
