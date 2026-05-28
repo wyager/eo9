@@ -25,6 +25,20 @@ const PROGRAMS: &[(&str, &[ArgKind])] = &[
     ("cruncher", &[ArgKind::Number, ArgKind::Number]),
     ("outcomes", &[ArgKind::Text, ArgKind::Text]),
     ("readwrite", &[ArgKind::Text, ArgKind::Text]),
+    // Coreutils (guest/coreutils/*) run against the blob's in-memory eo9:fs (seeded with a
+    // small sample tree — see fs::MemFs::seeded). Each imports only what it needs.
+    ("cat", &[ArgKind::Text]),
+    ("ls", &[ArgKind::Text]),
+    ("echo", &[ArgKind::Text]),
+    ("rng", &[ArgKind::Number]),
+    ("wc", &[ArgKind::Text]),
+    ("head", &[ArgKind::Text, ArgKind::Number]),
+    ("cp", &[ArgKind::Text, ArgKind::Text]),
+    ("mkdir", &[ArgKind::Text]),
+    ("rm", &[ArgKind::Text]),
+    ("touch", &[ArgKind::Text]),
+    ("stat", &[ArgKind::Text]),
+    ("find", &[ArgKind::Text, ArgKind::Text]),
 ];
 
 #[derive(Clone, Copy)]

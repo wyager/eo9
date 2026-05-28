@@ -481,6 +481,26 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
             false,
         )?;
     }
+    // The coreutils (guest/coreutils/*): real Eo9 guest programs the /vm page runs against
+    // the blob's in-memory eo9:fs. AOT'd to pulley32 and served by name like the examples.
+    for tool in [
+        "cat", "ls", "echo", "rng", "wc", "head", "cp", "mkdir", "rm", "touch", "stat", "find",
+    ] {
+        let component_path = root
+            .join("guest")
+            .join("target")
+            .join("components")
+            .join(format!("eo9-coreutil-{tool}.wasm"));
+        let component = std::fs::read(&component_path)
+            .map_err(|err| format!("failed to read {}: {err}", component_path.display()))?;
+        preaot_for_web(
+            &store_dir,
+            &component,
+            &format!("coreutil {tool}"),
+            &format!("{tool}.cwasm"),
+            false,
+        )?;
+    }
     let sleepy_wat = root.join("kernel").join("seed").join("sleepy.wat");
     let sleepy_wasm = wat::parse_file(&sleepy_wat)
         .map_err(|err| format!("failed to assemble {}: {err}", sleepy_wat.display()))?;

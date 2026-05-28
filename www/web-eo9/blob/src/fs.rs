@@ -235,6 +235,45 @@ impl MemFs {
         }
     }
 
+    /// A fresh filesystem pre-populated with a small sample tree, so the fs-backed coreutils
+    /// (`cat`, `ls`, `wc`, `stat`, `find`, `head`) have something to show on the page. The
+    /// content is informational only; programs may freely overwrite it (the fs is writable).
+    pub fn seeded() -> Self {
+        let mut fs = MemFs::new();
+        fs.seed_dir("/docs");
+        fs.seed_file(
+            "/welcome.txt",
+            b"Hello from the Eo9 web VM filesystem!\nThis is an in-memory eo9:fs served to \
+              guest programs by the blob.\nTry: cat /welcome.txt, ls /, wc /welcome.txt.\n",
+        );
+        fs.seed_file(
+            "/docs/about.txt",
+            b"Eo9 is a capability-secure OS on the WebAssembly Component Model.\nThe coreutils \
+              you are running here are real Eo9 guest components.\n",
+        );
+        fs.seed_file("/docs/notes.txt", b"line one\nline two\nline three\n");
+        fs
+    }
+
+    /// Insert a file directly (used by [`MemFs::seeded`]); creates parent dirs as needed.
+    pub fn seed_file(&mut self, path: &str, contents: &[u8]) {
+        let path = normalize(path);
+        if let Some((parent, _)) = path.rsplit_once('/') {
+            let parent = if parent.is_empty() { "/" } else { parent };
+            self.seed_dir(parent);
+        }
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(self.files.get(&path).map(|b| b.len() as u64).unwrap_or(0))
+            .saturating_add(contents.len() as u64);
+        self.files.insert(path, contents.to_vec());
+    }
+
+    /// Insert a directory directly (used by [`MemFs::seeded`]).
+    pub fn seed_dir(&mut self, path: &str) {
+        self.dirs.insert(normalize(path));
+    }
+
     fn is_dir(&self, path: &str) -> bool {
         if self.dirs.contains(path) {
             return true;

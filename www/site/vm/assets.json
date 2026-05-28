@@ -1,10 +1,22 @@
 {
-  "blob": "/vm/web-eo9.499b4d73ea6bf72d.wasm",
+  "blob": "/vm/web-eo9.485c471c01748f5c.wasm",
   "store": {
+    "cat": "/vm/store/cat.a4ff4500641403f8.cwasm",
+    "cp": "/vm/store/cp.ae42a62357831cc0.cwasm",
     "cruncher": "/vm/store/cruncher.c9cd26b092f3ec15.cwasm",
+    "echo": "/vm/store/echo.187fbd424b4c436e.cwasm",
+    "find": "/vm/store/find.62efb85268dd22e3.cwasm",
+    "head": "/vm/store/head.725ee43ca372c08a.cwasm",
     "hello": "/vm/store/hello.ad989e33ee2f4660.cwasm",
+    "ls": "/vm/store/ls.30ec428b2158bb27.cwasm",
+    "mkdir": "/vm/store/mkdir.89ab43f568d5ea0d.cwasm",
     "outcomes": "/vm/store/outcomes.4ccba9dfa10b997d.cwasm",
     "readwrite": "/vm/store/readwrite.a0c9044b357f2553.cwasm",
-    "sleepy": "/vm/store/sleepy.0f0fafc8b008d00f.cwasm"
+    "rm": "/vm/store/rm.f0bab58410003924.cwasm",
+    "rng": "/vm/store/rng.27baac0000f2942f.cwasm",
+    "sleepy": "/vm/store/sleepy.0f0fafc8b008d00f.cwasm",
+    "stat": "/vm/store/stat.b4d63f7ac5fd6139.cwasm",
+    "touch": "/vm/store/touch.896727ea3bdd6139.cwasm",
+    "wc": "/vm/store/wc.f0c3d96e67ceee97.cwasm"
   }
 }

@@ -263,3 +263,44 @@ runnable on a host with no fiber backend.
       into the store, is the remaining work to a real `eosh>` prompt. The recipe in D14 stands;
       D14(d)'s bytes-vs-Pulley duality is now concretely set up (the build emits both the raw
       `.wasm` and the `.cwasm` for the demo program, the pattern eosh's store needs).
+
+16. **Milestone-3, coreutils run in the browser (committed, verified).** The twelve coreutils
+    (`cat ls echo rng wc head cp mkdir rm touch stat find`) are now AOT'd to pulley32 into the
+    fingerprinted `/vm` store and runnable on the page against the blob's in-memory `eo9:fs`
+    (`fs::MemFs::seeded` pre-populates a small sample tree — `/welcome.txt`, `/docs/*` — so the
+    fs-backed tools have content; the fs is writable, so programs may change it). Each imports
+    only what it needs (echo → text; rng → entropy + text; the rest → fs + text + io) and runs
+    through the existing `store::run_program` path (no exec surface needed — these are leaf
+    programs, not the shell). Verified: `node www/web-eo9/verify-coreutils.mjs` → **12/12 PASS**
+    (`echo` → `success(done)`, `rng 5` → `success(generated(5))`, `cat /welcome.txt` →
+    `success(printed(150))`, `ls /` → `success(listed(2))`, `wc`/`stat`/`head`/`cp`/`mkdir`/
+    `touch`/`rm`/`find` all succeed against the seeded fs); `verify-fs`/`verify-exec` still pass;
+    `check-web-vm` ok (18 fingerprinted assets); featureless `cargo xtask ci` green; the page
+    gains a coreutils optgroup + arg placeholders, and `selftest.js` gains echo/rng/cat/ls/find
+    checks. Blob unchanged at 4.13 MiB (the coreutils are separate store artifacts, fetched on
+    demand). This expands "what runs in the browser" to 16 real Eo9 programs and stages the
+    coreutils for the eosh prompt.
+
+17. **The eosh prompt (`eosh>` on /vm) — still the remaining work; the blocker is the exec
+    surface's spawn/wait, not the ABI.** Booting eosh needs the blob to host the guest-facing
+    `eo9:exec` *Linker* surface eosh imports — `component-algebra` (load/describe/compose/
+    restrict/rename/configure), `compile` (artifact-lookup with a clean "$/& needs the compiler"
+    refusal), and `task` (spawn/wait) with the `component`/`image`/`task` resource tables — which
+    is only exercisable by a guest (eosh), so it cannot be verified without also AOT'ing eosh and
+    booting the prompt. The genuine integration risk is **`task.spawn`/`task.wait`**: in the
+    kernel (`wasm/shellexec.rs`) children run on the kernel's drive loop via a `CHILDREN`
+    registry and `wait` polls it; the blob has no such drive loop, so a child must be run from
+    inside eosh's `task.wait` host call — i.e. nested concurrent execution of a child store while
+    the parent guest (eosh) is suspended in a `func_wrap_concurrent` host call. Getting that
+    wrong deadlocks the executor ("cannot block a synchronous task" / re-entrancy). This is a
+    design-and-iterate piece, not a one-pass plumbing job — it is the reason this and the two
+    prior passes stopped short of the prompt. The foundations are all in place and proven:
+    the algebra runs in the blob (D15), the fs/io providers run (D12), the SDK async-main/await
+    runs fiberlessly (D12), and the leaf programs (examples + coreutils) run via the store path
+    (D16). The next pass builds `eo9:exec` against the raw `Linker` (mirroring the eosh-imported
+    subset of shellexec.rs, dropping fuel/preemption/codegen) with a run-to-completion spawn/wait
+    designed for the single-child, no-drive-loop browser executor, AOTs eosh + makes resolve read
+    `/bin/<name>.wasm` (ship the raw component bytes alongside the `.cwasm`, content-addressed per
+    D14(d)), then boots and verifies an `eosh>` smoke. A server-side `/vm/compile` endpoint (the
+    standalone server has the full toolchain) is the path to making `$`/`&` composition actually
+    compile-and-run in the browser, since in-blob codegen is std/mmap-blocked.
