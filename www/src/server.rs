@@ -384,20 +384,19 @@ async fn serve_site_connection<IO>(
             // The one dynamic endpoint: POST /vm/compile fuses a store-name composition with
             // the real algebra and compiles it to a pulley32 image (plan/18 D20). Everything
             // else is the static-file path.
-            let response = if request.method() == Method::POST
-                && request.uri().path() == "/vm/compile"
-            {
-                compile_response(request.into_body(), &site_root, transport).await
-            } else {
-                site_response(
-                    request.method(),
-                    request.uri(),
-                    request.headers(),
-                    &site_root,
-                    transport,
-                )
-                .await
-            };
+            let response =
+                if request.method() == Method::POST && request.uri().path() == "/vm/compile" {
+                    compile_response(request.into_body(), &site_root, transport).await
+                } else {
+                    site_response(
+                        request.method(),
+                        request.uri(),
+                        request.headers(),
+                        &site_root,
+                        transport,
+                    )
+                    .await
+                };
             Ok::<_, Infallible>(response)
         }
     });
@@ -615,7 +614,11 @@ static COMPILE_PERMITS: OnceLock<Semaphore> = OnceLock::new();
 /// Handle `POST /vm/compile`: read a size-capped composition expression, fuse + compile it to
 /// a pulley32 image under a concurrency limit and a time bound, and return the image (or a
 /// typed 4xx/5xx). Carries the same standard security headers as every other response.
-async fn compile_response(body: Incoming, site_root: &Path, transport: Transport) -> Response<Body> {
+async fn compile_response(
+    body: Incoming,
+    site_root: &Path,
+    transport: Transport,
+) -> Response<Body> {
     with_standard_headers(compile_response_inner(body, site_root).await, transport)
 }
 
@@ -623,11 +626,15 @@ async fn compile_response_inner(body: Incoming, site_root: &Path) -> Response<Bo
     // 1. Size-capped body read — never buffer more than MAX_COMPILE_BODY from the client.
     let collected = match Limited::new(body, MAX_COMPILE_BODY).collect().await {
         Ok(c) => c.to_bytes(),
-        Err(_) => return compile_text_response(StatusCode::PAYLOAD_TOO_LARGE, "composition too large"),
+        Err(_) => {
+            return compile_text_response(StatusCode::PAYLOAD_TOO_LARGE, "composition too large");
+        }
     };
     let expr = match std::str::from_utf8(&collected) {
         Ok(s) => s.trim().to_string(),
-        Err(_) => return compile_text_response(StatusCode::BAD_REQUEST, "request body must be UTF-8"),
+        Err(_) => {
+            return compile_text_response(StatusCode::BAD_REQUEST, "request body must be UTF-8");
+        }
     };
     if expr.is_empty() {
         return compile_text_response(StatusCode::BAD_REQUEST, "empty composition");
@@ -639,7 +646,10 @@ async fn compile_response_inner(body: Incoming, site_root: &Path) -> Response<Bo
     let permit = match timeout(COMPILE_ACQUIRE_WAIT, sem.acquire()).await {
         Ok(Ok(p)) => p,
         Ok(Err(_closed)) => {
-            return compile_text_response(StatusCode::INTERNAL_SERVER_ERROR, "compiler unavailable");
+            return compile_text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "compiler unavailable",
+            );
         }
         Err(_elapsed) => {
             return compile_text_response(StatusCode::SERVICE_UNAVAILABLE, "compiler busy, retry");
@@ -658,8 +668,9 @@ async fn compile_response_inner(body: Incoming, site_root: &Path) -> Response<Bo
     }
 
     // 4. Compile on a blocking thread (CPU-bound), abandon it if it overruns the time budget.
-    let job =
-        tokio::task::spawn_blocking(move || crate::compile::compile_expression(&expr, &raw_dir, &allow));
+    let job = tokio::task::spawn_blocking(move || {
+        crate::compile::compile_expression(&expr, &raw_dir, &allow)
+    });
     let outcome = timeout(COMPILE_TIMEOUT, job).await;
     drop(permit);
     match outcome {

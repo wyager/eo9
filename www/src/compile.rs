@@ -68,7 +68,10 @@ fn parse(expr: &str) -> Result<Expr, CompileError> {
     if head.is_empty() {
         return Err(CompileError::BadExpression("empty composition".into()));
     }
-    if head.iter().any(|t| *t == "&" || *t == "rename" || *t == "with" || *t == "configure") {
+    if head
+        .iter()
+        .any(|t| *t == "&" || *t == "rename" || *t == "with" || *t == "configure")
+    {
         return Err(CompileError::BadExpression(
             "the browser compile endpoint supports only `$` composition and a leading `only` \
              gate for now (native Eo9 and the bare-metal kernel run the full algebra)"
@@ -84,7 +87,9 @@ fn parse(expr: &str) -> Result<Expr, CompileError> {
             .get(1)
             .ok_or_else(|| CompileError::BadExpression("`only` needs an allow-list".into()))?;
         if rest.get(2) != Some(&"$") {
-            return Err(CompileError::BadExpression("`only <list>` must be followed by `$`".into()));
+            return Err(CompileError::BadExpression(
+                "`only <list>` must be followed by `$`".into(),
+            ));
         }
         only = Some(list.split(',').map(|s| s.trim().to_string()).collect());
         rest = &rest[3..];
@@ -96,7 +101,9 @@ fn parse(expr: &str) -> Result<Expr, CompileError> {
     for tok in rest {
         if expect_name {
             if *tok == "$" {
-                return Err(CompileError::BadExpression("expected a program name".into()));
+                return Err(CompileError::BadExpression(
+                    "expected a program name".into(),
+                ));
             }
             names.push((*tok).to_string());
             expect_name = false;
@@ -110,7 +117,9 @@ fn parse(expr: &str) -> Result<Expr, CompileError> {
         }
     }
     if names.is_empty() || expect_name {
-        return Err(CompileError::BadExpression("dangling `$` / missing program name".into()));
+        return Err(CompileError::BadExpression(
+            "dangling `$` / missing program name".into(),
+        ));
     }
     Ok(Expr { only, names })
 }
@@ -122,7 +131,8 @@ fn load_program(name: &str, raw_dir: &Path, allow: &[String]) -> Result<Componen
         return Err(CompileError::UnknownProgram(name.to_string()));
     }
     let path: PathBuf = raw_dir.join(format!("{name}.wasm"));
-    let bytes = std::fs::read(&path).map_err(|_| CompileError::MissingComponent(name.to_string()))?;
+    let bytes =
+        std::fs::read(&path).map_err(|_| CompileError::MissingComponent(name.to_string()))?;
     Component::load(bytes).map_err(|e| CompileError::CompileFailed(format!("load `{name}`: {e:?}")))
 }
 
@@ -229,7 +239,10 @@ mod tests {
         for (name, file) in pairs {
             let src = components.join(file);
             if !src.exists() {
-                eprintln!("skipping: {} not built (run `cargo xtask build-guest`)", src.display());
+                eprintln!(
+                    "skipping: {} not built (run `cargo xtask build-guest`)",
+                    src.display()
+                );
                 return;
             }
             std::fs::copy(&src, raw_dir.join(format!("{name}.wasm"))).unwrap();
@@ -244,7 +257,11 @@ mod tests {
         // substantial artifact, not an empty/degenerate one.
         let image = compile_expression("entropy.seeded $ rng --count 3", &raw_dir, &allow)
             .expect("the composition compiles server-side");
-        assert!(image.len() > 4096, "implausibly small image: {} bytes", image.len());
+        assert!(
+            image.len() > 4096,
+            "implausibly small image: {} bytes",
+            image.len()
+        );
 
         // A name outside the allow-set is rejected before any compile.
         assert!(matches!(

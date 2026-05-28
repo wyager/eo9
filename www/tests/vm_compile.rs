@@ -67,7 +67,10 @@ fn compiles_a_store_name_composition_to_an_image() {
     let Some(addr) = vm_server() else { return };
     let response = post(addr, "/vm/compile", "entropy.seeded $ rng --count 3");
     assert_eq!(response.status, 200, "body: {}", response.body_text());
-    assert_eq!(response.header("content-type"), Some("application/octet-stream"));
+    assert_eq!(
+        response.header("content-type"),
+        Some("application/octet-stream")
+    );
     assert!(
         response.body.len() > 4096,
         "implausibly small image: {} bytes",
