@@ -7,16 +7,22 @@
 // capability is missing), bind typed flags to main's signature, instantiate, and render the
 // typed outcome. The programs themselves are the real Eo9 components; their behavior is theirs.
 
-import { MemFs, decodeText, makeImports } from './host.js';
+// `./host.js` (the browser-side root providers) is loaded dynamically in `start()` so that a
+// failure to fetch or evaluate it cannot take the whole terminal down with it: the prompt stays
+// interactive and the error is printed where the visitor can see it.
+let host = null;
 
 // --- Page state --------------------------------------------------------------------------------
 
-const hasJSPI = typeof WebAssembly.Suspending === 'function';
+// Guard the WebAssembly global itself: `typeof WebAssembly.Suspending` throws when the global is
+// missing entirely (locked-down browsers), and a top-level throw would leave a dead terminal.
+const hasJSPI = typeof WebAssembly === 'object' && typeof WebAssembly.Suspending === 'function';
+const hasWasm = typeof WebAssembly === 'object';
 
 const state = {
   manifest: null, // loaded from components/manifest.json
   grants: { text: true, time: true, fs: true },
-  memfs: new MemFs(),
+  memfs: null, // created once ./host.js has loaded
   modules: new Map(), // component name -> import() promise
   history: [],
   historyIndex: -1,
@@ -235,6 +241,14 @@ function coreModuleLoader(entry) {
 }
 
 async function runProgram(entry, flagTokens) {
+  if (!hasWasm) {
+    println('this browser has WebAssembly disabled or unavailable, so programs cannot run here.', 'launcher-err');
+    return;
+  }
+  if (!host) {
+    println('the browser host module (host.js) did not load, so programs cannot run; see the error above.', 'launcher-err');
+    return;
+  }
   if (entry.asyncMain && !hasJSPI) {
     println(
       `${entry.name} has an async main, which the transpiled form drives with JSPI ` +
@@ -266,7 +280,7 @@ async function runProgram(entry, flagTokens) {
     return;
   }
 
-  const imports = makeImports(state.grants, programSink, state.memfs);
+  const imports = host.makeImports(state.grants, programSink, state.memfs);
   const started = performance.now();
   try {
     const instance = await module.instantiate(coreModuleLoader(entry), imports);
@@ -381,6 +395,10 @@ function cmdGrantRevoke(which, name) {
 }
 
 function cmdFiles() {
+  if (!host || !state.memfs) {
+    println('the browser host module (host.js) did not load, so there is no in-page filesystem.', 'launcher-err');
+    return;
+  }
   const entries = state.memfs.entries();
   if (entries.length === 0) {
     println('the in-page filesystem is empty (try `' + (findComponent('readwrite')?.example ?? 'readwrite') + '`)');
@@ -388,7 +406,7 @@ function cmdFiles() {
   }
   println('the in-page filesystem (persists until you reload the page):');
   for (const [path, bytes] of entries) {
-    const preview = bytes.length <= 120 ? `  ${JSON.stringify(decodeText(bytes))}` : '';
+    const preview = bytes.length <= 120 ? `  ${JSON.stringify(host.decodeText(bytes))}` : '';
     println(`  ${path}  (${bytes.length} bytes)${preview}`);
   }
 }
@@ -523,16 +541,36 @@ function onKeyDown(event) {
 // --- Startup -----------------------------------------------------------------------------------
 
 async function start() {
+  // The terminal must stay interactive (and say what went wrong) no matter what fails to load
+  // below, so the input wiring and the error reporting come before anything that can fail.
   inputEl.addEventListener('keydown', onKeyDown);
   screenEl.addEventListener('click', () => inputEl.focus());
+  window.addEventListener('error', (event) => {
+    println(`page error: ${event.message ?? event.error ?? 'unknown error'}`, 'launcher-err');
+  });
+  window.addEventListener('unhandledrejection', (event) => {
+    println(`page error: ${event.reason ?? 'unknown error'}`, 'launcher-err');
+  });
 
   println('Eo9 /try — real Eo9 example components, running on your browser\'s WebAssembly engine.', 'launcher');
   println('This prompt is a small launcher, not eosh. `help` lists commands; `about` says what is real here.', 'launcher');
-  if (!hasJSPI) {
+  if (!hasWasm) {
+    println('note: this browser has WebAssembly disabled or unavailable, so programs cannot run here;', 'launcher-err');
+    println('      the launcher commands (help, list, describe, grants, …) still work.', 'launcher-err');
+  }
+  if (hasWasm && !hasJSPI) {
     println('note: this browser has no JSPI (WebAssembly.Suspending), so programs with an async main', 'launcher-err');
     println('      (readwrite) cannot run here; recent Chromium-based browsers support it.', 'launcher-err');
   }
   println('');
+
+  try {
+    host = await import('./host.js');
+    state.memfs = new host.MemFs();
+  } catch (err) {
+    println(`could not load the browser host (host.js): ${err}`, 'launcher-err');
+    println('the prompt still works, but programs cannot run until the page loads correctly.', 'launcher-err');
+  }
 
   try {
     const response = await fetch('./components/manifest.json');

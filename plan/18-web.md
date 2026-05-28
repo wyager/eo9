@@ -505,3 +505,39 @@ kernel, just interpreted.
 **The server `/vm/compile` endpoint** (Decisions 20–21) stays in place — it is tested, bounded,
 and useful as a reference/fallback — but nothing in the blob or the page calls it any more.
 Removing it (and its `site/vm/raw/` inputs) is a planner call for a later pass.
+
+## Decision 23 — the page terminals must survive a hostile browser and behave like terminals
+
+Owner report from a real-Chrome walkthrough: the in-page console only took focus when the exact
+prompt line was clicked, and Enter appeared to do nothing. Investigation against the committed
+site reproduced a way to get exactly that dead-terminal state: both `try.js` and `vm.js` (and
+`selftest.js`) computed `hasJSPI` at module top level via `typeof WebAssembly.Suspending`, which
+**throws `ReferenceError` when the `WebAssembly` global itself is absent** (locked-down or
+policy-managed browsers, or a degraded renderer) — killing the whole module before any click or
+keydown handler is registered, leaving an empty, unresponsive console whose only live element is
+the bare `<input>` row.
+
+**What changed**
+- All three scripts guard the global first (`typeof WebAssembly === "object" && …`); a missing
+  engine now degrades to an explained limitation instead of a dead page. `/vm` reaches its
+  existing "no WebAssembly support" reporting; `/try` prints a note and keeps the launcher
+  commands working.
+- `try.js` loads `host.js` dynamically inside `start()` and reports a load failure in the
+  terminal; input wiring and `error`/`unhandledrejection` reporting are registered before
+  anything that can fail, so no asset failure can silence the prompt again.
+- Terminal ergonomics on `/vm` (parity with `/try`, which already had click-to-focus): clicking
+  anywhere in the console focuses the input when a program is reading; keystrokes typed while
+  focus is elsewhere are routed into the input; a stray Enter when nothing is reading prints a
+  hint instead of doing nothing; `cursor: text` over the console.
+- Verified in real headless Chrome 148 with CDP-driven mouse/keyboard events (not the node
+  harness): full eosh session on `/vm` (boot → click mid-console → `hello --name chrome
+  --excited true` → routed-keystroke `ls /` → `exit`), `/try` click-anywhere + Enter, and both
+  pages with `WebAssembly` deleted from the page (the failure mode above) staying interactive
+  and self-explaining. node verify-{eosh,exec,fs,coreutils} and `cargo xtask check-web-vm`
+  unchanged and green.
+
+**Known pre-existing gap (not addressed here):** `/vm/selftest.html` currently reports
+`FAIL sleepy reports the stackful-lift limitation honestly` on master too — `run_sleepy` now
+*succeeds* fiberlessly (`sleepy.run() measured ~52 ms across its await`), so the check's
+expectation (non-zero rc + a "stackful" line) is stale. Whether the canary's purpose changed or
+the check should now assert success is the blob owner's call.

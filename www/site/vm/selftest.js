@@ -11,7 +11,9 @@ let exports = null;
 let lines = [];
 
 const hasJSPI =
-  typeof WebAssembly.Suspending === "function" && typeof WebAssembly.promising === "function";
+  typeof WebAssembly === "object" &&
+  typeof WebAssembly.Suspending === "function" &&
+  typeof WebAssembly.promising === "function";
 
 function note(line) {
   results.textContent += line + "\n";

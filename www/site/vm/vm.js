@@ -51,8 +51,13 @@ let exportsRef = null;
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 
+// `typeof WebAssembly.Suspending` alone throws if the WebAssembly global itself is missing
+// (locked-down browsers do exist) — and a top-level throw here would take the whole page's
+// wiring down with it, leaving a silently dead terminal. Guard the global first.
 const hasJSPI =
-  typeof WebAssembly.Suspending === "function" && typeof WebAssembly.promising === "function";
+  typeof WebAssembly === "object" &&
+  typeof WebAssembly.Suspending === "function" &&
+  typeof WebAssembly.promising === "function";
 
 function writeLine(text, cls) {
   const line = document.createElement("div");
@@ -100,8 +105,8 @@ function armReadLine() {
   });
 }
 
-terminalInput.addEventListener("keydown", (event) => {
-  if (event.key !== "Enter" || pendingReadLine === null) return;
+function submitTerminalLine() {
+  if (pendingReadLine === null) return;
   const line = terminalInput.value;
   terminalInput.value = "";
   terminalInput.disabled = true;
@@ -109,6 +114,65 @@ terminalInput.addEventListener("keydown", (event) => {
   pendingReadLine = null;
   writeLine(`> ${line}`, "vm-cmd");
   resolve(line);
+}
+
+const READLINE_HINT =
+  "(nothing is reading the terminal right now — boot the eosh shell, or press “Read a line”, then type below)";
+let lastHintAt = 0;
+function readlineHint() {
+  const now = Date.now();
+  if (now - lastHintAt < 2000) return;
+  lastHintAt = now;
+  writeLine(READLINE_HINT, "vm-cmd");
+}
+
+terminalInput.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  if (pendingReadLine === null) {
+    readlineHint();
+    return;
+  }
+  submitTerminalLine();
+});
+
+// Behave like a terminal: clicking anywhere in the console focuses the input (when a program
+// is reading), and keystrokes that would otherwise be lost are routed to it.
+function focusTerminalInput() {
+  if (!terminalInput.disabled) terminalInput.focus();
+}
+output.addEventListener("click", focusTerminalInput);
+document.getElementById("vm-input-row").addEventListener("click", focusTerminalInput);
+
+document.addEventListener("keydown", (event) => {
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  const target = event.target;
+  const inFormField =
+    target instanceof HTMLElement &&
+    (target.tagName === "INPUT" ||
+      target.tagName === "TEXTAREA" ||
+      target.tagName === "SELECT" ||
+      target.tagName === "BUTTON" ||
+      target.isContentEditable);
+  if (inFormField) return;
+  if (pendingReadLine !== null && !terminalInput.disabled) {
+    // A program is reading: send the keystroke to the terminal input instead of losing it.
+    if (event.key.length === 1) {
+      terminalInput.focus();
+      terminalInput.value += event.key;
+      event.preventDefault();
+    } else if (event.key === "Backspace") {
+      terminalInput.focus();
+      terminalInput.value = terminalInput.value.slice(0, -1);
+      event.preventDefault();
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      submitTerminalLine();
+    }
+  } else if (event.key === "Enter") {
+    // Nothing is reading: explain instead of doing nothing.
+    readlineHint();
+  }
 });
 
 async function hostSleepMs(ms) {
