@@ -377,7 +377,7 @@ trim (serve `/bin` raw+cwasm from the HTTP store instead of embedding) is the re
 blob-size follow-up. Nit: eosh renders the refusal as `CompileError::Codegen(...)` (raw enum
 prefix) — an eosh-side rendering follow-up.
 
-## Decision 20 — server-side `/vm/compile` for in-browser `$`/`&` (DESIGN; not yet implemented)
+## Decision 20 — server-side `/vm/compile` for in-browser `$`/`&` (DESIGN — implemented in Decision 21)
 
 In-blob codegen is std/mmap-blocked, so a fused composition can't be compiled client-side
 (Decision 19's clean refusal). The path to actually running `entropy.seeded $ rng` in the
@@ -405,3 +405,58 @@ unverified code; #1 (only-narrowing) and #2 (provider in /bin) are done and veri
 - **Verify**: `entropy.seeded $ rng --count 3` at the browser prompt → server compiles → eosh
   runs it → typed outcome, deterministic across runs (extend verify-eosh.mjs with a stub/real
   `/vm/compile` responder, and a www server integration test for the route + its bounds).
+
+## Decision 21 — `/vm/compile` implemented: the in-browser composition round-trip works
+
+Decision 20's design, built and verified end-to-end. Typing `entropy.seeded $ rng --count 3`
+at the browser `eosh>` prompt now genuinely compiles the fused composition on the server and
+runs it in the blob — verified by `verify-eosh.mjs` (which spawns the real `eo9-www` server and
+points the blob's compile host-import at its `/vm/compile`): 3 SplitMix64 numbers print,
+deterministic across two runs, and the composition no longer hits the codegen refusal.
+
+What was built (all under `www/`, `xtask`; eosh untouched):
+
+- **Server compile core (`www/src/compile.rs`)**: `compile_expression(expr, raw_dir, allow)`
+  parses `[only <csv> $] name ($ name)*` (consumer `--flags` stripped — bound at spawn, not
+  part of the fused component), resolves each name against the allow-set, fuses with the real
+  `eo9-component` algebra (right-assoc `$`, leading `only` → `restrict`), and precompiles to a
+  pulley32 image with the exact engine config `xtask::preaot_for_web` uses (shared helper
+  `pulley_engine`). `&`/`rename`/`configure` are rejected with a clear message (the kernel/
+  native run the full algebra). New host deps: `eo9-component` (path) + `wasmtime` 45. Unit-
+  tested: fuses `entropy.seeded $ rng` to a real artifact; allow-set rejection enforced.
+- **HTTP route (`www/src/server.rs`)**: `POST /vm/compile`, dispatched in the site connection's
+  service before the static-file path. **Security bounds**: 2 KiB request-body cap
+  (`Limited`), a 20 s compile timeout (`spawn_blocking` + `timeout`), and a concurrency gate
+  (2 permits, wait up to 10 s then 503). The allow-set is exactly the stems of
+  `site/vm/raw/*.wasm` shipped with the site — never the client's word. Typed responses:
+  `application/octet-stream` image on success, `text/plain` 4xx/5xx with the reason. Carries
+  the standard security headers. The CSP already had `connect-src 'self'`, so no CSP change was
+  needed (the design's one open question resolved itself). Integration-tested over real HTTP
+  (`www/tests/vm_compile.rs`): compiles `entropy.seeded $ rng`, rejects unknown programs (400),
+  unsupported ops (400), empty (400), and oversized bodies (413).
+- **Raw components (`xtask build-web-vm`)**: emits each `/bin` program's raw bytes to
+  `site/vm/raw/<name>.wasm` (the same set, by name). Not fingerprinted — the server resolves
+  them by fixed name. `check-web-vm` still passes (it checks only the fingerprinted assets);
+  `build-web-vm` reproduces them deterministically (straight copy of the guest components).
+- **Blob (`host.rs`, `execsurface.rs`)**: a `host_compile_len`/`host_compile_copy` JSPI import
+  pair mirroring the existing `host_fetch_*` (async POST stashes the image + returns its length;
+  sync copy into blob memory). The key wrinkle the design under-specified: **eosh `load`s raw
+  bytes, never names**, and `ComponentEntry` tracked no provenance — so the compile op had the
+  fused bytes but not the names+ops expression the endpoint requires. Resolved by recovering
+  names **by content hash** against the embedded `/bin` set (`name_for`, reusing the existing
+  `artifact_for` hash) and threading a small `Prov` enum (`Program`/`Compose`/`Only`) through
+  `load`/`compose`/`restrict`; `extend`/`rename`/`configure` set provenance `None` (not in the
+  endpoint grammar → the existing clean refusal, unchanged). On a fused (artifact-`None`)
+  component, `compile` renders the provenance to the endpoint expression, POSTs via the host
+  import, and runs the returned image through the unchanged run-to-completion `spawn` path.
+- **vm.js**: the page shim — `hostCompileLen` POSTs to `/vm/compile`, `hostCompileCopy` copies
+  the image; both registered (`Suspending` under JSPI, an `unavailable` stub otherwise). The
+  other blob harnesses (`verify-{coreutils,fs,exec}.mjs`) get `-1` stubs so the blob still
+  instantiates (the two imports are now mandatory).
+
+Security recap (all required bounds present): names-and-ops only (no uploaded bytes); allow-set
+= shipped store programs (anything else 4xx); request-size cap; compile timeout; concurrency
+limit. Blob size after the round-trip wiring: ~6.05 MiB raw / ~1.19 MiB brotli (the lazy-fetch
+`/bin` trim from Decision 19 remains the recorded blob-size follow-up). The Decision 19 nit
+(eosh renders an actual refusal as `CompileError::Codegen(...)`) is now rarely reached for `$`
+compositions (they compile) but still applies to `&`/`rename`/`configure` — unchanged.

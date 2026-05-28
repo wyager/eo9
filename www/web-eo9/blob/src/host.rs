@@ -33,6 +33,14 @@ unsafe extern "C" {
     fn host_fetch_len(name_ptr: *const u8, name_len: usize) -> i32;
     /// Copy the most recently fetched artifact (see [`host_fetch_len`]) into `dest`.
     fn host_fetch_copy(dest_ptr: *mut u8, len: usize);
+    /// **JSPI** — POST a composition expression (UTF-8 at `expr_ptr`, `expr_len` bytes) to the
+    /// server's `/vm/compile` endpoint, which fuses the named store programs with the real
+    /// algebra and compiles the result to a pulley32 image. Returns the image byte length and
+    /// caches the bytes on the JS side (copy with [`host_compile_copy`]), `-1` if the server
+    /// rejected or could not compile it, `-2` if the browser cannot suspend (no JSPI).
+    fn host_compile_len(expr_ptr: *const u8, expr_len: usize) -> i32;
+    /// Copy the most recently server-compiled image (see [`host_compile_len`]) into `dest`.
+    fn host_compile_copy(dest_ptr: *mut u8, len: usize);
 }
 
 pub fn write_out(message: &str) {
@@ -70,6 +78,28 @@ pub fn read_line(cap: usize) -> Option<String> {
     }
     buffer.truncate(written as usize);
     Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// Ask the server to compile a composition expressed over store-program names + algebra ops
+/// (e.g. `entropy.seeded $ rng`) to a pulley32 image. The browser can't compile a fused
+/// composition itself (in-blob codegen is std/mmap-blocked); the server has the full toolchain.
+pub fn compile_composition(expr: &str) -> Result<Vec<u8>, String> {
+    let len = unsafe { host_compile_len(expr.as_ptr(), expr.len()) };
+    match len {
+        -2 => Err(String::from(
+            "this browser cannot suspend WebAssembly (no JSPI), so the blob cannot reach the \
+             server compiler",
+        )),
+        -1 => Err(std::format!(
+            "the server could not compile `{expr}` (only `$` compositions and a leading `only` \
+             over shipped store programs are supported)"
+        )),
+        len => {
+            let mut bytes = vec![0u8; len as usize];
+            unsafe { host_compile_copy(bytes.as_mut_ptr(), bytes.len()) };
+            Ok(bytes)
+        }
+    }
 }
 
 /// Fetch a pre-AOT'd pulley32 artifact from the page's HTTP store (`/vm/store/<name>.cwasm`).
