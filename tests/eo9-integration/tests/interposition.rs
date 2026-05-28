@@ -7,6 +7,7 @@
 //!   * plain (default-configured) `time.frozen $ time.fuzzy $ hello`;
 //!   * configured `configure(time.frozen, …) $ configure(time.fuzzy, …) $ hello`;
 //!   * the `&` form `(configure(time.frozen, …) & configure(time.fuzzy, …)) $ hello`.
+//!
 //! In every case the program must run to `success` and observe the frozen clock as
 //! quantized by the fuzzy layer — never trap.
 
