@@ -459,6 +459,23 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
         false,
     )?;
 
+    // eosh — the shell itself, booted in the blob against the in-browser eo9:exec surface
+    // (plan/18: eosh in the browser). Pre-AOT'd to pulley32 and embedded.
+    let eosh_component = std::fs::read(
+        root.join("guest")
+            .join("target")
+            .join("components")
+            .join("eosh.wasm"),
+    )
+    .map_err(|err| format!("failed to read the eosh component: {err}"))?;
+    preaot_for_web(
+        &artifacts,
+        &eosh_component,
+        "eosh shell",
+        "eosh.cwasm",
+        false,
+    )?;
+
     // The page's HTTP-backed program store: real example programs (and the kernel's async
     // sleep canary) pre-AOT'd to pulley32 and served as static files the blob fetches on
     // demand (www/web-eo9/blob/src/store.rs).

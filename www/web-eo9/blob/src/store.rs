@@ -256,6 +256,9 @@ pub fn run_program(name: &str, raw_args: &[&str]) -> wasmtime::Result<()> {
     let elapsed = host::monotonic_ns().saturating_sub(started);
 
     crate::outf!("{name}: outcome = {}", render_val(&outcome));
-    crate::outf!("{name}: ran in {:.1} ms (Pulley interpreter)", elapsed as f64 / 1_000_000.0);
+    crate::outf!(
+        "{name}: ran in {:.1} ms (Pulley interpreter)",
+        elapsed as f64 / 1_000_000.0
+    );
     Ok(())
 }

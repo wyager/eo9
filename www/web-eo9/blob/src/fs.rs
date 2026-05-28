@@ -111,8 +111,14 @@ struct WitWriteResult {
     bytes_written: u64,
 }
 
-type FsReadReturn = (Resource<BufferRes>, std::result::Result<WitReadResult, WitFsError>);
-type FsWriteReturn = (Resource<BufferRes>, std::result::Result<WitWriteResult, WitFsError>);
+type FsReadReturn = (
+    Resource<BufferRes>,
+    std::result::Result<WitReadResult, WitFsError>,
+);
+type FsWriteReturn = (
+    Resource<BufferRes>,
+    std::result::Result<WitWriteResult, WitFsError>,
+);
 
 // --- io buffer table (same design and bounds as the kernel / usermode runtime) -----------
 
@@ -285,7 +291,10 @@ impl MemFs {
             format!("{path}/")
         };
         self.files.keys().any(|p| p.starts_with(&prefix))
-            || self.dirs.iter().any(|p| p.starts_with(&prefix) && p != path)
+            || self
+                .dirs
+                .iter()
+                .any(|p| p.starts_with(&prefix) && p != path)
     }
 
     fn insert_open(&mut self, path: String) -> u32 {
@@ -481,14 +490,12 @@ impl MemFs {
         offset: u64,
         data: &[u8],
     ) -> std::result::Result<u64, WitFsError> {
-        let offset = usize::try_from(offset).map_err(|_| WitFsError::Io("offset too large".into()))?;
+        let offset =
+            usize::try_from(offset).map_err(|_| WitFsError::Io("offset too large".into()))?;
         let end = offset
             .checked_add(data.len())
             .ok_or_else(|| WitFsError::Io("write range overflow".into()))?;
-        let bytes = self
-            .files
-            .get_mut(path)
-            .ok_or(WitFsError::NotFound)?;
+        let bytes = self.files.get_mut(path).ok_or(WitFsError::NotFound)?;
         let grow = end.saturating_sub(bytes.len()) as u64;
         if grow > 0 && self.total_bytes + grow > MAX_FS_BYTES {
             return Err(WitFsError::NoSpace);
@@ -637,8 +644,7 @@ fn add_fs(linker: &mut Linker<WebState>) -> Result<()> {
          (_cap, path, flags): (Resource<FsCap>, String, WitOpenFlags)|
          -> ConcurrentFuture<'_, (std::result::Result<Resource<FileRes>, WitFsError>,)> {
             Box::pin(async move {
-                let result =
-                    accessor.with(|mut access| access.data_mut().fs().open(&path, flags));
+                let result = accessor.with(|mut access| access.data_mut().fs().open(&path, flags));
                 Ok((result.map(Resource::new_own),))
             })
         },
@@ -662,7 +668,8 @@ fn add_fs(linker: &mut Linker<WebState>) -> Result<()> {
          (_cap, path): (Resource<FsCap>, String)|
          -> ConcurrentFuture<'_, (std::result::Result<Vec<String>, WitFsError>,)> {
             Box::pin(async move {
-                let result = accessor.with(|mut access| access.data_mut().fs().list_directory(&path));
+                let result =
+                    accessor.with(|mut access| access.data_mut().fs().list_directory(&path));
                 Ok((result,))
             })
         },
@@ -686,7 +693,8 @@ fn add_fs(linker: &mut Linker<WebState>) -> Result<()> {
          (_cap, path): (Resource<FsCap>, String)|
          -> ConcurrentFuture<'_, (std::result::Result<(), WitFsError>,)> {
             Box::pin(async move {
-                let result = accessor.with(|mut access| access.data_mut().fs().create_directory(&path));
+                let result =
+                    accessor.with(|mut access| access.data_mut().fs().create_directory(&path));
                 Ok((result,))
             })
         },
