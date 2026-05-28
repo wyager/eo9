@@ -633,7 +633,10 @@ fn shell_verbose_announces_child_grants() {
     // `-v` makes the capability set children inherit visible at spawn time (user-study
     // finding #8); a default run stays quiet (the full picture is still in `env`).
     let store = temp_store("shell-vgrants");
-    let verbose = eo9(&store, &["-v", "shell", "-c", "hello --name v --excited true"]);
+    let verbose = eo9(
+        &store,
+        &["-v", "shell", "-c", "hello --name v --excited true"],
+    );
     assert_eq!(verbose.code, 0, "stderr: {}", verbose.stderr);
     assert!(
         verbose
