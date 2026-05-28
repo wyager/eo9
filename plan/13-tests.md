@@ -137,3 +137,28 @@ Everything; starts alongside Phase 1 (law tests) and grows with each milestone.
     suite (it caught the `time.none`/`text.none`/`entropy.none` split-identity failures on first run); the
     fully generative suite over synthetic component triples (resources, types-siblings, multi-slot,
     stateful configured providers) plus an observational action-law check stays queued for this area.
+
+15. **Generative property suite (the queued item from D14, now built).**
+    `tests/eo9-integration/tests/algebra_properties.rs` enumerates small component graphs from a fixed
+    catalog of fixtures (deterministic — no randomness/wall-clock; a failure always reproduces) and asserts
+    the spec's algebraic properties across all of them:
+    - **Encoder soundness** (the D14 obligation, generalized from `$` over the shipped corpus to nested
+      compose, `&` environments, `only` with admit/seal/reject/malformed allow-lists, and `rename` of
+      present/missing/colliding slots): every operation yields a validated component or a *typed* refusal,
+      never an `Internal(_)`. The cap-vocabulary sweep runs **510 cases**; a small guest-backed sweep adds
+      breadth over resource-owning / stateful-configured providers (fs.memfs, time.frozen, entropy.seeded).
+    - **Action law** `(x & y) $ c ≡ x $ y $ c` observed across a range of values via the two-slot
+      `two-answers` consumer (a mis-wiring would change `left*100+right`).
+    - **Sealing** (innermost provider always wins, over a range of values), **`only`** (sealing an optional
+      → observed absence; rejecting a required → typed `RequiredOutsideAllowList`), and **rename**
+      round-trip identity + executability of the stripped form.
+    The whole file runs in ~1.5 s (plus the shared guest build the other suites already pay).
+    No currently-shipping behavior failed a property.
+
+16. **Spec gap flagged: `≡` and instance identity are under-specified (PL study #5).** The spec states its
+    laws with an abstract `≡` and does not pin down component *instance* identity under composition (when two
+    importers share one provider instance vs. get distinct ones; whether the action law preserves that), and
+    the identity element `empty` has no concrete spelling. The property suite defines `≡` *operationally* —
+    same `program-outcome` value text under the same args and root providers — which is the testable
+    stand-in but does not settle the instance-identity question. This wants a SPEC clarification (out of
+    this area's scope); recorded here so it is not lost.
