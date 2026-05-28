@@ -30,9 +30,23 @@ fn redirect_server_addr() -> SocketAddr {
 
 /// Send one raw HTTP/1.1 request (plus Host/Connection headers) and parse the response.
 fn request(addr: SocketAddr, method: &str, target: &str) -> HttpResponse {
+    request_with_headers(addr, method, target, &[])
+}
+
+/// Like [`request`], with extra request headers (`("Name", "value")` pairs).
+fn request_with_headers(
+    addr: SocketAddr,
+    method: &str,
+    target: &str,
+    extra_headers: &[(&str, &str)],
+) -> HttpResponse {
     let mut stream = TcpStream::connect(addr).expect("connect to test server");
-    let message =
-        format!("{method} {target} HTTP/1.1\r\nHost: eo9.org\r\nConnection: close\r\n\r\n");
+    let mut message =
+        format!("{method} {target} HTTP/1.1\r\nHost: eo9.org\r\nConnection: close\r\n");
+    for (name, value) in extra_headers {
+        message.push_str(&format!("{name}: {value}\r\n"));
+    }
+    message.push_str("\r\n");
     stream.write_all(message.as_bytes()).expect("send request");
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).expect("read response");
@@ -144,6 +158,63 @@ fn query_strings_are_ignored_for_resolution() {
         response.header("Content-Type"),
         Some("text/css; charset=utf-8")
     );
+}
+
+#[test]
+fn precompressed_assets_are_served_by_content_negotiation() {
+    // The committed site tree carries .br/.gz siblings for the heavyweight assets
+    // (written by `cargo xtask precompress-site`); a client that accepts brotli gets the
+    // brotli bytes, a gzip-only client gets gzip, and a client that accepts neither gets
+    // the original — always with the original's Content-Type and a Vary on Accept-Encoding.
+    let plain = request(site_server_addr(), "GET", "/vm/web-eo9.wasm");
+    assert_eq!(plain.status, 200);
+    assert_eq!(plain.header("Content-Encoding"), None);
+    assert_eq!(plain.header("Content-Type"), Some("application/wasm"));
+    assert_eq!(plain.header("Vary"), Some("Accept-Encoding"));
+
+    let brotli = request_with_headers(
+        site_server_addr(),
+        "GET",
+        "/vm/web-eo9.wasm",
+        &[("Accept-Encoding", "gzip, deflate, br, zstd")],
+    );
+    assert_eq!(brotli.status, 200);
+    assert_eq!(brotli.header("Content-Encoding"), Some("br"));
+    assert_eq!(brotli.header("Content-Type"), Some("application/wasm"));
+    assert_eq!(brotli.header("Vary"), Some("Accept-Encoding"));
+    assert!(
+        brotli.body.len() < plain.body.len() / 2,
+        "brotli body ({}) should be far smaller than the original ({})",
+        brotli.body.len(),
+        plain.body.len()
+    );
+
+    let gzip = request_with_headers(
+        site_server_addr(),
+        "GET",
+        "/try/components/hello/hello.js",
+        &[("Accept-Encoding", "gzip")],
+    );
+    assert_eq!(gzip.status, 200);
+    assert_eq!(gzip.header("Content-Encoding"), Some("gzip"));
+    assert_eq!(
+        gzip.header("Content-Type"),
+        Some("text/javascript; charset=utf-8")
+    );
+    assert!(
+        !gzip.body.is_empty() && gzip.body[0..2] == [0x1f, 0x8b],
+        "gzip magic"
+    );
+
+    // Tiny files have no variants and are served identity-encoded even to willing clients.
+    let small = request_with_headers(
+        site_server_addr(),
+        "GET",
+        "/logo.svg",
+        &[("Accept-Encoding", "br, gzip")],
+    );
+    assert_eq!(small.status, 200);
+    assert_eq!(small.header("Content-Encoding"), None);
 }
 
 #[test]

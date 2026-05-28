@@ -26,8 +26,13 @@ use tokio::time::timeout;
 use tokio_rustls::LazyConfigAcceptor;
 use tokio_rustls::server::TlsStream;
 
+use hyper::HeaderMap;
+
 use crate::tls::TlsSettings;
-use crate::{Config, Mode, ResolveError, cache_control, content_type, resolve, tls};
+use crate::{
+    Config, Encoding, Mode, ResolveError, accepted_encodings, cache_control, content_type, resolve,
+    tls,
+};
 
 type Body = Full<Bytes>;
 
@@ -324,7 +329,15 @@ where
     let service = service_fn(move |request: Request<Incoming>| {
         let site_root = site_root.clone();
         async move {
-            Ok::<_, Infallible>(site_response(request.method(), request.uri(), &site_root).await)
+            Ok::<_, Infallible>(
+                site_response(
+                    request.method(),
+                    request.uri(),
+                    request.headers(),
+                    &site_root,
+                )
+                .await,
+            )
         }
     });
     drive_connection(stream, service, limits).await;
@@ -352,8 +365,16 @@ where
 
 /// Build the response for one request against the site directory. GET and HEAD are served
 /// (hyper omits the body for HEAD itself); every other method gets 405. Resolution failures
-/// get 400 or 404 with a small HTML body.
-pub async fn site_response(method: &Method, uri: &Uri, site_root: &Path) -> Response<Body> {
+/// get 400 or 404 with a small HTML body. When the client accepts it and a fresh
+/// pre-compressed sibling exists (see `www/precompress`), that representation is served with
+/// the matching `Content-Encoding`; the `Content-Type` and cache policy are always those of
+/// the original file.
+pub async fn site_response(
+    method: &Method,
+    uri: &Uri,
+    request_headers: &HeaderMap,
+    site_root: &Path,
+) -> Response<Body> {
     if method != Method::GET && method != Method::HEAD {
         let mut response = error_response(StatusCode::METHOD_NOT_ALLOWED);
         response
@@ -361,20 +382,74 @@ pub async fn site_response(method: &Method, uri: &Uri, site_root: &Path) -> Resp
             .insert(header::ALLOW, header::HeaderValue::from_static("GET, HEAD"));
         return response;
     }
-    match resolve(site_root, uri.path()) {
-        Ok(file) => match tokio::fs::read(&file).await {
-            Ok(contents) => Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, content_type(&file))
-                .header(header::CACHE_CONTROL, cache_control(&file))
-                .body(Full::new(Bytes::from(contents)))
-                .expect("statically valid response"),
-            // The file vanished between resolution and reading; treat it as not found.
-            Err(_) => error_response(StatusCode::NOT_FOUND),
-        },
-        Err(ResolveError::BadRequest) => error_response(StatusCode::BAD_REQUEST),
-        Err(ResolveError::NotFound) => error_response(StatusCode::NOT_FOUND),
+    let file = match resolve(site_root, uri.path()) {
+        Ok(file) => file,
+        Err(ResolveError::BadRequest) => return error_response(StatusCode::BAD_REQUEST),
+        Err(ResolveError::NotFound) => return error_response(StatusCode::NOT_FOUND),
+    };
+
+    let accept_encoding = request_headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|value| value.to_str().ok());
+    let variant = select_precompressed(&file, accept_encoding).await;
+    let read_path = variant
+        .as_ref()
+        .map_or_else(|| file.clone(), |(path, _)| path.clone());
+
+    let contents = match tokio::fs::read(&read_path).await {
+        Ok(contents) => contents,
+        // The file vanished between resolution and reading; treat it as not found.
+        Err(_) => return error_response(StatusCode::NOT_FOUND),
+    };
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type(&file))
+        .header(header::CACHE_CONTROL, cache_control(&file))
+        // The served representation depends on Accept-Encoding whenever a sibling exists,
+        // and may start to at any deploy: always tell caches to key on it.
+        .header(header::VARY, "Accept-Encoding");
+    if let Some((_, encoding)) = variant {
+        builder = builder.header(header::CONTENT_ENCODING, encoding.token());
     }
+    builder
+        .body(Full::new(Bytes::from(contents)))
+        .expect("statically valid response")
+}
+
+/// Pick the pre-compressed sibling to serve, if any: the client must accept the encoding,
+/// the sibling must exist, and it must be at least as new as the original — an edited
+/// original is never shadowed by a stale variant.
+async fn select_precompressed(
+    file: &Path,
+    accept_encoding: Option<&str>,
+) -> Option<(PathBuf, Encoding)> {
+    let accepted = accepted_encodings(accept_encoding);
+    if accepted.is_empty() {
+        return None;
+    }
+    let original = tokio::fs::metadata(file).await.ok()?;
+    for encoding in accepted {
+        let mut name = file.as_os_str().to_owned();
+        name.push(".");
+        name.push(encoding.file_extension());
+        let candidate = PathBuf::from(name);
+        let Ok(meta) = tokio::fs::metadata(&candidate).await else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let fresh = match (meta.modified(), original.modified()) {
+            (Ok(variant_mtime), Ok(original_mtime)) => variant_mtime >= original_mtime,
+            // If either filesystem refuses to report mtimes, trust the build step.
+            _ => true,
+        };
+        if fresh {
+            return Some((candidate, encoding));
+        }
+    }
+    None
 }
 
 /// Build the 301 redirect to HTTPS for one plain-HTTP request. `host_header` is the raw

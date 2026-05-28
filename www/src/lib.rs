@@ -255,6 +255,72 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// A pre-compressed representation the server can serve from a sibling file written by
+/// `www/precompress` (`<file>.br` / `<file>.gz`), negotiated via `Accept-Encoding`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+    Brotli,
+    Gzip,
+}
+
+impl Encoding {
+    /// The `Content-Encoding` token sent on the wire.
+    pub fn token(self) -> &'static str {
+        match self {
+            Encoding::Brotli => "br",
+            Encoding::Gzip => "gzip",
+        }
+    }
+
+    /// The sibling-file extension the precompressor writes.
+    pub fn file_extension(self) -> &'static str {
+        match self {
+            Encoding::Brotli => "br",
+            Encoding::Gzip => "gz",
+        }
+    }
+}
+
+/// Parse an `Accept-Encoding` header value into the encodings the client accepts, in the
+/// server's preference order (brotli before gzip). A missing header accepts neither; a
+/// wildcard accepts both; an explicit `q=0` refuses one. Only encodings we can actually
+/// serve (from pre-compressed siblings) are reported.
+pub fn accepted_encodings(accept_encoding: Option<&str>) -> Vec<Encoding> {
+    let Some(value) = accept_encoding else {
+        return Vec::new();
+    };
+    let mut brotli = None;
+    let mut gzip = None;
+    let mut wildcard = None;
+    for entry in value.split(',') {
+        let mut parts = entry.split(';');
+        let token = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        // q defaults to 1; a malformed q-value is treated as acceptable rather than refused.
+        let quality = parts
+            .filter_map(|param| {
+                let (name, value) = param.split_once('=')?;
+                name.trim().eq_ignore_ascii_case("q").then_some(value)
+            })
+            .next_back()
+            .map(|q| q.trim().parse::<f32>().unwrap_or(1.0));
+        let acceptable = quality.is_none_or(|q| q > 0.0);
+        match token.as_str() {
+            "br" => brotli = Some(acceptable),
+            "gzip" | "x-gzip" => gzip = Some(acceptable),
+            "*" => wildcard = Some(acceptable),
+            _ => {}
+        }
+    }
+    let mut accepted = Vec::new();
+    if brotli.or(wildcard).unwrap_or(false) {
+        accepted.push(Encoding::Brotli);
+    }
+    if gzip.or(wildcard).unwrap_or(false) {
+        accepted.push(Encoding::Gzip);
+    }
+    accepted
+}
+
 /// The `Content-Type` value for a file, chosen by extension.
 pub fn content_type(path: &Path) -> &'static str {
     let extension = path
@@ -485,6 +551,41 @@ mod tests {
         assert_eq!(
             cache_control(Path::new("logo.svg")),
             "public, max-age=86400"
+        );
+    }
+
+    #[test]
+    fn accept_encoding_negotiation() {
+        // No header, empty header, or everything refused: serve the original.
+        assert!(accepted_encodings(None).is_empty());
+        assert!(accepted_encodings(Some("")).is_empty());
+        assert!(accepted_encodings(Some("identity")).is_empty());
+        assert!(accepted_encodings(Some("br;q=0, gzip;q=0")).is_empty());
+
+        // Typical browser value: both, brotli preferred.
+        assert_eq!(
+            accepted_encodings(Some("gzip, deflate, br, zstd")),
+            vec![Encoding::Brotli, Encoding::Gzip]
+        );
+        assert_eq!(accepted_encodings(Some("gzip")), vec![Encoding::Gzip]);
+        assert_eq!(accepted_encodings(Some("x-gzip")), vec![Encoding::Gzip]);
+        assert_eq!(accepted_encodings(Some("BR")), vec![Encoding::Brotli]);
+
+        // Wildcard accepts both unless an explicit entry refuses one.
+        assert_eq!(
+            accepted_encodings(Some("*")),
+            vec![Encoding::Brotli, Encoding::Gzip]
+        );
+        assert_eq!(accepted_encodings(Some("*, br;q=0")), vec![Encoding::Gzip]);
+
+        // q-values: refused vs preferred (we only honor refusal, order is ours).
+        assert_eq!(
+            accepted_encodings(Some("br;q=0.5, gzip;q=1.0")),
+            vec![Encoding::Brotli, Encoding::Gzip]
+        );
+        assert_eq!(
+            accepted_encodings(Some("gzip;q=0, br")),
+            vec![Encoding::Brotli]
         );
     }
 
