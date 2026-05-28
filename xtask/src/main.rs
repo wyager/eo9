@@ -1786,7 +1786,21 @@ fn package(root: &Path) -> Result<(), String> {
     // packages and build-verifies each one. The resulting .crate files land in
     // target/package, so their upload sizes can be reported.
     for krate in PUBLISH_LEAF_CRATES {
-        run(root, "cargo", ["publish", "--dry-run", "-p", krate])?;
+        // `--registry crates-io` targets crates.io even when a local cargo config replaces
+        // the default registry with a mirror (cargo refuses to publish "to" a replaced
+        // source); the dry run uploads nothing and needs no token.
+        run(
+            root,
+            "cargo",
+            [
+                "publish",
+                "--dry-run",
+                "--registry",
+                "crates-io",
+                "-p",
+                krate,
+            ],
+        )?;
     }
     println!("xtask: dry-run-verified leaf crates (target/package):");
     for krate in PUBLISH_LEAF_CRATES {
@@ -1815,7 +1829,7 @@ fn package(root: &Path) -> Result<(), String> {
          xtask: to be live on crates.io before the next):"
     );
     for krate in PUBLISH_CRATES {
-        println!("xtask:   cargo publish -p {krate}");
+        println!("xtask:   cargo publish --registry crates-io -p {krate}");
     }
     println!(
         "xtask: note: only the leaf crates are dry-run-verified here — cargo cannot verify\n\
