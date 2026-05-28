@@ -10,14 +10,13 @@
 //! * writes — `open`(write), `write`, `create-directory`, `remove` are routed to
 //!   `lower`; the overlay never mutates `upper`.
 //!
-//! The overlay exports its own `eo9:fs/types`, so its `fs-impl` is a compound root
-//! handle capturing the two underlying roots (`upper::default()` / `lower::default()`).
-//! Open files and immutable handles are this provider's own resources tagging which
-//! layer served the open, so each subsequent `read`/`write`/`exec-read` is dispatched
-//! back to that layer. Binding-type notes: the two import slots share the imported
-//! `eo9:fs/types.fs-impl` and the `eo9:io` buffer resource, but each slot has its own
-//! nominal `file`/`immutable-handle`/error/record types — hence the per-layer enums and
-//! the per-layer mapping helpers below.
+//! The overlay's exported `fs-impl` is its own compound root handle capturing the two
+//! underlying roots (`upper::default()` / `lower::default()`). Open files and immutable
+//! handles are this provider's own resources tagging which layer served the open, so each
+//! subsequent `read`/`write`/`exec-read` is dispatched back to that layer. Binding-type
+//! notes: each import slot mints its own nominal `fs-impl`/`file`/`immutable-handle`/error
+//! types (only the `eo9:io` buffer resource is shared) — hence the per-layer enums and the
+//! per-layer mapping helpers below.
 
 #![no_std]
 
@@ -36,7 +35,6 @@ wit_bindgen::generate!({
 });
 
 use exports::eo9::fs::fs::{self, Buffer, FsError, NodeStat, OpenFlags, ReadResult, WriteResult};
-use exports::eo9::fs::types as export_types;
 
 /// Map the `upper` slot's error onto the exported (structurally identical) error type.
 fn upper_error(error: upper::FsError) -> FsError {
@@ -113,8 +111,8 @@ fn is_write(options: OpenFlags) -> bool {
     options.intersects(OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE)
 }
 
-/// The exported root handle: captures both underlying filesystems' root handles.
-/// (`upper`/`lower` share the imported `eo9:fs/types.fs-impl` resource type.)
+/// The exported root handle: captures both underlying filesystems' root handles
+/// (each slot's `fs-impl` is its own nominal type).
 struct OverlayImpl {
     upper: upper::FsImpl,
     lower: lower::FsImpl,
@@ -134,28 +132,25 @@ enum OverlayExec {
 
 struct Stub;
 
-impl export_types::Guest for Stub {
-    type FsImpl = OverlayImpl;
-}
-
-impl export_types::GuestFsImpl for OverlayImpl {}
+impl fs::GuestFsImpl for OverlayImpl {}
 
 impl fs::GuestFile for OverlayFile {}
 impl fs::GuestImmutableHandle for OverlayExec {}
 
 impl fs::Guest for Stub {
+    type FsImpl = OverlayImpl;
     type File = OverlayFile;
     type ImmutableHandle = OverlayExec;
 
-    fn default() -> export_types::FsImpl {
-        export_types::FsImpl::new(OverlayImpl {
+    fn default() -> fs::FsImpl {
+        fs::FsImpl::new(OverlayImpl {
             upper: upper::default(),
             lower: lower::default(),
         })
     }
 
     async fn open(
-        fs: export_types::FsImplBorrow<'_>,
+        fs: fs::FsImplBorrow<'_>,
         path: String,
         options: OpenFlags,
     ) -> Result<fs::File, FsError> {
@@ -181,7 +176,7 @@ impl fs::Guest for Stub {
     }
 
     async fn open_exec(
-        fs: export_types::FsImplBorrow<'_>,
+        fs: fs::FsImplBorrow<'_>,
         path: String,
     ) -> Result<fs::ImmutableHandle, FsError> {
         let overlay = fs.get::<OverlayImpl>();
@@ -198,7 +193,7 @@ impl fs::Guest for Stub {
     }
 
     async fn list_directory(
-        fs: export_types::FsImplBorrow<'_>,
+        fs: fs::FsImplBorrow<'_>,
         path: String,
     ) -> Result<Vec<String>, FsError> {
         let overlay = fs.get::<OverlayImpl>();
@@ -223,7 +218,7 @@ impl fs::Guest for Stub {
         }
     }
 
-    async fn stat(fs: export_types::FsImplBorrow<'_>, path: String) -> Result<NodeStat, FsError> {
+    async fn stat(fs: fs::FsImplBorrow<'_>, path: String) -> Result<NodeStat, FsError> {
         let overlay = fs.get::<OverlayImpl>();
         match upper::stat(&overlay.upper, path.clone()).await {
             Ok(stat) => Ok(upper_stat(stat)),
@@ -236,7 +231,7 @@ impl fs::Guest for Stub {
     }
 
     async fn create_directory(
-        fs: export_types::FsImplBorrow<'_>,
+        fs: fs::FsImplBorrow<'_>,
         path: String,
     ) -> Result<(), FsError> {
         let overlay = fs.get::<OverlayImpl>();
@@ -245,7 +240,7 @@ impl fs::Guest for Stub {
             .map_err(lower_error)
     }
 
-    async fn remove(fs: export_types::FsImplBorrow<'_>, path: String) -> Result<(), FsError> {
+    async fn remove(fs: fs::FsImplBorrow<'_>, path: String) -> Result<(), FsError> {
         let overlay = fs.get::<OverlayImpl>();
         lower::remove(&overlay.lower, path)
             .await

@@ -34,7 +34,6 @@ wit_bindgen::generate!({
 });
 
 use eo9::fs::fs as underlying;
-use eo9::fs::types::FsImpl;
 use exports::eo9::fs::fs::{self, Buffer, FsError, NodeStat, OpenFlags, ReadResult, WriteResult};
 use exports::eo9::fs::readonly_config;
 
@@ -73,6 +72,13 @@ fn map_flags(options: OpenFlags) -> underlying::OpenFlags {
 /// The `fs.readonly` provider.
 struct Stub;
 
+/// The exported root handle: a token for the read-only view. The underlying capability
+/// is reachable through the imported interface's own accessor, so the token carries no
+/// state of its own.
+struct ReadonlyRoot;
+
+impl fs::GuestFsImpl for ReadonlyRoot {}
+
 /// An open file of the read-only view: wraps the underlying file, which was necessarily
 /// opened without write/create/truncate.
 struct ReadonlyFile {
@@ -88,52 +94,65 @@ impl fs::GuestFile for ReadonlyFile {}
 impl fs::GuestImmutableHandle for ReadonlyExec {}
 
 impl readonly_config::Guest for Stub {
-    async fn configure() -> Result<FsImpl, String> {
-        Ok(underlying::default())
+    async fn configure() -> Result<fs::FsImpl, String> {
+        Ok(fs::FsImpl::new(ReadonlyRoot))
     }
 }
 
 impl fs::Guest for Stub {
+    type FsImpl = ReadonlyRoot;
     type File = ReadonlyFile;
     type ImmutableHandle = ReadonlyExec;
 
-    fn default() -> FsImpl {
-        underlying::default()
+    fn default() -> fs::FsImpl {
+        fs::FsImpl::new(ReadonlyRoot)
     }
 
-    async fn open(fs: &FsImpl, path: String, options: OpenFlags) -> Result<fs::File, FsError> {
+    async fn open(
+        _fs: fs::FsImplBorrow<'_>,
+        path: String,
+        options: OpenFlags,
+    ) -> Result<fs::File, FsError> {
         if options.intersects(OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE) {
             return Err(FsError::ReadOnly);
         }
-        let inner = underlying::open(fs, path, map_flags(options))
+        let inner = underlying::open(&underlying::default(), path, map_flags(options))
             .await
             .map_err(map_error)?;
         Ok(fs::File::new(ReadonlyFile { inner }))
     }
 
-    async fn open_exec(fs: &FsImpl, path: String) -> Result<fs::ImmutableHandle, FsError> {
-        let inner = underlying::open_exec(fs, path).await.map_err(map_error)?;
+    async fn open_exec(
+        _fs: fs::FsImplBorrow<'_>,
+        path: String,
+    ) -> Result<fs::ImmutableHandle, FsError> {
+        let inner = underlying::open_exec(&underlying::default(), path)
+            .await
+            .map_err(map_error)?;
         Ok(fs::ImmutableHandle::new(ReadonlyExec { inner }))
     }
 
-    async fn list_directory(fs: &FsImpl, path: String) -> Result<Vec<String>, FsError> {
-        underlying::list_directory(fs, path)
+    async fn list_directory(
+        _fs: fs::FsImplBorrow<'_>,
+        path: String,
+    ) -> Result<Vec<String>, FsError> {
+        underlying::list_directory(&underlying::default(), path)
             .await
             .map_err(map_error)
     }
 
-    async fn stat(fs: &FsImpl, path: String) -> Result<NodeStat, FsError> {
-        underlying::stat(fs, path)
+    async fn stat(_fs: fs::FsImplBorrow<'_>, path: String) -> Result<NodeStat, FsError> {
+        underlying::stat(&underlying::default(), path)
             .await
             .map(map_stat)
             .map_err(map_error)
     }
 
-    async fn create_directory(_fs: &FsImpl, _path: String) -> Result<(), FsError> {
+    async fn create_directory(_fs: fs::FsImplBorrow<'_>, _path: String) -> Result<(), FsError> {
         Err(FsError::ReadOnly)
     }
 
-    async fn remove(_fs: &FsImpl, _path: String) -> Result<(), FsError> {
+    async fn remove(_fs: fs::FsImplBorrow<'_>, _path: String) -> Result<(), FsError> {
         Err(FsError::ReadOnly)
     }
 

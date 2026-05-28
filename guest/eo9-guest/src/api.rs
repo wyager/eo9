@@ -33,7 +33,7 @@ pub mod disk {
 }
 
 pub mod fs {
-    pub use crate::bindings::eo9::fs::{fs, types};
+    pub use crate::bindings::eo9::fs::fs;
 }
 
 pub mod net {
