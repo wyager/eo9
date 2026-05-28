@@ -422,6 +422,309 @@ impl FsProvider for HostFs {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// The session overlay filesystem
+// ---------------------------------------------------------------------------------------
+
+/// Which layer of a session overlay served a handle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OverlayLayer {
+    Upper,
+    Lower,
+}
+
+/// `eo9:fs/fs` as the layered session filesystem (SPEC.md "Overlay filesystems"), composed
+/// host-side from two root providers: reads resolve in `upper` first and fall through to
+/// `lower` on not-found, directory listings are the union of both layers (upper wins on a
+/// name collision), and every mutation — write-opens, `create-directory`, `remove` — is
+/// routed to `lower`; `upper` is never written through the overlay. Without a `lower`
+/// layer the overlay is read-only and mutations report [`FsError::ReadOnly`].
+///
+/// This is the embedder-side counterpart of the guest `fs.overlay` provider: the session's
+/// layers are themselves root providers (the `/bin` program view and the user's
+/// `--fs-root`), which the OS core links directly, exactly as it links every other root
+/// capability. Swapping in the guest `fs.overlay` component — so the same layering is also
+/// available to programs purely through the algebra — is the recorded follow-up
+/// (plan/11-usermode.md Decisions).
+struct OverlayFs {
+    upper: Arc<Mutex<Box<dyn FsProvider>>>,
+    lower: Option<Arc<Mutex<Box<dyn FsProvider>>>>,
+    /// Outer handle -> (serving layer, the layer's own handle).
+    files: Arc<Mutex<HashMap<FsHandle, (OverlayLayer, FsHandle)>>>,
+    execs: Arc<Mutex<HashMap<FsHandle, (OverlayLayer, FsHandle)>>>,
+    next_handle: FsHandle,
+}
+
+impl OverlayFs {
+    fn new(upper: Box<dyn FsProvider>, lower: Option<Box<dyn FsProvider>>) -> Self {
+        OverlayFs {
+            upper: Arc::new(Mutex::new(upper)),
+            lower: lower.map(|fs| Arc::new(Mutex::new(fs))),
+            files: Arc::new(Mutex::new(HashMap::new())),
+            execs: Arc::new(Mutex::new(HashMap::new())),
+            next_handle: 1,
+        }
+    }
+
+    fn alloc_handle(&mut self) -> FsHandle {
+        let handle = self.next_handle;
+        self.next_handle += 1;
+        handle
+    }
+
+    /// The provider behind a layer. A `Lower` entry can only exist when the lower layer
+    /// does, so the expect is unreachable by construction.
+    fn layer(&self, layer: OverlayLayer) -> Arc<Mutex<Box<dyn FsProvider>>> {
+        match layer {
+            OverlayLayer::Upper => Arc::clone(&self.upper),
+            OverlayLayer::Lower => Arc::clone(
+                self.lower
+                    .as_ref()
+                    .expect("a lower-layer handle implies a lower layer"),
+            ),
+        }
+    }
+}
+
+impl FsProvider for OverlayFs {
+    fn open(&mut self, path: &str, flags: OpenFlags) -> BoxOp<Result<FsHandle, FsError>> {
+        let outer = self.alloc_handle();
+        let files = Arc::clone(&self.files);
+        let path = path.to_string();
+        let wants_write = flags.write || flags.create || flags.truncate;
+        if wants_write {
+            // Mutations belong to the writable layer; the overlay never writes upper.
+            let Some(lower) = self.lower.clone() else {
+                return ready_op(Err(FsError::ReadOnly));
+            };
+            return Box::pin(async move {
+                let op = { lower.lock().unwrap().open(&path, flags) };
+                op.await.map(|inner| {
+                    files
+                        .lock()
+                        .unwrap()
+                        .insert(outer, (OverlayLayer::Lower, inner));
+                    outer
+                })
+            });
+        }
+        let upper = Arc::clone(&self.upper);
+        let lower = self.lower.clone();
+        Box::pin(async move {
+            let op = { upper.lock().unwrap().open(&path, flags) };
+            match op.await {
+                Ok(inner) => {
+                    files
+                        .lock()
+                        .unwrap()
+                        .insert(outer, (OverlayLayer::Upper, inner));
+                    Ok(outer)
+                }
+                // Only an absence falls through; any other upper answer (denied, a type
+                // error, an I/O failure) is the overlay's answer — upper shadows lower.
+                Err(FsError::NotFound) => match lower {
+                    Some(lower) => {
+                        let op = { lower.lock().unwrap().open(&path, flags) };
+                        op.await.map(|inner| {
+                            files
+                                .lock()
+                                .unwrap()
+                                .insert(outer, (OverlayLayer::Lower, inner));
+                            outer
+                        })
+                    }
+                    None => Err(FsError::NotFound),
+                },
+                Err(err) => Err(err),
+            }
+        })
+    }
+
+    fn open_exec(&mut self, path: &str) -> BoxOp<Result<FsHandle, FsError>> {
+        let outer = self.alloc_handle();
+        let execs = Arc::clone(&self.execs);
+        let path = path.to_string();
+        let upper = Arc::clone(&self.upper);
+        let lower = self.lower.clone();
+        Box::pin(async move {
+            let op = { upper.lock().unwrap().open_exec(&path) };
+            match op.await {
+                Ok(inner) => {
+                    execs
+                        .lock()
+                        .unwrap()
+                        .insert(outer, (OverlayLayer::Upper, inner));
+                    Ok(outer)
+                }
+                Err(FsError::NotFound) => match lower {
+                    Some(lower) => {
+                        let op = { lower.lock().unwrap().open_exec(&path) };
+                        op.await.map(|inner| {
+                            execs
+                                .lock()
+                                .unwrap()
+                                .insert(outer, (OverlayLayer::Lower, inner));
+                            outer
+                        })
+                    }
+                    None => Err(FsError::NotFound),
+                },
+                Err(err) => Err(err),
+            }
+        })
+    }
+
+    fn list_directory(&mut self, path: &str) -> BoxOp<Result<Vec<String>, FsError>> {
+        let upper = Arc::clone(&self.upper);
+        let lower = self.lower.clone();
+        let path = path.to_string();
+        Box::pin(async move {
+            let upper_result = {
+                let op = { upper.lock().unwrap().list_directory(&path) };
+                op.await
+            };
+            let lower_result = match &lower {
+                Some(lower) => Some({
+                    let op = { lower.lock().unwrap().list_directory(&path) };
+                    op.await
+                }),
+                None => None,
+            };
+            match (upper_result, lower_result) {
+                // Union of both layers, upper winning on collisions (dedup keeps upper's).
+                (Ok(mut names), Some(Ok(extra))) => {
+                    for name in extra {
+                        if !names.contains(&name) {
+                            names.push(name);
+                        }
+                    }
+                    Ok(names)
+                }
+                (Ok(names), _) => Ok(names),
+                (Err(_), Some(Ok(names))) => Ok(names),
+                // Both layers failed (or only upper exists and failed): upper's error.
+                (Err(err), _) => Err(err),
+            }
+        })
+    }
+
+    fn stat(&mut self, path: &str) -> BoxOp<Result<NodeStat, FsError>> {
+        let upper = Arc::clone(&self.upper);
+        let lower = self.lower.clone();
+        let path = path.to_string();
+        Box::pin(async move {
+            let op = { upper.lock().unwrap().stat(&path) };
+            match op.await {
+                Ok(stat) => Ok(stat),
+                Err(FsError::NotFound) => match lower {
+                    Some(lower) => {
+                        let op = { lower.lock().unwrap().stat(&path) };
+                        op.await
+                    }
+                    None => Err(FsError::NotFound),
+                },
+                Err(err) => Err(err),
+            }
+        })
+    }
+
+    fn create_directory(&mut self, path: &str) -> BoxOp<Result<(), FsError>> {
+        let Some(lower) = self.lower.clone() else {
+            return ready_op(Err(FsError::ReadOnly));
+        };
+        let path = path.to_string();
+        Box::pin(async move {
+            let op = { lower.lock().unwrap().create_directory(&path) };
+            op.await
+        })
+    }
+
+    fn remove(&mut self, path: &str) -> BoxOp<Result<(), FsError>> {
+        let Some(lower) = self.lower.clone() else {
+            return ready_op(Err(FsError::ReadOnly));
+        };
+        let path = path.to_string();
+        Box::pin(async move {
+            let op = { lower.lock().unwrap().remove(&path) };
+            op.await
+        })
+    }
+
+    fn read(
+        &mut self,
+        file: FsHandle,
+        offset: u64,
+        dst: Vec<u8>,
+    ) -> BoxOp<(Vec<u8>, Result<u64, FsError>)> {
+        let entry = self.files.lock().unwrap().get(&file).copied();
+        let Some((layer, inner)) = entry else {
+            return ready_op((dst, Err(FsError::Io("unknown file handle".to_string()))));
+        };
+        let provider = self.layer(layer);
+        Box::pin(async move {
+            let op = { provider.lock().unwrap().read(inner, offset, dst) };
+            op.await
+        })
+    }
+
+    fn write(
+        &mut self,
+        file: FsHandle,
+        offset: u64,
+        src: Vec<u8>,
+    ) -> BoxOp<(Vec<u8>, Result<u64, FsError>)> {
+        let entry = self.files.lock().unwrap().get(&file).copied();
+        let Some((layer, inner)) = entry else {
+            return ready_op((src, Err(FsError::Io("unknown file handle".to_string()))));
+        };
+        let provider = self.layer(layer);
+        Box::pin(async move {
+            let op = { provider.lock().unwrap().write(inner, offset, src) };
+            op.await
+        })
+    }
+
+    fn exec_size(&mut self, handle: FsHandle) -> u64 {
+        let entry = self.execs.lock().unwrap().get(&handle).copied();
+        let Some((layer, inner)) = entry else {
+            return 0;
+        };
+        self.layer(layer).lock().unwrap().exec_size(inner)
+    }
+
+    fn exec_read(
+        &mut self,
+        handle: FsHandle,
+        offset: u64,
+        dst: Vec<u8>,
+    ) -> BoxOp<(Vec<u8>, Result<u64, FsError>)> {
+        let entry = self.execs.lock().unwrap().get(&handle).copied();
+        let Some((layer, inner)) = entry else {
+            return ready_op((
+                dst,
+                Err(FsError::Io("unknown immutable handle".to_string())),
+            ));
+        };
+        let provider = self.layer(layer);
+        Box::pin(async move {
+            let op = { provider.lock().unwrap().exec_read(inner, offset, dst) };
+            op.await
+        })
+    }
+
+    fn close_file(&mut self, file: FsHandle) {
+        if let Some((layer, inner)) = self.files.lock().unwrap().remove(&file) {
+            self.layer(layer).lock().unwrap().close_file(inner);
+        }
+    }
+
+    fn close_exec(&mut self, handle: FsHandle) {
+        if let Some((layer, inner)) = self.execs.lock().unwrap().remove(&handle) {
+            self.layer(layer).lock().unwrap().close_exec(inner);
+        }
+    }
+}
+
 /// The root providers of a usermode run: text on the process's standard streams, the
 /// host's real clocks, the OS RNG, and — only when `--fs-root` was given — the host
 /// filesystem rooted at that directory.
@@ -442,44 +745,103 @@ pub fn root_providers(cfg: &Config) -> Result<Providers, String> {
     Ok(assemble(fs, None))
 }
 
-/// The root providers for a child spawned *by the shell*: exactly the same grant a direct
-/// `eo9 run` would make (text/time/entropy, fs only when `--fs-root` was given), and never
-/// the exec capability. Infallible because the exec provider's child-policy factory cannot
-/// report errors: a broken `--fs-root` degrades to a warning and no filesystem.
-pub fn child_root_providers(cfg: &Config) -> Providers {
-    let fs: Option<Box<dyn FsProvider>> = match &cfg.fs_root {
-        Some(root) => match HostFs::new(root, cfg.exec_snapshot) {
+/// The layered session filesystem: the session directory's read-only program view
+/// (`/bin/<name>.wasm`, plus the session manifest) as the upper layer, over the user's
+/// writable `--fs-root` as the lower layer (when granted). Degrades to warnings rather
+/// than errors: a broken root never blocks a session, the affected layer is just absent.
+fn session_overlay_fs(
+    session_root: &Path,
+    fs_root: Option<&Path>,
+    snapshot: eo9_providers_unix::fs::ExecSnapshotPolicy,
+) -> Option<Box<dyn FsProvider>> {
+    let lower: Option<Box<dyn FsProvider>> = match fs_root {
+        Some(root) => match HostFs::new(root, snapshot) {
             Ok(fs) => Some(Box::new(fs)),
             Err(err) => {
-                eprintln!("eo9: warning: the shell's children get no fs capability: {err}");
+                eprintln!("eo9: warning: programs get no writable data root: {err}");
                 None
             }
         },
         None => None,
     };
-    assemble(fs, None)
+    match HostFs::new(session_root, snapshot) {
+        Ok(upper) => Some(Box::new(OverlayFs::new(Box::new(upper), lower))),
+        Err(err) => {
+            eprintln!("eo9: warning: the session loses its program view (/bin): {err}");
+            // Without the program view the data root (if any) is still worth granting.
+            lower
+        }
+    }
 }
 
-/// The providers granted to the shell task itself: terminal stdio, the host clocks, the
-/// OS RNG, a filesystem rooted at the session directory (the `/bin` name view eosh
-/// resolves programs from), and the exec capability — the one grant that makes eosh a
-/// native executor. Children spawned through that capability receive
-/// [`child_root_providers`], never exec itself.
+/// The providers granted to the shell task, and — by the same recipe — to every child it
+/// spawns. The session environment is: terminal stdio, the host clocks, the OS RNG, the
+/// layered session filesystem (the read-only `/bin` program view over the writable
+/// `--fs-root`, see [`OverlayFs`]), and the full `eo9:exec` capability (the component
+/// algebra, `compile`, and `task`/spawn).
+///
+/// A child spawned through the exec capability inherits the **same** environment by
+/// default — the same overlaid filesystem (so a nested `eosh` finds `/bin` and a data
+/// tool finds the user's files) and a fresh `eo9:exec` whose own child policy rebuilds
+/// this very environment, so grandchildren (nested shells, schedulers) are full peers
+/// too. This is "the environment is just data, handed down" (SPEC.md, Execution APIs):
+/// authority is ambient *within a session*, bounded by the session's own grants. The
+/// runtime still links only the interfaces a given child imports (the loader rule), and
+/// `only`/`$`/`&`/`configure` attenuate the component *before* spawn — so
+/// `only eo9:text/text $ prog` strips exec and fs, and a program that cannot run without
+/// a sealed required capability is refused before it starts.
 ///
 /// `editor` replaces the plain stdio text provider with the interactive line editor
-/// (history + tab completion) when the session is interactive; it changes how the
-/// shell's input is typed, not what is granted.
+/// (history + tab completion) when the session is interactive; it changes how the shell's
+/// input is typed, not what is granted (children always get the plain stdio text
+/// provider).
 pub fn shell_providers(
     cfg: &Config,
     session_root: &Path,
     image: &Image,
     editor: Option<crate::interactive::InteractiveText>,
 ) -> Result<Providers, String> {
-    let child_cfg = cfg.clone();
-    let policy = ChildPolicy::with_providers(move || child_root_providers(&child_cfg));
-    let fs: Option<Box<dyn FsProvider>> =
-        Some(Box::new(HostFs::new(session_root, cfg.exec_snapshot)?));
-    let mut providers = assemble(fs, Some(ExecProvider::new(image.engine(), policy)));
+    // The shell itself cannot work without its session filesystem (eosh resolves
+    // `/bin/<name>.wasm` through it); surface a broken session root as a hard error here.
+    // The per-child factory below degrades problems to warnings instead, never blocking a
+    // spawn.
+    drop(
+        HostFs::new(session_root, cfg.exec_snapshot)
+            .map_err(|err| format!("cannot root the shell session filesystem: {err}"))?,
+    );
+
+    // Owned, 'static state for the recursive environment factory. `engine`'s concrete
+    // type (the wasmtime engine) is only ever captured here, never named — this crate has
+    // no direct wasmtime dependency by design.
+    let engine = image.engine().clone();
+    let exec_snapshot = cfg.exec_snapshot;
+    let session_root = session_root.to_path_buf();
+    let fs_root = cfg.fs_root.clone();
+
+    // A late-bound self-reference: `make` builds the session environment, and the exec
+    // capability it installs carries a child policy that calls `make` again for the next
+    // generation. Boxing it as one `Arc<dyn Fn>` keeps the recursion a single type.
+    type MakeEnv = dyn Fn() -> Providers + Send + Sync;
+    let slot: Arc<Mutex<Option<Arc<MakeEnv>>>> = Arc::new(Mutex::new(None));
+    let make: Arc<MakeEnv> = {
+        let slot = Arc::clone(&slot);
+        Arc::new(move || {
+            let fs = session_overlay_fs(&session_root, fs_root.as_deref(), exec_snapshot);
+            let child_slot = Arc::clone(&slot);
+            let policy = ChildPolicy::with_providers(move || {
+                let make = child_slot
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("the session child policy is initialized before the first spawn");
+                make()
+            });
+            assemble(fs, Some(ExecProvider::new(&engine, policy)))
+        })
+    };
+    *slot.lock().unwrap() = Some(Arc::clone(&make));
+
+    let mut providers = make();
     if let Some(editor) = editor {
         providers.text = Some(Box::new(editor));
     }
@@ -489,32 +851,49 @@ pub fn shell_providers(
 /// The session manifest `eo9 shell` leaves at `<session>/session` for eosh's `env`
 /// builtin: a plain-text description of what the shell session holds and what programs
 /// started from it receive. Purely informational — the linking rules above are the
-/// authority. Keep this in sync with [`shell_providers`] / [`child_root_providers`]
-/// (it describes exactly the grants they assemble) and with eosh-core's `envinfo`
-/// parser (the `eo9-session 1` format).
+/// authority. Keep this in sync with [`shell_providers`] (it describes exactly the
+/// environment it assembles) and with eosh-core's `envinfo` parser (the `eo9-session 1`
+/// format).
+///
+/// Children inherit the shell's full environment by default — the same text/time/entropy,
+/// the same layered filesystem (the read-only `/bin` program view over the writable
+/// `--fs-root`), and the entire `eo9:exec` capability — so a child can itself compose,
+/// compile, and spawn (a nested `eosh` is a full peer). Restrict any one command with
+/// `only`.
 pub fn session_manifest(cfg: &Config) -> String {
     let mut lines = vec![
         "eo9-session 1".to_string(),
         "shell text terminal standard streams".to_string(),
         "shell time host clocks".to_string(),
         "shell entropy host OS RNG".to_string(),
-        "shell fs the session directory (program names under /bin)".to_string(),
-        "shell exec spawn programs as children".to_string(),
+        "shell fs programs at /bin (read-only) layered over the session's data root".to_string(),
+        "shell exec the component algebra, compile, and spawn".to_string(),
         "child text terminal standard streams (shared with the shell)".to_string(),
         "child time host clocks".to_string(),
         "child entropy host OS RNG".to_string(),
     ];
     match &cfg.fs_root {
         Some(root) => lines.push(format!(
-            "child fs host directory {} (from --fs-root)",
+            "child fs programs at /bin (read-only) over host directory {} (from --fs-root)",
             root.display()
         )),
         None => lines.push(
-            "note programs get no filesystem: start the shell with --fs-root <dir> to grant one"
+            "child fs programs at /bin (read-only); writes are refused — no writable data root"
                 .to_string(),
         ),
     }
-    lines.push("note children never receive the exec capability".to_string());
+    lines.push("child exec the component algebra, compile, and spawn".to_string());
+    lines.push(
+        "note children inherit the shell's full environment; restrict a command with `only` \
+         (e.g. `only eo9:text/text $ prog`)"
+            .to_string(),
+    );
+    if cfg.fs_root.is_none() {
+        lines.push(
+            "note start the shell with --fs-root <dir> to give programs a writable data directory"
+                .to_string(),
+        );
+    }
     let mut manifest = lines.join("\n");
     manifest.push('\n');
     manifest
@@ -603,22 +982,143 @@ mod tests {
     }
 
     #[test]
-    fn session_manifest_reflects_the_fs_grant() {
+    fn session_manifest_grants_children_the_full_environment() {
         let without = session_manifest(&Config::default());
         assert!(without.starts_with("eo9-session 1\n"));
+        // The shell holds the whole environment...
         assert!(without.contains("shell exec "));
+        assert!(without.contains("shell fs "));
+        // ...and children inherit all of it, including fs (the /bin view) and exec.
+        assert!(without.contains("child fs "));
+        assert!(without.contains("child exec "));
         assert!(without.contains("child entropy "));
-        assert!(!without.contains("child fs "));
+        // The note points at `only` as the way to restrict, not at a withheld capability.
+        assert!(without.contains("restrict a command with `only`"));
+        assert!(!without.contains("never receive the exec capability"));
+        // Without --fs-root the manifest says how to grant a writable data root.
         assert!(without.contains("--fs-root"));
+        assert!(without.contains("writes are refused"));
 
         let cfg = Config {
             fs_root: Some(std::path::PathBuf::from("/tmp/data")),
             ..Config::default()
         };
         let with = session_manifest(&cfg);
-        assert!(with.contains("child fs host directory /tmp/data"));
-        assert!(!with.contains("programs get no filesystem"));
-        assert!(with.contains("never receive the exec capability"));
+        assert!(with.contains("over host directory /tmp/data (from --fs-root)"));
+        assert!(!with.contains("writes are refused"));
+        assert!(!with.contains("to give programs a writable data directory"));
+    }
+
+    #[test]
+    fn overlay_fs_layers_reads_and_routes_writes_to_lower() {
+        let upper_root = scratch_dir("overlay-upper");
+        let lower_root = scratch_dir("overlay-lower");
+        std::fs::create_dir_all(upper_root.join("bin")).unwrap();
+        std::fs::write(upper_root.join("bin/tool.wasm"), b"program bytes").unwrap();
+        std::fs::write(upper_root.join("shared.txt"), b"from upper").unwrap();
+        std::fs::write(lower_root.join("shared.txt"), b"from lower!").unwrap();
+        std::fs::write(lower_root.join("notes.txt"), b"user data").unwrap();
+
+        let policy = eo9_providers_unix::fs::ExecSnapshotPolicy::CloneOrRefuse;
+        let upper = HostFs::new(&upper_root, policy).unwrap();
+        let lower = HostFs::new(&lower_root, policy).unwrap();
+        let mut overlay = OverlayFs::new(Box::new(upper), Some(Box::new(lower)));
+
+        let read = OpenFlags {
+            read: true,
+            write: false,
+            create: false,
+            truncate: false,
+        };
+
+        // Upper-only path reads through; lower-only path falls through.
+        let tool = block_on(overlay.open("bin/tool.wasm", read)).expect("upper file opens");
+        let (buf, n) = block_on(overlay.read(tool, 0, vec![0u8; 13]));
+        assert_eq!(n.unwrap(), 13);
+        assert_eq!(buf, b"program bytes");
+        overlay.close_file(tool);
+
+        let notes = block_on(overlay.open("notes.txt", read)).expect("lower file opens");
+        let (buf, n) = block_on(overlay.read(notes, 0, vec![0u8; 9]));
+        assert_eq!(n.unwrap(), 9);
+        assert_eq!(buf, b"user data");
+        overlay.close_file(notes);
+
+        // A name in both layers reads the upper copy (upper shadows lower).
+        let shared = block_on(overlay.open("shared.txt", read)).expect("shared opens");
+        let (buf, _) = block_on(overlay.read(shared, 0, vec![0u8; 10]));
+        assert_eq!(buf, b"from upper");
+        overlay.close_file(shared);
+
+        // Listings union both layers; the shadowed name appears once.
+        let mut names = block_on(overlay.list_directory("/")).expect("list /");
+        names.sort();
+        assert_eq!(names, vec!["bin", "notes.txt", "shared.txt"]);
+
+        // Writes are routed to lower and never touch upper.
+        let write = OpenFlags {
+            read: true,
+            write: true,
+            create: true,
+            truncate: true,
+        };
+        let out = block_on(overlay.open("new.txt", write)).expect("write-open goes to lower");
+        let (_, written) = block_on(overlay.write(out, 0, b"hi".to_vec()));
+        assert_eq!(written.unwrap(), 2);
+        overlay.close_file(out);
+        assert!(lower_root.join("new.txt").is_file());
+        assert!(!upper_root.join("new.txt").exists());
+
+        // exec opens resolve upper-first too.
+        let exec = block_on(overlay.open_exec("bin/tool.wasm")).expect("open-exec on upper");
+        assert_eq!(overlay.exec_size(exec), 13);
+        overlay.close_exec(exec);
+
+        std::fs::remove_dir_all(&upper_root).unwrap();
+        std::fs::remove_dir_all(&lower_root).unwrap();
+    }
+
+    #[test]
+    fn overlay_fs_without_a_lower_layer_is_read_only() {
+        let upper_root = scratch_dir("overlay-readonly");
+        std::fs::write(upper_root.join("present.txt"), b"ro").unwrap();
+        let policy = eo9_providers_unix::fs::ExecSnapshotPolicy::CloneOrRefuse;
+        let upper = HostFs::new(&upper_root, policy).unwrap();
+        let mut overlay = OverlayFs::new(Box::new(upper), None);
+
+        let read = OpenFlags {
+            read: true,
+            write: false,
+            create: false,
+            truncate: false,
+        };
+        assert!(block_on(overlay.open("present.txt", read)).is_ok());
+        assert_eq!(
+            block_on(overlay.stat("missing.txt")),
+            Err(FsError::NotFound)
+        );
+
+        let write = OpenFlags {
+            read: false,
+            write: true,
+            create: true,
+            truncate: false,
+        };
+        assert_eq!(
+            block_on(overlay.open("new.txt", write)),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(
+            block_on(overlay.create_directory("dir")),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(
+            block_on(overlay.remove("present.txt")),
+            Err(FsError::ReadOnly)
+        );
+        assert!(upper_root.join("present.txt").is_file());
+
+        std::fs::remove_dir_all(&upper_root).unwrap();
     }
 
     #[test]
