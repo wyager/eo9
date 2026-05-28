@@ -15,6 +15,21 @@
 
 ---
 
+## Quick start
+
+| Command | What it does |
+|---|---|
+| `make setup` | One-time: install the prerequisites (Rust target, `wasm-tools`; checks for QEMU) |
+| `make shell` | Build the components and drop into the `eosh>` shell on your host |
+| `make www` | Serve the website + the in-browser demos at <http://127.0.0.1:8080/> |
+| `make qemu` | Boot the bare-metal kernel in QEMU to an `eosh>` prompt |
+| `make ci` | Run the full local gate (host + guest + kernel workspaces) |
+
+**Prerequisites** (`make setup` does all of it): a Rust toolchain via [rustup](https://rustup.rs)
+(the pinned nightly and per-workspace targets install themselves on first build), the
+`wasm32-unknown-unknown` target, and the `wasm-tools` CLI (`cargo install --locked wasm-tools`).
+`qemu-system-aarch64` is only needed for the bare-metal demo.
+
 ## Userspace mode
 
 ```sh
