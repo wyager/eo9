@@ -116,6 +116,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("build-web-vm", rest)?;
             build_web_vm(&root)
         }
+        "check-web-vm" => {
+            expect_no_args("check-web-vm", rest)?;
+            check_web_vm(&root)
+        }
         "precompress-site" => {
             expect_no_args("precompress-site", rest)?;
             precompress_site(&root)
@@ -174,6 +178,9 @@ COMMANDS:
     build-web-vm         Pre-AOT the web-VM demo components to pulley32, build the wasm32
                          blob (www/web-eo9, the real runtime stack for the /vm page), and
                          install it into www/site/vm/ (commit the result; ci does not need it)
+    check-web-vm         Rebuild the /vm blob and store artifacts to a temp staging dir and
+                         byte-compare against the committed www/site/vm/ files; nonzero exit
+                         if they drifted (run after changing guest sources; ci does not need it)
     precompress-site     Write brotli/gzip siblings next to the compressible files under
                          www/site via www/precompress, so the server can serve pre-compressed
                          bytes (runs automatically at the end of the build-web-* commands;
@@ -496,6 +503,123 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
     // Regenerated blob/store artifacts need fresh pre-compressed siblings or the server
     // falls back to serving them uncompressed.
     precompress_site(root)
+}
+
+/// The store programs the /vm page serves over HTTP (kept in sync with `build_web_vm`'s
+/// loop and `check_web_vm`). The kernel WAT canary `sleepy` is handled separately.
+const WEB_VM_STORE_EXAMPLES: [&str; 3] = ["hello", "cruncher", "outcomes"];
+
+/// Drift guard: rebuild the /vm blob and its HTTP store artifacts to a temporary staging
+/// directory and byte-compare them against the committed files under `www/site/vm/`,
+/// without overwriting anything. Exits non-zero if any artifact drifted — which is what
+/// happens when the guest sources change but the committed assets are not regenerated.
+/// The web-VM build is byte-deterministic on the pinned toolchain (verified), so a byte
+/// mismatch is a true staleness signal, not codegen noise. Not part of `ci` (needs the
+/// wasm32 target + a full guest build); run it after touching guest sources or the blob.
+fn check_web_vm(root: &Path) -> Result<(), String> {
+    build_guest(root)?;
+
+    let web = root.join("www").join("web-eo9");
+    // The blob embeds these via include_bytes!, so they must be regenerated (into the
+    // gitignored blob/artifacts/) for the blob we build to reflect current sources.
+    let embedded = web.join("blob").join("artifacts");
+    std::fs::create_dir_all(&embedded)
+        .map_err(|err| format!("failed to create {}: {err}", embedded.display()))?;
+    let seed_wat = root.join("kernel").join("seed").join("hello.wat");
+    let seed_wasm = wat::parse_file(&seed_wat)
+        .map_err(|err| format!("failed to assemble {}: {err}", seed_wat.display()))?;
+    let entropy_path = root
+        .join("guest")
+        .join("target")
+        .join("components")
+        .join("eo9-stub-entropy-seeded.wasm");
+    let entropy_wasm = std::fs::read(&entropy_path)
+        .map_err(|err| format!("failed to read {}: {err}", entropy_path.display()))?;
+    preaot_for_web(&embedded, &seed_wasm, "seed", "seed.cwasm", false)?;
+    preaot_for_web(&embedded, &seed_wasm, "seed (fuel)", "seed-fuel.cwasm", true)?;
+    preaot_for_web(
+        &embedded,
+        &entropy_wasm,
+        "entropy.seeded",
+        "entropy-seeded.cwasm",
+        false,
+    )?;
+
+    // Stage the HTTP-store artifacts in a temp dir and collect them for comparison.
+    let staging = web.join("target").join("check-web-vm-store");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)
+        .map_err(|err| format!("failed to create {}: {err}", staging.display()))?;
+    let mut staged: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for example in WEB_VM_STORE_EXAMPLES {
+        let component_path = root
+            .join("guest")
+            .join("target")
+            .join("components")
+            .join(format!("eo9-example-{example}.wasm"));
+        let component = std::fs::read(&component_path)
+            .map_err(|err| format!("failed to read {}: {err}", component_path.display()))?;
+        let file = format!("{example}.cwasm");
+        preaot_for_web(&staging, &component, example, &file, false)?;
+        staged.push((file, staging.join(format!("{example}.cwasm"))));
+    }
+    let sleepy_wat = root.join("kernel").join("seed").join("sleepy.wat");
+    let sleepy_wasm = wat::parse_file(&sleepy_wat)
+        .map_err(|err| format!("failed to assemble {}: {err}", sleepy_wat.display()))?;
+    preaot_for_web(&staging, &sleepy_wasm, "sleepy", "sleepy.cwasm", false)?;
+    staged.push(("sleepy.cwasm".to_string(), staging.join("sleepy.cwasm")));
+
+    // Build the blob (it embeds the regenerated blob/artifacts/) without installing it.
+    let manifest = web.join("Cargo.toml");
+    run(
+        root,
+        "cargo",
+        [
+            OsStr::new("build"),
+            OsStr::new("--release"),
+            OsStr::new("--target"),
+            OsStr::new("wasm32-unknown-unknown"),
+            OsStr::new("--manifest-path"),
+            manifest.as_os_str(),
+            OsStr::new("-p"),
+            OsStr::new("web-eo9-blob"),
+        ],
+    )?;
+    let built_blob = web
+        .join("target")
+        .join("wasm32-unknown-unknown")
+        .join("release")
+        .join("web_eo9_blob.wasm");
+
+    // Compare everything against the committed site files.
+    let site = root.join("www").join("site").join("vm");
+    let mut drifted: Vec<String> = Vec::new();
+    let same = |a: &Path, b: &Path| -> bool {
+        match (std::fs::read(a), std::fs::read(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+    };
+    if !same(&built_blob, &site.join("web-eo9.wasm")) {
+        drifted.push("web-eo9.wasm".to_string());
+    }
+    for (name, fresh) in &staged {
+        if !same(fresh, &site.join("store").join(name)) {
+            drifted.push(format!("store/{name}"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+
+    if drifted.is_empty() {
+        println!("xtask: check-web-vm: committed /vm assets are up to date with current sources");
+        Ok(())
+    } else {
+        Err(format!(
+            "check-web-vm: committed /vm assets are stale — run `cargo xtask build-web-vm` and \
+             commit the result. Drifted: {}",
+            drifted.join(", ")
+        ))
+    }
 }
 
 /// Pre-AOT one component to a `pulley32` artifact for the web VM blob. The configuration
