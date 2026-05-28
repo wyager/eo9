@@ -116,6 +116,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("build-web-vm", rest)?;
             build_web_vm(&root)
         }
+        "precompress-site" => {
+            expect_no_args("precompress-site", rest)?;
+            precompress_site(&root)
+        }
         "build-kernel" => {
             build_kernel(&root, &arch_arg("build-kernel", rest)?)?;
             Ok(())
@@ -170,6 +174,10 @@ COMMANDS:
     build-web-vm         Pre-AOT the web-VM demo components to pulley32, build the wasm32
                          blob (www/web-eo9, the real runtime stack for the /vm page), and
                          install it into www/site/vm/ (commit the result; ci does not need it)
+    precompress-site     Write brotli/gzip siblings next to the compressible files under
+                         www/site via www/precompress, so the server can serve pre-compressed
+                         bytes (runs automatically at the end of the build-web-* commands;
+                         commit the result; ci does not need it)
     build-kernel <arch>  Precompile the seed/async canaries, eo9-example-hello, and entropy.seeded for
                          bare metal and build the bootable kernel image (aarch64 only so far;
                          ELF for QEMU's -kernel loader)
@@ -331,6 +339,29 @@ fn build_web_demo(root: &Path) -> Result<(), String> {
             OsStr::new("--out"),
             out.as_os_str(),
         ],
+    )?;
+    // Regenerated bundles need fresh pre-compressed siblings or the server falls back to
+    // serving them uncompressed (it never serves a variant older than its original).
+    precompress_site(root)
+}
+
+/// Write brotli/gzip siblings next to the compressible static assets under `www/site`
+/// (see `www/precompress`); the server serves them by `Accept-Encoding` negotiation.
+fn precompress_site(root: &Path) -> Result<(), String> {
+    let manifest = root.join("www").join("precompress").join("Cargo.toml");
+    let site = root.join("www").join("site");
+    run(
+        root,
+        "cargo",
+        [
+            OsStr::new("run"),
+            OsStr::new("--release"),
+            OsStr::new("--manifest-path"),
+            manifest.as_os_str(),
+            OsStr::new("--"),
+            OsStr::new("--site"),
+            site.as_os_str(),
+        ],
     )
 }
 
@@ -462,7 +493,9 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
         "xtask: installed the web VM blob at {} ({size} bytes)",
         installed.display()
     );
-    Ok(())
+    // Regenerated blob/store artifacts need fresh pre-compressed siblings or the server
+    // falls back to serving them uncompressed.
+    precompress_site(root)
 }
 
 /// Pre-AOT one component to a `pulley32` artifact for the web VM blob. The configuration

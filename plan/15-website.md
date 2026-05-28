@@ -195,3 +195,39 @@ wasm32 well enough for that.
     page; (iv) eosh + store + exec in the blob — the real shell in the browser; (v) fold `/try` v1's page
     into the new flow (keep the jco path only if it still earns its place). The spike's probe code stays
     under `www/embed-spike/` as the reference for the wasm32 embedding details until (ii) starts.
+21. **Web hardening from user study 04 (2026-05-27).** Implemented on `area/15-web-hardening`, all
+    measured against the study's own numbers:
+    - *Compression:* a new `www/precompress` helper (own workspace; brotli 8.x + flate2) writes `.br`/`.gz`
+      siblings for compressible assets ≥1 KiB that shrink ≥5% (run via `cargo xtask precompress-site`,
+      and automatically at the end of `build-web-demo`/`build-web-vm`; outputs committed like the other
+      built assets). The server negotiates `Accept-Encoding` and serves a sibling only when it is at least
+      as new as its original, with the original's `Content-Type` plus `Content-Encoding` and
+      `Vary: Accept-Encoding` — so a stale or missing variant degrades to "uncompressed", never to "wrong
+      bytes". Wire sizes: the `/vm` blob 1,239,835 → 320,076 B (br) / 425,365 B (gz); `hello.js`
+      141,066 → 22,382 B; site total 2,242 KiB → 566 KiB brotli.
+    - *Security headers:* every site, error, and redirect response carries `X-Content-Type-Options:
+      nosniff`, `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy: same-origin`, and a
+      first-party-only CSP (`default-src 'self'` plus `'wasm-unsafe-eval'` in `script-src`, the one thing
+      the demo pages need to compile fetched wasm); `Strict-Transport-Security` (2 years,
+      includeSubDomains) only on the TLS listener. The `/vm` self-test's inline script moved to
+      `selftest.js` so `script-src 'self'` holds with no inline allowances anywhere. COEP is deliberately
+      omitted until something needs cross-origin isolation (no threads/SharedArrayBuffer on the site);
+      Permissions-Policy likewise deferred.
+    - *Caching:* strong content-hash ETags on every representation (identity/br/gz each get their own),
+      `If-None-Match` → bodyless 304; lifetimes are HTML 5 min, wasm/cwasm 1 day, everything else 1 hour.
+      Stable URLs + validators was chosen over fingerprinted URLs (no HTML rewriting step needed); revisit
+      fingerprinting if the asset set grows.
+    - *Disclosures and the vm.js error path:* `/try` now states that the friendly refusal is launcher text
+      while the enforcement is the absent import; `/vm` states that its embedded demos import nothing (the
+      program-store row is where imports are linked). `vm.js` reports the real load-failure cause (and
+      only blames missing WebAssembly when WebAssembly is actually missing) and falls back from
+      `instantiateStreaming` to ArrayBuffer instantiation.
+    - *Deferred from the study list:* (a) splitting the shared jco intrinsics out of the four `/try`
+      bundles — the pinned `js-component-bindgen` 1.19.3 has no shared-intrinsics output mode, post-hoc
+      text extraction of the ~90%-identical preamble would be fragile, and minification would add a
+      JS-minifier dependency that needs a planner call; pre-compression already cuts the four bundles'
+      wire cost ~84% (brotli), so the remaining cost is parse time, not transfer. Options recorded:
+      upstream jco shared-intrinsics mode, or an approved minifier in try-build. (b) Softening/verifying
+      the blob's printed cross-host determinism line (the bare-metal leg) — the string lives in the blob's
+      Rust, not the page; fold into the next `/vm` content pass. (c) A browser-support matrix and
+      interpreter-speed expectations on `/vm` — copy change, fold into the same pass.

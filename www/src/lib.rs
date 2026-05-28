@@ -255,6 +255,72 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// A pre-compressed representation the server can serve from a sibling file written by
+/// `www/precompress` (`<file>.br` / `<file>.gz`), negotiated via `Accept-Encoding`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+    Brotli,
+    Gzip,
+}
+
+impl Encoding {
+    /// The `Content-Encoding` token sent on the wire.
+    pub fn token(self) -> &'static str {
+        match self {
+            Encoding::Brotli => "br",
+            Encoding::Gzip => "gzip",
+        }
+    }
+
+    /// The sibling-file extension the precompressor writes.
+    pub fn file_extension(self) -> &'static str {
+        match self {
+            Encoding::Brotli => "br",
+            Encoding::Gzip => "gz",
+        }
+    }
+}
+
+/// Parse an `Accept-Encoding` header value into the encodings the client accepts, in the
+/// server's preference order (brotli before gzip). A missing header accepts neither; a
+/// wildcard accepts both; an explicit `q=0` refuses one. Only encodings we can actually
+/// serve (from pre-compressed siblings) are reported.
+pub fn accepted_encodings(accept_encoding: Option<&str>) -> Vec<Encoding> {
+    let Some(value) = accept_encoding else {
+        return Vec::new();
+    };
+    let mut brotli = None;
+    let mut gzip = None;
+    let mut wildcard = None;
+    for entry in value.split(',') {
+        let mut parts = entry.split(';');
+        let token = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        // q defaults to 1; a malformed q-value is treated as acceptable rather than refused.
+        let quality = parts
+            .filter_map(|param| {
+                let (name, value) = param.split_once('=')?;
+                name.trim().eq_ignore_ascii_case("q").then_some(value)
+            })
+            .next_back()
+            .map(|q| q.trim().parse::<f32>().unwrap_or(1.0));
+        let acceptable = quality.is_none_or(|q| q > 0.0);
+        match token.as_str() {
+            "br" => brotli = Some(acceptable),
+            "gzip" | "x-gzip" => gzip = Some(acceptable),
+            "*" => wildcard = Some(acceptable),
+            _ => {}
+        }
+    }
+    let mut accepted = Vec::new();
+    if brotli.or(wildcard).unwrap_or(false) {
+        accepted.push(Encoding::Brotli);
+    }
+    if gzip.or(wildcard).unwrap_or(false) {
+        accepted.push(Encoding::Gzip);
+    }
+    accepted
+}
+
 /// The `Content-Type` value for a file, chosen by extension.
 pub fn content_type(path: &Path) -> &'static str {
     let extension = path
@@ -283,14 +349,57 @@ pub fn content_type(path: &Path) -> &'static str {
     }
 }
 
-/// The `Cache-Control` value for a file. HTML revalidates quickly so content updates show up;
-/// everything else (stylesheet, logo, images) may be cached for a day.
+/// The `Cache-Control` value for a file. The asset URLs are stable (not fingerprinted), so
+/// freshness comes from short-to-moderate lifetimes plus the strong ETags every response
+/// carries: once a cached copy expires, an `If-None-Match` revalidation is a 304 with no
+/// body. HTML revalidates quickly so content updates show up; the heavyweight wasm/cwasm
+/// artifacts (which change rarely and cost the most to refetch) keep a day; everything else
+/// (styles, scripts, images, manifests) gets an hour.
 pub fn cache_control(path: &Path) -> &'static str {
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
     if content_type(path).starts_with("text/html") {
         "public, max-age=300"
-    } else {
+    } else if matches!(extension.as_str(), "wasm" | "cwasm") {
         "public, max-age=86400"
+    } else {
+        "public, max-age=3600"
     }
+}
+
+/// A strong ETag for one served representation: a 64-bit FNV-1a over the exact bytes being
+/// sent (so the identity, brotli, and gzip representations of one file each get their own
+/// validator), rendered as a quoted hex string. Collision risk is negligible for a site of
+/// this size, and the value changes whenever the content does, which is all a validator
+/// must guarantee.
+pub fn etag(bytes: &[u8]) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    // Mix the length in so a truncation that happens to preserve the hash still changes it.
+    hash ^= bytes.len() as u64;
+    hash = hash.wrapping_mul(PRIME);
+    format!("\"{hash:016x}\"")
+}
+
+/// Does an `If-None-Match` header value match this representation's ETag? Handles the
+/// wildcard, comma-separated lists, and weak (`W/`) prefixes (weak comparison is fine for
+/// a 304 decision).
+pub fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
+    if if_none_match.trim() == "*" {
+        return true;
+    }
+    if_none_match
+        .split(',')
+        .map(|candidate| candidate.trim().trim_start_matches("W/"))
+        .any(|candidate| candidate == etag)
 }
 
 #[cfg(test)]
@@ -482,9 +591,65 @@ mod tests {
             cache_control(Path::new("index.html")),
             "public, max-age=300"
         );
+        assert_eq!(cache_control(Path::new("logo.svg")), "public, max-age=3600");
         assert_eq!(
-            cache_control(Path::new("logo.svg")),
+            cache_control(Path::new("vm/web-eo9.wasm")),
             "public, max-age=86400"
+        );
+        assert_eq!(
+            cache_control(Path::new("vm/store/hello.cwasm")),
+            "public, max-age=86400"
+        );
+    }
+
+    #[test]
+    fn etags_are_strong_quoted_and_content_dependent() {
+        let a = etag(b"hello");
+        let b = etag(b"hello!");
+        assert_ne!(a, b);
+        assert_eq!(a, etag(b"hello"));
+        assert!(a.starts_with('"') && a.ends_with('"') && a.len() == 18);
+
+        assert!(if_none_match_matches(&a, &a));
+        assert!(if_none_match_matches("*", &a));
+        assert!(if_none_match_matches(&format!("W/{a}"), &a));
+        assert!(if_none_match_matches(&format!("{b}, {a}"), &a));
+        assert!(!if_none_match_matches(&b, &a));
+        assert!(!if_none_match_matches("\"deadbeef\"", &a));
+    }
+
+    #[test]
+    fn accept_encoding_negotiation() {
+        // No header, empty header, or everything refused: serve the original.
+        assert!(accepted_encodings(None).is_empty());
+        assert!(accepted_encodings(Some("")).is_empty());
+        assert!(accepted_encodings(Some("identity")).is_empty());
+        assert!(accepted_encodings(Some("br;q=0, gzip;q=0")).is_empty());
+
+        // Typical browser value: both, brotli preferred.
+        assert_eq!(
+            accepted_encodings(Some("gzip, deflate, br, zstd")),
+            vec![Encoding::Brotli, Encoding::Gzip]
+        );
+        assert_eq!(accepted_encodings(Some("gzip")), vec![Encoding::Gzip]);
+        assert_eq!(accepted_encodings(Some("x-gzip")), vec![Encoding::Gzip]);
+        assert_eq!(accepted_encodings(Some("BR")), vec![Encoding::Brotli]);
+
+        // Wildcard accepts both unless an explicit entry refuses one.
+        assert_eq!(
+            accepted_encodings(Some("*")),
+            vec![Encoding::Brotli, Encoding::Gzip]
+        );
+        assert_eq!(accepted_encodings(Some("*, br;q=0")), vec![Encoding::Gzip]);
+
+        // q-values: refused vs preferred (we only honor refusal, order is ours).
+        assert_eq!(
+            accepted_encodings(Some("br;q=0.5, gzip;q=1.0")),
+            vec![Encoding::Brotli, Encoding::Gzip]
+        );
+        assert_eq!(
+            accepted_encodings(Some("gzip;q=0, br")),
+            vec![Encoding::Brotli]
         );
     }
 

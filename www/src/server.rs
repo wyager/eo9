@@ -26,10 +26,63 @@ use tokio::time::timeout;
 use tokio_rustls::LazyConfigAcceptor;
 use tokio_rustls::server::TlsStream;
 
+use hyper::HeaderMap;
+
 use crate::tls::TlsSettings;
-use crate::{Config, Mode, ResolveError, cache_control, content_type, resolve, tls};
+use crate::{
+    Config, Encoding, Mode, ResolveError, accepted_encodings, cache_control, content_type, resolve,
+    tls,
+};
 
 type Body = Full<Bytes>;
+
+/// Whether a response is being served over TLS. `Strict-Transport-Security` is only ever
+/// sent on TLS responses (per the HSTS spec, plain-HTTP responses must not set it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Plain,
+    Tls,
+}
+
+/// The Content-Security-Policy for every page: first-party only, with the one extra
+/// permission the demo pages need — `'wasm-unsafe-eval'` so the browser may compile
+/// WebAssembly fetched from this origin (`/try`'s transpiled components, `/vm`'s blob).
+/// There is no inline script or style anywhere on the site.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
+     style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; \
+     base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/// Two years, the conventional HSTS lifetime once a site is committed to HTTPS.
+const STRICT_TRANSPORT_SECURITY: &str = "max-age=63072000; includeSubDomains";
+
+/// Add the security headers every response carries (and HSTS on TLS responses). Applied to
+/// site responses, error responses, and redirects alike.
+fn with_standard_headers(mut response: Response<Body>, transport: Transport) -> Response<Body> {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        header::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("referrer-policy"),
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("content-security-policy"),
+        header::HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(
+        header::HeaderName::from_static("cross-origin-opener-policy"),
+        header::HeaderValue::from_static("same-origin"),
+    );
+    if transport == Transport::Tls {
+        headers.insert(
+            header::HeaderName::from_static("strict-transport-security"),
+            header::HeaderValue::from_static(STRICT_TRANSPORT_SECURITY),
+        );
+    }
+    response
+}
 
 /// Connection limits applied to every listener. Defaults are generous for a small static
 /// site; tests use smaller values.
@@ -186,7 +239,7 @@ pub async fn serve_site_http(
         let site_root = site_root.clone();
         tokio::spawn(async move {
             let _permit = permit; // released when the connection is done
-            serve_site_connection(stream, site_root, limits).await;
+            serve_site_connection(stream, site_root, limits, Transport::Plain).await;
         });
     }
 }
@@ -289,7 +342,7 @@ async fn serve_tls_connection(
         // An ACME validation connection: already answered and closed in `tls_accept`.
         None => Ok(()),
         Some(tls) => {
-            serve_site_connection(tls, site_root, limits).await;
+            serve_site_connection(tls, site_root, limits, Transport::Tls).await;
             Ok(())
         }
     }
@@ -317,14 +370,27 @@ async fn tls_accept(
 }
 
 /// Serve HTTP/1.1 on one (plain or TLS) connection, answering every request from the site.
-async fn serve_site_connection<IO>(stream: IO, site_root: Arc<PathBuf>, limits: Limits)
-where
+async fn serve_site_connection<IO>(
+    stream: IO,
+    site_root: Arc<PathBuf>,
+    limits: Limits,
+    transport: Transport,
+) where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     let service = service_fn(move |request: Request<Incoming>| {
         let site_root = site_root.clone();
         async move {
-            Ok::<_, Infallible>(site_response(request.method(), request.uri(), &site_root).await)
+            Ok::<_, Infallible>(
+                site_response(
+                    request.method(),
+                    request.uri(),
+                    request.headers(),
+                    &site_root,
+                    transport,
+                )
+                .await,
+            )
         }
     });
     drive_connection(stream, service, limits).await;
@@ -352,8 +418,30 @@ where
 
 /// Build the response for one request against the site directory. GET and HEAD are served
 /// (hyper omits the body for HEAD itself); every other method gets 405. Resolution failures
-/// get 400 or 404 with a small HTML body.
-pub async fn site_response(method: &Method, uri: &Uri, site_root: &Path) -> Response<Body> {
+/// get 400 or 404 with a small HTML body. When the client accepts it and a fresh
+/// pre-compressed sibling exists (see `www/precompress`), that representation is served with
+/// the matching `Content-Encoding`; the `Content-Type` and cache policy are always those of
+/// the original file. Every response carries the standard security headers.
+pub async fn site_response(
+    method: &Method,
+    uri: &Uri,
+    request_headers: &HeaderMap,
+    site_root: &Path,
+    transport: Transport,
+) -> Response<Body> {
+    with_standard_headers(
+        site_file_response(method, uri, request_headers, site_root).await,
+        transport,
+    )
+}
+
+/// The content half of [`site_response`]: everything except the standard headers.
+async fn site_file_response(
+    method: &Method,
+    uri: &Uri,
+    request_headers: &HeaderMap,
+    site_root: &Path,
+) -> Response<Body> {
     if method != Method::GET && method != Method::HEAD {
         let mut response = error_response(StatusCode::METHOD_NOT_ALLOWED);
         response
@@ -361,24 +449,94 @@ pub async fn site_response(method: &Method, uri: &Uri, site_root: &Path) -> Resp
             .insert(header::ALLOW, header::HeaderValue::from_static("GET, HEAD"));
         return response;
     }
-    match resolve(site_root, uri.path()) {
-        Ok(file) => match tokio::fs::read(&file).await {
-            Ok(contents) => Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, content_type(&file))
-                .header(header::CACHE_CONTROL, cache_control(&file))
-                .body(Full::new(Bytes::from(contents)))
-                .expect("statically valid response"),
-            // The file vanished between resolution and reading; treat it as not found.
-            Err(_) => error_response(StatusCode::NOT_FOUND),
-        },
-        Err(ResolveError::BadRequest) => error_response(StatusCode::BAD_REQUEST),
-        Err(ResolveError::NotFound) => error_response(StatusCode::NOT_FOUND),
+    let file = match resolve(site_root, uri.path()) {
+        Ok(file) => file,
+        Err(ResolveError::BadRequest) => return error_response(StatusCode::BAD_REQUEST),
+        Err(ResolveError::NotFound) => return error_response(StatusCode::NOT_FOUND),
+    };
+
+    let accept_encoding = request_headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|value| value.to_str().ok());
+    let variant = select_precompressed(&file, accept_encoding).await;
+    let read_path = variant
+        .as_ref()
+        .map_or_else(|| file.clone(), |(path, _)| path.clone());
+
+    let contents = match tokio::fs::read(&read_path).await {
+        Ok(contents) => contents,
+        // The file vanished between resolution and reading; treat it as not found.
+        Err(_) => return error_response(StatusCode::NOT_FOUND),
+    };
+
+    // A strong validator over the exact representation being served (the brotli, gzip, and
+    // identity bytes of one file each get their own), so revalidation after the cache
+    // lifetime is a bodyless 304 instead of a re-download.
+    let etag = crate::etag(&contents);
+    let revalidated = request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| crate::if_none_match_matches(value, &etag));
+
+    let mut builder = Response::builder()
+        .status(if revalidated {
+            StatusCode::NOT_MODIFIED
+        } else {
+            StatusCode::OK
+        })
+        .header(header::CONTENT_TYPE, content_type(&file))
+        .header(header::CACHE_CONTROL, cache_control(&file))
+        .header(header::ETAG, etag)
+        // The served representation depends on Accept-Encoding whenever a sibling exists,
+        // and may start to at any deploy: always tell caches to key on it.
+        .header(header::VARY, "Accept-Encoding");
+    if let Some((_, encoding)) = variant {
+        builder = builder.header(header::CONTENT_ENCODING, encoding.token());
     }
+    let body = if revalidated { Vec::new() } else { contents };
+    builder
+        .body(Full::new(Bytes::from(body)))
+        .expect("statically valid response")
+}
+
+/// Pick the pre-compressed sibling to serve, if any: the client must accept the encoding,
+/// the sibling must exist, and it must be at least as new as the original — an edited
+/// original is never shadowed by a stale variant.
+async fn select_precompressed(
+    file: &Path,
+    accept_encoding: Option<&str>,
+) -> Option<(PathBuf, Encoding)> {
+    let accepted = accepted_encodings(accept_encoding);
+    if accepted.is_empty() {
+        return None;
+    }
+    let original = tokio::fs::metadata(file).await.ok()?;
+    for encoding in accepted {
+        let mut name = file.as_os_str().to_owned();
+        name.push(".");
+        name.push(encoding.file_extension());
+        let candidate = PathBuf::from(name);
+        let Ok(meta) = tokio::fs::metadata(&candidate).await else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let fresh = match (meta.modified(), original.modified()) {
+            (Ok(variant_mtime), Ok(original_mtime)) => variant_mtime >= original_mtime,
+            // If either filesystem refuses to report mtimes, trust the build step.
+            _ => true,
+        };
+        if fresh {
+            return Some((candidate, encoding));
+        }
+    }
+    None
 }
 
 /// Build the 301 redirect to HTTPS for one plain-HTTP request. `host_header` is the raw
-/// `Host` header value; `canonical_host` is the fallback when it is missing.
+/// `Host` header value; `canonical_host` is the fallback when it is missing. The redirect
+/// listener is plain HTTP, so the standard headers are added without HSTS.
 pub fn redirect_response(
     host_header: Option<&str>,
     uri: &Uri,
@@ -389,11 +547,11 @@ pub fn redirect_response(
         .filter(|host| is_valid_host(host))
         .or(canonical_host);
     let Some(host) = host else {
-        return error_response(StatusCode::BAD_REQUEST);
+        return with_standard_headers(error_response(StatusCode::BAD_REQUEST), Transport::Plain);
     };
     let path_and_query = uri.path_and_query().map_or("/", |pq| pq.as_str());
     let location = format!("https://{host}{path_and_query}");
-    Response::builder()
+    let response = Response::builder()
         .status(StatusCode::MOVED_PERMANENTLY)
         .header(header::LOCATION, location.as_str())
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -401,7 +559,8 @@ pub fn redirect_response(
         .body(Full::new(Bytes::from(format!(
             "<!doctype html>\n<html><body><a href=\"{location}\">{location}</a></body></html>\n"
         ))))
-        .expect("statically valid response")
+        .expect("statically valid response");
+    with_standard_headers(response, Transport::Plain)
 }
 
 /// Drop a trailing `:port` from a Host header value, leaving IPv6 literals intact.
