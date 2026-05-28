@@ -25,12 +25,6 @@ rustls = { version = "0.23.40", default-features = false, features = ["ring", "l
 rustls-pki-types = { version = "1.14.1", features = ["std"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-acme = { version = "0.15.2", default-features = false, features = ["ring", "tls12", "webpki-roots"] }
-# The /vm/compile endpoint (plan/18 D20): fuse a store-name composition with the real algebra
-# and compile it to a pulley32 image server-side (the browser can't — in-blob codegen is
-# std/mmap-blocked). Host-side wasmtime (default features incl. cranelift + pulley +
-# component-model), exactly as `xtask::preaot_for_web` uses.
-eo9-component = { path = "../crates/eo9-component" }
-wasmtime = "45.0.0"
 
 [dev-dependencies]
 # Self-signed certificates for the manual-TLS integration tests.

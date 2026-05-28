@@ -260,3 +260,17 @@ wasm32 well enough for that.
       covers /try's wire cost. Recorded as a follow-up. NOTE: this overlaps `area/18-web-m3` (which also
       regenerated the /vm assets and added `check-web-vm`); whichever merges first, the other must rebase —
       this branch's `fingerprint-web-vm`/`check-web-vm` supersede the plain regeneration.
+
+## Decision 23 — the server-side `/vm/compile` endpoint is removed
+
+In-blob codegen (plan/18 D22) made the endpoint dead code: nothing in the blob, the page, or the
+harnesses calls it any more, and an unused network endpoint that compiles client-supplied input is
+attack surface with no benefit. Removed: the `POST /vm/compile` route and its handlers/limits in
+`www/src/server.rs`, the `www/src/compile.rs` module and its `eo9-component`/`wasmtime`
+dependencies, the `www/tests/vm_compile.rs` integration tests, the committed `site/vm/raw/`
+component copies, and the `xtask build-web-vm` step that wrote them. The browser keeps its own raw
+`/bin` bytes embedded in the blob (`web-eo9/blob/artifacts/bin-*.wasm`), which is what the in-blob
+algebra and compiler use, so nothing user-visible changes; compositions still compile client-side.
+The connection-limit `Semaphore`/`timeout` machinery (Decision 21's hardening) is unrelated and
+stays. If a server-assisted compile is ever wanted again (e.g. native-speed codegen as an
+optimization), Decisions 20–21 record the bounded design to resurrect.
