@@ -1362,6 +1362,177 @@ fn seeding_never_clobbers_user_bindings() {
 }
 
 // -----------------------------------------------------------------------------------
+// store reseed and the upgrade refresh of seeded bindings
+// -----------------------------------------------------------------------------------
+
+/// `store add <component> --name <name>` and return the object hash it printed.
+fn add_as(store: &Path, component: &str, name: &str) -> String {
+    let added = eo9(
+        store,
+        &["store", "add", &component_arg(component), "--name", name],
+    );
+    assert_eq!(added.code, 0, "stderr: {}", added.stderr);
+    added
+        .stdout
+        .lines()
+        .next()
+        .expect("store add prints the object hash")
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn upgrade_refresh_rebinds_stale_seeded_names() {
+    let store = temp_store("reseed-upgrade");
+
+    // First run seeds the store and writes the seed record.
+    let first = eo9(&store, &["-c", "help"]);
+    assert_eq!(first.code, 0, "stderr: {}", first.stderr);
+    assert!(first.stderr.contains("seeded"), "{}", first.stderr);
+
+    // Simulate a store left behind by an *older* eo9: the seeded `hello` points at
+    // different bytes (here: the cruncher component) and the recorded fingerprint is not
+    // this binary's. The record is rewritten exactly as that older binary would have
+    // left it, so `hello` still counts as the seeder's, just out of date.
+    let old_hello = add_as(&store, "cruncher", "hello");
+    let seed_path = store.join("seed");
+    let record = fs::read_to_string(&seed_path).expect("the seed record exists after seeding");
+    let rewritten: String = record
+        .lines()
+        .map(|line| {
+            if line.starts_with("fingerprint ") {
+                format!("fingerprint {}", "0".repeat(64))
+            } else if line.starts_with("hello ") {
+                format!("hello {old_hello}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&seed_path, rewritten).expect("rewrite the seed record");
+
+    // The next start notices the fingerprint mismatch, refreshes the seeded names, and
+    // `hello` greets again instead of failing with cruncher's signature.
+    let run = eo9(&store, &["hello", "--name", "upgrade", "--excited", "true"]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.contains("refreshed") && run.stderr.contains("bundled program"),
+        "expected an upgrade-refresh notice: {}",
+        run.stderr
+    );
+    assert!(run.stdout.contains("Hello, upgrade!"), "{}", run.stdout);
+
+    // The refresh is a one-time event: the next run is quiet.
+    let again = eo9(&store, &["hello", "--name", "again", "--excited", "false"]);
+    assert_eq!(again.code, 0, "stderr: {}", again.stderr);
+    assert!(!again.stderr.contains("refreshed"), "{}", again.stderr);
+}
+
+#[test]
+fn reseed_leaves_user_bindings_alone() {
+    let store = temp_store("reseed-user");
+
+    let first = eo9(&store, &["-c", "help"]);
+    assert!(first.stderr.contains("seeded"), "{}", first.stderr);
+
+    // The user adds their own name and deliberately re-binds the seeded `cruncher` name
+    // to a different component (the hello example).
+    let mything = add_as(&store, "cruncher", "mything");
+    let overridden_cruncher = add_as(&store, "hello", "cruncher");
+
+    // A forced reseed refreshes only what seeding still owns: both user bindings keep
+    // their hashes.
+    let reseeded = eo9(&store, &["store", "reseed"]);
+    assert_eq!(reseeded.code, 0, "stderr: {}", reseeded.stderr);
+    let listed = eo9(&store, &["store", "ls"]);
+    assert!(
+        listed.stdout.contains(&format!("mything {mything}")),
+        "user-added binding must survive a reseed: {}",
+        listed.stdout
+    );
+    assert!(
+        listed
+            .stdout
+            .contains(&format!("cruncher {overridden_cruncher}")),
+        "a user-overridden seeded name must survive a reseed: {}",
+        listed.stdout
+    );
+}
+
+#[test]
+fn legacy_store_without_a_seed_record_is_refreshed_on_use() {
+    let store = temp_store("reseed-legacy-auto");
+
+    let first = eo9(&store, &["-c", "help"]);
+    assert!(first.stderr.contains("seeded"), "{}", first.stderr);
+
+    // Make the store look like one seeded by an eo9 from before seed records existed:
+    // no record file, and a bundled name holding outdated bytes.
+    fs::remove_file(store.join("seed")).expect("remove the seed record");
+    add_as(&store, "cruncher", "hello");
+
+    // The store was clearly seeded (eosh is bound), so the next start refreshes the
+    // bundled names even without a record, and `hello` is the bundled greeter again.
+    let run = eo9(&store, &["hello", "--name", "legacy", "--excited", "false"]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.contains("refreshed"),
+        "expected the legacy refresh notice: {}",
+        run.stderr
+    );
+    assert!(run.stdout.contains("Hello, legacy."), "{}", run.stdout);
+}
+
+#[test]
+fn store_reseed_recovers_a_legacy_store() {
+    let store = temp_store("reseed-legacy-cmd");
+
+    let first = eo9(&store, &["-c", "help"]);
+    assert!(first.stderr.contains("seeded"), "{}", first.stderr);
+
+    // A legacy store (no record), with a stale bundled name and a user-added name.
+    fs::remove_file(store.join("seed")).expect("remove the seed record");
+    add_as(&store, "cruncher", "hello");
+    let mything = add_as(&store, "cruncher", "mything");
+
+    // The explicit command refreshes the bundled names (without a record there is no way
+    // to tell a re-bound bundled name from a stale one — that is what the user asked
+    // for) but never touches names that are not bundled at all.
+    let reseeded = eo9(&store, &["store", "reseed"]);
+    assert_eq!(reseeded.code, 0, "stderr: {}", reseeded.stderr);
+    assert!(
+        reseeded.stdout.contains("refreshed"),
+        "stdout: {}",
+        reseeded.stdout
+    );
+
+    let describe = eo9(&store, &["describe", "hello"]);
+    assert_eq!(describe.code, 0, "stderr: {}", describe.stderr);
+    assert!(
+        describe.stdout.contains("--name <string>"),
+        "hello must be the bundled greeter again: {}",
+        describe.stdout
+    );
+    let listed = eo9(&store, &["store", "ls"]);
+    assert!(
+        listed.stdout.contains(&format!("mything {mything}")),
+        "user-added binding must survive: {}",
+        listed.stdout
+    );
+
+    // Running it again reports there is nothing left to do.
+    let again = eo9(&store, &["store", "reseed"]);
+    assert_eq!(again.code, 0, "stderr: {}", again.stderr);
+    assert!(
+        again.stdout.contains("already match"),
+        "stdout: {}",
+        again.stdout
+    );
+}
+
+// -----------------------------------------------------------------------------------
 // coreutils: the basic tool suite (guest/coreutils/*)
 // -----------------------------------------------------------------------------------
 

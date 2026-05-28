@@ -1,24 +1,44 @@
-//! `eo9 store …`: the module-store subcommands — add, ls, gc.
+//! `eo9 store …`: the module-store subcommands — add, ls, gc, reseed.
 
 use std::path::PathBuf;
 
 use eo9_store::{CachePolicy, Name};
 
 use crate::cli::{ArgStream, Config, EXIT_SUCCESS, consume_global_options, expect_end, vlog};
+use crate::seed;
 
 pub fn cmd_store(stream: &mut ArgStream, cfg: &mut Config) -> Result<u8, String> {
     consume_global_options(stream, cfg)?;
     let Some(action) = stream.next() else {
-        return Err("`store` needs an action: add, ls, or gc".to_string());
+        return Err("`store` needs an action: add, ls, gc, or reseed".to_string());
     };
     match action.as_str() {
         "add" => store_add(stream, cfg),
         "ls" => store_ls(stream, cfg),
         "gc" => store_gc(stream, cfg),
+        "reseed" => store_reseed(stream, cfg),
         other => Err(format!(
-            "unknown store action `{other}`: expected add, ls, or gc"
+            "unknown store action `{other}`: expected add, ls, gc, or reseed"
         )),
     }
+}
+
+/// `eo9 store reseed`: re-bind the bundled program names to the components carried by
+/// this binary. With a seed record (any store this version has seeded), names the user
+/// re-bound — and every name added with `store add --name` — stay theirs; on a store
+/// without one (seeded by an older eo9), every bundled name is refreshed. Objects are
+/// never deleted, so nothing is lost either way.
+fn store_reseed(stream: &mut ArgStream, cfg: &mut Config) -> Result<u8, String> {
+    consume_global_options(stream, cfg)?;
+    expect_end(stream, "store reseed")?;
+    let store = cfg.open_store()?;
+    let refreshed = seed::reseed(cfg, &store)?;
+    if refreshed == 0 {
+        println!("bundled programs already match this eo9 binary");
+    } else {
+        println!("refreshed {refreshed} bundled program(s) to this eo9 binary's components");
+    }
+    Ok(EXIT_SUCCESS)
 }
 
 /// `eo9 store add <path> [--name <dotted-name>]`: add a component file to the

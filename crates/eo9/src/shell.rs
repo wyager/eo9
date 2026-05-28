@@ -43,9 +43,10 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
     let store = cfg.open_store()?;
 
     // First run against an empty store: seed it from the embedded components so the
-    // shell has programs to offer. A seeding problem never blocks the shell itself.
-    if let Err(err) = seed::seed_store_if_empty(cfg, &store) {
-        eprintln!("eo9: warning: could not seed the module store: {err}");
+    // shell has programs to offer; after an upgrade, refresh the bundled names so a store
+    // seeded by an older eo9 keeps working. A seeding problem never blocks the shell.
+    if let Err(err) = seed::ensure_seeded(cfg, &store) {
+        eprintln!("eo9: warning: could not seed/refresh the module store: {err}");
     }
 
     let eosh = resolve_eosh(cfg, &store)?;
@@ -97,8 +98,12 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
         max_memory: cfg.max_memory,
         max_table_elements: None,
     };
-    let mut task = Task::spawn(&loaded.image, &args, limits, shell_providers)
-        .map_err(|err| format!("cannot spawn eosh ({}): {err}", eosh.origin))?;
+    let mut task = Task::spawn(&loaded.image, &args, limits, shell_providers).map_err(|err| {
+        run::stale_store_hint(
+            &eosh.origin,
+            format!("cannot spawn eosh ({}): {err}", eosh.origin),
+        )
+    })?;
 
     let outcome = run::drive_to_completion(cfg, &mut task);
     let (rendered, code) = run::render_outcome(&outcome);
