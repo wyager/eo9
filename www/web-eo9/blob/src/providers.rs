@@ -106,27 +106,72 @@ struct WitInstant {
 
 // --- Registration --------------------------------------------------------------------------
 
-/// Register the browser root providers: the `types` resources and the text, time, and
-/// entropy capability interfaces.
+/// Register all browser root providers (text, time, entropy — each with its `types`
+/// resource). Used for an unrestricted run.
 pub fn add_providers(linker: &mut Linker<WebState>) -> Result<()> {
-    add_types(linker)?;
     add_text(linker)?;
     add_time(linker)?;
     add_entropy(linker)?;
     Ok(())
 }
 
-fn add_types(linker: &mut Linker<WebState>) -> Result<()> {
+/// Register only the root providers admitted by `allow` (the `only` allow-list recorded on
+/// the component). `None` means unrestricted (everything). This is how `only`-attenuation
+/// is enforced on the run path: the child runs the base artifact, so a capability the
+/// `only` gate sealed must be withheld from the linker — a program importing a sealed-away
+/// interface then fails at instantiation, and an optional sealed capability is observed as
+/// absent. Each family registers its own authority-free `types` only alongside its
+/// authority interface, so a program never needs a family's `types` unless it imports that
+/// family.
+pub fn add_providers_for(linker: &mut Linker<WebState>, allow: Option<&[String]>) -> Result<()> {
+    if family_admitted(allow, "eo9:text/text") {
+        add_text(linker)?;
+    }
+    if family_admitted(allow, "eo9:time/time") {
+        add_time(linker)?;
+    }
+    if family_admitted(allow, "eo9:entropy/entropy") {
+        add_entropy(linker)?;
+    }
+    Ok(())
+}
+
+/// True if `iface` (a full interface ref like `eo9:text/text`) is admitted by the allow-list.
+/// `None` admits everything. An allow entry admits `iface` when it is the same interface or
+/// the bare package of it (the `only eo9:text` shorthand) — version suffixes ignored.
+pub fn family_admitted(allow: Option<&[String]>, iface: &str) -> bool {
+    match allow {
+        None => true,
+        Some(list) => list.iter().any(|entry| admits(entry, iface)),
+    }
+}
+
+fn admits(entry: &str, iface: &str) -> bool {
+    let e = entry.split('@').next().unwrap_or(entry);
+    let f = iface.split('@').next().unwrap_or(iface);
+    // exact interface match, or a bare-package entry (`eo9:text`) matching `eo9:text/...`.
+    e == f || (!e.contains('/') && f.strip_prefix(e).is_some_and(|rest| rest.starts_with('/')))
+}
+
+fn add_text_types(linker: &mut Linker<WebState>) -> Result<()> {
     linker.instance("eo9:text/types@0.1.0")?.resource(
         "text-impl",
         ResourceType::host::<TextCap>(),
         |_, _| Ok(()),
     )?;
+    Ok(())
+}
+
+fn add_time_types(linker: &mut Linker<WebState>) -> Result<()> {
     linker.instance("eo9:time/types@0.1.0")?.resource(
         "time-impl",
         ResourceType::host::<TimeCap>(),
         |_, _| Ok(()),
     )?;
+    Ok(())
+}
+
+fn add_entropy_types(linker: &mut Linker<WebState>) -> Result<()> {
     linker.instance("eo9:entropy/types@0.1.0")?.resource(
         "entropy-impl",
         ResourceType::host::<EntropyCap>(),
@@ -148,6 +193,7 @@ fn add_default_handle<C: 'static>(instance: &mut LinkerInstance<'_, WebState>) -
 /// `eo9:text/text`: the page terminal. Both output streams go to the one terminal pane
 /// (stderr lines are prefixed so they are distinguishable).
 fn add_text(linker: &mut Linker<WebState>) -> Result<()> {
+    add_text_types(linker)?;
     let mut text = linker.instance("eo9:text/text@0.1.0")?;
     add_default_handle::<TextCap>(&mut text)?;
 
@@ -182,6 +228,7 @@ fn add_text(linker: &mut Linker<WebState>) -> Result<()> {
 /// `eo9:time/time`: wall-clock seconds from `Date.now()`, monotonic time from
 /// `performance.now()`, sleeps from `setTimeout` via JSPI.
 fn add_time(linker: &mut Linker<WebState>) -> Result<()> {
+    add_time_types(linker)?;
     let mut time = linker.instance("eo9:time/time@0.1.0")?;
     add_default_handle::<TimeCap>(&mut time)?;
 
@@ -239,6 +286,7 @@ fn add_time(linker: &mut Linker<WebState>) -> Result<()> {
 /// `eo9:entropy/entropy`: `crypto.getRandomValues` — the browser's CSPRNG is the machine's
 /// entropy root here.
 fn add_entropy(linker: &mut Linker<WebState>) -> Result<()> {
+    add_entropy_types(linker)?;
     let mut entropy = linker.instance("eo9:entropy/entropy@0.1.0")?;
     add_default_handle::<EntropyCap>(&mut entropy)?;
 

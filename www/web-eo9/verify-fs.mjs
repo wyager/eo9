@@ -42,6 +42,8 @@ const imports = {
         return -1;
       }
     }),
+    host_compile_copy: () => {},
+    host_compile_len: new WebAssembly.Suspending(async () => -1),
   },
 };
 

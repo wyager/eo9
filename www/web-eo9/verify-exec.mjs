@@ -27,6 +27,8 @@ const imports = {
     host_sleep_ms: new WebAssembly.Suspending((ms) => new Promise((r) => setTimeout(r, ms))),
     host_read_line: new WebAssembly.Suspending(async () => -1),
     host_fetch_len: new WebAssembly.Suspending(async () => -1),
+    host_compile_copy: () => {},
+    host_compile_len: new WebAssembly.Suspending(async () => -1),
   },
 };
 

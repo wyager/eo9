@@ -340,3 +340,123 @@ ok. Blob 5.20 MiB raw / 1.07 MiB brotli.
 the interactive `eosh>` prompt on the page (main(none) reading the terminal via JSPI read-line);
 `only`-attenuation via a linker restricted to the admitted interfaces (today the base artifact
 runs with full root providers); the server-side `/vm/compile` endpoint for `$`/`&`.
+
+## Decision 18 — `only`-attenuation enforced by a restricted linker on the run path
+
+`spawn` runs the *base* artifact (compile = artifact lookup; an `only`/`rename` of a binary
+keeps the base artifact, recording the admitted allow-list on the component), so a capability
+the `only` gate sealed must be withheld at run time by the linker, not the bytes. `run_child`
+now threads the recorded `allow` into the linker: `providers::add_providers_for(linker, allow)`
+adds only the admitted root families (each family registers its own authority-free `types`
+alongside its authority interface, so a program never needs a family's `types` unless it imports
+that family), and fs/io is added only when `eo9:fs/fs` is admitted. `allow == None` is
+unrestricted. An entry admits an interface by exact match or as the bare package (`only eo9:text`
+matches `eo9:text/text`), version-insensitive — the same package-shorthand the usermode `only`
+accepts.
+
+Verified (`verify-eosh.mjs`): `only eo9:text/text,eo9:time/time $ hello` runs against a
+text+time-only linker; `only eo9:text/text $ echo` runs text-only; `only eo9:text/text $ hello`
+is refused (`restrict` rejects the required-but-unadmitted `eo9:time/time` before spawn). Note:
+with the current demo programs (all imports required, none optional) the restricted linker is
+defense-in-depth — a program can't use a capability it doesn't import, and required-outside-allow
+is refused at `restrict`; the restriction becomes load-bearing for a program with an *optional*
+import that a successful `only` seals as absent (none in the demo set yet).
+
+## Decision 19 — a provider in `/bin` so `$`/`&` is exercisable through eosh
+
+`entropy.seeded` (the unmodified `eo9-stub-entropy-seeded`) is now seeded into the blob's
+`/bin` as raw component bytes (for the algebra's `load`) plus a pulley `.cwasm` (the `bin!`
+macro embeds both), via the same xtask `/bin` build loop as the example/coreutil binaries.
+A visitor can now type `entropy.seeded $ rng --count 3` at the prompt: eosh resolves both
+from `/bin`, composes with the real algebra, and `compile` of the fused result returns the
+clean "composition needs the compiler" refusal (no precompiled artifact) — reached through
+eosh, not a crash (verify-eosh.mjs). The server-side `/vm/compile` endpoint (Decision 20,
+pending) is the path to actually compiling+running such a composition in the browser. Cost:
+the blob grows by entropy.seeded's raw+cwasm (~6.05 MiB raw / ~1.19 MiB brotli) — a lazy-fetch
+trim (serve `/bin` raw+cwasm from the HTTP store instead of embedding) is the recorded
+blob-size follow-up. Nit: eosh renders the refusal as `CompileError::Codegen(...)` (raw enum
+prefix) — an eosh-side rendering follow-up.
+
+## Decision 20 — server-side `/vm/compile` for in-browser `$`/`&` (DESIGN — implemented in Decision 21)
+
+In-blob codegen is std/mmap-blocked, so a fused composition can't be compiled client-side
+(Decision 19's clean refusal). The path to actually running `entropy.seeded $ rng` in the
+browser is a bounded compile endpoint on the standalone `www` server (which has the full host
+toolchain). Design for the next focused pass (NOT done here — it's a server + blob + page
+feature that can't be implemented *and* verified within one fork's budget without shipping
+unverified code; #1 (only-narrowing) and #2 (provider in /bin) are done and verified instead):
+
+- **Server (`www/src`)**: a POST `/vm/compile` route. Body is a composition expressed over
+  **store program names + algebra ops** (e.g. `entropy.seeded $ rng`), NOT uploaded bytes.
+  The server: parses the expression with a small host-side parser (a minimal `name [--flag v]
+  { ($|&) name … }` / `only … $` reader — the eosh grammar is no_std guest code, so a tiny
+  host reader is cleaner than reusing it), resolves each name against a fixed allow-set of the
+  `/vm` store programs (reject anything not in the set), fuses with `eo9-component` (compose/
+  extend/restrict/configure), and compiles to a pulley32 image with the same web-compatible
+  engine config `xtask::preaot_for_web` uses (new dep: eo9-component + eo9-runtime, host-side).
+  Returns the `.cwasm` bytes. **Security (required)**: names restricted to the known store set;
+  request-size cap; a compile timeout; a small concurrency limit (semaphore) — so it can't be a
+  compile-bomb/DoS. Keep the existing security headers; add `connect-src 'self'` to the CSP for
+  the POST and verify the page still loads.
+- **Blob (`execsurface.rs` compile)**: on a fused (artifact-None) component, instead of the
+  flat refusal, POST the composition to `/vm/compile` via a JSPI `Suspending` host import
+  (the blob already fetches the store over HTTP), receive the pulley image, and run it through
+  the existing run-to-completion `spawn` path — honestly labelled "compiled on the server".
+- **Verify**: `entropy.seeded $ rng --count 3` at the browser prompt → server compiles → eosh
+  runs it → typed outcome, deterministic across runs (extend verify-eosh.mjs with a stub/real
+  `/vm/compile` responder, and a www server integration test for the route + its bounds).
+
+## Decision 21 — `/vm/compile` implemented: the in-browser composition round-trip works
+
+Decision 20's design, built and verified end-to-end. Typing `entropy.seeded $ rng --count 3`
+at the browser `eosh>` prompt now genuinely compiles the fused composition on the server and
+runs it in the blob — verified by `verify-eosh.mjs` (which spawns the real `eo9-www` server and
+points the blob's compile host-import at its `/vm/compile`): 3 SplitMix64 numbers print,
+deterministic across two runs, and the composition no longer hits the codegen refusal.
+
+What was built (all under `www/`, `xtask`; eosh untouched):
+
+- **Server compile core (`www/src/compile.rs`)**: `compile_expression(expr, raw_dir, allow)`
+  parses `[only <csv> $] name ($ name)*` (consumer `--flags` stripped — bound at spawn, not
+  part of the fused component), resolves each name against the allow-set, fuses with the real
+  `eo9-component` algebra (right-assoc `$`, leading `only` → `restrict`), and precompiles to a
+  pulley32 image with the exact engine config `xtask::preaot_for_web` uses (shared helper
+  `pulley_engine`). `&`/`rename`/`configure` are rejected with a clear message (the kernel/
+  native run the full algebra). New host deps: `eo9-component` (path) + `wasmtime` 45. Unit-
+  tested: fuses `entropy.seeded $ rng` to a real artifact; allow-set rejection enforced.
+- **HTTP route (`www/src/server.rs`)**: `POST /vm/compile`, dispatched in the site connection's
+  service before the static-file path. **Security bounds**: 2 KiB request-body cap
+  (`Limited`), a 20 s compile timeout (`spawn_blocking` + `timeout`), and a concurrency gate
+  (2 permits, wait up to 10 s then 503). The allow-set is exactly the stems of
+  `site/vm/raw/*.wasm` shipped with the site — never the client's word. Typed responses:
+  `application/octet-stream` image on success, `text/plain` 4xx/5xx with the reason. Carries
+  the standard security headers. The CSP already had `connect-src 'self'`, so no CSP change was
+  needed (the design's one open question resolved itself). Integration-tested over real HTTP
+  (`www/tests/vm_compile.rs`): compiles `entropy.seeded $ rng`, rejects unknown programs (400),
+  unsupported ops (400), empty (400), and oversized bodies (413).
+- **Raw components (`xtask build-web-vm`)**: emits each `/bin` program's raw bytes to
+  `site/vm/raw/<name>.wasm` (the same set, by name). Not fingerprinted — the server resolves
+  them by fixed name. `check-web-vm` still passes (it checks only the fingerprinted assets);
+  `build-web-vm` reproduces them deterministically (straight copy of the guest components).
+- **Blob (`host.rs`, `execsurface.rs`)**: a `host_compile_len`/`host_compile_copy` JSPI import
+  pair mirroring the existing `host_fetch_*` (async POST stashes the image + returns its length;
+  sync copy into blob memory). The key wrinkle the design under-specified: **eosh `load`s raw
+  bytes, never names**, and `ComponentEntry` tracked no provenance — so the compile op had the
+  fused bytes but not the names+ops expression the endpoint requires. Resolved by recovering
+  names **by content hash** against the embedded `/bin` set (`name_for`, reusing the existing
+  `artifact_for` hash) and threading a small `Prov` enum (`Program`/`Compose`/`Only`) through
+  `load`/`compose`/`restrict`; `extend`/`rename`/`configure` set provenance `None` (not in the
+  endpoint grammar → the existing clean refusal, unchanged). On a fused (artifact-`None`)
+  component, `compile` renders the provenance to the endpoint expression, POSTs via the host
+  import, and runs the returned image through the unchanged run-to-completion `spawn` path.
+- **vm.js**: the page shim — `hostCompileLen` POSTs to `/vm/compile`, `hostCompileCopy` copies
+  the image; both registered (`Suspending` under JSPI, an `unavailable` stub otherwise). The
+  other blob harnesses (`verify-{coreutils,fs,exec}.mjs`) get `-1` stubs so the blob still
+  instantiates (the two imports are now mandatory).
+
+Security recap (all required bounds present): names-and-ops only (no uploaded bytes); allow-set
+= shipped store programs (anything else 4xx); request-size cap; compile timeout; concurrency
+limit. Blob size after the round-trip wiring: ~6.05 MiB raw / ~1.19 MiB brotli (the lazy-fetch
+`/bin` trim from Decision 19 remains the recorded blob-size follow-up). The Decision 19 nit
+(eosh renders an actual refusal as `CompileError::Codegen(...)`) is now rarely reached for `$`
+compositions (they compile) but still applies to `&`/`rename`/`configure` — unchanged.

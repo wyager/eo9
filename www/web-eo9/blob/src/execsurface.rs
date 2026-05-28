@@ -52,6 +52,8 @@ static BIN: &[BinProgram] = &[
     bin!("cat"),
     bin!("ls"),
     bin!("rng"),
+    // A provider, so `entropy.seeded $ rng` (and other `$`/`&`) is formable at the prompt.
+    bin!("entropy.seeded"),
 ];
 
 /// Seed `/bin/<name>.wasm` with each program's raw component bytes so eosh's `resolve`
@@ -82,6 +84,49 @@ fn artifact_for(raw: &[u8]) -> Option<Vec<u8>> {
         .map(|p| p.pulley.to_vec())
 }
 
+/// Identify a loaded component by content hash as one of the named `/bin` store programs. eosh
+/// `load`s raw bytes (it never tells the blob the name), so this is how the blob recovers the
+/// name needed to ask the server to compile a composition over store-program names.
+fn name_for(raw: &[u8]) -> Option<&'static str> {
+    let want = hash(raw);
+    BIN.iter().find(|p| hash(p.raw) == want).map(|p| p.name)
+}
+
+/// How a composed component was built, in terms of store-program names + algebra ops — enough
+/// to render the `/vm/compile` expression the server re-fuses from its own trusted store. Only
+/// the operators the endpoint accepts are tracked; anything else makes provenance `None`, which
+/// keeps the clean "needs the compiler" refusal rather than POSTing something unsupported.
+enum Prov {
+    /// A `/bin` program identified by content hash.
+    Program(&'static str),
+    /// `provider $ consumer`.
+    Compose(Box<Prov>, Box<Prov>),
+    /// `only <interfaces> $ <inner>` (a leading restriction over a `$` chain).
+    Only(Vec<String>, Box<Prov>),
+}
+
+impl Prov {
+    /// Render the `$`-chain body (programs and composition), or `None` if a nested `only`
+    /// appears (the endpoint only supports a single leading `only`).
+    fn render_chain(&self) -> Option<String> {
+        match self {
+            Prov::Program(name) => Some((*name).to_string()),
+            Prov::Compose(a, b) => Some(format!("{} $ {}", a.render_chain()?, b.render_chain()?)),
+            Prov::Only(..) => None,
+        }
+    }
+
+    /// Render the full expression in the endpoint's grammar (`[only <csv> $] name ($ name)*`).
+    fn render(&self) -> Option<String> {
+        match self {
+            Prov::Only(ifaces, inner) => {
+                Some(format!("only {} $ {}", ifaces.join(","), inner.render_chain()?))
+            }
+            other => other.render_chain(),
+        }
+    }
+}
+
 // --- Resource tables (rep = index; freed by the resource destructors) --------------------
 
 struct ComponentEntry {
@@ -94,6 +139,10 @@ struct ComponentEntry {
     /// restrict the child's linker at spawn (the algebra sealed them in the bytes, but we
     /// run the base artifact, so the restriction is reapplied as a narrowed linker).
     allow: Option<Vec<String>>,
+    /// How this component was built from named store programs + ops, when recoverable — lets
+    /// `compile` ask the server to re-fuse and compile a composition that has no in-blob
+    /// artifact. `None` when any constituent is unknown or an unsupported op was used.
+    provenance: Option<Prov>,
 }
 
 struct ImageEntry {
@@ -579,20 +628,30 @@ fn val_to_outcome(val: &Val) -> ProgramOutcome {
 /// Instantiate a child artifact against the (possibly restricted) browser root providers and
 /// run `main` to completion. A separate `Store`/`Engine` from the caller — eosh awaits the
 /// whole call, so there is at most one child running at a time.
-fn run_child(artifact: &[u8], _allow: Option<&[String]>, vals: Vec<Val>) -> ProgramOutcome {
-    match run_child_inner(artifact, vals) {
+fn run_child(artifact: &[u8], allow: Option<&[String]>, vals: Vec<Val>) -> ProgramOutcome {
+    match run_child_inner(artifact, allow, vals) {
         Ok(outcome) => outcome,
         Err(error) => ProgramOutcome::Abnormal(WitAbnormalExit::Trapped(std::format!("{error}"))),
     }
 }
 
-fn run_child_inner(artifact: &[u8], vals: Vec<Val>) -> Result<ProgramOutcome> {
+fn run_child_inner(
+    artifact: &[u8],
+    allow: Option<&[String]>,
+    vals: Vec<Val>,
+) -> Result<ProgramOutcome> {
     let engine = engine(false)?;
     // SAFETY: produced by `cargo xtask build-web-vm` with the matching configuration.
     let component = unsafe { WtComponent::deserialize(&engine, artifact)? };
     let mut linker: Linker<WebState> = Linker::new(&engine);
-    crate::providers::add_providers(&mut linker)?;
-    crate::fs::add_fs_io(&mut linker)?;
+    // Enforce `only`-attenuation on the run path: the child runs the base artifact, so a
+    // capability the `only` gate sealed is withheld from its linker (a sealed-away required
+    // import then fails at instantiation; a sealed optional is observed absent). `allow ==
+    // None` is unrestricted.
+    crate::providers::add_providers_for(&mut linker, allow)?;
+    if crate::providers::family_admitted(allow, "eo9:fs/fs") {
+        crate::fs::add_fs_io(&mut linker)?;
+    }
     let mut store = Store::new(&engine, WebState::new());
     let instance = block_on(
         "child instantiation",
@@ -645,10 +704,12 @@ fn add_component_algebra(linker: &mut Linker<WebState>) -> Result<()> {
             match Component::load(image.clone()) {
                 Ok(component) => {
                     let artifact = artifact_for(&image);
+                    let provenance = name_for(&image).map(Prov::Program);
                     let rep = store.data_mut().exec().put_component(ComponentEntry {
                         component,
                         artifact,
                         allow: None,
+                        provenance,
                     });
                     Ok((Ok(Resource::new_own(rep)),))
                 }
@@ -692,10 +753,17 @@ fn add_component_algebra(linker: &mut Linker<WebState>) -> Result<()> {
             let consumer = exec.take_component(c.rep())?;
             match compose(&provider.component, &consumer.component) {
                 Ok(component) => {
+                    // Provenance survives only if BOTH sides are nameable store programs/
+                    // compositions; otherwise the result can't be expressed for the server.
+                    let provenance = match (provider.provenance, consumer.provenance) {
+                        (Some(a), Some(b)) => Some(Prov::Compose(Box::new(a), Box::new(b))),
+                        _ => None,
+                    };
                     let rep = store.data_mut().exec().put_component(ComponentEntry {
                         component,
                         artifact: None,
                         allow: consumer.allow,
+                        provenance,
                     });
                     Ok((Ok(Resource::new_own(rep)),))
                 }
@@ -718,6 +786,8 @@ fn add_component_algebra(linker: &mut Linker<WebState>) -> Result<()> {
                         component,
                         artifact: None,
                         allow: base_e.allow,
+                        // `&` (extend) is not part of the compile endpoint's grammar.
+                        provenance: None,
                     });
                     Ok((Ok(Resource::new_own(rep)),))
                 }
@@ -742,10 +812,15 @@ fn add_component_algebra(linker: &mut Linker<WebState>) -> Result<()> {
             match restrict(&entry.component, &refs) {
                 Ok(component) => {
                     let admitted: Vec<String> = allow.iter().map(|r| r.interface.clone()).collect();
+                    // `only` over a nameable composition renders as a leading `only` gate.
+                    let provenance = entry
+                        .provenance
+                        .map(|inner| Prov::Only(admitted.clone(), Box::new(inner)));
                     let rep = store.data_mut().exec().put_component(ComponentEntry {
                         component,
                         artifact: entry.artifact,
                         allow: Some(admitted),
+                        provenance,
                     });
                     Ok((Ok(Resource::new_own(rep)),))
                 }
@@ -766,6 +841,8 @@ fn add_component_algebra(linker: &mut Linker<WebState>) -> Result<()> {
                         component,
                         artifact: entry.artifact,
                         allow: entry.allow,
+                        // `rename` is not part of the compile endpoint's grammar.
+                        provenance: None,
                     });
                     Ok((Ok(Resource::new_own(rep)),))
                 }
@@ -788,6 +865,8 @@ fn add_component_algebra(linker: &mut Linker<WebState>) -> Result<()> {
                         component,
                         artifact: None,
                         allow: None,
+                        // `configure` is not part of the compile endpoint's grammar.
+                        provenance: None,
                     });
                     Ok((Ok(Resource::new_own(rep)),))
                 }
@@ -846,12 +925,30 @@ fn add_compile(linker: &mut Linker<WebState>) -> Result<()> {
                     });
                     Ok((Ok(Resource::new_own(rep)),))
                 }
-                None => Ok((Err(WitCompileError::Codegen(
-                    "composition needs the compiler, which isn't available in the browser yet \
-                     (in-blob codegen is std/mmap-blocked); native Eo9 and the bare-metal kernel \
-                     compile it on-target"
-                        .to_string(),
-                )),)),
+                // No precompiled artifact (a `$`/`only` composition). If the composition is
+                // expressible over named store programs + supported ops, ask the server to
+                // re-fuse and compile it (it has the full toolchain the browser lacks), then
+                // run the returned image like any other. Otherwise, the honest refusal.
+                None => match entry.provenance.as_ref().and_then(Prov::render) {
+                    Some(expr) => match crate::host::compile_composition(&expr) {
+                        Ok(image) => {
+                            let arg_specs = info.args.into_iter().map(|a| (a.name, a.ty)).collect();
+                            let rep = store.data_mut().exec().put_image(ImageEntry {
+                                artifact: image,
+                                allow: entry.allow,
+                                arg_specs,
+                            });
+                            Ok((Ok(Resource::new_own(rep)),))
+                        }
+                        Err(message) => Ok((Err(WitCompileError::Codegen(message)),)),
+                    },
+                    None => Ok((Err(WitCompileError::Codegen(
+                        "composition needs the compiler, which isn't available in the browser yet \
+                         (in-blob codegen is std/mmap-blocked); native Eo9 and the bare-metal \
+                         kernel compile it on-target"
+                            .to_string(),
+                    )),)),
+                },
             }
         },
     )?;
