@@ -11,7 +11,9 @@ use eo9_component::{ArgSpec, Component, ComponentKind, ImportNeed};
 use eo9_runtime::task::FUEL_QUANTUM;
 use eo9_runtime::{NamedArg, Outcome, ResumeOutcome, SpawnLimits, Task, WaveValue};
 
-use crate::cli::{Config, EXIT_ABNORMAL, EXIT_FAILURE, EXIT_SUCCESS, OutcomeChannel, ProgramArg, vlog};
+use crate::cli::{
+    Config, EXIT_ABNORMAL, EXIT_FAILURE, EXIT_SUCCESS, OutcomeChannel, ProgramArg, vlog,
+};
 use crate::compile;
 use crate::providers;
 use crate::source;
@@ -339,7 +341,13 @@ mod tests {
         assert_eq!(args[1], NamedArg::new("name", "\"world\""));
 
         // Too many positionals with nowhere to go is an error here (no name to carry).
-        assert!(bind_args(&params, &[positional("a"), positional("b"), positional("c")]).is_err());
+        assert!(
+            bind_args(
+                &params,
+                &[positional("a"), positional("b"), positional("c")]
+            )
+            .is_err()
+        );
     }
 
     #[test]

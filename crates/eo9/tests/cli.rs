@@ -1633,7 +1633,10 @@ fn coreutils_take_several_positional_paths() {
     );
 
     // head's earlier parameter is still bound by name while the tail stays positional.
-    let head = eo9(&store, &["--fs-root", sb, "-c", "head --lines 1 /a.txt /b.txt"]);
+    let head = eo9(
+        &store,
+        &["--fs-root", sb, "-c", "head --lines 1 /a.txt /b.txt"],
+    );
     assert_eq!(head.code, 0, "stderr: {}", head.stderr);
     assert!(
         head.stdout.contains("==> /a.txt <==") && head.stdout.contains("==> /b.txt <=="),
