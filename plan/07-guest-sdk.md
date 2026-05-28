@@ -139,3 +139,28 @@ example programs used by every other area's tests.
       `FsImplBorrow<'_>` rather than `&FsImpl`. The draft's hand-written forwarding code (written blind)
       needs a mechanical pass against that real layout — area 09's follow-up; nothing was changed on its
       branch.
+
+## Decisions (panic diagnostics)
+
+11. **Trap reasons are cleaned; the panic message needs a per-world post-trap export (2026-05-27).**
+    Owner ruling: surface guest panic diagnostics through the existing `abnormal(trapped(reason))` arm, via
+    an executor-mediated path (option A) — never a hidden ambient import.
+    - *Done now (capability-clean, no WIT):* `crates/eo9-runtime/src/trap.rs` rebuilds the trapped reason
+      from wasmtime's already-flowing demangled backtrace — trap kind ("guest panicked — wasm `unreachable`
+      …") plus a symbol-only call chain (`… ← core::panicking::panic_fmt ← main`) with code addresses and
+      rustc `[hash]` disambiguators stripped, bounded to 16 frames, deterministic across runs/builds. This
+      replaces the raw escaped `{err:#}` text the user studies flagged as unreadable.
+    - *Still missing — the panic message string and source line.* The `#![no_std]` guest panic handler
+      (`guest/eo9-guest/src/rt.rs`) discards `PanicInfo` before the `unreachable` trap, and at the **component
+      boundary** the host cannot read them back: a host import would be an ambient capability a guest could
+      use for general output (disqualified), and a component does not expose its inner core memory/globals to
+      the host, so there is no post-trap memory read either. Mechanism (c) — wasmtime's own trap text — was
+      verified to carry the backtrace but **not** the message (the handler threw it away), and `--debug-info`
+      adds no source line to the text backtrace.
+    - *Proposed WIT (deferred — WIT is contended this wave):* a tiny, capability-clean **export** the SDK
+      synthesizes on every world, e.g. `eo9:rt/diagnostics` with `last-trap-reason: func() -> option<string>`.
+      The panic handler writes "<message> at <file:line>" into a guest static before trapping; the executor,
+      on catching the trap, calls that export (an export grants the guest nothing — it cannot be used for
+      proactive output, only read by the executor on the trap path) and folds the result into
+      `trapped(reason)`. This is an *export*, not an import, so it does not widen the guest's authority.
+      Implement once the configure-sync WIT churn settles.

@@ -203,6 +203,24 @@ fn run_outcomes_covers_success_failure_and_abnormal() {
         "trap reason missing: {}",
         trapped.stderr
     );
+    // The reason is the cleaned, deterministic form: a panic label, the trap kind, and a
+    // symbol-only backtrace naming the panicking function — with no code addresses or
+    // rustc `[hash]` disambiguators (the raw `{err:#}` noise the user studies flagged).
+    assert!(
+        trapped.stderr.contains("guest panicked"),
+        "trap reason should be labelled a guest panic: {}",
+        trapped.stderr
+    );
+    assert!(
+        trapped.stderr.contains("guest backtrace:") && trapped.stderr.contains("main"),
+        "trap reason should name the panicking function: {}",
+        trapped.stderr
+    );
+    assert!(
+        !trapped.stderr.contains("0x") && !trapped.stderr.contains('['),
+        "trap reason should carry no addresses or [hash] noise: {}",
+        trapped.stderr
+    );
 }
 
 #[test]

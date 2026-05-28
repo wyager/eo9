@@ -492,7 +492,7 @@ impl Task {
                     let call = main.call_concurrent(accessor, &params, &mut results).await;
                     let stored = match call {
                         Ok(()) => Ok(results.into_iter().next().unwrap_or(Val::Bool(false))),
-                        Err(err) => Err(format!("{err:#}")),
+                        Err(err) => Err(crate::trap::trap_reason(&err)),
                     };
                     *cell.lock().unwrap() = Some(stored);
                 })
@@ -588,7 +588,7 @@ impl Task {
                 }),
             },
             (Some(Err(trap)), _) => Outcome::Trapped(trap),
-            (None, Err(err)) => Outcome::Trapped(format!("{err:#}")),
+            (None, Err(err)) => Outcome::Trapped(crate::trap::trap_reason(&err)),
             (None, Ok(())) => {
                 Outcome::Trapped("task event loop finished without a `main` result".to_string())
             }
