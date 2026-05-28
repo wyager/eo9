@@ -356,10 +356,31 @@ unsafe fn page_str<'a>(ptr: *const u8, len: usize) -> &'a str {
     core::str::from_utf8(unsafe { core::slice::from_raw_parts(ptr, len) }).unwrap_or("")
 }
 
-/// The kernel's async sleep canary: a real awaited `time.sleep`, parked on a browser timer.
+/// The kernel's async sleep canary (stackful lift — reported as unsupported on this host).
 #[unsafe(no_mangle)]
 pub extern "C" fn run_sleepy() -> i32 {
     report("sleepy", store::run_sleepy())
+}
+
+/// Park the whole VM on a real browser timer through the same JSPI import the time
+/// provider's `sleep` uses, and measure the elapsed monotonic time around it.
+#[unsafe(no_mangle)]
+pub extern "C" fn probe_sleep(ms: u32) -> i32 {
+    let ms = ms.clamp(1, 10_000);
+    let started = host::monotonic_ns();
+    host::sleep_ms(f64::from(ms));
+    let elapsed = host::monotonic_ns().saturating_sub(started);
+    outf!(
+        "park the VM: asked the browser for a {ms} ms timer; the VM was suspended and resumed \
+         {:.1} ms later (measured by the same monotonic clock the time provider serves)",
+        elapsed as f64 / 1_000_000.0
+    );
+    if elapsed >= u64::from(ms) * 1_000_000 {
+        0
+    } else {
+        outf!("probe_sleep: the VM came back early — JSPI suspension did not happen");
+        1
+    }
 }
 
 /// Terminal-input round trip through the same JSPI import the text provider's `read-line`

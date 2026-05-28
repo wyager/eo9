@@ -142,40 +142,62 @@ fn top_level_func(
         .ok_or_else(|| wasmtime::Error::msg(format!("`{name}` is not a function")))
 }
 
-/// Run the kernel's async sleep canary (`sleepy`): an unmodified component whose `run`
-/// export awaits a 50 ms `time.sleep` — on this page the await is parked on a real browser
-/// timer, so the measured elapsed time is genuine wall-clock time.
+/// Run the kernel's async sleep canary (`sleepy`): a hand-written component whose `run`
+/// export uses the Component Model's **stackful** async lift (it blocks mid-guest-frame on
+/// a sync-lowered `time.sleep`). The bare-metal kernel runs it on its fiber backend; this
+/// wasm32 host has no fibers, so the fiberless path refuses the stackful shape — which the
+/// page reports honestly. Eo9's real guests use the callback ABI and do run here (see
+/// [`run_program`]); the awaited-timer mechanics themselves are demonstrated by
+/// `probe_sleep` and by `read-line`.
 pub fn run_sleepy() -> wasmtime::Result<()> {
-    let artifact = host::fetch_artifact("sleepy").map_err(wasmtime::Error::msg)?;
-    let (mut store, instance) = instantiate(&artifact)?;
-    let run = top_level_func(&mut store, &instance, "run")?;
+    fn attempt() -> wasmtime::Result<(u64, u64)> {
+        let artifact = host::fetch_artifact("sleepy").map_err(wasmtime::Error::msg)?;
+        let (mut store, instance) = instantiate(&artifact)?;
+        let run = top_level_func(&mut store, &instance, "run")?;
 
-    let started = host::monotonic_ns();
-    let elapsed_guest = block_on(
-        "sleepy.run",
-        store.run_concurrent(async move |accessor| -> wasmtime::Result<u64> {
-            let mut result = [Val::Bool(false)];
-            run.call_concurrent(accessor, &[], &mut result).await?;
-            match result[0] {
-                Val::U64(value) => Ok(value),
-                ref other => Err(wasmtime::Error::msg(format!(
-                    "sleepy.run returned an unexpected value: {other:?}"
-                ))),
-            }
-        }),
-    )???;
-    let elapsed_here = host::monotonic_ns().saturating_sub(started);
+        let started = host::monotonic_ns();
+        let elapsed_guest = block_on(
+            "sleepy.run",
+            store.run_concurrent(async move |accessor| -> wasmtime::Result<u64> {
+                let mut result = [Val::Bool(false)];
+                run.call_concurrent(accessor, &[], &mut result).await?;
+                match result[0] {
+                    Val::U64(value) => Ok(value),
+                    ref other => Err(wasmtime::Error::msg(format!(
+                        "sleepy.run returned an unexpected value: {other:?}"
+                    ))),
+                }
+            }),
+        )???;
+        Ok((elapsed_guest, host::monotonic_ns().saturating_sub(started)))
+    }
 
-    crate::outf!(
-        "sleepy.run() — an awaited 50 ms time.sleep, parked on a real browser timer via JSPI:"
-    );
-    crate::outf!(
-        "  the guest measured {:.1} ms across its await; the page measured {:.1} ms around the call",
-        elapsed_guest as f64 / 1_000_000.0,
-        elapsed_here as f64 / 1_000_000.0
-    );
-    crate::outf!("  (>= 50 ms on both clocks proves the guest genuinely suspended and resumed)");
-    Ok(())
+    match attempt() {
+        Ok((elapsed_guest, elapsed_here)) => {
+            crate::outf!(
+                "sleepy.run() measured {:.1} ms across its await; the page measured {:.1} ms",
+                elapsed_guest as f64 / 1_000_000.0,
+                elapsed_here as f64 / 1_000_000.0
+            );
+            Ok(())
+        }
+        Err(error) => {
+            crate::outf!(
+                "sleepy uses the Component Model's *stackful* async lift — it blocks in the \
+                 middle of a guest frame, which needs a fiber backend. wasm32 has none, so the \
+                 fiberless web VM cannot run that shape yet (the bare-metal kernel can)."
+            );
+            crate::outf!(
+                "Eo9's own guests use the callback ABI instead, and those run here — see the \
+                 program store above; the awaited-timer / awaited-input mechanics are the \
+                 \"park the VM\" and \"read a line\" demos."
+            );
+            crate::outf!("(wasmtime's refusal: {error})");
+            Err(wasmtime::Error::msg(
+                "stackful async lift is not runnable on the fiberless wasm32 host",
+            ))
+        }
+    }
 }
 
 /// Fetch and run one of the page store's example programs with typed arguments.

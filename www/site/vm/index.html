@@ -51,8 +51,9 @@
       <input id="program-args" type="text" value="browser true" size="22" spellcheck="false">
       <button id="btn-program" disabled>Fetch from the store &amp; run</button>
     </span>
-    <button id="btn-sleepy" disabled>Run sleepy (awaited 50&nbsp;ms sleep)</button>
+    <button id="btn-park" disabled>Park the VM on a 300&nbsp;ms timer</button>
     <button id="btn-readline" disabled>Read a line from the terminal</button>
+    <button id="btn-sleepy" disabled>Run sleepy (stackful-lift canary)</button>
   </div>
 
   <pre id="vm-output">loading the Eo9 blob…</pre>
@@ -85,11 +86,13 @@
       providers: text → this terminal, time → the browser clocks, entropy →
       <code>crypto.getRandomValues</code>. Typed arguments in, a typed outcome out — the same
       contract as native <code>eo9 run</code>.</li>
-    <li><strong>sleepy / read a line</strong> — genuinely blocking operations: the guest's awaited
-      <code>time.sleep</code> is parked on a real browser timer, and <code>read-line</code> waits for
-      the input box below the terminal, using JavaScript Promise Integration (JSPI) to suspend the
-      whole VM and resume it. These need a JSPI-capable browser (current Chrome/Edge; the page says
-      so if yours is not).</li>
+    <li><strong>park the VM / read a line</strong> — genuinely blocking operations: the VM (and any
+      guest awaiting <code>time.sleep</code> or <code>read-line</code> inside it) is parked on a real
+      browser timer or on the input box below the terminal, using JavaScript Promise Integration
+      (JSPI) to suspend the whole VM and resume it. These need a JSPI-capable browser (current
+      Chrome/Edge; the page says so if yours is not). The <em>sleepy</em> canary uses the Component
+      Model's stackful async lift, which still needs a fiber backend — the page reports that
+      limitation honestly rather than hiding it.</li>
   </ul>
   <p>
     What is <em>not</em> here yet: the shell (eosh), the capability algebra, and on-page composition.

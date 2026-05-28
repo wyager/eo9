@@ -13,6 +13,7 @@ const buttons = {
   entropy: document.getElementById("btn-entropy"),
   program: document.getElementById("btn-program"),
   sleepy: document.getElementById("btn-sleepy"),
+  park: document.getElementById("btn-park"),
   readline: document.getElementById("btn-readline"),
 };
 const seedInput = document.getElementById("seed");
@@ -220,13 +221,14 @@ async function main() {
   // imports) must be wrapped with WebAssembly.promising and awaited.
   const promising = (fn) => (hasJSPI ? WebAssembly.promising(fn) : fn);
   const runSleepy = promising(exports.run_sleepy);
+  const probeSleep = promising(exports.probe_sleep);
   const probeReadLine = promising(exports.probe_read_line);
   const runProgram = promising(exports.run_program);
 
   const enableIdleButtons = () => {
     for (const button of [buttons.hello, buttons.fuel, buttons.entropy]) button.disabled = false;
     const blocked = !hasJSPI;
-    for (const button of [buttons.program, buttons.sleepy, buttons.readline]) {
+    for (const button of [buttons.program, buttons.sleepy, buttons.park, buttons.readline]) {
       button.disabled = blocked;
     }
   };
@@ -263,7 +265,8 @@ async function main() {
       return exports.run_entropy(lo, hi, count);
     });
 
-  buttons.sleepy.onclick = () => run("sleepy (awaited 50 ms sleep)", () => runSleepy());
+  buttons.park.onclick = () => run("park the VM (300 ms)", () => probeSleep(300));
+  buttons.sleepy.onclick = () => run("sleepy (stackful-lift canary)", () => runSleepy());
   buttons.readline.onclick = () => run("read-line", () => probeReadLine());
   buttons.program.onclick = () =>
     run(`store: ${programSelect.value}`, async () => {
