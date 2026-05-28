@@ -145,6 +145,33 @@ pub fn ring_get_byte() -> Option<u8> {
     Some(byte)
 }
 
+/// ETX (Ctrl-C) — the interrupt key.
+pub const CTRL_C: u8 = 0x03;
+
+/// Non-destructively scan the waiting input for a Ctrl-C and, if present, consume the ring up
+/// to and including it (flushing pending input through the interrupt, the usual terminal
+/// behaviour) and return `true`. If no Ctrl-C is waiting the ring is left untouched and this
+/// returns `false`. Single-consumer-safe: only the boot core calls this and `ring_get_byte`,
+/// never concurrently, so reading `tail..head` and advancing `tail` here is sound.
+#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
+pub fn take_ctrl_c() -> bool {
+    let head = RX_RING.head.load(Ordering::Acquire);
+    let mut i = RX_RING.tail.load(Ordering::Relaxed);
+    while i != head {
+        // SAFETY: the boot core is the sole consumer; this slot is published (it is before
+        // `head`, which was loaded with acquire ordering).
+        let byte = unsafe { (*RX_RING.buf.get())[i] };
+        let next = (i + 1) % RX_RING_CAP;
+        if byte == CTRL_C {
+            // Discard everything up to and including the Ctrl-C.
+            RX_RING.tail.store(next, Ordering::Release);
+            return true;
+        }
+        i = next;
+    }
+    false
+}
+
 /// Zero-sized serial console handle; `core::fmt::Write` goes straight to the hardware.
 pub struct Console;
 

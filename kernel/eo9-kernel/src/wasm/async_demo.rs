@@ -63,7 +63,7 @@ pub fn run() {
 
     crate::kprintln!(
         "async demo: entropy.seeded configure(seed = {ENTROPY_SEED:#x}) then get-u64 x2 \
-         (async-lifted configure, unmodified guest component)"
+         (sync configure, unmodified guest component)"
     );
     let start_us = crate::timer::uptime_us();
     match run_entropy_seeded() {
@@ -116,7 +116,7 @@ fn run_sleepy() -> Result<u64, wasmtime::Error> {
 }
 
 /// Instantiate the unmodified `entropy.seeded` component, bind a seed through its
-/// async-lifted `configure` export, and draw two values from the configured capability.
+/// `configure` export, and draw two values from the configured capability.
 fn run_entropy_seeded() -> Result<(u64, u64), wasmtime::Error> {
     let engine = super::new_engine()?;
 

@@ -844,3 +844,32 @@ preemption/hardening work.
       (mirroring usermode `--max-fuel`); (5) W^X for JIT pages — split the publisher's identity mapping so
       code pages are mapped executable-not-writable after the cache maintenance (needs mmu.rs page-permission
       support).
+
+40. **Metal depth hardening — Ctrl-C, kill-cascade, per-child cap (2026-05-27).** D38 items 2–4 of D39.
+    - **Ctrl-C interrupt key (item 2).** `uart::take_ctrl_c()` non-destructively scans the RX ring for ETX
+      (`0x03`) and, if present, consumes the ring up to and including it (flushing pending input, the usual
+      terminal behaviour). The exec `task.wait` op calls it on each pending iteration — the shell is parked in
+      `wait` (not `read-line`) while a foreground job runs, so a Ctrl-C there means "kill what I'm waiting on":
+      it kills the awaited task (and its descendants, below) and returns its outcome, dropping back to the
+      prompt. Verified (scripted serial): `cruncher --rounds 100000000000` interrupted → `abnormal: killed`,
+      prompt returns, a following `hello` runs.
+    - **Kill cascade (item 3).** A parallel `PARENTS` vector (index-aligned with `CHILDREN`) records each
+      child's parent rep; `CURRENT_PARENT` is set around each `drive_children` poll so a nested spawn during
+      that poll records its parent (top-level shell spawns record `None`). `kill_task_tree(rep)` kills `rep`
+      and all transitive descendants (fixed-point over `PARENTS`, cycle-bounded); both `task.kill` and the
+      Ctrl-C path use it, so killing a foreground nested eosh takes its children/grandchildren down rather
+      than orphaning them on the drive loop. Verified: nested eosh running a foreground cruncher, Ctrl-C →
+      both die, machine stays responsive (a following `hello` runs immediately).
+    - **Per-child hard cap (item 4).** `MAX_LIVE_CHILDREN = 64`: `spawn_child` refuses (clear error) once that
+      many children are live (running/checked-out), so a fork-bomb-style shell can't exhaust memory/drive-loop
+      time; finished children free slots. Inert for normal nesting (the demo + interactive sessions are
+      unaffected). Not independently QEMU-exercised (needs a 64-spawn loop eosh lacks); the bound is a simple
+      pre-spawn count check.
+    - Doc-only fixes done: the stale "interrupt is never taken as an exception / PSTATE.I stays masked" note in
+      timer.rs (the timer IRQ is now taken and EOI'd by `kirq`), and the kernel async-demo "async-lifted
+      configure" strings (configure is now sync). Verified: `cargo xtask ci` green; `qemu demo` reproduces the
+      sched/preemption demo + hello + sleepy + on-target codegen unchanged.
+    - **Remaining (item 5): W^X for JIT code pages** — give mmu.rs page-permission support and map on-target
+      code pages executable-not-writable (writable-not-executable while being written), after the existing
+      I/D-cache maintenance. Not started this pass; the gic.rs module-header doc still describes the original
+      masked-WFI design (doc-only follow-up).
