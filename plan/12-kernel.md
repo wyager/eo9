@@ -762,3 +762,42 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
     says the kernel was built without the feature (it previously always claimed composition was unavailable).
     Spawn instantiation errors that mention an unsatisfied `eo9:*` import are rendered as a friendly
     missing-capability message instead of the raw linker error (the fs/io case from the user studies).
+
+38. **Child fuel / preemption and metal shell recursion (2026-05-27).** The three pieces that turn "one
+    looping child takes the machine" (the embedded-study blocker) into a scheduled system:
+    - **Fuel on metal.** The kernel engine and xtask's `precompile_for_kernel` both set `consume_fuel(true)`
+      (compile-relevant, so the baked artifacts and on-target codegen agree; the store image's artifacts grew
+      ~14% — 3.5 → 3.9 MiB — and are re-precompiled by every `build-kernel` run anyway). Every store sets
+      fuel before guest code runs: the demos/headless runner/eosh use an effectively-unlimited pool; spawned
+      children get usermode parity — `SPAWN_FUEL` (40k) for instantiation, then `u64::MAX` sliced by
+      `fuel_async_yield_interval(FUEL_QUANTUM = 10_000)`, so every poll of a child runs at most one quantum
+      and yields back to the drive loop. The headless runner accepts `max-fuel=<units>` (the metal counterpart
+      of `eo9 run --max-fuel`): an exhausted budget ends the run as `abnormal(killed)` (verified:
+      `program=cruncher … max-fuel=50000`). An `OutOfFuel` trap in a child maps to the `killed` outcome.
+    - **The drive loop checks children out to poll them.** `ChildSlot` gained a `Polling` state:
+      `drive_children` takes the drive future out of the registry, polls it with the lock released, and checks
+      it back in (kill/handle-drop during a poll are honoured at check-in). This removes the D36 deadlock —
+      a child being polled can itself spawn/wait/kill through the same registry — and children spawned
+      mid-pass get their first poll in the same pass. The boot `demo` now opens with a scheduling
+      demonstration using exactly this machinery: three cruncher children (200k rounds, 2M rounds, and a
+      `u64::MAX`-rounds spinner) interleave on one drive loop — the short one finishes (~508 turns) while the
+      long one and the spinner are still running, the long one finishes (~5k turns) while the spinner still
+      spins, and the spinner is then killed cleanly (`abnormal(killed)`).
+    - **Children inherit the full session environment.** `spawn_child` now links the read-only store fs,
+      io buffers, and the whole `eo9:exec` surface (plus text/time/entropy as before) and gives each child its
+      own `ShellState` over the shared store image — the same inherit-everything-restrict-with-`only` default
+      as usermode (plan/11 D14–15). `eosh> eosh` therefore works on metal: the nested shell resolves `/bin`,
+      runs programs, fuses + compiles compositions on-target, reads the truthful session manifest, and `exit`
+      returns to the outer shell (verified interactively; the grandchild spawn from a child mid-poll is the
+      D36 case the lock rework enables). The friendly missing-capability message now covers only what the
+      kernel genuinely lacks (net/disk/pci).
+    - **eo9-sched: not adopted yet (recorded).** The registry's round-robin plus wasmtime's fuel-yield
+      slicing already gives every child a bounded slice per turn on the single core; eo9-sched's conserved
+      fuel ledger and policies become valuable with guest-directed `resume`/donation (E5) or priorities, and
+      adopting it now would add bookkeeping with no observable change. Revisit alongside E5.
+    - **Limitations / follow-ups.** Killing a parent does not cascade to its children (the registry is flat;
+      orphaned grandchildren run to completion unobserved); shell-spawned children have no per-child hard cap
+      (same as usermode — only the headless runner takes `max-fuel`); nested shells share the one serial
+      console (input goes to the innermost active reader); eosh itself still has no interrupt key, so a
+      foreground spinner still occupies the *prompt* even though the machine, other children, and the kill
+      path all keep working; the idle-wake interval (10 ms) bounds await-point latency as before.
