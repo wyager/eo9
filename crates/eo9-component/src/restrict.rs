@@ -19,6 +19,7 @@
 //! functions -- e.g. the `eo9:*/types` interfaces that `use` drags in) carry no authority
 //! and are always admitted.
 
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -33,7 +34,7 @@ use wit_parser::{Resolve, WorldId, WorldItem};
 use crate::compose::{encode, export_all, register, slot_annotations, world_exports};
 use crate::describe::{ImportMeta, OPTIONAL_SUFFIX};
 use crate::error::RestrictError;
-use crate::{Component, InterfaceRef, semver, slots, synth};
+use crate::{Component, InterfaceRef, Wiring, semver, slots, synth};
 
 /// Bounds `c` to the allow-list `allow`, per the rules above.
 pub fn restrict(c: &Component, allow: &[InterfaceRef]) -> Result<Component, RestrictError> {
@@ -54,10 +55,31 @@ pub fn restrict(c: &Component, allow: &[InterfaceRef]) -> Result<Component, Rest
     if !offenders.is_empty() {
         return Err(RestrictError::RequiredOutsideAllowList(offenders));
     }
-    if to_seal.is_empty() {
-        return Ok(c.clone());
+    // The gate applies even when nothing needs sealing (everything was already admitted);
+    // record it either way so the wiring tree shows the `only` boundary.
+    let inner = if to_seal.is_empty() {
+        c.clone()
+    } else {
+        seal_optional_imports(c, &to_seal)?
+    };
+    let allow_labels: Vec<String> = allow
+        .iter()
+        .map(|entry| match &entry.version {
+            Some(version) => format!("{}@{version}", entry.interface),
+            None => entry.interface.clone(),
+        })
+        .collect();
+    let mut sealed_absent: Vec<String> = Vec::new();
+    for import in &to_seal {
+        if !sealed_absent.contains(&import.interface) {
+            sealed_absent.push(import.interface.clone());
+        }
     }
-    seal_optional_imports(c, &to_seal)
+    Ok(inner.with_wiring(Wiring::Restrict {
+        allow: allow_labels,
+        sealed_absent,
+        body: Box::new(c.wiring().clone()),
+    }))
 }
 
 /// Checks that every allow-list entry is an interface name with a parseable version.

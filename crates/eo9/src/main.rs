@@ -67,9 +67,36 @@ fn dispatch(args: Vec<String>) -> Result<u8, String> {
         }
         "describe" => {
             cli::consume_global_options(&mut stream, &mut cfg)?;
-            let target = program_reference(&mut stream, "describe")?;
-            cli::expect_end(&mut stream, "describe")?;
-            describe::cmd_describe(&cfg, &target)
+            // `--wiring` (anywhere among the positionals) switches to the composition tree
+            // and lets several references form a `$`-chain; plain `describe` takes one.
+            let mut wiring = false;
+            let mut references: Vec<String> = Vec::new();
+            while let Some(token) = stream.peek() {
+                match token {
+                    "--wiring" => {
+                        stream.next();
+                        wiring = true;
+                    }
+                    other if !other.starts_with('-') => {
+                        references.push(stream.next().expect("peeked token exists"));
+                    }
+                    other => return Err(format!("unknown option `{other}` for `describe`")),
+                }
+            }
+            if references.is_empty() {
+                return Err("`describe` needs a program name or path".to_string());
+            }
+            if wiring {
+                describe::cmd_wiring(&cfg, &references)
+            } else if references.len() == 1 {
+                describe::cmd_describe(&cfg, &references[0])
+            } else {
+                Err(
+                    "`describe` takes one reference; use `describe --wiring A B …` \
+                    to show a composition's wiring tree"
+                        .to_string(),
+                )
+            }
         }
         "compile" => {
             cli::consume_global_options(&mut stream, &mut cfg)?;
@@ -133,6 +160,8 @@ COMMANDS:
                               component), compile it through the compile cache, run it
                               against the unix root providers, and print its outcome as WAVE
     describe <name-or-path>   Show a component's kind, imports, exports, and arguments
+    describe --wiring <ref>…  Show the composition/wiring tree; several refs form a `$`
+                              chain (A $ B $ …), making interposed providers visible
     compile <name-or-path>    Compile a program and warm the compile cache
     store add <path> [--name <dotted-name>]
                               Add a component file to the module store, optionally binding a name

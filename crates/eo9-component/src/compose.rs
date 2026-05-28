@@ -6,6 +6,7 @@
 //! the imports of the result (wac merges identically-named residuals), which is exactly
 //! the residual formula from SPEC.md "Composition and the `$` operator".
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -13,9 +14,9 @@ use alloc::vec::Vec;
 use wac_graph::types::{ItemKind, Package};
 use wac_graph::{CompositionGraph, EncodeOptions, InstantiationArgumentError, NodeId, PackageId};
 
-use crate::describe::CONFIG_SUFFIX;
+use crate::describe::{CONFIG_SUFFIX, OPTIONAL_SUFFIX};
 use crate::error::ComposeError;
-use crate::{Component, ComponentKind, externs, slots};
+use crate::{Component, ComponentKind, Wiring, externs, slots};
 
 /// A non-fatal observation made while composing (SPEC.md "Composition and the `$`
 /// operator": unmatched provider exports are dropped, and the shell is expected to warn
@@ -99,7 +100,32 @@ pub fn compose_checked(
     export_all(&mut graph, c_pkg, c_inst, None)?;
 
     let component = encode(&graph, &slot_annotations(&[provider, consumer]))?;
+    let component = component.with_wiring(Wiring::Compose {
+        provider: Box::new(provider.wiring().clone()),
+        consumer: Box::new(consumer.wiring().clone()),
+        satisfied: satisfied_interfaces(provider, consumer),
+    });
     Ok((component, warnings))
+}
+
+/// The interfaces a provider's exports satisfy among a consumer's imports (by interface
+/// type, matching the `-optional` flavor too) -- recorded in the compose wiring so a tree
+/// shows what an interposed layer actually contributes.
+fn satisfied_interfaces(provider: &Component, consumer: &Component) -> Vec<String> {
+    let mut satisfied = Vec::new();
+    for export in &provider.meta().exports {
+        if export.interface.is_empty() {
+            continue;
+        }
+        let matched = consumer.meta().imports.iter().any(|import| {
+            import.interface == export.interface
+                || import.interface.strip_suffix(OPTIONAL_SUFFIX) == Some(export.interface.as_str())
+        });
+        if matched && !satisfied.contains(&export.interface) {
+            satisfied.push(export.interface.clone());
+        }
+    }
+    satisfied
 }
 
 /// If the provider's only relevant offer for something the consumer *requires* is a
@@ -165,7 +191,19 @@ pub fn extend(base: &Component, layer: &Component) -> Result<Component, ComposeE
         .collect();
     export_all(&mut graph, x_pkg, x_inst, Some(&shadowed))?;
 
-    encode(&graph, &slot_annotations(&[base, layer]))
+    // Shadowing is only meaningful where the base also exported that slot; report just the
+    // base exports the layer actually overrode.
+    let base_slots: Vec<String> = base.meta().exports.iter().map(|e| e.slot.clone()).collect();
+    let overridden: Vec<String> = shadowed
+        .into_iter()
+        .filter(|slot| base_slots.contains(slot))
+        .collect();
+    let component = encode(&graph, &slot_annotations(&[base, layer]))?;
+    Ok(component.with_wiring(Wiring::Extend {
+        base: Box::new(base.wiring().clone()),
+        layer: Box::new(layer.wiring().clone()),
+        shadowed: overridden,
+    }))
 }
 
 /// Registers component bytes with the graph under `name`.

@@ -243,3 +243,15 @@ its first milestones, and to be the place where cross-area seams get found.
     text/time/entropy only. `env`'s manifest now describes the layered fs and the inherited exec, and
     `env <program>` marks `eo9:fs` imports as satisfied by the session (the read-only view exists even
     without `--fs-root`).
+
+17. **`eo9 describe --wiring` (owner ruling 2026-05-27 — the full composition tree).** `describe` gains a
+    `--wiring` mode: one reference renders the component as a leaf; several references compose a
+    right-associative `$`-chain in-process (`describe --wiring A B C` ≡ `A $ B $ C`, last = consumer) and
+    render the resulting `Component::wiring_tree()`, labelling each leaf with the reference it was resolved
+    from. This is host-side and needs no WIT change — it builds the composition here, which is the only way
+    to get the tree (provenance is in-memory, not in the bytes; see plan/03 D19). **eosh follow-up (not done,
+    WIT kept stable this wave):** eosh's `describe` builtin goes through `eo9:exec`'s `describe`, which
+    returns `component-info` with no wiring field, so eosh cannot show the tree for an expression it
+    composed. Surfacing it there needs an `eo9:exec` addition — e.g. `component-info` gaining an optional
+    wiring/provenance field (or a dedicated `wiring(component) -> string`) that the host fills from the
+    algebra's `Wiring`. The CLI `describe --wiring` delivers the owner's full-tree ask now without that.

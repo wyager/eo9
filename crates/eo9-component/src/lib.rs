@@ -46,6 +46,7 @@ mod restrict;
 pub mod semver;
 mod slots;
 mod synth;
+mod wiring;
 
 pub use component::Component;
 pub use compose::{ComposeWarning, compose, compose_checked, extend};
@@ -53,6 +54,7 @@ pub use configure::configure;
 pub use error::{ComposeError, ConfigureError, LoadError, RenameError, RestrictError};
 pub use rename::rename;
 pub use restrict::restrict;
+pub use wiring::Wiring;
 
 /// Which of the two module kinds a component is (SPEC.md: binary or provider, never
 /// both). Mirrors `component-kind` in `eo9:exec/component-algebra`.
