@@ -7,6 +7,7 @@
 //! (path resolution, content types, cache headers) is unit-testable and the listeners are
 //! integration-testable on ephemeral ports (see `tests/`).
 
+pub mod compile;
 pub mod server;
 pub mod tls;
 
