@@ -190,6 +190,62 @@ expiry, with no restart and no downtime. If you ever need to supply a certificat
 elsewhere instead, use `--tls-cert`/`--tls-key` (manual mode) — the rest of the behavior is
 identical.
 
+### Updating the live deployment
+
+The production host (`root@eo9.org`) runs the **clone-in-place** variant of the steps
+above: the repository is cloned to `/opt/eo9`, the server is built there with the
+repo-pinned toolchain, and the systemd unit `eo9-www` runs the binary straight out of
+that build tree as the unprivileged `eo9www` user. The layout:
+
+| Path | What |
+|------|------|
+| `/opt/eo9` | the git clone (tracks `origin/master`) |
+| `/opt/eo9/www/target/release/eo9-www` | the built binary (the unit's `ExecStart`) |
+| `/opt/eo9/www/site` | the served site (`--site`) |
+| `/srv/eo9-www/acme-cache` | the Let's Encrypt cache — **outside** the clone, so it survives rebuilds |
+| `/etc/systemd/system/eo9-www.service` | the unit (`systemctl enable`d; starts on boot) |
+
+**Site content only** (anything under `www/site/`) — no rebuild and no restart. The
+server reads files from disk per request, so a pull is enough and the new content is
+served immediately:
+
+```sh
+cd /opt/eo9 && git pull
+```
+
+**Server code or dependencies** (`www/src/`, `www/Cargo.toml`, `www/Cargo.lock`) — rebuild,
+then restart. Build as root (the SSH user); cargo selects the repo-pinned nightly
+automatically. On the 1-vCPU host the build takes a few minutes and leans on swap, but the
+old binary keeps serving the whole time — only the final `restart` swaps it in:
+
+```sh
+cd /opt/eo9 && git pull
+cd /opt/eo9/www && cargo build --release   # if `cargo` isn't found: . "$HOME/.cargo/env"
+systemctl restart eo9-www
+```
+
+A restart reuses the cached certificate (logs `acme: DeployedCachedCert`, no new ACME
+order), so it is a sub-second blip while the listener rebinds and never touches Let's
+Encrypt's rate limits.
+
+**Confirm it worked:**
+
+```sh
+systemctl status eo9-www --no-pager
+journalctl -u eo9-www -n 20 --no-pager        # startup line + any `acme:` events
+curl -sI https://eo9.org/ | head -1           # expect: HTTP/1.1 200 OK
+```
+
+If `git pull` ever reports local changes (e.g. an out-of-band edit to `Cargo.lock`),
+reconcile the clone to the remote with `git fetch origin master && git reset --hard
+origin/master` — the build tree should carry nothing that diverges from `origin/master`,
+and the certificate cache lives outside it, so this is safe.
+
+> **Heads-up on `cargo update`.** `www/Cargo.lock` pins `http = 1.4.0` on purpose: `http`
+> 1.4.1 makes `async-web-client` (pulled in by `rustls-acme`) panic during a live ACME
+> order. Don't let a `cargo update` bump it back without re-validating certificate issuance
+> against Let's Encrypt staging (`--acme-staging`, a separate `--acme-cache`).
+
 **Built-in limits.** Each listener caps concurrent connections at 256 and applies deadlines:
 10 s for a TLS handshake, 10 s to read a request's headers (which also bounds idle
 keep-alive waits), and 60 s for one connection's total lifetime. Stalled or hostile
