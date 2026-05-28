@@ -70,6 +70,12 @@ inputQueue = [
   "echo --text hi",
   "cat --path /welcome.txt",
   "ls --path /",
+  // only-attenuation: the gate admitting exactly hello's needs runs it (restricted linker
+  // serves only text+time); a text-only program runs under only-text (served only text);
+  // dropping a required capability is refused (restrict: required-outside-allow).
+  "only eo9:text/text,eo9:time/time $ hello --name boxed --excited true",
+  "only eo9:text/text $ echo --text restricted",
+  "only eo9:text/text $ hello --name nope --excited true",
   "exit",
 ];
 lines.length = 0;
@@ -87,6 +93,9 @@ const checks = [
   ["interactive: echo printed hi", /\bhi\b/.test(interactive)],
   ["interactive: cat read /welcome.txt", /printed\(/.test(interactive)],
   ["interactive: ls listed /", /listed\(/.test(interactive)],
+  ["only admitting text+time runs hello", /Hello, boxed/.test(interactive)],
+  ["only-text runs a text-only program", /restricted/.test(interactive)],
+  ["only-text refuses hello (needs time)", !/Hello, nope/.test(interactive)],
   ["interactive: session exited", bootRc === 0 && /success\(exited\)/.test(interactive)],
 ];
 let ok = true;

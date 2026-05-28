@@ -340,3 +340,24 @@ ok. Blob 5.20 MiB raw / 1.07 MiB brotli.
 the interactive `eosh>` prompt on the page (main(none) reading the terminal via JSPI read-line);
 `only`-attenuation via a linker restricted to the admitted interfaces (today the base artifact
 runs with full root providers); the server-side `/vm/compile` endpoint for `$`/`&`.
+
+## Decision 18 — `only`-attenuation enforced by a restricted linker on the run path
+
+`spawn` runs the *base* artifact (compile = artifact lookup; an `only`/`rename` of a binary
+keeps the base artifact, recording the admitted allow-list on the component), so a capability
+the `only` gate sealed must be withheld at run time by the linker, not the bytes. `run_child`
+now threads the recorded `allow` into the linker: `providers::add_providers_for(linker, allow)`
+adds only the admitted root families (each family registers its own authority-free `types`
+alongside its authority interface, so a program never needs a family's `types` unless it imports
+that family), and fs/io is added only when `eo9:fs/fs` is admitted. `allow == None` is
+unrestricted. An entry admits an interface by exact match or as the bare package (`only eo9:text`
+matches `eo9:text/text`), version-insensitive — the same package-shorthand the usermode `only`
+accepts.
+
+Verified (`verify-eosh.mjs`): `only eo9:text/text,eo9:time/time $ hello` runs against a
+text+time-only linker; `only eo9:text/text $ echo` runs text-only; `only eo9:text/text $ hello`
+is refused (`restrict` rejects the required-but-unadmitted `eo9:time/time` before spawn). Note:
+with the current demo programs (all imports required, none optional) the restricted linker is
+defense-in-depth — a program can't use a capability it doesn't import, and required-outside-allow
+is refused at `restrict`; the restriction becomes load-bearing for a program with an *optional*
+import that a successful `only` seals as absent (none in the demo set yet).

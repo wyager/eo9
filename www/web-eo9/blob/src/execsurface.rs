@@ -579,20 +579,30 @@ fn val_to_outcome(val: &Val) -> ProgramOutcome {
 /// Instantiate a child artifact against the (possibly restricted) browser root providers and
 /// run `main` to completion. A separate `Store`/`Engine` from the caller — eosh awaits the
 /// whole call, so there is at most one child running at a time.
-fn run_child(artifact: &[u8], _allow: Option<&[String]>, vals: Vec<Val>) -> ProgramOutcome {
-    match run_child_inner(artifact, vals) {
+fn run_child(artifact: &[u8], allow: Option<&[String]>, vals: Vec<Val>) -> ProgramOutcome {
+    match run_child_inner(artifact, allow, vals) {
         Ok(outcome) => outcome,
         Err(error) => ProgramOutcome::Abnormal(WitAbnormalExit::Trapped(std::format!("{error}"))),
     }
 }
 
-fn run_child_inner(artifact: &[u8], vals: Vec<Val>) -> Result<ProgramOutcome> {
+fn run_child_inner(
+    artifact: &[u8],
+    allow: Option<&[String]>,
+    vals: Vec<Val>,
+) -> Result<ProgramOutcome> {
     let engine = engine(false)?;
     // SAFETY: produced by `cargo xtask build-web-vm` with the matching configuration.
     let component = unsafe { WtComponent::deserialize(&engine, artifact)? };
     let mut linker: Linker<WebState> = Linker::new(&engine);
-    crate::providers::add_providers(&mut linker)?;
-    crate::fs::add_fs_io(&mut linker)?;
+    // Enforce `only`-attenuation on the run path: the child runs the base artifact, so a
+    // capability the `only` gate sealed is withheld from its linker (a sealed-away required
+    // import then fails at instantiation; a sealed optional is observed absent). `allow ==
+    // None` is unrestricted.
+    crate::providers::add_providers_for(&mut linker, allow)?;
+    if crate::providers::family_admitted(allow, "eo9:fs/fs") {
+        crate::fs::add_fs_io(&mut linker)?;
+    }
     let mut store = Store::new(&engine, WebState::new());
     let instance = block_on(
         "child instantiation",
