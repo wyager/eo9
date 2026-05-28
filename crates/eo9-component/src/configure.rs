@@ -45,6 +45,7 @@
 //! the same operands. The configured behavior end-to-end is exercised by the runtime and
 //! integration suites.
 
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -67,7 +68,7 @@ use crate::compose::{
 };
 use crate::describe::{CONFIG_SUFFIX, CONFIGURE};
 use crate::error::ConfigureError;
-use crate::{Component, ComponentKind, synth};
+use crate::{Component, ComponentKind, Wiring, synth};
 
 /// The subtask status code meaning "the callee already returned" (Component Model async
 /// ABI: the low four bits of an async-lowered call's packed return value).
@@ -337,7 +338,18 @@ where
     }
     export_all(&mut graph, provider_pkg, provider_inst, Some(&skip_slots)).map_err(compose_err)?;
 
-    encode_graph(&graph, &slot_annotations(&[provider])).map_err(compose_err)
+    let arg_labels: Vec<String> = args
+        .iter()
+        .map(|(name, value)| format!("{}={}", name.as_ref(), value.as_ref()))
+        .collect();
+    encode_graph(&graph, &slot_annotations(&[provider]))
+        .map(|component| {
+            component.with_wiring(Wiring::Configure {
+                args: arg_labels,
+                body: Box::new(provider.wiring().clone()),
+            })
+        })
+        .map_err(compose_err)
 }
 
 /// Checks that an exported API interface can be forwarded by the binder: only

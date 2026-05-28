@@ -245,3 +245,20 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     `time.frozen --now-seconds 100 … $ hello` on metal → `[100.000000000] Hello, …` → `ok: greeted`). The
     earlier async-configure machinery (waitable-set for the configure step) is gone; SPEC updated to call
     `configure` synchronous and deliberately minimal. (See plan/02 D16 for the WIT/stub side.)
+
+19. **Composition provenance / the wiring tree (owner ruling 2026-05-27, synthesis #7, study 05 #9).** A
+    `Component` now carries an in-memory `Wiring` (new `wiring.rs`, re-exported from the crate) recording how
+    the algebra built it: `Leaf{label,kind,exports,imports}` for a loaded component, and
+    `Compose{provider,consumer,satisfied}`, `Extend{base,layer,shadowed}`, `Restrict{allow,sealed_absent,body}`,
+    `Rename{from,to,body}`, `Configure{args,body}` for the operations. Each op attaches its node to the
+    result (compose records the interfaces the provider sealed for the consumer; extend the base slots the
+    layer shadowed; restrict the allow-list and the optionals sealed absent — recorded even when nothing
+    needed sealing; rename and configure wrap the operand's wiring). `Component::wiring()` exposes it and
+    `wiring_tree()` renders the indented tree, making an interposed attenuator visible even though it is
+    sealed out of the residual surface (`fs.readonly $ cat` no longer reads like `cat`). **Provenance is
+    metadata only**: it is not in the bytes, never changes `save()`/`executable_bytes()`/the blake3 content
+    hash, and is excluded from equality (impl'd by hand as byte identity, since `meta` is a pure function of
+    the bytes) — verified by `tests/eo9-integration/tests/wiring.rs` (reloading composed bytes yields a leaf
+    with byte-identical content and an equal component). It is in-memory: a component loaded from the store is
+    a `Leaf` (its history was never in its bytes); the full tree appears only for compositions built
+    in-process (the CLI `describe --wiring` builds one — see plan/11).

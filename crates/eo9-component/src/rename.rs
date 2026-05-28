@@ -11,13 +11,13 @@
 //! `import system-fs: eo9:fs/fs`, and it is what keeps the interface identity visible to
 //! `describe` after the rename.
 
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 
-use crate::Component;
 use crate::describe::{ExportMeta, ImportMeta};
 use crate::error::RenameError;
 use crate::externs::{self, ExternName, Side};
-use crate::slots;
+use crate::{Component, Wiring, slots};
 
 /// One planned extern-name rewrite.
 struct Rewrite {
@@ -61,8 +61,16 @@ pub fn rename(c: &Component, from: &str, to: &str) -> Result<Component, RenameEr
             .as_ref()
             .is_none_or(|r| r.old_extern == r.new_extern)
     };
+    let renamed = |component: Component| {
+        component.with_wiring(Wiring::Rename {
+            from: from.to_string(),
+            to: to.to_string(),
+            body: Box::new(c.wiring().clone()),
+        })
+    };
+
     if is_noop(&import_rewrite) && is_noop(&export_rewrite) {
-        return Ok(c.clone());
+        return Ok(renamed(c.clone()));
     }
 
     let bytes = externs::rewrite_extern_names(c.bytes(), |side, name| {
@@ -78,7 +86,9 @@ pub fn rename(c: &Component, from: &str, to: &str) -> Result<Component, RenameEr
             })
     })
     .map_err(RenameError::Internal)?;
-    Component::load(bytes).map_err(|err| RenameError::Internal(format!("rename produced {err}")))
+    Component::load(bytes)
+        .map(renamed)
+        .map_err(|err| RenameError::Internal(format!("rename produced {err}")))
 }
 
 fn plan_import_rewrite(

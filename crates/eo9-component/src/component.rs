@@ -1,9 +1,11 @@
 //! The `Component` value: validated bytes plus the metadata `load` extracted from them.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::describe::Meta;
 use crate::error::LoadError;
+use crate::wiring::Wiring;
 use crate::{ComponentInfo, ComponentKind};
 
 /// An open program value: a binary or a provider (SPEC.md "Programs as values").
@@ -11,21 +13,43 @@ use crate::{ComponentInfo, ComponentKind};
 /// A `Component` is pure data -- naming or composing one never runs it. Every value of
 /// this type holds bytes that have already been validated and classified by
 /// [`Component::load`], so the algebra's operations can assume a well-formed Eo9 module.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// A component also carries its composition [`Wiring`] -- in-memory provenance recording
+/// how the algebra built it. Provenance is metadata only: it is NOT in the bytes and is
+/// NOT part of equality (two components with identical bytes are equal regardless of how
+/// each was built), so the content-addressed store and compile cache are unaffected.
+#[derive(Debug, Clone)]
 pub struct Component {
     bytes: Vec<u8>,
     meta: Meta,
+    wiring: Wiring,
 }
+
+// Identity is byte identity (`meta` is a pure function of `bytes`); the in-memory wiring
+// provenance is deliberately excluded so it cannot affect the content hash or any
+// equality-keyed structure.
+impl PartialEq for Component {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+impl Eq for Component {}
 
 impl Component {
     /// Validates `bytes` as a Component Model component and classifies it as an Eo9
     /// module (binary or provider).
     ///
-    /// Mirrors `load` in `eo9:exec/component-algebra`.
+    /// Mirrors `load` in `eo9:exec/component-algebra`. The result is a [`Wiring::Leaf`]:
+    /// loading recovers no composition history (it is not in the bytes).
     pub fn load(bytes: impl Into<Vec<u8>>) -> Result<Self, LoadError> {
         let bytes = bytes.into();
         let meta = Meta::from_bytes(&bytes)?;
-        Ok(Self { bytes, meta })
+        let wiring = Wiring::leaf(&meta);
+        Ok(Self {
+            bytes,
+            meta,
+            wiring,
+        })
     }
 
     /// The component's bytes, exactly as loaded or produced by an operation.
@@ -73,6 +97,31 @@ impl Component {
     /// Which of the two module kinds this component is.
     pub fn kind(&self) -> ComponentKind {
         self.meta.kind
+    }
+
+    /// The component's composition provenance (see [`Wiring`]).
+    pub fn wiring(&self) -> &Wiring {
+        &self.wiring
+    }
+
+    /// Render the composition provenance as an indented tree (see [`Wiring::render`]).
+    pub fn wiring_tree(&self) -> alloc::string::String {
+        self.wiring.render()
+    }
+
+    /// Attach a human label to this component's leaf wiring (e.g. the store name it was
+    /// resolved from), so a wiring tree can name it. A no-op once the component has been
+    /// composed (only leaves carry a label).
+    pub fn with_label(mut self, name: impl Into<String>) -> Self {
+        self.wiring.set_label(name);
+        self
+    }
+
+    /// Replace the component's wiring provenance (used by the algebra operations to record
+    /// how a result was built). Never touches the bytes.
+    pub(crate) fn with_wiring(mut self, wiring: Wiring) -> Self {
+        self.wiring = wiring;
+        self
     }
 
     /// The cached slot-level metadata (internal: richer than the public info).

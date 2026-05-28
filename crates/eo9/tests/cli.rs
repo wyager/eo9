@@ -1468,3 +1468,40 @@ fn fs_coreutil_without_fs_root_is_refused() {
         refused.stderr
     );
 }
+
+/// `describe --wiring`: a single reference renders the component as a leaf; several
+/// references compose a `$`-chain and render the tree, naming the interposed provider that
+/// plain `describe` cannot show (synthesis #7, study 05 #9).
+#[test]
+fn describe_wiring_renders_a_leaf_and_a_composition_tree() {
+    let store = temp_store("describe-wiring");
+
+    // Single reference (a component path): a labelled leaf with its capability surface.
+    let hello = component_arg("hello");
+    let leaf = eo9(&store, &["describe", "--wiring", &hello]);
+    assert_eq!(leaf.code, 0, "stderr: {}", leaf.stderr);
+    assert!(leaf.stdout.contains("wiring:"), "stdout: {}", leaf.stdout);
+    assert!(leaf.stdout.contains("[binary]"), "stdout: {}", leaf.stdout);
+    assert!(
+        leaf.stdout.contains("imports:") && leaf.stdout.contains("eo9:text/text"),
+        "stdout: {}",
+        leaf.stdout
+    );
+
+    // Seed the store so bare names resolve, then compose a provider onto a consumer: the
+    // tree names the provider (entropy.seeded) that the composed result's surface hides.
+    let _ = eo9(&store, &["-c", "help"]);
+    let tree = eo9(&store, &["describe", "--wiring", "entropy.seeded", "rng"]);
+    assert_eq!(tree.code, 0, "stderr: {}", tree.stderr);
+    assert!(tree.stdout.contains("$ compose"), "stdout: {}", tree.stdout);
+    assert!(
+        tree.stdout.contains("provider: entropy.seeded"),
+        "stdout: {}",
+        tree.stdout
+    );
+    assert!(
+        tree.stdout.contains("consumer: rng"),
+        "stdout: {}",
+        tree.stdout
+    );
+}
