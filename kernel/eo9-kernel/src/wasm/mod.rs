@@ -46,7 +46,7 @@ use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::pin;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use wasmtime::{Config, CustomCodeMemory, Engine};
@@ -216,11 +216,31 @@ extern "C" fn wasmtime_concurrent_tls_set(pointer: *mut u8) {
 /// Generous because QEMU TCG is slow; a healthy operation finishes in milliseconds.
 const BLOCK_ON_WATCHDOG_NS: u64 = 30_000_000_000;
 
-/// How long the executor sleeps in `wfi` between re-polls while a host operation is pending.
-/// It bounds two things: the latency before a guest sleep deadline or freshly-arrived serial
-/// input is noticed, and the idle re-poll rate (host CPU cost at the prompt). 10 ms keeps the
-/// interactive shell feeling immediate while letting QEMU's vCPU sit idle between wakes.
+/// Safety-net `wfi` interval used when work is still in flight (a child is running) but no
+/// nearer wake was requested: bounds re-poll latency so a compute-bound child whose fuel
+/// yield is somehow not detected as runnable still advances. Sleep deadlines (via
+/// [`request_timer_wake`]) and serial input (the UART RX interrupt) wake the core directly,
+/// so this is only a backstop, not the normal cadence.
 const IDLE_WAKE_INTERVAL_NS: u64 = 10_000_000;
+
+/// Backstop `wfi` interval when nothing is running (the bare eosh prompt with no children):
+/// input arrives via the UART RX interrupt, so the core need only wake about once a second
+/// as a liveness backstop — this is what drops idle host CPU from the old ~1% toward ~0%.
+const IDLE_BACKSTOP_NS: u64 = 1_000_000_000;
+
+/// Floor on an armed wake so we never program a zero/at-deadline timer.
+const MIN_WAKE_NS: u64 = 100_000;
+
+/// Earliest absolute uptime (ns) any parked future has asked the executor to wake for —
+/// `u64::MAX` means "nothing time-bound is pending". [`SleepUntil`](providers) lowers it to
+/// its deadline each poll via [`request_timer_wake`]; [`idle_wait`] consumes and resets it.
+static NEXT_TIMER_WAKE_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Ask the executor's idle `wfi` to wake no later than `deadline_ns` (absolute uptime).
+/// Takes the earliest across all callers in a drive pass.
+pub(crate) fn request_timer_wake(deadline_ns: u64) {
+    NEXT_TIMER_WAKE_NS.fetch_min(deadline_ns, Ordering::AcqRel);
+}
 
 /// Where a parked host-import future ([`providers`]' `read-line`/`time.sleep`) leaves the
 /// waker it wants woken. [`block_on`] takes and wakes it after each `wfi`, so wasmtime
@@ -270,14 +290,44 @@ fn wake_idle() {
 }
 
 /// One idle step for a polling drive loop ([`block_on`] and the interactive shell): arm the
-/// generic timer a short interval ahead (the GIC forwards it; src/exceptions.rs `kirq`
-/// EOIs it), halt the core in `wfi` until it (or other input) fires, then re-drive any
-/// parked host-import future. This is what turns the kernel's busy-poll into an idle wait —
-/// QEMU's vCPU (and a real core) sleeps between polls instead of spinning at 100%.
-pub(crate) fn idle_wait() {
-    crate::timer::arm_wake(IDLE_WAKE_INTERVAL_NS);
-    // SAFETY: `wfi` has no memory/register effects; it halts the core until an interrupt.
-    unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) };
+/// generic timer for the nearest pending wake, halt the core in `wfi` until that timer or a
+/// UART RX interrupt fires, then re-drive any parked host-import future. This is what turns
+/// the kernel's busy-poll into an idle wait — QEMU's vCPU (and a real core) sleeps between
+/// polls instead of spinning.
+///
+/// The wake delay is the earliest of: a sleep deadline a parked future requested
+/// ([`request_timer_wake`]), capped by a backstop. The backstop is short
+/// ([`IDLE_WAKE_INTERVAL_NS`]) when a child is still running (so it keeps getting turns even
+/// if its fuel-yield wake is missed) and long ([`IDLE_BACKSTOP_NS`]) when nothing is running
+/// — at the bare prompt, input arrives as a UART interrupt, so the core can sleep ~1 s at a
+/// time and idle near 0% instead of waking every 10 ms.
+///
+/// IRQs are masked across the `wfi`: a timer or UART interrupt that becomes pending in the
+/// window between the caller's last poll and the `wfi` then stays pending and still wakes the
+/// `wfi` (architecturally, a masked-but-pending IRQ is a `wfi` wake-up event), so there is no
+/// lost-wakeup race; unmasking afterwards takes the interrupt (`kirq` services + EOIs it).
+pub(crate) fn idle_wait(child_running: bool) {
+    let now = crate::timer::uptime_ns();
+    let requested = NEXT_TIMER_WAKE_NS.swap(u64::MAX, Ordering::AcqRel);
+    let cap = if child_running {
+        IDLE_WAKE_INTERVAL_NS
+    } else {
+        IDLE_BACKSTOP_NS
+    };
+    let delay = if requested == u64::MAX {
+        cap
+    } else {
+        requested.saturating_sub(now).clamp(MIN_WAKE_NS, cap)
+    };
+    // SAFETY: mask IRQ (DAIF.I=1), arm the timer, `wfi`, then unmask. `wfi` wakes on a
+    // pending IRQ even while masked, so masking only closes the lost-wakeup window; none of
+    // these instructions touch memory or clobber registers the compiler relies on.
+    unsafe {
+        core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
+        crate::timer::arm_wake(delay);
+        core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags));
+    }
     wake_idle();
 }
 
@@ -305,19 +355,13 @@ pub fn block_on<F: Future>(what: &str, future: F) -> Result<F::Output, wasmtime:
                         "{what} did not complete within the kernel executor's watchdog"
                     )));
                 }
-                // Idle the core instead of spinning at 100%: arm the generic timer to fire
-                // shortly (forwarded by the GIC), then `wfi`. PSTATE.I stays masked, so the
-                // interrupt is never *taken* — `wfi` simply wakes on it as a pending
-                // interrupt — and the next `arm_wake` deasserts the level-sensitive timer,
-                // clearing the GIC pending state with no EOI. The wake bound (2 ms) caps the
-                // latency at which a ready future (sleep deadline reached, input arrived) is
-                // re-polled; the only pending host operations on this machine are time- or
-                // input-driven, so this loses no useful work.
-                // Idle in `wfi` until the timer (or other input) wakes us, then re-drive the
-                // parked host future, instead of busy-spinning. A guest awaiting `time.sleep`
-                // or `read-line` registered its waker rather than self-waking, so this is what
-                // lets the core actually sleep between polls.
-                idle_wait();
+                // Idle in `wfi` until the nearest pending wake (a sleep deadline) or a UART
+                // RX interrupt fires, then re-drive the parked host future, instead of
+                // busy-spinning. block_on drives a single future with no sibling children, so
+                // `child_running = false`: it sleeps to the requested deadline (or the long
+                // backstop). A guest awaiting `time.sleep`/`read-line` registered its waker
+                // rather than self-waking, so this is what lets the core actually sleep.
+                idle_wait(false);
             }
         }
     }

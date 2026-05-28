@@ -392,13 +392,34 @@ enum ChildSlot {
 /// the children while the shell's own store is mutably borrowed by its in-flight call.
 static CHILDREN: KLock<Vec<Option<ChildSlot>>> = KLock::new(Vec::new());
 
-/// Waker used when polling child drives: wake-ups only need to be *recordable* (wasmtime
-/// re-polls the sub-futures whose waker was rung); the drive loop polls every iteration.
-struct ChildWaker;
+/// Waker used when polling one child drive. wasmtime re-polls the sub-futures whose waker
+/// was rung; in addition, this records *whether* the waker was rung at all during the poll,
+/// which is how [`drive_children`] tells a child that yielded on fuel (wants an immediate
+/// re-poll — runnable) from one parked on a host future like `read-line`/`time.sleep` (which
+/// instead registers the executor's idle waker and is re-driven after a `wfi`).
+struct ChildWaker {
+    rung: AtomicBool,
+}
 
 impl alloc::task::Wake for ChildWaker {
-    fn wake(self: Arc<Self>) {}
-    fn wake_by_ref(self: &Arc<Self>) {}
+    fn wake(self: Arc<Self>) {
+        self.rung.store(true, Ordering::Release);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.rung.store(true, Ordering::Release);
+    }
+}
+
+/// What [`drive_children`] observed across one pass, so the drive loop can decide whether to
+/// keep polling at full speed or idle the core in `wfi`.
+#[derive(Clone, Copy, Default)]
+pub struct DriveStatus {
+    /// At least one child yielded on fuel and wants to run again immediately — the loop
+    /// should re-poll without a `wfi` so a compute-bound child runs at full speed.
+    pub any_runnable: bool,
+    /// At least one child is still running (runnable or parked on a host future) — the loop
+    /// keeps a short idle backstop so a child keeps getting turns.
+    pub any_running: bool,
 }
 
 /// Reset the registry (called once when a shell session starts, so reps are dense and a
@@ -428,7 +449,8 @@ enum Taken {
 /// D36). Children spawned *during* this pass land at the end of the registry and get their
 /// first poll in the same pass (the index re-checks the length each iteration); slots are
 /// never removed or reordered, so the index stays valid across the unlocked poll.
-pub fn drive_children() {
+pub fn drive_children() -> DriveStatus {
+    let mut status = DriveStatus::default();
     let mut index = 0usize;
     loop {
         let taken = CHILDREN.with(|children| {
@@ -457,29 +479,45 @@ pub fn drive_children() {
         };
 
         // Poll with the registry unlocked. With fuel slicing (`spawn_child`) this runs at
-        // most one quantum of guest code before yielding back here.
-        let waker = Waker::from(Arc::new(ChildWaker));
+        // most one quantum of guest code before yielding back here. The flag-waker records
+        // whether the poll asked to be re-run (a fuel yield rings it; a host-future park does
+        // not), which tells the drive loop whether this child is runnable or merely waiting.
+        let child_waker = Arc::new(ChildWaker {
+            rung: AtomicBool::new(false),
+        });
+        let waker = Waker::from(child_waker.clone());
         let mut cx = Context::from_waker(&waker);
         let polled = drive.as_mut().poll(&mut cx);
 
-        CHILDREN.with(|children| {
+        let still_running = CHILDREN.with(|children| {
             let slot = &mut children[index];
             match slot {
                 // Normal case: still checked out to us — check it back in.
-                Some(ChildSlot::Polling) => {
-                    *slot = Some(match polled {
-                        Poll::Ready(outcome) => ChildSlot::Done(outcome),
-                        Poll::Pending => ChildSlot::Running(drive),
-                    });
-                }
+                Some(ChildSlot::Polling) => match polled {
+                    Poll::Ready(outcome) => {
+                        *slot = Some(ChildSlot::Done(outcome));
+                        false
+                    }
+                    Poll::Pending => {
+                        *slot = Some(ChildSlot::Running(drive));
+                        true
+                    }
+                },
                 // The child was killed (slot now Done) or its handle was dropped (slot now
                 // None) while we were polling it: keep that state; dropping the checked-out
                 // drive future here releases the child's store and any in-flight work.
-                _ => {}
+                _ => false,
             }
         });
+        if still_running {
+            status.any_running = true;
+            if child_waker.rung.load(Ordering::Acquire) {
+                status.any_runnable = true;
+            }
+        }
         index += 1;
     }
+    status
 }
 
 // -----------------------------------------------------------------------------------------
@@ -705,7 +743,9 @@ fn spawn_child(
     let instance = {
         let instantiate = linker.instantiate_async(&mut store, component);
         let mut instantiate = core::pin::pin!(instantiate);
-        let waker = Waker::from(Arc::new(ChildWaker));
+        let waker = Waker::from(Arc::new(ChildWaker {
+            rung: AtomicBool::new(false),
+        }));
         let mut cx = Context::from_waker(&waker);
         let mut result = None;
         for _ in 0..4096 {
