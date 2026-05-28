@@ -273,3 +273,13 @@ its first milestones, and to be the place where cross-area seams get found.
     mismatch (missing interface instance / resource implementation) appends "this component may have been
     built for an older eo9 — try `eo9 store reseed`". Covered by four CLI tests (upgrade refresh, user
     bindings survive, legacy auto-refresh, reseed on a legacy store) plus seed-record/fingerprint unit tests.
+
+19. **Installed binaries seed from the bundled component set.** `seed.rs` now routes every use
+    of the embedded set through `carried_components()`: the build.rs-embedded
+    `guest/target/components` set when the binary was built inside the repo (dev builds are
+    unchanged), otherwise the prebuilt set from the `eo9-components` crate — which is what a
+    `cargo install eo9` build carries, so a fresh install still seeds eosh, the examples, the
+    coreutils, and the standard stubs (verified by building with the components directory absent:
+    the binary seeded 36 bundled programs and ran `hello`). build.rs also falls back to the
+    packaged `Cargo.lock` for the wasmtime-version half of the cache key when the workspace
+    lockfile is absent (the published-crate case).
