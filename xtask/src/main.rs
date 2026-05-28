@@ -116,6 +116,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("build-web-vm", rest)?;
             build_web_vm(&root)
         }
+        "check-web-vm" => {
+            expect_no_args("check-web-vm", rest)?;
+            check_web_vm(&root)
+        }
         "precompress-site" => {
             expect_no_args("precompress-site", rest)?;
             precompress_site(&root)
@@ -123,10 +127,6 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         "fingerprint-web-vm" => {
             expect_no_args("fingerprint-web-vm", rest)?;
             fingerprint_web_vm(&root)
-        }
-        "check-web-vm" => {
-            expect_no_args("check-web-vm", rest)?;
-            check_web_vm(&root)
         }
         "build-kernel" => {
             build_kernel(&root, &arch_arg("build-kernel", rest)?)?;
@@ -182,6 +182,9 @@ COMMANDS:
     build-web-vm         Pre-AOT the web-VM demo components to pulley32, build the wasm32
                          blob (www/web-eo9, the real runtime stack for the /vm page), and
                          install it into www/site/vm/ (commit the result; ci does not need it)
+    check-web-vm         Rebuild the /vm blob and store artifacts to a temp staging dir and
+                         byte-compare against the committed www/site/vm/ files; nonzero exit
+                         if they drifted (run after changing guest sources; ci does not need it)
     precompress-site     Write brotli/gzip siblings next to the compressible files under
                          www/site via www/precompress, so the server can serve pre-compressed
                          bytes (runs automatically at the end of the build-web-* commands;

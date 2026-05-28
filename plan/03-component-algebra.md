@@ -194,3 +194,13 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     should adopt `executable_bytes()` (one-line change each, outside this area) — until they do, running a
     renamed-residual artifact still fails with the parse error. Covered by
     `tests/eo9-integration/tests/compose_diagnostics.rs` and the corpus soundness test below.
+    **Adoption done (branch `area/04-executable-bytes-adoption`):** every host compile site now feeds the
+    executor `executable_bytes()` rather than the saved bytes — the exec provider's `compile`
+    (`crates/eo9-runtime/src/link.rs`), `eo9 run`/`compile` (`crates/eo9/src/compile.rs`), and the kernel's
+    on-target codegen path (`kernel/eo9-kernel/src/wasm/shellexec.rs`). `describe`/`save`/the store hash and
+    cache key keep the full (annotated) bytes, so identity and cache hits are unchanged for plain programs;
+    only codegen input drops the annotation. The runtime never matched providers by the annotation (the
+    wasmtime linker matches by extern name), so stripping it does not affect satisfaction — a renamed slot
+    that is satisfied (`with p as wallclock`) is sealed at compose time and never reaches codegen as a
+    residual. `renamed_residual_import_still_compiles` now also asserts the saved bytes fail the runtime's
+    parser while `executable_bytes()` compiles.
