@@ -18,27 +18,56 @@
 //!     `get-u64` draws via the same `run_concurrent`/`call_concurrent` path usermode
 //!     eo9-runtime uses — running fiberlessly on this wasm32 host.
 
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 use wasmtime::component::{Component, Linker, Val};
 use wasmtime::{Config, CustomCodeMemory, Engine, Store};
 
-#[link(wasm_import_module = "env")]
-unsafe extern "C" {
-    fn host_write(ptr: *const u8, len: usize);
-}
+mod host;
+mod providers;
+mod store;
 
 fn out(message: &str) {
-    unsafe { host_write(message.as_ptr(), message.len()) }
+    host::write_out(message)
 }
 
+#[macro_export]
 macro_rules! outf {
     ($($arg:tt)*) => {{
+        use core::fmt::Write as _;
         let mut message = String::new();
         let _ = write!(&mut message, $($arg)*);
-        out(&message);
+        $crate::out_line(&message);
     }};
+}
+
+/// Macro plumbing for [`outf!`] (callable from every module).
+pub fn out_line(message: &str) {
+    out(message)
+}
+
+/// Single-threaded polling executor (the same shape as the bare-metal kernel's
+/// `block_on`). The fiberless guest calls complete without suspending, and the
+/// genuinely-blocking host imports (sleep, read-line, fetch) park the *whole blob* via
+/// JSPI before returning, so this loop only ever spins across host-future bookkeeping.
+pub(crate) fn block_on<F: core::future::Future>(
+    what: &str,
+    future: F,
+) -> wasmtime::Result<F::Output> {
+    use core::task::{Context, Poll, Waker};
+    const MAX_POLLS: u64 = 10_000_000;
+    let mut future = core::pin::pin!(future);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    for _ in 0..MAX_POLLS {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return Ok(value),
+            Poll::Pending => core::hint::spin_loop(),
+        }
+    }
+    Err(wasmtime::Error::msg(format!(
+        "{what} did not complete within {MAX_POLLS} polls"
+    )))
 }
 
 // --- wasmtime custom-platform hooks (same pair the bare-metal kernel provides) -----------
@@ -196,28 +225,6 @@ pub extern "C" fn run_fuel() -> i32 {
 
 mod entropy {
     use super::*;
-    use core::future::Future;
-    use core::pin::pin;
-    use core::task::{Context, Poll, Waker};
-
-    /// Single-threaded polling executor (the same shape as the bare-metal kernel's
-    /// `block_on`); the fiberless guest calls complete without suspending, so this loop
-    /// only spins across host-future bookkeeping.
-    fn block_on<F: Future>(what: &str, future: F) -> wasmtime::Result<F::Output> {
-        const MAX_POLLS: u64 = 10_000_000;
-        let mut future = pin!(future);
-        let waker = Waker::noop();
-        let mut context = Context::from_waker(waker);
-        for _ in 0..MAX_POLLS {
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(value) => return Ok(value),
-                Poll::Pending => core::hint::spin_loop(),
-            }
-        }
-        Err(wasmtime::Error::msg(format!(
-            "{what} did not complete within {MAX_POLLS} polls"
-        )))
-    }
 
     fn exported_func(
         instance: &wasmtime::component::Instance,
@@ -313,4 +320,81 @@ pub extern "C" fn run_entropy(seed_lo: u32, seed_hi: u32, count: u32) -> i32 {
     let seed = (u64::from(seed_hi) << 32) | u64::from(seed_lo);
     let count = count.clamp(1, 64);
     report("entropy", entropy::run(seed, count))
+}
+
+// --- milestone 2: real programs from the HTTP store, awaits parked on the browser ---------
+
+/// Allocate `len` bytes the page's JavaScript can write into (program names / arguments)
+/// before calling [`run_program`]. Paired with [`web_free`].
+#[unsafe(no_mangle)]
+pub extern "C" fn web_alloc(len: usize) -> *mut u8 {
+    let mut buffer = Vec::<u8>::with_capacity(len.max(1));
+    let ptr = buffer.as_mut_ptr();
+    core::mem::forget(buffer);
+    ptr
+}
+
+/// Release a buffer handed out by [`web_alloc`].
+///
+/// # Safety
+/// `ptr`/`len` must be exactly what a single prior `web_alloc(len)` returned.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn web_free(ptr: *mut u8, len: usize) {
+    if !ptr.is_null() {
+        drop(unsafe { Vec::from_raw_parts(ptr, 0, len.max(1)) });
+    }
+}
+
+/// Decode a (pointer, length) pair handed in by the page.
+///
+/// # Safety
+/// The range must be a live `web_alloc` buffer the page filled with UTF-8.
+unsafe fn page_str<'a>(ptr: *const u8, len: usize) -> &'a str {
+    if ptr.is_null() || len == 0 {
+        return "";
+    }
+    core::str::from_utf8(unsafe { core::slice::from_raw_parts(ptr, len) }).unwrap_or("")
+}
+
+/// The kernel's async sleep canary: a real awaited `time.sleep`, parked on a browser timer.
+#[unsafe(no_mangle)]
+pub extern "C" fn run_sleepy() -> i32 {
+    report("sleepy", store::run_sleepy())
+}
+
+/// Terminal-input round trip through the same JSPI import the text provider's `read-line`
+/// uses: the blob parks until the visitor presses Enter, then echoes the line back.
+#[unsafe(no_mangle)]
+pub extern "C" fn probe_read_line() -> i32 {
+    out("read-line: waiting for one line of terminal input (the blob is parked on your keyboard)…");
+    match host::read_line(4096) {
+        Some(line) => {
+            outf!("read-line -> {line:?} (round-tripped through the suspended blob)");
+            0
+        }
+        None => {
+            out("read-line -> end of input");
+            0
+        }
+    }
+}
+
+/// Fetch one of the page store's programs and run `main` with the given arguments
+/// (`args` = unit-separator-joined fields written into a `web_alloc` buffer by the page).
+#[unsafe(no_mangle)]
+pub extern "C" fn run_program(
+    name_ptr: *const u8,
+    name_len: usize,
+    args_ptr: *const u8,
+    args_len: usize,
+) -> i32 {
+    let name = unsafe { page_str(name_ptr, name_len) }.to_owned();
+    let args_joined = unsafe { page_str(args_ptr, args_len) }.to_owned();
+    let args: Vec<&str> = if args_joined.is_empty() {
+        Vec::new()
+    } else {
+        args_joined.split('\u{1f}').collect()
+    };
+    let result = store::run_program(&name, &args);
+    report(&name, result)
 }

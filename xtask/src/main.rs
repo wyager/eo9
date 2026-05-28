@@ -389,6 +389,39 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
         false,
     )?;
 
+    // The page's HTTP-backed program store: real example programs (and the kernel's async
+    // sleep canary) pre-AOT'd to pulley32 and served as static files the blob fetches on
+    // demand (www/web-eo9/blob/src/store.rs).
+    let store_dir = root.join("www").join("site").join("vm").join("store");
+    std::fs::create_dir_all(&store_dir)
+        .map_err(|err| format!("failed to create {}: {err}", store_dir.display()))?;
+    for example in ["hello", "cruncher", "outcomes"] {
+        let component_path = root
+            .join("guest")
+            .join("target")
+            .join("components")
+            .join(format!("eo9-example-{example}.wasm"));
+        let component = std::fs::read(&component_path)
+            .map_err(|err| format!("failed to read {}: {err}", component_path.display()))?;
+        preaot_for_web(
+            &store_dir,
+            &component,
+            &format!("example {example}"),
+            &format!("{example}.cwasm"),
+            false,
+        )?;
+    }
+    let sleepy_wat = root.join("kernel").join("seed").join("sleepy.wat");
+    let sleepy_wasm = wat::parse_file(&sleepy_wat)
+        .map_err(|err| format!("failed to assemble {}: {err}", sleepy_wat.display()))?;
+    preaot_for_web(
+        &store_dir,
+        &sleepy_wasm,
+        "sleepy (async sleep canary)",
+        "sleepy.cwasm",
+        false,
+    )?;
+
     // Build the blob in its own workspace for wasm32-unknown-unknown.
     let manifest = root.join("www").join("web-eo9").join("Cargo.toml");
     run(
