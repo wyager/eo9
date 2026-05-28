@@ -536,7 +536,13 @@ fn check_web_vm(root: &Path) -> Result<(), String> {
     let entropy_wasm = std::fs::read(&entropy_path)
         .map_err(|err| format!("failed to read {}: {err}", entropy_path.display()))?;
     preaot_for_web(&embedded, &seed_wasm, "seed", "seed.cwasm", false)?;
-    preaot_for_web(&embedded, &seed_wasm, "seed (fuel)", "seed-fuel.cwasm", true)?;
+    preaot_for_web(
+        &embedded,
+        &seed_wasm,
+        "seed (fuel)",
+        "seed-fuel.cwasm",
+        true,
+    )?;
     preaot_for_web(
         &embedded,
         &entropy_wasm,
