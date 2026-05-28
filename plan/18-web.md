@@ -460,3 +460,48 @@ limit. Blob size after the round-trip wiring: ~6.05 MiB raw / ~1.19 MiB brotli (
 `/bin` trim from Decision 19 remains the recorded blob-size follow-up). The Decision 19 nit
 (eosh renders an actual refusal as `CompileError::Codegen(...)`) is now rarely reached for `$`
 compositions (they compile) but still applies to `&`/`rename`/`configure` — unchanged.
+
+## Decision 22 — in-blob codegen: the browser VM is fully self-hosted (compose → compile → run, client-side)
+
+Owner-approved goal: stop outsourcing composition codegen to the server and reuse the kernel's
+no_std compile fork *inside the wasm32 blob*, with cranelift's **Pulley backends** as the
+emission target — the same compose → compile → run story as native Eo9 and the bare-metal
+kernel, just interpreted.
+
+**What changed**
+- `web-eo9-blob` gains an `inblob-codegen` cargo feature (default **on**) = `wasmtime/cranelift`
+  on the already-vendored wasmtime. No vendored crate needed any change: the kernel's no_std
+  port of wasmtime-environ/wasmtime-cranelift compiles for `wasm32-unknown-unknown` as-is, and
+  cranelift-codegen's `host-arch` feature is a silent no-op on wasm32 (no native backend exists),
+  leaving exactly the Pulley32/Pulley64 backends the blob needs. The blob's existing executing
+  engine config (`target("pulley32")`, OS-less tunables, no-op code memory) doubles as the
+  compiling engine — `Component::new` on it drives Cranelift → Pulley bytecode, and Pulley
+  bytecode needs no executable pages, so the publisher stays a no-op.
+- `exec.rs::compile_demo()` (a new `compile_demo` export + page/selftest checks): compiles the
+  raw hello component and an algebra-fused `entropy.seeded $ rng` in-blob and runs both —
+  the measured demo of the self-hosted pipeline.
+- `execsurface.rs`: the `eo9:exec` `compile` op now compiles a fused composition's
+  `executable_bytes()` **in-blob** (`compile_in_blob` → `Component::new` → `serialize()` → the
+  same deserialize-and-run image path as a pre-AOT'd program). The server-POST path and its
+  provenance machinery (`Prov`, `name_for`, `host_compile_len/copy`, vm.js glue) are removed —
+  eosh `load`s raw bytes and the blob compiles whatever fused bytes the algebra produced, so
+  `&`/`rename`/`configure` results compile too (no longer limited to the endpoint's
+  `[only $] name ($ name)*` grammar). With the feature off (the size-measurement build) a fused
+  composition gets the honest "compiler not built into this blob" refusal.
+- `verify-eosh.mjs` is now fully offline (no server spawn, no compile import): a passing run is
+  direct proof that `entropy.seeded $ rng --count 3` typed at the eosh prompt is fused and
+  compiled with **zero server involvement**. verify-exec gained the compile_demo checks;
+  selftest.html exercises compile_demo in the browser.
+
+**Measured (node v25 JSPI harness, this machine)**
+- In-blob compile latency: hello (35,265-byte component) ≈ **112 ms**; the fused
+  `entropy.seeded $ rng` (57,274 bytes) ≈ **58 ms**; outputs are byte-identical to the
+  server-compiled and native results (the seeded stream matches value-for-value).
+- Blob size: 6.05 MiB raw / 1.19 MiB brotli (runtime-only, prior) → **9.50 MiB raw / 1.73 MiB
+  brotli** with the compiler in (+3.4 MiB raw / +0.54 MiB on the wire). Per the size call in the
+  directive (≤ ~3 MiB brotli), this ships as a single blob; a lazy-loaded compiler module and the
+  Decision 19 lazy-fetch `/bin` trim remain available follow-ups if the wire size ever matters.
+
+**The server `/vm/compile` endpoint** (Decisions 20–21) stays in place — it is tested, bounded,
+and useful as a reference/fallback — but nothing in the blob or the page calls it any more.
+Removing it (and its `site/vm/raw/` inputs) is a planner call for a later pass.

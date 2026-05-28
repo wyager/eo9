@@ -171,33 +171,9 @@ function hostFetchCopy(destPtr, len) {
   fetchedArtifact = null;
 }
 
-// The most recent server-compiled composition image, copied into the blob by
-// host_compile_copy. POST the composition expression (store-program names + algebra ops, never
-// component bytes) to /vm/compile; the server fuses + compiles it to a pulley32 image.
-let compiledImage = null;
-
-async function hostCompileLen(exprPtr, exprLen) {
-  // Decode the expression before any await — the wasm memory may move while suspended.
-  const expr = decoder.decode(new Uint8Array(memory.buffer, exprPtr, exprLen));
-  try {
-    const response = await fetch("/vm/compile", {
-      method: "POST",
-      headers: { "content-type": "text/plain" },
-      body: expr,
-    });
-    if (!response.ok) return -1;
-    compiledImage = new Uint8Array(await response.arrayBuffer());
-    return compiledImage.length;
-  } catch {
-    return -1;
-  }
-}
-
-function hostCompileCopy(destPtr, len) {
-  if (compiledImage === null) return;
-  new Uint8Array(memory.buffer, destPtr, len).set(compiledImage.subarray(0, len));
-  compiledImage = null;
-}
+// (Compositions are compiled *inside the blob* — Cranelift -> Pulley, the same vendored
+// compile layers the bare-metal kernel uses on-target — so there is no server compile call
+// to wire here.)
 
 // Fallbacks when the browser has no JSPI: report "unavailable" so the blob errors cleanly
 // (the page also disables the affected buttons and says why).
@@ -206,9 +182,6 @@ function unavailableReadLine() {
   return -2;
 }
 function unavailableFetchLen() {
-  return -2;
-}
-function unavailableCompileLen() {
   return -2;
 }
 
@@ -255,13 +228,9 @@ async function main() {
       host_monotonic_ns: hostMonotonicNs,
       host_random_fill: hostRandomFill,
       host_fetch_copy: hostFetchCopy,
-      host_compile_copy: hostCompileCopy,
       host_sleep_ms: hasJSPI ? new WebAssembly.Suspending(hostSleepMs) : unavailableSleep,
       host_read_line: hasJSPI ? new WebAssembly.Suspending(hostReadLine) : unavailableReadLine,
       host_fetch_len: hasJSPI ? new WebAssembly.Suspending(hostFetchLen) : unavailableFetchLen,
-      host_compile_len: hasJSPI
-        ? new WebAssembly.Suspending(hostCompileLen)
-        : unavailableCompileLen,
     },
   };
   try {

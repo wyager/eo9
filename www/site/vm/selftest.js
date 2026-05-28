@@ -196,6 +196,14 @@ async function run() {
     check("coreutil find rc", (await runStored("find", ["/", ".txt"])) === 0);
     check("coreutil find matches", sawLine(/welcome\.txt/));
 
+    // In-blob codegen: compile a raw component and an algebra-fused composition inside the
+    // blob (Cranelift -> Pulley) and run them — fully client-side, no server, no pre-AOT.
+    lines = [];
+    const compileDemo = promising(exports.compile_demo);
+    check("in-blob codegen rc", (await compileDemo()) === 0);
+    check("in-blob codegen compiled hello client-side", sawLine(/hello compiled in [\d.]+ ms \(client-side, no server\)/));
+    check("in-blob codegen ran the fused composition", sawLine(/fused and compiled in-blob -> success\(generated\(3\)\)/));
+
     // eosh booting in the blob: the unmodified shell links the in-blob eo9:exec surface and
     // runs a command end to end (resolve from /bin -> load -> compile -> spawn -> wait).
     lines = [];
