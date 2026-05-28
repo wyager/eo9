@@ -1,10 +1,12 @@
 //! `fs.memfs` — a RAM-backed filesystem.
 //!
 //! Targets the `eo9:fs/memfs` stub world: exports `eo9:fs/fs` over an in-memory tree of
-//! directories and files, empty until `configure` creates it. The standard scratch/test
-//! filesystem and part of the deterministic environment of integration milestone I2:
-//! directory listings come back sorted and everything observable is a pure function of
-//! the operations performed.
+//! directories and files. The standard scratch/test filesystem and part of the
+//! deterministic environment of integration milestone I2: directory listings come back
+//! sorted and everything observable is a pure function of the operations performed.
+//! The documented default state is the empty filesystem — `configure` (which takes no
+//! arguments) creates exactly that, and an unconfigured memfs self-initializes to it on
+//! first use, so plain `fs.memfs $ program` works and never traps (plan/09 Decision 14).
 //!
 //! Semantics (the MVP surface, documented here because the WIT leaves them open):
 //!
@@ -64,6 +66,19 @@ struct Memfs {
 }
 
 static STATE: ProviderState<Memfs> = ProviderState::new();
+
+/// Run `f` over the filesystem state. An unconfigured memfs defaults to the documented
+/// empty filesystem — exactly the state `configure` creates, since `configure` takes no
+/// arguments — so plain `fs.memfs $ program` works and never traps (the option-C
+/// default-configuration rule, plan/09 Decision 14).
+fn with_state<R>(f: impl FnOnce(&mut Memfs) -> R) -> R {
+    if !STATE.is_set() {
+        STATE.set(Memfs {
+            root: BTreeMap::new(),
+        });
+    }
+    STATE.with(f)
+}
 
 /// Resolve `path` into segments: empty and `.` segments are ignored, `..` pops one
 /// level and never climbs above the root.
@@ -211,7 +226,7 @@ impl fs::Guest for Stub {
         if segments.is_empty() {
             return Err(FsError::IsADirectory);
         }
-        let data = STATE.with(|memfs| {
+        let data = with_state(|memfs| {
             let existing = match memfs.lookup(&segments)? {
                 Some(Node::File(data)) => Some(Rc::clone(data)),
                 Some(Node::Directory(_)) => return Err(FsError::IsADirectory),
@@ -246,7 +261,7 @@ impl fs::Guest for Stub {
         if segments.is_empty() {
             return Err(FsError::IsADirectory);
         }
-        let data = STATE.with(|memfs| memfs.file_data(&segments))?;
+        let data = with_state(|memfs| memfs.file_data(&segments))?;
         // Snapshot the contents: memfs promises immutability by copying.
         let bytes = data.borrow().clone();
         Ok(fs::ImmutableHandle::new(ExecSnapshot { bytes }))
@@ -257,7 +272,7 @@ impl fs::Guest for Stub {
         path: String,
     ) -> Result<Vec<String>, FsError> {
         let segments = segments(&path);
-        STATE.with(|memfs| {
+        with_state(|memfs| {
             let entries = if segments.is_empty() {
                 &memfs.root
             } else {
@@ -274,7 +289,7 @@ impl fs::Guest for Stub {
 
     async fn stat(_fs: fs::FsImplBorrow<'_>, path: String) -> Result<NodeStat, FsError> {
         let segments = segments(&path);
-        STATE.with(|memfs| {
+        with_state(|memfs| {
             if segments.is_empty() {
                 return Ok(NodeStat {
                     kind: NodeKind::Directory,
@@ -300,7 +315,7 @@ impl fs::Guest for Stub {
         if segments.is_empty() {
             return Err(FsError::AlreadyExists);
         }
-        STATE.with(|memfs| {
+        with_state(|memfs| {
             if memfs.lookup(&segments)?.is_some() {
                 return Err(FsError::AlreadyExists);
             }
@@ -318,7 +333,7 @@ impl fs::Guest for Stub {
                 "cannot remove the root directory",
             )));
         }
-        STATE.with(|memfs| {
+        with_state(|memfs| {
             match memfs.lookup(&segments)? {
                 Some(Node::Directory(entries)) if !entries.is_empty() => {
                     return Err(FsError::Io(String::from("directory is not empty")));

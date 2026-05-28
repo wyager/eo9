@@ -5,11 +5,9 @@
 //! type identity"), each named slot of the overlay mints its own root-handle type, so two
 //! *independent* guest filesystems can be wired into `upper`/`lower` and the fused
 //! component encodes and validates — the type-identity blocker of plan/09 Decision 12 is
-//! gone. What still cannot run end to end is the *configuration* of the leaves: a
-//! provider's config interface is dropped by the composition that wires it into a slot,
-//! so an unconfigured `fs.memfs` leaf traps on first use (plan/09 Decision 13). The
-//! behavioral round-trip below therefore stays `#[ignore]`d until that is resolved (or a
-//! configuration-free fs leaf exists).
+//! gone. And with the default-configuration rule (plan/09 Decision 14), an unconfigured
+//! `fs.memfs` leaf self-binds its documented default (the empty filesystem) instead of
+//! trapping, so the behavioral round-trip below runs end to end as well.
 
 use eo9_component::{Component, compose, rename};
 use eo9_integration::{guest, run};
@@ -128,12 +126,12 @@ fn guest_leaf_layering_composes_and_validates() {
     );
 }
 
-/// The behavioral round-trip — a write landing in the lower layer and reading back
-/// through the overlay's fall-through path — still cannot run: the leaves' `memfs-config`
-/// interfaces are dropped by the composition that wires them into the slots, so the
-/// unconfigured memfs state traps on first use (plan/09 Decision 13 records the options).
+/// The behavioral round-trip: the program's writes land in the lower memfs leaf and read
+/// back through the overlay's fall-through path. The leaves are composed unconfigured —
+/// their `memfs-config` interfaces are dropped by the slot wiring — and run on the
+/// documented default (an empty filesystem) per plan/09 Decision 14, which is what
+/// closed the configuration half of plan/09 Decision 13.
 #[test]
-#[ignore = "memfs leaves cannot be configured through a composition — see plan/09 Decision 13"]
 fn readwrite_through_the_overlay_round_trips() {
     guest::ensure_components(&[
         "eo9-stub-fs-memfs",

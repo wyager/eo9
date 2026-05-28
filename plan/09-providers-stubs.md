@@ -147,3 +147,16 @@ Match the priority order above; (1)+(2) unblock I2.
     configurations for the stubs (the pending owner decision on unconfigured-provider semantics would close
     this for memfs, whose configure takes no arguments), a configuration-free static fs leaf for tests, or
     compose-time configuration that survives slot wiring.
+14. **Default configurations (the owner's option-C ruling): a runtime panic is never the outcome of an
+    unconfigured provider.** Stubs with a sensible default now self-bind it lazily on first use and document
+    it: `entropy.seeded` → seed `0xE09`; `time.frozen` → 2000-01-01T00:00:00 UTC with monotonic origin 0;
+    `time.fuzzy` → 1 ms granularity; `fs.memfs` → the empty filesystem (identical to what its nullary
+    `configure` creates). `configure`/provider flags override the default exactly as before, so all existing
+    configured behavior is unchanged. Plain compositions (`time.frozen $ hello`, `entropy.seeded $ rng`,
+    `fs.memfs $ readwrite`) therefore run deterministically out of the box — covered by the new
+    `default_configuration` integration suite — and the `fs.overlay` behavioral round-trip with two
+    unconfigured memfs leaves now runs end to end (the configuration half of Decision 13 is closed; its
+    compose-time-configuration-of-leaves option remains open for providers that genuinely need arguments).
+    Rule for future stubs: if no sensible default exists (e.g. a net provider needing an address), the
+    failure must be a clear pre-run/typed refusal — never a trap; implement it as a typed error from the
+    API operations (or a loader-visible required-config marker once one exists), not a panic.
