@@ -204,3 +204,37 @@ runnable on a host with no fiber backend.
     layer 4's ABI risk is now retired (above), so the remaining work is plumbing the exec
     surface. Next pass: build `eo9:exec` + `/bin` store view in the blob, AOT eosh, then boot
     the prompt.
+
+14. **Layer-2 feasibility CONFIRMED: the algebra closure compiles for `wasm32-unknown-unknown`
+    in the blob's dependency graph.** The gating unknown for hosting the `eo9:exec` surface in
+    the blob was whether `eo9-component` (the algebra) and its wasm-tools closure build for the
+    blob's target alongside the vendored wasmtime family. Probed directly and retired (no code
+    committed — the probe deps were reverted): with `eo9-component = { path =
+    "../../../crates/eo9-component", default-features = false }` added to `blob/Cargo.toml` and
+    the same five algebra `[patch.crates-io]` entries the kernel uses added to the blob
+    workspace (`wit-parser`, `wac-types`, `wac-graph`, `wit-component`, `wasm-wave` →
+    `kernel/vendor/*`), `cargo build -p web-eo9-blob --target wasm32-unknown-unknown` compiled
+    `wac-types`, `wit-parser`, `wac-graph`, `wasm-wave`, `wit-component`, and `eo9-component`
+    cleanly (only unused-import warnings; no version conflict with the vendored wasmtime family
+    in the unified graph). The only errors were the blob lib's own `include_bytes!` of the
+    pre-AOT `artifacts/*.cwasm` (produced by `build-web-vm`, not run in the probe) — unrelated.
+    So the no_std algebra runs on wasm32 exactly as it does on `aarch64-unknown-none`.
+    - **Exact next-pass recipe (apply deliberately, not as a dead dep):** (a) add the dep line +
+      the five patches above; (b) implement the `eo9:exec` host surface in a new
+      `blob/src/exec.rs`, mirroring the SUBSET of `kernel/wasm/shellexec.rs` eosh actually
+      imports — component-algebra `load`(bytes→component via `eo9_component::load`) / `describe`
+      / `compose`/`restrict`/`rename`/`configure`, and `task` spawn/wait — but DROP everything
+      the browser doesn't need (no child fuel/preemption, no drive-loop scheduler, no on-target
+      codegen integration); the surface is far smaller than the kernel's 1,588 lines because the
+      browser has no codegen and runs one child at a time. (c) `compile` = artifact-lookup: a
+      fused/`$`/`&` composition has no pre-AOT'd Pulley image, so it returns a clean typed
+      "composition needs the compiler, which isn't available in the browser yet" refusal; a bare
+      `/bin/<name>` resolves to its committed `store/<name>.<hash>.cwasm`. (d) the bytes-vs-Pulley
+      mismatch: eosh's `resolve` reads `/bin/<name>.wasm` (raw component bytes) to `load`+`describe`
+      via the algebra, but the store ships pre-AOT'd Pulley `.cwasm`; ship BOTH per program (the
+      raw `.wasm` for the algebra, the `.cwasm` for spawn) or have `spawn` of a store-resolved
+      component fetch the matching `.cwasm` by content hash — decide in the next pass and record.
+      (e) AOT eosh + the coreutils into the fingerprinted store (extend `build-web-vm`); (f) boot
+      eosh against text/time/entropy + the layer-1 fs/io + this exec surface; verify an `eosh>`
+      smoke (`hello`, `ls`, `cat`, a refused `$`) via the node/JSPI harness pattern, extend
+      `selftest.js`, keep `check-web-vm` green.
