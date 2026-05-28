@@ -204,3 +204,30 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     that is satisfied (`with p as wallclock`) is sealed at compose time and never reaches codegen as a
     residual. `renamed_residual_import_still_compiles` now also asserts the saved bytes fail the runtime's
     parser while `executable_bytes()` compiles.
+17. **Configured interposition (D15) is blocked by a sync-export constraint, not just a state-machine gap —
+    fix is out of the binder.** Reproduced and root-caused exactly: `hello` reaches the trap through
+    `eo9:time/time#now`, which is a **synchronous** WIT function (only `sleep` is async). The outer binder is
+    `configure(time.fuzzy)`; its gate async-lowers `time.fuzzy`'s `configure`, and `time.fuzzy::configure`
+    calls `underlying::default()` (guest/stubs/time-fuzzy/src/lib.rs:86) — i.e. it reenters the *imported*
+    clock, which under `time.frozen $ time.fuzzy $ hello` is `configure(time.frozen)`'s binder and makes its
+    own nested async-lowered `configure` call. That nesting is what makes the outer `time.fuzzy::configure`
+    return non-eagerly (STARTED, not SUBTASK_RETURNED), so the gate hits `unreachable`. (Over a *host* clock
+    `default()` is a plain host call, no nested binder, configure eager-returns — hence "works over a host
+    clock"; standalone, no reentry — hence "works alone".)
+    **The decisive new finding:** D15's proposed fix ("async-callback lifts for every forwarder") cannot work
+    here, because a forwarder's export asyncness must match the WIT function's declared asyncness — `now`,
+    `default`, `resolution`, `monotonic-now` are declared sync, so their binder exports must be sync lifts and
+    have no callback to suspend into. The binder also imports no `waitable-set.wait` (blocking-drain)
+    intrinsic — its only wait path is the async-lifted callback path, unavailable to a sync export — and
+    wasmtime 45 forbids a sync-lifted task from blocking (the D15 "cannot block" result). So whenever
+    `configure` parks and is first reached through a sync API function (the common case), there is **no
+    pure-binder-codegen fix** under wasmtime 45. Confirmed by reproduction + intrinsic audit; no code changed
+    this pass (the two cases stay `#[ignore]`d with a sharpened reason). **Real options, ranked:**
+    (1) make `configure` a **sync** func in the WIT (it binds compile-time constants and must not block —
+    the binder doc already assumes eager completion): then the gate is a plain sync call, nested configured
+    providers resolve synchronously, and both the single-binder and interposition cases work — cost is a
+    wit/ change to every `*-config` interface + the stubs' `configure` signatures + the binder's
+    configure-call codegen (areas 02/09 + here); (2) **runtime-assisted configuration** — eo9-runtime drives
+    each binder's `configure` once after instantiation, in a context where blocking is permitted, before the
+    consumer's `main` runs (area 04); the binder shrinks to pure forwarding. Option 1 is the cleaner and is
+    recommended. Until one lands, configured-over-configured interposition stays in GAPS.
