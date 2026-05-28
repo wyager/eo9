@@ -34,7 +34,7 @@ interface perf-optional {
 /// that the exported `perf` serves via `default()` (see SPEC: Binary or provider, never both).
 interface null-config {
     use types.{perf-impl};
-    configure: async func() -> result<perf-impl, string>;
+    configure: func() -> result<perf-impl, string>;
 }
 
 /// perf.none — absence: exports the optional flavor answering `none`.

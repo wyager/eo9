@@ -68,7 +68,7 @@ impl types::Guest for Stub {
 impl types::GuestEntropyImpl for SeededEntropy {}
 
 impl seeded_config::Guest for Stub {
-    async fn configure(seed: u64) -> Result<types::EntropyImpl, String> {
+    fn configure(seed: u64) -> Result<types::EntropyImpl, String> {
         STATE.set(seed);
         Ok(types::EntropyImpl::new(SeededEntropy))
     }

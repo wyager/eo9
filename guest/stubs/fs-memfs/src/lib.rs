@@ -200,7 +200,7 @@ impl fs::GuestFile for OpenFile {}
 impl fs::GuestImmutableHandle for ExecSnapshot {}
 
 impl memfs_config::Guest for Stub {
-    async fn configure() -> Result<fs::FsImpl, String> {
+    fn configure() -> Result<fs::FsImpl, String> {
         STATE.set(Memfs {
             root: BTreeMap::new(),
         });

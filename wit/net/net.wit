@@ -96,13 +96,13 @@ interface net-optional {
 /// that the exported `net` serves via `default()` (see SPEC: Binary or provider, never both).
 interface deny-config {
     use types.{net-impl};
-    configure: async func() -> result<net-impl, string>;
+    configure: func() -> result<net-impl, string>;
 }
 
 /// Compose-time configuration entry for net.loopback (same convention as `deny-config`).
 interface loopback-config {
     use types.{net-impl};
-    configure: async func() -> result<net-impl, string>;
+    configure: func() -> result<net-impl, string>;
 }
 
 /// net.none — absence: exports the optional flavor answering `none`.

@@ -66,14 +66,14 @@ interface disk-optional {
 /// that the exported `disk` serves via `default()` (see SPEC: Binary or provider, never both).
 interface readonly-config {
     use types.{disk-impl};
-    configure: async func() -> result<disk-impl, string>;
+    configure: func() -> result<disk-impl, string>;
 }
 
 /// Compose-time configuration entry for disk.mem: `configure` binds the device size and
 /// returns the root handle that the exported `disk` serves via `default()`.
 interface mem-config {
     use types.{disk-impl};
-    configure: async func(size: u64) -> result<disk-impl, string>;
+    configure: func(size: u64) -> result<disk-impl, string>;
 }
 
 /// disk.none — absence: exports the optional flavor answering `none`.

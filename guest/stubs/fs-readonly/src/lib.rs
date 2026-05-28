@@ -94,7 +94,7 @@ impl fs::GuestFile for ReadonlyFile {}
 impl fs::GuestImmutableHandle for ReadonlyExec {}
 
 impl readonly_config::Guest for Stub {
-    async fn configure() -> Result<fs::FsImpl, String> {
+    fn configure() -> Result<fs::FsImpl, String> {
         Ok(fs::FsImpl::new(ReadonlyRoot))
     }
 }

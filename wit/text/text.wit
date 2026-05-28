@@ -51,13 +51,13 @@ interface text-optional {
 /// that the exported `text` serves via `default()` (see SPEC: Binary or provider, never both).
 interface null-config {
     use types.{text-impl};
-    configure: async func() -> result<text-impl, string>;
+    configure: func() -> result<text-impl, string>;
 }
 
 /// Compose-time configuration entry for text.capture (same convention as `null-config`).
 interface capture-config {
     use types.{text-impl};
-    configure: async func() -> result<text-impl, string>;
+    configure: func() -> result<text-impl, string>;
 }
 
 /// text.none — absence: exports the optional flavor answering `none`.

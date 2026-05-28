@@ -209,14 +209,14 @@ interface pci-optional {
 /// that the exported `pci` serves via `default()` (see SPEC: Binary or provider, never both).
 interface deny-config {
     use types.{pci-impl};
-    configure: async func() -> result<pci-impl, string>;
+    configure: func() -> result<pci-impl, string>;
 }
 
 /// Compose-time configuration entry for pci.filtered: `configure` binds the allow-list of
 /// device addresses and returns the root handle that the exported `pci` serves via `default()`.
 interface filtered-config {
     use types.{pci-impl, device-address};
-    configure: async func(allow: list<device-address>) -> result<pci-impl, string>;
+    configure: func(allow: list<device-address>) -> result<pci-impl, string>;
 }
 
 /// pci.none — absence: exports the optional flavor answering `none`.

@@ -36,7 +36,7 @@ impl types::Guest for Stub {
 impl types::GuestTextImpl for NullText {}
 
 impl null_config::Guest for Stub {
-    async fn configure() -> Result<types::TextImpl, String> {
+    fn configure() -> Result<types::TextImpl, String> {
         Ok(types::TextImpl::new(NullText))
     }
 }

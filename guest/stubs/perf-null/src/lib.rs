@@ -36,7 +36,7 @@ impl types::Guest for Stub {
 impl types::GuestPerfImpl for NullPerf {}
 
 impl null_config::Guest for Stub {
-    async fn configure() -> Result<types::PerfImpl, String> {
+    fn configure() -> Result<types::PerfImpl, String> {
         Ok(types::PerfImpl::new(NullPerf))
     }
 }

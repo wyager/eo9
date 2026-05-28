@@ -71,7 +71,7 @@ impl types::Guest for Stub {
 impl types::GuestTimeImpl for FrozenTime {}
 
 impl frozen_config::Guest for Stub {
-    async fn configure(now_seconds: i64, monotonic_ns: u64) -> Result<types::TimeImpl, String> {
+    fn configure(now_seconds: i64, monotonic_ns: u64) -> Result<types::TimeImpl, String> {
         STATE.set(Frozen {
             now_seconds,
             monotonic_ns,

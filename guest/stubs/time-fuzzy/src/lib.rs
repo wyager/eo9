@@ -78,7 +78,7 @@ fn quantize_datetime(datetime: Datetime, granularity_ns: u64) -> Datetime {
 struct Stub;
 
 impl fuzzy_config::Guest for Stub {
-    async fn configure(granularity_ns: u64) -> Result<TimeImpl, String> {
+    fn configure(granularity_ns: u64) -> Result<TimeImpl, String> {
         if granularity_ns == 0 {
             return Err(String::from("granularity-ns must be at least 1"));
         }
