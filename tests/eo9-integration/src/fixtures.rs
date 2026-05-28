@@ -755,7 +755,7 @@ fn det_env_wat() -> String {
     (export "monotonic-now" (func (param "t" (borrow $ti)) (result $instant)))))
   (import "eo9:time/frozen-config@0.1.0" (instance $frozen-config
     (export "time-impl" (type $tfc (eq $time-impl)))
-    (export "configure" (func async (param "now-seconds" s64) (param "monotonic-ns" u64)
+    (export "configure" (func (param "now-seconds" s64) (param "monotonic-ns" u64)
       (result (result (own $tfc) (error string)))))))
 
   ;; ----- entropy: the API, and entropy.seeded's config interface --------------------------
@@ -768,7 +768,7 @@ fn det_env_wat() -> String {
     (export "get-u64" (func (param "e" (borrow $ei)) (result u64)))))
   (import "eo9:entropy/seeded-config@0.1.0" (instance $seeded-config
     (export "entropy-impl" (type $eic (eq $entropy-impl)))
-    (export "configure" (func async (param "seed" u64)
+    (export "configure" (func (param "seed" u64)
       (result (result (own $eic) (error string)))))))
 
   ;; ----- fs: the API (narrowed), and fs.memfs's config interface ---------------------------
@@ -791,7 +791,7 @@ fn det_env_wat() -> String {
   (alias export $fs "fs-impl" (type $fs-impl))
   (import "eo9:fs/memfs-config@0.1.0" (instance $memfs-config
     (export "fs-impl" (type $fsic (eq $fs-impl)))
-    (export "configure" (func async
+    (export "configure" (func
       (result (result (own $fsic) (error string)))))))
 
   ;; ----- text: left residual so the ambient text provider captures the output --------------

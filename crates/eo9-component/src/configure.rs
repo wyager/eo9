@@ -18,13 +18,16 @@
 //!   interface is sealed away -- the consumer can neither observe nor re-run the
 //!   configuration.
 //!
-//! Binding on first use, rather than at instantiation, is what makes the configured
-//! provider runnable under the Component Model's concurrency rules: `configure` is an
-//! `async func`, and a synchronous task (a composed consumer's `main`) may not make a
-//! blocking call to an async-lifted export, nor may anything call out of a component
-//! while it is still being instantiated. The binder therefore *async-lowers* `configure`
-//! and makes the call lazily, from within the consumer's own task, accepting only an
-//! immediately-completed result (compose-time configuration must not block).
+//! Binding on first use, rather than at instantiation, is what keeps the configured
+//! provider runnable: nothing may call out of a component while it is still being
+//! instantiated, so the binder makes the `configure` call lazily, from within the
+//! consumer's own task, on the first forwarded API call. `configure` is a *synchronous*
+//! export (it binds compile-time constants and must not block), so the binder sync-lowers
+//! it -- a plain canonical call that may itself synchronously reenter another configured
+//! provider's `configure`. (It was once async-lowered to dodge the "a sync task may not
+//! block on an async-lifted export" rule; that made a configured provider whose
+//! `configure` reentered another configured provider untypable -- the bug-1 trap. Making
+//! `configure` sync removes the gamble entirely; see plan/03 D17 and SPEC.)
 //!
 //! Forwarding follows each API function's own ABI:
 //!
@@ -172,9 +175,9 @@ struct DropIntrinsic {
 
 /// Everything the binder core module is generated from.
 struct BinderPlan {
-    /// The config interface's extern name (import module of the async-lowered call).
+    /// The config interface's extern name (import module of the sync `configure` call).
     config_extern: String,
-    /// `configure`'s async-lowered core signature.
+    /// `configure`'s sync-lowered core signature.
     config_sig: WasmSignature,
     /// The baked-in arguments, in parameter order.
     constants: Vec<FlatConst>,
@@ -263,7 +266,12 @@ where
 
     // Type-check the WAVE arguments against the declared parameters and lower them.
     let constants = bind_arguments(&resolve, &function, args)?;
-    let config_sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, &function);
+    // `configure` is a synchronous export (it binds compile-time constants and must not
+    // block), so it is sync-lowered: a plain canonical call that may itself synchronously
+    // reenter another configured provider's `configure`. (It used to be async-lowered to
+    // dodge the "a sync task may not block on an async export" rule; that made nested
+    // configured compositions untypable -- the bug-1 trap. See plan/03 D17 + SPEC.)
+    let config_sig = resolve.wasm_signature(AbiVariant::GuestImport, &function);
     if config_sig.indirect_params {
         return Err(internal(
             "`configure` takes too many (or too large) parameters for compose-time baking"
@@ -853,7 +861,7 @@ struct ForwardIndices {
     task_return: u32,
 }
 
-/// Builds the binder's core module: the async-lowered `configure` import, a lowered
+/// Builds the binder's core module: the sync-lowered `configure` import, a lowered
 /// import and a gating forwarder export for every provider API function (sync
 /// passthroughs for sync functions, async-callback lifts for async ones), a one-shot
 /// configuration flag, an in-flight call counter, and a bump allocator for canonical-ABI
@@ -867,7 +875,7 @@ fn synthesize_binder_module(plan: &BinderPlan) -> Vec<u8> {
     let mut exports = ExportSection::new();
     let mut code = CodeSection::new();
 
-    // Imported functions first (they occupy the low function indices): the async-lowered
+    // Imported functions first (they occupy the low function indices): the sync-lowered
     // `configure`, the lowered API functions (with their task-return intrinsics), the
     // resource-drop intrinsics, then the root async intrinsics.
     let mut next_import = 0u32;
@@ -875,7 +883,7 @@ fn synthesize_binder_module(plan: &BinderPlan) -> Vec<u8> {
     let configure_import = synth::push_signature(&mut types, &plan.config_sig);
     imports.import(
         &plan.config_extern,
-        &format!("[async-lower]{CONFIGURE}"),
+        CONFIGURE,
         wasm_encoder::EntityType::Function(configure_import),
     );
     let configure_func = next_import;
@@ -1144,11 +1152,11 @@ fn realloc_body() -> wasm_encoder::Function {
     f
 }
 
-/// The one-shot gate: call `configure` (async-lowered, so a synchronous caller task is
-/// allowed to make the call) with the baked-in constants, require that it completed
-/// immediately and successfully, and mark the provider configured. Any failure -- an
-/// error from `configure`, or a configuration that would block -- traps, so an invalid
-/// value fails before the consumer observes any API behavior.
+/// The one-shot gate: call `configure` (sync-lowered) with the baked-in constants,
+/// require that it returned success, and mark the provider configured. An error from
+/// `configure` (an invalid baked value) traps, so it fails before the consumer observes
+/// any API behavior. Because `configure` is synchronous it can run from a synchronous
+/// caller and may itself reenter another configured provider's `configure`.
 fn gate_body(plan: &BinderPlan, layout: &Layout, configure_func: u32) -> wasm_encoder::Function {
     let mut f = wasm_encoder::Function::new([]);
     let mut next_string = 0usize;
@@ -1180,15 +1188,15 @@ fn gate_body(plan: &BinderPlan, layout: &Layout, configure_func: u32) -> wasm_en
     }
     f.instruction(&Instruction::Call(configure_func));
 
-    // The async-lowered call returns a packed subtask status; only "already returned"
-    // (i.e. `configure` completed without blocking) is acceptable here.
-    f.instruction(&Instruction::I32Const(0xF));
-    f.instruction(&Instruction::I32And);
-    f.instruction(&Instruction::I32Const(SUBTASK_RETURNED));
-    f.instruction(&Instruction::I32Ne);
-    f.instruction(&Instruction::If(BlockType::Empty));
-    f.instruction(&Instruction::Unreachable);
-    f.instruction(&Instruction::End);
+    // Sync-lowered call: there is no subtask status to inspect. Any results small enough
+    // to be returned by value (rather than through the retptr) arrive on the stack; drop
+    // them -- the binder only needs the side effect of `configure` having bound the
+    // provider's state. All standard configs return `result<x-impl, string>`, which is
+    // wide enough to use the retptr, so this loop is empty for them and the discriminant
+    // is read from `scratch` below.
+    for _ in &plan.config_sig.results {
+        f.instruction(&Instruction::Drop);
+    }
 
     if plan.config_sig.retptr {
         // The first byte of the written result is the `result<_, _>` discriminant.

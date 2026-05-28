@@ -231,3 +231,17 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     each binder's `configure` once after instantiation, in a context where blocking is permitted, before the
     consumer's `main` runs (area 04); the binder shrinks to pure forwarding. Option 1 is the cleaner and is
     recommended. Until one lands, configured-over-configured interposition stays in GAPS.
+
+18. **Bug 1 fixed: `configure` is now synchronous; the binder sync-lowers it (owner ruling 2026-05-27,
+    option 1).** `configure` is declared `func` (not `async func`) in every `*-config` interface; the binder's
+    one-shot gate makes a plain sync canonical call (no async-lower, no eager-completion gamble, no subtask
+    status check) before forwarding. A sync `configure` may itself synchronously reenter another configured
+    provider's `configure`, so the D17 trap disappears: the two `tests/.../interposition.rs` cases
+    (`time.frozen $ time.fuzzy $ hello` and the `&` form) are un-ignored and **pass**. The async API-forwarding
+    machinery (sync passthrough for sync funcs, async-callback lifts for async funcs like `time.sleep`) is
+    unchanged — only the `configure` invocation became sync. All configure suites stay green
+    (invoker_configured_env, deterministic_env, default_configuration, soundness_corpus, algebra_properties),
+    and the on-target kernel composition path still feeds Cranelift codegen (verified: interactive
+    `time.frozen --now-seconds 100 … $ hello` on metal → `[100.000000000] Hello, …` → `ok: greeted`). The
+    earlier async-configure machinery (waitable-set for the configure step) is gone; SPEC updated to call
+    `configure` synchronous and deliberately minimal. (See plan/02 D16 for the WIT/stub side.)

@@ -118,19 +118,19 @@ interface fs-optional {
 /// that the exported `fs` serves via `default()` (see SPEC: Binary or provider, never both).
 interface deny-config {
     use fs.{fs-impl};
-    configure: async func() -> result<fs-impl, string>;
+    configure: func() -> result<fs-impl, string>;
 }
 
 /// Compose-time configuration entry for fs.readonly (same convention as `deny-config`).
 interface readonly-config {
     use fs.{fs-impl};
-    configure: async func() -> result<fs-impl, string>;
+    configure: func() -> result<fs-impl, string>;
 }
 
 /// Compose-time configuration entry for fs.memfs (same convention as `deny-config`).
 interface memfs-config {
     use fs.{fs-impl};
-    configure: async func() -> result<fs-impl, string>;
+    configure: func() -> result<fs-impl, string>;
 }
 
 /// fs.none — absence: exports the optional flavor answering `none`.

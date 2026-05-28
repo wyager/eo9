@@ -37,7 +37,7 @@ interface entropy-optional {
 /// (see SPEC: Binary or provider, never both).
 interface seeded-config {
     use types.{entropy-impl};
-    configure: async func(seed: u64) -> result<entropy-impl, string>;
+    configure: func(seed: u64) -> result<entropy-impl, string>;
 }
 
 /// entropy.none — absence: exports the optional flavor answering `none`.

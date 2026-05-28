@@ -62,7 +62,7 @@ impl net::GuestTcpListener for NoSocket {}
 impl net::GuestUdpSocket for NoSocket {}
 
 impl deny_config::Guest for Stub {
-    async fn configure() -> Result<types::NetImpl, String> {
+    fn configure() -> Result<types::NetImpl, String> {
         Ok(types::NetImpl::new(DenyNet))
     }
 }

@@ -71,11 +71,6 @@ fn plain_middleware_over_plain_provider_runs() {
 /// The configured `$` chain from the study report: a configured guest middleware over a
 /// configured guest provider of the same interface.
 #[test]
-#[ignore = "configured-over-configured interposition still traps: the gate is reached through the \
-            SYNC `time#now`, and `time.fuzzy::configure` reenters the imported clock (`underlying::default()`), \
-            so the outer `configure` parks; a sync export has no callback to await it and wasmtime 45 forbids \
-            a sync-lifted task from blocking — no pure-binder fix exists (sync WIT funcs can't be async-lifted). \
-            Fix is sync `configure` in the WIT or runtime-assisted configuration — see plan/03 Decision 17"]
 fn configured_middleware_over_configured_provider_runs() {
     guest::ensure_components(STUBS);
     let frozen = configure(
@@ -99,11 +94,6 @@ fn configured_middleware_over_configured_provider_runs() {
 
 /// The `&` form of the same environment: `(frozen & fuzzy) $ hello`.
 #[test]
-#[ignore = "configured-over-configured interposition still traps: the gate is reached through the \
-            SYNC `time#now`, and `time.fuzzy::configure` reenters the imported clock (`underlying::default()`), \
-            so the outer `configure` parks; a sync export has no callback to await it and wasmtime 45 forbids \
-            a sync-lifted task from blocking — no pure-binder fix exists (sync WIT funcs can't be async-lifted). \
-            Fix is sync `configure` in the WIT or runtime-assisted configuration — see plan/03 Decision 17"]
 fn configured_environment_with_middleware_runs() {
     guest::ensure_components(STUBS);
     let frozen = configure(

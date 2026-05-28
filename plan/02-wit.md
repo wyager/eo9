@@ -200,3 +200,15 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
     program is affected (none import `fs-optional` yet), noted for a later pass. (d) text/time/entropy/disk/
     net/pci keep their types-only siblings for now; migrate them opportunistically when they gain a
     multi-instance consumer, using this decision as the template.
+
+16. **`configure` is synchronous (owner ruling 2026-05-27, the bug-1 fix).** Every `*-config` interface's
+    `configure` is now a plain `func`, not `async func`. Rationale: `configure` binds compile-time constants
+    and must not block or perform I/O, so async bought nothing — and it made nested-configured compositions
+    untypable (a sync caller cannot wait on a parked async `configure`; plan/03 D17). Making it sync removes
+    the gamble: the binder sync-lowers the call and a configured provider's `configure` may synchronously
+    reenter another's. Changed: the `configure` signature in entropy/time/fs/disk/net/pci/text/perf
+    `*-config` interfaces (the `eo9:exec/component-algebra.configure` *operation* was already sync and is
+    unrelated); the 10 stubs that export a `configure` dropped `async fn`; the binder's configure-call codegen
+    (plan/03 D18); the `det_env_guest` WAT fixture's three config imports. SPEC's `main`/`configure` paragraph
+    now declares `configure` synchronous and "a wart we keep small on purpose." A provider that ever needs to
+    do something dynamic does it lazily in its API, never in `configure`.

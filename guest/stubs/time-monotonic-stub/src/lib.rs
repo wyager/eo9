@@ -63,7 +63,7 @@ impl types::Guest for Stub {
 impl types::GuestTimeImpl for StubClock {}
 
 impl monotonic_stub_config::Guest for Stub {
-    async fn configure(start_ns: u64, step_ns: u64) -> Result<types::TimeImpl, String> {
+    fn configure(start_ns: u64, step_ns: u64) -> Result<types::TimeImpl, String> {
         STATE.set(Clock {
             counter_ns: start_ns,
             step_ns,

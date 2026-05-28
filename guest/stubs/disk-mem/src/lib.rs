@@ -59,7 +59,7 @@ impl types::Guest for Stub {
 impl types::GuestDiskImpl for MemDisk {}
 
 impl mem_config::Guest for Stub {
-    async fn configure(size: u64) -> Result<types::DiskImpl, String> {
+    fn configure(size: u64) -> Result<types::DiskImpl, String> {
         let Ok(size) = usize::try_from(size) else {
             return Err(String::from("size does not fit in the guest address space"));
         };

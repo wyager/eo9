@@ -55,19 +55,19 @@ interface time-optional {
 /// (see SPEC: Binary or provider, never both).
 interface frozen-config {
     use types.{time-impl};
-    configure: async func(now-seconds: s64, monotonic-ns: u64) -> result<time-impl, string>;
+    configure: func(now-seconds: s64, monotonic-ns: u64) -> result<time-impl, string>;
 }
 
 /// Compose-time configuration entry for time.monotonic-stub (same convention as `frozen-config`).
 interface monotonic-stub-config {
     use types.{time-impl};
-    configure: async func(start-ns: u64, step-ns: u64) -> result<time-impl, string>;
+    configure: func(start-ns: u64, step-ns: u64) -> result<time-impl, string>;
 }
 
 /// Compose-time configuration entry for time.fuzzy (same convention as `frozen-config`).
 interface fuzzy-config {
     use types.{time-impl};
-    configure: async func(granularity-ns: u64) -> result<time-impl, string>;
+    configure: func(granularity-ns: u64) -> result<time-impl, string>;
 }
 
 /// time.none — absence: exports the optional flavor answering `none`.
