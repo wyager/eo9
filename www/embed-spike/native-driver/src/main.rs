@@ -183,6 +183,48 @@ fn verify_blob(blob_path: &Path) -> Result<()> {
             Ok(())
         },
     )?;
+    // The milestone-2 import surface (browser clocks / randomness / JSPI-suspending calls).
+    // The native check only exercises the embedded demos, so plain stand-ins suffice: real
+    // clocks, a no-op sleep, end-of-input for read-line, and "store unavailable" for fetch
+    // (the page store is exercised in the browser self-test, www/site/vm/selftest.html).
+    linker.func_wrap("env", "host_now_ms", || -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as f64)
+            .unwrap_or(0.0)
+    })?;
+    {
+        let started = std::time::Instant::now();
+        linker.func_wrap("env", "host_monotonic_ns", move || -> f64 {
+            started.elapsed().as_nanos() as f64
+        })?;
+    }
+    linker.func_wrap(
+        "env",
+        "host_random_fill",
+        |mut caller: Caller<'_, ()>, ptr: u32, len: u32| -> Result<()> {
+            let memory = caller
+                .get_export("memory")
+                .and_then(|export| export.into_memory())
+                .ok_or_else(|| msg("blob has no exported memory"))?;
+            // Deterministic filler — the native check never draws browser entropy.
+            let bytes: Vec<u8> = (0..len).map(|index| (index % 251) as u8).collect();
+            memory
+                .write(&mut caller, ptr as usize, &bytes)
+                .map_err(|error| msg(format!("writing host_random_fill bytes: {error}")))?;
+            Ok(())
+        },
+    )?;
+    linker.func_wrap("env", "host_sleep_ms", |ms: f64| {
+        std::thread::sleep(std::time::Duration::from_millis(ms.max(0.0) as u64));
+    })?;
+    linker.func_wrap("env", "host_read_line", |_ptr: u32, _cap: u32| -> i32 { -1 })?;
+    linker.func_wrap(
+        "env",
+        "host_fetch_len",
+        |_ptr: u32, _len: u32| -> i32 { -2 },
+    )?;
+    linker.func_wrap("env", "host_fetch_copy", |_ptr: u32, _len: u32| {})?;
 
     let mut store = Store::new(&engine, ());
     let instance = linker.instantiate(&mut store, &module)?;

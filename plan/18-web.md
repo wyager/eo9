@@ -82,3 +82,40 @@ runnable on a host with no fiber backend.
      eo9-runtime/eo9-component are linked in (the spike's 1 MiB is wasmtime alone); whether
      `instantiateStreaming` needs the server to skip gzip for ranges (it doesn't — size is
      fine).
+7. **Milestone 2 (browser root providers, the HTTP program store, JSPI suspension) is in.**
+   The blob now registers browser root providers mirroring the kernel's
+   (`blob/src/providers.rs`): `eo9:text/text` → the page terminal (write sync; `read-line`
+   suspends the whole VM on the input box via JSPI), `eo9:time/time` → `Date.now` /
+   `performance.now` (with `sleep` parked on a real `setTimeout`), `eo9:entropy/entropy` →
+   `crypto.getRandomValues`. `cargo xtask build-web-vm` additionally pre-AOTs the real
+   example programs (hello, cruncher, outcomes) and the kernel's sleepy canary to pulley32
+   under `www/site/vm/store/`, and the blob fetches them on demand over HTTP (a
+   JSPI-suspending `fetch`), deserializes, links the providers, and runs `main` with typed
+   arguments and a rendered outcome (`blob/src/store.rs`). New JS import surface and the
+   page wiring (program picker, "park the VM", read-line input row) are in `vm.js`; the
+   import calls that genuinely block are `WebAssembly.Suspending` functions and the exports
+   that may suspend are wrapped with `WebAssembly.promising`. Without JSPI the page degrades
+   honestly (those demos disabled with an explanation; hello/fuel/entropy still work).
+8. **Retail-browser verification is automated.** `www/site/vm/selftest.html` loads the same
+   blob with the same import wiring and runs every non-interactive demo, writing per-check
+   results and a PASS/FAIL verdict; verified green (19/19) in headless Google Chrome 148
+   (`--headless=new --virtual-time-budget=60000 --dump-dom http://127.0.0.1:<port>/vm/selftest.html`,
+   JSPI available): boot/hello/fuel/entropy with the exact SplitMix64 sequence, the three
+   store programs end to end (`Hello, selftest!` + `success(greeted)`, the exact cruncher
+   digest, the outcomes typed failure with stderr routed), and "park the VM" proving JSPI
+   suspension/resumption (the page-side clock advances ≥ the requested timer). The
+   embed-spike `verify-blob` mode grew the new import surface (plain stand-ins) so the
+   committed blob bytes still verify natively. The interactive read-line round trip needs a
+   human (it waits on the page's input box); it shares the exact code path the selftest's
+   suspending imports exercise.
+9. **One honest limitation found: the stackful async lift.** The kernel's `sleepy` canary
+   lifts its export `async` *without* a callback (stackful), i.e. it blocks mid-guest-frame
+   on a sync-lowered `sleep`; that shape needs a real fiber backend, which wasm32 does not
+   have, so the fiberless path refuses it ("store configuration requires `*_async`…"). The
+   page keeps the button and reports the limitation honestly instead of hiding it. Eo9's own
+   SDK guests use the callback ABI and run here; a callback-ABI guest that awaits
+   `time.sleep`/`read-line` will suspend on the real browser timer/input through the same
+   provider path "park the VM" exercises. Remaining for milestone 3 (the in-browser shell):
+   fs + io-buffer providers in the blob, the exec/store surface for eosh (algebra + compile
+   are further out — composition needs the compile path), and a callback-ABI sleep/read
+   demo guest once one exists in the tree.

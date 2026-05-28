@@ -39,7 +39,30 @@
     </span>
   </div>
 
+  <div id="vm-controls-m2">
+    <span id="program-controls">
+      <label for="program">program</label>
+      <select id="program">
+        <option value="hello">hello — needs text + time</option>
+        <option value="cruncher">cruncher — pure compute</option>
+        <option value="outcomes">outcomes — typed failure paths</option>
+      </select>
+      <label for="program-args">args</label>
+      <input id="program-args" type="text" value="browser true" size="22" spellcheck="false">
+      <button id="btn-program" disabled>Fetch from the store &amp; run</button>
+    </span>
+    <button id="btn-park" disabled>Park the VM on a 300&nbsp;ms timer</button>
+    <button id="btn-readline" disabled>Read a line from the terminal</button>
+    <button id="btn-sleepy" disabled>Run sleepy (stackful-lift canary)</button>
+  </div>
+
   <pre id="vm-output">loading the Eo9 blob…</pre>
+
+  <div id="vm-input-row">
+    <label for="vm-input">terminal input</label>
+    <input id="vm-input" type="text" placeholder="type here and press Enter when a program is reading…"
+           spellcheck="false" disabled>
+  </div>
 
   <h2>What this is</h2>
   <p>
@@ -58,10 +81,22 @@
       <em>async</em> ABI: its <code>configure</code> and <code>get-u64</code> are async-lifted calls,
       executed here without fibers (wasm32 has none) via Eo9's fiberless execution path. Same seed,
       same sequence as native Eo9 and the bare-metal kernel.</li>
+    <li><strong>program store</strong> — the second row fetches <em>real Eo9 example programs</em>
+      (pre-compiled Pulley images served as static files) and runs them against browser root
+      providers: text → this terminal, time → the browser clocks, entropy →
+      <code>crypto.getRandomValues</code>. Typed arguments in, a typed outcome out — the same
+      contract as native <code>eo9 run</code>.</li>
+    <li><strong>park the VM / read a line</strong> — genuinely blocking operations: the VM (and any
+      guest awaiting <code>time.sleep</code> or <code>read-line</code> inside it) is parked on a real
+      browser timer or on the input box below the terminal, using JavaScript Promise Integration
+      (JSPI) to suspend the whole VM and resume it. These need a JSPI-capable browser (current
+      Chrome/Edge; the page says so if yours is not). The <em>sleepy</em> canary uses the Component
+      Model's stackful async lift, which still needs a fiber backend — the page reports that
+      limitation honestly rather than hiding it.</li>
   </ul>
   <p>
-    What is <em>not</em> here yet: the shell (eosh), the capability algebra, the store, and programs
-    that block on real I/O. Those are the next milestones for this page; the
+    What is <em>not</em> here yet: the shell (eosh), the capability algebra, and on-page composition.
+    Those are the next milestones for this page; the
     <a href="/try/">/try page</a> remains the polished demo in the meantime.
   </p>
 
