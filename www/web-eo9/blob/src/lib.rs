@@ -346,6 +346,13 @@ pub extern "C" fn eosh_command(ptr: *const u8, len: usize) -> i32 {
     report("eosh", execsurface::boot_eosh(&command))
 }
 
+/// Boot the interactive `eosh>` prompt: eosh reads command lines from the page terminal
+/// (JSPI read-line) until end-of-input or `exit`.
+#[unsafe(no_mangle)]
+pub extern "C" fn eosh_boot() -> i32 {
+    report("eosh", execsurface::boot_eosh_interactive())
+}
+
 // --- milestone 2: real programs from the HTTP store, awaits parked on the browser ---------
 
 /// Allocate `len` bytes the page's JavaScript can write into (program names / arguments)

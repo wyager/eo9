@@ -30,20 +30,29 @@ use crate::{block_on, engine};
 // algebra's `load`) and the pre-AOT'd pulley32 artifact (for execution). Embedded by
 // `cargo xtask build-web-vm`. (hello today; more programs follow once their raw+pulley
 // forms are seeded — recorded in plan/18.)
-static HELLO_RAW: &[u8] = include_bytes!("../artifacts/example-hello.wasm");
-static HELLO_PULLEY: &[u8] = include_bytes!("../artifacts/example-hello.cwasm");
-
 struct BinProgram {
     name: &'static str,
     raw: &'static [u8],
     pulley: &'static [u8],
 }
 
-static BIN: &[BinProgram] = &[BinProgram {
-    name: "hello",
-    raw: HELLO_RAW,
-    pulley: HELLO_PULLEY,
-}];
+macro_rules! bin {
+    ($name:literal) => {
+        BinProgram {
+            name: $name,
+            raw: include_bytes!(concat!("../artifacts/bin-", $name, ".wasm")),
+            pulley: include_bytes!(concat!("../artifacts/bin-", $name, ".cwasm")),
+        }
+    };
+}
+
+static BIN: &[BinProgram] = &[
+    bin!("hello"),
+    bin!("echo"),
+    bin!("cat"),
+    bin!("ls"),
+    bin!("rng"),
+];
 
 /// Seed `/bin/<name>.wasm` with each program's raw component bytes so eosh's `resolve`
 /// (which opens `/bin/<name>.wasm` for execution and `load`s the bytes) finds them.
@@ -965,7 +974,18 @@ pub fn boot_eosh_instantiate() -> Result<()> {
 /// which resolves the program from `/bin`, compiles (artifact lookup), spawns it
 /// run-to-completion, and prints the outcome through the page terminal.
 pub fn boot_eosh(command: &str) -> Result<()> {
+    run_eosh(Some(command.to_string()))
+}
+
+/// Boot eosh interactively: `main(none)` reads command lines from the page terminal (the
+/// JSPI read-line import) until end-of-input or `exit` — the real `eosh>` prompt.
+pub fn boot_eosh_interactive() -> Result<()> {
+    run_eosh(None)
+}
+
+fn run_eosh(command: Option<String>) -> Result<()> {
     let engine = engine(false)?;
+    // SAFETY: produced by `cargo xtask build-web-vm` with the matching configuration.
     let component = unsafe { WtComponent::deserialize(&engine, EOSH_PULLEY)? };
     let mut linker: Linker<WebState> = Linker::new(&engine);
     crate::providers::add_providers(&mut linker)?;
@@ -982,11 +1002,10 @@ pub fn boot_eosh(command: &str) -> Result<()> {
     let main = instance
         .get_func(&mut store, index)
         .ok_or_else(|| wasmtime::Error::msg("eosh `main` is not a function"))?;
-    let command = command.to_string();
     let outcome = block_on(
         "eosh main",
         store.run_concurrent(async move |accessor| -> Result<Val> {
-            let arg = Val::Option(Some(std::boxed::Box::new(Val::String(command))));
+            let arg = Val::Option(command.map(|c| std::boxed::Box::new(Val::String(c))));
             let mut result = [Val::Bool(false)];
             main.call_concurrent(accessor, &[arg], &mut result).await?;
             Ok(result[0].clone())

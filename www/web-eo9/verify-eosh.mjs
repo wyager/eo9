@@ -15,6 +15,7 @@ const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 let memory = null;
 const lines = [];
+let inputQueue = []; // command lines fed to the interactive eosh prompt via read-line
 
 const imports = {
   env: {
@@ -27,7 +28,13 @@ const imports = {
     },
     host_fetch_copy: () => {},
     host_sleep_ms: new WebAssembly.Suspending((ms) => new Promise((r) => setTimeout(r, ms))),
-    host_read_line: new WebAssembly.Suspending(async () => -1),
+    host_read_line: new WebAssembly.Suspending(async (ptr, cap) => {
+      if (inputQueue.length === 0) return -1; // end of input
+      const bytes = encoder.encode(inputQueue.shift());
+      if (bytes.length > cap) return -1;
+      new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
+      return bytes.length;
+    }),
     host_fetch_len: new WebAssembly.Suspending(async () => -1),
   },
 };
@@ -55,19 +62,39 @@ const [ptr, len] = passStr("hello --name web --excited true");
 const cmdRc = await eoshCommand(ptr, len);
 x.web_free(ptr, len);
 
-const text = lines.join("\n");
-console.log(text);
+const oneShot = lines.join("\n");
+
+// Sub-step 3: the interactive `eosh>` prompt — feed command lines through read-line (JSPI),
+// the same path the page terminal uses. eosh runs each and reads the next until EOF/exit.
+inputQueue = [
+  "echo --text hi",
+  "cat --path /welcome.txt",
+  "ls --path /",
+  "exit",
+];
+lines.length = 0;
+const eoshBoot = WebAssembly.promising(x.eosh_boot);
+const bootRc = await eoshBoot();
+const interactive = lines.join("\n");
+
+console.log("--- one-shot ---\n" + oneShot + "\n--- interactive ---\n" + interactive);
 
 const checks = [
-  ["eosh instantiates (floor)", instRc === 0 && /eosh: instantiated/.test(text)],
-  ["eosh ran hello (greeting)", /Hello, web/.test(text)],
-  ["hello outcome greeted", /greeted/.test(text)],
+  ["eosh instantiates (floor)", instRc === 0 && /eosh: instantiated/.test(oneShot)],
+  ["eosh ran hello (greeting)", /Hello, web/.test(oneShot)],
+  ["hello outcome greeted", /greeted/.test(oneShot)],
   ["eosh command rc == 0", cmdRc === 0],
+  ["interactive: echo printed hi", /\bhi\b/.test(interactive)],
+  ["interactive: cat read /welcome.txt", /printed\(/.test(interactive)],
+  ["interactive: ls listed /", /listed\(/.test(interactive)],
+  ["interactive: session exited", bootRc === 0 && /success\(exited\)/.test(interactive)],
 ];
 let ok = true;
 for (const [label, pass] of checks) {
   if (!pass) ok = false;
   console.log(`  ${pass ? "ok" : "FAIL"}: ${label}`);
 }
-console.log(`\neosh boot: instantiate rc=${instRc}, command rc=${cmdRc} -> ${ok ? "PASS" : "FAIL"}`);
+console.log(
+  `\neosh boot: instantiate rc=${instRc}, command rc=${cmdRc}, interactive rc=${bootRc} -> ${ok ? "PASS" : "FAIL"}`,
+);
 process.exit(ok ? 0 : 1);
