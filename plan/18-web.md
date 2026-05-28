@@ -361,3 +361,18 @@ with the current demo programs (all imports required, none optional) the restric
 defense-in-depth — a program can't use a capability it doesn't import, and required-outside-allow
 is refused at `restrict`; the restriction becomes load-bearing for a program with an *optional*
 import that a successful `only` seals as absent (none in the demo set yet).
+
+## Decision 19 — a provider in `/bin` so `$`/`&` is exercisable through eosh
+
+`entropy.seeded` (the unmodified `eo9-stub-entropy-seeded`) is now seeded into the blob's
+`/bin` as raw component bytes (for the algebra's `load`) plus a pulley `.cwasm` (the `bin!`
+macro embeds both), via the same xtask `/bin` build loop as the example/coreutil binaries.
+A visitor can now type `entropy.seeded $ rng --count 3` at the prompt: eosh resolves both
+from `/bin`, composes with the real algebra, and `compile` of the fused result returns the
+clean "composition needs the compiler" refusal (no precompiled artifact) — reached through
+eosh, not a crash (verify-eosh.mjs). The server-side `/vm/compile` endpoint (Decision 20,
+pending) is the path to actually compiling+running such a composition in the browser. Cost:
+the blob grows by entropy.seeded's raw+cwasm (~6.05 MiB raw / ~1.19 MiB brotli) — a lazy-fetch
+trim (serve `/bin` raw+cwasm from the HTTP store instead of embedding) is the recorded
+blob-size follow-up. Nit: eosh renders the refusal as `CompileError::Codegen(...)` (raw enum
+prefix) — an eosh-side rendering follow-up.

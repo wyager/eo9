@@ -485,6 +485,10 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
         ("cat", "eo9-coreutil-cat"),
         ("ls", "eo9-coreutil-ls"),
         ("rng", "eo9-coreutil-rng"),
+        // A provider in /bin so a `provider $ consumer` composition is formable through eosh
+        // (e.g. `entropy.seeded $ rng`) — it reaches the clean "needs the compiler" refusal
+        // since the fused result has no precompiled artifact.
+        ("entropy.seeded", "eo9-stub-entropy-seeded"),
     ] {
         let raw = std::fs::read(
             root.join("guest")

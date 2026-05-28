@@ -76,6 +76,10 @@ inputQueue = [
   "only eo9:text/text,eo9:time/time $ hello --name boxed --excited true",
   "only eo9:text/text $ echo --text restricted",
   "only eo9:text/text $ hello --name nope --excited true",
+  // a `provider $ consumer` composition: formable now that entropy.seeded is in /bin; the
+  // fused result has no precompiled artifact, so compile gives the clean codegen refusal
+  // (the server-side /vm/compile endpoint is the path to actually running it) — not a crash.
+  "entropy.seeded $ rng --count 3",
   "exit",
 ];
 lines.length = 0;
@@ -96,6 +100,7 @@ const checks = [
   ["only admitting text+time runs hello", /Hello, boxed/.test(interactive)],
   ["only-text runs a text-only program", /restricted/.test(interactive)],
   ["only-text refuses hello (needs time)", !/Hello, nope/.test(interactive)],
+  ["compose gives the clean codegen refusal", /needs the compiler/.test(interactive)],
   ["interactive: session exited", bootRc === 0 && /success\(exited\)/.test(interactive)],
 ];
 let ok = true;

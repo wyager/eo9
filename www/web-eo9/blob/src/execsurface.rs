@@ -52,6 +52,8 @@ static BIN: &[BinProgram] = &[
     bin!("cat"),
     bin!("ls"),
     bin!("rng"),
+    // A provider, so `entropy.seeded $ rng` (and other `$`/`&`) is formable at the prompt.
+    bin!("entropy.seeded"),
 ];
 
 /// Seed `/bin/<name>.wasm` with each program's raw component bytes so eosh's `resolve`
