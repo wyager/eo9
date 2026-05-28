@@ -316,6 +316,7 @@ where
         provider_inst,
         binder_pkg,
         binder_inst,
+        &[],
     )
     .map_err(compose_err)?;
     // The wrapper exports the binder's gated API interfaces plus whatever else the
