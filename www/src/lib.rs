@@ -349,19 +349,60 @@ pub fn content_type(path: &Path) -> &'static str {
     }
 }
 
-/// The `Cache-Control` value for a file. The asset URLs are stable (not fingerprinted), so
-/// freshness comes from short-to-moderate lifetimes plus the strong ETags every response
-/// carries: once a cached copy expires, an `If-None-Match` revalidation is a 304 with no
-/// body. HTML revalidates quickly so content updates show up; the heavyweight wasm/cwasm
-/// artifacts (which change rarely and cost the most to refetch) keep a day; everything else
-/// (styles, scripts, images, manifests) gets an hour.
+/// Is this a content-fingerprinted immutable asset (`name.<16-hex>.wasm` / `.cwasm`)?
+///
+/// The web-VM build (`cargo xtask fingerprint-web-vm`) renames the large immutable assets —
+/// the wasm blob and the Pulley `.cwasm` store images — to carry a hash of their contents in
+/// the filename, and points the page at them through `vm/assets.json`. The URL therefore *is*
+/// the version: a different build yields a different URL, so these can be cached forever and
+/// never revalidated, and the server never hashes their bodies on the request path. The check
+/// is a cheap filename test (no I/O, no hashing): the stem's final dot-segment is exactly 16
+/// lowercase hex digits and the extension is one we fingerprint.
+pub fn is_fingerprinted(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if !matches!(extension.as_str(), "wasm" | "cwasm") {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    match stem.rsplit_once('.') {
+        Some((base, hash)) => {
+            !base.is_empty()
+                && hash.len() == 16
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        None => false,
+    }
+}
+
+/// The `Cache-Control` value for a file.
+///
+/// Content-fingerprinted assets (see [`is_fingerprinted`]) are immutable: their URL changes
+/// whenever their bytes do, so they get a one-year lifetime plus `immutable` — Cloudflare and
+/// browsers hold them indefinitely and never revalidate, and a new OS build simply produces a
+/// new URL (nothing to purge). The `assets.json` manifest is the indirection that flips those
+/// URLs, so it must never be stale: it is served `no-cache` (revalidate every time; the cheap
+/// ETag makes that a 304 when unchanged). HTML revalidates quickly so content updates show up;
+/// other small static files (styles, scripts, images) get an hour. Any non-fingerprinted
+/// wasm/cwasm (e.g. a dev build before fingerprinting) keeps the previous one-day lifetime.
 pub fn cache_control(path: &Path) -> &'static str {
     let extension = path
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
-    if content_type(path).starts_with("text/html") {
+    if is_fingerprinted(path) {
+        "public, max-age=31536000, immutable"
+    } else if path.file_name().and_then(|n| n.to_str()) == Some("assets.json") {
+        "no-cache"
+    } else if content_type(path).starts_with("text/html") {
         "public, max-age=300"
     } else if matches!(extension.as_str(), "wasm" | "cwasm") {
         "public, max-age=86400"
@@ -600,6 +641,41 @@ mod tests {
             cache_control(Path::new("vm/store/hello.cwasm")),
             "public, max-age=86400"
         );
+        // Fingerprinted assets are immutable and cached for a year; the manifest that points
+        // at them is never cached, so a new build is picked up immediately.
+        assert_eq!(
+            cache_control(Path::new("vm/web-eo9.3872dc3f251945ac.wasm")),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            cache_control(Path::new("vm/store/hello.5afedde1cf4b36c8.cwasm")),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(cache_control(Path::new("vm/assets.json")), "no-cache");
+    }
+
+    #[test]
+    fn fingerprinted_assets_are_detected_by_name() {
+        // Real fingerprinted names (16 lowercase hex + a fingerprinted extension).
+        assert!(is_fingerprinted(Path::new(
+            "vm/web-eo9.3872dc3f251945ac.wasm"
+        )));
+        assert!(is_fingerprinted(Path::new(
+            "vm/store/hello.5afedde1cf4b36c8.cwasm"
+        )));
+        // Not fingerprinted: canonical names, wrong length/case/charset, wrong extension,
+        // and a bare hash with no base name.
+        assert!(!is_fingerprinted(Path::new("vm/web-eo9.wasm")));
+        assert!(!is_fingerprinted(Path::new("vm/store/hello.cwasm")));
+        assert!(!is_fingerprinted(Path::new(
+            "vm/web-eo9.3872DC3F251945AC.wasm"
+        )));
+        assert!(!is_fingerprinted(Path::new("vm/web-eo9.3872dc3f.wasm")));
+        assert!(!is_fingerprinted(Path::new(
+            "vm/web-eo9.notarealhash16x.wasm"
+        )));
+        assert!(!is_fingerprinted(Path::new("app.3872dc3f251945ac.js")));
+        assert!(!is_fingerprinted(Path::new("3872dc3f251945ac.wasm")));
     }
 
     #[test]

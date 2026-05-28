@@ -108,6 +108,32 @@ async function hostReadLine(ptr, cap) {
   return len;
 }
 
+// Content-fingerprinted asset URLs, loaded once from /vm/assets.json. The manifest is
+// short-cached while the assets it points at are immutable+forever-cached, so a new build
+// flips these URLs and clients pick up the new OS immediately. Falls back to the canonical
+// names if the manifest is missing (e.g. a dev build before fingerprinting).
+let assetMap = null;
+async function loadAssetMap() {
+  if (assetMap) return assetMap;
+  try {
+    const response = await fetch("/vm/assets.json", { cache: "no-cache" });
+    if (response.ok) {
+      assetMap = await response.json();
+      return assetMap;
+    }
+  } catch {
+    // fall through to the canonical names
+  }
+  assetMap = { blob: "/vm/web-eo9.wasm", store: {} };
+  return assetMap;
+}
+function blobUrl() {
+  return (assetMap && assetMap.blob) || "/vm/web-eo9.wasm";
+}
+function storeUrl(name) {
+  return (assetMap && assetMap.store && assetMap.store[name]) || `/vm/store/${name}.cwasm`;
+}
+
 // The most recent store fetch, copied into the blob by host_fetch_copy.
 let fetchedArtifact = null;
 
@@ -115,7 +141,7 @@ async function hostFetchLen(namePtr, nameLen) {
   const name = decoder.decode(new Uint8Array(memory.buffer, namePtr, nameLen));
   if (!/^[a-z0-9-]{1,64}$/.test(name)) return -1;
   try {
-    const response = await fetch(`/vm/store/${name}.cwasm`);
+    const response = await fetch(storeUrl(name));
     if (!response.ok) return -1;
     fetchedArtifact = new Uint8Array(await response.arrayBuffer());
     return fetchedArtifact.length;
@@ -192,9 +218,11 @@ async function main() {
     if (typeof WebAssembly !== "object") {
       throw new Error("this browser has no WebAssembly support");
     }
-    const response = await fetch("/vm/web-eo9.wasm");
+    await loadAssetMap();
+    const url = blobUrl();
+    const response = await fetch(url);
     if (!response.ok) {
-      throw new Error(`fetching /vm/web-eo9.wasm failed: HTTP ${response.status}`);
+      throw new Error(`fetching ${url} failed: HTTP ${response.status}`);
     }
     // Prefer streaming compilation; fall back to buffering the bytes if the engine refuses
     // (older engines, or a misconfigured Content-Type on the response).

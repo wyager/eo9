@@ -231,3 +231,32 @@ wasm32 well enough for that.
       the blob's printed cross-host determinism line (the bare-metal leg) — the string lives in the blob's
       Rust, not the page; fold into the next `/vm` content pass. (c) A browser-support matrix and
       interpreter-speed expectations on `/vm` — copy change, fold into the same pass.
+
+22. **CDN-friendly fingerprinted caching for the immutable assets (2026-05-27).** Owner ask: the big
+    blobs (the /vm wasm blob, the `.cwasm` store images) must be cacheable forever by Cloudflare/browsers,
+    a new OS build must reach clients immediately, and the server must not re-hash a big blob per request.
+    Scheme (content-fingerprinted immutable URLs):
+    - `cargo xtask fingerprint-web-vm` (runs inside `build-web-vm`, before precompress) hashes each /vm
+      immutable asset once (`content_fingerprint`, 64-bit FNV-1a → 16 hex — same convention as the server
+      ETag; no new xtask deps), renames it to `name.<hash>.ext`, drops the old siblings, and writes
+      `vm/assets.json` mapping logical name → URL. `vm.js`/`selftest.js` fetch the manifest first and
+      resolve the blob/store URLs through it (falling back to canonical names for a dev build with no
+      manifest).
+    - The server (`eo9_www::is_fingerprinted`, a cheap filename test — stem ends in `.<16-hex>`, ext
+      wasm/cwasm) serves fingerprinted assets `Cache-Control: public, max-age=31536000, immutable` with
+      **no ETag** — the URL is the version, so their bodies are never hashed on the request path. The
+      `assets.json` manifest is the indirection point and is served `no-cache` (cheap ETag → 304 when
+      unchanged), so a deploy flips the referenced URLs at once; HTML stays `max-age=300`; small static
+      files keep cheap ETags (hashing a few-KB file per request is negligible). A million requests for the
+      ~1 MiB blob therefore cost zero server hashing.
+    - Cloudflare: with far-future `immutable` the edge holds the blob and never revalidates; a rebuild
+      changes the URL so there is nothing to purge, and the short-cached HTML/manifest carry the new
+      references. No CDN config required beyond default caching.
+    - `cargo xtask check-web-vm` is a drift guard: it verifies `assets.json` points at existing,
+      fingerprinted files whose names still encode their current content hash (catches a stale manifest or
+      a hand-edited asset). Not wired into `ci` (needs built assets), like the other web-build steps.
+    - Only /vm is fingerprinted. /try's jco modules cross-import by relative path, so fingerprinting them
+      needs import rewriting (the same shared-intrinsics work deferred in D21); pre-compression already
+      covers /try's wire cost. Recorded as a follow-up. NOTE: this overlaps `area/18-web-m3` (which also
+      regenerated the /vm assets and added `check-web-vm`); whichever merges first, the other must rebase —
+      this branch's `fingerprint-web-vm`/`check-web-vm` supersede the plain regeneration.
