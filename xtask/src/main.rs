@@ -749,6 +749,10 @@ fn precompile_for_kernel(
     config.memory_guard_size(0);
     config.memory_init_cow(false);
     config.concurrency_support(true);
+    // Fuel metering is compile-relevant (the generated code carries the fuel decrements).
+    // The kernel engine meters fuel so spawned children are preemptible at quantum
+    // granularity (plan/12: child fuel / preemption); the precompiled artifacts must match.
+    config.consume_fuel(true);
     config.gc_support(false);
     config.wasm_threads(false);
     let engine = wasmtime::Engine::new(&config)

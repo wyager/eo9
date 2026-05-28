@@ -134,6 +134,11 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
         engine: engine.clone(),
     }));
     let mut store = Store::new(&engine, state);
+    // The engine meters fuel (see `new_engine`); the shell itself runs from an
+    // effectively-unlimited pool — its own guest code is the parser/evaluator, and the
+    // heavy work (children, on-target compilation) happens elsewhere. Children get their
+    // own sliced pools in `shellexec::spawn_child`.
+    store.set_fuel(u64::MAX)?;
 
     let instance = super::block_on(
         "eosh instantiation",

@@ -22,8 +22,12 @@
 //!   the event loop from a host function. `wait`/`runnable`/`kill` observe the child;
 //!   `resume` (guest-directed fuel donation) is unsupported, as in usermode (E5).
 //!
-//! Fuel metering for children is not enabled yet: `consume_fuel` is compile-relevant and
-//! would invalidate the precompiled artifacts; it lands together with the scheduler work.
+//! Children are fuel-metered (the engine enables `consume_fuel`, matched by xtask's
+//! precompile configuration): instantiation runs on a small bounded budget, and the call to
+//! `main` runs from an effectively-infinite pool sliced by [`FUEL_QUANTUM`] — every poll of
+//! a child executes at most one quantum and then yields, so a compute-bound (or
+//! deliberately spinning) child is preempted and the other children plus the shell keep
+//! making progress. This is the same regime as the usermode runtime (`crates/eo9-runtime`).
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -47,6 +51,16 @@ use super::wave;
 
 /// Boxed future shape for `func_wrap_concurrent` closures.
 type ConcurrentFuture<'a, R> = Pin<Box<dyn Future<Output = Result<R>> + Send + 'a>>;
+
+/// How much fuel a child executes per poll before yielding back to the drive loop — the
+/// preemption quantum. Same value as the usermode runtime's `FUEL_QUANTUM`
+/// (crates/eo9-runtime/src/task.rs) so a "slice" means the same thing on both targets.
+pub const FUEL_QUANTUM: u64 = 10_000;
+
+/// Fuel budget for a child's instantiation (start-time code), mirroring usermode
+/// `SPAWN_FUEL`: enough for the trivial start sections eo9 components have, small enough
+/// that a hostile component cannot burn unbounded CPU before `spawn` even returns.
+pub const SPAWN_FUEL: u64 = 4 * FUEL_QUANTUM;
 
 // -----------------------------------------------------------------------------------------
 // Host resource representations
@@ -474,8 +488,11 @@ fn spawn_child(
         store.limiter(|state| state.limiter());
     }
 
-    // Instantiation must not depend on external completions (eo9 components have no
-    // start-time code); drive it with a bounded poll loop, as usermode `spawn` does.
+    // Instantiation runs on a small bounded fuel budget paid by the spawner (usermode
+    // `SPAWN_FUEL` parity): any start-time code either finishes within it or the spawn
+    // fails — never an unbounded burn. It must also not depend on external completions;
+    // drive it with a bounded poll loop, as usermode `spawn` does.
+    store.set_fuel(SPAWN_FUEL).map_err(internal)?;
     let instance = {
         let instantiate = linker.instantiate_async(&mut store, component);
         let mut instantiate = core::pin::pin!(instantiate);
@@ -495,8 +512,29 @@ fn spawn_child(
             .ok_or_else(|| {
                 WitSpawnError::Internal("instantiation unexpectedly suspended".to_string())
             })?
-            .map_err(internal)?
+            .map_err(|err| {
+                if matches!(
+                    err.downcast_ref::<wasmtime::Trap>(),
+                    Some(wasmtime::Trap::OutOfFuel)
+                ) {
+                    WitSpawnError::Internal(format!(
+                        "component start-time code exceeded the spawn fuel budget \
+                         ({SPAWN_FUEL} fuel): instantiation must not run unbounded guest code"
+                    ))
+                } else {
+                    internal(err)
+                }
+            })?
     };
+
+    // Normal fuel regime for the child's life (usermode parity): an effectively-infinite
+    // pool sliced by the fixed yield quantum, so every poll of the child runs at most
+    // FUEL_QUANTUM units and then yields back to the drive loop — that slicing is what
+    // keeps a compute-bound child from monopolizing the machine.
+    store.set_fuel(u64::MAX).map_err(internal)?;
+    store
+        .fuel_async_yield_interval(Some(FUEL_QUANTUM))
+        .map_err(internal)?;
 
     let main = instance
         .get_func(&mut store, "main")
@@ -511,6 +549,17 @@ fn spawn_child(
         let mut results = vec![Val::Bool(false)];
         match main.call_async(&mut store, &params, &mut results).await {
             Ok(()) => render_outcome(result_ty.as_ref(), results.first()),
+            // An exhausted fuel pool is the budget being enforced, not a guest bug: report
+            // it as the task being killed (usermode `--max-fuel` parity). Unreachable with
+            // the u64::MAX pool above, but correct the moment a per-child cap is plumbed.
+            Err(err)
+                if matches!(
+                    err.downcast_ref::<wasmtime::Trap>(),
+                    Some(wasmtime::Trap::OutOfFuel)
+                ) =>
+            {
+                KOutcome::Killed
+            }
             Err(err) => KOutcome::Trapped(format!("{err:?}")),
         }
     });

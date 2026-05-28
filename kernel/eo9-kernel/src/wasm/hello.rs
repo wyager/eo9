@@ -59,6 +59,8 @@ fn try_run() -> Result<String, wasmtime::Error> {
     providers::add_providers(&mut linker)?;
 
     let mut store = Store::new(&engine, KernelState::new());
+    // The engine meters fuel (see `new_engine`); the demo gets an effectively-unlimited pool.
+    store.set_fuel(u64::MAX)?;
     let instance = super::block_on(
         "hello instantiation",
         linker.instantiate_async(&mut store, &component),
