@@ -3,8 +3,8 @@
 Tracked by the planner so nothing gets lost. Each item notes where it is recorded and what unblocks it.
 Items are removed when closed; design questions move to SPEC.md when resolved.
 
-_Last updated: 2026-05-27 (master at 805841a, after the layered-session / coreutils / overlay /
-configure-defaults / study-fixes / GIC-idle / in-browser-VM wave)._
+_Last updated: 2026-05-27 (master at 14c0443, after the algebra-bug-fix / kernel-preemption /
+nested-eosh-on-metal / web-hardening / CDN-caching batch)._
 
 ## Decisions pending with the owner
 
@@ -14,9 +14,8 @@ configure-defaults / study-fixes / GIC-idle / in-browser-VM wave)._
 - **`describe` wiring/attenuator view**: `describe fs.readonly $ cat` is indistinguishable from
   `describe cat` — interposed attenuators are invisible in the residual import surface. Security and PL
   personas both want an audit view. (synthesis #7, study 05 #9)
-- **Roadmap ordering**: confirm child-fuel/preemption as the next kernel milestone (embedded persona's #1 —
-  one looping child currently takes the machine), and whether real-board bring-up jumps ahead of the
-  riscv64/x86_64 QEMU ports. (synthesis #6, #14)
+- **Roadmap ordering**: child-fuel/preemption is now done (the embedded persona's #1 blocker is closed); the
+  open question is whether real-board bring-up jumps ahead of the riscv64/x86_64 QEMU ports. (synthesis #14)
 - **Shell `-c` outcome format + exit codes**: unify eosh's `ok:`/`error:` rendering with `run`'s WAVE
   format and propagate honest 0/1/2/3 exit codes through `shell -c` (needs a small eosh-world variant
   addition). (plan/11 D14)
@@ -32,10 +31,11 @@ configure-defaults / study-fixes / GIC-idle / in-browser-VM wave)._
 ## Settled directions (recorded so they're not re-litigated)
 
 - **The in-browser real-stack VM shipped** (supersedes the 2026-05-26 "/try v2 deferred" ruling): the owner
-  re-opened it on 2026-05-27; the wasm32+Pulley blob now runs on `/vm` through milestone 2 (fiberless
-  callback execution behind an off-by-default vendored feature, browser root providers, HTTP program store,
-  JSPI suspension, retail-Chrome-verified). `/try` v1 remains alongside it. Milestone 3 (eosh in the
-  browser) is queued. (plan/18)
+  re-opened it on 2026-05-27; the wasm32+Pulley blob runs on `/vm` through milestone 2 (fiberless callback
+  execution behind an off-by-default vendored feature, browser root providers, HTTP program store, JSPI
+  suspension, retail-Chrome-verified). The server now has compression, security headers, and
+  Cloudflare-friendly content-fingerprinted immutable caching with no per-request blob hashing. `/try` v1
+  remains alongside it. Milestone 3 (eosh in the browser) is queued. (plan/18, plan/15)
 - **No upstreaming until a compelling MVP** (owner ruling 2026-05-26), refined 2026-05-27: feasibility
   reports live in `docs/upstreaming/`, and three contribution packages are staged locally for owner review
   and push (wasmtime CM-async no_std; wit-parser no_std decoding; wasm-wave no_std `wit`). wit-component
@@ -45,8 +45,9 @@ configure-defaults / study-fixes / GIC-idle / in-browser-VM wave)._
 - **Unconfigured providers never trap** (owner ruling 2026-05-27, option C): standard stubs self-bind
   documented defaults; providers with no sensible default must export only their config interface so
   unconfigured composition is a compose-time mismatch (SPEC "export shape encodes whether configuration is
-  required"). Implemented for the four configurable stubs; the export-shape diagnostic and `describe`
-  marking of required config args are queued.
+  required"). Implemented for the four configurable stubs; the compose-time export-shape diagnostic landed (a
+  required API import satisfiable only by a config-only provider is refused with an "apply `configure(…)`"
+  hint); `describe` marking of required config args is still queued.
 - **Root-handle resources live in the API interface** (owner ruling 2026-05-27, option 1): done for
   `eo9:fs`; disk/net/pci migrate by the same mechanical recipe when one gains a multi-instance consumer.
 
@@ -64,23 +65,28 @@ configure-defaults / study-fixes / GIC-idle / in-browser-VM wave)._
 
 ## Functional gaps (implementation exists, coverage incomplete)
 
-### Algebra correctness (new, from the PL study — next fix wave)
-- **Configured middleware over a configured provider traps**: `time.frozen --… $ time.fuzzy --… $ hello`
-  (and the `&` form) fails at runtime; each provider works alone and the middleware works over the host
-  clock — a counterexample to the override law and a composition shape missing from the suite. (study 05 #1)
-- **`fs.none $ <fs-consumer>` fails encode/validation** instead of cleanly dropping the unmatched export —
-  violates the no-op-drop law; wanted obligation: "if the interface-level composition is defined, the
-  encoded component validates; otherwise a typed refusal". (study 05 #2)
-- **`rename` on a residual import produces an invalid artifact** (codegen rejects the import name); renaming
-  both sides then composing works. (study 05 #3)
-- **`≡` and instance identity are undefined** in the spec's laws (when do two importers share one provider
-  instance; does the action law preserve it); the identity element `empty` has no concrete spelling.
-  (study 05 #5)
-- **No generative property-test suite** over component triples (resources, types-siblings, multi-slot,
-  stateful configured providers) asserting encoder-validates-when-defined + the action law — would have
-  caught the three bugs above. (study 05 #6)
-- **The spec-promised "exports match nothing" warning never fires** — a dead outer provider is silently
-  ignored. (study 05 #7)
+### Algebra correctness (from the PL study)
+- **FIXED — `fs.none $ <fs-consumer>` encode/validation failure** (study 05 #2, merge 6438b22): compose/extend
+  now skip wiring an authority-free import from a provider that doesn't also satisfy the package's authority
+  interface, per the no-op-drop law; the `time.none`/`text.none`/`entropy.none` family is healed too and the
+  seeded soundness corpus guards it.
+- **FIXED — `rename` on a residual import produced an invalid artifact** (study 05 #3, merges 6438b22 +
+  82b2eeb): `Component::executable_bytes()` strips the implements annotation and is now fed to the compiler
+  in the runtime, CLI, and kernel compile paths, while describe/store-hash/cache-key keep the full bytes —
+  renamed-residual artifacts compile and run.
+- **OPEN — Configured middleware over a configured provider traps**: `time.frozen --… $ time.fuzzy --… $
+  hello` (and the `&` form) fails at runtime; root-caused (the binder's sync-lifted configure gate can't
+  wait for a non-eager configure that calls through another composed provider) — needs an event-driven /
+  two-phase binder or runtime support; the failing shapes are `#[ignore]`d with the cause. (study 05 #1,
+  plan/03 D15)
+- **OPEN — `≡` and instance identity are undefined** in the spec's laws (when do two importers share one
+  provider instance; does the action law preserve it); the identity element `empty` has no concrete
+  spelling. (study 05 #5)
+- **OPEN — No fully generative property-test suite** over component triples (resources, types-siblings,
+  multi-slot, stateful configured providers); the seeded soundness corpus exists but the generative version
+  asserting encoder-validates-when-defined + the action law is still queued. (study 05 #6, plan/13 D14)
+- **OPEN — The spec-promised "exports match nothing" warning never reaches the user**: `compose_checked`
+  returns `ProviderExportsUnused`, but surfacing it in eosh/CLI needs the host-side exec WIT. (study 05 #7)
 - Binder caveats (unchanged): depends on wasmtime 45's CM-async ABI encodings (one constants block);
   suspended-subtask path not yet exercised end-to-end; cancellation of an in-flight forwarded call traps;
   >4 flat params / variant results / >16-flattened-param cases rejected with clear errors.
@@ -105,34 +111,45 @@ configure-defaults / study-fixes / GIC-idle / in-browser-VM wave)._
   follow-up to make it algebraic. (plan/10 D9, plan/11 D15)
 
 ### Bare metal
-- **Scheduling is the top gap**: no child fuel, no eo9-sched adoption, no preemption — a looping child takes
-  the machine (embedded persona's #1 blocker). Idle is now interrupt-driven (~1% host CPU via GICv2 + timer
-  IRQ + `wfi`); a PL011 RX interrupt would make it true event-driven 0%; the single-slot idle waker needs to
-  become a queue when concurrent children land. (plan/12 D36)
-- **Metal children receive text/time/entropy only** — no fs/io/exec wiring, so fs-needing children get a
-  friendly refusal and nested eosh on metal is not yet possible (the kernel `drive_children` loop also needs
-  rework before nested spawning is safe). W^X for JIT code pages still TODO; exceptions are fatal; on-target
-  codegen determinism not bit-compared; on-target code measured ~25–35% slower than host AOT (verify
-  opt-level parity); no instrumentation for peak compile heap / phase timings / cache-hit reasons; no
-  writable storage or fused-artifact cache on metal; the kernel store image lacks the coreutils.
-  (plan/12 D22–37, studies 01/03)
+- **FIXED — child fuel + preemption** (embedded persona's #1 blocker, merge e5b97c6): children run on a
+  sliced fuel budget (10k yield interval) driven from a reworked check-out/poll/check-in loop, so a looping
+  child no longer takes the machine; `program=… max-fuel=N` kills a runaway with `abnormal(killed)`. eo9-sched
+  is still not adopted (round-robin + fuel-slicing suffices; revisit with guest-directed `resume`/E5).
+- **FIXED — nested eosh on metal** (merge e5b97c6): metal children now inherit the full session environment
+  (read-only store fs, io buffers, exec), so `eosh> eosh` works on metal incl. an on-target-compiled
+  grandchild composition; `only` still strips the surface.
+- **Kernel scheduling follow-ups** (plan/12 D38): parent kill does not cascade to orphaned grandchildren; no
+  per-child hard fuel cap for shell spawns; nested shells share the one serial console and eosh has no
+  interrupt key (a foreground spinner occupies the prompt though the machine and kill path stay live); the
+  idle waker is single-slot (needs a queue when multiple host futures park); a PL011 RX interrupt would take
+  idle from ~1% to true event-driven 0%.
+- **Other metal gaps**: W^X for JIT code pages still TODO; exceptions are fatal; on-target codegen
+  determinism not bit-compared and measured ~25–35% slower than host AOT (verify opt-level parity); no
+  instrumentation for peak compile heap / phase timings / cache-hit reasons; no writable storage or
+  fused-artifact cache on metal; the kernel store image lacks the coreutils. (plan/12 D22–38, studies 01/03)
 - **Wasmtime version bumps are not free**: re-verify the binder/executor ABI-constant blocks and re-AOT all
   artifacts on any bump off 45.
 - riscv64/x86_64 ports and the QEMU test tier not started; real-board bring-up unscheduled (owner decision).
 
 ### Website / in-browser demos
-- **Server hardening** (web-dev study): no response compression (the 1.21 MiB /vm blob would be ~290 KB with
-  brotli), no security headers (CSP, HSTS, X-Content-Type-Options, COOP/COEP), max-age-only caching with no
-  ETag/fingerprinted URLs.
-- **/try v1**: ~570 KB of mostly duplicated jco glue (split shared intrinsics + minify); the friendly
-  refusal is launcher JS (the real enforcement is the absent import — add the disclosure sentence);
-  stub composition blocked by the upstream js-component-bindgen TDZ bug (issue text drafted, plan/15 D11).
+- **FIXED — server hardening** (web-dev study, merges 3afc833 + 14c0443): pre-compressed `.br`/`.gz`
+  siblings with Accept-Encoding negotiation (the /vm blob is ~320 KB brotli on the wire); security headers
+  (CSP, X-Content-Type-Options, Referrer-Policy, COOP; HSTS on TLS only); and content-fingerprinted immutable
+  URLs (`web-eo9.<hash>.wasm` via `vm/assets.json`) served `public, max-age=31536000, immutable` with no
+  per-request hashing, short-cached HTML/manifest for instant deploys, and a `check-web-vm` drift guard.
+  Deferred: COEP/Permissions-Policy headers; the disclosure sentences landed.
+- **Path-dependent wasm32 blob build** (new): `build-web-vm` in a different checkout directory yields a
+  different blob hash with no source change; `check-web-vm` validates committed self-consistency, not
+  rebuild-match, so it won't catch cross-machine churn — wants a reproducible-build fix (e.g.
+  `--remap-path-prefix`) before CI runs build-web-vm on another machine. (plan/15 D22)
+- **/try v1**: not content-fingerprinted (its jco modules cross-import by relative path — needs the deferred
+  shared-intrinsics work); ~570 KB of mostly duplicated jco glue (split shared intrinsics + minify;
+  compression already covers the wire cost); stub composition blocked by the upstream js-component-bindgen
+  TDZ bug (issue text drafted, plan/15 D11, D21).
 - **/vm**: milestone 3 = fs + io providers in the blob, the exec/store surface for eosh-in-browser, a
   callback-ABI sleep/read demo guest; the stackful-lift `sleepy` canary is correctly refused on the
-  fiberless host (page says so); add the "these components import nothing yet" disclosure; vm.js error path
-  hard-codes one cause and lacks an instantiateStreaming fallback; the determinism claim should point at the
-  native cross-check; blob-size watch (1.21 MiB raw). JSPI support outside Chromium still to re-check.
-  (plan/18 D7–9, study 04)
+  fiberless host (page says so); blob-size watch (~1.2 MiB raw). JSPI support outside Chromium still to
+  re-check. (plan/18 D7–11, study 04)
 
 ## Tracked from the user studies (see docs/user-studies/00-synthesis.md for the full triage)
 
