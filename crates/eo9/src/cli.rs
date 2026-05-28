@@ -181,22 +181,42 @@ fn parse_exec_snapshot(value: &str) -> Result<ExecSnapshotPolicy, String> {
     }
 }
 
-/// Parse the rest of the stream as the program's own `--<flag> <value>` pairs.
-pub fn parse_program_flags(stream: &mut ArgStream) -> Result<Vec<(String, String)>, String> {
-    let mut flags = Vec::new();
+/// One argument destined for the program being run: either a `--<flag> <value>` pair or a
+/// bare positional value (filled against `main`'s parameters in declaration order; see
+/// [`crate::run`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgramArg {
+    /// `--name value`.
+    Flag { name: String, value: String },
+    /// A bare value with no flag name.
+    Positional(String),
+}
+
+/// Parse the rest of the stream as the program's own arguments: `--<flag> <value>` pairs
+/// and bare positional values, in the order they were given.
+pub fn parse_program_flags(stream: &mut ArgStream) -> Result<Vec<ProgramArg>, String> {
+    let mut args = Vec::new();
     while let Some(token) = stream.next() {
-        let name = token.strip_prefix("--").filter(|name| !name.is_empty());
-        let Some(name) = name else {
-            return Err(format!(
-                "unexpected argument {token:?}: program arguments are passed as `--<flag> <value>` pairs"
-            ));
-        };
-        let value = stream
-            .next()
-            .ok_or_else(|| format!("program argument `--{name}` is missing its value"))?;
-        flags.push((name.to_string(), value));
+        match token.strip_prefix("--").filter(|name| !name.is_empty()) {
+            Some(name) => {
+                let value = stream
+                    .next()
+                    .ok_or_else(|| format!("program argument `--{name}` is missing its value"))?;
+                args.push(ProgramArg::Flag {
+                    name: name.to_string(),
+                    value,
+                });
+            }
+            None if token == "--" => {
+                // Everything after a literal `--` is positional, even if it looks like a flag.
+                while let Some(rest) = stream.next() {
+                    args.push(ProgramArg::Positional(rest));
+                }
+            }
+            None => args.push(ProgramArg::Positional(token)),
+        }
     }
-    Ok(flags)
+    Ok(args)
 }
 
 /// Parse the `shell` command's own arguments: global options plus an optional
@@ -291,14 +311,42 @@ mod tests {
         assert_eq!(
             flags,
             vec![
-                ("name".to_string(), "eo9".to_string()),
-                ("excited".to_string(), "true".to_string()),
+                ProgramArg::Flag {
+                    name: "name".to_string(),
+                    value: "eo9".to_string()
+                },
+                ProgramArg::Flag {
+                    name: "excited".to_string(),
+                    value: "true".to_string()
+                },
             ]
         );
 
-        assert!(parse_program_flags(&mut stream(&["name"])).is_err());
         assert!(parse_program_flags(&mut stream(&["--name"])).is_err());
-        assert!(parse_program_flags(&mut stream(&["--", "x"])).is_err());
+    }
+
+    #[test]
+    fn bare_values_are_positional_arguments() {
+        let args =
+            parse_program_flags(&mut stream(&["a.txt", "--excited", "true", "b.txt"])).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                ProgramArg::Positional("a.txt".to_string()),
+                ProgramArg::Flag {
+                    name: "excited".to_string(),
+                    value: "true".to_string()
+                },
+                ProgramArg::Positional("b.txt".to_string()),
+            ]
+        );
+
+        // A literal `--` makes everything after it positional, even flag-shaped tokens.
+        let args = parse_program_flags(&mut stream(&["--", "--weird-name"])).unwrap();
+        assert_eq!(
+            args,
+            vec![ProgramArg::Positional("--weird-name".to_string())]
+        );
     }
 
     #[test]

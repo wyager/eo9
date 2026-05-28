@@ -11,7 +11,9 @@ use eo9_component::{ArgSpec, Component, ComponentKind, ImportNeed};
 use eo9_runtime::task::FUEL_QUANTUM;
 use eo9_runtime::{NamedArg, Outcome, ResumeOutcome, SpawnLimits, Task, WaveValue};
 
-use crate::cli::{Config, EXIT_ABNORMAL, EXIT_FAILURE, EXIT_SUCCESS, OutcomeChannel, vlog};
+use crate::cli::{
+    Config, EXIT_ABNORMAL, EXIT_FAILURE, EXIT_SUCCESS, OutcomeChannel, ProgramArg, vlog,
+};
 use crate::compile;
 use crate::providers;
 use crate::source;
@@ -20,7 +22,7 @@ use crate::source;
 /// program finishes, so this is a scheduling granule, not a budget.
 const RESUME_DONATION: u64 = 100 * FUEL_QUANTUM;
 
-pub fn cmd_run(cfg: &Config, reference: &str, flags: &[(String, String)]) -> Result<u8, String> {
+pub fn cmd_run(cfg: &Config, reference: &str, flags: &[ProgramArg]) -> Result<u8, String> {
     let source = source::resolve_program(cfg, reference)?;
 
     // The argument signature drives flag handling (SPEC.md "Type-directed arguments"):
@@ -46,7 +48,7 @@ pub fn cmd_run(cfg: &Config, reference: &str, flags: &[(String, String)]) -> Res
             source.origin
         ));
     }
-    let args = bind_args(&info.args, flags);
+    let args = bind_args(&info.args, flags)?;
 
     // Obtain the image through the compile cache: a hit is deserialized without codegen,
     // a miss compiles once and caches the very image that runs below (plan 06).
@@ -150,25 +152,84 @@ pub(crate) fn drive_to_completion(cfg: &Config, task: &mut Task) -> Outcome {
     outcome
 }
 
-/// Bind `--flag value` pairs to `main`'s parameters. A flag filling a `string`-typed
-/// parameter is taken literally and WAVE-quoted here; every other value is passed through
-/// as WAVE text. Unknown, duplicate, or missing arguments are reported by the runtime's
-/// spawn-time type check against the signature.
-fn bind_args(params: &[ArgSpec], flags: &[(String, String)]) -> Vec<NamedArg> {
-    flags
-        .iter()
-        .map(|(name, raw)| {
-            let is_string = params
-                .iter()
-                .any(|param| param.name == *name && param.ty == "string");
-            let value = if is_string {
-                wave_string(raw)
-            } else {
-                raw.clone()
-            };
-            NamedArg::new(name.clone(), value)
-        })
-        .collect()
+/// Bind the program's command-line arguments to `main`'s parameters.
+///
+/// * `--flag value` pairs bind by name: a flag filling a `string`-typed parameter is taken
+///   literally and WAVE-quoted here; a flag filling a `list<string>` parameter with a
+///   value that isn't already WAVE list syntax is wrapped as a one-element list; every
+///   other value is passed through as WAVE text.
+/// * Bare positional values fill the still-unfilled parameters in declaration order
+///   (string parameters quoted, everything else passed through).
+/// * When `main`'s **final** parameter is `list<string>` it is variadic: positional values
+///   left over once the other parameters are filled are collected into it (so
+///   `cat a.txt b.txt` works), and it defaults to the empty list when nothing fills it.
+///
+/// Unknown, duplicate, or type-mismatched arguments are reported by the runtime's
+/// spawn-time check against the signature; "more positionals than parameters" is the one
+/// error that has to be reported here, because such a value has no name to carry.
+fn bind_args(params: &[ArgSpec], flags: &[ProgramArg]) -> Result<Vec<NamedArg>, String> {
+    let variadic = params
+        .last()
+        .filter(|param| param.ty.trim() == "list<string>");
+    let mut named: Vec<NamedArg> = Vec::new();
+    let mut variadic_values: Vec<String> = Vec::new();
+
+    for arg in flags {
+        match arg {
+            ProgramArg::Flag { name, value } => {
+                let ty = params
+                    .iter()
+                    .find(|param| param.name == *name)
+                    .map(|param| param.ty.trim());
+                let encoded = match ty {
+                    Some("string") => wave_string(value),
+                    Some("list<string>") if !value.trim_start().starts_with('[') => {
+                        format!("[{}]", wave_string(value))
+                    }
+                    _ => value.clone(),
+                };
+                named.push(NamedArg::new(name.clone(), encoded));
+            }
+            ProgramArg::Positional(value) => {
+                let next_unfilled = params
+                    .iter()
+                    .filter(|param| variadic.map(|v| v.name != param.name).unwrap_or(true))
+                    .find(|param| !named.iter().any(|arg| arg.name == param.name));
+                match (next_unfilled, variadic) {
+                    (Some(param), _) => {
+                        let encoded = if param.ty.trim() == "string" {
+                            wave_string(value)
+                        } else {
+                            value.clone()
+                        };
+                        named.push(NamedArg::new(param.name.clone(), encoded));
+                    }
+                    (None, Some(_)) => variadic_values.push(wave_string(value)),
+                    (None, None) => {
+                        return Err(format!(
+                            "unexpected positional argument {value:?}: this program's \
+                             parameters are already filled (pass values as `--<flag> <value>`)"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(param) = variadic
+        && !named.iter().any(|arg| arg.name == param.name)
+    {
+        named.push(NamedArg::new(
+            param.name.clone(),
+            format!("[{}]", variadic_values.join(", ")),
+        ));
+    } else if !variadic_values.is_empty() {
+        return Err(format!(
+            "positional arguments and `--{}` were both given; use one or the other",
+            variadic.map(|param| param.name.as_str()).unwrap_or("flag")
+        ));
+    }
+    Ok(named)
 }
 
 /// Whether the component has a *required* import of an `eo9:fs` interface — i.e. it
@@ -239,14 +300,22 @@ mod tests {
         assert_eq!(wave_string("line\nbreak"), "\"line\\u{a}break\"");
     }
 
+    fn flag(name: &str, value: &str) -> ProgramArg {
+        ProgramArg::Flag {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    fn positional(value: &str) -> ProgramArg {
+        ProgramArg::Positional(value.to_string())
+    }
+
     #[test]
     fn string_parameters_take_their_flag_text_literally() {
         let params = [spec("name", "string"), spec("excited", "bool")];
-        let flags = [
-            ("name".to_string(), "world".to_string()),
-            ("excited".to_string(), "true".to_string()),
-        ];
-        let args = bind_args(&params, &flags);
+        let flags = [flag("name", "world"), flag("excited", "true")];
+        let args = bind_args(&params, &flags).unwrap();
         assert_eq!(args[0], NamedArg::new("name", "\"world\""));
         assert_eq!(args[1], NamedArg::new("excited", "true"));
     }
@@ -254,9 +323,61 @@ mod tests {
     #[test]
     fn unknown_flags_pass_through_for_the_runtime_to_reject() {
         let params = [spec("seed", "u64")];
-        let flags = [("nonsense".to_string(), "1".to_string())];
-        let args = bind_args(&params, &flags);
+        let flags = [flag("nonsense", "1")];
+        let args = bind_args(&params, &flags).unwrap();
         assert_eq!(args[0], NamedArg::new("nonsense", "1"));
+    }
+
+    #[test]
+    fn positionals_fill_parameters_in_declaration_order() {
+        let params = [spec("name", "string"), spec("excited", "bool")];
+        let args = bind_args(&params, &[positional("world"), positional("true")]).unwrap();
+        assert_eq!(args[0], NamedArg::new("name", "\"world\""));
+        assert_eq!(args[1], NamedArg::new("excited", "true"));
+
+        // Named flags win their parameter; positionals take what is left.
+        let args = bind_args(&params, &[flag("excited", "true"), positional("world")]).unwrap();
+        assert_eq!(args[0], NamedArg::new("excited", "true"));
+        assert_eq!(args[1], NamedArg::new("name", "\"world\""));
+
+        // Too many positionals with nowhere to go is an error here (no name to carry).
+        assert!(
+            bind_args(
+                &params,
+                &[positional("a"), positional("b"), positional("c")]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_final_list_of_strings_parameter_is_variadic() {
+        let params = [spec("paths", "list<string>")];
+        let args = bind_args(&params, &[positional("a.txt"), positional("b.txt")]).unwrap();
+        assert_eq!(args, vec![NamedArg::new("paths", "[\"a.txt\", \"b.txt\"]")]);
+
+        // No values at all: the variadic parameter defaults to the empty list.
+        let args = bind_args(&params, &[]).unwrap();
+        assert_eq!(args, vec![NamedArg::new("paths", "[]")]);
+
+        // Earlier parameters are filled first; the rest spill into the variadic tail.
+        let params = [spec("lines", "u64"), spec("paths", "list<string>")];
+        let args = bind_args(
+            &params,
+            &[flag("lines", "2"), positional("a.txt"), positional("b.txt")],
+        )
+        .unwrap();
+        assert_eq!(args[0], NamedArg::new("lines", "2"));
+        assert_eq!(args[1], NamedArg::new("paths", "[\"a.txt\", \"b.txt\"]"));
+
+        // A named flag for the list parameter coerces a single bare value into a list,
+        // and then mixing in positionals is rejected as ambiguous.
+        let params = [spec("paths", "list<string>")];
+        let args = bind_args(&params, &[flag("paths", "a.txt")]).unwrap();
+        assert_eq!(args, vec![NamedArg::new("paths", "[\"a.txt\"]")]);
+        let args = bind_args(&params, &[flag("paths", "[\"a.txt\"]")]).unwrap();
+        assert_eq!(args, vec![NamedArg::new("paths", "[\"a.txt\"]")]);
+        assert!(bind_args(&params, &[flag("paths", "a.txt"), positional("b.txt")]).is_err());
     }
 
     #[test]

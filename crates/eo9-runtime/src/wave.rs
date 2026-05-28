@@ -36,7 +36,10 @@ impl NamedArg {
 /// `Val` list `main` is called with.
 ///
 /// Every declared parameter must be supplied exactly once and every supplied argument must
-/// name a declared parameter; anything else is a `bad-arguments` spawn error.
+/// name a declared parameter; anything else is a `bad-arguments` spawn error. The one
+/// exception is a **final `list<string>` parameter**, which is the variadic tail by
+/// convention (`cat a.txt b.txt`): when nothing supplies it, it defaults to the empty list
+/// instead of being a missing-argument error.
 pub(crate) fn parse_args(signature: &ComponentFunc, args: &[NamedArg]) -> Result<Vec<Val>, String> {
     let params: Vec<(String, Type)> = signature
         .params()
@@ -50,10 +53,16 @@ pub(crate) fn parse_args(signature: &ComponentFunc, args: &[NamedArg]) -> Result
     }
 
     let mut vals = Vec::with_capacity(params.len());
-    for (name, ty) in &params {
+    for (index, (name, ty)) in params.iter().enumerate() {
         let matching: Vec<&NamedArg> = args.iter().filter(|arg| arg.name == *name).collect();
         let arg = match matching.as_slice() {
-            [] => return Err(format!("missing argument `{name}`")),
+            [] => {
+                if index == params.len() - 1 && is_string_list(ty) {
+                    vals.push(Val::List(Vec::new()));
+                    continue;
+                }
+                return Err(format!("missing argument `{name}`"));
+            }
             [arg] => *arg,
             _ => return Err(format!("argument `{name}` supplied more than once")),
         };
@@ -66,6 +75,11 @@ pub(crate) fn parse_args(signature: &ComponentFunc, args: &[NamedArg]) -> Result
         vals.push(val);
     }
     Ok(vals)
+}
+
+/// Is this a `list<string>` type — the shape the variadic-tail convention applies to?
+fn is_string_list(ty: &Type) -> bool {
+    matches!(ty, Type::List(list) if matches!(list.ty(), Type::String))
 }
 
 /// Render a completed `main` return value as a [`Outcome`].

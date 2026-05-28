@@ -12,5 +12,5 @@ world ls {
         fs(string),
         io(string),
     }
-    export main: async func(path: string) -> result<program-success, program-failure>;
+    export main: async func(paths: list<string>) -> result<program-success, program-failure>;
 }

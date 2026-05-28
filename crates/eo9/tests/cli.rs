@@ -1044,12 +1044,13 @@ fn shell_children_see_bin_programs_and_fs_root_data_at_once() {
     fs::write(sandbox.join("notes.txt"), "layered\n").expect("write fixture");
     let sb = sandbox.to_str().expect("utf-8 sandbox path");
 
-    let ls = eo9(&store, &["--fs-root", sb, "-c", "ls --path /"]);
+    // `ls` with no arguments lists the root (the variadic tail defaults to empty).
+    let ls = eo9(&store, &["--fs-root", sb, "-c", "ls"]);
     assert_eq!(ls.code, 0, "stderr: {}", ls.stderr);
     assert!(ls.stdout.contains("notes.txt"), "ls output: {}", ls.stdout);
     assert!(ls.stdout.contains("bin"), "ls output: {}", ls.stdout);
 
-    let ls_bin = eo9(&store, &["--fs-root", sb, "-c", "ls --path /bin"]);
+    let ls_bin = eo9(&store, &["--fs-root", sb, "-c", "ls /bin"]);
     assert_eq!(ls_bin.code, 0, "stderr: {}", ls_bin.stderr);
     assert!(
         ls_bin.stdout.contains("hello.wasm"),
@@ -1057,7 +1058,7 @@ fn shell_children_see_bin_programs_and_fs_root_data_at_once() {
         ls_bin.stdout
     );
 
-    let cat = eo9(&store, &["--fs-root", sb, "-c", "cat --path /notes.txt"]);
+    let cat = eo9(&store, &["--fs-root", sb, "-c", "cat /notes.txt"]);
     assert_eq!(cat.code, 0, "stderr: {}", cat.stderr);
     assert!(cat.stdout.contains("layered"), "cat output: {}", cat.stdout);
 
@@ -1554,11 +1555,12 @@ fn coreutils_fs_tools_against_a_sandbox() {
     let sb = sandbox.to_str().expect("utf-8 sandbox path");
 
     // ls lists the directory; cat prints contents; wc reports "<lines> <words> <bytes>".
-    let ls = eo9(&store, &["--fs-root", sb, "-c", "ls --path /"]);
+    // Paths are positional (the variadic `paths` tail), through the eosh one-shot.
+    let ls = eo9(&store, &["--fs-root", sb, "-c", "ls /"]);
     assert_eq!(ls.code, 0, "stderr: {}", ls.stderr);
     assert!(ls.stdout.contains("notes.txt"), "ls output: {}", ls.stdout);
 
-    let cat = eo9(&store, &["--fs-root", sb, "-c", "cat --path /notes.txt"]);
+    let cat = eo9(&store, &["--fs-root", sb, "-c", "cat /notes.txt"]);
     assert_eq!(cat.code, 0, "stderr: {}", cat.stderr);
     assert!(
         cat.stdout.contains("alpha beta"),
@@ -1566,7 +1568,16 @@ fn coreutils_fs_tools_against_a_sandbox() {
         cat.stdout
     );
 
-    let wc = eo9(&store, &["--fs-root", sb, "-c", "wc --path /notes.txt"]);
+    // The named-flag spelling still works: a single value coerces to the one-element list.
+    let cat_flag = eo9(&store, &["--fs-root", sb, "-c", "cat --paths /notes.txt"]);
+    assert_eq!(cat_flag.code, 0, "stderr: {}", cat_flag.stderr);
+    assert!(
+        cat_flag.stdout.contains("alpha beta"),
+        "cat --paths output: {}",
+        cat_flag.stdout
+    );
+
+    let wc = eo9(&store, &["--fs-root", sb, "-c", "wc /notes.txt"]);
     assert_eq!(wc.code, 0, "stderr: {}", wc.stderr);
     assert!(wc.stdout.contains("2 3 17"), "wc output: {}", wc.stdout);
 
@@ -1580,6 +1591,66 @@ fn coreutils_fs_tools_against_a_sandbox() {
         sandbox.join("copy.txt").is_file(),
         "cp did not create copy.txt"
     );
+}
+
+#[test]
+fn coreutils_take_several_positional_paths() {
+    // The variadic tail end to end: `cat a.txt b.txt` prints both files in order, both
+    // through the eosh one-shot and through the implicit-run CLI form.
+    let store = temp_store("coreutils-variadic");
+    let sandbox = temp_sandbox("coreutils-variadic");
+    fs::write(sandbox.join("a.txt"), "first\n").expect("write fixture");
+    fs::write(sandbox.join("b.txt"), "second\n").expect("write fixture");
+    let sb = sandbox.to_str().expect("utf-8 sandbox path");
+
+    let shell_cat = eo9(&store, &["--fs-root", sb, "-c", "cat /a.txt /b.txt"]);
+    assert_eq!(shell_cat.code, 0, "stderr: {}", shell_cat.stderr);
+    let first = shell_cat.stdout.find("first").expect("first file printed");
+    let second = shell_cat
+        .stdout
+        .find("second")
+        .expect("second file printed");
+    assert!(first < second, "files out of order: {}", shell_cat.stdout);
+
+    // The same two paths through `eo9 <program> …` directly (positionals at the CLI).
+    let _ = eo9(&store, &["-c", "help"]); // seed the store so `cat` resolves by name
+    let run_cat = eo9(&store, &["--fs-root", sb, "cat", "/a.txt", "/b.txt"]);
+    assert_eq!(run_cat.code, 0, "stderr: {}", run_cat.stderr);
+    assert!(
+        run_cat.stdout.contains("first") && run_cat.stdout.contains("second"),
+        "cat output: {}",
+        run_cat.stdout
+    );
+    assert_eq!(run_cat.stderr.trim(), "success(printed(13))");
+
+    // wc over two files prints a per-file line plus a total.
+    let wc = eo9(&store, &["--fs-root", sb, "-c", "wc /a.txt /b.txt"]);
+    assert_eq!(wc.code, 0, "stderr: {}", wc.stderr);
+    assert!(
+        wc.stdout.contains("/a.txt") && wc.stdout.contains("total"),
+        "wc output: {}",
+        wc.stdout
+    );
+
+    // head's earlier parameter is still bound by name while the tail stays positional.
+    let head = eo9(
+        &store,
+        &["--fs-root", sb, "-c", "head --lines 1 /a.txt /b.txt"],
+    );
+    assert_eq!(head.code, 0, "stderr: {}", head.stderr);
+    assert!(
+        head.stdout.contains("==> /a.txt <==") && head.stdout.contains("==> /b.txt <=="),
+        "head output: {}",
+        head.stdout
+    );
+
+    // touch + rm accept several paths; the files appear and disappear on the host side.
+    let touch = eo9(&store, &["--fs-root", sb, "-c", "touch /x.txt /y.txt"]);
+    assert_eq!(touch.code, 0, "stderr: {}", touch.stderr);
+    assert!(sandbox.join("x.txt").is_file() && sandbox.join("y.txt").is_file());
+    let rm = eo9(&store, &["--fs-root", sb, "-c", "rm /x.txt /y.txt"]);
+    assert_eq!(rm.code, 0, "stderr: {}", rm.stderr);
+    assert!(!sandbox.join("x.txt").exists() && !sandbox.join("y.txt").exists());
 }
 
 #[test]
@@ -1631,7 +1702,7 @@ fn fs_coreutil_without_fs_root_is_refused() {
     // A coreutil that requires eo9:fs is refused before running when no fs is granted.
     let store = temp_store("coreutils-no-fs");
     let _ = eo9(&store, &["-c", "help"]); // seed the store so `cat` resolves by name
-    let refused = eo9(&store, &["cat", "--path", "/x"]);
+    let refused = eo9(&store, &["cat", "/x"]);
     assert_eq!(refused.code, 3, "stderr: {}", refused.stderr);
     assert!(
         refused.stderr.contains("eo9:fs"),

@@ -12,5 +12,5 @@ world head {
         fs(string),
         io(string),
     }
-    export main: async func(path: string, lines: u64) -> result<program-success, program-failure>;
+    export main: async func(lines: u64, paths: list<string>) -> result<program-success, program-failure>;
 }

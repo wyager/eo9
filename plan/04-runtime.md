@@ -302,6 +302,33 @@ in `tests/exec_api.rs`, which should be flipped to assert the deterministic seed
 once resolved. Per instruction, no workaround was attempted; candidate directions are an
 area-03 binder fix or bind-on-first-use.
 
+### D13. The variadic-tail convention in the WAVE arg binder (branch `area/04-positional-args`)
+
+Owner request: `cat a.txt b.txt` instead of `cat --path a.txt`. The convention, applied
+uniformly by the front-ends and the runtime:
+
+- **Positional values** (bare tokens after the program name) fill `main`'s parameters in
+  declaration order; named `--flag value` pairs still bind by name and win their parameter.
+  This was already eosh's application rule; `eo9 run` / the implicit-run CLI form now accept
+  bare tokens too (`cli::ProgramArg`, `run::bind_args`), with `--` forcing everything after
+  it positional.
+- **A final `list<string>` parameter is the variadic tail**: positional values left over once
+  the other parameters are filled are collected into it, and when nothing supplies it at all
+  it defaults to the empty list. The empty-list default lives in the runtime's
+  `wave::parse_args` (last parameter + `list<string>` only), so every embedder gets it; the
+  CLI and eosh also emit the collected list themselves. A *named* flag for a `list<string>`
+  parameter whose value is not already WAVE list syntax is coerced to a one-element list
+  (`cat --paths a.txt` ≡ `cat a.txt`); supplying both the flag and positionals is rejected as
+  ambiguous.
+- Type direction is unchanged: a positional landing on a `string` parameter is quoted
+  literally, anything else is passed through as WAVE text (so `cruncher 9 200000` works and a
+  mis-typed positional gets the runtime's "not a valid `u64`" error naming the parameter).
+- Scope: usermode (`eo9 run`, eosh via the host exec provider) — the kernel's and the web
+  blob's own arg codecs do not have the empty-list default yet; on those surfaces the
+  variadic tail still has to be supplied (follow-up if it matters in practice).
+
+Coreutil signature changes that ride on this are plan/17 D6.
+
 ### Escalations for the planner
 
 - **E1 (resolved by the async-operations migration):** binaries that await must have an

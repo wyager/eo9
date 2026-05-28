@@ -302,12 +302,22 @@ impl<'a, B: Backend> Evaluator<'a, B> {
 /// Match flags and positional arguments against a declared signature, WAVE-encoding
 /// each value per its parameter's type; `initial` carries arguments already bound by an
 /// inner application.
+///
+/// Positional values fill the still-unfilled parameters in declaration order. When the
+/// signature's **final** parameter is `list<string>` it is the variadic tail: positional
+/// values left over once the other parameters are filled are collected into it, so
+/// `cat a.txt b.txt` passes both paths as one list argument.
 fn collect_named_args(
     initial: Vec<NamedArg>,
     specs: &[ArgSpec],
     args: &[Arg],
 ) -> Result<Vec<NamedArg>, EvalError> {
+    let variadic = specs
+        .last()
+        .filter(|spec| wave::is_string_list(&spec.ty))
+        .map(|spec| spec.name.clone());
     let mut named = initial;
+    let mut tail: Vec<String> = Vec::new();
     for arg in args {
         match arg {
             Arg::Flag { name, value } => {
@@ -318,13 +328,36 @@ fn collect_named_args(
                 push_arg(&mut named, spec, value)?;
             }
             Arg::Positional(value) => {
-                let spec = specs
-                    .iter()
-                    .find(|spec| !named.iter().any(|arg| arg.name == spec.name))
-                    .ok_or(EvalError::TooManyPositional)?;
-                push_arg(&mut named, spec, value)?;
+                let spec = specs.iter().find(|spec| {
+                    Some(&spec.name) != variadic.as_ref()
+                        && !named.iter().any(|arg| arg.name == spec.name)
+                });
+                match (spec, &variadic) {
+                    (Some(spec), _) => push_arg(&mut named, spec, value)?,
+                    (None, Some(name)) => match value {
+                        ArgValue::Word(text) | ArgValue::Quoted(text) => tail.push(text.clone()),
+                        ArgValue::Expr(_) => {
+                            return Err(EvalError::ExpressionForDataParameter {
+                                name: name.clone(),
+                                ty: String::from("list<string>"),
+                            });
+                        }
+                    },
+                    (None, None) => return Err(EvalError::TooManyPositional),
+                }
             }
         }
+    }
+    if let Some(name) = variadic
+        && !tail.is_empty()
+    {
+        if named.iter().any(|arg| arg.name == name) {
+            return Err(EvalError::DuplicateArgument { name });
+        }
+        named.push(NamedArg {
+            name,
+            value: wave::string_list(&tail),
+        });
     }
     Ok(named)
 }
@@ -358,11 +391,12 @@ fn push_arg(named: &mut Vec<NamedArg>, spec: &ArgSpec, value: &ArgValue) -> Resu
 }
 
 /// Check an argument list for completeness against a declared signature: missing
-/// optional parameters are filled with `none`, missing required ones are an error.
-/// Used where the signature is final — the top-level run rule for `main` arguments,
-/// the application site for a provider's `configure` arguments.
+/// optional parameters are filled with `none`, a missing **final** `list<string>`
+/// parameter (the variadic tail) is filled with the empty list, and missing required
+/// ones are an error. Used where the signature is final — the top-level run rule for
+/// `main` arguments, the application site for a provider's `configure` arguments.
 pub fn complete_args(args: &mut Vec<NamedArg>, specs: &[ArgSpec]) -> Result<(), EvalError> {
-    for spec in specs {
+    for (index, spec) in specs.iter().enumerate() {
         if args.iter().any(|arg| arg.name == spec.name) {
             continue;
         }
@@ -370,6 +404,11 @@ pub fn complete_args(args: &mut Vec<NamedArg>, specs: &[ArgSpec]) -> Result<(), 
             args.push(NamedArg {
                 name: spec.name.clone(),
                 value: wave::none_value(),
+            });
+        } else if index == specs.len() - 1 && wave::is_string_list(&spec.ty) {
+            args.push(NamedArg {
+                name: spec.name.clone(),
+                value: wave::string_list(&[]),
             });
         } else {
             return Err(EvalError::MissingArgument {
@@ -646,6 +685,73 @@ mod tests {
                     value: "\"shy\"".to_string()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_final_list_of_strings_parameter_collects_the_positional_tail() {
+        let mut backend = MockBackend::new();
+        backend.program("cat", binary(&[("paths", "list<string>")]));
+        // Several positionals collect into one list argument.
+        let out = eval(&mut backend, "cat a.txt \"b c.txt\"").expect("evaluates");
+        assert_eq!(
+            out.args,
+            vec![NamedArg {
+                name: "paths".to_string(),
+                value: "[\"a.txt\", \"b c.txt\"]".to_string()
+            }]
+        );
+        // A named flag with a single bare value is the one-element list spelling.
+        let out = eval(&mut backend, "cat --paths a.txt").expect("evaluates");
+        assert_eq!(
+            out.args,
+            vec![NamedArg {
+                name: "paths".to_string(),
+                value: "[\"a.txt\"]".to_string()
+            }]
+        );
+        // Earlier parameters fill first; the remainder spills into the variadic tail.
+        backend.program(
+            "head",
+            binary(&[("lines", "u64"), ("paths", "list<string>")]),
+        );
+        let out = eval(&mut backend, "head --lines 2 a.txt b.txt").expect("evaluates");
+        assert_eq!(
+            out.args,
+            vec![
+                NamedArg {
+                    name: "lines".to_string(),
+                    value: "2".to_string()
+                },
+                NamedArg {
+                    name: "paths".to_string(),
+                    value: "[\"a.txt\", \"b.txt\"]".to_string()
+                },
+            ]
+        );
+        // Both the flag and positional spellings at once are ambiguous.
+        assert_eq!(
+            eval(&mut backend, "cat --paths a.txt b.txt").unwrap_err(),
+            EvalError::DuplicateArgument {
+                name: "paths".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_missing_variadic_tail_completes_to_the_empty_list() {
+        let mut args = Vec::new();
+        let specs = [ArgSpec {
+            name: "paths".to_string(),
+            ty: "list<string>".to_string(),
+        }];
+        complete_args(&mut args, &specs).expect("completes");
+        assert_eq!(
+            args,
+            vec![NamedArg {
+                name: "paths".to_string(),
+                value: "[]".to_string()
+            }]
         );
     }
 
