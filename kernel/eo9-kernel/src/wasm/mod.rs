@@ -83,6 +83,13 @@ pub fn new_engine() -> Result<Engine, wasmtime::Error> {
     config.memory_guard_size(0);
     config.memory_init_cow(false);
     config.concurrency_support(true);
+    // Fuel metering. Compile-relevant (generated code carries the fuel decrements), so
+    // xtask's `precompile_for_kernel` sets exactly the same flag. Every store on this
+    // engine must be given fuel before guest code runs (`Store::set_fuel`); spawned shell
+    // children additionally slice their pool with `fuel_async_yield_interval` so a
+    // compute-bound child is preempted at quantum granularity instead of monopolizing the
+    // drive loop (plan/12: child fuel / preemption).
+    config.consume_fuel(true);
     // Without virtual memory wasmtime cannot flip page protections itself, so it asks the
     // embedder to "publish" code memory; on this machine that is D-cache clean + I-cache
     // invalidate over the range (see below), no page-permission flips.

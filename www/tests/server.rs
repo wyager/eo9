@@ -30,9 +30,23 @@ fn redirect_server_addr() -> SocketAddr {
 
 /// Send one raw HTTP/1.1 request (plus Host/Connection headers) and parse the response.
 fn request(addr: SocketAddr, method: &str, target: &str) -> HttpResponse {
+    request_with_headers(addr, method, target, &[])
+}
+
+/// Like [`request`], with extra request headers (`("Name", "value")` pairs).
+fn request_with_headers(
+    addr: SocketAddr,
+    method: &str,
+    target: &str,
+    extra_headers: &[(&str, &str)],
+) -> HttpResponse {
     let mut stream = TcpStream::connect(addr).expect("connect to test server");
-    let message =
-        format!("{method} {target} HTTP/1.1\r\nHost: eo9.org\r\nConnection: close\r\n\r\n");
+    let mut message =
+        format!("{method} {target} HTTP/1.1\r\nHost: eo9.org\r\nConnection: close\r\n");
+    for (name, value) in extra_headers {
+        message.push_str(&format!("{name}: {value}\r\n"));
+    }
+    message.push_str("\r\n");
     stream.write_all(message.as_bytes()).expect("send request");
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).expect("read response");
@@ -72,13 +86,104 @@ fn serves_css_and_svg_with_correct_content_types_and_caching() {
     let css = request(site_server_addr(), "GET", "/style.css");
     assert_eq!(css.status, 200);
     assert_eq!(css.header("Content-Type"), Some("text/css; charset=utf-8"));
-    assert_eq!(css.header("Cache-Control"), Some("public, max-age=86400"));
+    assert_eq!(css.header("Cache-Control"), Some("public, max-age=3600"));
 
     let svg = request(site_server_addr(), "GET", "/logo.svg");
     assert_eq!(svg.status, 200);
     assert_eq!(svg.header("Content-Type"), Some("image/svg+xml"));
-    assert_eq!(svg.header("Cache-Control"), Some("public, max-age=86400"));
+    assert_eq!(svg.header("Cache-Control"), Some("public, max-age=3600"));
     assert!(svg.body_text().contains("<svg"));
+
+    // The /vm manifest is the indirection point: never cached, so a new build is seen at once.
+    let manifest = request(site_server_addr(), "GET", "/vm/assets.json");
+    assert_eq!(manifest.status, 200);
+    assert_eq!(manifest.header("Content-Type"), Some("application/json"));
+    assert_eq!(manifest.header("Cache-Control"), Some("no-cache"));
+}
+
+#[test]
+fn fingerprinted_assets_are_immutable_and_unhashed() {
+    // Discover the fingerprinted blob URL via the manifest (its hash changes per build).
+    let manifest = request(site_server_addr(), "GET", "/vm/assets.json").body_text();
+    let blob_url = manifest
+        .split('"')
+        .find(|s| s.starts_with("/vm/web-eo9.") && s.ends_with(".wasm"))
+        .expect("manifest names a fingerprinted blob");
+
+    let blob = request(site_server_addr(), "GET", blob_url);
+    assert_eq!(blob.status, 200);
+    assert_eq!(blob.header("Content-Type"), Some("application/wasm"));
+    // Immutable + one year, and — crucially — NO ETag: the URL is the version, so the server
+    // never hashes the ~1 MiB body on the request path.
+    assert_eq!(
+        blob.header("Cache-Control"),
+        Some("public, max-age=31536000, immutable")
+    );
+    assert_eq!(blob.header("ETag"), None);
+
+    // An immutable asset never revalidates: an If-None-Match request gets a full 200, not a 304.
+    let conditional = request_with_headers(
+        site_server_addr(),
+        "GET",
+        blob_url,
+        &[("If-None-Match", "\"anything\"")],
+    );
+    assert_eq!(conditional.status, 200);
+    assert!(!conditional.body.is_empty());
+}
+
+#[test]
+fn conditional_requests_revalidate_with_a_304() {
+    // First request: a strong ETag comes back with the body.
+    let first = request(site_server_addr(), "GET", "/style.css");
+    assert_eq!(first.status, 200);
+    let etag = first.header("ETag").expect("ETag on a 200").to_owned();
+    assert!(etag.starts_with('"') && etag.ends_with('"'));
+    assert!(!first.body.is_empty());
+
+    // Revalidating with that ETag: 304, same validator, no body.
+    let revalidated = request_with_headers(
+        site_server_addr(),
+        "GET",
+        "/style.css",
+        &[("If-None-Match", &etag)],
+    );
+    assert_eq!(revalidated.status, 304);
+    assert_eq!(revalidated.header("ETag"), Some(etag.as_str()));
+    assert!(revalidated.body.is_empty());
+
+    // A stale validator gets the full body again.
+    let stale = request_with_headers(
+        site_server_addr(),
+        "GET",
+        "/style.css",
+        &[("If-None-Match", "\"0123456789abcdef\"")],
+    );
+    assert_eq!(stale.status, 200);
+    assert!(!stale.body.is_empty());
+
+    // The ETag is per representation: the brotli bytes of one file carry their own. Uses a
+    // non-fingerprinted compressible asset (vm.js) — fingerprinted assets are immutable and
+    // carry no ETag at all (see fingerprinted_assets_are_immutable_and_unhashed).
+    let plain = request(site_server_addr(), "GET", "/vm/vm.js");
+    let brotli = request_with_headers(
+        site_server_addr(),
+        "GET",
+        "/vm/vm.js",
+        &[("Accept-Encoding", "br")],
+    );
+    assert_ne!(plain.header("ETag"), brotli.header("ETag"));
+
+    // And a conditional request for the compressed representation revalidates too.
+    let brotli_etag = brotli.header("ETag").unwrap().to_owned();
+    let brotli_revalidated = request_with_headers(
+        site_server_addr(),
+        "GET",
+        "/vm/vm.js",
+        &[("Accept-Encoding", "br"), ("If-None-Match", &brotli_etag)],
+    );
+    assert_eq!(brotli_revalidated.status, 304);
+    assert!(brotli_revalidated.body.is_empty());
 }
 
 #[test]
@@ -144,6 +249,110 @@ fn query_strings_are_ignored_for_resolution() {
         response.header("Content-Type"),
         Some("text/css; charset=utf-8")
     );
+}
+
+#[test]
+fn every_response_carries_the_security_headers() {
+    // Pages, assets, and error responses all get the same security header set; HSTS is
+    // absent here because this listener is plain HTTP (the HTTPS tests assert its presence).
+    for target in ["/", "/style.css", "/no-such-page", "/try/", "/vm/"] {
+        let response = request(site_server_addr(), "GET", target);
+        assert_eq!(
+            response.header("X-Content-Type-Options"),
+            Some("nosniff"),
+            "target: {target}"
+        );
+        assert_eq!(
+            response.header("Referrer-Policy"),
+            Some("no-referrer"),
+            "target: {target}"
+        );
+        assert_eq!(
+            response.header("Cross-Origin-Opener-Policy"),
+            Some("same-origin"),
+            "target: {target}"
+        );
+        let csp = response
+            .header("Content-Security-Policy")
+            .unwrap_or_else(|| panic!("missing CSP on {target}"));
+        assert!(csp.contains("default-src 'self'"), "target: {target}");
+        assert!(csp.contains("'wasm-unsafe-eval'"), "target: {target}");
+        assert!(csp.contains("frame-ancestors 'none'"), "target: {target}");
+        assert_eq!(
+            response.header("Strict-Transport-Security"),
+            None,
+            "plain HTTP must not set HSTS (target: {target})"
+        );
+    }
+
+    // The redirect listener (also plain HTTP) carries them too.
+    let redirect = request(redirect_server_addr(), "GET", "/");
+    assert_eq!(redirect.header("X-Content-Type-Options"), Some("nosniff"));
+    assert_eq!(redirect.header("Strict-Transport-Security"), None);
+}
+
+#[test]
+fn precompressed_assets_are_served_by_content_negotiation() {
+    // The committed site tree carries .br/.gz siblings for the heavyweight assets
+    // (written by `cargo xtask precompress-site`); a client that accepts brotli gets the
+    // brotli bytes, a gzip-only client gets gzip, and a client that accepts neither gets
+    // the original — always with the original's Content-Type and a Vary on Accept-Encoding.
+    // The blob is fingerprinted; discover its current URL from the manifest.
+    let manifest = request(site_server_addr(), "GET", "/vm/assets.json").body_text();
+    let blob_url = manifest
+        .split('"')
+        .find(|s| s.starts_with("/vm/web-eo9.") && s.ends_with(".wasm"))
+        .expect("manifest names a fingerprinted blob")
+        .to_owned();
+    let plain = request(site_server_addr(), "GET", &blob_url);
+    assert_eq!(plain.status, 200);
+    assert_eq!(plain.header("Content-Encoding"), None);
+    assert_eq!(plain.header("Content-Type"), Some("application/wasm"));
+    assert_eq!(plain.header("Vary"), Some("Accept-Encoding"));
+
+    let brotli = request_with_headers(
+        site_server_addr(),
+        "GET",
+        &blob_url,
+        &[("Accept-Encoding", "gzip, deflate, br, zstd")],
+    );
+    assert_eq!(brotli.status, 200);
+    assert_eq!(brotli.header("Content-Encoding"), Some("br"));
+    assert_eq!(brotli.header("Content-Type"), Some("application/wasm"));
+    assert_eq!(brotli.header("Vary"), Some("Accept-Encoding"));
+    assert!(
+        brotli.body.len() < plain.body.len() / 2,
+        "brotli body ({}) should be far smaller than the original ({})",
+        brotli.body.len(),
+        plain.body.len()
+    );
+
+    let gzip = request_with_headers(
+        site_server_addr(),
+        "GET",
+        "/try/components/hello/hello.js",
+        &[("Accept-Encoding", "gzip")],
+    );
+    assert_eq!(gzip.status, 200);
+    assert_eq!(gzip.header("Content-Encoding"), Some("gzip"));
+    assert_eq!(
+        gzip.header("Content-Type"),
+        Some("text/javascript; charset=utf-8")
+    );
+    assert!(
+        !gzip.body.is_empty() && gzip.body[0..2] == [0x1f, 0x8b],
+        "gzip magic"
+    );
+
+    // Tiny files have no variants and are served identity-encoded even to willing clients.
+    let small = request_with_headers(
+        site_server_addr(),
+        "GET",
+        "/logo.svg",
+        &[("Accept-Encoding", "br, gzip")],
+    );
+    assert_eq!(small.status, 200);
+    assert_eq!(small.header("Content-Encoding"), None);
 }
 
 #[test]

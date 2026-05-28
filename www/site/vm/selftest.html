@@ -1,0 +1,19 @@
+<!doctype html>
+<!-- Automated self-test for the Eo9 web VM blob: loads the same blob with the same import
+     wiring as /vm/ (vm.js) and runs every non-interactive demo, writing one result line per
+     check into #results and a final PASS/FAIL verdict into #verdict (and document.title).
+     Used for headless-browser verification (e.g. `chrome --headless=new --dump-dom`); it is
+     also handy to open by hand. The interactive read-line demo is exercised on /vm/ itself. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Eo9 web VM self-test</title>
+</head>
+<body>
+<h1>Eo9 web VM self-test</h1>
+<pre id="terminal"></pre>
+<pre id="results"></pre>
+<pre id="verdict">RUNNING</pre>
+<script type="module" src="/vm/selftest.js"></script>
+</body>
+</html>

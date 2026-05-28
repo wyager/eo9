@@ -183,3 +183,20 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
         `GUEST_COMPONENTS`); `pci.deny`/`pci.filtered` implementations are deferred to area 09.
     (g) `wit/check.sh` now validates `pci`; no existing package changed. SPEC.md has no PCI section yet —
         a proposed paragraph went to the planner with this decision.
+
+15. **`fs-impl` moved from `eo9:fs/types` into `interface fs`; the `types` interface is gone (owner-approved
+    convention change; SPEC "Multi-instance imports and type identity", branch `area/02-fs-impl-in-interface`).**
+    (a) Rationale: resource identity is per *exporting instance*, so a root handle declared in a shared
+    types-only sibling forces every named import of `fs` to share one mint — which made two-slot consumers
+    (`fs.overlay`) ill-typed against independent leaves. Declaring the resource in the API interface itself
+    makes every named import mint its own root-handle type, exactly like the interface-local `file`/
+    `immutable-handle` resources already did. (b) `fs-optional` and the `*-config` interfaces now `use
+    fs.{fs-impl}`; the `none`/`deny`/`memfs` worlds no longer export a types interface; consumers that only
+    name the handle (fs.none, optional consumers) acquire a *types-only* import of `eo9:fs/fs`, which
+    `describe` classifies as authority-free (structurally: no functions) and the runtime satisfies
+    unconditionally with a resource-only `eo9:fs/fs` linker instance. (c) The CLI/embed `requires_fs`
+    pre-checks now skip authority-free imports (closing the old GAPS nit about types-only fs imports
+    demanding a grant); eosh's `envinfo` still classifies by the `/types`-suffix heuristic — no in-tree
+    program is affected (none import `fs-optional` yet), noted for a later pass. (d) text/time/entropy/disk/
+    net/pci keep their types-only siblings for now; migrate them opportunistically when they gain a
+    multi-instance consumer, using this decision as the template.

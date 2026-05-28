@@ -71,6 +71,10 @@
     and it applies the loader rule: a program's imports are checked against what the host provides,
     and a missing required import means the program is refused before it is instantiated. Use
     <code>grants</code>, <code>grant</code>, and <code>revoke</code> to see that from the outside.
+    To be precise about where the security lives: the polite refusal text is printed by this page's
+    launcher, but the enforcement is that a revoked capability is simply never put in the import
+    object handed to the module — going around the launcher doesn't get you the capability, it just
+    gets you a less helpful error.
   </p>
   <p>
     <strong>The prompt above is not eosh.</strong> It is a launcher with a handful of commands; the

@@ -77,6 +77,8 @@ pub(crate) fn add_providers(linker: &mut Linker<TaskState>, providers: &Provider
     }
     if providers.fs.is_some() {
         add_fs(linker)?;
+    } else {
+        add_fs_handle_only(linker)?;
     }
     if providers.exec.is_some() {
         add_exec(linker)?;
@@ -95,7 +97,7 @@ pub struct TextCap;
 pub struct TimeCap;
 /// Host representation of `eo9:entropy/types.entropy-impl`.
 pub struct EntropyCap;
-/// Host representation of `eo9:fs/types.fs-impl`.
+/// Host representation of `eo9:fs/fs.fs-impl`.
 pub struct FsCap;
 /// Host representation of `eo9:fs/fs.file`; the rep is the provider's file handle.
 pub struct FileRes;
@@ -287,9 +289,13 @@ type ConcurrentFuture<'a, R> = Pin<Box<dyn Future<Output = Result<R>> + Send + '
 // Always-available pieces: types, buffers, optional flavors
 // ---------------------------------------------------------------------------------------
 
-/// Register every types-only interface (the root-handle resources). These carry no
-/// authority: a handle is a token, and every operation that accepts one is defined on the
-/// capability interface, which is only linked when the capability was granted.
+/// Register every always-available root-handle resource. These carry no authority: a
+/// handle is a token, and every operation that accepts one is only linked when the
+/// capability was granted. For the APIs that still use a types-only sibling interface
+/// (text/time/entropy) the resource lives there; for `eo9:fs` it lives in the `fs`
+/// interface itself (SPEC: "Multi-instance imports and type identity"), so the resource
+/// is registered into that instance unconditionally and `add_fs` adds the operations
+/// only when the capability was granted.
 fn add_types(linker: &mut Linker<TaskState>) -> Result<()> {
     linker.instance("eo9:text/types@0.1.0")?.resource(
         "text-impl",
@@ -306,7 +312,15 @@ fn add_types(linker: &mut Linker<TaskState>) -> Result<()> {
         ResourceType::host::<EntropyCap>(),
         |_, _| Ok(()),
     )?;
-    linker.instance("eo9:fs/types@0.1.0")?.resource(
+    Ok(())
+}
+
+/// Register only the `eo9:fs/fs` root-handle resource — the always-available shape of the
+/// fs interface when the capability was *not* granted, so components that merely name the
+/// handle type (a types-only `use`, e.g. `fs.none` or an `fs-optional` consumer) still
+/// instantiate. The operations are added by `add_fs` only when fs was granted.
+fn add_fs_handle_only(linker: &mut Linker<TaskState>) -> Result<()> {
+    linker.instance("eo9:fs/fs@0.1.0")?.resource(
         "fs-impl",
         ResourceType::host::<FsCap>(),
         |_, _| Ok(()),
@@ -536,6 +550,7 @@ fn add_entropy(linker: &mut Linker<TaskState>) -> Result<()> {
 
 fn add_fs(linker: &mut Linker<TaskState>) -> Result<()> {
     let mut fs = linker.instance("eo9:fs/fs@0.1.0")?;
+    fs.resource("fs-impl", ResourceType::host::<FsCap>(), |_, _| Ok(()))?;
     add_default_handle::<FsCap>(&mut fs)?;
 
     // The file resources belong to the fs interface itself; dropping a handle tells the
@@ -1274,7 +1289,13 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
          -> Result<(Result<Resource<ExecImageRes>, WitCompileError>,)> {
             let exec = store.data_mut().exec_provider()?;
             let component = take_component(exec, component.rep())?;
-            let bytes = component.save();
+            // Feed the executor the `implements`-stripped form: plain-named slots (a
+            // renamed residual import, a multi-instance consumer) carry an annotation the
+            // pinned runtime's parser predates, so compiling the saved bytes would fail
+            // with an opaque parse error. `save`/`describe` keep the annotation; only the
+            // bytes handed to codegen drop it. (Identical to the saved bytes when there is
+            // no annotation, so a plain program is unaffected.)
+            let bytes = component.executable_bytes();
             Ok((match crate::image::Image::compile(&exec.engine, bytes) {
                 Ok(image) => {
                     let rep = exec.images.insert(image)?;

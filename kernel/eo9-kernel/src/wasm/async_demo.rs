@@ -90,6 +90,8 @@ fn run_sleepy() -> Result<u64, wasmtime::Error> {
     providers::add_providers(&mut linker)?;
 
     let mut store = Store::new(&engine, KernelState::new());
+    // The engine meters fuel (see `new_engine`); the demo gets an effectively-unlimited pool.
+    store.set_fuel(u64::MAX)?;
     let instance = super::block_on(
         "sleepy instantiation",
         linker.instantiate_async(&mut store, &component),
@@ -124,6 +126,8 @@ fn run_entropy_seeded() -> Result<(u64, u64), wasmtime::Error> {
     // The seeded stub world imports nothing; an empty linker is the correct environment.
     let linker: Linker<KernelState> = Linker::new(&engine);
     let mut store = Store::new(&engine, KernelState::new());
+    // The engine meters fuel (see `new_engine`); the demo gets an effectively-unlimited pool.
+    store.set_fuel(u64::MAX)?;
     let instance = super::block_on(
         "entropy.seeded instantiation",
         linker.instantiate_async(&mut store, &component),

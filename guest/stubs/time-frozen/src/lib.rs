@@ -8,6 +8,12 @@
 //!
 //! `resolution()` reports `u64::MAX`: a clock that never advances has no meaningful
 //! granularity, so it reports the coarsest possible one.
+//!
+//! Used without `configure`, the clock falls back to the documented default instant —
+//! 2000-01-01T00:00:00 UTC ([`DEFAULT_NOW_SECONDS`]) with a monotonic origin of 0
+//! ([`DEFAULT_MONOTONIC_NS`]) — on first use, so plain `time.frozen $ program` works and
+//! never traps; `configure` (or the shell's `--now-seconds`/`--monotonic-ns` flags)
+//! overrides it (plan/09 Decision 14, the option-C default-configuration rule).
 
 #![no_std]
 
@@ -33,6 +39,24 @@ struct Frozen {
 }
 
 static STATE: ProviderState<Frozen> = ProviderState::new();
+
+/// The documented default frozen instant: 2000-01-01T00:00:00 UTC.
+pub const DEFAULT_NOW_SECONDS: i64 = 946_684_800;
+
+/// The documented default monotonic reading: the origin.
+pub const DEFAULT_MONOTONIC_NS: u64 = 0;
+
+/// Run `f` over the frozen instant, binding the documented default first if `configure`
+/// never ran (the option-C default-configuration rule, plan/09 Decision 14).
+fn with_state<R>(f: impl FnOnce(&mut Frozen) -> R) -> R {
+    if !STATE.is_set() {
+        STATE.set(Frozen {
+            now_seconds: DEFAULT_NOW_SECONDS,
+            monotonic_ns: DEFAULT_MONOTONIC_NS,
+        });
+    }
+    STATE.with(f)
+}
 
 /// The `time.frozen` provider.
 struct Stub;
@@ -62,14 +86,14 @@ impl time::Guest for Stub {
     }
 
     fn now(_t: time::TimeImplBorrow<'_>) -> Datetime {
-        STATE.with(|frozen| Datetime {
+        with_state(|frozen| Datetime {
             seconds: frozen.now_seconds,
             nanoseconds: 0,
         })
     }
 
     fn monotonic_now(_t: time::TimeImplBorrow<'_>) -> Instant {
-        STATE.with(|frozen| Instant {
+        with_state(|frozen| Instant {
             nanoseconds: frozen.monotonic_ns,
         })
     }

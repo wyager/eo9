@@ -5,16 +5,13 @@
 /// the way up the tree — not yet specified here.
 package eo9:fs@0.1.0;
 
-/// Root-handle type, shared by the required and `-optional` flavors.
-/// (Types-only interface — see plan/02-wit.md Decisions.)
-interface types {
-    /// The filesystem capability's root handle.
-    resource fs-impl;
-}
-
 interface fs {
     use eo9:io/buffers@0.1.0.{buffer};
-    use types.{fs-impl};
+
+    /// The filesystem capability's root handle. Declared in the API interface itself
+    /// (not in a types-only sibling) so every named import of `fs` mints its own
+    /// root-handle type — see SPEC: "Multi-instance imports and type identity".
+    resource fs-impl;
 
     /// The capability's root handle (see SPEC: The capability algebra).
     default: func() -> fs-impl;
@@ -111,7 +108,7 @@ interface fs {
 
 /// Optional flavor of `fs` (hand-written for v0; see SPEC: The capability algebra).
 interface fs-optional {
-    use types.{fs-impl};
+    use fs.{fs-impl};
 
     /// `none` when the capability was not granted.
     default: func() -> option<fs-impl>;
@@ -120,31 +117,29 @@ interface fs-optional {
 /// Compose-time configuration entry for fs.deny: `configure` returns the root handle
 /// that the exported `fs` serves via `default()` (see SPEC: Binary or provider, never both).
 interface deny-config {
-    use types.{fs-impl};
+    use fs.{fs-impl};
     configure: async func() -> result<fs-impl, string>;
 }
 
 /// Compose-time configuration entry for fs.readonly (same convention as `deny-config`).
 interface readonly-config {
-    use types.{fs-impl};
+    use fs.{fs-impl};
     configure: async func() -> result<fs-impl, string>;
 }
 
 /// Compose-time configuration entry for fs.memfs (same convention as `deny-config`).
 interface memfs-config {
-    use types.{fs-impl};
+    use fs.{fs-impl};
     configure: async func() -> result<fs-impl, string>;
 }
 
 /// fs.none — absence: exports the optional flavor answering `none`.
 world none {
-    export types;
     export fs-optional;
 }
 
 /// fs.deny — refusal: exports `fs` with every operation failing with `denied`.
 world deny {
-    export types;
     export fs;
     export deny-config;
 }
@@ -159,7 +154,6 @@ world readonly {
 
 /// fs.memfs — a RAM-backed filesystem (deterministic; the standard scratch/test fs).
 world memfs {
-    export types;
     export fs;
     export memfs-config;
 }

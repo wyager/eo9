@@ -36,7 +36,6 @@ mod bindings {
             "eo9:io/buffers@0.1.0": eo9_guest::api::io::buffers,
             "eo9:text/types@0.1.0": eo9_guest::api::text::types,
             "eo9:text/text@0.1.0": eo9_guest::api::text::text,
-            "eo9:fs/types@0.1.0": eo9_guest::api::fs::types,
             "eo9:fs/fs@0.1.0": eo9_guest::api::fs::fs,
         },
     });

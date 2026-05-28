@@ -48,7 +48,7 @@ mod slots;
 mod synth;
 
 pub use component::Component;
-pub use compose::{compose, extend};
+pub use compose::{ComposeWarning, compose, compose_checked, extend};
 pub use configure::configure;
 pub use error::{ComposeError, ConfigureError, LoadError, RenameError, RestrictError};
 pub use rename::rename;
@@ -77,6 +77,9 @@ pub struct ImportNeed {
     pub version: String,
     /// Mandatory vs. optional import.
     pub required: bool,
+    /// Whether the imported interface carries no authority (it has no functions, only
+    /// types) — e.g. a types-only `use` of an API interface, or an `eo9:*/types` sibling.
+    pub authority_free: bool,
 }
 
 /// One export slot: a name carrying an interface and version.

@@ -124,7 +124,6 @@ macro_rules! __bindings_with {
         $crate::__bindings_with!(
             apis [$($rest)*]
             with [$($acc)*
-                "eo9:fs/types@0.1.0": eo9_guest::api::fs::types,
                 "eo9:fs/fs@0.1.0": eo9_guest::api::fs::fs,
             ]
             $($tail)*

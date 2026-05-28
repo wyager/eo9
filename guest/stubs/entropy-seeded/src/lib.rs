@@ -5,6 +5,11 @@
 //! `fs.memfs`, `time.frozen`, and `disk.mem` this forms the deterministic environment of
 //! integration milestone I2 — the same seed always produces the same byte stream.
 //!
+//! Used without `configure`, the provider falls back to the documented default seed
+//! [`DEFAULT_SEED`] (`0xE09`) on first use, so plain `entropy.seeded $ program` is
+//! deterministic out of the box and never traps; `configure` (or the shell's `--seed`
+//! flag) overrides it (plan/09 Decision 14, the option-C default-configuration rule).
+//!
 //! Not cryptographically secure; it is a reproducible stand-in for tests and
 //! deterministic runs (see SPEC.md, "Entropy API").
 
@@ -28,6 +33,18 @@ use exports::eo9::entropy::types;
 
 /// The PRNG state: the SplitMix64 counter, bound by `configure`.
 static STATE: ProviderState<u64> = ProviderState::new();
+
+/// The documented default seed, used when the provider is composed without `configure`.
+pub const DEFAULT_SEED: u64 = 0xE09;
+
+/// Run `f` over the PRNG state, binding the documented default seed first if `configure`
+/// never ran (the option-C default-configuration rule, plan/09 Decision 14).
+fn with_state<R>(f: impl FnOnce(&mut u64) -> R) -> R {
+    if !STATE.is_set() {
+        STATE.set(DEFAULT_SEED);
+    }
+    STATE.with(f)
+}
 
 /// One step of SplitMix64: advance the counter and return the next 64-bit output.
 fn next_u64(counter: &mut u64) -> u64 {
@@ -64,7 +81,7 @@ impl entropy::Guest for Stub {
 
     fn get_bytes(_e: entropy::EntropyImplBorrow<'_>, len: u64) -> Vec<u8> {
         let len = usize::try_from(len).unwrap_or(usize::MAX);
-        STATE.with(|counter| {
+        with_state(|counter| {
             let mut bytes = Vec::with_capacity(len);
             while bytes.len() < len {
                 let word = next_u64(counter).to_le_bytes();
@@ -76,7 +93,7 @@ impl entropy::Guest for Stub {
     }
 
     fn get_u64(_e: entropy::EntropyImplBorrow<'_>) -> u64 {
-        STATE.with(next_u64)
+        with_state(next_u64)
     }
 }
 

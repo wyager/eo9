@@ -222,6 +222,7 @@ impl Meta {
                     interface: i.interface.clone(),
                     version: i.version.clone(),
                     required: i.required,
+                    authority_free: i.authority_free,
                 })
                 .collect(),
             exports: self

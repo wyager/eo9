@@ -1,0 +1,9 @@
+{
+  "blob": "/vm/web-eo9.2f44fff520b5063d.wasm",
+  "store": {
+    "cruncher": "/vm/store/cruncher.c9cd26b092f3ec15.cwasm",
+    "hello": "/vm/store/hello.ad989e33ee2f4660.cwasm",
+    "outcomes": "/vm/store/outcomes.4ccba9dfa10b997d.cwasm",
+    "sleepy": "/vm/store/sleepy.0f0fafc8b008d00f.cwasm"
+  }
+}
