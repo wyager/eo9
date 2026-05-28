@@ -189,16 +189,42 @@ async function main() {
     },
   };
   try {
+    if (typeof WebAssembly !== "object") {
+      throw new Error("this browser has no WebAssembly support");
+    }
     const response = await fetch("/vm/web-eo9.wasm");
-    if (!response.ok) throw new Error(`fetch failed: ${response.status}`);
-    const { instance } = await WebAssembly.instantiateStreaming(response, imports);
-    exports = instance.exports;
+    if (!response.ok) {
+      throw new Error(`fetching /vm/web-eo9.wasm failed: HTTP ${response.status}`);
+    }
+    // Prefer streaming compilation; fall back to buffering the bytes if the engine refuses
+    // (older engines, or a misconfigured Content-Type on the response).
+    let result = null;
+    if (typeof WebAssembly.instantiateStreaming === "function") {
+      try {
+        result = await WebAssembly.instantiateStreaming(response.clone(), imports);
+      } catch {
+        result = null;
+      }
+    }
+    if (result === null) {
+      result = await WebAssembly.instantiate(await response.arrayBuffer(), imports);
+    }
+    exports = result.instance.exports;
     exportsRef = exports;
     memory = exports.memory;
   } catch (error) {
+    // Report the actual cause; don't blame missing WebAssembly support for a network or
+    // server problem.
     output.textContent = "";
     writeLine(`could not load the Eo9 blob: ${error}`, "vm-error");
-    writeLine("(this page needs a browser with WebAssembly enabled)", "vm-error");
+    if (typeof WebAssembly !== "object") {
+      writeLine("(this page needs a browser with WebAssembly enabled)", "vm-error");
+    } else {
+      writeLine(
+        "(the message above is the real cause — usually the blob failed to download; the browser console has details)",
+        "vm-error",
+      );
+    }
     return;
   }
 
