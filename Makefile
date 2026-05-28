@@ -37,6 +37,7 @@ setup:
 	  && echo "  ok       qemu-system-aarch64" \
 	  || { echo "  optional qemu-system-aarch64 not found — only needed for 'make qemu'; install it with"; \
 	       echo "           your package manager (e.g. 'brew install qemu' / 'apt install qemu-system-arm')"; }
+	-@cargo xtask doctor
 
 # `make shell` uses a repo-local store (target/eo9-store) so the session always matches the
 # components that were just built, and never collides with an older ~/.eo9 store from a
