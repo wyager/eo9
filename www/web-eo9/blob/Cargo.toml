@@ -25,3 +25,7 @@ wasmtime = { version = "45.0.0", default-features = false, features = [
     "component-model-async",
     "component-model-async-fiberless",
 ] }
+# The component algebra (the `eo9:exec` surface eosh imports). `default-features = false`
+# = the no_std build, exactly as the bare-metal kernel links it; its closure is patched to
+# the vendored no_std crates in the workspace `[patch.crates-io]` (see the workspace manifest).
+eo9-component = { path = "../../../crates/eo9-component", default-features = false }

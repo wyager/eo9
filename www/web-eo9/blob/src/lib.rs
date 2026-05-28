@@ -26,6 +26,7 @@ use wasmtime::{Config, CustomCodeMemory, Engine, Store};
 mod fs;
 mod host;
 mod providers;
+mod exec;
 mod store;
 
 fn out(message: &str) {
@@ -321,6 +322,14 @@ pub extern "C" fn run_entropy(seed_lo: u32, seed_hi: u32, count: u32) -> i32 {
     let seed = (u64::from(seed_hi) << 32) | u64::from(seed_lo);
     let count = count.clamp(1, 64);
     report("entropy", entropy::run(seed, count))
+}
+
+/// Run the real component algebra (`eo9-component`) in the browser on a raw component —
+/// load, describe, `only`-restrict — then execute the same component via Pulley. The
+/// foundation of the in-browser `eo9:exec` surface eosh imports.
+#[unsafe(no_mangle)]
+pub extern "C" fn algebra_demo() -> i32 {
+    report("algebra", exec::algebra_demo())
 }
 
 // --- milestone 2: real programs from the HTTP store, awaits parked on the browser ---------
