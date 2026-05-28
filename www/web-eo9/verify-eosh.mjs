@@ -89,6 +89,7 @@ inputQueue = [
   // dropping a required capability is refused (restrict: required-outside-allow).
   "only eo9:text/text,eo9:time/time $ hello --name boxed --excited true",
   "only eo9:text/text $ echo --text restricted",
+  "only eo9:text $ echo --text shorthand",
   "only eo9:text/text $ hello --name nope --excited true",
   // a `provider $ consumer` composition: entropy.seeded (a /bin provider) feeds rng. The fused
   // result has no pre-AOT'd artifact, so the blob compiles it *in-blob* (Cranelift -> Pulley) and
@@ -132,6 +133,7 @@ const checks = [
   ],
   ["only admitting text+time runs hello", /Hello, boxed/.test(interactive)],
   ["only-text runs a text-only program", /restricted/.test(interactive)],
+  ["only with the package shorthand (eo9:text) runs echo", /shorthand/.test(interactive)],
   ["only-text refuses hello (needs time)", !/Hello, nope/.test(interactive)],
   // The composition was NOT refused — it compiled inside the blob and ran (3 rng numbers),
   // with no server reachable from this harness at all.

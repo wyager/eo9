@@ -541,3 +541,36 @@ the bare `<input>` row.
 *succeeds* fiberlessly (`sleepy.run() measured ~52 ms across its await`), so the check's
 expectation (non-zero rc + a "stackful" line) is stale. Whether the canary's purpose changed or
 the check should now assert success is the blob owner's call.
+
+## Decision 24 — variadic coreutil arguments in the blob; the sleepy expectation flips to success
+
+The positional/variadic argument merge re-signatured the path-taking coreutils to a trailing
+`paths: list<string>` (and `head` to `(lines: u64, paths: list<string>)`), which the committed /vm
+store assets and the blob's two argument paths did not yet understand.
+
+**What changed**
+- The blob's WAVE-lite codec (`execsurface.rs`) now parses `list<T>` values (top-level-comma split,
+  quotes/brackets respected) and `bind_args` defaults a *missing* `list<…>` argument to the empty
+  list, mirroring the host binder's empty-tail rule — so a bare `ls` works at the browser eosh
+  prompt exactly like it does natively.
+- The page program-row table (`store.rs`) gained `ArgKind::TextList`: a trailing variadic field that
+  collects zero or more values into a `list<string>` (`cat`, `ls`, `wc`, `stat`, `rm`, `touch`, and
+  `head`'s new `lines`-then-`paths` order).
+- `cargo xtask build-web-vm` regenerated the store (new fingerprints for the seven re-signatured
+  coreutils) and the blob (which also picks up the rebuilt eosh with positional/variadic binding);
+  `check-web-vm` is green against the committed assets.
+- Harnesses: `verify-coreutils.mjs` covers multi-path `cat`, a bare `ls`, and `head 2 <path>`;
+  `verify-eosh.mjs` drives `cat /welcome.txt /docs/about.txt`, a bare `ls`, and the `only eo9:text`
+  package shorthand at the interactive prompt. All four node/JSPI harnesses pass (coreutils 14/14,
+  eosh 16/16, fs, exec).
+- The stale selftest expectation from D23 is resolved the way the observed behaviour dictates:
+  `run_sleepy` on the current blob *succeeds* (`sleepy.run() measured ~52 ms across its await`,
+  rc 0), so `selftest.js` now asserts success-and-measured rather than the old refusal. The /vm page
+  copy describing the canary as a reported limitation was updated to match. (The `store.rs`
+  `run_sleepy` doc comment still describes the old refusal framing — comment-only, left for a later
+  blob rebuild to avoid churning the fingerprint for a no-code change.)
+
+**Noted, not addressed here:** the kernel's scalar WAVE arg codec still lacks the empty-tail
+default for a missing trailing `list<string>` (bare `ls` on metal), and the pre-existing clippy
+findings in `web-eo9-blob` (`not_unsafe_ptr_arg_deref` on the exported `extern "C"` entry points,
+one `collapsible_if`) remain — the web-eo9 workspace is not in any clippy gate.
