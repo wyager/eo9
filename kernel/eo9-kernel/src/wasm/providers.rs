@@ -47,8 +47,9 @@ pub struct KernelState {
     entropy_state: u64,
     /// Resource limits enforced where wasm asks the host for memory/tables (set at spawn).
     limits: KernelLimits,
-    /// The shell session's state (fs view, buffers, exec tables) — present only on the
-    /// store that runs eosh; ordinary programs and children carry `None`.
+    /// The session's state (fs view, buffers, exec tables) — present on the store that
+    /// runs eosh and on every spawned child (children inherit the full session
+    /// environment); headless demo runs carry `None`.
     #[cfg(feature = "wasm-store")]
     pub shell: Option<alloc::boxed::Box<super::shell::ShellState>>,
 }

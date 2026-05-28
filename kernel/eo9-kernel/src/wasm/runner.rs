@@ -53,8 +53,11 @@ pub fn boot(bootargs: Option<&str>) -> bool {
     let (program, args) = parse_command_line(bootargs);
 
     // The bare `demo` token keeps the original boot sequence reachable:
-    // `cargo xtask qemu aarch64 demo`.
+    // `cargo xtask qemu aarch64 demo`. The scheduling/preemption demonstration runs first
+    // (it needs the store image), then main.rs continues with the original sequence
+    // (seed, hello, the async demos, on-target codegen).
     if program.is_none() && tokenize(bootargs).iter().any(|token| token == "demo") {
+        super::shellexec::preemption_demo(entries);
         return false;
     }
 
@@ -152,6 +155,23 @@ fn run_entry(entry: &StoreEntry, args: &[(String, String)]) {
 }
 
 fn try_run(entry: &StoreEntry, args: &[(String, String)]) -> Result<String, wasmtime::Error> {
+    // `max-fuel=<units>` is an option of the runner itself — the headless counterpart of
+    // usermode `eo9 run --max-fuel` — not an argument of the program: a hard budget on the
+    // run's fuel; exhausting it ends the run with `abnormal(killed)`.
+    let mut max_fuel: Option<u64> = None;
+    let mut program_args: Vec<(String, String)> = Vec::new();
+    for (key, value) in args {
+        if key == "max-fuel" {
+            max_fuel = Some(value.parse().map_err(|err| {
+                wasmtime::Error::msg(format!(
+                    "invalid max-fuel value `{value}` (fuel units expected): {err}"
+                ))
+            })?);
+        } else {
+            program_args.push((key.clone(), value.clone()));
+        }
+    }
+
     let engine = super::new_engine()?;
 
     // SAFETY: the artifact comes from the store image produced by `cargo xtask
@@ -163,6 +183,11 @@ fn try_run(entry: &StoreEntry, args: &[(String, String)]) -> Result<String, wasm
     providers::add_providers(&mut linker)?;
 
     let mut store = Store::new(&engine, KernelState::new());
+    // The engine meters fuel (see `new_engine`). A headless run gets the whole budget in
+    // one pool: effectively unlimited by default, or exactly `max-fuel=<units>` when given.
+    // No yield interval here — there is nothing to interleave with, and the long-standing
+    // executor watchdog applies to wedged (pending) operations, not to running guest code.
+    store.set_fuel(max_fuel.unwrap_or(u64::MAX))?;
     let instance = super::block_on(
         "instantiation",
         linker.instantiate_async(&mut store, &component),
@@ -173,9 +198,23 @@ fn try_run(entry: &StoreEntry, args: &[(String, String)]) -> Result<String, wasm
         .ok_or_else(|| wasmtime::Error::msg("component does not export `main`"))?;
     let signature = main.ty(&store);
 
-    let params = build_params(&signature, args).map_err(wasmtime::Error::msg)?;
+    let params = build_params(&signature, &program_args).map_err(wasmtime::Error::msg)?;
     let mut results: Vec<Val> = signature.results().map(|_| Val::Bool(false)).collect();
-    super::block_on("main()", main.call_async(&mut store, &params, &mut results))??;
+    let call = super::block_on("main()", main.call_async(&mut store, &params, &mut results))?;
+    if let Err(error) = call {
+        // Out of fuel is the budget being enforced, not a failure of the runner: report it
+        // the way usermode reports an exhausted `--max-fuel` budget (abnormal / killed).
+        if matches!(
+            error.downcast_ref::<wasmtime::Trap>(),
+            Some(wasmtime::Trap::OutOfFuel)
+        ) {
+            let budget = max_fuel.unwrap_or(u64::MAX);
+            return Ok(format!(
+                "abnormal(killed) — the fuel budget of {budget} units was exhausted"
+            ));
+        }
+        return Err(error);
+    }
 
     Ok(results
         .first()

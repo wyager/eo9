@@ -8,8 +8,10 @@
 //! * **fs** — a read-only view of the baked-in store image: `/bin/<name>.wasm` per store
 //!   entry plus the `/session` manifest (src/wasm/shellfs.rs);
 //! * **exec** — component-algebra/compile/task backed by the store image and the child
-//!   drive loop (src/wasm/shellexec.rs); children receive the kernel root providers
-//!   (text/time/entropy), never fs or exec — the same child policy as usermode.
+//!   drive loop (src/wasm/shellexec.rs); children inherit the full session environment
+//!   (text/time/entropy, the read-only store fs, io buffers, and exec) every generation —
+//!   the same inherit-everything default as usermode, restricted with `only` — so a nested
+//!   `eosh` is a full peer.
 //!
 //! The session manifest (`eo9-session 1` format, plan/10 D9) is generated here so eosh's
 //! `env` builtin can show the capability picture of this machine.
@@ -59,7 +61,9 @@ pub fn boot_to_eosh(entries: &'static [StoreEntry]) {
 
 /// The session manifest eosh's `env` builtin reads from `/session` (the `eo9-session 1`
 /// format from plan/10 D9 / plan/11 D12 — keep in sync with eosh-core's `envinfo`).
-fn session_manifest(entries: &'static [StoreEntry]) -> String {
+/// Children read the same manifest through their own fs view (they inherit the full
+/// session environment, so the picture it paints is theirs too).
+pub(super) fn session_manifest(entries: &'static [StoreEntry]) -> String {
     let names: alloc::vec::Vec<&str> = entries.iter().map(|entry| entry.name).collect();
     let mut lines = vec![
         String::from("eo9-session 1"),
@@ -69,8 +73,14 @@ fn session_manifest(entries: &'static [StoreEntry]) -> String {
         String::from("child text PL011 serial console (shared with the shell)"),
         String::from("child time generic timer + PL031 RTC"),
         String::from("child entropy counter-seeded splitmix64 (a stub, not a CSPRNG)"),
-        String::from("note programs get no filesystem on bare metal yet"),
-        String::from("note children never receive the exec capability"),
+        String::from(
+            "child fs the same read-only store image view (programs under /bin, /session)",
+        ),
+        String::from(
+            "child exec spawn programs as children (the full session environment is inherited, every generation)",
+        ),
+        String::from("note programs get no writable filesystem on bare metal yet"),
+        String::from("note restrict a command with `only` to strip capabilities before it runs"),
         if cfg!(feature = "wasm-codegen") {
             String::from(
                 "note the store is read-only and baked into the kernel image; compositions \
@@ -134,6 +144,11 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
         engine: engine.clone(),
     }));
     let mut store = Store::new(&engine, state);
+    // The engine meters fuel (see `new_engine`); the shell itself runs from an
+    // effectively-unlimited pool — its own guest code is the parser/evaluator, and the
+    // heavy work (children, on-target compilation) happens elsewhere. Children get their
+    // own sliced pools in `shellexec::spawn_child`.
+    store.set_fuel(u64::MAX)?;
 
     let instance = super::block_on(
         "eosh instantiation",
