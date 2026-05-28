@@ -109,3 +109,10 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
     capability, which this session does not provide to it". `load`/`rename`/`compile` keep the generic
     rendering for now. Guest-SDK panic messages are still discarded by the panic handler (preserving them
     needs either a hidden import or a new diagnostic channel — owner design call, see GAPS).
+11. **`only` package shorthand (2026-05-27).** An `only` allow-list entry may name a whole package
+    (`eo9:text`) as well as a single interface (`eo9:text/text`); a package entry admits every interface of
+    that package the consumer imports. Every user-study persona tripped on the full-ref-only requirement.
+    Implemented entirely in `eo9-component`'s `restrict` (allow-list validation now accepts a `namespace:package`
+    entry with no `/interface`, and `admitted` matches by package prefix when the entry has no `/`); eosh's
+    `parse_allow_entry` already passed a package-only word through unchanged, and full refs are unchanged.
+    Covered by `tests/eo9-integration/tests/only_shorthand.rs`.
