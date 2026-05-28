@@ -162,3 +162,35 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     validates (covered by `tests/eo9-integration/tests/overlay.rs`). The describe surface gained an
     `authority_free` flag on `ImportNeed` (computed structurally: an imported interface with no functions),
     which the CLI/embed `requires_fs` checks now respect.
+
+15. **Configured interposition (middleware-over-provider, both configured) still traps — root cause
+    characterized, fix deferred.** The PL user-study finding 1 (`time.frozen --… $ time.fuzzy --… $ hello`
+    and the `&` form trap; each provider works alone; the unconfigured chain works) is the configuration
+    binder's gate: it async-lowers the provider's `configure` and requires eager completion, and a
+    `configure` that itself calls through another composed provider (time.fuzzy's `configure` obtains the
+    underlying clock handle from the layer below) does not complete eagerly under wasmtime 45 in that
+    nesting. The gate cannot simply wait: it runs inside synchronously-lifted forwarders, and a sync-lifted
+    task may not block (verified empirically — a park-and-wait gate produces "cannot block a synchronous
+    task before returning", and sync-lowering the `configure` call instead breaks the previously-working
+    single-binder cases). The real fix is making the binder fully event-driven (async-callback lifts for
+    every forwarder with a two-phase configure-then-forward state machine that saves the original call's
+    arguments across the wait) or runtime-level support; both exceed this pass. Recorded as an ignored
+    regression test (`tests/eo9-integration/tests/interposition.rs`, the two configured cases) with the
+    plain-default chain kept active as a guard; the shape stays listed in GAPS until the binder rework.
+16. **Compose diagnostics, the split-identity wiring rule, and executable bytes.** Three changes from the
+    same study: (a) `compose` no longer wires a types-only (authority-free) import from a provider that
+    does not also satisfy the package's authority interface — wiring just the types splits the package's
+    nominal resource identity between two implementers and the encoded composition fails validation (the
+    `X.none $ consumer` shape; `time.none`/`text.none`/`entropy.none` were still affected after the fs
+    move). Such imports stay residual, which is what the drop law wants anyway. (b) `compose_checked` is the
+    new entry point reporting `ComposeWarning::ProviderExportsUnused` when a provider contributes nothing
+    (the spec-promised dead-layer warning; `compose` keeps its signature and discards warnings), and a
+    provider that offers only `X-config` for a required `X` is refused with an "apply `configure(…)`" hint
+    (the SPEC export-shape rule). Surfacing the warning in eosh/the CLI needs the host-side exec WIT to
+    carry it — follow-up for areas 02/04/10. (c) `Component::executable_bytes()` strips the purely
+    descriptive `implements` extern-name annotations so a renamed-but-residual slot (e.g.
+    `rename eo9:time/time wallclock $ hello`) yields an artifact the pinned runtime can parse; `bytes()`
+    keeps the annotation so describe/round-tripping stay lossless. The runtime/CLI/kernel compile paths
+    should adopt `executable_bytes()` (one-line change each, outside this area) — until they do, running a
+    renamed-residual artifact still fails with the parse error. Covered by
+    `tests/eo9-integration/tests/compose_diagnostics.rs` and the corpus soundness test below.

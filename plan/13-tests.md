@@ -130,3 +130,10 @@ Everything; starts alongside Phase 1 (law tests) and grows with each milestone.
     it stays queued for milestone 3 (gates I3) alongside fuel-conservation accounting.
 13. **Test-group counts after milestone 2** (30 total): capabilities 8, deterministic-env 5,
     runtime-rules 4, CLI transcripts 3, determinism 5, kill/linearity 2, harness self-checks 3.
+14. **Encoder-soundness corpus (the PL study's obligation, bounded form).**
+    `tests/eo9-integration/tests/soundness_corpus.rs` composes every shipped stub provider over a corpus of
+    real consumers and asserts the result is either a validated component or a *typed* refusal — never an
+    internal wiring/encoding failure. This is the deterministic slice of the requested generative property
+    suite (it caught the `time.none`/`text.none`/`entropy.none` split-identity failures on first run); the
+    fully generative suite over synthetic component triples (resources, types-siblings, multi-slot,
+    stateful configured providers) plus an observational action-law check stays queued for this area.
