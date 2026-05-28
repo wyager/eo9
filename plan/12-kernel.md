@@ -801,3 +801,37 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
       console (input goes to the innermost active reader); eosh itself still has no interrupt key, so a
       foreground spinner still occupies the *prompt* even though the machine, other children, and the kill
       path all keep working; the idle-wake interval (10 ms) bounds await-point latency as before.
+
+39. **Metal depth hardening — UART RX interrupt + event-driven `wfi` idle (2026-05-27).** Item 1 of the
+    D38-follow-up list. Previously the idle path armed a fixed 10 ms timer and re-polled `read-line` on every
+    wake (~1% host CPU at the prompt) and a compute-bound child in the *interactive* shell advanced only one
+    fuel quantum per wake. Now:
+    - **Receive is interrupt-driven.** `enable_rx_interrupt` unmasks the PL011 RX + RX-timeout interrupts;
+      the GIC forwards UART SPI 33 (added to the enable list in main.rs); `kirq` calls `uart::drain_rx`, which
+      empties the RX FIFO into a small SPSC ring (`RX_RING`, IRQ = sole producer, the boot core's `read-line`
+      = sole consumer) and clears the UART interrupt. `ReadLine` now consumes from the ring (`ring_get_byte`)
+      rather than polling the data register. A keystroke therefore wakes `wfi` directly.
+    - **Idle is event-driven and deadline-precise.** `idle_wait(child_running)` arms the timer to the earliest
+      deadline a parked future requested (`SleepUntil` → `request_timer_wake`, taking the min), capped by a
+      backstop: short (10 ms) when a child is still running so it keeps getting turns, long (1 s) at the bare
+      prompt where input arrives as a UART interrupt. So a `sleep` wakes at its actual deadline and an idle
+      prompt sleeps ~1 s at a time (measured host CPU at the prompt: 0.7% on the first sample then 0.0%,
+      vs the previous steady ~0.8%). The `wfi` runs with IRQ masked (`daifset`/`daifclr` around it) so an
+      interrupt that becomes pending in the poll→`wfi` window still wakes it — no lost-wakeup race.
+    - **Runnable children no longer wait on `wfi`.** `drive_children` returns a `DriveStatus`; the
+      flag-`ChildWaker` records whether a child's poll rang its waker (a fuel yield does; a host-future park
+      does not). The interactive loop re-polls immediately while any child is runnable (full-speed compute,
+      an improvement over the old one-quantum-per-tick) and only `wfi`s when nothing is runnable.
+    - Verified: `cargo xtask ci` green; `qemu demo` reproduces the preemption demo + hello + sleepy (57 ms ≥
+      50) + on-target codegen unchanged; interactive `qemu` runs `hello`/`cruncher` and `exit` over the now
+      interrupt-driven console; idle CPU ~0% (above). Stale "PSTATE.I stays masked / timer is the only source"
+      comments in exceptions.rs updated; gic.rs/timer.rs module docs still describe the original masked design
+      and are a doc-only follow-up.
+    - **Not done this pass (the rest of D38, precise next steps):** (2) a Ctrl-C interrupt key — now cheap
+      given the RX ring: have `drive_children` (or the exec `wait` path) scan the ring for `0x03` while a
+      foreground child runs and route it to the existing kill path, tracking which child is foreground;
+      (3) parent-kill cascade — give `ChildSlot`/the registry a parent rep and have `kill` recurse;
+      (4) per-child hard cap — a per-exec-holder counter + a bounded child-fuel pool in `spawn_child`
+      (mirroring usermode `--max-fuel`); (5) W^X for JIT pages — split the publisher's identity mapping so
+      code pages are mapped executable-not-writable after the cache maintenance (needs mmu.rs page-permission
+      support).
