@@ -146,7 +146,7 @@ fn bind_args(params: &[ArgSpec], flags: &[(String, String)]) -> Vec<NamedArg> {
 fn requires_fs(imports: &[ImportNeed]) -> bool {
     imports
         .iter()
-        .any(|need| need.required && need.interface.starts_with("eo9:fs/"))
+        .any(|need| need.required && !need.authority_free && need.interface.starts_with("eo9:fs/"))
 }
 
 /// Render the executor's view of how the task ended as the spec's three-way
@@ -235,13 +235,23 @@ mod tests {
             interface: interface.to_string(),
             version: "0.1.0".to_string(),
             required,
+            authority_free: false,
         };
-        // Required fs (and its types interface) demands a grant.
+        // Required fs demands a grant.
         assert!(requires_fs(&[need("eo9:fs/fs", true)]));
         assert!(requires_fs(&[
             need("eo9:text/text", true),
-            need("eo9:fs/types", true),
+            need("eo9:fs/fs", true),
         ]));
+        // A types-only use of the fs interface (no functions) carries no authority and
+        // does not demand a grant.
+        assert!(!requires_fs(&[ImportNeed {
+            slot: "eo9:fs/fs".to_string(),
+            interface: "eo9:fs/fs".to_string(),
+            version: "0.1.0".to_string(),
+            required: true,
+            authority_free: true,
+        }]));
         // Optional fs is sealed with absence; other APIs never demand a grant.
         assert!(!requires_fs(&[need("eo9:fs/fs", false)]));
         assert!(!requires_fs(&[

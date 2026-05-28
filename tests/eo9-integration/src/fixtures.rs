@@ -772,11 +772,8 @@ fn det_env_wat() -> String {
       (result (result (own $eic) (error string)))))))
 
   ;; ----- fs: the API (narrowed), and fs.memfs's config interface ---------------------------
-  (import "eo9:fs/types@0.1.0" (instance $fs-types
-    (export "fs-impl" (type (sub resource)))))
-  (alias export $fs-types "fs-impl" (type $fs-impl))
   (import "eo9:fs/fs@0.1.0" (instance $fs
-    (export "fs-impl" (type $fsi (eq $fs-impl)))
+    (export "fs-impl" (type $fsi (sub resource)))
     (type $fs-error-def (variant
       (case "not-found") (case "already-exists") (case "not-a-directory")
       (case "is-a-directory") (case "denied") (case "read-only") (case "no-space")
@@ -791,6 +788,7 @@ fn det_env_wat() -> String {
       (result (result (error $fs-error)))))
     (export "stat" (func async (param "fs" (borrow $fsi)) (param "path" string)
       (result (result $node-stat (error $fs-error)))))))
+  (alias export $fs "fs-impl" (type $fs-impl))
   (import "eo9:fs/memfs-config@0.1.0" (instance $memfs-config
     (export "fs-impl" (type $fsic (eq $fs-impl)))
     (export "configure" (func async

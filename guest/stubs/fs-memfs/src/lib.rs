@@ -47,7 +47,6 @@ use exports::eo9::fs::fs::{
     self, Buffer, FsError, NodeKind, NodeStat, OpenFlags, ReadResult, WriteResult,
 };
 use exports::eo9::fs::memfs_config;
-use exports::eo9::fs::types;
 
 /// A file's contents, shared between the directory tree and any open handles
 /// (Unix unlink semantics: removing the name does not invalidate open files).
@@ -180,30 +179,27 @@ struct ExecSnapshot {
     bytes: Vec<u8>,
 }
 
-impl types::Guest for Stub {
-    type FsImpl = MemfsRoot;
-}
-
-impl types::GuestFsImpl for MemfsRoot {}
+impl fs::GuestFsImpl for MemfsRoot {}
 
 impl fs::GuestFile for OpenFile {}
 impl fs::GuestImmutableHandle for ExecSnapshot {}
 
 impl memfs_config::Guest for Stub {
-    async fn configure() -> Result<types::FsImpl, String> {
+    async fn configure() -> Result<fs::FsImpl, String> {
         STATE.set(Memfs {
             root: BTreeMap::new(),
         });
-        Ok(types::FsImpl::new(MemfsRoot))
+        Ok(fs::FsImpl::new(MemfsRoot))
     }
 }
 
 impl fs::Guest for Stub {
+    type FsImpl = MemfsRoot;
     type File = OpenFile;
     type ImmutableHandle = ExecSnapshot;
 
-    fn default() -> types::FsImpl {
-        types::FsImpl::new(MemfsRoot)
+    fn default() -> fs::FsImpl {
+        fs::FsImpl::new(MemfsRoot)
     }
 
     async fn open(

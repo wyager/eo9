@@ -151,3 +151,14 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     in-flight forwarded call is unsupported and traps (a caller that drops a pending future would hit it;
     none of the current guests cancel); (c) the binder now also leans on the packed callback-code and
     subtask-event encodings of the CM async ABI, kept in one constants block at the top of `configure.rs`.
+
+14. **Guest-leaf layering of `fs.overlay` needed no algebra change.** The earlier per-slot-types plan (a
+    named `types` import per slot) is not expressible in WIT text — an import item cannot re-bind its `use`
+    dependencies to a chosen sibling import — so the owner approved moving the root-handle resource into the
+    `fs` interface itself (plan/02 Decision 15). With that, `rename`/`with`/`compose` wire two independent
+    fs leaves into the overlay's `upper`/`lower` slots unchanged: each named import mints its own root-handle
+    type, the existing slot-name matching does the rest, and the previously failing construction
+    (`with memfs-A as upper, memfs-B as lower $ fs.overlay $ readwrite`) now composes, encodes, and
+    validates (covered by `tests/eo9-integration/tests/overlay.rs`). The describe surface gained an
+    `authority_free` flag on `ImportNeed` (computed structurally: an imported interface with no functions),
+    which the CLI/embed `requires_fs` checks now respect.

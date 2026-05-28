@@ -118,12 +118,8 @@ fn buffers_are_backed_by_the_task_buffer_table() {
 /// async-lifted `main`, so each call parks the task until the host completes it.
 const FS_DIR_WAT: &str = r#"
 (component
-  (import "eo9:fs/types@0.1.0" (instance $fs-types
-    (export "fs-impl" (type (sub resource)))))
-  (alias export $fs-types "fs-impl" (type $fs-impl))
-
   (import "eo9:fs/fs@0.1.0" (instance $fs
-    (export "fs-impl" (type $fsi (eq $fs-impl)))
+    (export "fs-impl" (type $fsi (sub resource)))
     (type $fs-error-def (variant
       (case "not-found") (case "already-exists") (case "not-a-directory")
       (case "is-a-directory") (case "denied") (case "read-only") (case "no-space")
