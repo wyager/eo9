@@ -124,6 +124,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("precompress-site", rest)?;
             precompress_site(&root)
         }
+        "fingerprint-web-vm" => {
+            expect_no_args("fingerprint-web-vm", rest)?;
+            fingerprint_web_vm(&root)
+        }
         "build-kernel" => {
             build_kernel(&root, &arch_arg("build-kernel", rest)?)?;
             Ok(())
@@ -185,6 +189,13 @@ COMMANDS:
                          www/site via www/precompress, so the server can serve pre-compressed
                          bytes (runs automatically at the end of the build-web-* commands;
                          commit the result; ci does not need it)
+    fingerprint-web-vm   Rename the /vm immutable assets (the wasm blob and .cwasm store
+                         images) to carry a content hash, write vm/assets.json, and drop the
+                         old siblings — so they can be cached forever and a rebuild changes the
+                         URL (runs automatically inside build-web-vm; commit the result)
+    check-web-vm         Verify vm/assets.json matches the committed fingerprinted /vm assets
+                         (the names encode the current content hash) — a drift guard; ci does
+                         not run it (needs a built blob)
     build-kernel <arch>  Precompile the seed/async canaries, eo9-example-hello, and entropy.seeded for
                          bare metal and build the bootable kernel image (aarch64 only so far;
                          ELF for QEMU's -kernel loader)
@@ -500,132 +511,254 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
         "xtask: installed the web VM blob at {} ({size} bytes)",
         installed.display()
     );
+    // Content-fingerprint the immutable assets (rename to carry a content hash, write the
+    // manifest the page loads) before compressing, so the committed .br/.gz siblings are of
+    // the fingerprinted files and a rebuild that changes the OS yields new, cache-busting URLs.
+    fingerprint_web_vm(root)?;
     // Regenerated blob/store artifacts need fresh pre-compressed siblings or the server
     // falls back to serving them uncompressed.
     precompress_site(root)
 }
 
-/// The store programs the /vm page serves over HTTP (kept in sync with `build_web_vm`'s
-/// loop and `check_web_vm`). The kernel WAT canary `sleepy` is handled separately.
-const WEB_VM_STORE_EXAMPLES: [&str; 3] = ["hello", "cruncher", "outcomes"];
-
-/// Drift guard: rebuild the /vm blob and its HTTP store artifacts to a temporary staging
-/// directory and byte-compare them against the committed files under `www/site/vm/`,
-/// without overwriting anything. Exits non-zero if any artifact drifted — which is what
-/// happens when the guest sources change but the committed assets are not regenerated.
-/// The web-VM build is byte-deterministic on the pinned toolchain (verified), so a byte
-/// mismatch is a true staleness signal, not codegen noise. Not part of `ci` (needs the
-/// wasm32 target + a full guest build); run it after touching guest sources or the blob.
-fn check_web_vm(root: &Path) -> Result<(), String> {
-    build_guest(root)?;
-
-    let web = root.join("www").join("web-eo9");
-    // The blob embeds these via include_bytes!, so they must be regenerated (into the
-    // gitignored blob/artifacts/) for the blob we build to reflect current sources.
-    let embedded = web.join("blob").join("artifacts");
-    std::fs::create_dir_all(&embedded)
-        .map_err(|err| format!("failed to create {}: {err}", embedded.display()))?;
-    let seed_wat = root.join("kernel").join("seed").join("hello.wat");
-    let seed_wasm = wat::parse_file(&seed_wat)
-        .map_err(|err| format!("failed to assemble {}: {err}", seed_wat.display()))?;
-    let entropy_path = root
-        .join("guest")
-        .join("target")
-        .join("components")
-        .join("eo9-stub-entropy-seeded.wasm");
-    let entropy_wasm = std::fs::read(&entropy_path)
-        .map_err(|err| format!("failed to read {}: {err}", entropy_path.display()))?;
-    preaot_for_web(&embedded, &seed_wasm, "seed", "seed.cwasm", false)?;
-    preaot_for_web(
-        &embedded,
-        &seed_wasm,
-        "seed (fuel)",
-        "seed-fuel.cwasm",
-        true,
-    )?;
-    preaot_for_web(
-        &embedded,
-        &entropy_wasm,
-        "entropy.seeded",
-        "entropy-seeded.cwasm",
-        false,
-    )?;
-
-    // Stage the HTTP-store artifacts in a temp dir and collect them for comparison.
-    let staging = web.join("target").join("check-web-vm-store");
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging)
-        .map_err(|err| format!("failed to create {}: {err}", staging.display()))?;
-    let mut staged: Vec<(String, std::path::PathBuf)> = Vec::new();
-    for example in WEB_VM_STORE_EXAMPLES {
-        let component_path = root
-            .join("guest")
-            .join("target")
-            .join("components")
-            .join(format!("eo9-example-{example}.wasm"));
-        let component = std::fs::read(&component_path)
-            .map_err(|err| format!("failed to read {}: {err}", component_path.display()))?;
-        let file = format!("{example}.cwasm");
-        preaot_for_web(&staging, &component, example, &file, false)?;
-        staged.push((file, staging.join(format!("{example}.cwasm"))));
+/// The `/vm` immutable assets that get content-fingerprinted: the wasm blob and every Pulley
+/// `.cwasm` store image. Their URLs become the version, so they can be cached forever.
+fn web_vm_fingerprint_plan(site_dir: &Path) -> Result<Vec<(PathBuf, String)>, String> {
+    // (canonical file, logical key for the manifest)
+    let mut plan = vec![(site_dir.join("web-eo9.wasm"), "blob".to_owned())];
+    let store_dir = site_dir.join("store");
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&store_dir)
+        .map_err(|err| format!("failed to read {}: {err}", store_dir.display()))?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("cwasm"))
+        // Skip already-fingerprinted leftovers; we rebuild the plan from canonical names.
+        .filter(|p| !is_fingerprinted_name(p))
+        .collect();
+    entries.sort();
+    for entry in entries {
+        let name = entry
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("bad store artifact name: {}", entry.display()))?
+            .to_owned();
+        plan.push((entry, format!("store/{name}")));
     }
-    let sleepy_wat = root.join("kernel").join("seed").join("sleepy.wat");
-    let sleepy_wasm = wat::parse_file(&sleepy_wat)
-        .map_err(|err| format!("failed to assemble {}: {err}", sleepy_wat.display()))?;
-    preaot_for_web(&staging, &sleepy_wasm, "sleepy", "sleepy.cwasm", false)?;
-    staged.push(("sleepy.cwasm".to_string(), staging.join("sleepy.cwasm")));
+    Ok(plan)
+}
 
-    // Build the blob (it embeds the regenerated blob/artifacts/) without installing it.
-    let manifest = web.join("Cargo.toml");
-    run(
-        root,
-        "cargo",
-        [
-            OsStr::new("build"),
-            OsStr::new("--release"),
-            OsStr::new("--target"),
-            OsStr::new("wasm32-unknown-unknown"),
-            OsStr::new("--manifest-path"),
-            manifest.as_os_str(),
-            OsStr::new("-p"),
-            OsStr::new("web-eo9-blob"),
-        ],
-    )?;
-    let built_blob = web
-        .join("target")
-        .join("wasm32-unknown-unknown")
-        .join("release")
-        .join("web_eo9_blob.wasm");
-
-    // Compare everything against the committed site files.
-    let site = root.join("www").join("site").join("vm");
-    let mut drifted: Vec<String> = Vec::new();
-    let same = |a: &Path, b: &Path| -> bool {
-        match (std::fs::read(a), std::fs::read(b)) {
-            (Ok(x), Ok(y)) => x == y,
-            _ => false,
-        }
+/// Whether a path is a content-fingerprinted immutable asset (`name.<16-hex>.wasm`/`.cwasm`).
+/// Mirrors `eo9_www::is_fingerprinted`; duplicated here so xtask stays dependency-light (it
+/// must not pull in the web-server crate). Keep the two in sync.
+fn is_fingerprinted_name(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "wasm" | "cwasm") {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
     };
-    if !same(&built_blob, &site.join("web-eo9.wasm")) {
-        drifted.push("web-eo9.wasm".to_string());
+    match stem.rsplit_once('.') {
+        Some((base, hash)) => {
+            !base.is_empty()
+                && hash.len() == 16
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        None => false,
     }
-    for (name, fresh) in &staged {
-        if !same(fresh, &site.join("store").join(name)) {
-            drifted.push(format!("store/{name}"));
+}
+
+/// A 16-hex-char content fingerprint (64-bit FNV-1a, the same convention the server's ETag
+/// uses), short enough for a tidy URL and ample for cache-busting a handful of assets.
+fn content_fingerprint(bytes: &[u8]) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash ^= bytes.len() as u64;
+    hash = hash.wrapping_mul(PRIME);
+    format!("{hash:016x}")
+}
+
+/// Insert the fingerprint into a canonical filename: `web-eo9.wasm` -> `web-eo9.<hash>.wasm`.
+fn fingerprinted_name(canonical: &Path, hash: &str) -> String {
+    let stem = canonical
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let ext = canonical
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    format!("{stem}.{hash}.{ext}")
+}
+
+/// Delete a file and its `.br`/`.gz` precompressed siblings, ignoring absence.
+fn remove_with_siblings(path: &Path) {
+    for suffix in ["", ".br", ".gz"] {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(p));
+    }
+}
+
+/// Content-fingerprint the `/vm` immutable assets and write `vm/assets.json`.
+///
+/// Each canonical asset (`web-eo9.wasm`, `store/*.cwasm`) is hashed once, renamed to embed the
+/// hash, and recorded in the manifest the page fetches to resolve URLs. Old fingerprinted
+/// variants (and stale `.br`/`.gz` siblings) are removed so a rebuild leaves exactly the
+/// current set. Runs inside `build-web-vm`; precompression happens afterward.
+fn fingerprint_web_vm(root: &Path) -> Result<(), String> {
+    let site_dir = root.join("www").join("site").join("vm");
+    // Clear any previously-fingerprinted assets so an OS change doesn't leave old-hash files.
+    for dir in [site_dir.clone(), site_dir.join("store")] {
+        if let Ok(read) = std::fs::read_dir(&dir) {
+            for path in read.filter_map(Result::ok).map(|e| e.path()) {
+                let stale_sibling = strip_precompressed_suffix(&path)
+                    .is_some_and(|base| is_fingerprinted_name(&base));
+                if is_fingerprinted_name(&path) || stale_sibling {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
         }
     }
-    let _ = std::fs::remove_dir_all(&staging);
 
-    if drifted.is_empty() {
-        println!("xtask: check-web-vm: committed /vm assets are up to date with current sources");
-        Ok(())
-    } else {
-        Err(format!(
-            "check-web-vm: committed /vm assets are stale — run `cargo xtask build-web-vm` and \
-             commit the result. Drifted: {}",
-            drifted.join(", ")
-        ))
+    let plan = web_vm_fingerprint_plan(&site_dir)?;
+    let mut manifest_entries: Vec<(String, String)> = Vec::new();
+    for (canonical, key) in plan {
+        let bytes = std::fs::read(&canonical)
+            .map_err(|err| format!("failed to read {}: {err}", canonical.display()))?;
+        let hash = content_fingerprint(&bytes);
+        let new_name = fingerprinted_name(&canonical, &hash);
+        let new_path = canonical.with_file_name(&new_name);
+        std::fs::rename(&canonical, &new_path)
+            .map_err(|err| format!("failed to rename {}: {err}", canonical.display()))?;
+        // Drop the canonical file's stale precompressed siblings; precompress regenerates
+        // them for the fingerprinted name.
+        remove_with_siblings(&canonical);
+        // URL the page fetches: relative to the site root, always `/vm/...`.
+        let rel = new_path
+            .strip_prefix(root.join("www").join("site"))
+            .map_err(|_| "fingerprinted asset escaped the site root".to_owned())?;
+        let url = format!("/{}", rel.to_string_lossy().replace('\\', "/"));
+        manifest_entries.push((key, url));
     }
+
+    write_assets_manifest(&site_dir, &manifest_entries)?;
+    println!(
+        "xtask: fingerprinted {} /vm asset(s) and wrote vm/assets.json",
+        manifest_entries.len()
+    );
+    Ok(())
+}
+
+/// If `path` ends in `.br`/`.gz`, the path with that suffix removed; else `None`.
+fn strip_precompressed_suffix(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    for suffix in [".br", ".gz"] {
+        if let Some(base) = name.strip_suffix(suffix) {
+            return Some(path.with_file_name(base));
+        }
+    }
+    None
+}
+
+/// Write `vm/assets.json`: a nested map `{ "blob": "/vm/...", "store": { "hello": "/vm/store/..." } }`.
+/// Hand-rolled JSON (xtask stays dependency-light); the values are build-controlled URLs.
+fn write_assets_manifest(site_dir: &Path, entries: &[(String, String)]) -> Result<(), String> {
+    let mut blob = String::new();
+    let mut store: Vec<(String, String)> = Vec::new();
+    for (key, url) in entries {
+        match key.strip_prefix("store/") {
+            Some(name) => store.push((name.to_owned(), url.clone())),
+            None if key == "blob" => blob = url.clone(),
+            None => store.push((key.clone(), url.clone())),
+        }
+    }
+    let mut json = String::from("{\n");
+    json.push_str(&format!("  \"blob\": {},\n", json_string(&blob)));
+    json.push_str("  \"store\": {\n");
+    for (i, (name, url)) in store.iter().enumerate() {
+        let comma = if i + 1 < store.len() { "," } else { "" };
+        json.push_str(&format!(
+            "    {}: {}{comma}\n",
+            json_string(name),
+            json_string(url)
+        ));
+    }
+    json.push_str("  }\n}\n");
+    let path = site_dir.join("assets.json");
+    std::fs::write(&path, json).map_err(|err| format!("failed to write {}: {err}", path.display()))
+}
+
+/// Minimal JSON string escaping for the manifest values (build-controlled names/URLs).
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Drift guard: verify `vm/assets.json` points at committed files whose names still encode
+/// their current content hash (so a stale manifest or a hand-edited asset is caught). Does
+/// not rebuild the blob, so it is cheap enough to run anywhere.
+fn check_web_vm(root: &Path) -> Result<(), String> {
+    let site_dir = root.join("www").join("site").join("vm");
+    let manifest_path = site_dir.join("assets.json");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .map_err(|err| format!("failed to read {}: {err}", manifest_path.display()))?;
+    // Pull every "/vm/..." URL out of the manifest (values are the only such strings).
+    let urls: Vec<String> = manifest
+        .split('"')
+        .filter(|s| s.starts_with("/vm/"))
+        .map(str::to_owned)
+        .collect();
+    if urls.is_empty() {
+        return Err(format!("{} lists no /vm assets", manifest_path.display()));
+    }
+    let site_root = root.join("www").join("site");
+    let mut checked = 0usize;
+    for url in urls {
+        let rel = url.trim_start_matches('/');
+        let path = site_root.join(rel);
+        if !path.exists() {
+            return Err(format!("assets.json points at {url}, which does not exist"));
+        }
+        if !is_fingerprinted_name(&path) {
+            return Err(format!("assets.json points at non-fingerprinted {url}"));
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+        let expected = content_fingerprint(&bytes);
+        let actual = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.rsplit_once('.').map(|(_, h)| h.to_owned()))
+            .unwrap_or_default();
+        if expected != actual {
+            return Err(format!(
+                "{url} is stale: name encodes {actual} but its content hashes to {expected} \
+                 (re-run `cargo xtask fingerprint-web-vm` / `build-web-vm`)"
+            ));
+        }
+        checked += 1;
+    }
+    println!("xtask: check-web-vm ok — {checked} fingerprinted /vm asset(s) match assets.json");
+    Ok(())
 }
 
 /// Pre-AOT one component to a `pulley32` artifact for the web VM blob. The configuration

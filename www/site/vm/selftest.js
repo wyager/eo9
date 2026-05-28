@@ -23,11 +23,31 @@ function hostWrite(ptr, len) {
   terminal.textContent += text + "\n";
 }
 
+// Resolve fingerprinted asset URLs via /vm/assets.json (falls back to canonical names).
+let assetMap = null;
+async function loadAssetMap() {
+  if (assetMap) return assetMap;
+  try {
+    const response = await fetch("/vm/assets.json", { cache: "no-cache" });
+    if (response.ok) {
+      assetMap = await response.json();
+      return assetMap;
+    }
+  } catch {
+    /* fall through */
+  }
+  assetMap = { blob: "/vm/web-eo9.wasm", store: {} };
+  return assetMap;
+}
+const blobUrl = () => (assetMap && assetMap.blob) || "/vm/web-eo9.wasm";
+const storeUrl = (name) =>
+  (assetMap && assetMap.store && assetMap.store[name]) || `/vm/store/${name}.cwasm`;
+
 let fetchedArtifact = null;
 async function hostFetchLen(namePtr, nameLen) {
   const name = decoder.decode(new Uint8Array(memory.buffer, namePtr, nameLen));
   try {
-    const response = await fetch(`/vm/store/${name}.cwasm`);
+    const response = await fetch(storeUrl(name));
     if (!response.ok) return -1;
     fetchedArtifact = new Uint8Array(await response.arrayBuffer());
     return fetchedArtifact.length;
@@ -87,7 +107,8 @@ function check(name, condition) {
 
 async function run() {
   note(`jspi ${hasJSPI ? "available" : "MISSING"}`);
-  const response = await fetch("/vm/web-eo9.wasm");
+  await loadAssetMap();
+  const response = await fetch(blobUrl());
   const { instance } = await WebAssembly.instantiateStreaming(response, imports);
   exports = instance.exports;
   memory = exports.memory;

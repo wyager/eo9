@@ -94,9 +94,42 @@ fn serves_css_and_svg_with_correct_content_types_and_caching() {
     assert_eq!(svg.header("Cache-Control"), Some("public, max-age=3600"));
     assert!(svg.body_text().contains("<svg"));
 
-    // The heavyweight artifacts keep the longer lifetime; revalidation is covered below.
-    let wasm = request(site_server_addr(), "GET", "/vm/web-eo9.wasm");
-    assert_eq!(wasm.header("Cache-Control"), Some("public, max-age=86400"));
+    // The /vm manifest is the indirection point: never cached, so a new build is seen at once.
+    let manifest = request(site_server_addr(), "GET", "/vm/assets.json");
+    assert_eq!(manifest.status, 200);
+    assert_eq!(manifest.header("Content-Type"), Some("application/json"));
+    assert_eq!(manifest.header("Cache-Control"), Some("no-cache"));
+}
+
+#[test]
+fn fingerprinted_assets_are_immutable_and_unhashed() {
+    // Discover the fingerprinted blob URL via the manifest (its hash changes per build).
+    let manifest = request(site_server_addr(), "GET", "/vm/assets.json").body_text();
+    let blob_url = manifest
+        .split('"')
+        .find(|s| s.starts_with("/vm/web-eo9.") && s.ends_with(".wasm"))
+        .expect("manifest names a fingerprinted blob");
+
+    let blob = request(site_server_addr(), "GET", blob_url);
+    assert_eq!(blob.status, 200);
+    assert_eq!(blob.header("Content-Type"), Some("application/wasm"));
+    // Immutable + one year, and — crucially — NO ETag: the URL is the version, so the server
+    // never hashes the ~1 MiB body on the request path.
+    assert_eq!(
+        blob.header("Cache-Control"),
+        Some("public, max-age=31536000, immutable")
+    );
+    assert_eq!(blob.header("ETag"), None);
+
+    // An immutable asset never revalidates: an If-None-Match request gets a full 200, not a 304.
+    let conditional = request_with_headers(
+        site_server_addr(),
+        "GET",
+        blob_url,
+        &[("If-None-Match", "\"anything\"")],
+    );
+    assert_eq!(conditional.status, 200);
+    assert!(!conditional.body.is_empty());
 }
 
 #[test]
@@ -129,12 +162,14 @@ fn conditional_requests_revalidate_with_a_304() {
     assert_eq!(stale.status, 200);
     assert!(!stale.body.is_empty());
 
-    // The ETag is per representation: the brotli bytes of one file carry their own.
-    let plain = request(site_server_addr(), "GET", "/vm/web-eo9.wasm");
+    // The ETag is per representation: the brotli bytes of one file carry their own. Uses a
+    // non-fingerprinted compressible asset (vm.js) — fingerprinted assets are immutable and
+    // carry no ETag at all (see fingerprinted_assets_are_immutable_and_unhashed).
+    let plain = request(site_server_addr(), "GET", "/vm/vm.js");
     let brotli = request_with_headers(
         site_server_addr(),
         "GET",
-        "/vm/web-eo9.wasm",
+        "/vm/vm.js",
         &[("Accept-Encoding", "br")],
     );
     assert_ne!(plain.header("ETag"), brotli.header("ETag"));
@@ -144,7 +179,7 @@ fn conditional_requests_revalidate_with_a_304() {
     let brotli_revalidated = request_with_headers(
         site_server_addr(),
         "GET",
-        "/vm/web-eo9.wasm",
+        "/vm/vm.js",
         &[("Accept-Encoding", "br"), ("If-None-Match", &brotli_etag)],
     );
     assert_eq!(brotli_revalidated.status, 304);
@@ -262,7 +297,14 @@ fn precompressed_assets_are_served_by_content_negotiation() {
     // (written by `cargo xtask precompress-site`); a client that accepts brotli gets the
     // brotli bytes, a gzip-only client gets gzip, and a client that accepts neither gets
     // the original — always with the original's Content-Type and a Vary on Accept-Encoding.
-    let plain = request(site_server_addr(), "GET", "/vm/web-eo9.wasm");
+    // The blob is fingerprinted; discover its current URL from the manifest.
+    let manifest = request(site_server_addr(), "GET", "/vm/assets.json").body_text();
+    let blob_url = manifest
+        .split('"')
+        .find(|s| s.starts_with("/vm/web-eo9.") && s.ends_with(".wasm"))
+        .expect("manifest names a fingerprinted blob")
+        .to_owned();
+    let plain = request(site_server_addr(), "GET", &blob_url);
     assert_eq!(plain.status, 200);
     assert_eq!(plain.header("Content-Encoding"), None);
     assert_eq!(plain.header("Content-Type"), Some("application/wasm"));
@@ -271,7 +313,7 @@ fn precompressed_assets_are_served_by_content_negotiation() {
     let brotli = request_with_headers(
         site_server_addr(),
         "GET",
-        "/vm/web-eo9.wasm",
+        &blob_url,
         &[("Accept-Encoding", "gzip, deflate, br, zstd")],
     );
     assert_eq!(brotli.status, 200);
