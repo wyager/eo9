@@ -852,10 +852,17 @@ fn shell_env_shows_the_session_capability_picture() {
         "{}",
         run.stdout
     );
-    // Without --fs-root, children get no filesystem and env says how to grant one.
+    // Children inherit the full environment (including exec); the note points at `only`
+    // as the way to restrict a command, and — without --fs-root — at how to grant a
+    // writable data root.
     assert!(run.stdout.contains("--fs-root"), "{}", run.stdout);
     assert!(
-        run.stdout.contains("never receive the exec capability"),
+        run.stdout.contains("restrict a command with `only`"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout.contains("never receive the exec capability"),
         "{}",
         run.stdout
     );
@@ -882,7 +889,9 @@ fn shell_env_shows_the_session_capability_picture() {
         granted.stdout
     );
     assert!(
-        !granted.stdout.contains("--fs-root <dir> to grant one"),
+        !granted
+            .stdout
+            .contains("to give programs a writable data directory"),
         "{}",
         granted.stdout
     );
@@ -908,7 +917,9 @@ fn shell_env_of_a_program_marks_imports_against_the_session() {
     // Inspecting never runs the program.
     assert!(!hello.stdout.contains("Hello"), "{}", hello.stdout);
 
-    // readwrite requires a filesystem; without --fs-root this session would refuse it.
+    // readwrite requires a filesystem; the session always layers one (the read-only /bin
+    // program view, writable only when --fs-root adds a data root), so the import is
+    // satisfied — `env` reports the grant rather than a refusal.
     let readwrite = eo9(&store, &["shell", "-c", "env readwrite"]);
     assert_eq!(readwrite.code, 0, "stderr: {}", readwrite.stderr);
     assert!(
@@ -917,11 +928,123 @@ fn shell_env_of_a_program_marks_imports_against_the_session() {
         readwrite.stdout
     );
     assert!(
-        readwrite
-            .stdout
-            .contains("missing — would be refused at spawn"),
+        readwrite.stdout.contains("satisfied by the session (fs)"),
         "{}",
         readwrite.stdout
+    );
+}
+
+#[test]
+fn shell_child_inherits_the_full_exec_environment_and_recurses() {
+    // The headline of the child-capability default: a child `eosh` launched from `eosh`
+    // is a full peer — it inherits the whole `eo9:exec` surface (component algebra,
+    // compile, spawn) plus the layered session filesystem, so it can both spawn programs
+    // AND compose them, and it can recurse. Driven through piped stdin: the nested shell
+    // consumes the rest of the script and EOF ends both shells (a nested non-tty shell
+    // shares the one stdin, so every command goes before the implicit exits).
+    let store = temp_store("shell-recurse");
+    let script = "eosh\n\
+                  hello --name nested --excited true\n\
+                  only eo9:text/text,eo9:time/time $ hello --name boxed --excited true\n\
+                  text.null $ hello --name quiet --excited true\n";
+    let run = eo9_with_stdin(&store, &["shell"], Some(script));
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+
+    // Two banners: the outer shell launched a nested one (recursion).
+    let banners = run.stdout.matches("eosh — the Eo9 shell").count();
+    assert!(
+        banners >= 2,
+        "expected a nested shell banner: {}",
+        run.stdout
+    );
+    // The nested shell SPAWNED a program.
+    assert!(
+        run.stdout.contains("Hello, nested!"),
+        "nested shell did not run a program: {}",
+        run.stdout
+    );
+    // The nested shell COMPOSED with `only` and ran the result.
+    assert!(
+        run.stdout.contains("Hello, boxed!"),
+        "nested shell could not compose with `only`: {}",
+        run.stdout
+    );
+    // The nested shell COMPOSED with `$`: text.null seals hello's text, so the greeting
+    // is discarded but the program still succeeds.
+    assert!(
+        !run.stdout.contains("Hello, quiet!"),
+        "text.null should have sealed the greeting: {}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("greeted"),
+        "expected a success outcome from the nested shell: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn shell_children_see_bin_programs_and_fs_root_data_at_once() {
+    // The layered session filesystem: a data tool sees the user's --fs-root files at `/`
+    // AND the read-only /bin program view, in one capability. Writes land in the data
+    // root and never touch the program view.
+    let store = temp_store("shell-overlay");
+    let sandbox = temp_sandbox("shell-overlay");
+    fs::write(sandbox.join("notes.txt"), "layered\n").expect("write fixture");
+    let sb = sandbox.to_str().expect("utf-8 sandbox path");
+
+    let ls = eo9(&store, &["--fs-root", sb, "-c", "ls --path /"]);
+    assert_eq!(ls.code, 0, "stderr: {}", ls.stderr);
+    assert!(ls.stdout.contains("notes.txt"), "ls output: {}", ls.stdout);
+    assert!(ls.stdout.contains("bin"), "ls output: {}", ls.stdout);
+
+    let ls_bin = eo9(&store, &["--fs-root", sb, "-c", "ls --path /bin"]);
+    assert_eq!(ls_bin.code, 0, "stderr: {}", ls_bin.stderr);
+    assert!(
+        ls_bin.stdout.contains("hello.wasm"),
+        "ls /bin output: {}",
+        ls_bin.stdout
+    );
+
+    let cat = eo9(&store, &["--fs-root", sb, "-c", "cat --path /notes.txt"]);
+    assert_eq!(cat.code, 0, "stderr: {}", cat.stderr);
+    assert!(cat.stdout.contains("layered"), "cat output: {}", cat.stdout);
+
+    // A write goes to the data root on the host side, not into the program view.
+    let cp = eo9(
+        &store,
+        &["--fs-root", sb, "-c", "cp --src /notes.txt --dst /copy.txt"],
+    );
+    assert_eq!(cp.code, 0, "stderr: {}", cp.stderr);
+    assert!(sandbox.join("copy.txt").is_file(), "copy missing");
+    assert!(
+        !store.join("shell/copy.txt").exists(),
+        "wrote into /bin view"
+    );
+
+    // Without --fs-root there is no writable layer: a mutation is refused by the
+    // read-only overlay, in the program's own error vocabulary (an fs error reported as
+    // the program's failure outcome, not a missing-capability spawn refusal).
+    let denied = eo9(&store, &["-c", "mkdir --path /newdir"]);
+    assert_ne!(denied.code, 0, "stdout: {}", denied.stdout);
+    assert!(!store.join("shell/newdir").exists(), "wrote into /bin view");
+}
+
+#[test]
+fn only_strips_the_whole_exec_surface_from_a_restricted_child() {
+    // `only` attenuates before spawn: restricting eosh (which requires the full eo9:exec
+    // surface) to just text is refused before it runs — proof that the algebra removes
+    // exec/compile/spawn, so a locked-down child cannot compose or launch anything.
+    let store = temp_store("shell-only-exec");
+    let run = eo9(&store, &["shell", "-c", "only eo9:text/text $ eosh"]);
+    // The refusal is a compose-time error (printed by eosh), not a run: it never reaches
+    // a spawn. It surfaces on stderr and the one-shot reports failure.
+    let output = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        output.contains("eo9:exec/component-algebra")
+            || output.contains("RequiredOutsideAllowList"),
+        "only should refuse eosh for lacking the exec surface (code {}): {output}",
+        run.code
     );
 }
 
