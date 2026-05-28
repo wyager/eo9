@@ -40,13 +40,20 @@ const MAX_ENTROPY_REQUEST_BYTES: u64 = 64 * 1024;
 /// Upper bound on a single `read-line` line (mirrors the kernel's cap).
 const MAX_READ_LINE_BYTES: usize = 4096;
 
-/// Store data for programs run against the browser's root providers. The roots are the
-/// browser APIs themselves, so there is nothing to carry besides the store type.
-pub struct WebState;
+/// Store data for programs run against the browser's root providers. text/time/entropy are
+/// the browser APIs themselves (nothing to carry), but `eo9:fs`/`eo9:io` are backed by an
+/// in-blob writable memory filesystem and buffer table (see `crate::fs`).
+pub struct WebState {
+    pub fs: crate::fs::MemFs,
+    pub buffers: crate::fs::BufferTable,
+}
 
 impl WebState {
     pub fn new() -> Self {
-        WebState
+        WebState {
+            fs: crate::fs::MemFs::new(),
+            buffers: crate::fs::BufferTable::default(),
+        }
     }
 }
 

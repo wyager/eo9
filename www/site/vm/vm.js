@@ -26,6 +26,7 @@ const ARG_PLACEHOLDERS = {
   hello: "browser true",
   cruncher: "9 200000",
   outcomes: 'fail "sad path"',
+  readwrite: '/scratch/note.txt "hello disk"',
 };
 
 // Argument fields are joined with the ASCII unit separator before crossing into the blob.

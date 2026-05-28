@@ -23,6 +23,7 @@ use std::sync::Arc;
 use wasmtime::component::{Component, Linker, Val};
 use wasmtime::{Config, CustomCodeMemory, Engine, Store};
 
+mod fs;
 mod host;
 mod providers;
 mod store;
