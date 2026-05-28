@@ -10,6 +10,7 @@ const output = document.getElementById("vm-output");
 const buttons = {
   hello: document.getElementById("btn-hello"),
   fuel: document.getElementById("btn-fuel"),
+  algebra: document.getElementById("btn-algebra"),
   entropy: document.getElementById("btn-entropy"),
   program: document.getElementById("btn-program"),
   sleepy: document.getElementById("btn-sleepy"),
@@ -281,7 +282,8 @@ async function main() {
   const runProgram = promising(exports.run_program);
 
   const enableIdleButtons = () => {
-    for (const button of [buttons.hello, buttons.fuel, buttons.entropy]) button.disabled = false;
+    for (const button of [buttons.hello, buttons.fuel, buttons.algebra, buttons.entropy])
+      button.disabled = false;
     const blocked = !hasJSPI;
     for (const button of [buttons.program, buttons.sleepy, buttons.park, buttons.readline]) {
       button.disabled = blocked;
@@ -307,6 +309,7 @@ async function main() {
 
   buttons.hello.onclick = () => run("hello + add", () => exports.run_hello());
   buttons.fuel.onclick = () => run("fuel metering", () => exports.run_fuel());
+  buttons.algebra.onclick = () => run("component algebra", () => exports.algebra_demo());
   buttons.entropy.onclick = () =>
     run("entropy.seeded", () => {
       const seed = parseSeed(seedInput.value);

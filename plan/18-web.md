@@ -238,3 +238,28 @@ runnable on a host with no fiber backend.
       eosh against text/time/entropy + the layer-1 fs/io + this exec surface; verify an `eosh>`
       smoke (`hello`, `ls`, `cat`, a refused `$`) via the node/JSPI harness pattern, extend
       `selftest.js`, keep `check-web-vm` green.
+
+15. **Milestone-3, the component algebra runs in the browser (committed, verified).** The
+    real `eo9-component` crate (`default-features = false` = its no_std build) is now a
+    dependency of the blob, with the same five algebra `[patch.crates-io]` entries the kernel
+    uses added to `www/web-eo9/Cargo.toml` — confirming D14's probe in a *committed* build:
+    the algebra closure compiles for `wasm32-unknown-unknown` alongside the vendored wasmtime
+    family. A new `blob/src/exec.rs` + the `algebra_demo()` export exercise it end to end:
+    `eo9_component::load` a raw component → `describe` (kind/imports/exports) → `restrict`
+    (`only eo9:text/text, eo9:time/time`) → then execute the *same* component via Pulley
+    against the browser root providers. `cargo xtask build-web-vm` now also emits the hello
+    example as raw `blob/artifacts/example-hello.wasm` (for the algebra) and pre-AOT'd
+    `example-hello.cwasm` (for execution). Verified: `node www/web-eo9/verify-exec.mjs` →
+    describe = binary, imports text+time, `only` seals a 35 KB component, execution →
+    `success(greeted)`; the fs regression harness still passes; `selftest.js` gains the same
+    four checks; the page gains a "Run the component algebra" button. Blob grew 1.42 → 4.05
+    MiB (829 KiB brotli) — the algebra closure (wit-component/wac-graph/wit-parser/wasm-wave +
+    eo9-component) adds ~2.7 MiB; a size-trim pass (or shipping the algebra only on the eosh
+    page) is worth a follow-up.
+    - **What this is and is not:** this proves the algebra + execution run in the blob and is
+      the foundation for eosh. It does NOT yet register the guest-facing `eo9:exec` Linker
+      surface (component-algebra/compile/task as host imports an *eosh component* links
+      against) — that, plus the `/bin` store view feeding eosh's `resolve` and AOT'ing eosh
+      into the store, is the remaining work to a real `eosh>` prompt. The recipe in D14 stands;
+      D14(d)'s bytes-vs-Pulley duality is now concretely set up (the build emits both the raw
+      `.wasm` and the `.cwasm` for the demo program, the pattern eosh's store needs).

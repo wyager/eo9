@@ -438,6 +438,27 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
         false,
     )?;
 
+    // The component-algebra demo (plan/18 D15): the blob runs the real `eo9-component`
+    // algebra — load/describe/restrict — on a raw component IN THE BROWSER, then executes
+    // it via Pulley. Embed the hello example both as raw component bytes (for the algebra)
+    // and pre-AOT'd to pulley32 (for execution), so the demo is self-contained.
+    let hello_component = std::fs::read(
+        root.join("guest")
+            .join("target")
+            .join("components")
+            .join("eo9-example-hello.wasm"),
+    )
+    .map_err(|err| format!("failed to read the hello example component: {err}"))?;
+    std::fs::write(artifacts.join("example-hello.wasm"), &hello_component)
+        .map_err(|err| format!("failed to write the raw hello component to artifacts: {err}"))?;
+    preaot_for_web(
+        &artifacts,
+        &hello_component,
+        "example hello (algebra demo)",
+        "example-hello.cwasm",
+        false,
+    )?;
+
     // The page's HTTP-backed program store: real example programs (and the kernel's async
     // sleep canary) pre-AOT'd to pulley32 and served as static files the blob fetches on
     // demand (www/web-eo9/blob/src/store.rs).
