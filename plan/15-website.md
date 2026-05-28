@@ -274,3 +274,35 @@ algebra and compiler use, so nothing user-visible changes; compositions still co
 The connection-limit `Semaphore`/`timeout` machinery (Decision 21's hardening) is unrelated and
 stays. If a server-assisted compile is ever wanted again (e.g. native-speed codegen as an
 optimization), Decisions 20–21 record the bounded design to resurrect.
+
+## Decision 24 — site copy refreshed to current reality (the /vm page is no longer "work in progress")
+
+The front page, /try, and /vm described the world as it was before the browser eosh shell, the
+in-blob compiler, and `only`-narrowing landed. Refreshed against what is actually true on master:
+
+- **/vm**: title/tagline drop "work in progress" — the page now states what it is: the full stack
+  (engine, Cranelift→Pulley compiler, eosh, capability algebra) compiled to WebAssembly with no
+  server involvement. The "~1 MB module" figure became "about 1.8 MB compressed on the wire"; the
+  bullet list gained the eosh shell (resolve `/bin` → spawn → typed outcomes, `only` attenuation,
+  `$` composition compiled in-blob); the program-store bullet now mentions the in-blob fs and the
+  positional/variadic paths; the entropy bullet no longer calls `configure` async-lifted (it is
+  synchronous now); the sleepy bullet reports that the stackful-lift canary runs (it used to be
+  described as honestly refused); the closing "what is not here yet: the shell, the algebra,
+  composition" paragraph — all of which are here now — was replaced by the honest current gaps
+  (no persistence, no networking, interpreted speed). The eosh hint shows verified commands
+  (`cat /welcome.txt /docs/about.txt`, bare `ls`, `only eo9:text $ echo …`,
+  `entropy.seeded $ rng --count 3`); arg placeholders match the new coreutil signatures.
+- **/try**: the "not on this page yet" paragraph now points at /vm, where the shell, the stubs, the
+  algebra, and the compiler genuinely run; footer links to /vm. The page keeps its honest framing
+  as the smaller, jco-transpiled demo of the capability rule itself.
+- **Front page**: hero links lead with "Run it in your browser" (/vm) ahead of the /try demo; the
+  `only` example is now a real, runnable command (`only eo9:text,eo9:time $ hello --name web
+  --excited true`, verified at the browser prompt); the algebra section notes the same algebra runs
+  natively, on metal, and in the browser; the eofs section says plainly that the engine is built
+  and the provider wiring is in progress; the bare-metal section states what runs today (AArch64
+  QEMU boot-to-eosh with on-target codegen) with RISC-V/x86-64 next; "Roadmap" became "Where it
+  stands" (working today vs. next up), replacing aims that have since shipped.
+- **README**: the two `cat --path notes.txt` examples became `cat notes.txt` (positional args).
+- All copy claims about the browser were checked against the node/JSPI harnesses or the committed
+  code rather than asserted; sizes from the current fingerprinted assets. STATUS.md itself still
+  describes the server-side `/vm/compile` era and is the planner's to refresh (out of scope here).

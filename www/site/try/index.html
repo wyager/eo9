@@ -77,13 +77,15 @@
     gets you a less helpful error.
   </p>
   <p>
-    <strong>The prompt above is not eosh.</strong> It is a launcher with a handful of commands; the
-    real Eo9 shell, the standard stub providers (<code>time.frozen</code>,
-    <code>entropy.seeded</code>, <code>fs.memfs</code>, …), and the composition algebra
-    (<code>$</code>, <code>&amp;</code>, <code>only</code>, <code>configure</code>) are not on this
-    page yet. There is also no compiler here: on a real Eo9 system, providers are fused into the
-    program and compiled to native code, which is the point of the design — this page trades that
-    for the convenience of running in a browser tab.
+    <strong>The prompt above is not eosh.</strong> It is a launcher with a handful of commands, and
+    there is no Eo9 compiler on this page: the components are translated to ES modules at site
+    build time and run on the browser's own engine. The real Eo9 shell, the stub providers
+    (<code>entropy.seeded</code>, <code>fs.memfs</code>, …), the composition algebra
+    (<code>$</code>, <code>only</code>, …), and the real engine-plus-compiler stack <em>do</em> run
+    in your browser — on the <a href="/vm/">/vm page</a>, where the whole Eo9 runtime is compiled
+    to WebAssembly and compositions typed at the <code>eosh&gt;</code> prompt are compiled inside
+    the page. This page stays deliberately small: it shows the capability rule itself — imports
+    granted, revoked, and refused — with the least machinery possible.
   </p>
 
   <h2>Browser support</h2>
@@ -102,6 +104,7 @@
     <p>Eo9 is MIT-licensed and developed in the open.</p>
     <p>
       <a href="/">eo9.org</a> ·
+      <a href="/vm/">the full OS in your browser (/vm)</a> ·
       <a href="https://github.com/wyager/eo9">Source</a> ·
       <a href="https://github.com/wyager/eo9/blob/master/SPEC.md">Spec</a>
     </p>

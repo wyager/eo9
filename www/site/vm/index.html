@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Eo9 web VM (work in progress)</title>
+  <title>Eo9 web VM — the OS in your browser</title>
   <meta name="description"
-        content="The real Eo9 runtime stack — wasmtime with the Pulley interpreter — compiled to WebAssembly and running real Eo9 components inside your browser.">
+        content="The full Eo9 stack — the wasmtime+Pulley engine, the Cranelift compiler, the eosh shell, and the capability algebra — compiled to WebAssembly and running entirely inside your browser.">
   <link rel="icon" type="image/svg+xml" href="/logo.svg">
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/vm/vm.css">
@@ -19,8 +19,8 @@
       <h1><a href="/">Eo9</a> / web&nbsp;VM</h1>
     </div>
     <p class="tagline">
-      The real Eo9 runtime stack, compiled to WebAssembly, running inside your browser.
-      <strong>Work in progress.</strong>
+      The full Eo9 stack — engine, compiler, shell, and capability algebra — compiled to
+      WebAssembly, running entirely inside your browser. No server does any of the work.
     </p>
   </div>
 </header>
@@ -75,8 +75,10 @@
   <div id="vm-controls-eosh">
     <button id="btn-eosh" disabled>Boot the eosh shell</button>
     <span class="vm-hint">the real Eo9 shell, unmodified, running in the blob — type commands in the
-      terminal input below (e.g. <code>hello --name web --excited true</code>, <code>ls /</code>,
-      <code>cat /welcome.txt</code>); <code>exit</code> ends the session</span>
+      terminal input below (e.g. <code>hello --name web --excited true</code>, <code>ls</code>,
+      <code>cat /welcome.txt /docs/about.txt</code>,
+      <code>only eo9:text $ echo --text boxed</code>,
+      <code>entropy.seeded $ rng --count 3</code>); <code>exit</code> ends the session</span>
   </div>
 
   <pre id="vm-output">loading the Eo9 blob…</pre>
@@ -89,11 +91,14 @@
 
   <h2>What this is</h2>
   <p>
-    The buttons above drive a single ~1&nbsp;MB WebAssembly module: <em>the same wasmtime the
-    native Eo9 runtime and the bare-metal kernel embed</em>, compiled for wasm32, with its
+    The buttons above drive a single WebAssembly module (about 1.8&nbsp;MB compressed on the
+    wire): <em>the same wasmtime the native Eo9 runtime and the bare-metal kernel embed</em>,
+    compiled for wasm32, with its
     <a href="https://docs.wasmtime.dev/examples-pulley.html">Pulley</a> interpreter executing
-    pre-compiled images of unmodified Eo9 components. The page's JavaScript only provides this
-    output box; no Eo9 semantics are re-implemented in JS.
+    unmodified Eo9 components — and the same Cranelift-based compile layers the bare-metal
+    kernel uses, so compositions typed at the prompt are compiled right here in the page. The
+    page's JavaScript only provides this output box and your keyboard; no Eo9 semantics are
+    re-implemented in JS, and no server is involved after the page loads.
   </p>
   <ul>
     <li><strong>hello + add</strong> — the kernel's seed component (the first thing Eo9 ever ran on
@@ -101,15 +106,24 @@
     <li><strong>fuel metering</strong> — the same call with wasmtime's fuel accounting on, the
       mechanism Eo9 uses to meter CPU.</li>
     <li><strong>entropy.seeded</strong> — an unmodified Eo9 provider stub using the Component Model
-      <em>async</em> ABI: its <code>configure</code> and <code>get-u64</code> are async-lifted calls,
-      executed here without fibers (wasm32 has none) via Eo9's fiberless execution path. Same seed,
+      <em>async</em> ABI: its <code>get-u64</code> draws are async-lifted calls, executed here
+      without fibers (wasm32 has none) via Eo9's fiberless execution path. Same seed,
       same sequence as native Eo9 and the bare-metal kernel.</li>
-    <li><strong>program store</strong> — the second row fetches <em>real Eo9 example programs</em>
-      (pre-compiled Pulley images served as static files) and runs them against browser root
-      providers: text → this terminal, time → the browser clocks, entropy →
-      <code>crypto.getRandomValues</code>. Typed arguments in, a typed outcome out — the same
-      contract as native <code>eo9 run</code>.</li>
-    <li><strong>compiler in the VM</strong> — the blob also carries the same Cranelift-based
+    <li><strong>program store</strong> — the second row fetches <em>real Eo9 programs</em>
+      (the example programs plus all twelve coreutils, pre-compiled Pulley images served as
+      static files) and runs them against browser root providers: text → this terminal, time →
+      the browser clocks, entropy → <code>crypto.getRandomValues</code>, and an in-memory
+      <code>eo9:fs</code> living inside the blob. Typed arguments in (the path-taking tools
+      take positional, variadic paths, e.g. <code>cat /welcome.txt /docs/about.txt</code>), a
+      typed outcome out — the same contract as native <code>eo9 run</code>.</li>
+    <li><strong>the eosh shell</strong> — the third row boots the real Eo9 shell, unmodified.
+      It resolves programs from <code>/bin</code>, spawns them through the same typed
+      <code>eo9:exec</code> surface the native CLI and the bare-metal kernel use, and the
+      capability algebra works at the prompt: <code>only eo9:text $ echo --text hi</code>
+      genuinely narrows what the child can import (a program needing a sealed-away capability
+      is refused before it runs), and <code>entropy.seeded $ rng --count 3</code> is fused by
+      the real algebra and runs deterministically.</li>
+    <li><strong>compiler in the VM</strong> — the blob carries the same Cranelift-based
       compile layers the bare-metal kernel uses for on-target codegen, emitting Pulley bytecode:
       a composition typed at the eosh prompt (e.g. <code>entropy.seeded $ rng</code>) is fused by
       the real component algebra and <em>compiled inside your browser</em>, with no server
@@ -118,21 +132,24 @@
       guest awaiting <code>time.sleep</code> or <code>read-line</code> inside it) is parked on a real
       browser timer or on the input box below the terminal, using JavaScript Promise Integration
       (JSPI) to suspend the whole VM and resume it. These need a JSPI-capable browser (current
-      Chrome/Edge; the page says so if yours is not). The <em>sleepy</em> canary uses the Component
-      Model's stackful async lift, which still needs a fiber backend — the page reports that
-      limitation honestly rather than hiding it.</li>
+      Chrome/Edge; the page says so if yours is not). The <em>sleepy</em> canary — the kernel's
+      stackful-async sleep test — runs here too, awaiting a real browser timer in the middle of a
+      guest call and reporting the elapsed time it measured.</li>
   </ul>
   <p>
-    One disclosure, so the name of the page doesn't overclaim: the three embedded demos in the
-    first row import nothing at all — they are evidence that the real engine and the real
-    component ABI run in your browser, not a demonstration of capability mediation. The
-    program-store row is where imports are actually linked (text, time, entropy), and the
-    <a href="/try/">/try page</a> is where granting and revoking capabilities is the demo.
+    One disclosure, so the page doesn't overclaim: the three embedded demos in the first row
+    import nothing at all — they are evidence that the real engine and the real component ABI
+    run in your browser, not a demonstration of capability mediation. The mediation demos are
+    the rows below them: the program store links real imports (text, time, entropy, fs), and
+    the shell's <code>only</code> / <code>$</code> are the real algebra doing real attenuation
+    and composition.
   </p>
   <p>
-    What is <em>not</em> here yet: the shell (eosh), the capability algebra, and on-page composition.
-    Those are the next milestones for this page; the
-    <a href="/try/">/try page</a> remains the polished demo in the meantime.
+    What is <em>not</em> here: persistence (the in-blob filesystem is in-memory and resets on
+    reload), networking, and native-speed execution — everything runs through the Pulley
+    interpreter, so this page is about fidelity, not performance. The
+    <a href="/try/">/try page</a> is a smaller, separate demo that runs transpiled components on
+    the browser's own engine.
   </p>
 
 </main>

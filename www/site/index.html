@@ -21,7 +21,8 @@
       A capability-secure operating system built on the WebAssembly Component Model.
     </p>
     <p class="links">
-      <a href="/try/">Try it in your browser</a>
+      <a href="/vm/">Run it in your browser</a>
+      <a href="/try/">Try the component demo</a>
       <a href="https://github.com/wyager/eo9">Source on GitHub</a>
       <a href="https://github.com/wyager/eo9/blob/master/SPEC.md">Read the spec</a>
     </p>
@@ -65,10 +66,12 @@
   </p>
   <pre><code>&gt; net.none $ browser                        # browser observes "no network"
 &gt; time.monotonic-stub &amp; virtualnet $ app    # a packaged environment, applied to app
-&gt; only eo9:time,eo9:fs $ cruncher --input data.bin   # allow-list; anything else is a compose-time error</code></pre>
+&gt; only eo9:text,eo9:time $ hello --name web --excited true   # allow-list; anything else is refused at compose time</code></pre>
   <p>
-    Arguments are named and typed — there is no untyped <code>argv</code> — and a program reports its
-    outcome in its own typed vocabulary rather than a numeric exit code.
+    Arguments are typed and bound by name or position — there is no untyped <code>argv</code> — and a
+    program reports its outcome in its own typed vocabulary rather than a numeric exit code. The same
+    algebra runs everywhere the OS does: at the usermode <code>eosh</code> prompt, on the bare-metal
+    kernel, and <a href="/vm/">compiled to WebAssembly in your browser</a>.
   </p>
 
   <h2>Virtualization and sandboxing by substitution</h2>
@@ -99,34 +102,45 @@
 
   <h2>eofs, the native filesystem</h2>
   <p>
-    Eo9 bundles its own filesystem, <code>eofs</code>, and it is just a provider: it imports the disk
-    API and exports the filesystem API, so the same component runs over a real block device on bare
-    metal and over a file-backed or in-memory disk under usermode Eo9. It is copy-on-write and never
-    overwrites in place, with atomic root flips — crash consistency by construction, no fsck. It is a
-    Merkle tree throughout, so every file and directory carries a precomputed content hash up to the
-    root: integrity checking, cheap change detection, and hash-guided incremental backup. Snapshots
-    are retained roots, and block compression is on by default.
+    Eo9 bundles its own filesystem, <code>eofs</code>, designed as just another provider: it imports
+    the disk API and exports the filesystem API, so the same component will run over a real block
+    device on bare metal and over a file-backed or in-memory disk under usermode Eo9. It is copy-on-write and
+    never overwrites in place, with atomic root flips — crash consistency by construction, no fsck. It
+    is a Merkle tree throughout, so every file and directory carries a precomputed content hash up to
+    the root: integrity checking, cheap change detection, and hash-guided incremental backup. Snapshots
+    are retained roots, and block compression is on by default. The core engine is built and tested;
+    wiring it in as the standard disk-backed provider is in progress.
   </p>
 
   <h2>Bare metal and hosted</h2>
   <p>
     Eo9 targets bare metal — AArch64, RISC-V, and x86-64, including MMU-less hardware — and, because
     it is fundamentally a WebAssembly compiler plus a set of APIs, the same system also runs as an
-    ordinary usermode program on an existing OS (or on Eo9 itself).
+    ordinary usermode program on an existing OS (or on Eo9 itself), and even compiled to WebAssembly
+    in a browser tab. Today the AArch64 kernel boots to an interactive <code>eosh</code> under QEMU,
+    compiles compositions to native code on the machine, and preempts and contains its children;
+    the RISC-V and x86-64 ports are next.
   </p>
 
-  <h2>Roadmap</h2>
-  <p>The MVP being built in the open right now aims at:</p>
+  <h2>Where it stands</h2>
+  <p>Working today, built in the open:</p>
   <ul>
-    <li>the core OS API specs (execution, disk, filesystem, net, text, messages, entropy, time, perf);</li>
-    <li>a usermode <code>eo9</code> binary backed by standard *nix APIs;</li>
-    <li>bootable QEMU images for AMD64, AArch64, and rv64gc — headless programs and boot-to-shell;</li>
-    <li><code>eosh</code>, a shell built around the composition operators;</li>
-    <li>usermode and in-QEMU test suites.</li>
+    <li>the core OS API specs (execution, filesystem, disk, text, time, entropy, …) and the
+      composition algebra, with law tests and a generative property suite;</li>
+    <li>a usermode <code>eo9</code> binary backed by standard *nix APIs — typed arguments and
+      outcomes, a content-addressed store and compile cache, deterministic seeded runs, and
+      <code>eosh</code>, the shell built around the composition operators;</li>
+    <li>a bare-metal AArch64 kernel that boots to the same shell under QEMU and compiles
+      components to native code on the machine;</li>
+    <li>the same stack compiled to WebAssembly — <a href="/vm/">eo9.org/vm</a> boots
+      <code>eosh</code> in a browser tab and compiles compositions inside the page;</li>
+    <li>usermode integration suites and a single CI gate over the host, guest, and kernel
+      workspaces.</li>
   </ul>
   <p>
-    Progress, plans, and the full design live in the repository:
-    <a href="https://github.com/wyager/eo9">github.com/wyager/eo9</a>.
+    Next up: the RISC-V and x86-64 kernel ports and real boards, networking and the message API, and
+    <code>eofs</code> as the standard on-disk provider. Progress, plans, and the full design live in
+    the repository: <a href="https://github.com/wyager/eo9">github.com/wyager/eo9</a>.
   </p>
 
 </main>

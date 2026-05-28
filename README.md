@@ -58,11 +58,11 @@ eo9 echo --text "hello pipes" | tr a-z A-Z
 jail the program cannot escape:
 
 ```sh
-eo9 cat --path notes.txt
+eo9 cat notes.txt
 #> eo9: error: cat […] requires the eo9:fs filesystem capability, which eo9 does not grant
 #>      by default: pass `--fs-root <dir>` …            (refused before it runs; exit 3)
 
-eo9 --fs-root ./sandbox cat --path notes.txt
+eo9 --fs-root ./sandbox cat notes.txt
 #> capability systems are neat
 #> success(printed(28))
 

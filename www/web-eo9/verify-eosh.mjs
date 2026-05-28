@@ -80,13 +80,16 @@ const oneShot = lines.join("\n");
 // the same path the page terminal uses. eosh runs each and reads the next until EOF/exit.
 inputQueue = [
   "echo --text hi",
-  "cat --path /welcome.txt",
-  "ls --path /",
+  // Positional + variadic arguments: the path-taking coreutils take a trailing
+  // list<string>, so cat reads two files and a *bare* ls works (missing tail -> []).
+  "cat /welcome.txt /docs/about.txt",
+  "ls",
   // only-attenuation: the gate admitting exactly hello's needs runs it (restricted linker
   // serves only text+time); a text-only program runs under only-text (served only text);
   // dropping a required capability is refused (restrict: required-outside-allow).
   "only eo9:text/text,eo9:time/time $ hello --name boxed --excited true",
   "only eo9:text/text $ echo --text restricted",
+  "only eo9:text $ echo --text shorthand",
   "only eo9:text/text $ hello --name nope --excited true",
   // a `provider $ consumer` composition: entropy.seeded (a /bin provider) feeds rng. The fused
   // result has no pre-AOT'd artifact, so the blob compiles it *in-blob* (Cranelift -> Pulley) and
@@ -118,10 +121,19 @@ const checks = [
   ["hello outcome greeted", /greeted/.test(oneShot)],
   ["eosh command rc == 0", cmdRc === 0],
   ["interactive: echo printed hi", /\bhi\b/.test(interactive)],
-  ["interactive: cat read /welcome.txt", /printed\(/.test(interactive)],
-  ["interactive: ls listed /", /listed\(/.test(interactive)],
+  [
+    "interactive: cat read two positional paths",
+    /Hello from the Eo9 web VM filesystem/.test(interactive) &&
+      /capability-secure OS/.test(interactive) &&
+      /printed\(/.test(interactive),
+  ],
+  [
+    "interactive: bare ls listed / (empty-tail default)",
+    /welcome\.txt/.test(interactive) && /listed\(/.test(interactive),
+  ],
   ["only admitting text+time runs hello", /Hello, boxed/.test(interactive)],
   ["only-text runs a text-only program", /restricted/.test(interactive)],
+  ["only with the package shorthand (eo9:text) runs echo", /shorthand/.test(interactive)],
   ["only-text refuses hello (needs time)", !/Hello, nope/.test(interactive)],
   // The composition was NOT refused — it compiled inside the blob and ran (3 rng numbers),
   // with no server reachable from this harness at all.

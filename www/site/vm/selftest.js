@@ -231,8 +231,10 @@ async function run() {
 
     lines = [];
     const sleepyRc = await runSleepy();
-    check("sleepy reports the stackful-lift limitation honestly",
-      sleepyRc !== 0 && sawLine(/stackful/));
+    // The kernel's stackful-lift sleep canary now runs on this host too (it used to be
+    // refused by the fiberless path); assert the successful await-and-measure behaviour.
+    check("sleepy (stackful-lift canary) runs and measures its await",
+      sleepyRc === 0 && sawLine(/measured [\d.]+ ms across its await/));
   }
 
   verdict.textContent = failures === 0 ? "PASS" : `FAIL (${failures})`;
