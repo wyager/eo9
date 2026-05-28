@@ -14,13 +14,15 @@
 //! * **compile** — for a pristine store entry, a content lookup of its baked-in host-AOT
 //!   artifact (the fast path); for a fused algebra result, on-target Cranelift codegen
 //!   (`Component::new`, plan/12 Decision 29). Providers are rejected with `not-a-binary`.
-//! * **task** — `spawn` instantiates the artifact against the kernel root providers
-//!   (text/time/entropy — children never receive fs or exec, same policy as usermode) and
-//!   binds `main`'s WAVE arguments against its signature; the child then executes on the
-//!   shell's drive loop (`drive_children`), interleaved with the shell itself, exactly as
-//!   usermode children execute inside their parent's resume — wasmtime forbids re-entering
-//!   the event loop from a host function. `wait`/`runnable`/`kill` observe the child;
-//!   `resume` (guest-directed fuel donation) is unsupported, as in usermode (E5).
+//! * **task** — `spawn` instantiates the artifact against the full session environment —
+//!   the kernel root providers (text/time/entropy) plus the read-only store filesystem,
+//!   io buffers, and the whole `eo9:exec` surface, the same inherit-everything default as
+//!   usermode (restrict with `only`) — and binds `main`'s WAVE arguments against its
+//!   signature; the child then executes on the shell's drive loop (`drive_children`),
+//!   interleaved with the shell itself, exactly as usermode children execute inside their
+//!   parent's resume — wasmtime forbids re-entering the event loop from a host function.
+//!   `wait`/`runnable`/`kill` observe the child; `resume` (guest-directed fuel donation) is
+//!   unsupported, as in usermode (E5).
 //!
 //! Children are fuel-metered (the engine enables `consume_fuel`, matched by xtask's
 //! precompile configuration): instantiation runs on a small bounded budget, and the call to
@@ -525,7 +527,7 @@ fn try_preemption_demo(entries: &'static [super::store::StoreEntry]) -> Result<(
                 value: format!("{rounds}"),
             },
         ];
-        spawn_child(&engine, &component, &args, None).map_err(|err| {
+        spawn_child(&engine, entries, &component, &args, None).map_err(|err| {
             wasmtime::Error::msg(match err {
                 WitSpawnError::BadArguments(msg) => format!("spawn failed (bad arguments): {msg}"),
                 WitSpawnError::Internal(msg) => format!("spawn failed: {msg}"),
@@ -653,8 +655,17 @@ fn bind_args(
 /// Instantiate a child from its precompiled component, bind `main`'s arguments, and park
 /// it in the registry. No guest code beyond instantiation runs here; the child executes on
 /// the shell's drive loop.
+///
+/// Children inherit the full session environment — the kernel root providers
+/// (text/time/entropy), the read-only store filesystem (`/bin`, `/session`), the io
+/// buffers, and the whole `eo9:exec` surface — every generation, exactly like usermode
+/// children since the layered-session change (plan/11 D14–15). The loader rule keeps this
+/// honest: a child only links the interfaces its (possibly `only`-restricted) component
+/// imports, so granting the full set is inert for programs that never asked for it, and a
+/// nested `eosh` is a full peer that can resolve `/bin`, spawn, and compose.
 fn spawn_child(
     engine: &Engine,
+    entries: &'static [super::store::StoreEntry],
     component: &Component,
     args: &[WitNamedArg],
     max_memory: Option<u64>,
@@ -669,8 +680,18 @@ fn spawn_child(
 
     let mut linker: Linker<KernelState> = Linker::new(engine);
     providers::add_providers(&mut linker).map_err(internal)?;
+    super::shellfs::add_buffers(&mut linker).map_err(internal)?;
+    super::shellfs::add_fs(&mut linker).map_err(internal)?;
+    add_exec(&mut linker).map_err(internal)?;
 
-    let mut store = Store::new(engine, KernelState::new());
+    let mut state = KernelState::new();
+    state.shell = Some(Box::new(super::shell::ShellState {
+        fs: super::shellfs::ShellFs::new(entries, super::shell::session_manifest(entries)),
+        buffers: super::shellfs::BufferTable::default(),
+        exec: ShellExec::default(),
+        engine: engine.clone(),
+    }));
+    let mut store = Store::new(engine, state);
     if let Some(max_memory) = max_memory {
         store.data_mut().set_max_memory(max_memory);
         store.limiter(|state| state.limiter());
@@ -1418,12 +1439,13 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
          (image, args, limits): (Resource<ExecImageRes>, Vec<WitNamedArg>, WitSpawnLimits)|
          -> Result<(Result<Resource<ChildTaskRes>, WitSpawnError>,)> {
             let engine = store.data_mut().shell_engine()?;
+            let entries = store.data_mut().shell_entries()?;
             let component = {
                 let exec = store.data_mut().shell_exec()?;
                 exec.image(image.rep())?.component.clone()
             };
             Ok((
-                match spawn_child(&engine, &component, &args, limits.max_memory) {
+                match spawn_child(&engine, entries, &component, &args, limits.max_memory) {
                     Ok(rep) => Ok(Resource::new_own(rep)),
                     Err(err) => Err(err),
                 },
@@ -1539,15 +1561,16 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
 }
 
 /// Translate a linker "missing import" instantiation error into the capability story
-/// instead of leaking the raw error text (user-study finding: an fs-needing child died
-/// with a raw `eo9:io/buffers` linker error).
+/// instead of leaking the raw error text (user-study finding). Children now inherit the
+/// session's fs/io/exec surface, so the remaining genuinely-unavailable capabilities on
+/// bare metal are the ones the kernel has no provider for at all.
 fn missing_capability(text: &str) -> Option<String> {
-    let capability = if text.contains("eo9:fs/") || text.contains("eo9:io/") {
-        "a filesystem, which the bare-metal session does not provide to children yet"
-    } else if text.contains("eo9:exec/") {
-        "the exec capability, which the bare-metal session does not provide to children yet"
-    } else if text.contains("eo9:net/") {
+    let capability = if text.contains("eo9:net/") {
         "the network, which the bare-metal session does not provide"
+    } else if text.contains("eo9:disk/") {
+        "raw disk access, which the bare-metal session does not provide"
+    } else if text.contains("eo9:pci/") {
+        "PCI device access, which the bare-metal session does not provide"
     } else {
         return None;
     };
