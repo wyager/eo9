@@ -7,9 +7,12 @@
 //! * a session directory under the store root whose `bin/` holds one `<name>.wasm` per
 //!   bound store name (plus the dev-tree example/stub components), because eosh resolves
 //!   program names as `/bin/<name>.wasm` on its granted filesystem;
-//! * the usual root providers (terminal stdio, host clocks, OS RNG), an fs rooted at that
-//!   session directory, and the exec capability whose child policy grants children the
-//!   same session roots a direct `eo9 run` would get — never exec itself;
+//! * the usual root providers (terminal stdio, host clocks, OS RNG), the layered session
+//!   filesystem (the read-only `/bin` program view over the writable `--fs-root`), and the
+//!   full `eo9:exec` capability (component algebra, compile, spawn) — whose child policy
+//!   hands every child the *same* environment by default, so a child `eosh` is a full peer
+//!   (it can resolve `/bin`, compose, compile, and spawn, and recurse further); attenuate
+//!   any one command with `only`;
 //! * the existing drive loop; interactive when no command was given, one-shot with `-c`.
 //!
 //! Known limitation (runtime escalation E5): children execute inside the shell's own
@@ -90,7 +93,7 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
         // A clean shell exit stays quiet: everything worth seeing was already printed by
         // eosh (and its children) through the text capability.
         Outcome::Success(_) => vlog!(cfg, "shell outcome: {rendered}"),
-        _ => println!("{rendered}"),
+        _ => run::print_outcome(cfg, &rendered),
     }
     Ok(code)
 }

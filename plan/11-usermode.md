@@ -188,3 +188,42 @@ its first milestones, and to be the place where cross-area seams get found.
     `shell_providers`/`child_root_providers` and must be kept in sync with them; writing it is best-effort
     (a failure degrades to a warning and `env` just has less to say). Children cannot read it — their
     filesystem, if any, is `--fs-root`, not the session directory.
+
+14. **User-study fixes (2026-05-27).** (a) The typed outcome line is printed on **stderr** by default —
+    program output owns stdout, the exit code already encodes the outcome — with `--outcome
+    <stderr|stdout|quiet>` to override (the CLI transcripts assert the stderr form). (b) `--max-fuel <units>`
+    caps the fuel donated by the drive loop; an exhausted budget kills the task (`abnormal(killed)`, exit 2);
+    default unlimited. (c) Direct runs (`eo9 run <name>` / `eo9 <name>`) seed an empty store from the
+    embedded components exactly like the shell path, so the first README example works on a fresh install.
+    (d) Not done here, recorded as remaining: unifying eosh's `ok:`/`error:` per-command lines with `run`'s
+    WAVE outcome format, and propagating the child's 0/1/2/3 exit code through `shell -c` (today a failed or
+    trapped child both exit 1 via eosh's `command-failed`); needs a small eosh-world variant addition.
+
+15. **The layered session filesystem and the full child environment (Phase 2 of the overlay/recursive-eosh
+    plan, 2026-05-27).** The session's filesystem is now an **overlay** (SPEC.md "Overlay filesystems"),
+    assembled host-side in `providers::OverlayFs`: the *upper* layer is the session directory's read-only
+    program view (`/bin/<name>.wasm` plus the `session` manifest), the *lower* layer is the user's writable
+    `--fs-root` (absent → the overlay is read-only and mutations report `read-only`). Reads resolve
+    upper-first and fall through to lower on not-found, listings union both layers (upper wins), every
+    mutation routes to lower; handles are tagged with their serving layer. The shell **and every child**
+    receive this same filesystem, and children now inherit the **full session environment** — text, time,
+    entropy, the overlaid fs, and the entire `eo9:exec` surface (component algebra, compile, task) — via a
+    recursive child policy (`shell_providers`' `make` factory), so a nested `eosh` is a full peer that can
+    resolve `/bin`, compose, compile, spawn, and recurse; every generation gets the same environment.
+    Restriction is composition: `only`/`$`/`&`/`configure` attenuate before spawn (covered by the
+    `only_strips_the_whole_exec_surface_from_a_restricted_child` test), and the runtime still links only
+    what a child imports. This supersedes the "children never receive exec" rule in Decisions 8/13 and the
+    earlier held child-caps branch (its regression — children losing `--fs-root` — is exactly what the
+    overlay fixes; the `coreutils_fs_tools_against_a_sandbox` and
+    `shell_children_see_bin_programs_and_fs_root_data_at_once` tests pin both behaviors at once).
+    *Why host-side rather than the guest `fs.overlay` component:* both of this phase's layers are root
+    providers (the program view and `--fs-root`), which the OS core links directly like every other root
+    capability; interposing the guest `fs.overlay` component instead requires the runtime to (a) satisfy a
+    component's two named `eo9:fs` slots from two host providers and (b) compose the overlay onto every
+    spawned child (with the compile-cost and cache-key consequences that implies) — recorded here as the
+    follow-up that makes the session overlay itself algebraic; the guest component, its semantics, and its
+    tests are already merged (plan/09 D11–12) and unchanged by this decision. Bare-metal recursion remains
+    deferred (plan/12 D36: the kernel's child-drive lock); the kernel session still grants children
+    text/time/entropy only. `env`'s manifest now describes the layered fs and the inherited exec, and
+    `env <program>` marks `eo9:fs` imports as satisfied by the session (the read-only view exists even
+    without `--fs-root`).

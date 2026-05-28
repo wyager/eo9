@@ -101,3 +101,11 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
    interface with `grants: func() -> list<grant-info>` describing the caller's own providers and its
    children's policy — would replace the file convention; the manifest format was chosen to be trivially
    replaceable by it.
+
+10. **Friendly error rendering (2026-05-27).** The eosh backend renders `only`/`$`/`&`/`configure`/`spawn`
+    failures as plain-language sentences instead of the generated error enums' debug form (the user studies
+    flagged `RestrictError::RequiredOutsideAllowList([...])` and raw linker text). Spawn `internal` errors
+    that mention an unsatisfied `eo9:*` import are translated into "the program requires the <capability>
+    capability, which this session does not provide to it". `load`/`rename`/`compile` keep the generic
+    rendering for now. Guest-SDK panic messages are still discarded by the panic handler (preserving them
+    needs either a hidden import or a new diagnostic channel — owner design call, see GAPS).

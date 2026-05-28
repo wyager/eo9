@@ -506,6 +506,7 @@ fn do_open(
         .truncate(options.truncate)
         .open(&resolved)
         .map_err(|err| io_to_fs(&err))?;
+    verify_fd_within_root(&file, root)?;
     Ok(FsFile {
         file: Arc::new(file),
         readable: options.read,
@@ -534,6 +535,7 @@ fn do_open_exec(
         ));
     }
     let mut source = File::open(&resolved).map_err(|err| io_to_fs(&err))?;
+    verify_fd_within_root(&source, root)?;
 
     // Clone-first: a zero-copy COW snapshot into a fresh private file, immediately
     // unlinked so only this handle's descriptor can reach it. If the backing filesystem
@@ -791,6 +793,55 @@ fn resolve_parent(root: &Path, path: &str) -> Result<PathBuf, FsError> {
         Ok(canonical_parent.join(name))
     } else {
         Err(FsError::Denied)
+    }
+}
+
+/// Interim TOCTOU hardening: after a file has been opened, re-verify that the path the
+/// open descriptor actually refers to still lies under `root`. The resolve-then-open
+/// sequence is not atomic, so a host-side actor can swap a path component for a symlink
+/// between canonicalization and `open`; checking the descriptor's own path (fcntl
+/// `F_GETPATH` on macOS, `/proc/self/fd` on Linux) closes the easy version of that race.
+/// The real fix remains `openat2(RESOLVE_BENEATH)`-style resolution (see GAPS.md).
+fn verify_fd_within_root(file: &File, root: &Path) -> Result<(), FsError> {
+    match fd_path(file) {
+        Ok(actual) => {
+            if actual.starts_with(root) {
+                Ok(())
+            } else {
+                Err(FsError::Denied)
+            }
+        }
+        // If the descriptor's path cannot be read (unnamed/unlinked files, exotic
+        // filesystems), fall back to the pre-open containment decision rather than
+        // refusing valid opens.
+        Err(_) => Ok(()),
+    }
+}
+
+/// Best-effort path of an open descriptor.
+fn fd_path(file: &File) -> std::io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+        if rc == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let len = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+        Ok(PathBuf::from(std::str::from_utf8(&buf[..len]).map_err(
+            |_| std::io::Error::other("non-UTF-8 descriptor path"),
+        )?))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = file;
+        Err(std::io::Error::other("descriptor path lookup unsupported"))
     }
 }
 
@@ -1073,6 +1124,27 @@ mod tests {
         .unwrap();
         let (_, result) = read_file(write_only.as_ref(), 0, 5);
         assert!(matches!(result.unwrap_err(), FsError::Io(_)));
+    }
+
+    #[test]
+    fn fd_re_verification_accepts_inside_and_rejects_outside_the_root() {
+        let root = TempDir::new();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let inside = canonical_root.join("inside.txt");
+        std::fs::write(&inside, b"in").unwrap();
+        let inside_file = File::open(&inside).unwrap();
+        assert!(verify_fd_within_root(&inside_file, &canonical_root).is_ok());
+
+        let elsewhere = TempDir::new();
+        let outside = std::fs::canonicalize(elsewhere.path())
+            .unwrap()
+            .join("outside.txt");
+        std::fs::write(&outside, b"out").unwrap();
+        let outside_file = File::open(&outside).unwrap();
+        assert!(matches!(
+            verify_fd_within_root(&outside_file, &canonical_root),
+            Err(FsError::Denied)
+        ));
     }
 
     #[test]

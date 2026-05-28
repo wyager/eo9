@@ -146,10 +146,10 @@ fn run_hello_by_path_end_to_end() {
         run.stdout
     );
     assert_eq!(
-        run.stdout.lines().last(),
+        run.stderr.lines().last(),
         Some("success(greeted)"),
-        "outcome line missing from stdout: {}",
-        run.stdout
+        "outcome line missing from stderr: {}",
+        run.stderr
     );
 }
 
@@ -167,41 +167,41 @@ fn run_outcomes_covers_success_failure_and_abnormal() {
     let ok = run_mode("ok", "all good");
     assert_eq!(ok.code, 0, "stderr: {}", ok.stderr);
     assert_eq!(
-        ok.stdout.lines().last(),
+        ok.stderr.lines().last(),
         Some("success(completed(\"all good\"))")
     );
 
     let quiet = run_mode("quiet", "");
     assert_eq!(quiet.code, 0, "stderr: {}", quiet.stderr);
-    assert_eq!(quiet.stdout.trim(), "success(quiet)");
+    assert_eq!(quiet.stderr.trim(), "success(quiet)");
 
     let fail = run_mode("fail", "went wrong");
     assert_eq!(fail.code, 1, "stderr: {}", fail.stderr);
     assert_eq!(
-        fail.stdout.lines().last(),
+        fail.stderr.lines().last(),
         Some("failure(requested-failure(\"went wrong\"))")
     );
 
     let rejected = run_mode("nonsense", "");
     assert_eq!(rejected.code, 1, "stderr: {}", rejected.stderr);
     assert!(
-        rejected.stdout.trim().starts_with("failure(bad-arguments("),
+        rejected.stderr.trim().starts_with("failure(bad-arguments("),
         "unexpected outcome: {}",
-        rejected.stdout
+        rejected.stderr
     );
 
     // A guest panic lowers to a wasm trap: the executor's abnormal arm, exit code 2.
     let trapped = run_mode("trap", "");
     assert_eq!(trapped.code, 2, "stderr: {}", trapped.stderr);
     assert!(
-        trapped.stdout.trim().starts_with("abnormal(trapped("),
+        trapped.stderr.trim().starts_with("abnormal(trapped("),
         "unexpected outcome: {}",
-        trapped.stdout
+        trapped.stderr
     );
     assert!(
-        trapped.stdout.contains("unreachable"),
+        trapped.stderr.contains("unreachable"),
         "trap reason missing: {}",
-        trapped.stdout
+        trapped.stderr
     );
 }
 
@@ -224,7 +224,7 @@ fn run_cruncher_is_deterministic_pure_compute() {
         &["run", &cruncher, "--seed", "9", "--rounds", "1000"],
     );
     assert_eq!(first.code, 0, "stderr: {}", first.stderr);
-    assert_eq!(first.stdout.trim(), format!("success(digest({expected}))"));
+    assert_eq!(first.stderr.trim(), format!("success(digest({expected}))"));
 
     // Pure compute with fixed arguments is bit-deterministic run to run.
     let second = eo9(
@@ -232,12 +232,12 @@ fn run_cruncher_is_deterministic_pure_compute() {
         &["run", &cruncher, "--seed", "9", "--rounds", "1000"],
     );
     assert_eq!(second.code, 0, "stderr: {}", second.stderr);
-    assert_eq!(second.stdout, first.stdout);
+    assert_eq!(second.stderr, first.stderr);
 
     // Zero rounds is rejected in the program's own failure vocabulary.
     let rejected = eo9(&store, &["run", &cruncher, "--seed", "9", "--rounds", "0"]);
     assert_eq!(rejected.code, 1);
-    assert!(rejected.stdout.trim().starts_with("failure(bad-arguments("));
+    assert!(rejected.stderr.trim().starts_with("failure(bad-arguments("));
 }
 
 // -----------------------------------------------------------------------------------
@@ -365,7 +365,15 @@ fn an_unwritable_cache_never_fails_a_run() {
         "expected an insert warning: {}",
         cold.stderr
     );
-    assert!(cold.stdout.trim().starts_with("success(digest("));
+    assert!(
+        cold.stderr
+            .lines()
+            .last()
+            .unwrap_or("")
+            .starts_with("success(digest("),
+        "outcome line missing from stderr: {}",
+        cold.stderr
+    );
 
     // Populate the cache normally, then make the entry read-only: the lookup's
     // use-count bump fails, which is treated as a miss (warn + recompile), not an error.
@@ -488,7 +496,7 @@ fn readwrite_round_trips_through_the_unix_fs() {
         ],
     );
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
-    assert_eq!(run.stdout.trim(), "success(round-tripped(10))");
+    assert_eq!(run.stderr.trim(), "success(round-tripped(10))");
 
     // The write really landed on the host filesystem, under the fs root.
     assert_eq!(
@@ -523,14 +531,14 @@ fn readwrite_failures_stay_in_the_programs_vocabulary_and_inside_the_root() {
     let escape = run_with_path("../escaped.txt");
     assert_eq!(escape.code, 1, "stderr: {}", escape.stderr);
     assert!(
-        escape.stdout.trim().starts_with("failure(fs("),
+        escape.stderr.trim().starts_with("failure(fs("),
         "expected the program's fs failure: {}",
-        escape.stdout
+        escape.stderr
     );
     assert!(
-        escape.stdout.contains("Denied"),
+        escape.stderr.contains("Denied"),
         "expected a denied error: {}",
-        escape.stdout
+        escape.stderr
     );
     assert!(
         !fs_root
@@ -546,9 +554,9 @@ fn readwrite_failures_stay_in_the_programs_vocabulary_and_inside_the_root() {
     let missing = run_with_path("no-such-dir/note.txt");
     assert_eq!(missing.code, 1, "stderr: {}", missing.stderr);
     assert!(
-        missing.stdout.trim().starts_with("failure(fs("),
+        missing.stderr.trim().starts_with("failure(fs("),
         "expected the program's fs failure: {}",
-        missing.stdout
+        missing.stderr
     );
 }
 
@@ -670,7 +678,7 @@ fn shell_composes_with_the_algebra() {
             })
             .expect("a digest in the output")
     };
-    assert_eq!(digest(&run.stdout), digest(&direct.stdout));
+    assert_eq!(digest(&run.stdout), digest(&direct.stderr));
 }
 
 #[test]
@@ -687,17 +695,17 @@ fn shell_maps_child_failures_to_exit_code_1() {
         failed.stdout
     );
     assert!(
-        failed.stdout.contains("failure(command-failed("),
+        failed.stderr.contains("failure(command-failed("),
         "the shell's own outcome should be a failure: {}",
-        failed.stdout
+        failed.stderr
     );
 
     let unknown = eo9(&store, &["shell", "-c", "nosuchprogram"]);
     assert_eq!(unknown.code, 1, "stdout: {}", unknown.stdout);
     assert!(
-        unknown.stdout.contains("cannot resolve `nosuchprogram`"),
+        unknown.stderr.contains("cannot resolve `nosuchprogram`"),
         "{}",
-        unknown.stdout
+        unknown.stderr
     );
 }
 
@@ -844,10 +852,17 @@ fn shell_env_shows_the_session_capability_picture() {
         "{}",
         run.stdout
     );
-    // Without --fs-root, children get no filesystem and env says how to grant one.
+    // Children inherit the full environment (including exec); the note points at `only`
+    // as the way to restrict a command, and — without --fs-root — at how to grant a
+    // writable data root.
     assert!(run.stdout.contains("--fs-root"), "{}", run.stdout);
     assert!(
-        run.stdout.contains("never receive the exec capability"),
+        run.stdout.contains("restrict a command with `only`"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout.contains("never receive the exec capability"),
         "{}",
         run.stdout
     );
@@ -874,7 +889,9 @@ fn shell_env_shows_the_session_capability_picture() {
         granted.stdout
     );
     assert!(
-        !granted.stdout.contains("--fs-root <dir> to grant one"),
+        !granted
+            .stdout
+            .contains("to give programs a writable data directory"),
         "{}",
         granted.stdout
     );
@@ -900,7 +917,9 @@ fn shell_env_of_a_program_marks_imports_against_the_session() {
     // Inspecting never runs the program.
     assert!(!hello.stdout.contains("Hello"), "{}", hello.stdout);
 
-    // readwrite requires a filesystem; without --fs-root this session would refuse it.
+    // readwrite requires a filesystem; the session always layers one (the read-only /bin
+    // program view, writable only when --fs-root adds a data root), so the import is
+    // satisfied — `env` reports the grant rather than a refusal.
     let readwrite = eo9(&store, &["shell", "-c", "env readwrite"]);
     assert_eq!(readwrite.code, 0, "stderr: {}", readwrite.stderr);
     assert!(
@@ -909,11 +928,123 @@ fn shell_env_of_a_program_marks_imports_against_the_session() {
         readwrite.stdout
     );
     assert!(
-        readwrite
-            .stdout
-            .contains("missing — would be refused at spawn"),
+        readwrite.stdout.contains("satisfied by the session (fs)"),
         "{}",
         readwrite.stdout
+    );
+}
+
+#[test]
+fn shell_child_inherits_the_full_exec_environment_and_recurses() {
+    // The headline of the child-capability default: a child `eosh` launched from `eosh`
+    // is a full peer — it inherits the whole `eo9:exec` surface (component algebra,
+    // compile, spawn) plus the layered session filesystem, so it can both spawn programs
+    // AND compose them, and it can recurse. Driven through piped stdin: the nested shell
+    // consumes the rest of the script and EOF ends both shells (a nested non-tty shell
+    // shares the one stdin, so every command goes before the implicit exits).
+    let store = temp_store("shell-recurse");
+    let script = "eosh\n\
+                  hello --name nested --excited true\n\
+                  only eo9:text/text,eo9:time/time $ hello --name boxed --excited true\n\
+                  text.null $ hello --name quiet --excited true\n";
+    let run = eo9_with_stdin(&store, &["shell"], Some(script));
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+
+    // Two banners: the outer shell launched a nested one (recursion).
+    let banners = run.stdout.matches("eosh — the Eo9 shell").count();
+    assert!(
+        banners >= 2,
+        "expected a nested shell banner: {}",
+        run.stdout
+    );
+    // The nested shell SPAWNED a program.
+    assert!(
+        run.stdout.contains("Hello, nested!"),
+        "nested shell did not run a program: {}",
+        run.stdout
+    );
+    // The nested shell COMPOSED with `only` and ran the result.
+    assert!(
+        run.stdout.contains("Hello, boxed!"),
+        "nested shell could not compose with `only`: {}",
+        run.stdout
+    );
+    // The nested shell COMPOSED with `$`: text.null seals hello's text, so the greeting
+    // is discarded but the program still succeeds.
+    assert!(
+        !run.stdout.contains("Hello, quiet!"),
+        "text.null should have sealed the greeting: {}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("greeted"),
+        "expected a success outcome from the nested shell: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn shell_children_see_bin_programs_and_fs_root_data_at_once() {
+    // The layered session filesystem: a data tool sees the user's --fs-root files at `/`
+    // AND the read-only /bin program view, in one capability. Writes land in the data
+    // root and never touch the program view.
+    let store = temp_store("shell-overlay");
+    let sandbox = temp_sandbox("shell-overlay");
+    fs::write(sandbox.join("notes.txt"), "layered\n").expect("write fixture");
+    let sb = sandbox.to_str().expect("utf-8 sandbox path");
+
+    let ls = eo9(&store, &["--fs-root", sb, "-c", "ls --path /"]);
+    assert_eq!(ls.code, 0, "stderr: {}", ls.stderr);
+    assert!(ls.stdout.contains("notes.txt"), "ls output: {}", ls.stdout);
+    assert!(ls.stdout.contains("bin"), "ls output: {}", ls.stdout);
+
+    let ls_bin = eo9(&store, &["--fs-root", sb, "-c", "ls --path /bin"]);
+    assert_eq!(ls_bin.code, 0, "stderr: {}", ls_bin.stderr);
+    assert!(
+        ls_bin.stdout.contains("hello.wasm"),
+        "ls /bin output: {}",
+        ls_bin.stdout
+    );
+
+    let cat = eo9(&store, &["--fs-root", sb, "-c", "cat --path /notes.txt"]);
+    assert_eq!(cat.code, 0, "stderr: {}", cat.stderr);
+    assert!(cat.stdout.contains("layered"), "cat output: {}", cat.stdout);
+
+    // A write goes to the data root on the host side, not into the program view.
+    let cp = eo9(
+        &store,
+        &["--fs-root", sb, "-c", "cp --src /notes.txt --dst /copy.txt"],
+    );
+    assert_eq!(cp.code, 0, "stderr: {}", cp.stderr);
+    assert!(sandbox.join("copy.txt").is_file(), "copy missing");
+    assert!(
+        !store.join("shell/copy.txt").exists(),
+        "wrote into /bin view"
+    );
+
+    // Without --fs-root there is no writable layer: a mutation is refused by the
+    // read-only overlay, in the program's own error vocabulary (an fs error reported as
+    // the program's failure outcome, not a missing-capability spawn refusal).
+    let denied = eo9(&store, &["-c", "mkdir --path /newdir"]);
+    assert_ne!(denied.code, 0, "stdout: {}", denied.stdout);
+    assert!(!store.join("shell/newdir").exists(), "wrote into /bin view");
+}
+
+#[test]
+fn only_strips_the_whole_exec_surface_from_a_restricted_child() {
+    // `only` attenuates before spawn: restricting eosh (which requires the full eo9:exec
+    // surface) to just text is refused before it runs — proof that the algebra removes
+    // exec/compile/spawn, so a locked-down child cannot compose or launch anything.
+    let store = temp_store("shell-only-exec");
+    let run = eo9(&store, &["shell", "-c", "only eo9:text/text $ eosh"]);
+    // The refusal is a compose-time error (printed by eosh), not a run: it never reaches
+    // a spawn. It surfaces on stderr and the one-shot reports failure.
+    let output = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        output.contains("eo9:exec/component-algebra")
+            || output.contains("RequiredOutsideAllowList"),
+        "only should refuse eosh for lacking the exec surface (code {}): {output}",
+        run.code
     );
 }
 
@@ -958,7 +1089,7 @@ fn store_add_ls_gc_and_run_by_name() {
         "stdout: {}",
         run.stdout
     );
-    assert_eq!(run.stdout.lines().last(), Some("success(greeted)"));
+    assert_eq!(run.stderr.lines().last(), Some("success(greeted)"));
 
     let unknown = eo9(&store, &["run", "nosuchname"]);
     assert_eq!(unknown.code, 3);
@@ -1076,7 +1207,7 @@ fn default_invocations_run_the_shell_and_programs() {
         "{}",
         by_path.stdout
     );
-    assert_eq!(by_path.stdout.lines().last(), Some("success(greeted)"));
+    assert_eq!(by_path.stderr.lines().last(), Some("success(greeted)"));
 
     // And so is `eo9 <bare-name> …` once the name is bound (here: by the seeding above).
     let by_name = eo9(&store, &["hello", "--name", "byname", "--excited", "true"]);
