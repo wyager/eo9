@@ -48,7 +48,7 @@ mod slots;
 mod synth;
 
 pub use component::Component;
-pub use compose::{compose, extend};
+pub use compose::{ComposeWarning, compose, compose_checked, extend};
 pub use configure::configure;
 pub use error::{ComposeError, ConfigureError, LoadError, RenameError, RestrictError};
 pub use rename::rename;

@@ -13,8 +13,33 @@ use alloc::vec::Vec;
 use wac_graph::types::{ItemKind, Package};
 use wac_graph::{CompositionGraph, EncodeOptions, InstantiationArgumentError, NodeId, PackageId};
 
+use crate::describe::CONFIG_SUFFIX;
 use crate::error::ComposeError;
 use crate::{Component, ComponentKind, externs, slots};
+
+/// A non-fatal observation made while composing (SPEC.md "Composition and the `$`
+/// operator": unmatched provider exports are dropped, and the shell is expected to warn
+/// when a provider contributed nothing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposeWarning {
+    /// None of the provider's exports matched an import of the consumer: the entire
+    /// provider is dropped from the composition (a dead layer). The slot names of the
+    /// dropped exports are listed for the message.
+    ProviderExportsUnused { exports: Vec<String> },
+}
+
+impl core::fmt::Display for ComposeWarning {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::ProviderExportsUnused { exports } => write!(
+                f,
+                "the provider's exports ({}) match nothing the consumer imports; the layer has \
+                 no effect and is dropped",
+                exports.join(", ")
+            ),
+        }
+    }
+}
 
 /// `$` -- composition: satisfy `consumer`'s imports from `provider`'s matching exports.
 ///
@@ -27,6 +52,15 @@ use crate::{Component, ComponentKind, externs, slots};
 ///
 /// The left operand must be a provider; the right operand may be a binary or a provider.
 pub fn compose(provider: &Component, consumer: &Component) -> Result<Component, ComposeError> {
+    compose_checked(provider, consumer).map(|(component, _)| component)
+}
+
+/// [`compose`], also reporting non-fatal observations (see [`ComposeWarning`]) so a
+/// shell or other front end can relay them to the user.
+pub fn compose_checked(
+    provider: &Component,
+    consumer: &Component,
+) -> Result<(Component, Vec<ComposeWarning>), ComposeError> {
     if provider.kind() != ComponentKind::Provider {
         return Err(ComposeError::NotAProvider);
     }
@@ -37,10 +71,58 @@ pub fn compose(provider: &Component, consumer: &Component) -> Result<Component, 
     let p_inst = graph.instantiate(p_pkg);
     let c_inst = graph.instantiate(c_pkg);
 
-    wire_matching_imports(&mut graph, p_pkg, p_inst, c_pkg, c_inst)?;
+    let skips = split_identity_skips(provider, consumer);
+    let sealed = wire_matching_imports(&mut graph, p_pkg, p_inst, c_pkg, c_inst, &skips)?;
+    let mut warnings = Vec::new();
+    if sealed == 0 {
+        // Nothing the provider exports is consumed. If that is because the provider
+        // only offers its configuration interface for an API the consumer actually
+        // needs (the SPEC "export shape encodes whether configuration is required"
+        // rule), refuse with the configure hint; otherwise it is the spec's
+        // dead-layer case, which composes fine but deserves a warning.
+        if let Some(slot) = unconfigured_provider_for(provider, consumer) {
+            return Err(ComposeError::TypeMismatch(format!(
+                "`{slot}` exports only its configuration interface for an API the consumer \
+                 requires -- apply `configure(\u{2026})` to bind its arguments and produce a \
+                 composable provider (an unconfigured provider has no API to compose)"
+            )));
+        }
+        warnings.push(ComposeWarning::ProviderExportsUnused {
+            exports: provider
+                .meta()
+                .exports
+                .iter()
+                .map(|e| e.slot.clone())
+                .collect(),
+        });
+    }
     export_all(&mut graph, c_pkg, c_inst, None)?;
 
-    encode(&graph, &slot_annotations(&[provider, consumer]))
+    let component = encode(&graph, &slot_annotations(&[provider, consumer]))?;
+    Ok((component, warnings))
+}
+
+/// If the provider's only relevant offer for something the consumer *requires* is a
+/// `*-config` interface (it exports `X-config` but not `X`, and the consumer requires
+/// `X`), the slot name of that required API -- the "needs `configure`" situation.
+fn unconfigured_provider_for(provider: &Component, consumer: &Component) -> Option<String> {
+    let provider_exports = &provider.meta().exports;
+    for import in &consumer.meta().imports {
+        if !import.required || import.interface.is_empty() {
+            continue;
+        }
+        let exports_api = provider_exports
+            .iter()
+            .any(|e| e.interface == import.interface);
+        let config_interface = format!("{}{}", import.interface, CONFIG_SUFFIX);
+        let exports_config = provider_exports
+            .iter()
+            .any(|e| e.interface == config_interface);
+        if exports_config && !exports_api {
+            return Some(import.slot.clone());
+        }
+    }
+    None
 }
 
 /// `&` -- environment extension: `base` extended and, where they overlap, overridden by
@@ -65,7 +147,14 @@ pub fn extend(base: &Component, layer: &Component) -> Result<Component, ComposeE
     let x_inst = graph.instantiate(x_pkg);
     let y_inst = graph.instantiate(y_pkg);
 
-    wire_matching_imports(&mut graph, x_pkg, x_inst, y_pkg, y_inst)?;
+    wire_matching_imports(
+        &mut graph,
+        x_pkg,
+        x_inst,
+        y_pkg,
+        y_inst,
+        &split_identity_skips(base, layer),
+    )?;
 
     // Exports: everything from the layer, plus whatever the base exports that the layer
     // does not shadow (shadowing is keyed by slot name).
@@ -152,14 +241,50 @@ pub(crate) fn world_exports(graph: &CompositionGraph, pkg: PackageId) -> Vec<(St
         .collect()
 }
 
+/// The extern names of `consumer` imports that must NOT be wired from `provider`: a
+/// types-only (authority-free) import whose package's authority interface the consumer
+/// also imports but `provider` does not export. Wiring just the types in that situation
+/// splits the package's nominal resource identity between two implementers -- the
+/// authority interface keeps expecting the types of whoever eventually provides it --
+/// and the encoded composition fails validation (the `X.none $ consumer` shape from the
+/// PL user study). Leaving the types import residual keeps the drop law intact: the
+/// provider contributes nothing, and whoever provides the authority later brings its
+/// own types instance.
+fn split_identity_skips(provider: &Component, consumer: &Component) -> Vec<String> {
+    let provider_exports = &provider.meta().exports;
+    let imports = &consumer.meta().imports;
+    let package_of = |interface: &str| interface.split('/').next().unwrap_or("").to_string();
+
+    let mut skips = Vec::new();
+    for import in imports {
+        if !import.authority_free || import.interface.is_empty() {
+            continue;
+        }
+        let package = package_of(&import.interface);
+        let unsatisfied_authority = imports.iter().any(|other| {
+            !other.authority_free
+                && package_of(&other.interface) == package
+                && !provider_exports
+                    .iter()
+                    .any(|e| e.interface == other.interface)
+        });
+        if unsatisfied_authority {
+            skips.push(import.extern_name.clone());
+        }
+    }
+    skips
+}
+
 /// Wires every interface import of `to` that is matched -- by slot name and the semver
-/// rule -- by an interface export of `from`. Returns how many imports were sealed.
+/// rule -- by an interface export of `from`, except those listed (by extern name) in
+/// `skip`. Returns how many imports were sealed.
 pub(crate) fn wire_matching_imports(
     graph: &mut CompositionGraph,
     from_pkg: PackageId,
     from_inst: NodeId,
     to_pkg: PackageId,
     to_inst: NodeId,
+    skip: &[String],
 ) -> Result<usize, ComposeError> {
     let exports = world_exports(graph, from_pkg);
     let imports = world_imports(graph, to_pkg);
@@ -168,6 +293,9 @@ pub(crate) fn wire_matching_imports(
     for (import_name, import_kind) in &imports {
         // Capability slots are interfaces; other import kinds are never wired here.
         if !matches!(import_kind, ItemKind::Instance(_)) {
+            continue;
+        }
+        if skip.iter().any(|name| name == import_name) {
             continue;
         }
         let matched = exports.iter().find(|(export_name, export_kind)| {

@@ -46,6 +46,23 @@ impl Component {
         self.bytes
     }
 
+    /// The component's bytes with every `implements` extern-name annotation stripped:
+    /// the form to hand to an executor's `compile`.
+    ///
+    /// Plain-named slots (a renamed import such as `wallclock`, or a multi-instance
+    /// consumer's named slots) carry an `implements` annotation recording the interface
+    /// they are an instance of. The annotation is purely descriptive -- `describe`,
+    /// wiring, and validation in this crate use it, but the canonical ABI never does --
+    /// and the pinned runtime's component parser predates it, so compiling bytes that
+    /// still carry one fails with an opaque parse error instead of running (or being
+    /// refused for the missing import) cleanly. Stripping it changes nothing about the
+    /// component's behavior; it only drops the describe-side identity of named slots,
+    /// which an executor does not need. `bytes()`/`save()` keep the annotation so the
+    /// algebra itself stays lossless.
+    pub fn executable_bytes(&self) -> Vec<u8> {
+        crate::externs::strip_implements(&self.bytes).unwrap_or_else(|_| self.bytes.clone())
+    }
+
     /// Kind, imports, exports, and argument signature of the component.
     ///
     /// Mirrors `describe` in `eo9:exec/component-algebra`.
