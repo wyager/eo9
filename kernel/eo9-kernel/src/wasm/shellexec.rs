@@ -377,6 +377,11 @@ impl<T> KLock<T> {
 enum ChildSlot {
     /// Still executing: the drive future owns the child's store and the one call to `main`.
     Running(Pin<Box<dyn Future<Output = KOutcome> + Send>>),
+    /// Temporarily checked out by [`drive_children`], which polls the drive future *without*
+    /// holding the registry lock — that is what lets the child itself reach the registry
+    /// (a nested eosh spawning, waiting on, or killing its own children) without
+    /// deadlocking on the single-core spinlock (plan/12 D36).
+    Polling,
     /// Finished (or killed); later observations see this outcome.
     Done(KOutcome),
 }
@@ -400,28 +405,211 @@ pub fn reset_children() {
     CHILDREN.with(|children| children.clear());
 }
 
+/// What one registry index held when [`drive_children`] looked at it.
+enum Taken {
+    /// Past the end of the registry.
+    End,
+    /// Nothing runnable here (empty, finished, or already checked out).
+    Skip,
+    /// A runnable child, checked out for one poll.
+    Run(Pin<Box<dyn Future<Output = KOutcome> + Send>>),
+}
+
 /// Poll every running child once. Called from the shell's drive loop between polls of the
 /// shell itself — the bare-metal counterpart of children executing inside their parent's
 /// resume in usermode.
+///
+/// Each child is *checked out* of the registry (its slot set to [`ChildSlot::Polling`]),
+/// polled with the lock released, and then checked back in. Holding the lock across the
+/// poll would deadlock the moment a child reaches the exec surface itself — a nested eosh
+/// spawning a grandchild, waiting on it, or killing it all take the same lock (plan/12
+/// D36). Children spawned *during* this pass land at the end of the registry and get their
+/// first poll in the same pass (the index re-checks the length each iteration); slots are
+/// never removed or reordered, so the index stays valid across the unlocked poll.
 pub fn drive_children() {
-    CHILDREN.with(|children| {
-        for slot in children.iter_mut() {
-            let completed = match slot {
-                Some(ChildSlot::Running(drive)) => {
-                    let waker = Waker::from(Arc::new(ChildWaker));
-                    let mut cx = Context::from_waker(&waker);
-                    match drive.as_mut().poll(&mut cx) {
-                        Poll::Ready(outcome) => Some(outcome),
-                        Poll::Pending => None,
+    let mut index = 0usize;
+    loop {
+        let taken = CHILDREN.with(|children| {
+            if index >= children.len() {
+                return Taken::End;
+            }
+            match &mut children[index] {
+                Some(slot @ ChildSlot::Running(_)) => {
+                    match core::mem::replace(slot, ChildSlot::Polling) {
+                        ChildSlot::Running(drive) => Taken::Run(drive),
+                        // `slot` matched Running above; replace returned that same value.
+                        _ => unreachable!("checked-out slot was not running"),
                     }
                 }
-                _ => None,
-            };
-            if let Some(outcome) = completed {
-                *slot = Some(ChildSlot::Done(outcome));
+                _ => Taken::Skip,
+            }
+        });
+
+        let mut drive = match taken {
+            Taken::End => break,
+            Taken::Skip => {
+                index += 1;
+                continue;
+            }
+            Taken::Run(drive) => drive,
+        };
+
+        // Poll with the registry unlocked. With fuel slicing (`spawn_child`) this runs at
+        // most one quantum of guest code before yielding back here.
+        let waker = Waker::from(Arc::new(ChildWaker));
+        let mut cx = Context::from_waker(&waker);
+        let polled = drive.as_mut().poll(&mut cx);
+
+        CHILDREN.with(|children| {
+            let slot = &mut children[index];
+            match slot {
+                // Normal case: still checked out to us — check it back in.
+                Some(ChildSlot::Polling) => {
+                    *slot = Some(match polled {
+                        Poll::Ready(outcome) => ChildSlot::Done(outcome),
+                        Poll::Pending => ChildSlot::Running(drive),
+                    });
+                }
+                // The child was killed (slot now Done) or its handle was dropped (slot now
+                // None) while we were polling it: keep that state; dropping the checked-out
+                // drive future here releases the child's store and any in-flight work.
+                _ => {}
+            }
+        });
+        index += 1;
+    }
+}
+
+// -----------------------------------------------------------------------------------------
+// The boot-time scheduling demonstration (`cargo xtask qemu aarch64 demo`)
+// -----------------------------------------------------------------------------------------
+
+/// Demonstrate child preemption headlessly, with the same spawn / drive / kill machinery the
+/// interactive shell uses: three cruncher children — a short computation, a long one, and a
+/// deliberate spinner (`u64::MAX` rounds) — share one drive loop. The short child finishes
+/// while the long one is still mid-computation (every poll runs at most [`FUEL_QUANTUM`]
+/// fuel, so the loop interleaves them), and the spinner — which before fuel metering would
+/// have monopolized the machine forever — is killed cleanly while still spinning.
+pub fn preemption_demo(entries: &'static [super::store::StoreEntry]) {
+    crate::kprintln!(
+        "sched demo: three cruncher children on one drive loop (short 200k rounds, long 2M \
+         rounds, spinner u64::MAX rounds), preempted every {FUEL_QUANTUM} fuel"
+    );
+    if let Err(error) = try_preemption_demo(entries) {
+        crate::kprintln!("sched demo: FAILED: {error:?}");
+    }
+    // Leave a clean registry behind for whatever runs next.
+    reset_children();
+}
+
+fn try_preemption_demo(entries: &'static [super::store::StoreEntry]) -> Result<()> {
+    let cruncher = entries
+        .iter()
+        .find(|entry| entry.name == "cruncher")
+        .ok_or_else(|| wasmtime::Error::msg("the baked-in store has no `cruncher` entry"))?;
+
+    let engine = super::new_engine()?;
+    // SAFETY: the artifact comes from the store image produced by `cargo xtask build-kernel`
+    // with the same wasmtime version and engine configuration.
+    let component = unsafe { Component::deserialize(&engine, cruncher.artifact)? };
+
+    reset_children();
+    let spawn = |seed: u64, rounds: u64| -> Result<u32> {
+        let args = [
+            WitNamedArg {
+                name: String::from("seed"),
+                value: format!("{seed}"),
+            },
+            WitNamedArg {
+                name: String::from("rounds"),
+                value: format!("{rounds}"),
+            },
+        ];
+        spawn_child(&engine, &component, &args, None).map_err(|err| {
+            wasmtime::Error::msg(match err {
+                WitSpawnError::BadArguments(msg) => format!("spawn failed (bad arguments): {msg}"),
+                WitSpawnError::Internal(msg) => format!("spawn failed: {msg}"),
+            })
+        })
+    };
+    let short = spawn(9, 200_000)?;
+    let long = spawn(9, 2_000_000)?;
+    let spinner = spawn(9, u64::MAX)?;
+
+    let outcome_of = |rep: u32| -> Option<KOutcome> {
+        CHILDREN.with(|children| match children.get(rep as usize) {
+            Some(Some(ChildSlot::Done(outcome))) => Some(outcome.clone()),
+            _ => None,
+        })
+    };
+    let label = |outcome: &KOutcome| -> String {
+        match outcome {
+            KOutcome::Success { value, .. } => format!("success({value})"),
+            KOutcome::Failure { value, .. } => format!("failure({value})"),
+            KOutcome::Trapped(reason) => format!("abnormal(trapped({reason}))"),
+            KOutcome::Killed => String::from("abnormal(killed)"),
+        }
+    };
+
+    // Drive until the long child finishes, reporting interleaving evidence along the way.
+    // The bound exists so a regression cannot wedge the boot demo.
+    const MAX_TURNS: u64 = 5_000_000;
+    let mut turns: u64 = 0;
+    let mut short_done = false;
+    loop {
+        drive_children();
+        turns += 1;
+        if turns > MAX_TURNS {
+            return Err(wasmtime::Error::msg(
+                "the scheduling demo exceeded its turn bound",
+            ));
+        }
+        if !short_done {
+            if let Some(outcome) = outcome_of(short) {
+                short_done = true;
+                crate::kprintln!(
+                    "sched demo: short finished after {turns} turns -> {} (long still \
+                     running: {}, spinner still running: {})",
+                    label(&outcome),
+                    outcome_of(long).is_none(),
+                    outcome_of(spinner).is_none()
+                );
             }
         }
+        if let Some(outcome) = outcome_of(long) {
+            crate::kprintln!(
+                "sched demo: long finished after {turns} turns -> {} (spinner still \
+                 running: {})",
+                label(&outcome),
+                outcome_of(spinner).is_none()
+            );
+            break;
+        }
+    }
+
+    // The spinner would run forever; kill it exactly the way the shell's `task.kill` does
+    // and confirm the registry reports the kill.
+    let was_running = CHILDREN.with(|children| match children.get_mut(spinner as usize) {
+        Some(slot) => match slot {
+            Some(ChildSlot::Running(_) | ChildSlot::Polling) => {
+                *slot = Some(ChildSlot::Done(KOutcome::Killed));
+                true
+            }
+            _ => false,
+        },
+        None => false,
     });
+    let spinner_outcome = outcome_of(spinner).unwrap_or(KOutcome::Killed);
+    crate::kprintln!(
+        "sched demo: killed the spinner after {turns} turns -> {} (was still running: \
+         {was_running})",
+        label(&spinner_outcome)
+    );
+    crate::kprintln!(
+        "sched demo: a compute-bound or spinning child no longer takes the machine; every \
+         child runs in {FUEL_QUANTUM}-fuel slices on the shared drive loop"
+    );
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------------------
@@ -1274,7 +1462,7 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                 let outcome = core::future::poll_fn(move |cx| {
                     let observed = CHILDREN.with(|children| match children.get(rep) {
                         Some(Some(ChildSlot::Done(outcome))) => Some(Ok(outcome.clone())),
-                        Some(Some(ChildSlot::Running(_))) => None,
+                        Some(Some(ChildSlot::Running(_) | ChildSlot::Polling)) => None,
                         _ => Some(Err(wasmtime::Error::msg(format!(
                             "unknown task handle {rep}"
                         )))),
@@ -1329,9 +1517,12 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                 let outcome = CHILDREN.with(|children| match children.get_mut(rep) {
                     Some(slot) => match slot {
                         Some(ChildSlot::Done(outcome)) => Ok(outcome.clone()),
-                        Some(ChildSlot::Running(_)) => {
+                        Some(ChildSlot::Running(_) | ChildSlot::Polling) => {
                             // Dropping the drive future drops the child's store, guest
-                            // state, and in-flight work (SPEC "Kill and linearity").
+                            // state, and in-flight work (SPEC "Kill and linearity") — for a
+                            // child currently checked out by `drive_children`, that drop
+                            // happens when the poll returns and sees the slot is no longer
+                            // `Polling`.
                             *slot = Some(ChildSlot::Done(KOutcome::Killed));
                             Ok(KOutcome::Killed)
                         }

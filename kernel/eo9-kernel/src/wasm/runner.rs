@@ -53,8 +53,11 @@ pub fn boot(bootargs: Option<&str>) -> bool {
     let (program, args) = parse_command_line(bootargs);
 
     // The bare `demo` token keeps the original boot sequence reachable:
-    // `cargo xtask qemu aarch64 demo`.
+    // `cargo xtask qemu aarch64 demo`. The scheduling/preemption demonstration runs first
+    // (it needs the store image), then main.rs continues with the original sequence
+    // (seed, hello, the async demos, on-target codegen).
     if program.is_none() && tokenize(bootargs).iter().any(|token| token == "demo") {
+        super::shellexec::preemption_demo(entries);
         return false;
     }
 
