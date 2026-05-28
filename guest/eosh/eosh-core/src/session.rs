@@ -38,6 +38,11 @@ pub struct Session<B: Backend> {
     bindings: BTreeMap<String, B::Component>,
     environment: Option<B::Component>,
     history: Vec<String>,
+    /// Where the per-command outcome line (`ok: …`/`error: …`) goes: standard output in
+    /// an interactive REPL (the default), standard error in one-shot (`--command`) mode so
+    /// a `-c` invocation's standard output carries only the program's own output — matching
+    /// `eo9 run`, whose outcome line is on stderr by default.
+    outcome_on_stderr: bool,
 }
 
 impl<B: Backend> Session<B> {
@@ -47,7 +52,14 @@ impl<B: Backend> Session<B> {
             bindings: BTreeMap::new(),
             environment: None,
             history: Vec::new(),
+            outcome_on_stderr: false,
         }
+    }
+
+    /// Route the per-command outcome line to standard error instead of standard output
+    /// (used by one-shot `--command` mode so pipes carry only program output).
+    pub fn route_outcome_to_stderr(&mut self) {
+        self.outcome_on_stderr = true;
     }
 
     /// Hand the shell its granted environment (an environment value possessed by the
@@ -230,7 +242,11 @@ impl<B: Backend> Session<B> {
         let outcome = self.backend.wait(task).await;
 
         let rendered = render_outcome(&outcome);
-        self.backend.print(&rendered);
+        if self.outcome_on_stderr {
+            self.backend.print_error(&rendered);
+        } else {
+            self.backend.print(&rendered);
+        }
         match outcome {
             Outcome::Success(_) => LineResult::Ok,
             Outcome::Failure(_) | Outcome::Abnormal(_) => LineResult::ProgramFailed(rendered),

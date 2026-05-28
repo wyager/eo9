@@ -115,3 +115,10 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
     instead of raw escaped text. The panic *message* + source line still need the per-world post-trap
     export proposed in plan/07 Decision 11 (an export, not an import — capability-clean), deferred behind
     the configure-sync WIT churn.
+11. **`only` package shorthand (2026-05-27).** An `only` allow-list entry may name a whole package
+    (`eo9:text`) as well as a single interface (`eo9:text/text`); a package entry admits every interface of
+    that package the consumer imports. Every user-study persona tripped on the full-ref-only requirement.
+    Implemented entirely in `eo9-component`'s `restrict` (allow-list validation now accepts a `namespace:package`
+    entry with no `/interface`, and `admitted` matches by package prefix when the entry has no `/`); eosh's
+    `parse_allow_entry` already passed a package-only word through unchanged, and full refs are unchanged.
+    Covered by `tests/eo9-integration/tests/only_shorthand.rs`.

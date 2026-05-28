@@ -129,6 +129,15 @@ async function run() {
   check("run_entropy first draw", sawLine(/0x505f147c387507b6/));
   check("run_entropy second draw", sawLine(/0xe2e264775fe9be54/));
 
+  // The component algebra (eo9-component) running in the blob: load + describe + only on a
+  // raw component, then execution of the same component via Pulley. No JSPI needed (hello
+  // does not suspend).
+  lines = [];
+  check("algebra_demo rc", exports.algebra_demo() === 0);
+  check("algebra describe binary", sawLine(/describe: kind = binary/));
+  check("algebra only seals", sawLine(/only .* -> a sealed component/));
+  check("algebra executes the described component", sawLine(/success\(greeted\)/));
+
   if (!hasJSPI) {
     note("skipping store/sleepy checks: no JSPI in this browser");
   } else {

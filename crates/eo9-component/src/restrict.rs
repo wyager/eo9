@@ -13,9 +13,11 @@
 //!
 //! Allow-list matching is by interface *type*, not slot name: an entry admits both the
 //! required and `-optional` flavor of its interface, at any semver-compatible version at
-//! or below the entry's (an absent entry version admits every version). Types-only
-//! interfaces (no functions -- e.g. the `eo9:*/types` interfaces that `use` drags in)
-//! carry no authority and are always admitted.
+//! or below the entry's (an absent entry version admits every version). An entry may name
+//! a single interface (`eo9:text/text`) or a whole package (`eo9:text`); a package entry
+//! admits every interface of that package the consumer imports. Types-only interfaces (no
+//! functions -- e.g. the `eo9:*/types` interfaces that `use` drags in) carry no authority
+//! and are always admitted.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -62,9 +64,13 @@ pub fn restrict(c: &Component, allow: &[InterfaceRef]) -> Result<Component, Rest
 fn validate_allow_list(allow: &[InterfaceRef]) -> Result<(), RestrictError> {
     for entry in allow {
         let (name, inline_version) = slots::split_extern_name(&entry.interface);
-        if !name.contains(':') || !name.contains('/') || !inline_version.is_empty() {
+        // An entry is either a full interface name (`namespace:package/interface`) or a
+        // package shorthand (`namespace:package`); the version always rides in
+        // `entry.version`, never inline.
+        if !name.contains(':') || !inline_version.is_empty() {
             return Err(RestrictError::InvalidAllowList(format!(
-                "`{}` is not an interface name (expected `namespace:package/interface`)",
+                "`{}` is not an interface or package name (expected \
+                 `namespace:package/interface` or `namespace:package`)",
                 entry.interface
             )));
         }
@@ -79,20 +85,33 @@ fn validate_allow_list(allow: &[InterfaceRef]) -> Result<(), RestrictError> {
     Ok(())
 }
 
-/// Whether an allow-list admits an import (by interface type and the semver rule).
+/// Whether an allow-list admits an import (by interface type and the semver rule). An
+/// entry is a full interface name (exact, also admitting the import's `-optional` flavor)
+/// or a package shorthand with no `/interface` (admits any interface of that package).
 fn admitted(import: &ImportMeta, allow: &[InterfaceRef]) -> bool {
     allow.iter().any(|entry| {
-        let base_matches = import.interface == entry.interface;
-        let optional_matches = import
-            .interface
-            .strip_suffix(OPTIONAL_SUFFIX)
-            .is_some_and(|base| base == entry.interface);
-        (base_matches || optional_matches)
+        let interface_matches = if entry.interface.contains('/') {
+            let base_matches = import.interface == entry.interface;
+            let optional_matches = import
+                .interface
+                .strip_suffix(OPTIONAL_SUFFIX)
+                .is_some_and(|base| base == entry.interface);
+            base_matches || optional_matches
+        } else {
+            interface_package(&import.interface) == entry.interface
+        };
+        interface_matches
             && entry
                 .version
                 .as_deref()
                 .is_none_or(|granted| semver::satisfies(granted, &import.version))
     })
+}
+
+/// The `namespace:package` portion of an interface name (`eo9:text/text` -> `eo9:text`),
+/// used to match a package-shorthand allow-list entry.
+fn interface_package(interface: &str) -> &str {
+    interface.split('/').next().unwrap_or(interface)
 }
 
 /// The `slot (interface@version)` text used to name an offending import.
