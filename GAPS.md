@@ -3,8 +3,10 @@
 Tracked by the planner so nothing gets lost. Each item notes where it is recorded and what unblocks it.
 Items are removed when closed; design questions move to SPEC.md when resolved.
 
-_Last updated: 2026-05-27 (overnight; master at 4962464, after the configure-sync / bug-1-fix /
-browser-eosh-shell / UART-RX-idle / Ctrl-C+cascade / describe-wiring / property-suite batch)._
+_Last updated: 2026-05-27 (overnight; master at 12449c0, after the configure-sync / bug-1-fix /
+browser-eosh-shell / in-browser-composition / UART-RX-idle / Ctrl-C+cascade / W^X / describe-wiring /
+property-suite batch). All three overnight goals delivered: working algebra, working browser eosh shell,
+working compilation (native, metal, and in-browser via `/vm/compile`)._
 
 ## Decisions pending with the owner
 
@@ -21,10 +23,10 @@ browser-eosh-shell / UART-RX-idle / Ctrl-C+cascade / describe-wiring / property-
   below). (3) **`describe --wiring` full composition tree** — DONE CLI-side (`00bfaf7`); the eosh-side tree
   needs an `eo9:exec` WIT field (follow-up). (4) **Entropy stays in the default child set** — no-op by
   decision; spawn-time grant visibility shipped under `-v`. (5) **Roadmap order: depth → breadth → real
-  hardware** — the D38 metal-depth hardening is essentially done (idle, preemption, Ctrl-C, cascade, caps;
-  W^X in progress); riscv64/x86_64 QEMU ports next, then real-board (owner will obtain an aarch64 board once
-  the demos look good). `only` package shorthand, `-c` stderr outcomes, and `-v` grant visibility — DONE
-  (`a212595`); honest `-c` 0/1/2/3 exit codes still need an eosh `program-failure` WIT class (follow-up).
+  hardware** — the metal-depth hardening is COMPLETE (idle 0%, preemption, Ctrl-C, cascade, caps, and W^X for
+  JIT code pages `18e93a4`); riscv64/x86_64 QEMU ports next, then real-board (owner will obtain an aarch64
+  board once the demos look good). `only` package shorthand, `-c` stderr outcomes, and `-v` grant visibility
+  — DONE (`a212595`); honest `-c` 0/1/2/3 exit codes still need an eosh `program-failure` WIT class (follow-up).
 - **The in-browser real-stack VM shipped** (supersedes the 2026-05-26 "/try v2 deferred" ruling): the owner
   re-opened it on 2026-05-27; the wasm32+Pulley blob runs on `/vm` through milestone 2 (fiberless callback
   execution behind an off-by-default vendored feature, browser root providers, HTTP program store, JSPI
@@ -32,8 +34,12 @@ browser-eosh-shell / UART-RX-idle / Ctrl-C+cascade / describe-wiring / property-
   Cloudflare-friendly content-fingerprinted immutable caching with no per-request blob hashing. `/try` v1
   remains alongside it. **Milestone 3 (eosh in the browser) shipped** (`4962464`): the real algebra + the
   unmodified eosh boot in the blob; the shell resolves `/bin` and runs 16 programs (examples + coreutils).
-  Remaining (in progress, `area/18-web-complete`): in-browser `$`/`&` via a server-side `/vm/compile`
-  endpoint, and `only`-narrowing via a restricted linker. (plan/18, plan/15)
+  **The web demo is now complete** (`12449c0`, plan/18 D19–21): `only` genuinely narrows via a per-family
+  restricted linker; `entropy.seeded` is seeded into the browser `/bin`; and a bounded server-side
+  `POST /vm/compile` (names+ops only, allow-set, 2 KiB body, 20 s timeout, 2-concurrency gate) makes `$`
+  compositions compile+run in the browser (`entropy.seeded $ rng` verified deterministic). `&`/rename/
+  configure are not accepted by the endpoint and still refuse; in-blob codegen stays std/mmap-blocked.
+  (plan/18, plan/15)
 - **No upstreaming until a compelling MVP** (owner ruling 2026-05-26), refined 2026-05-27: feasibility
   reports live in `docs/upstreaming/`, and three contribution packages are staged locally for owner review
   and push (wasmtime CM-async no_std; wit-parser no_std decoding; wasm-wave no_std `wit`). wit-component
@@ -123,11 +129,14 @@ browser-eosh-shell / UART-RX-idle / Ctrl-C+cascade / describe-wiring / property-
   cascades** to orphaned descendants, and a **per-child spawn cap** bounds nesting (`a127861`). Residual:
   the idle waker is still single-slot (needs a queue when multiple host futures park concurrently); nested
   shells still share the one serial console.
-- **Other metal gaps**: **W^X for JIT code pages — in progress** (`area/12-wx`: map on-target code
-  executable-not-writable); exceptions are fatal; on-target codegen determinism not bit-compared and measured
+- **FIXED — W^X for JIT code pages** (`18e93a4`, plan/12 D41): DRAM mapped at 4 KiB granularity, heap
+  RW-non-executable, the publisher writes→cache-maintains→flips generated code to RX-read-only (no W+X window,
+  break-before-use TLB); on-target codegen verified running from the W^X pages. The metal DEPTH track is now
+  complete. Residual hardening: kernel-image-internal W^X (split `.text`/`.rodata`/`.data`) and guard regions.
+- **Other metal gaps**: exceptions are fatal; on-target codegen determinism not bit-compared and measured
   ~25–35% slower than host AOT (verify opt-level parity); no instrumentation for peak compile heap / phase
   timings / cache-hit reasons; no writable storage or fused-artifact cache on metal; the kernel store image
-  lacks the coreutils. (plan/12 D22–40, studies 01/03)
+  lacks the coreutils; the idle waker is single-slot (needs a queue for concurrent host-future parks). (plan/12 D22–41, studies 01/03)
 - **Wasmtime version bumps are not free**: re-verify the binder/executor ABI-constant blocks and re-AOT all
   artifacts on any bump off 45.
 - riscv64/x86_64 ports and the QEMU test tier not started; real-board bring-up unscheduled (owner decision).
@@ -147,13 +156,16 @@ browser-eosh-shell / UART-RX-idle / Ctrl-C+cascade / describe-wiring / property-
   shared-intrinsics work); ~570 KB of mostly duplicated jco glue (split shared intrinsics + minify;
   compression already covers the wire cost); stub composition blocked by the upstream js-component-bindgen
   TDZ bug (issue text drafted, plan/15 D11, D21).
-- **/vm**: milestone 3 SHIPPED — fs + io providers in the blob, the in-blob `eo9:exec` surface, and the
-  **eosh shell booting + running 16 programs** (`f419df8` … `4962464`). Remaining (in progress,
-  `area/18-web-complete`): in-browser `$`/`&` via a bounded server-side `/vm/compile` endpoint (in-blob
-  codegen is std/mmap-blocked), `only`-narrowing via a restricted linker, and seeding a provider into `/bin`
-  to exercise composition. Blob now ~6 MiB raw / ~1.2 MiB brotli — a lazy-fetch `/bin` trim is wanted. The
-  stackful-lift `sleepy` canary is refused on the fiberless host (page says so), though some engines
-  (Bun.WebView) actually run it. JSPI support outside Chromium still to re-check. (plan/18 D7–17, study 04)
+- **/vm — COMPLETE**: milestone 3 (fs + io providers, the in-blob `eo9:exec` surface, the **eosh shell
+  booting + running 16 programs**, `f419df8` … `4962464`) plus the web-completion (`12449c0`): **`only`
+  genuinely narrows** via a restricted linker, `entropy.seeded` is seeded into `/bin`, and a bounded
+  server-side **`POST /vm/compile`** makes in-browser `$` compositions compile+run (`entropy.seeded $ rng`
+  verified deterministic). `&`/rename/configure aren't accepted by the endpoint and still refuse; in-blob
+  codegen stays std/mmap-blocked. Remaining (not blocking): **retail-Chrome click-through not yet captured**
+  (the node/JSPI harness proves the round-trip incl. real JSPI + the same `vm.js` glue — a literal browser
+  run is the one un-automated step); blob ~6 MiB raw / ~1.2 MiB brotli — a lazy-fetch `/bin` trim is wanted;
+  the stackful-lift `sleepy` canary is refused on the fiberless host (page says so) though some engines
+  (Bun.WebView) actually run it; JSPI support outside Chromium still to re-check. (plan/18 D7–21, study 04)
 
 ## Tracked from the user studies (see docs/user-studies/00-synthesis.md for the full triage)
 
@@ -167,7 +179,7 @@ browser-eosh-shell / UART-RX-idle / Ctrl-C+cascade / describe-wiring / property-
   3 on the direct path; `eo9 store --help` errors instead of printing help; the outcome line needs a leading
   newline guard when program output doesn't end in one.
 - Security follow-ups: hostile-component CI suite + fuzzing of the fs provider and ABI boundary; signed
-  stores/provenance; W^X on metal; align the symlink Denied/NotFound oracle.
+  stores/provenance; align the symlink Denied/NotFound oracle. (W^X on metal — DONE, `18e93a4`.)
 - Performance/instrumentation: compose/compile/run timing split, cache-hit reasons, peak compile heap;
   on-target vs host-AOT parity; zero-cost-layer claim needs a benchmark or softer wording.
 - The `--debug-info` cache-key claim from study 01 was investigated and found already correct (closed).
@@ -183,6 +195,8 @@ browser-eosh-shell / UART-RX-idle / Ctrl-C+cascade / describe-wiring / property-
 - Empty per-process exec-copy directories are never cleaned from the temp dir.
 - `eo9-sched` not yet adopted by the CLI drive loop.
 - Root host workspace manifest lacks a `license = "MIT"` field (guest/www have it).
+- The standalone `www` workspace isn't in `cargo xtask ci`'s fmt/clippy scope — www-only branches can pass
+  ci with fmt drift; add www to the gate.
 - `eo9-embed`: exit-code mapping nit (0/1/2 vs 0/1/2/3); consolidate the `eo9` binary onto eo9-embed;
   engine/cache reuse; an exec-through-Host end-to-end test. (plan/16)
 - kernel/vendor/README.md is missing the algebra-crate section (wit-parser, wac-*, wit-component,
