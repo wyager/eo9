@@ -8,7 +8,7 @@
 //! * `rename` of a residual import — the renamed component keeps its slot identity for
 //!   `describe`, and its executable form compiles instead of failing to parse.
 
-use eo9_component::{ComposeWarning, Component, compose, compose_checked, rename};
+use eo9_component::{Component, ComposeWarning, compose, compose_checked, rename};
 use eo9_integration::fixtures::build_component;
 use eo9_integration::{guest, run};
 
