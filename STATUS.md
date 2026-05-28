@@ -4,8 +4,10 @@ Maintained by the planner; refreshed when merges land. Companion docs: `PLAN.md`
 `plan/*.md` (per-area briefs + decisions), `GAPS.md` (known gaps and deferred items), `SPEC.md` (the design),
 `docs/user-studies/` (external-perspective findings and their triage).
 
-_Last updated: 2026-05-27 (overnight), master at 4962464. Headline: **the eosh shell now boots and runs in
-the browser, and the last open algebra-correctness bug (bug 1) is fixed.**_
+_Last updated: 2026-05-27 (overnight), master at 12449c0. Headline: **all three overnight goals are
+delivered — working algebra (the last correctness bug is fixed), a working browser eosh shell, and working
+compilation including in-browser `$` composition via the server-side `/vm/compile` round-trip.** The metal
+depth track is complete through W^X.**_
 
 ## Overnight changes (since the 2026-05-27 daytime refresh)
 
@@ -19,7 +21,16 @@ the browser, and the last open algebra-correctness bug (bug 1) is fixed.**_
   wasm32+Pulley `/vm` blob; the shell resolves `/bin`, runs 16 programs (4 examples + 12 coreutils), and
   renders typed outcomes, with in-blob fs/io and JSPI read-line. (Caveats below.)
 - **Metal idle is now 0.0% host CPU** (`388962f`): a real UART-RX interrupt + event-driven WFI (was ~1%
-  timer-poll). Plus **Ctrl-C, kill-cascade, and a per-child spawn cap** on metal (`a127861`).
+  timer-poll). Plus **Ctrl-C, kill-cascade, and a per-child spawn cap** on metal (`a127861`), and **W^X for
+  JIT code pages** (`18e93a4`): DRAM mapped at 4 KiB granularity, heap RW-non-executable, the publisher
+  writes→cache-maintains→flips generated code to RX-read-only (no W+X window, break-before-use TLB), with
+  on-target codegen verified running from the W^X pages. The **metal depth track is now complete**.
+- **In-browser composition + `only`-narrowing** (`12449c0`): `only` now genuinely narrows in the browser via
+  a per-family restricted linker (a child importing a sealed-away interface is refused); `entropy.seeded` is
+  seeded into the browser `/bin`; and a bounded server-side **`POST /vm/compile`** endpoint makes `$`
+  compositions compile+run in the browser — eosh POSTs a names+ops expression, the server resolves it
+  against an allow-set, fuses with the real algebra, precompiles to a Pulley image, and returns it. Verified:
+  `entropy.seeded $ rng --count 3` at the browser prompt compiles server-side and runs deterministically.
 - **`describe --wiring`** (`00bfaf7`): a full composition tree showing each provider layer and what it
   satisfies/seals/attenuates (provenance is in-memory only — content hash and compile cache unchanged).
 - **Readable guest traps** (`dc53e70`): a trapped program now reports a clean reason (trap kind + demangled
@@ -100,19 +111,21 @@ the browser, and the last open algebra-correctness bug (bug 1) is fixed.**_
   review-ready contribution branches (wasmtime CM-async no_std in `~/code/wasmtime-nostd`; wit-parser no_std
   decoding and wasm-wave no_std `wit` in `~/code/wasm-tools-nostd`) awaiting owner review/push.
 
-## In the browser today — and the honest caveats
+## In the browser today
 
 The `/vm` page runs the **real stack**: `eosh>` boots, 16 programs run (hello/cruncher/outcomes/readwrite +
-the 12 coreutils), the real algebra does `load`/`describe`/`only`, and execution is genuine wasmtime+Pulley
-with fuel and entropy matching native byte-for-byte. Two things are NOT yet real in the browser (both in
-progress, `area/18-web-complete`):
+the 12 coreutils), the real algebra does `load`/`describe`, and execution is genuine wasmtime+Pulley with
+fuel and entropy matching native byte-for-byte.
 
-- **`$`/`&` composition** currently returns a clean "composition needs the compiler, not in the browser yet"
-  refusal — there is no in-blob codegen (cranelift is std/mmap-blocked on wasm32). The fix in progress is a
-  bounded server-side `/vm/compile` endpoint that fuses+compiles store-program compositions and returns a
-  Pulley image ("compiled on the server").
-- **`only`** in the browser records the allow-set but `spawn` still links all root providers, so it does not
-  yet *narrow* — the restricted-linker wiring is in progress.
+- **`$` composition compiles and runs** via the bounded server-side `/vm/compile` round-trip (the server
+  fuses store-program compositions and returns a Pulley image; "compiled on the server"). `&`/`rename`/
+  `configure` are not accepted by the endpoint and still return a clean refusal; in-blob codegen remains
+  std/mmap-blocked on wasm32.
+- **`only` genuinely narrows**: a child is instantiated with a linker restricted to the admitted import set,
+  so a program needing a sealed-away capability is refused.
+- **One un-automated step**: the full round-trip is verified by a node/JSPI harness against the real server
+  (real JSPI + the same `vm.js` glue), but a literal retail-Chrome click-through hasn't been captured —
+  tracked in GAPS.
 
 ## Implemented (libraries / components on master)
 
@@ -131,16 +144,13 @@ progress, `area/18-web-complete`):
 | Integration suites (capability laws, determinism, invoker-configured env, default configuration, overlay layering, compose diagnostics, soundness corpus, generative property suite, interposition, kill/linearity, CLI transcripts) | `tests/eo9-integration` + `crates/eo9/tests` | green; QEMU tier not started |
 | Usermode binary `eo9` (run/store/describe/compile/cache/shell, layered session, recursive child env, stderr outcomes, --max-fuel, seeding, --wiring) | `crates/eo9` | done for current scope |
 | Embeddable runtime (`Eo9` builder, Sandbox + Host backends behind a `ProviderSource` seam) | `crates/eo9-embed` | complete; foundation for `eo9 bundle` and the wasm32 backend |
-| Website + server + `/try` + `/vm` (real-stack wasm32+Pulley blob; eosh shell + 16 programs in-browser; browser providers, HTTP store, JSPI; compression, security headers, fingerprinted immutable caching) | `www/` | deployable; in-browser composition (`/vm/compile`) + `only`-narrowing in progress; /try jco-dedup queued |
-| Bare-metal kernel (aarch64: boot, MMU, GICv2 + UART-RX event-driven idle, kernel providers, sync + async guests, baked-in store, boot-to-interactive-eosh, on-target Cranelift codegen, interactive composition, child fuel/preemption, Ctrl-C/kill-cascade/per-child-cap, nested eosh; vendored CM-async + compile-layer + algebra no_std forks) | `kernel/` | MVP + full preemption/interrupt/containment depth complete; W^X in progress; riscv64/x86_64 + QEMU test tier not started |
+| Website + server + `/try` + `/vm` (real-stack wasm32+Pulley blob; eosh shell + 16 programs in-browser; browser providers, HTTP store, JSPI; `only`-narrowing; server-side `/vm/compile` for in-browser `$` composition; compression, security headers, fingerprinted immutable caching) | `www/` | deployable; in-browser `$` composition + `only`-narrowing done; retail-browser click-through + /try jco-dedup + blob-size trim queued |
+| Bare-metal kernel (aarch64: boot, MMU, GICv2 + UART-RX event-driven idle, kernel providers, sync + async guests, baked-in store, boot-to-interactive-eosh, on-target Cranelift codegen, interactive composition, child fuel/preemption, Ctrl-C/kill-cascade/per-child-cap, nested eosh, W^X JIT code pages; vendored CM-async + compile-layer + algebra no_std forks) | `kernel/` | MVP + full preemption/interrupt/containment depth complete incl. W^X; riscv64/x86_64 + QEMU test tier not started |
 
 ## In progress right now
 
-- **Web demo completion** (`area/18-web-complete`): `only`-attenuation via a restricted linker (so `only`
-  actually narrows in the browser), seeding a provider into `/bin` to exercise `$`/`&`, and a bounded
-  server-side `/vm/compile` endpoint so in-browser `$`/`&` composition actually compiles+runs.
-- **W^X for JIT code pages** (`area/12-wx`): map on-target-generated code executable-not-writable — the last
-  metal-depth item.
+- Nothing on area branches — the overnight batch (algebra bug 1, browser eosh shell, in-browser composition,
+  metal depth through W^X) is fully merged. Next dispatches are the "Next up" items below.
 
 ## Next up (rough order)
 
@@ -149,9 +159,10 @@ progress, `area/18-web-complete`):
 2. **WIT follow-ups** (kept stable this wave): the `eo9:rt/diagnostics` post-trap export for guest panic
    *messages*; an `eo9:exec` wiring field so eosh (not just the CLI) can show the `--wiring` tree; an eosh
    `program-failure` three-way class so `shell -c` gives honest 0/1/2/3 exit codes.
-3. **Web**: finish the in-progress `/vm/compile` + `only`-narrowing; the `/try` jco glue dedup; a
-   reproducible-build fix for the path-dependent wasm32 blob hash; COEP/Permissions-Policy headers; blob-size
-   trim (lazy-fetch `/bin`).
+3. **Web**: capture the retail-Chrome click-through of `/vm` (the one un-automated verification step); the
+   `/try` jco glue dedup; a reproducible-build fix for the path-dependent wasm32 blob hash; COEP/
+   Permissions-Policy headers; blob-size trim (lazy-fetch `/bin`); add the standalone `www` workspace to
+   `cargo xtask ci`'s fmt/clippy scope (www-only branches currently can pass ci with fmt drift).
 4. **Kernel breadth**: riscv64/x86_64 ports and the QEMU test tier (real-board bring-up ordering is the one
    roadmap question the owner will settle once the demos look good — depth before breadth before hardware).
 5. Demo packaging (`cargo install eo9` without a checkout) and the Bundle milestone (`eo9 bundle` on
