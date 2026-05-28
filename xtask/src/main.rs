@@ -476,6 +476,14 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
         false,
     )?;
 
+    // Raw component bytes the server-side `/vm/compile` endpoint fuses (plan/18 D20). The same
+    // `/bin` program set, by name, under `site/vm/raw/<name>.wasm`; the endpoint's allow-set is
+    // exactly the stems present here. Not fingerprinted — the server resolves them by fixed
+    // name, never serves them to the browser as immutable assets.
+    let compile_raw_dir = root.join("www").join("site").join("vm").join("raw");
+    std::fs::create_dir_all(&compile_raw_dir)
+        .map_err(|err| format!("failed to create {}: {err}", compile_raw_dir.display()))?;
+
     // Programs eosh can resolve from `/bin` in the browser: each as raw component bytes (for
     // the algebra's `load`, seeded into the blob's MemFs) and pre-AOT'd to pulley32 (for
     // execution via the exec surface). hello + a useful spread of coreutils.
@@ -499,6 +507,10 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
         .map_err(|err| format!("failed to read the {name} component for /bin: {err}"))?;
         std::fs::write(artifacts.join(format!("bin-{name}.wasm")), &raw).map_err(|err| {
             format!("failed to write the raw {name} component to artifacts: {err}")
+        })?;
+        // The server-side compiler's copy, resolved by bare name (`<name>.wasm`).
+        std::fs::write(compile_raw_dir.join(format!("{name}.wasm")), &raw).map_err(|err| {
+            format!("failed to write the raw {name} component for /vm/compile: {err}")
         })?;
         preaot_for_web(
             &artifacts,

@@ -8,11 +8,11 @@
 use std::convert::Infallible;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -381,7 +381,14 @@ async fn serve_site_connection<IO>(
     let service = service_fn(move |request: Request<Incoming>| {
         let site_root = site_root.clone();
         async move {
-            Ok::<_, Infallible>(
+            // The one dynamic endpoint: POST /vm/compile fuses a store-name composition with
+            // the real algebra and compiles it to a pulley32 image (plan/18 D20). Everything
+            // else is the static-file path.
+            let response = if request.method() == Method::POST
+                && request.uri().path() == "/vm/compile"
+            {
+                compile_response(request.into_body(), &site_root, transport).await
+            } else {
                 site_response(
                     request.method(),
                     request.uri(),
@@ -389,8 +396,9 @@ async fn serve_site_connection<IO>(
                     &site_root,
                     transport,
                 )
-                .await,
-            )
+                .await
+            };
+            Ok::<_, Infallible>(response)
         }
     });
     drive_connection(stream, service, limits).await;
@@ -588,6 +596,131 @@ fn is_valid_host(host: &str) -> bool {
         && host
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+}
+
+/// Maximum size of a `/vm/compile` request body. The body is a short composition expression
+/// over store-program names and algebra ops; anything larger is rejected before any work.
+const MAX_COMPILE_BODY: usize = 2048;
+/// A single server-side compile must finish within this budget or the request is abandoned.
+const COMPILE_TIMEOUT: Duration = Duration::from_secs(20);
+/// At most this many compiles run at once (the pulley compiler is CPU-heavy); further requests
+/// wait up to [`COMPILE_ACQUIRE_WAIT`] for a slot before being turned away with 503.
+const MAX_CONCURRENT_COMPILES: usize = 2;
+/// How long a request waits for a compile slot before giving up with 503. Bounds the queue so
+/// a burst cannot pile up unboundedly, while letting normal bursts through (a compile is fast).
+const COMPILE_ACQUIRE_WAIT: Duration = Duration::from_secs(10);
+/// Process-wide compile concurrency gate, created on first use.
+static COMPILE_PERMITS: OnceLock<Semaphore> = OnceLock::new();
+
+/// Handle `POST /vm/compile`: read a size-capped composition expression, fuse + compile it to
+/// a pulley32 image under a concurrency limit and a time bound, and return the image (or a
+/// typed 4xx/5xx). Carries the same standard security headers as every other response.
+async fn compile_response(body: Incoming, site_root: &Path, transport: Transport) -> Response<Body> {
+    with_standard_headers(compile_response_inner(body, site_root).await, transport)
+}
+
+async fn compile_response_inner(body: Incoming, site_root: &Path) -> Response<Body> {
+    // 1. Size-capped body read — never buffer more than MAX_COMPILE_BODY from the client.
+    let collected = match Limited::new(body, MAX_COMPILE_BODY).collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return compile_text_response(StatusCode::PAYLOAD_TOO_LARGE, "composition too large"),
+    };
+    let expr = match std::str::from_utf8(&collected) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return compile_text_response(StatusCode::BAD_REQUEST, "request body must be UTF-8"),
+    };
+    if expr.is_empty() {
+        return compile_text_response(StatusCode::BAD_REQUEST, "empty composition");
+    }
+
+    // 2. Concurrency limit — wait briefly for a slot, then turn away. Held until the compile
+    //    finishes, so at most MAX_CONCURRENT_COMPILES run at once.
+    let sem = COMPILE_PERMITS.get_or_init(|| Semaphore::new(MAX_CONCURRENT_COMPILES));
+    let permit = match timeout(COMPILE_ACQUIRE_WAIT, sem.acquire()).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(_closed)) => {
+            return compile_text_response(StatusCode::INTERNAL_SERVER_ERROR, "compiler unavailable");
+        }
+        Err(_elapsed) => {
+            return compile_text_response(StatusCode::SERVICE_UNAVAILABLE, "compiler busy, retry");
+        }
+    };
+
+    // 3. The allow-set is exactly the raw components shipped under site/vm/raw — never the
+    //    client's word for what exists. An empty set means the site was built without them.
+    let raw_dir = site_root.join("vm").join("raw");
+    let allow = allowed_programs(&raw_dir).await;
+    if allow.is_empty() {
+        return compile_text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no compile components installed on this server",
+        );
+    }
+
+    // 4. Compile on a blocking thread (CPU-bound), abandon it if it overruns the time budget.
+    let job =
+        tokio::task::spawn_blocking(move || crate::compile::compile_expression(&expr, &raw_dir, &allow));
+    let outcome = timeout(COMPILE_TIMEOUT, job).await;
+    drop(permit);
+    match outcome {
+        Ok(Ok(Ok(image))) => compiled_image_response(image),
+        Ok(Ok(Err(err))) => compile_error_response(err),
+        Ok(Err(_join)) => {
+            compile_text_response(StatusCode::INTERNAL_SERVER_ERROR, "compiler crashed")
+        }
+        Err(_elapsed) => compile_text_response(StatusCode::GATEWAY_TIMEOUT, "compile timed out"),
+    }
+}
+
+/// The store-program names the site actually ships (the stems of `site/vm/raw/*.wasm`). This
+/// is the allow-set: a referenced name not present here is rejected.
+async fn allowed_programs(raw_dir: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(raw_dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("wasm")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                names.push(stem.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// A successful compile: the opaque pulley32 image, not cached (it is composition-specific and
+/// cheap to regenerate; the browser caches nothing for these).
+fn compiled_image_response(image: Vec<u8>) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Full::new(Bytes::from(image)))
+        .expect("statically valid response")
+}
+
+/// A short plaintext compile status (errors and refusals), so the browser eosh can surface the
+/// reason verbatim.
+fn compile_text_response(status: StatusCode, msg: &str) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Full::new(Bytes::from(format!("{msg}\n"))))
+        .expect("statically valid response")
+}
+
+/// Map a [`crate::compile::CompileError`] to an HTTP status: bad input is the client's fault
+/// (4xx), a missing server component or compiler failure is ours (5xx).
+fn compile_error_response(err: crate::compile::CompileError) -> Response<Body> {
+    use crate::compile::CompileError;
+    let status = match &err {
+        CompileError::BadExpression(_) | CompileError::UnknownProgram(_) => StatusCode::BAD_REQUEST,
+        CompileError::CompileFailed(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        CompileError::MissingComponent(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    compile_text_response(status, &err.to_string())
 }
 
 fn error_response(status: StatusCode) -> Response<Body> {
