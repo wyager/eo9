@@ -122,3 +122,10 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
     entry with no `/interface`, and `admitted` matches by package prefix when the entry has no `/`); eosh's
     `parse_allow_entry` already passed a package-only word through unchanged, and full refs are unchanged.
     Covered by `tests/eo9-integration/tests/only_shorthand.rs`.
+12. **Variadic tail in argument application (2026-05-28).** Positional application arguments already filled
+    parameters in declared order; now, when the callee's **final** parameter is `list<string>`, the
+    positionals left over once the other parameters are filled collect into it as one list argument
+    (`cat a.txt b.txt`), a single bare value for a `list<string>` flag coerces to a one-element list
+    (`cat --paths a.txt`), and `complete_args` fills an omitted final `list<string>` with `[]` (so bare `ls`
+    runs and lists `/`). Mixing the flag and positional spellings for the same parameter is a duplicate-argument
+    error. The convention itself is plan/04 D13; the coreutil signatures that use it are plan/17 D6.
