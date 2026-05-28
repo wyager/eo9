@@ -442,7 +442,7 @@ fn child_providers(source: &Arc<dyn ProviderSource>, grants: Grants) -> Provider
 fn requires_fs(imports: &[ImportNeed]) -> bool {
     imports
         .iter()
-        .any(|need| need.required && need.interface.starts_with("eo9:fs/"))
+        .any(|need| need.required && !need.authority_free && need.interface.starts_with("eo9:fs/"))
 }
 
 /// Drive a task to completion: donate fuel, run, park the thread on I/O, repeat. Shared
@@ -547,6 +547,7 @@ mod tests {
             interface: interface.to_string(),
             version: "0.1.0".to_string(),
             required,
+            authority_free: false,
         };
         assert!(requires_fs(&[need("eo9:fs/fs", true)]));
         assert!(!requires_fs(&[need("eo9:fs/fs", false)]));

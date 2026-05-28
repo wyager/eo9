@@ -230,10 +230,7 @@ impl fs::Guest for Stub {
         }
     }
 
-    async fn create_directory(
-        fs: fs::FsImplBorrow<'_>,
-        path: String,
-    ) -> Result<(), FsError> {
+    async fn create_directory(fs: fs::FsImplBorrow<'_>, path: String) -> Result<(), FsError> {
         let overlay = fs.get::<OverlayImpl>();
         lower::create_directory(&overlay.lower, path)
             .await

@@ -38,7 +38,7 @@ type ConcurrentFuture<'a, R> = Pin<Box<dyn Future<Output = Result<R>> + Send + '
 // Host resource representations
 // -----------------------------------------------------------------------------------------
 
-/// Host representation of `eo9:fs/types.fs-impl` (stateless token).
+/// Host representation of `eo9:fs/fs.fs-impl` (stateless token).
 pub struct FsCap;
 /// Host representation of `eo9:fs/fs.file`; the rep indexes the open-file table.
 pub struct FileRes;
@@ -466,17 +466,13 @@ pub fn add_buffers(linker: &mut Linker<KernelState>) -> Result<()> {
     Ok(())
 }
 
-/// Register `eo9:fs/types` and `eo9:fs/fs` against the shell session's read-only store
+/// Register `eo9:fs/fs` (root handle + operations) against the shell session's read-only store
 /// view. Every operation completes immediately (the data is in memory), so the async
 /// members resolve on their first poll.
 pub fn add_fs(linker: &mut Linker<KernelState>) -> Result<()> {
-    linker.instance("eo9:fs/types@0.1.0")?.resource(
-        "fs-impl",
-        ResourceType::host::<FsCap>(),
-        |_, _| Ok(()),
-    )?;
-
     let mut fs = linker.instance("eo9:fs/fs@0.1.0")?;
+
+    fs.resource("fs-impl", ResourceType::host::<FsCap>(), |_, _| Ok(()))?;
 
     fs.func_wrap(
         "default",
