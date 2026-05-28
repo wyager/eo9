@@ -486,6 +486,21 @@ fn wave_to_val(ty: &str, value: &str) -> std::result::Result<Val, String> {
             inner, body,
         )?))));
     }
+    if let Some(inner) = ty.strip_prefix("list<").and_then(|t| t.strip_suffix('>')) {
+        let body = value
+            .strip_prefix('[')
+            .and_then(|v| v.strip_suffix(']'))
+            .ok_or_else(|| std::format!("`{value}` is not a {ty} (expected `[…]`)"))?
+            .trim();
+        if body.is_empty() {
+            return Ok(Val::List(std::vec::Vec::new()));
+        }
+        let mut items = std::vec::Vec::new();
+        for part in split_top_level(body) {
+            items.push(wave_to_val(inner, part.trim())?);
+        }
+        return Ok(Val::List(items));
+    }
     match ty {
         "string" => {
             let unquoted = value
@@ -531,6 +546,40 @@ fn bad(value: &str, ty: &str) -> String {
     std::format!("`{value}` is not a {ty}")
 }
 
+/// Split a WAVE list body on top-level commas (commas inside quotes or nested brackets do
+/// not split), so `["a, b", "c"]` parses as two elements.
+fn split_top_level(body: &str) -> std::vec::Vec<&str> {
+    let mut parts = std::vec::Vec::new();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    for (i, c) in body.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '[' | '(' | '{' => depth += 1,
+            ']' | ')' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&body[start..]);
+    parts
+}
+
 /// Interfaces the browser executor's root environment serves to a spawned program — a
 /// binary importing only these (plus authority-free types) is runnable.
 fn is_root_provided(interface: &str) -> bool {
@@ -549,7 +598,15 @@ fn bind_args(
     for (name, ty) in specs {
         let matching: Vec<&WitNamedArg> = args.iter().filter(|a| a.name == *name).collect();
         let arg = match matching.as_slice() {
-            [] => return Err(std::format!("missing argument `{name}`")),
+            [] => {
+                // Mirror the host binder's empty-tail default: a missing `list<…>` argument
+                // is the empty list, so bare `ls` works at the browser eosh prompt too.
+                if ty.trim().starts_with("list<") {
+                    vals.push(Val::List(std::vec::Vec::new()));
+                    continue;
+                }
+                return Err(std::format!("missing argument `{name}`"));
+            }
             [a] => *a,
             _ => return Err(std::format!("argument `{name}` supplied more than once")),
         };

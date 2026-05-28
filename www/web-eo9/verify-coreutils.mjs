@@ -74,14 +74,22 @@ async function run(name, args) {
 }
 
 // (name, args, predicate over the combined output)
+// The path-taking tools take a trailing variadic list of paths (positional, like the native
+// CLI): `cat` reads several files, a *bare* `ls` lists `/` (the missing tail defaults to []).
 const cases = [
   ["echo", ["hello from the web VM"], (o) => /hello from the web VM/.test(o)],
   ["rng", ["5"], (o) => (o.match(/\d{2,}/g) || []).length >= 5],
   ["cat", ["/welcome.txt"], (o) => /Hello from the Eo9 web VM filesystem/.test(o)],
+  [
+    "cat",
+    ["/welcome.txt", "/docs/about.txt"],
+    (o) => /Hello from the Eo9 web VM filesystem/.test(o) && /capability-secure OS/.test(o),
+  ],
   ["ls", ["/"], (o) => /welcome\.txt/.test(o) && /docs/.test(o)],
+  ["ls", [], (o) => /welcome\.txt/.test(o) && /docs/.test(o)],
   ["wc", ["/welcome.txt"], (o) => /success/.test(o)],
   ["stat", ["/welcome.txt"], (o) => /success/.test(o)],
-  ["head", ["/docs/notes.txt", "2"], (o) => /line one/.test(o) && /line two/.test(o) && !/line three/.test(o)],
+  ["head", ["2", "/docs/notes.txt"], (o) => /line one/.test(o) && /line two/.test(o) && !/line three/.test(o)],
   ["cp", ["/welcome.txt", "/docs/copy.txt"], (o) => /success/.test(o)],
   ["mkdir", ["/scratch"], (o) => /success/.test(o)],
   ["touch", ["/scratch/empty"], (o) => /success/.test(o)],

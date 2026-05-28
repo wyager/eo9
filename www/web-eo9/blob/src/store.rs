@@ -26,18 +26,20 @@ const PROGRAMS: &[(&str, &[ArgKind])] = &[
     ("outcomes", &[ArgKind::Text, ArgKind::Text]),
     ("readwrite", &[ArgKind::Text, ArgKind::Text]),
     // Coreutils (guest/coreutils/*) run against the blob's in-memory eo9:fs (seeded with a
-    // small sample tree — see fs::MemFs::seeded). Each imports only what it needs.
-    ("cat", &[ArgKind::Text]),
-    ("ls", &[ArgKind::Text]),
+    // small sample tree — see fs::MemFs::seeded). Each imports only what it needs. The
+    // path-taking tools take a variadic list of paths (`cat /a /b`), mirroring the native
+    // CLI's positional/variadic argument binding; an empty list means "the default".
+    ("cat", &[ArgKind::TextList]),
+    ("ls", &[ArgKind::TextList]),
     ("echo", &[ArgKind::Text]),
     ("rng", &[ArgKind::Number]),
-    ("wc", &[ArgKind::Text]),
-    ("head", &[ArgKind::Text, ArgKind::Number]),
+    ("wc", &[ArgKind::TextList]),
+    ("head", &[ArgKind::Number, ArgKind::TextList]),
     ("cp", &[ArgKind::Text, ArgKind::Text]),
     ("mkdir", &[ArgKind::Text]),
-    ("rm", &[ArgKind::Text]),
-    ("touch", &[ArgKind::Text]),
-    ("stat", &[ArgKind::Text]),
+    ("rm", &[ArgKind::TextList]),
+    ("touch", &[ArgKind::TextList]),
+    ("stat", &[ArgKind::TextList]),
     ("find", &[ArgKind::Text, ArgKind::Text]),
 ];
 
@@ -46,32 +48,52 @@ enum ArgKind {
     Text,
     Flag,
     Number,
+    /// A trailing variadic `list<string>` parameter: collects every remaining field (zero
+    /// or more), mirroring the host binder's empty-tail default so bare `ls` works here too.
+    TextList,
 }
 
 fn parse_args(kinds: &[ArgKind], raw: &[&str]) -> Result<Vec<Val>, String> {
-    if raw.len() != kinds.len() {
+    let variadic_tail = matches!(kinds.last(), Some(ArgKind::TextList));
+    let fixed = if variadic_tail {
+        kinds.len() - 1
+    } else {
+        kinds.len()
+    };
+    if raw.len() < fixed || (!variadic_tail && raw.len() != kinds.len()) {
         return Err(format!(
-            "expected {} argument(s), got {}",
-            kinds.len(),
+            "expected {}{} argument(s), got {}",
+            fixed,
+            if variadic_tail { " or more" } else { "" },
             raw.len()
         ));
     }
-    kinds
-        .iter()
-        .zip(raw)
-        .map(|(kind, value)| match kind {
-            ArgKind::Text => Ok(Val::String(value.to_string())),
+    let mut vals = Vec::with_capacity(kinds.len());
+    for (kind, value) in kinds[..fixed].iter().zip(raw) {
+        let val = match kind {
+            ArgKind::Text => Val::String(value.to_string()),
             ArgKind::Flag => match *value {
-                "true" => Ok(Val::Bool(true)),
-                "false" => Ok(Val::Bool(false)),
-                other => Err(format!("`{other}` is not a bool (use true/false)")),
+                "true" => Val::Bool(true),
+                "false" => Val::Bool(false),
+                other => return Err(format!("`{other}` is not a bool (use true/false)")),
             },
             ArgKind::Number => value
                 .parse::<u64>()
                 .map(Val::U64)
-                .map_err(|_| format!("`{value}` is not an unsigned integer")),
-        })
-        .collect()
+                .map_err(|_| format!("`{value}` is not an unsigned integer"))?,
+            ArgKind::TextList => unreachable!("list arguments only appear in trailing position"),
+        };
+        vals.push(val);
+    }
+    if variadic_tail {
+        vals.push(Val::List(
+            raw[fixed..]
+                .iter()
+                .map(|value| Val::String(value.to_string()))
+                .collect(),
+        ));
+    }
+    Ok(vals)
 }
 
 /// Render a component value the way the native CLI renders outcomes (close enough for the
