@@ -873,3 +873,23 @@ preemption/hardening work.
       code pages executable-not-writable (writable-not-executable while being written), after the existing
       I/D-cache maintenance. Not started this pass; the gic.rs module-header doc still describes the original
       masked-WFI design (doc-only follow-up).
+
+41. **Metal depth hardening — W^X for JIT code pages (2026-05-27).** Item 5 of D39, done. The 1 GiB DRAM
+    block in `mmu.rs` is now mapped at **4 KiB page granularity** (level-1 → one level-2 table → 256 level-3
+    tables, ~1 MiB of static page tables covering the 512 MiB DRAM window): the DTB area and the heap default
+    to Normal RW **non-executable** (PXN|UXN), the kernel image `[__kernel_start, __heap_start)` stays RWX
+    (the trusted kernel runs from it), and the device window is unchanged. A new
+    `mmu::set_range_permissions(start, len, PagePerm)` rewrites the L3 descriptors for a range (AP[2]/PXN/UXN),
+    then `dsb ishst` → per-page `tlbi vaae1` → `dsb ish; isb`. The code publisher
+    (`wasm::BareMetalCodeMemory`) now uses it: `required_alignment` = 4096 (whole-page code regions),
+    `publish_executable` cache-maintains then flips the range to **executable + read-only** (`ReadExecOnly`),
+    `unpublish_executable` flips it back to RW-NX. So Cranelift-emitted guest code is written into NX heap and
+    is never simultaneously writable and executable. The kernel image itself is left RWX (internal `.text`/
+    `.data` W^X is a further hardening, not the JIT threat addressed here). Verified: `cargo xtask ci` green
+    (featureless); `qemu demo` — `mmu:` line reports "heap W^X", on-target Cranelift codegen runs from the
+    flipped pages (`add(17,25) -> 42`), and every deserialize path (seed/hello/sleepy/entropy.seeded) +
+    preemption demo run + clean PSCI power-off; interactive plain `hello` runs under W^X. (The interactive
+    on-target composition exercises the identical publish→flip path the demo proves; the scripted serial
+    harness couldn't pace input over the interrupt-driven console to capture it separately.) Also corrected
+    the now-stale `gic.rs` module header (IRQs are taken via `kirq` now, not masked-WFI). Remaining: finer
+    W^X for the kernel image's own `.text`/`.rodata`; guard regions.
