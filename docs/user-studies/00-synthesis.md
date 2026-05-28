@@ -41,3 +41,57 @@ vocabulary; `describe`/`env` inspection; determinism via seeded/frozen providers
 detection; trap containment; the compose→fuse→compile-on-target→run loop on metal with bit-identical
 results; boot-to-prompt speed; performance generally a non-issue. Across all three sessions, trust losses
 came from documentation overclaim and off-happy-path rough edges — never from the core model or speed.
+
+---
+
+# Round 2 (sessions 04–06, 2026-05-27) — triage
+
+Sessions: 04 web-platform developer (eo9.org, /try, /vm), 05 PL/type-systems researcher (spec + algebra),
+06 novice developer (getting-started). Same disposition rule: every finding is **Fix now**, **Tracked**
+(GAPS/roadmap), or **Owner decision**; nothing is dropped.
+
+## Round-1 status update
+
+Now FIXED on master: the unconfigured-provider trap (#1 — documented defaults, never-trap rule), the
+README-doesn't-run items (#2 — verified install order, full interface refs, real outputs), raw error
+strings in the main paths (#3), outcome-line-to-stderr + `--max-fuel` + fresh-store seeding (#4, #6),
+the kernel env text (#18), the TOCTOU interim fd re-verification (#9), and the `--debug-info` cache-key
+claim was investigated and found already correct (#5, closed). Still open from round 1: panic-message
+preservation and the debugger story (#5), `describe` attenuator visibility (#7), child-grant
+visibility/entropy opt-in (#8), signed stores (#11), hostile-component suite (#12), metal scheduling and
+storage (#6, #13), real-board ordering (#14), instrumentation (#15), codegen parity (#16), authoring
+friction (#17), `only` package shorthand (#20).
+
+## Round-2 findings
+
+| # | Finding (session) | Disposition |
+|---|---|---|
+| R2-1 | Configured guest middleware over a configured guest provider traps (`time.frozen --… $ time.fuzzy --… $ hello`, and `&` form) — override-law counterexample, shape missing from the suite (05) | **Fix now** (algebra wave). |
+| R2-2 | `fs.none $ <fs-consumer>` fails encode/validation instead of dropping the unmatched export (no-op-drop law violation) (05) | **Fix now** (algebra wave). |
+| R2-3 | `rename` on a residual import yields an invalid artifact (codegen rejects the import name) (05) | **Fix now** (algebra wave). |
+| R2-4 | The laws' `≡`, instance identity/sharing under composition, and the `empty` element are unspecified (05) | **Fix now** (SPEC clarification) + **Tracked** (tests). |
+| R2-5 | Generative property suite over component triples requested — would have caught R2-1..3 (05) | **Tracked** (area 13 work item, high priority). |
+| R2-6 | The spec-promised "exports match nothing" warning never fires (05) | **Fix now** (algebra wave). |
+| R2-7 | `describe` hides interposed attenuators (reconfirmed) (05) | **Owner decision** (round-1 #7). |
+| R2-8 | Zero-cost-layer and artifact-identity claims unevidenced (no identity-middleware benchmark, no user-facing digest) (05) | **Tracked** (benchmark or soften; expose composition digest). |
+| R2-9 | No response compression anywhere; /vm blob 1.21 MiB raw vs ~290 KB brotli (04) | **Fix now** (web hardening). |
+| R2-10 | No security headers (CSP, HSTS, XCTO, COOP/COEP) (04) | **Fix now** (web hardening). |
+| R2-11 | Caching: max-age only, no ETag/fingerprinted assets → stale-blob window after deploys (04) | **Fix now** (web hardening). |
+| R2-12 | /try ships ~570 KB of ~90% duplicated jco glue (04) | **Tracked** (split shared intrinsics + minify). |
+| R2-13 | Two missing disclosure sentences: /try's refusal is launcher JS; /vm's components import nothing yet (04) | **Fix now** (one sentence each). |
+| R2-14 | /vm determinism claim is self-asserted by the blob; bare-metal leg unverified (04) | **Tracked** (point at the native cross-check; verify or soften). |
+| R2-15 | vm.js error path hard-codes one cause; no instantiateStreaming fallback (04) | **Fix now** (web hardening). |
+| R2-16 | README getting-started order broken on a fresh checkout (install before build-guest) (06) | **FIXED** (README pass: build-guest → install --force). |
+| R2-17 | New guest crates silently ignored unless added to `GUEST_COMPONENTS`; failure surfaces later as a confusing store error (06) | **Tracked** (auto-pickup or loud warning; `eo9 new` scaffold). |
+| R2-18 | Error-quality inconsistency: `fs("FsError::…")` debug text, NotFound for a visible read-only /bin file, double-printed shell refusals, exit 1 vs 3 across front doors, `eo9 store --help` errors (06) | **Fix now** (next error-rendering pass) / **Owner decision** for the `-c` exit-code unification. |
+| R2-19 | Outcome line glues onto program output without a trailing newline (06) | **Fix now** (small). |
+| R2-20 | `/bin`/`session` entries appear in `ls` of a `--fs-root` session and surprise users (06) | **Tracked** (presentation; document or filter). |
+| R2-21 | Vocabulary is the on-ramp blocker; participant supplied a 7-step beginner-tutorial outline (06) | **Tracked** (tutorial/getting-started doc). |
+| R2-22 | STATUS/GAPS lagged reality (described /vm as deferred after it shipped) (04) | **FIXED** (this refresh); keep docs current per merge. |
+
+## What landed well in round 2
+
+The /vm page running the real stack with native-matching entropy and fuel parity; the site's restraint
+(small front page, no third-party JS); sealing, `only` position semantics, the action law on stateful
+providers, and determinism-by-substitution surviving adversarial probing; the seeded-RNG and frozen-clock
+demos as the moment the model "clicked" for the novice; refusal-before-run naming exact imports.
