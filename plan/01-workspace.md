@@ -79,3 +79,14 @@ None. Everything else depends on this.
    is fmt → lint → build → build-guest → test. The no-change overhead is ~1.5–2 s (an incremental no-op
    guest build plus re-componentize/validate of every component); a content-hash freshness check was
    deliberately not added — predictable ordering over cleverness.
+10. **Top-level Makefile as the human entry point.** A fresh machine failed `cargo xtask build-guest`
+    because the `wasm-tools` CLI was not installed and the spawn error was opaque; the README also assumed
+    host tools that were never listed. The repo now carries a plain POSIX `Makefile` with `setup` / `shell` /
+    `www` / `www-build` / `qemu` / `ci` targets — thin wrappers over `cargo xtask` that check for the tools
+    they need (`wasm-tools`, `qemu-system-aarch64`) and point at `make setup` instead of dying with a raw
+    spawn error. `make setup` is idempotent: it adds the wasm32 target on the root-pinned toolchain (guest/
+    and kernel/ declare their own targets in their `rust-toolchain.toml`), installs `wasm-tools` if missing,
+    and prints a prerequisite summary. `make www` serves the committed site directly (the demo assets are
+    committed and reproducible); `make www-build` is the rebuild-from-source variant. README gained a
+    "Quick start" table + a Prerequisites note. A `cargo xtask doctor` subcommand and friendlier xtask
+    spawn errors remain a queued follow-up (xtask was owned by other work when this landed).
