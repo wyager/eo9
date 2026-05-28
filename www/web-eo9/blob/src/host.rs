@@ -45,7 +45,11 @@ pub fn now_ms() -> f64 {
 
 pub fn monotonic_ns() -> u64 {
     let ns = unsafe { host_monotonic_ns() };
-    if ns.is_finite() && ns > 0.0 { ns as u64 } else { 0 }
+    if ns.is_finite() && ns > 0.0 {
+        ns as u64
+    } else {
+        0
+    }
 }
 
 pub fn random_fill(buffer: &mut [u8]) {

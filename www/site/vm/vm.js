@@ -16,6 +16,7 @@ const buttons = {
   sleepy: document.getElementById("btn-sleepy"),
   park: document.getElementById("btn-park"),
   readline: document.getElementById("btn-readline"),
+  eosh: document.getElementById("btn-eosh"),
 };
 const seedInput = document.getElementById("seed");
 const countInput = document.getElementById("count");
@@ -292,12 +293,19 @@ async function main() {
   const probeSleep = promising(exports.probe_sleep);
   const probeReadLine = promising(exports.probe_read_line);
   const runProgram = promising(exports.run_program);
+  const eoshBoot = promising(exports.eosh_boot);
 
   const enableIdleButtons = () => {
     for (const button of [buttons.hello, buttons.fuel, buttons.algebra, buttons.entropy])
       button.disabled = false;
     const blocked = !hasJSPI;
-    for (const button of [buttons.program, buttons.sleepy, buttons.park, buttons.readline]) {
+    for (const button of [
+      buttons.program,
+      buttons.sleepy,
+      buttons.park,
+      buttons.readline,
+      buttons.eosh,
+    ]) {
       button.disabled = blocked;
     }
   };
@@ -338,6 +346,8 @@ async function main() {
   buttons.park.onclick = () => run("park the VM (300 ms)", () => probeSleep(300));
   buttons.sleepy.onclick = () => run("sleepy (stackful-lift canary)", () => runSleepy());
   buttons.readline.onclick = () => run("read-line", () => probeReadLine());
+  buttons.eosh.onclick = () =>
+    run("eosh shell — type commands below; `exit` to end", () => eoshBoot());
   buttons.program.onclick = () =>
     run(`store: ${programSelect.value}`, async () => {
       const [namePtr, nameLen] = intoBlob(programSelect.value);

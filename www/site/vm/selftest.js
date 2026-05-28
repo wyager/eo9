@@ -196,6 +196,21 @@ async function run() {
     check("coreutil find rc", (await runStored("find", ["/", ".txt"])) === 0);
     check("coreutil find matches", sawLine(/welcome\.txt/));
 
+    // eosh booting in the blob: the unmodified shell links the in-blob eo9:exec surface and
+    // runs a command end to end (resolve from /bin -> load -> compile -> spawn -> wait).
+    lines = [];
+    const eoshCommand = promising(exports.eosh_command);
+    const [eoshPtr, eoshLen] = intoBlob("hello --name web --excited true");
+    let eoshRc;
+    try {
+      eoshRc = await eoshCommand(eoshPtr, eoshLen);
+    } finally {
+      if (eoshLen) exports.web_free(eoshPtr, eoshLen);
+    }
+    check("eosh one-shot rc", eoshRc === 0);
+    check("eosh ran hello via the exec surface", sawLine(/Hello, web!/));
+    check("eosh session exited", sawLine(/session outcome = success\(exited\)/));
+
     lines = [];
     const before = performance.now();
     const parkRc = await WebAssembly.promising(exports.probe_sleep)(300);

@@ -62,8 +62,8 @@ pub fn algebra_demo() -> wasmtime::Result<()> {
         InterfaceRef::any("eo9:text/text"),
         InterfaceRef::any("eo9:time/time"),
     ];
-    let restricted =
-        restrict(&component, &allow).map_err(|err| wasmtime::Error::msg(format!("only failed: {err:?}")))?;
+    let restricted = restrict(&component, &allow)
+        .map_err(|err| wasmtime::Error::msg(format!("only failed: {err:?}")))?;
     crate::outf!(
         "  only eo9:text/text, eo9:time/time -> a sealed component of {} bytes (the algebra ran here)",
         restricted.save().len()

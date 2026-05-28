@@ -46,13 +46,18 @@ const MAX_READ_LINE_BYTES: usize = 4096;
 pub struct WebState {
     pub fs: crate::fs::MemFs,
     pub buffers: crate::fs::BufferTable,
+    pub exec: crate::execsurface::ExecTables,
 }
 
 impl WebState {
     pub fn new() -> Self {
+        let mut fs = crate::fs::MemFs::seeded();
+        // Seed `/bin/<name>.wasm` so eosh's `resolve` finds the page's programs.
+        crate::execsurface::seed_bin(&mut fs);
         WebState {
-            fs: crate::fs::MemFs::seeded(),
+            fs,
             buffers: crate::fs::BufferTable::default(),
+            exec: crate::execsurface::ExecTables::default(),
         }
     }
 }
@@ -208,9 +213,7 @@ fn add_time(linker: &mut Linker<WebState>) -> Result<()> {
 
     time.func_wrap(
         "resolution",
-        |_store: StoreContextMut<'_, WebState>,
-         (_cap,): (Resource<TimeCap>,)|
-         -> Result<(u64,)> {
+        |_store: StoreContextMut<'_, WebState>, (_cap,): (Resource<TimeCap>,)| -> Result<(u64,)> {
             // performance.now() is millisecond-ish (coarsened by the browser); report 1 ms.
             Ok((1_000_000,))
         },

@@ -55,13 +55,15 @@ Sessions: 04 web-platform developer (eo9.org, /try, /vm), 05 PL/type-systems res
 Now FIXED on master: the unconfigured-provider trap (#1 — documented defaults, never-trap rule), the
 README-doesn't-run items (#2 — verified install order, full interface refs, real outputs), raw error
 strings in the main paths (#3), outcome-line-to-stderr + `--max-fuel` + fresh-store seeding (#4, #6),
-the kernel env text (#18), the TOCTOU interim fd re-verification (#9), and the `--debug-info` cache-key
-claim was investigated and found already correct (#5, closed). Still open from round 1: panic-message
-preservation and the debugger story (#5), `describe` attenuator visibility (#7), child-grant
-visibility/entropy opt-in (#8), signed stores (#11), hostile-component suite (#12), real-board ordering
-(#14), instrumentation (#15), codegen parity (#16), authoring friction (#17), `only` package shorthand
-(#20). Metal scheduling (#6) is now FIXED (child fuel + preemption — a looping child no longer takes the
-machine); writable storage on metal (#13) is still open.
+the kernel env text (#18), the TOCTOU interim fd re-verification (#9), `describe` attenuator visibility
+(#7 — `describe --wiring` shows the full composition tree), `only` package shorthand (#8/#20 — `only eo9:text`
+admits the package), child-grant spawn-time visibility (#8 — under `-v`), and the `--debug-info` cache-key
+claim was investigated and found already correct (#5, closed). Metal scheduling (#6) is FIXED (child fuel +
+preemption — a looping child no longer takes the machine). Still open from round 1: panic-MESSAGE
+preservation and the debugger story (#5 — the readable backtrace shipped; the message needs an
+`eo9:rt/diagnostics` export), entropy-opt-in (#8 — decided no-op), signed stores (#11), hostile-component
+suite (#12), real-board ordering (#14), instrumentation (#15), codegen parity (#16), authoring friction
+(#17), writable storage on metal (#13).
 
 ## Round-2 findings
 
@@ -90,18 +92,19 @@ machine); writable storage on metal (#13) is still open.
 | R2-21 | Vocabulary is the on-ramp blocker; participant supplied a 7-step beginner-tutorial outline (06) | **Tracked** (tutorial/getting-started doc). |
 | R2-22 | STATUS/GAPS lagged reality (described /vm as deferred after it shipped) (04) | **FIXED** (this refresh); keep docs current per merge. |
 
-## Round-2 status update (post-batch, master 14c0443)
+## Round-2 status update (post-overnight-batch, master 4962464)
 
-Now FIXED on master: R2-2 (`fs.none` drop-law), R2-3 (`rename`-residual via `executable_bytes`), R2-9
-(compression), R2-10 (security headers), R2-11 (caching — content-fingerprinted immutable URLs + ETags),
-R2-13 (disclosure sentences), R2-15 (vm.js error path), in addition to the already-FIXED R2-16/R2-22.
-Still open: R2-1 (configured-middleware trap → event-driven binder), R2-4/R2-5 (`≡`/identity in SPEC +
-generative property suite), R2-6 (surface the "exports match nothing" warning), R2-7 (`describe`
-attenuator view — owner decision), R2-8 (zero-cost-layer benchmark / composition digest), R2-12 (/try
-jco dedup), R2-14 (/vm determinism cross-check), R2-17 (guest auto-pickup / `eo9 new`), R2-18 (error-quality
-+ `-c` exit codes), R2-19 (outcome-line newline), R2-20 (`/bin` in `ls`), R2-21 (beginner tutorial). New
-follow-up from this batch: the wasm32 blob build is path-dependent (different checkout dir → different
-hash) — wants a reproducible-build fix before cross-machine CI.
+Now FIXED on master: **R2-1 (configured-middleware trap)** — closed by making `configure` synchronous
+(`af9cb34`), not the event-driven binder; **R2-5 (generative property suite)** — landed (`26ddc28`); **R2-7
+(`describe` attenuator view)** — `describe --wiring` shipped (`00bfaf7`); plus the earlier R2-2 (`fs.none`
+drop-law), R2-3 (`rename`-residual via `executable_bytes`), R2-9 (compression), R2-10 (security headers),
+R2-11 (caching), R2-13 (disclosures), R2-15 (vm.js error path), R2-16/R2-22. Still open: R2-4 (`≡`/identity
+in SPEC), R2-6 (surface the "exports match nothing" warning host-side), R2-8 (zero-cost-layer benchmark /
+composition digest), R2-12 (/try jco dedup), R2-14 (/vm determinism cross-check), R2-17 (guest auto-pickup /
+`eo9 new`), R2-18 (error-quality + honest `-c` exit codes — needs an eosh `program-failure` WIT class),
+R2-19 (outcome-line newline), R2-20 (`/bin` in `ls`), R2-21 (beginner tutorial). Batch follow-up: the wasm32
+blob build is path-dependent (different checkout dir → different hash) — wants a reproducible-build fix
+before cross-machine CI.
 
 ## What landed well in round 2
 

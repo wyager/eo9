@@ -459,6 +459,52 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
         false,
     )?;
 
+    // eosh — the shell itself, booted in the blob against the in-browser eo9:exec surface
+    // (plan/18: eosh in the browser). Pre-AOT'd to pulley32 and embedded.
+    let eosh_component = std::fs::read(
+        root.join("guest")
+            .join("target")
+            .join("components")
+            .join("eosh.wasm"),
+    )
+    .map_err(|err| format!("failed to read the eosh component: {err}"))?;
+    preaot_for_web(
+        &artifacts,
+        &eosh_component,
+        "eosh shell",
+        "eosh.cwasm",
+        false,
+    )?;
+
+    // Programs eosh can resolve from `/bin` in the browser: each as raw component bytes (for
+    // the algebra's `load`, seeded into the blob's MemFs) and pre-AOT'd to pulley32 (for
+    // execution via the exec surface). hello + a useful spread of coreutils.
+    for (name, package) in [
+        ("hello", "eo9-example-hello"),
+        ("echo", "eo9-coreutil-echo"),
+        ("cat", "eo9-coreutil-cat"),
+        ("ls", "eo9-coreutil-ls"),
+        ("rng", "eo9-coreutil-rng"),
+    ] {
+        let raw = std::fs::read(
+            root.join("guest")
+                .join("target")
+                .join("components")
+                .join(format!("{package}.wasm")),
+        )
+        .map_err(|err| format!("failed to read the {name} component for /bin: {err}"))?;
+        std::fs::write(artifacts.join(format!("bin-{name}.wasm")), &raw).map_err(|err| {
+            format!("failed to write the raw {name} component to artifacts: {err}")
+        })?;
+        preaot_for_web(
+            &artifacts,
+            &raw,
+            &format!("/bin {name}"),
+            &format!("bin-{name}.cwasm"),
+            false,
+        )?;
+    }
+
     // The page's HTTP-backed program store: real example programs (and the kernel's async
     // sleep canary) pre-AOT'd to pulley32 and served as static files the blob fetches on
     // demand (www/web-eo9/blob/src/store.rs).
