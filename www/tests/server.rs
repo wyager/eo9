@@ -86,13 +86,69 @@ fn serves_css_and_svg_with_correct_content_types_and_caching() {
     let css = request(site_server_addr(), "GET", "/style.css");
     assert_eq!(css.status, 200);
     assert_eq!(css.header("Content-Type"), Some("text/css; charset=utf-8"));
-    assert_eq!(css.header("Cache-Control"), Some("public, max-age=86400"));
+    assert_eq!(css.header("Cache-Control"), Some("public, max-age=3600"));
 
     let svg = request(site_server_addr(), "GET", "/logo.svg");
     assert_eq!(svg.status, 200);
     assert_eq!(svg.header("Content-Type"), Some("image/svg+xml"));
-    assert_eq!(svg.header("Cache-Control"), Some("public, max-age=86400"));
+    assert_eq!(svg.header("Cache-Control"), Some("public, max-age=3600"));
     assert!(svg.body_text().contains("<svg"));
+
+    // The heavyweight artifacts keep the longer lifetime; revalidation is covered below.
+    let wasm = request(site_server_addr(), "GET", "/vm/web-eo9.wasm");
+    assert_eq!(wasm.header("Cache-Control"), Some("public, max-age=86400"));
+}
+
+#[test]
+fn conditional_requests_revalidate_with_a_304() {
+    // First request: a strong ETag comes back with the body.
+    let first = request(site_server_addr(), "GET", "/style.css");
+    assert_eq!(first.status, 200);
+    let etag = first.header("ETag").expect("ETag on a 200").to_owned();
+    assert!(etag.starts_with('"') && etag.ends_with('"'));
+    assert!(!first.body.is_empty());
+
+    // Revalidating with that ETag: 304, same validator, no body.
+    let revalidated = request_with_headers(
+        site_server_addr(),
+        "GET",
+        "/style.css",
+        &[("If-None-Match", &etag)],
+    );
+    assert_eq!(revalidated.status, 304);
+    assert_eq!(revalidated.header("ETag"), Some(etag.as_str()));
+    assert!(revalidated.body.is_empty());
+
+    // A stale validator gets the full body again.
+    let stale = request_with_headers(
+        site_server_addr(),
+        "GET",
+        "/style.css",
+        &[("If-None-Match", "\"0123456789abcdef\"")],
+    );
+    assert_eq!(stale.status, 200);
+    assert!(!stale.body.is_empty());
+
+    // The ETag is per representation: the brotli bytes of one file carry their own.
+    let plain = request(site_server_addr(), "GET", "/vm/web-eo9.wasm");
+    let brotli = request_with_headers(
+        site_server_addr(),
+        "GET",
+        "/vm/web-eo9.wasm",
+        &[("Accept-Encoding", "br")],
+    );
+    assert_ne!(plain.header("ETag"), brotli.header("ETag"));
+
+    // And a conditional request for the compressed representation revalidates too.
+    let brotli_etag = brotli.header("ETag").unwrap().to_owned();
+    let brotli_revalidated = request_with_headers(
+        site_server_addr(),
+        "GET",
+        "/vm/web-eo9.wasm",
+        &[("Accept-Encoding", "br"), ("If-None-Match", &brotli_etag)],
+    );
+    assert_eq!(brotli_revalidated.status, 304);
+    assert!(brotli_revalidated.body.is_empty());
 }
 
 #[test]

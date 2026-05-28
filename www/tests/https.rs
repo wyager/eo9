@@ -133,7 +133,7 @@ fn https_serves_assets_with_correct_content_types() {
     let svg = https_request("GET", "/logo.svg");
     assert_eq!(svg.status, 200);
     assert_eq!(svg.header("Content-Type"), Some("image/svg+xml"));
-    assert_eq!(svg.header("Cache-Control"), Some("public, max-age=86400"));
+    assert_eq!(svg.header("Cache-Control"), Some("public, max-age=3600"));
 
     let css = https_request("GET", "/style.css");
     assert_eq!(css.status, 200);

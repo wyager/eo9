@@ -469,18 +469,33 @@ async fn site_file_response(
         Err(_) => return error_response(StatusCode::NOT_FOUND),
     };
 
+    // A strong validator over the exact representation being served (the brotli, gzip, and
+    // identity bytes of one file each get their own), so revalidation after the cache
+    // lifetime is a bodyless 304 instead of a re-download.
+    let etag = crate::etag(&contents);
+    let revalidated = request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| crate::if_none_match_matches(value, &etag));
+
     let mut builder = Response::builder()
-        .status(StatusCode::OK)
+        .status(if revalidated {
+            StatusCode::NOT_MODIFIED
+        } else {
+            StatusCode::OK
+        })
         .header(header::CONTENT_TYPE, content_type(&file))
         .header(header::CACHE_CONTROL, cache_control(&file))
+        .header(header::ETAG, etag)
         // The served representation depends on Accept-Encoding whenever a sibling exists,
         // and may start to at any deploy: always tell caches to key on it.
         .header(header::VARY, "Accept-Encoding");
     if let Some((_, encoding)) = variant {
         builder = builder.header(header::CONTENT_ENCODING, encoding.token());
     }
+    let body = if revalidated { Vec::new() } else { contents };
     builder
-        .body(Full::new(Bytes::from(contents)))
+        .body(Full::new(Bytes::from(body)))
         .expect("statically valid response")
 }
 
