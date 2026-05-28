@@ -119,3 +119,48 @@ runnable on a host with no fiber backend.
    fs + io-buffer providers in the blob, the exec/store surface for eosh (algebra + compile
    are further out — composition needs the compile path), and a callback-ABI sleep/read
    demo guest once one exists in the tree.
+
+10. **Milestone-3 start: committed-asset drift fixed + a drift guard (the rest of m3 is the
+    next pass).** The /vm `web-eo9.wasm` blob and the `store/*.cwasm` programs are committed,
+    and review of the web-hardening branch found them stale: the `hello`/`cruncher`/`outcomes`
+    store artifacts (and the blob) predated the `fs-impl-in-interface` and `configure-defaults`
+    merges that regenerated the guest components. Fixed by re-running `cargo xtask build-web-vm`
+    and committing the regenerated assets (+ brotli/gzip siblings); `sleepy.cwasm` (from WAT) was
+    unaffected.
+    - **Determinism finding:** the web-VM build is **byte-deterministic** on the pinned toolchain
+      — a second `build-web-vm` reproduced every asset identically (the m1 "1-byte drift" did not
+      recur). So a byte-exact drift guard is sound (no codegen-noise false positives).
+    - **Guard:** `cargo xtask check-web-vm` rebuilds the blob + store artifacts to a temp staging
+      dir and byte-compares against the committed `www/site/vm/` files without overwriting them;
+      non-zero exit on drift, naming the stale files. Not wired into `ci` (it needs the wasm32
+      target + a full guest build); run it after touching guest sources. Verified both ways
+      (clean → "up to date"; a mutated committed artifact → "Drifted: store/hello.cwasm").
+    - **Verification of the regenerated assets:** a node v25 (JSPI) harness mirroring `vm.js`'s
+      import glue loaded the committed blob and ran `boot`/`run_hello` (`add(17,25)->42`)/
+      `run_fuel`/`run_entropy` (exact `0x505f147c387507b6`) and `run_program` for the three
+      store programs via the JSPI fetch path: `hello` → greeting + success, `cruncher` →
+      `digest(14341732361190694547)`, `outcomes` → `failure(requested-failure(...))`. All pass.
+
+11. **Milestone 3 remaining (fs/io providers → eosh in the browser) — design, not yet built.**
+    Deferred to the next pass because each piece needs real implementation + verification and
+    must not ship as an unverified blob:
+    - **`eo9:fs` (memfs) + `eo9:io` (owned buffers) host providers in the blob**, hand-mirrored
+      against the raw component `Linker` the way `blob/src/providers.rs` mirrors text/time/entropy
+      (eo9-runtime/eo9-providers-unix don't compile for wasm32). Shapes to copy: the kernel's
+      `wasm/shellfs.rs` (memfs semantics, file/immutable-handle resources, async
+      open/read/write/list-directory/stat/create-directory/remove) and the io buffer resource
+      (alloc/from-bytes/read-into/transfer). Proof: `readwrite` runs on /vm (it currently can't —
+      no fs/io providers). The fs-impl-in-interface convention is already on master, so the
+      root-handle lives on `eo9:fs/fs` here too.
+    - **Exec/store surface for eosh**: give the blob the `eo9:exec` capability (component-algebra
+      load/describe + spawn/wait) and a `/bin` view backed by the HTTP store, mirroring
+      `crates/eo9/src/shell.rs`. Open question to decide then: `compile` for a *fused* composition
+      needs codegen, which the blob does not have (Pulley artifacts are pre-AOT'd) — so `$`/`&`
+      should give a clean "composition needs the compiler, not available in the browser yet"
+      refusal, while plain program runs and `only`/attenuation (no new codegen) should work.
+      Decide whether attenuated-but-not-recompiled compositions are feasible via instantiate-time
+      linking.
+    - **Boot eosh on /vm**: a real `eosh>` prompt using the m2 JSPI `read-line` path; eosh is
+      built unmodified from guest sources and must run through the fiberless host. Needs a
+      callback-ABI read-line in eosh's await path (confirm eosh's read-line lift is callback-ABI,
+      not stackful — the stackful lift is unsupported on this host per Decision 9).
