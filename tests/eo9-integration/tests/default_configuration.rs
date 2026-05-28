@@ -20,10 +20,7 @@ const DEFAULT_NOW_SECONDS: i64 = 946_684_800;
 
 /// Run `program` with an ambient text capture (and nothing else ambient), returning the
 /// outcome and captured stdout.
-fn run_with_capture(
-    program: &eo9_component::Component,
-    args: &[NamedArg],
-) -> (Outcome, String) {
+fn run_with_capture(program: &eo9_component::Component, args: &[NamedArg]) -> (Outcome, String) {
     let capture = CaptureText::new();
     let providers = Providers {
         text: Some(Box::new(capture.clone())),
