@@ -33,10 +33,22 @@ include!(concat!(env!("OUT_DIR"), "/embedded_components.rs"));
 /// First line of the seed record at `<store-root>/seed`.
 const SEED_RECORD_HEADER: &str = "eo9-seed 1";
 
+/// The component set this binary carries: the locally built `guest/target/components`
+/// set when the binary was built inside the repository (so dev builds always ship what
+/// the tree builds), otherwise the prebuilt set bundled by the `eo9-components` crate —
+/// which is what a `cargo install eo9` build seeds from.
+fn carried_components() -> &'static [(&'static str, &'static [u8])] {
+    if EMBEDDED_COMPONENTS.is_empty() {
+        eo9_components::bundled()
+    } else {
+        EMBEDDED_COMPONENTS
+    }
+}
+
 /// The bytes of an embedded component by file stem (e.g. `eosh`), if the binary carries
 /// it.
 pub fn embedded(stem: &str) -> Option<&'static [u8]> {
-    EMBEDDED_COMPONENTS
+    carried_components()
         .iter()
         .find(|(name, _)| *name == stem)
         .map(|(_, bytes)| *bytes)
@@ -177,7 +189,7 @@ pub fn reseed(cfg: &Config, store: &Store) -> Result<usize, String> {
 /// The embedded set as `(shell name, bytes)` pairs (components without a valid shell
 /// name are skipped, exactly as seeding always has).
 fn embedded_set() -> Vec<(String, &'static [u8])> {
-    EMBEDDED_COMPONENTS
+    carried_components()
         .iter()
         .filter_map(|(stem, bytes)| shell_name_for(stem).map(|name| (name, *bytes)))
         .collect()
@@ -407,7 +419,7 @@ mod tests {
 
     #[test]
     fn every_embedded_component_has_a_shell_name() {
-        for (stem, bytes) in EMBEDDED_COMPONENTS {
+        for (stem, bytes) in carried_components() {
             assert!(
                 shell_name_for(stem).is_some(),
                 "embedded component {stem:?} has no shell name"

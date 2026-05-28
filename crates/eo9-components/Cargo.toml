@@ -1,0 +1,19 @@
+# eo9-components: the prebuilt Eo9 guest components (eosh, the examples, the coreutils,
+# and the standard stub providers), bundled as data so a `cargo install eo9` build can
+# seed a working shell without the guest toolchain (nightly + wasm32 target + wasm-tools).
+#
+# The data under data/ is refreshed from `guest/target/components/` by
+# `cargo xtask refresh-components` (and verified against the source tree by
+# `cargo xtask package`); it is never edited by hand. Components are wasm, so one
+# artifact set serves every host platform.
+[package]
+name = "eo9-components"
+description = "Prebuilt Eo9 guest components (the shell, examples, coreutils, and standard stub providers) bundled for the eo9 binary."
+version.workspace = true
+edition.workspace = true
+publish = true
+repository.workspace = true
+license = "MIT"
+include = ["/src", "/data", "/Cargo.toml"]
+
+[dependencies]

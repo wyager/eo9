@@ -446,9 +446,10 @@ dependencies = [
 
 [[package]]
 name = "eo9"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "eo9-component",
+ "eo9-components",
  "eo9-providers-unix",
  "eo9-runtime",
  "eo9-store",
@@ -457,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "eo9-component"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "wac-graph",
  "wasm-encoder 0.250.0",
@@ -468,8 +469,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-components"
+version = "0.1.0"
+
+[[package]]
 name = "eo9-embed"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "eo9-component",
  "eo9-providers-unix",
@@ -478,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "eo9-integration"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "eo9-component",
  "eo9-runtime",
@@ -490,11 +495,11 @@ dependencies = [
 
 [[package]]
 name = "eo9-placeholder"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "eo9-providers-unix"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
@@ -502,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "eo9-runtime"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "eo9-component",
  "wasmtime",
@@ -510,18 +515,18 @@ dependencies = [
 
 [[package]]
 name = "eo9-sched"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "eo9-store"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
 ]
 
 [[package]]
 name = "eofs-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "lz4_flex",
@@ -2225,7 +2230,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "eo9-component",
  "wasmtime",
