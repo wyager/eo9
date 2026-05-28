@@ -14,6 +14,10 @@
 //! the underlying resolution and the configured granularity, and `sleep` rounds the
 //! requested duration *up* to the next multiple of the granularity before forwarding, so
 //! sleep completions cannot be used as a finer timer than the clock itself.
+//!
+//! Used without `configure`, the granularity falls back to the documented default of one
+//! millisecond ([`DEFAULT_GRANULARITY_NS`]) on first use, so plain `time.fuzzy $ program`
+//! works and never traps; `configure` overrides it (plan/09 Decision 14).
 
 #![no_std]
 
@@ -37,6 +41,21 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// The configured granularity in nanoseconds (always at least 1).
 static GRANULARITY_NS: ProviderState<u64> = ProviderState::new();
+
+/// The documented default granularity — one millisecond — used when the provider is
+/// composed without `configure` (still a meaningful side-channel degradation; the
+/// option-C default-configuration rule, plan/09 Decision 14). `configure` (or the
+/// shell's `--granularity-ns` flag) overrides it.
+pub const DEFAULT_GRANULARITY_NS: u64 = 1_000_000;
+
+/// The effective granularity, binding the documented default first if `configure` never
+/// ran.
+fn granularity_ns() -> u64 {
+    if !GRANULARITY_NS.is_set() {
+        GRANULARITY_NS.set(DEFAULT_GRANULARITY_NS);
+    }
+    GRANULARITY_NS.with(|g| *g)
+}
 
 /// Floor `datetime` to the configured granularity (see the crate docs for the
 /// field-wise rule).
@@ -74,7 +93,7 @@ impl time::Guest for Stub {
     }
 
     fn now(t: &TimeImpl) -> Datetime {
-        let granularity = GRANULARITY_NS.with(|g| *g);
+        let granularity = granularity_ns();
         // The imported and exported interfaces have structurally identical but distinct
         // generated record types, hence the field-wise conversion.
         let underlying = underlying::now(t);
@@ -88,7 +107,7 @@ impl time::Guest for Stub {
     }
 
     fn monotonic_now(t: &TimeImpl) -> Instant {
-        let granularity = GRANULARITY_NS.with(|g| *g);
+        let granularity = granularity_ns();
         let instant = underlying::monotonic_now(t);
         Instant {
             nanoseconds: instant.nanoseconds - instant.nanoseconds % granularity,
@@ -96,12 +115,12 @@ impl time::Guest for Stub {
     }
 
     fn resolution(t: &TimeImpl) -> u64 {
-        let granularity = GRANULARITY_NS.with(|g| *g);
+        let granularity = granularity_ns();
         u64::max(underlying::resolution(t), granularity)
     }
 
     async fn sleep(t: &TimeImpl, duration_ns: u64) {
-        let granularity = GRANULARITY_NS.with(|g| *g);
+        let granularity = granularity_ns();
         let rounded_up = duration_ns
             .div_ceil(granularity)
             .saturating_mul(granularity);
