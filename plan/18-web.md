@@ -164,3 +164,43 @@ runnable on a host with no fiber backend.
       built unmodified from guest sources and must run through the fiberless host. Needs a
       callback-ABI read-line in eosh's await path (confirm eosh's read-line lift is callback-ABI,
       not stackful — the stackful lift is unsupported on this host per Decision 9).
+
+12. **Milestone-3, layer 1 done: the in-blob `eo9:fs` + `eo9:io` providers (readwrite runs).**
+    `www/web-eo9/blob/src/fs.rs` adds a **writable in-memory filesystem** (`MemFs`) and the
+    owned-buffer `eo9:io/buffers` table, mirroring the kernel's `wasm/shellfs.rs` and
+    `eo9-runtime::link` shapes (same WIT-shaped host types, same per-buffer/total byte caps)
+    but with writable semantics (files as byte vectors, directories as a path set;
+    open/read/write/stat/list-directory/create-directory/remove; `open-exec` pins a snapshot).
+    `WebState` now carries the memfs + buffer table; `store::instantiate` registers them
+    alongside the text/time/entropy roots. Verified: the unmodified `readwrite` example
+    (`--path /scratch/note.txt --contents "hello disk"`) round-trips end to end on `/vm` →
+    `success(round-tripped(10))` (node v25 / JSPI harness `www/web-eo9/verify-fs.mjs`, and a
+    new check in `selftest.js`); the existing programs (hello/cruncher/outcomes/entropy) still
+    pass (8/8 in the harness); `readwrite` is now a selectable program on the page. Blob grew
+    1.24 → 1.42 MiB.
+    - **Bug fixed in passing (the load-bearing finding):** programs whose imports *cross-`use`*
+      a resource (here `eo9:fs/fs` uses `eo9:io/buffers.buffer`) fail the **synchronous**
+      `linker.instantiate` under the component-model-async ABI with "resource implementation is
+      missing"; they link correctly only through **`instantiate_async`** driven by the polling
+      executor — exactly what the kernel runner (`runner.rs`) and usermode `spawn` (`task.rs`)
+      use. `store::instantiate` now instantiates via `block_on(linker.instantiate_async(…))`.
+      hello/cruncher/outcomes worked before only because they have no cross-interface `use`.
+    - **Finding that de-risks layer 4 (eosh):** `readwrite` is an SDK guest with an `async`
+      `main` that **awaits** async fs ops, and it runs fiberlessly here — so the SDK's
+      async-main + async-await path is callback-ABI and works on this host (not the stackful
+      lift of Decision 9). eosh uses the same `eo9_guest::main!`/`text::read_line().await`
+      shape, so booting eosh is **not** blocked by the fiber limitation; what remains for it is
+      the exec/store surface, not an ABI wall.
+
+13. **Milestone-3, layers 2–4 still to build (the exec surface + eosh) — deliberately not in
+    this pass.** Booting eosh needs the blob to host the whole `eo9:exec` surface eosh imports
+    (component-algebra load/describe, task spawn/wait, the `/bin` store view, and a `compile`
+    that is artifact-lookup with a clean "composition needs the compiler, not in the browser"
+    refusal for `$`/`&`). In the kernel that surface is ~1,600 lines (`wasm/shellexec.rs`);
+    hand-mirroring it against the raw `Linker` for wasm32 — and *verifying* it (AOT eosh into
+    the store, JS wiring, a browser/node smoke of an `eosh>` prompt) — is a milestone-sized
+    build that cannot be done and verified in one pass without shipping a large unverified
+    blob, which the project's norms forbid. Layer 1 is the clean, verified, committed prefix;
+    layer 4's ABI risk is now retired (above), so the remaining work is plumbing the exec
+    surface. Next pass: build `eo9:exec` + `/bin` store view in the blob, AOT eosh, then boot
+    the prompt.

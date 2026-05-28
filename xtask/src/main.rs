@@ -444,7 +444,7 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
     let store_dir = root.join("www").join("site").join("vm").join("store");
     std::fs::create_dir_all(&store_dir)
         .map_err(|err| format!("failed to create {}: {err}", store_dir.display()))?;
-    for example in ["hello", "cruncher", "outcomes"] {
+    for example in ["hello", "cruncher", "outcomes", "readwrite"] {
         let component_path = root
             .join("guest")
             .join("target")

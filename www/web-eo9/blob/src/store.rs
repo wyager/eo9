@@ -24,6 +24,7 @@ const PROGRAMS: &[(&str, &[ArgKind])] = &[
     ("hello", &[ArgKind::Text, ArgKind::Flag]),
     ("cruncher", &[ArgKind::Number, ArgKind::Number]),
     ("outcomes", &[ArgKind::Text, ArgKind::Text]),
+    ("readwrite", &[ArgKind::Text, ArgKind::Text]),
 ];
 
 #[derive(Clone, Copy)]
@@ -124,8 +125,18 @@ fn instantiate(
     let component = unsafe { Component::deserialize(&engine, artifact)? };
     let mut linker: Linker<WebState> = Linker::new(&engine);
     providers::add_providers(&mut linker)?;
+    crate::fs::add_fs_io(&mut linker)?;
     let mut store = Store::new(&engine, WebState::new());
-    let instance = linker.instantiate(&mut store, &component)?;
+    // Instantiate through the async path (driven by the polling executor), exactly as the
+    // kernel runner and usermode `spawn` do. A component that imports an interface which
+    // `use`s a resource from another (`eo9:fs/fs` using `eo9:io/buffers.buffer`) only links
+    // its cross-interface resources correctly through `instantiate_async` under the
+    // component-model-async ABI; the synchronous `instantiate` cannot resolve them (it fails
+    // with "resource implementation is missing").
+    let instance = block_on(
+        "instantiation",
+        linker.instantiate_async(&mut store, &component),
+    )??;
     Ok((store, instance))
 }
 

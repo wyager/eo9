@@ -160,6 +160,12 @@ async function run() {
     check("store outcomes rc (typed failure)", (await runStored("outcomes", ["fail", "sad path"])) === 0);
     check("store outcomes failure", sawLine(/failure\(requested-failure\("sad path"\)\)/));
 
+    // readwrite: an async-main SDK guest that awaits async fs ops, exercising the in-blob
+    // memfs (eo9:fs) + owned-buffer (eo9:io) providers and the fiberless async-await path.
+    lines = [];
+    check("store readwrite rc", (await runStored("readwrite", ["/scratch/note.txt", "hello disk"])) === 0);
+    check("store readwrite round-trip", sawLine(/success\(round-tripped\(10\)\)/));
+
     lines = [];
     const before = performance.now();
     const parkRc = await WebAssembly.promising(exports.probe_sleep)(300);
