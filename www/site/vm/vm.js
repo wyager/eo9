@@ -28,6 +28,18 @@ const ARG_PLACEHOLDERS = {
   cruncher: "9 200000",
   outcomes: 'fail "sad path"',
   readwrite: '/scratch/note.txt "hello disk"',
+  cat: "/welcome.txt",
+  ls: "/",
+  echo: '"hello from the web VM"',
+  rng: "5",
+  wc: "/welcome.txt",
+  head: "/docs/notes.txt 2",
+  cp: "/welcome.txt /docs/copy.txt",
+  mkdir: "/scratch",
+  rm: "/docs/notes.txt",
+  touch: "/scratch/empty",
+  stat: "/welcome.txt",
+  find: "/ .txt",
 };
 
 // Argument fields are joined with the ASCII unit separator before crossing into the blob.

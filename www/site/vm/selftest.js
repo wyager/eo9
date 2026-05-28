@@ -175,6 +175,27 @@ async function run() {
     check("store readwrite rc", (await runStored("readwrite", ["/scratch/note.txt", "hello disk"])) === 0);
     check("store readwrite round-trip", sawLine(/success\(round-tripped\(10\)\)/));
 
+    // Coreutils: real Eo9 guest programs run against the blob's seeded in-memory eo9:fs.
+    lines = [];
+    check("coreutil echo rc", (await runStored("echo", ["hello from the web VM"])) === 0);
+    check("coreutil echo output", sawLine(/hello from the web VM/));
+
+    lines = [];
+    check("coreutil rng rc", (await runStored("rng", ["5"])) === 0);
+    check("coreutil rng generated", sawLine(/success\(generated\(5\)\)/));
+
+    lines = [];
+    check("coreutil cat rc", (await runStored("cat", ["/welcome.txt"])) === 0);
+    check("coreutil cat reads the seeded file", sawLine(/Hello from the Eo9 web VM filesystem/));
+
+    lines = [];
+    check("coreutil ls rc", (await runStored("ls", ["/"])) === 0);
+    check("coreutil ls lists the seeded tree", sawLine(/welcome\.txt/) && sawLine(/docs/));
+
+    lines = [];
+    check("coreutil find rc", (await runStored("find", ["/", ".txt"])) === 0);
+    check("coreutil find matches", sawLine(/welcome\.txt/));
+
     lines = [];
     const before = performance.now();
     const parkRc = await WebAssembly.promising(exports.probe_sleep)(300);
