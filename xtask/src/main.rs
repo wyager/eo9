@@ -68,6 +68,13 @@ const GUEST_TARGET: &str = "wasm32-unknown-unknown";
 /// until area 12 introduces the real per-arch targets.
 const KERNEL_CHECK_TARGET: &str = "aarch64-unknown-none";
 
+/// The riscv64 bare-metal target (QEMU `virt`, S-mode under OpenSBI). Host-AOT artifacts
+/// for it are produced by the same precompile pipeline as aarch64, but emitting riscv64
+/// machine code needs the non-host Cranelift backends, which only the `kernel-cross-aot`
+/// xtask feature links (`build-kernel riscv64` re-runs itself with that feature when
+/// needed, so plain xtask builds stay lean).
+const KERNEL_RISCV64_TARGET: &str = "riscv64gc-unknown-none-elf";
+
 /// Bare-metal targets the feature-less kernel workspace is built and clippy-checked for in
 /// `build`/`lint` (and therefore `ci`), so a change cannot silently break a ported
 /// architecture. Only aarch64 additionally gets the full wasm feature set exercised under
@@ -1161,7 +1168,7 @@ const KERNEL_QEMU_MEMORY: &str = "512M";
 /// documents the format): each listed guest component is built, componentized, and
 /// host-AOT precompiled for the bare-metal target, then packed as
 /// `name + component bytes + artifact bytes + metadata text`.
-fn build_store_image(root: &Path) -> Result<PathBuf, String> {
+fn build_store_image(root: &Path, target: &str) -> Result<PathBuf, String> {
     let mut image: Vec<u8> = Vec::new();
     image.extend_from_slice(b"EO9STOR2");
     image.extend_from_slice(
@@ -1178,6 +1185,7 @@ fn build_store_image(root: &Path) -> Result<PathBuf, String> {
             &component,
             package,
             &format!("store-{shell_name}.cwasm"),
+            target,
         )?;
         let artifact = std::fs::read(&artifact_path)
             .map_err(|err| format!("failed to read {}: {err}", artifact_path.display()))?;
@@ -1195,19 +1203,32 @@ fn build_store_image(root: &Path) -> Result<PathBuf, String> {
         image.extend_from_slice(metadata);
     }
 
-    let out_dir = root.join("kernel").join("target").join("precompiled");
+    let out_dir = kernel_precompiled_dir(root, target);
     std::fs::create_dir_all(&out_dir)
         .map_err(|err| format!("failed to create {}: {err}", out_dir.display()))?;
     let out_path = out_dir.join("store.img");
     std::fs::write(&out_path, &image)
         .map_err(|err| format!("failed to write {}: {err}", out_path.display()))?;
     println!(
-        "xtask: assembled store image {} ({} bytes, {} components)",
+        "xtask: assembled store image {} ({} bytes, {} components, target {target})",
         out_path.display(),
         image.len(),
         KERNEL_STORE_COMPONENTS.len()
     );
     Ok(out_path)
+}
+
+/// Where host-AOT artifacts for a bare-metal target are written. aarch64 keeps the original
+/// flat `kernel/target/precompiled/` layout (so its artifacts and the env-var paths the
+/// kernel build embeds stay byte-for-byte identical to before the riscv64 port); every
+/// other target gets a per-target subdirectory.
+fn kernel_precompiled_dir(root: &Path, target: &str) -> PathBuf {
+    let base = root.join("kernel").join("target").join("precompiled");
+    if target == KERNEL_CHECK_TARGET {
+        base
+    } else {
+        base.join(target)
+    }
 }
 
 /// Describe one store component as the plain-text metadata block the kernel embeds next to
@@ -1279,24 +1300,128 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// riscv64 (QEMU `virt`, S-mode under OpenSBI): the port currently covers boot, serial,
-/// heap, timer, and interrupt-driven idle (plan/12-kernel.md), so the image is built
-/// feature-less — no wasm artifacts are embedded yet. The milestone-3 step (host-AOT
-/// components against the kernel providers) will extend this with the same precompile
-/// pipeline aarch64 uses.
+/// riscv64 (QEMU `virt`, S-mode under OpenSBI), milestone 3: the same host-AOT precompile
+/// pipeline as aarch64 — the seed canary, the real hello program, the async pair, and the
+/// read-only store image — targeted at riscv64, then a kernel build with the runtime
+/// feature set (`wasm-seed,wasm-hello,wasm-async,wasm-store`). On-target codegen
+/// (`wasm-codegen`) is not enabled for riscv64 yet — that is milestone 5 (Sv39 + W^X +
+/// the riscv64 backend in the vendored compile fork) — so the metal shell runs store
+/// programs and refuses `$`/`&` composition with the documented message.
+///
+/// Emitting riscv64 machine code from the host needs the non-host Cranelift backends,
+/// which only the off-by-default `kernel-cross-aot` xtask feature links (so every other
+/// xtask invocation stays lean). When the feature is absent this function re-runs
+/// `cargo run -p xtask --features kernel-cross-aot -- build-kernel riscv64` and returns
+/// the image that build produces.
 fn build_kernel_riscv64(root: &Path) -> Result<PathBuf, String> {
-    const TARGET: &str = "riscv64gc-unknown-none-elf";
     let kernel_dir = root.join("kernel");
-    run(
-        &kernel_dir,
-        "cargo",
-        ["build", "-p", "eo9-kernel", "--release", "--target", TARGET],
-    )?;
     let image = kernel_dir
         .join("target")
-        .join(TARGET)
+        .join(KERNEL_RISCV64_TARGET)
         .join("release")
         .join("eo9-kernel");
+
+    if !cfg!(feature = "kernel-cross-aot") {
+        println!(
+            "xtask: re-running with --features kernel-cross-aot (this xtask build does not \
+             link the riscv64 Cranelift backend)"
+        );
+        run(
+            root,
+            "cargo",
+            [
+                "run",
+                "-p",
+                "xtask",
+                "--features",
+                "kernel-cross-aot",
+                "--",
+                "build-kernel",
+                "riscv64",
+            ],
+        )?;
+        if !image.is_file() {
+            return Err(format!(
+                "the kernel-cross-aot build succeeded but {} is missing",
+                image.display()
+            ));
+        }
+        return Ok(image);
+    }
+
+    // The seed canary, assembled from WAT.
+    let seed_wat = root.join("kernel").join("seed").join("hello.wat");
+    let seed_wasm = wat::parse_file(&seed_wat)
+        .map_err(|err| format!("failed to assemble {}: {err}", seed_wat.display()))?;
+    let seed = precompile_for_kernel(
+        root,
+        &seed_wasm,
+        "seed component",
+        "seed.cwasm",
+        KERNEL_RISCV64_TARGET,
+    )?;
+
+    // The async canary (awaits time.sleep against the kernel timer), assembled from WAT.
+    let sleepy_wat = root.join("kernel").join("seed").join("sleepy.wat");
+    let sleepy_wasm = wat::parse_file(&sleepy_wat)
+        .map_err(|err| format!("failed to assemble {}: {err}", sleepy_wat.display()))?;
+    let sleepy = precompile_for_kernel(
+        root,
+        &sleepy_wasm,
+        "sleepy canary",
+        "sleepy.cwasm",
+        KERNEL_RISCV64_TARGET,
+    )?;
+
+    // The real hello program, built from the guest workspace.
+    let hello_component = build_guest_component(root, "eo9-example-hello")?;
+    let hello_wasm = std::fs::read(&hello_component)
+        .map_err(|err| format!("failed to read {}: {err}", hello_component.display()))?;
+    let hello = precompile_for_kernel(
+        root,
+        &hello_wasm,
+        "eo9-example-hello",
+        "hello.cwasm",
+        KERNEL_RISCV64_TARGET,
+    )?;
+
+    // The unmodified entropy.seeded stub (async-ABI configure), exactly as on aarch64.
+    let entropy_component = build_guest_component(root, "eo9-stub-entropy-seeded")?;
+    let entropy_wasm = std::fs::read(&entropy_component)
+        .map_err(|err| format!("failed to read {}: {err}", entropy_component.display()))?;
+    let entropy = precompile_for_kernel(
+        root,
+        &entropy_wasm,
+        "eo9-stub-entropy-seeded",
+        "entropy-seeded.cwasm",
+        KERNEL_RISCV64_TARGET,
+    )?;
+
+    // The read-only store image (the same component list as aarch64), AOT'd for riscv64.
+    let store_image = build_store_image(root, KERNEL_RISCV64_TARGET)?;
+
+    run_with_env(
+        &kernel_dir,
+        "cargo",
+        [
+            "build",
+            "-p",
+            "eo9-kernel",
+            "--release",
+            "--target",
+            KERNEL_RISCV64_TARGET,
+            "--features",
+            "wasm-seed,wasm-hello,wasm-async,wasm-store",
+        ],
+        &[
+            ("EO9_SEED_CWASM", seed.as_os_str()),
+            ("EO9_HELLO_CWASM", hello.as_os_str()),
+            ("EO9_SLEEPY_CWASM", sleepy.as_os_str()),
+            ("EO9_ENTROPY_SEEDED_CWASM", entropy.as_os_str()),
+            ("EO9_STORE_IMAGE", store_image.as_os_str()),
+        ],
+    )?;
+
     if !image.is_file() {
         return Err(format!(
             "kernel build succeeded but {} is missing",
@@ -1312,7 +1437,13 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
     let seed_wat = root.join("kernel").join("seed").join("hello.wat");
     let seed_wasm = wat::parse_file(&seed_wat)
         .map_err(|err| format!("failed to assemble {}: {err}", seed_wat.display()))?;
-    let seed = precompile_for_kernel(root, &seed_wasm, "seed component", "seed.cwasm")?;
+    let seed = precompile_for_kernel(
+        root,
+        &seed_wasm,
+        "seed component",
+        "seed.cwasm",
+        KERNEL_CHECK_TARGET,
+    )?;
 
     // The same seed component as *raw* (un-precompiled) wasm bytes, for the on-target
     // codegen demo: the kernel compiles this with its own Cranelift (wasm-codegen) rather
@@ -1331,13 +1462,25 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
     let sleepy_wat = root.join("kernel").join("seed").join("sleepy.wat");
     let sleepy_wasm = wat::parse_file(&sleepy_wat)
         .map_err(|err| format!("failed to assemble {}: {err}", sleepy_wat.display()))?;
-    let sleepy = precompile_for_kernel(root, &sleepy_wasm, "sleepy canary", "sleepy.cwasm")?;
+    let sleepy = precompile_for_kernel(
+        root,
+        &sleepy_wasm,
+        "sleepy canary",
+        "sleepy.cwasm",
+        KERNEL_CHECK_TARGET,
+    )?;
 
     // The real hello program, built from the guest workspace.
     let hello_component = build_guest_component(root, "eo9-example-hello")?;
     let hello_wasm = std::fs::read(&hello_component)
         .map_err(|err| format!("failed to read {}: {err}", hello_component.display()))?;
-    let hello = precompile_for_kernel(root, &hello_wasm, "eo9-example-hello", "hello.cwasm")?;
+    let hello = precompile_for_kernel(
+        root,
+        &hello_wasm,
+        "eo9-example-hello",
+        "hello.cwasm",
+        KERNEL_CHECK_TARGET,
+    )?;
 
     // The unmodified entropy.seeded stub from the guest workspace: a real SDK-built
     // component whose `configure` export uses the async canonical ABI.
@@ -1349,12 +1492,13 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
         &entropy_wasm,
         "eo9-stub-entropy-seeded",
         "entropy-seeded.cwasm",
+        KERNEL_CHECK_TARGET,
     )?;
 
     // The read-only store image: every listed component plus its host-AOT artifact,
     // keyed by shell name, for the kernel's `program=<name>` selection (and, later,
     // eosh's /bin view).
-    let store_image = build_store_image(root)?;
+    let store_image = build_store_image(root, KERNEL_CHECK_TARGET)?;
 
     let kernel_dir = root.join("kernel");
     run_with_env(
@@ -1395,7 +1539,8 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
     Ok(image)
 }
 
-/// Precompile a component for the bare-metal target, writing `kernel/target/precompiled/<name>`.
+/// Precompile a component for a bare-metal target, writing it under
+/// [`kernel_precompiled_dir`].
 ///
 /// The artifact must be loadable by the kernel's `no_std` wasmtime engine, so the
 /// compilation config mirrors what that engine computes for itself on an OS-less target:
@@ -1403,16 +1548,21 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
 /// memory initialization, and no wasm proposals beyond what the kernel build enables
 /// (feature unification gives this host build GC, threads, and component-model-async
 /// support via eo9-runtime's wasmtime features; the kernel build has none of those).
+/// The target string must match the kernel-side `NATIVE_TARGET` for that architecture
+/// (kernel/eo9-kernel/src/wasm/mod.rs) so deserialization accepts the artifact. Non-host
+/// targets (riscv64) additionally need the `kernel-cross-aot` xtask feature, which links
+/// every Cranelift backend.
 fn precompile_for_kernel(
     root: &Path,
     component: &[u8],
     what: &str,
     file_name: &str,
+    target: &str,
 ) -> Result<PathBuf, String> {
     let mut config = wasmtime::Config::new();
     config
-        .target(KERNEL_CHECK_TARGET)
-        .map_err(|err| format!("wasmtime rejected target {KERNEL_CHECK_TARGET}: {err:#}"))?;
+        .target(target)
+        .map_err(|err| format!("wasmtime rejected target {target}: {err:#}"))?;
     config.wasm_component_model(true);
     // The component-model async ABI (plus stackful lifts and the extra async built-ins
     // the eo9 guest SDK uses). Compile-relevant: the kernel engine enables exactly the
@@ -1438,14 +1588,14 @@ fn precompile_for_kernel(
         .precompile_component(component)
         .map_err(|err| format!("failed to precompile {what}: {err:#}"))?;
 
-    let out_dir = root.join("kernel").join("target").join("precompiled");
+    let out_dir = kernel_precompiled_dir(root, target);
     std::fs::create_dir_all(&out_dir)
         .map_err(|err| format!("failed to create {}: {err}", out_dir.display()))?;
     let out_path = out_dir.join(file_name);
     std::fs::write(&out_path, &artifact)
         .map_err(|err| format!("failed to write {}: {err}", out_path.display()))?;
     println!(
-        "xtask: precompiled {what} -> {} ({} bytes, target {KERNEL_CHECK_TARGET})",
+        "xtask: precompiled {what} -> {} ({} bytes, target {target})",
         out_path.display(),
         artifact.len()
     );

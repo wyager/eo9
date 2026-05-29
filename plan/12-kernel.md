@@ -999,3 +999,30 @@ preemption/hardening work.
     coreutils and relying on on-target codegen is the lever if the image ever needs trimming).
     Verified on QEMU aarch64: bare `ls` → listed(2), `ls /bin` → listed(14), `cat /session` →
     printed(903), `wc /session /session` → totals line, clean exit/PSCI off.
+47. **riscv64 milestone 3: host-AOT components run on the riscv64 kernel — and the baked store boots
+    eosh (2026-05-29, branch `area/12-riscv64-m3`).** No kernel source changes were needed: the D44 arch
+    split plus the per-arch `NATIVE_TARGET` already prepared the wasm side, and the vendored no_std
+    wasmtime closure compiles for `riscv64gc-unknown-none-elf` as-is. The work is xtask-side:
+    `precompile_for_kernel` and `build_store_image` take the bare-metal target (aarch64 keeps the original
+    flat `kernel/target/precompiled/` layout and stays byte-for-byte identical — verified by hashing every
+    artifact and the ELF before/after; other targets get `precompiled/<target>/`), and
+    `build-kernel riscv64` now runs the same precompile pipeline as aarch64 (seed, hello, the async pair,
+    the 14-component store image) and builds the kernel with `wasm-seed,wasm-hello,wasm-async,wasm-store`
+    (no `wasm-codegen`: on-target codegen is milestone 5, so the metal shell refuses `$`/`&` with the
+    documented message). Emitting riscv64 from the host needs the non-host Cranelift backends, which only
+    the new off-by-default `kernel-cross-aot` xtask feature links (`wasmtime/all-arch`); `build-kernel
+    riscv64` re-runs itself with that feature automatically, so every other xtask invocation stays lean —
+    the one-time cost of the cross-AOT build measured ~25 s on the dev machine, and plain builds pay
+    nothing. Verified on QEMU riscv64 `virt`: `program=hello name=riscv excited=true` →
+    `[wall-clock] Hello, riscv!` / `success(greeted)` (45 ms instantiate+main); `program=cruncher seed=9
+    rounds=200000` → `success(digest(14341732361190694547))` — the same digest as aarch64 and native;
+    `demo` → the fuel-sliced sched/preemption demo (short/long finish, spinner killed), the seed component
+    (`add(17,25) -> 42`), the hello program, the sleepy canary awaiting a 50 ms kernel-timer sleep
+    (62.2 ms observed), and entropy.seeded sync-configure with the exact SplitMix64 values; and an
+    interactive scripted session — the baked store boots **eosh on riscv64**: `ls /bin` lists 14 programs,
+    `hello --name riscv --excited true` → `ok: greeted`, a `$` composition refuses with the no-codegen
+    message, `exit` → clean SBI shutdown. aarch64 re-verified unchanged on the same xtask (demo incl.
+    on-target codegen, interactive with Ctrl-C kill, `pci program=lspci` → 3 devices). Remaining for the
+    port: milestone 5 (Sv39 translation + W^X + the riscv64 backend in the vendored compile fork for
+    on-target codegen) and milestone 6 parity checks (Ctrl-C / RX-ring consumption on riscv64, idle-power
+    measurement); milestone 4's boot-to-eosh goal is already covered by the store image above.
