@@ -199,11 +199,9 @@ fn the_real_text_null_stub_seals_the_text_import_like_a_fixture_sink() {
         .map(|import| import.interface)
         .collect();
     assert!(
-        residual
-            .iter()
-            .all(|interface| {
-                interface == "eo9:rt/diagnostics" || interface.starts_with("eo9:rt/diagnostics@")
-            }),
+        residual.iter().all(|interface| {
+            interface == "eo9:rt/diagnostics" || interface.starts_with("eo9:rt/diagnostics@")
+        }),
         "text.null must seal the text import; residual imports: {residual:?}"
     );
 
