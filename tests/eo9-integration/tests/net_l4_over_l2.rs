@@ -65,7 +65,10 @@ fn configuring_the_middleware_is_refused_typed_until_the_binder_learns_resource_
             ("gateway", "\"192.168.7.1\""),
         ],
     );
-    let message = format!("{:?}", result.expect_err("configure must be refused, not baked"));
+    let message = format!(
+        "{:?}",
+        result.expect_err("configure must be refused, not baked")
+    );
     assert!(
         message.contains("defines its own resources"),
         "expected the documented resource-owning-provider refusal, got: {message}"

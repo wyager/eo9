@@ -533,8 +533,7 @@ fn bindable(address: &IpAddress) -> bool {
     match address {
         IpAddress::V4(octets) => {
             *octets == (0, 0, 0, 0)
-                || Ipv4Address::new(octets.0, octets.1, octets.2, octets.3)
-                    == addressing().address
+                || Ipv4Address::new(octets.0, octets.1, octets.2, octets.3) == addressing().address
         }
         IpAddress::V6(groups) => *groups == (0, 0, 0, 0, 0, 0, 0, 0),
     }
@@ -663,13 +662,15 @@ impl l4::GuestUdpSocket for Udp {}
 impl l4_over_l2_config::Guest for Stub {
     /// Bind the static IPv4 addressing the stack uses on its link. Validation happens
     /// here, at compose time: a malformed address is a configure error, never a trap.
-    fn configure(address: String, prefix_length: u8, gateway: String) -> Result<l4::L4Impl, String> {
+    fn configure(
+        address: String,
+        prefix_length: u8,
+        gateway: String,
+    ) -> Result<l4::L4Impl, String> {
         let address = parse_ipv4(&address)?;
         let gateway = parse_ipv4(&gateway)?;
         if prefix_length > 32 {
-            return Err(format!(
-                "prefix-length must be 0..=32, not {prefix_length}"
-            ));
+            return Err(format!("prefix-length must be 0..=32, not {prefix_length}"));
         }
         ADDRESSING.set(Addressing {
             address,
