@@ -19,6 +19,22 @@ pub(crate) mod uart;
 /// Architecture name as spelled in `cargo xtask build-kernel <arch>` / `cargo xtask qemu <arch>`.
 pub(crate) const NAME: &str = "x86_64";
 
+/// Where PCI Express lives on this machine (QEMU `q35`): the MMCONFIG/ECAM window at its
+/// default base and the 32-bit PCI hole below it for BAR placement. The shared `src/pci.rs`
+/// compiles against these so wasm-store builds link, but the x86_64 QEMU invocation does
+/// not wire the `pci` boot grant yet — these values are documented, not verified
+/// (plan/12-kernel.md Decisions).
+#[cfg(feature = "wasm-store")]
+pub(crate) mod pci_map {
+    /// ECAM (PCIe configuration space) base (q35 MMCONFIG default).
+    pub(crate) const ECAM_BASE: usize = 0xb000_0000;
+    /// Buses walked (the window covers 256; bus 0 is all QEMU populates by default).
+    pub(crate) const ECAM_BUSES: u8 = 16;
+    /// 32-bit PCI hole: where unassigned memory BARs would be placed.
+    pub(crate) const MMIO_BASE: usize = 0x8000_0000;
+    pub(crate) const MMIO_END: usize = 0xb000_0000;
+}
+
 /// Boot banner: machine identification, privilege level, timer frequency, wall clock.
 pub(crate) fn banner() {
     crate::kprintln!();
