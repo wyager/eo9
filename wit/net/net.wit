@@ -297,10 +297,12 @@ interface l4-loopback-config {
 /// static IPv4 addressing the stack uses on its link. Addresses are dotted-quad strings
 /// (`"10.0.2.15"`); a malformed address is a configure-time error, never a trap. An
 /// unconfigured provider keeps its documented default — QEMU user-mode networking's
-/// layout (10.0.2.15/24, gateway 10.0.2.2) — so plain composition still works.
+/// layout (10.0.2.15/24, gateway 10.0.2.2) — so plain composition still works. (A DNS
+/// server is deliberately not part of this configuration: the middleware itself sends no
+/// DNS queries — resolvers are programs or middleware *above* `l4`.)
 interface l4-over-l2-config {
     use l4.{l4-impl};
-    configure: func(address: string, prefix-length: u8, gateway: string, dns: option<string>)
+    configure: func(address: string, prefix-length: u8, gateway: string)
         -> result<l4-impl, string>;
 }
 

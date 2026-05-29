@@ -73,6 +73,7 @@ use eo9::time::time;
 use exports::eo9::net::l4::{
     self, Buffer, IpAddress, L4Error, RecvResult, SendResult, SocketAddress,
 };
+use exports::eo9::net::l4_over_l2_config;
 
 // ------------------------------------------------------------------------------------------
 // Defaults and bounds (all documented in the crate header).
@@ -84,6 +85,61 @@ const OUR_ADDRESS: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
 const PREFIX_LEN: u8 = 24;
 /// The default gateway (QEMU user-mode networking's router).
 const GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+
+// ------------------------------------------------------------------------------------------
+// Configured addressing (`eo9:net/l4-over-l2-config`).
+// ------------------------------------------------------------------------------------------
+
+/// The static IPv4 addressing the stack binds on first use: the configured values, or the
+/// documented QEMU user-net defaults when the provider was composed without `configure`.
+#[derive(Clone, Copy)]
+struct Addressing {
+    address: Ipv4Address,
+    prefix_len: u8,
+    gateway: Ipv4Address,
+}
+
+impl Addressing {
+    const fn defaults() -> Addressing {
+        Addressing {
+            address: OUR_ADDRESS,
+            prefix_len: PREFIX_LEN,
+            gateway: GATEWAY,
+        }
+    }
+}
+
+/// Set exactly once, by `configure`; absent for an unconfigured provider.
+static ADDRESSING: ProviderState<Addressing> = ProviderState::new();
+
+/// The addressing in force: configured values when `configure` ran, the defaults otherwise.
+fn addressing() -> Addressing {
+    if ADDRESSING.is_set() {
+        ADDRESSING.with(|a| *a)
+    } else {
+        Addressing::defaults()
+    }
+}
+
+/// Parse a dotted-quad IPv4 address (`"10.0.2.15"`). Configure-time validation only —
+/// a malformed value is a configure error, never a trap.
+fn parse_ipv4(text: &str) -> Result<Ipv4Address, String> {
+    let mut octets = [0u8; 4];
+    let mut count = 0;
+    for part in text.split('.') {
+        if count == 4 {
+            return Err(format!("not a dotted-quad IPv4 address: {text:?}"));
+        }
+        octets[count] = part
+            .parse::<u8>()
+            .map_err(|_| format!("not a dotted-quad IPv4 address: {text:?}"))?;
+        count += 1;
+    }
+    if count != 4 {
+        return Err(format!("not a dotted-quad IPv4 address: {text:?}"));
+    }
+    Ok(Ipv4Address::new(octets[0], octets[1], octets[2], octets[3]))
+}
 
 /// Sockets (TCP + UDP combined) that may exist at once.
 const MAX_SOCKETS: usize = 16;
@@ -308,10 +364,14 @@ impl NetState {
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = seed;
         let mut iface = Interface::new(config, &mut dev, smol_instant(now));
+        let bound = addressing();
         iface.update_ip_addrs(|addrs| {
-            let _ = addrs.push(IpCidr::new(SmolIpAddress::Ipv4(OUR_ADDRESS), PREFIX_LEN));
+            let _ = addrs.push(IpCidr::new(
+                SmolIpAddress::Ipv4(bound.address),
+                bound.prefix_len,
+            ));
         });
-        let _ = iface.routes_mut().add_default_ipv4_route(GATEWAY);
+        let _ = iface.routes_mut().add_default_ipv4_route(bound.gateway);
         NetState {
             iface,
             sockets: SocketSet::new(Vec::new()),
@@ -468,12 +528,13 @@ fn destination_v4(address: &IpAddress) -> Result<Ipv4Address, L4Error> {
     }
 }
 
-/// Is this an acceptable local bind address (unspecified or the configured address)?
+/// Is this an acceptable local bind address (unspecified or the bound address)?
 fn bindable(address: &IpAddress) -> bool {
     match address {
         IpAddress::V4(octets) => {
             *octets == (0, 0, 0, 0)
-                || Ipv4Address::new(octets.0, octets.1, octets.2, octets.3) == OUR_ADDRESS
+                || Ipv4Address::new(octets.0, octets.1, octets.2, octets.3)
+                    == addressing().address
         }
         IpAddress::V6(groups) => *groups == (0, 0, 0, 0, 0, 0, 0, 0),
     }
@@ -481,7 +542,7 @@ fn bindable(address: &IpAddress) -> bool {
 
 /// Our own address with `port`, in the WIT vocabulary.
 fn local_address(port: u16) -> SocketAddress {
-    let octets = OUR_ADDRESS.octets();
+    let octets = addressing().address.octets();
     SocketAddress {
         address: IpAddress::V4((octets[0], octets[1], octets[2], octets[3])),
         port,
@@ -594,6 +655,30 @@ impl l4::GuestL4Impl for Root {}
 impl l4::GuestTcpConnection for Conn {}
 impl l4::GuestTcpListener for Listener {}
 impl l4::GuestUdpSocket for Udp {}
+
+// ------------------------------------------------------------------------------------------
+// The configure entry (`eo9:net/l4-over-l2-config`).
+// ------------------------------------------------------------------------------------------
+
+impl l4_over_l2_config::Guest for Stub {
+    /// Bind the static IPv4 addressing the stack uses on its link. Validation happens
+    /// here, at compose time: a malformed address is a configure error, never a trap.
+    fn configure(address: String, prefix_length: u8, gateway: String) -> Result<l4::L4Impl, String> {
+        let address = parse_ipv4(&address)?;
+        let gateway = parse_ipv4(&gateway)?;
+        if prefix_length > 32 {
+            return Err(format!(
+                "prefix-length must be 0..=32, not {prefix_length}"
+            ));
+        }
+        ADDRESSING.set(Addressing {
+            address,
+            prefix_len: prefix_length,
+            gateway,
+        });
+        Ok(l4::L4Impl::new(Root))
+    }
+}
 
 // ------------------------------------------------------------------------------------------
 // The exported l4 surface.
