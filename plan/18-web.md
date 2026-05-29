@@ -655,3 +655,11 @@ worktree site auto-boots to `eosh>` with no clicks and runs `hello` through the 
 handler. Blob: 8,756,332 bytes raw / 1,714,796 brotli (the new eosh + time.frozen raw+cwasm add
 ~168 KB raw / ~21 KB wire over Decision 27's figures). Only the blob asset changed fingerprint —
 the store `.cwasm` set reproduced byte-identically.
+
+**Follow-up (2026-05-28, `eo9:rt/diagnostics`):** the guest SDK's panic handler now reports panic messages
+through a new `eo9:rt/diagnostics.report-panic` import that every SDK-built component carries. Before the
+next `/vm` asset rebuild (`build-web-vm`), the blob's exec/provider surface must register that import —
+alongside the already-recorded `wiring` registration — or newly built components (including eosh and every
+/bin program) will fail to instantiate in the browser. The committed assets predate the import and keep
+working until then. Registering it as a per-child write-once slot surfaced in the child's trapped outcome
+matches the usermode/kernel behavior; accepting and ignoring it is the minimum.

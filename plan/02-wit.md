@@ -244,3 +244,20 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
     blob's hand-rolled exec surface (`www/web-eo9/blob/execsurface.rs`) does not register `wiring` yet; a
     freshly rebuilt eosh imports it, so `build-web-vm` would produce an eosh the blob cannot instantiate
     until the blob adds the function. The committed `/vm` assets carry the older eosh and keep working.
+19. **`eo9:rt` — the runtime-diagnostics package; `diagnostics.report-panic` (2026-05-28, owner-chosen
+    option (a) of plan/07 D12).** A new `wit/rt` package holds the runtime contract between the guest SDK
+    and the executor — interfaces that are part of how programs *run*, not OS capabilities. Its first
+    interface is `diagnostics`, a single `report-panic: func(message: string)`: the SDK panic handler calls
+    it with "<message> at <file>:<line>" immediately before lowering the panic to the `unreachable` trap,
+    and the executor stores at most one bounded (1 KiB) message per task and surfaces it in exactly one
+    place — a subsequent `abnormal(trapped(reason))`. It had to be an *import* (a trapped instance cannot be
+    re-entered, so the D11 post-trap export is impossible), but it is not an output channel: no guest can
+    ever read it and the host discards it unless the task traps. Because the call sits in the SDK's panic
+    handler, **every SDK-built component carries the import automatically** — no per-world edits — and the
+    algebra treats it like the types-only interfaces: `restrict`/`only` always admits it
+    (`eo9-component::restrict::runtime_diagnostics`), so allow-lists never have to name it. `wit/check.sh`
+    gained the `rt` package. Hosts registering it today: the usermode runtime (`eo9-runtime::link`) and the
+    kernel (`wasm/providers.rs`), both unconditionally. **Web follow-up (must land before the next `/vm`
+    asset rebuild, together with the D18 `wiring` registration):** the browser blob's exec/provider surface
+    must register `eo9:rt/diagnostics.report-panic` (storing into the child's outcome path, or at minimum
+    accepting and ignoring it) or newly built components will not instantiate there.

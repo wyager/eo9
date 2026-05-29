@@ -17,7 +17,9 @@
 //! a single interface (`eo9:text/text`) or a whole package (`eo9:text`); a package entry
 //! admits every interface of that package the consumer imports. Types-only interfaces (no
 //! functions -- e.g. the `eo9:*/types` interfaces that `use` drags in) carry no authority
-//! and are always admitted.
+//! and are always admitted, and so is `eo9:rt/diagnostics` -- the SDK panic handler's
+//! write-once trap-path sink, part of the runtime contract rather than an OS capability
+//! (the host discards it unless the task traps), so restriction never has to name it.
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -36,6 +38,19 @@ use crate::describe::{ImportMeta, OPTIONAL_SUFFIX};
 use crate::error::RestrictError;
 use crate::{Component, InterfaceRef, Wiring, semver, slots, synth};
 
+/// `eo9:rt/diagnostics` is the runtime's write-once panic-message sink (the SDK panic
+/// handler is its only caller; the executor surfaces it solely inside a subsequent
+/// `trapped(reason)`). It carries no authority a program could use to observe or affect
+/// anything, so `only` always admits it -- exactly like the types-only interfaces.
+/// Restricting it away would only break panic reporting.
+fn runtime_diagnostics(import: &ImportMeta) -> bool {
+    let base = import
+        .interface
+        .split_once('@')
+        .map_or(import.interface.as_str(), |(base, _)| base);
+    base == "eo9:rt/diagnostics"
+}
+
 /// Bounds `c` to the allow-list `allow`, per the rules above.
 pub fn restrict(c: &Component, allow: &[InterfaceRef]) -> Result<Component, RestrictError> {
     validate_allow_list(allow)?;
@@ -43,7 +58,7 @@ pub fn restrict(c: &Component, allow: &[InterfaceRef]) -> Result<Component, Rest
     let mut offenders = Vec::new();
     let mut to_seal = Vec::new();
     for import in &c.meta().imports {
-        if import.authority_free || admitted(import, allow) {
+        if import.authority_free || runtime_diagnostics(import) || admitted(import, allow) {
             continue;
         }
         if import.required {

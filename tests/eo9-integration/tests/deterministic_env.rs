@@ -189,7 +189,21 @@ fn the_real_text_null_stub_seals_the_text_import_like_a_fixture_sink() {
     guest::ensure_components(STUBS);
     let writer = fixtures::text_writer();
     let sealed = compose(&guest::load_stub("text.null"), &writer).expect("text.null $ writer");
-    assert!(sealed.describe().imports.is_empty());
+    // The text import must be sealed. (The SDK-built stub also carries the runtime's
+    // `eo9:rt/diagnostics` trap-path sink, which is not a capability and rides along on
+    // every real component — the law under test is about the text interface.)
+    let residual: Vec<String> = sealed
+        .describe()
+        .imports
+        .into_iter()
+        .map(|import| import.interface)
+        .collect();
+    assert!(
+        residual.iter().all(|interface| {
+            interface == "eo9:rt/diagnostics" || interface.starts_with("eo9:rt/diagnostics@")
+        }),
+        "text.null must seal the text import; residual imports: {residual:?}"
+    );
 
     let ambient = CaptureText::new();
     let outcome = run::run_component(

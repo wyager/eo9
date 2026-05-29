@@ -8,14 +8,11 @@
 //! the trap kind plus a symbol-only call chain, with the code addresses and `[hash]` noise
 //! removed.
 //!
-//! What it deliberately does NOT contain: the guest's panic *message* (`panic!("…")`) and
-//! source location. Those live in the guest's `PanicInfo`, which the `#![no_std]` panic
-//! handler discards before the `unreachable` trap; at the component boundary the host has
-//! no capability-clean way to read them back — a host import would be an ambient capability
-//! the guest could use for general output, and the only clean alternative is a per-world
-//! post-trap export the executor reads, which is a WIT addition (see plan/10 Decision 11).
-//! So the chain names the panicking function (`main`, `panic_fmt`, `rust_begin_unwind`) but
-//! not the message — "as close as the mechanism allows" without a WIT change.
+//! The guest's panic *message* and source location arrive separately: the SDK's panic
+//! handler reports them through `eo9:rt/diagnostics.report-panic` just before trapping
+//! (a trapped instance cannot be re-entered, so a post-trap export cannot work — see
+//! plan/07 Decision 12), the executor parks them in the task's write-once slot, and this
+//! module folds them into the front of the reason when the trap is rendered.
 
 use wasmtime::Trap;
 
@@ -29,7 +26,7 @@ const MAX_FRAMES: usize = 16;
 /// yields the same reason across runs and builds. Symbol names are taken from wasmtime's
 /// own demangled backtrace text (`FrameInfo::func_name` returns the still-mangled symbol),
 /// so no demangler dependency is needed.
-pub(crate) fn trap_reason(err: &wasmtime::Error) -> String {
+pub(crate) fn trap_reason(err: &wasmtime::Error, panic_message: Option<&str>) -> String {
     // wasmtime's alternate Display is the demangled backtrace; we mine symbol names from it.
     let full = format!("{err:#}");
 
@@ -44,10 +41,15 @@ pub(crate) fn trap_reason(err: &wasmtime::Error) -> String {
     // panic while keeping the trap's own wording (e.g. "wasm `unreachable` instruction
     // executed", "out of bounds memory access").
     let panicked = full.contains("rust_begin_unwind") || full.contains("panic_fmt");
-    let kind = if panicked {
-        format!("guest panicked — {trap}")
-    } else {
-        trap.to_string()
+    let kind = match (panicked, panic_message) {
+        // The usual case: a Rust panic that reported its message before trapping.
+        (true, Some(message)) => format!("guest panicked: {message} — {trap}"),
+        (true, None) => format!("guest panicked — {trap}"),
+        // A reported message followed by a different trap (e.g. a bounds fault while
+        // unwinding-free panicking is impossible, but a hostile guest could do this):
+        // still surface what it said, clearly labelled.
+        (false, Some(message)) => format!("{trap} (guest reported: {message})"),
+        (false, None) => trap.to_string(),
     };
 
     let mut chain: Vec<String> = Vec::new();

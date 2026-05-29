@@ -13,6 +13,14 @@
 //!
 //! Both are defined only when compiling for wasm32 so that host-side tooling
 //! (rust-analyzer, doc builds) never collides with `std`'s own definitions.
+//!
+//! Before trapping, the panic handler reports the panic message and source location
+//! through `eo9:rt/diagnostics.report-panic` — the executor's write-once diagnostics
+//! sink for the trap path (see wit/rt/rt.wit and plan/07 Decision 12). Because the call
+//! sits in the panic handler, every component built with this SDK carries the
+//! `eo9:rt/diagnostics` import; it is part of the runtime contract (like the allocator),
+//! carries no authority, and is always admitted by `only` (see
+//! `eo9-component::restrict`).
 
 #[cfg(target_arch = "wasm32")]
 #[global_allocator]
@@ -20,6 +28,23 @@ static ALLOCATOR: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
 
 #[cfg(target_arch = "wasm32")]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    // Re-entrancy guard: if formatting or reporting the message itself panics (e.g. the
+    // allocator fails), skip straight to the trap instead of recursing.
+    static REPORTING: AtomicBool = AtomicBool::new(false);
+    if !REPORTING.swap(true, Ordering::Relaxed) {
+        let message = match info.location() {
+            Some(location) => alloc::format!(
+                "{} at {}:{}",
+                info.message(),
+                location.file(),
+                location.line()
+            ),
+            None => alloc::format!("{}", info.message()),
+        };
+        crate::bindings::eo9::rt::diagnostics::report_panic(&message);
+    }
     core::arch::wasm32::unreachable()
 }

@@ -225,6 +225,34 @@ pub(crate) struct TaskState {
     pub(crate) providers: Providers,
     pub(crate) buffers: BufferTable,
     limits: StoreLimits,
+    /// The task's `eo9:rt/diagnostics` slot: the panic message the guest reported just
+    /// before trapping, if any. Write-once, bounded, shared with the [`Task`] so the trap
+    /// rendering can read it after the store has been consumed by the drive future.
+    pub(crate) panic_message: Arc<Mutex<Option<String>>>,
+}
+
+/// Ceiling on a reported panic message (bytes); anything longer is truncated on a char
+/// boundary. Diagnostics must never become a way to make the host hold unbounded data.
+const MAX_PANIC_MESSAGE_BYTES: usize = 1024;
+
+impl TaskState {
+    /// Record the guest's reported panic message (write-once: the first report wins).
+    pub(crate) fn report_panic(&self, message: String) {
+        let mut slot = self.panic_message.lock().unwrap();
+        if slot.is_some() {
+            return;
+        }
+        let mut message = message;
+        if message.len() > MAX_PANIC_MESSAGE_BYTES {
+            let mut end = MAX_PANIC_MESSAGE_BYTES;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+            message.push('…');
+        }
+        *slot = Some(message);
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -379,6 +407,9 @@ pub struct Task {
     /// True when the last resume returned [`ResumeOutcome::Blocked`] and the doorbell has
     /// not rung since.
     parked: bool,
+    /// The guest-reported panic message (see [`TaskState::report_panic`]); read when a
+    /// trap is rendered into the outcome.
+    panic_message: Arc<Mutex<Option<String>>>,
 }
 
 impl std::fmt::Debug for Task {
@@ -415,10 +446,12 @@ impl Task {
         link::add_providers(&mut linker, &providers)
             .map_err(|err| SpawnError::Internal(format!("provider wiring failed: {err:#}")))?;
 
+        let panic_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let state = TaskState {
             providers,
             buffers: BufferTable::default(),
             limits: StoreLimits::new(&limits),
+            panic_message: panic_message.clone(),
         };
         let mut store = Store::new(&engine, state);
         store.limiter(|state| &mut state.limits);
@@ -484,6 +517,7 @@ impl Task {
         // to `main`, and parks the result (value or trap) in the shared cell.
         let main_result: MainResultCell = Arc::new(Mutex::new(None));
         let cell = main_result.clone();
+        let panic_slot = panic_message.clone();
         let drive = Box::pin(async move {
             let mut store = store;
             store
@@ -492,7 +526,10 @@ impl Task {
                     let call = main.call_concurrent(accessor, &params, &mut results).await;
                     let stored = match call {
                         Ok(()) => Ok(results.into_iter().next().unwrap_or(Val::Bool(false))),
-                        Err(err) => Err(crate::trap::trap_reason(&err)),
+                        Err(err) => Err(crate::trap::trap_reason(
+                            &err,
+                            panic_slot.lock().unwrap().as_deref(),
+                        )),
                     };
                     *cell.lock().unwrap() = Some(stored);
                 })
@@ -508,6 +545,7 @@ impl Task {
             carried_fuel: 0,
             children,
             parked: false,
+            panic_message,
         })
     }
 
@@ -588,7 +626,10 @@ impl Task {
                 }),
             },
             (Some(Err(trap)), _) => Outcome::Trapped(trap),
-            (None, Err(err)) => Outcome::Trapped(crate::trap::trap_reason(&err)),
+            (None, Err(err)) => Outcome::Trapped(crate::trap::trap_reason(
+                &err,
+                self.panic_message.lock().unwrap().as_deref(),
+            )),
             (None, Ok(())) => {
                 Outcome::Trapped("task event loop finished without a `main` result".to_string())
             }

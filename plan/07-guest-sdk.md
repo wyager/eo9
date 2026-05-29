@@ -183,3 +183,17 @@ example programs used by every other area's tests.
     (c) keep the status quo: the cleaned, message-less backtrace from D11's done-now half.
     Nothing implemented for this item this wave (the other two WIT follow-ups — exec `wiring`, eosh
     `program-failure` classes — landed); GAPS keeps the panic-message line open citing this decision.
+13. **Panic messages reach `trapped(reason)` via the write-once `report-panic` import (2026-05-28;
+    implements option (a) of D12, owner-approved).** The SDK panic handler now formats
+    "<message> at <file>:<line>" from `PanicInfo` (re-entrancy-guarded so a panic while reporting skips
+    straight to the trap) and calls `eo9:rt/diagnostics.report-panic` before executing `unreachable`. The
+    usermode executor keeps a per-task write-once slot (truncated at 1 KiB) and the trap renderer folds it
+    into the cleaned reason: `abnormal(trapped("guest panicked: <message> at <file:line> — wasm
+    \`unreachable\` …; guest backtrace: …"))`; the kernel mirrors the same slot on `KernelState` and
+    prefixes its `trapped` text the same way. Capability posture: this is a diagnostics sink, not an output
+    channel — write-once per task, never readable by any guest, surfaced only on the trap path; calling it
+    and not trapping has no observable effect, and `only` always admits it (it is part of the runtime
+    contract, like the allocator). Every SDK-built component now imports `eo9:rt/diagnostics`; the D11
+    "cleaned backtrace" rendering is unchanged underneath. Remaining: the browser blob must register the
+    import before the next `/vm` asset rebuild (plan/02 D19), and the kernel's headless `program=` runner
+    still prints the raw trap text (its interactive shellexec path carries the message).

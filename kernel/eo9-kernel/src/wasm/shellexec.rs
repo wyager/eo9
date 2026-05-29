@@ -923,7 +923,12 @@ fn spawn_child(
             {
                 KOutcome::Killed
             }
-            Err(err) => KOutcome::Trapped(format!("{err:?}")),
+            Err(err) => KOutcome::Trapped(match store.data().panic_message.as_deref() {
+                // The guest reported its panic message through eo9:rt/diagnostics just
+                // before trapping — put it in front of the raw trap text.
+                Some(message) => format!("guest panicked: {message} — {err:?}"),
+                None => format!("{err:?}"),
+            }),
         }
     });
 

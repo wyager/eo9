@@ -1,0 +1,25 @@
+/// eo9:rt — runtime diagnostics shared by every Eo9 guest.
+///
+/// This package is part of the runtime contract between the guest SDK and the executor,
+/// not an OS capability: it grants no authority, has no root-handle resource, no
+/// configuration, and no provider stubs. The capability APIs live in the other `eo9:*`
+/// packages.
+package eo9:rt@0.1.0;
+
+/// A write-once diagnostics sink for the trap path.
+///
+/// The guest SDK's panic handler calls `report-panic` with the panic message and source
+/// location immediately before it lowers the panic to a wasm `unreachable` trap. The
+/// executor stores at most one bounded message per task and surfaces it in exactly one
+/// place: the `abnormal(trapped(reason))` outcome of a task that subsequently traps. It
+/// is never readable by any guest and is discarded if the task does not trap, so it is
+/// not usable as an output channel — which is why every program may import it without
+/// it counting against an `only` allow-list (see SPEC "Capability subsets…": restriction
+/// governs authority, and this interface carries none).
+interface diagnostics {
+    /// Record the calling task's panic message ("<message> at <file>:<line>").
+    ///
+    /// Write-once: the first call wins, later calls are ignored. The executor truncates
+    /// over-long messages. Calling this and then not trapping has no observable effect.
+    report-panic: func(message: string);
+}
