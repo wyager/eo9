@@ -739,3 +739,28 @@ browser; verify-eosh drives `env` (asserting the granted/receive sections) and n
 `describe entropy.seeded` shows the provider's configure argument. The try-it page's "Explore the sandbox"
 copy can now add an `env` line — a one-line follow-up deliberately not made here (the page was left
 untouched in this change).
+
+## Decision 33 — try-it terminal polish: full-width terminal, type on the prompt line (2026-05-29, owner feedback)
+
+Three owner fixes to the /vm page, all presentation-side (no blob or fingerprinted-asset changes):
+
+- **The terminal breaks out of the prose column.** The shell's own output (`help`, `env`, `describe`) is
+  laid out for ~100 monospace columns, but `#vm-output` inherited `main`'s 44rem prose width (~77 columns
+  at 0.85rem), so help lines wrapped. The terminal now sizes itself to `min(58rem, 100vw - 2.5rem)` and
+  centers itself in the viewport with a negative-margin breakout (`margin-left: calc((100% - W) / 2)`),
+  giving ~109 columns on desktop while collapsing to exactly the old gutters on narrow screens; long lines
+  still `pre-wrap` rather than scroll sideways. Verified in headless Chrome at 1280px: the longest help
+  line (100 chars, the `env <expr>` row) renders as a single client rect, 20px tall.
+- **Typed input renders on the prompt line itself.** `armReadLine` previously opened a *new* line starting
+  with a green `> `, which read as a duplicate prompt under the shell's own `eosh>` line. The live input
+  (text span + block cursor) is now appended to the last line the shell printed — the prompt line — and the
+  finished command freezes there, so the transcript reads `eosh> hello` exactly like a real terminal. No
+  `> ` marker is rendered anywhere anymore (verified: zero such lines after `help` and a run).
+- **Copy**: the "there is no separate input box" sentence is gone — typing into the terminal is
+  self-evident; the note now only says `exit` ends the session and reload gives a fresh one.
+
+Verification: node/JSPI verify-eosh (unchanged blob) still passes; www workspace tests green; check-web-vm
+still ok (only vm.css/vm.js/index.html and their precompressed siblings changed); headless-Chrome CDP run
+with real key events confirms the width, the absence of stray `> ` lines, `eosh> hello` rendering on one
+line while typing (cursor on the same line), and the bare `hello` command running to `ok: greeted`.
+The "Explore the sandbox" `env` line from D32 remains the deliberate follow-up.
