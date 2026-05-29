@@ -1105,3 +1105,47 @@ preemption/hardening work.
     driver, a FLUSH-on-commit story for durability against host crashes, virtio-net as the sibling driver
     feeding the `eo9:net` l2 layer, and store-on-disk so the artifact cache itself can live on the virtio
     device.
+
+51. **x86_64 port, milestones 1–2: PVH boot + serial + heap, timer + interrupt delivery + event-driven idle
+    on QEMU `q35` (2026-05-29, branch `area/12-x86-64`).** The third architecture follows the same ladder as
+    riscv64 (D45), reusing the D44 arch split unchanged — the shared core, heap, and wasm layers needed no
+    edits. `cargo xtask build-kernel x86_64` builds the feature-less image for `x86_64-unknown-none` (linked
+    at 2 MiB, `linker-x86_64.ld`) and `cargo xtask qemu x86_64` boots it under
+    `qemu-system-x86_64 -M q35 -no-reboot -nographic`.
+    - **Boot path: PVH direct boot, not Multiboot.** QEMU's `-kernel` only loads 32-bit Multiboot ELFs, so
+      the image instead carries the `XEN_ELFNOTE_PHYS32_ENTRY` note (in a PT_NOTE segment the linker script
+      declares explicitly): QEMU jumps to the 32-bit `pvh_start` stub with paging off and `%ebx` pointing at
+      the `hvm_start_info`. The stub loads its own GDT, points CR3 at a statically assembled 0..4 GiB
+      identity map (2 MiB pages), enables PAE + EFER.LME + paging, far-returns into 64-bit code, zeroes
+      `.bss`, installs the IDT, and hands the PVH command line to `kmain`. The command line is a plain
+      NUL-terminated string rather than a DTB, so `fdt::bootargs` gained a final, magic-checked C-string
+      fallback (unreachable on the device-tree architectures).
+    - **Per-arch surface** (`src/arch/x86_64/`): COM1 16550 over port I/O with the same interrupt-filled RX
+      ring as the other ports; the TSC (PIT-calibrated once at boot, ~1.0 GHz under TCG) as the monotonic
+      counter; PIT channel-0 one-shots as the wake timer (a single shot caps at ~54.9 ms — longer waits wake
+      early and re-arm, which the executor treats as a spurious wake; the LAPIC one-shot timer is the
+      recorded upgrade); the legacy 8259 PIC remapped to vectors 0x20..0x2F with only IRQ 0 (PIT) and IRQ 4
+      (COM1) unmasked — materially simpler than LAPIC+IOAPIC for two lines, with that as the recorded
+      upgrade path; the CMOS RTC for the wall clock; ACPI S5 via the q35 PM register (port 0x604) for a
+      scriptable power-off; `sti; hlt` as the lost-wakeup-free idle step. CPU exceptions dump
+      vector/error/RIP (+CR2 for page faults) and park; the IDT is installed by the boot path so even
+      pre-`interrupts_init` faults are loud rather than silent triple-fault exits.
+    - **Two x86-only build quirks**, both documented in the new `kernel/.cargo/config.toml` and the linker
+      script: `x86_64-unknown-none` defaults to position-independent code, so the kernel builds with
+      `-C relocation-model=static` (matching what the other bare-metal targets already default to); and the
+      PIC-compiled prebuilt core/alloc reach `memcpy` and friends through a GOT, which must be placed
+      explicitly in the image — left as an orphan section it lands after `__heap_start` and the heap
+      allocator clobbers it (the silent-power-off failure mode that cost the bring-up an evening).
+    - **Verified** (`cargo xtask qemu x86_64`): banner with calibrated TSC frequency and correct CMOS wall
+      clock, 509 MiB heap + self-test, 10 ms PIT condition polled, "timer interrupt delivered through the
+      trap path after ~15 ms" (IDT + PIC + PIT end to end), `cmdline:` echoed from `-append` via the PVH
+      string, clean ACPI S5 power-off (QEMU exits 0). aarch64 and riscv64 demo runs are byte-for-byte
+      unaffected; `cargo xtask ci` now builds and clippy-checks the feature-less kernel for all three
+      bare-metal targets. W^X stays deferred exactly as riscv64's was pre-Sv39: the boot map is 2 MiB RWX
+      pages without NXE, and the codegen milestone replaces it with 4 KiB tables + NX. Milestone 3 (host-AOT
+      components) needs the precompile pipeline pointed at `x86_64-unknown-none` (cranelift's x86_64 backend
+      is the host backend, so no extra feature), the kernel's wasm features built for the target — the
+      target disables SSE while Cranelift-generated code uses it, so the wasm milestones likely need a
+      custom target spec or `-C target-feature=+sse,+sse2` plus FP state handling in the trap entry — and
+      the UART RX ring consumed by the executor (wired but consumer-less today, as on riscv64 at this
+      stage).
