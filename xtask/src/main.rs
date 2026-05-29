@@ -113,11 +113,14 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // virtio disk (boot with the `pci` grant and the xtask `disk` flag).
     ("eo9-stub-disk-virtio", "disk.virtio"),
     ("eo9-stub-fs-eofs", "fs.eofs"),
-    // The network stack for real hardware: the virtio-net driver and its link-layer
-    // check, so the metal shell can compose `net.virtio $ l2check` against a QEMU
-    // user-mode NIC (boot with the `pci` grant and the xtask `net` flag).
+    // The network stack for real hardware: the virtio-net driver, its link-layer
+    // check, the TCP/IP middleware, and its transport-layer check, so the metal shell
+    // can compose `net.virtio $ l2check` and `net.virtio $ net.l4.over-l2 $ l4check`
+    // against a QEMU user-mode NIC (boot with the `pci` grant and the xtask `net` flag).
     ("eo9-stub-net-virtio", "net.virtio"),
     ("eo9-example-l2check", "l2check"),
+    ("eo9-stub-net-l4-over-l2", "net.l4.over-l2"),
+    ("eo9-example-l4check", "l4check"),
     // Basic coreutils, so the metal shell can inspect its own (read-only) filesystem:
     // `ls /bin`, `cat /session`, `wc`, `head`, `stat`.
     ("eo9-coreutil-ls", "ls"),
