@@ -210,6 +210,9 @@ interface l4 {
         connection-reset,
         timed-out,
         address-in-use,
+        /// The local address requested from `listen`/`bind-udp` is not one the
+        /// provider can bind (e.g. a non-loopback address on `net.l4.loopback`).
+        address-unavailable,
         not-connected,
         message-too-large,
         io(string),
