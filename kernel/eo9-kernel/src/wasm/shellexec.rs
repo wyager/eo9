@@ -1318,6 +1318,34 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
     )?;
 
     algebra.func_wrap(
+        "wiring",
+        |mut store: StoreContextMut<'_, KernelState>,
+         (component,): (Resource<AlgComponentRes>,)|
+         -> Result<(String,)> {
+            // The kernel's algebra stores results as fused bytes (no in-memory
+            // provenance survives `alg_binary_op`'s save), so the wiring view here is
+            // always the single leaf the loader reconstructs from the bytes. Keeping the
+            // in-memory `eo9_component::Component` values across operations (and with
+            // them the full tree) is the recorded follow-up in plan/02.
+            let kc = store.data_mut().shell_exec()?.component(component.rep())?;
+            #[cfg(feature = "wasm-codegen")]
+            {
+                let loaded = eo9_component::Component::load(kc.bytes.clone()).map_err(|err| {
+                    wasmtime::Error::msg(format!("failed to load component: {err}"))
+                })?;
+                Ok((loaded.wiring_tree(),))
+            }
+            #[cfg(not(feature = "wasm-codegen"))]
+            {
+                let _ = kc;
+                Ok((String::from(
+                    "(wiring unavailable: this kernel build has no component loader)",
+                ),))
+            }
+        },
+    )?;
+
+    algebra.func_wrap(
         "compose",
         |mut store: StoreContextMut<'_, KernelState>,
          (provider, consumer): (Resource<AlgComponentRes>, Resource<AlgComponentRes>)|

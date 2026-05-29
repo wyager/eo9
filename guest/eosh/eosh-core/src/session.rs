@@ -214,6 +214,16 @@ impl<B: Backend> Session<B> {
         for line in lines {
             self.backend.print(&line);
         }
+        if !imports_only {
+            // The composition tree: how the expression was wired together (each provider
+            // layer, what it satisfies or seals). `describe` of the residual surface
+            // alone cannot show interposed attenuators; the wiring view does.
+            let wiring = self.backend.wiring(&component);
+            self.backend.print("wiring:");
+            for line in wiring.lines() {
+                self.backend.print(&format!("  {line}"));
+            }
+        }
         LineResult::Ok
     }
 
@@ -499,6 +509,13 @@ mod tests {
         assert_eq!(run(&mut session, "describe memfs"), LineResult::Ok);
         assert!(session.backend.out.iter().any(|l| l == "kind: provider"));
         assert!(session.backend.out.iter().any(|l| l.contains("eo9:fs/fs")));
+        // The full describe view ends with the composition tree (a single leaf here).
+        assert!(session.backend.out.iter().any(|l| l == "wiring:"));
+        assert!(
+            session.backend.out.iter().any(|l| l == "  c1 [provider]"),
+            "out: {:?}",
+            session.backend.out
+        );
         assert!(
             !session
                 .backend
@@ -509,6 +526,7 @@ mod tests {
 
         session.backend.out.clear();
         assert_eq!(run(&mut session, "imports memfs"), LineResult::Ok);
+        // The imports-only view stays exactly the import list (no wiring section).
         assert_eq!(session.backend.out, vec!["imports: (none)"]);
     }
 

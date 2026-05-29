@@ -145,6 +145,12 @@ pub trait Backend {
     /// Kind, imports, exports, and argument signature.
     fn describe(&mut self, component: &Self::Component) -> ComponentInfo;
 
+    /// The composition tree of how the component was built, rendered as an indented
+    /// tree (one node per line). Provenance is recorded by the algebra operations in
+    /// this session and is not carried in component bytes, so a freshly resolved
+    /// program renders as a single leaf.
+    fn wiring(&mut self, component: &Self::Component) -> String;
+
     /// `$` — satisfy `consumer`'s imports from `provider`'s matching exports.
     fn compose(
         &mut self,

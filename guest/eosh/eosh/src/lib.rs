@@ -264,6 +264,10 @@ impl Backend for WitBackend {
         info_from_wit(component_algebra::describe(component))
     }
 
+    fn wiring(&mut self, component: &Self::Component) -> String {
+        component_algebra::wiring(component)
+    }
+
     fn compose(
         &mut self,
         provider: Self::Component,

@@ -681,8 +681,29 @@ fn shell_describe_builtin_inspects_without_running() {
     assert!(run.stdout.contains("kind: binary"), "{}", run.stdout);
     assert!(run.stdout.contains("--name: string"), "{}", run.stdout);
     assert!(run.stdout.contains("eo9:text/text"), "{}", run.stdout);
+    // A plain reference is a single wiring leaf.
+    assert!(run.stdout.contains("wiring:"), "{}", run.stdout);
     // Describing does not run the program.
     assert!(!run.stdout.contains("Hello"), "{}", run.stdout);
+}
+
+#[test]
+fn shell_describe_builtin_shows_the_composition_tree() {
+    // `describe` of an expression eosh composed shows the wiring tree (the eosh-side
+    // counterpart of `eo9 describe --wiring`): the `$` node with its provider and
+    // consumer leaves, fetched through `eo9:exec`'s `wiring`.
+    let store = temp_store("shell-describe-wiring");
+    let run = eo9(
+        &store,
+        &["shell", "-c", "describe entropy.seeded $ cruncher"],
+    );
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(run.stdout.contains("wiring:"), "{}", run.stdout);
+    assert!(run.stdout.contains("$ compose"), "{}", run.stdout);
+    assert!(run.stdout.contains("provider:"), "{}", run.stdout);
+    assert!(run.stdout.contains("consumer:"), "{}", run.stdout);
+    // Describing does not compile or run the composition.
+    assert!(!run.stdout.contains("digest("), "{}", run.stdout);
 }
 
 #[test]
