@@ -54,18 +54,33 @@ pub fn embedded(stem: &str) -> Option<&'static [u8]> {
         .map(|(_, bytes)| *bytes)
 }
 
+/// APIs whose own name contains a dash (the layered net family). For their stubs the
+/// dash inside the API name converts to a dot as well, so `eo9-stub-net-l4-loopback`
+/// seeds as `net.l4.loopback` — the spelling SPEC and the plans use — rather than
+/// `net.l4-loopback`.
+const DASHED_APIS: &[&str] = &["net-l2", "net-l3", "net-l4"];
+
 /// The shell name a built component file answers to: `eo9-example-hello` → `hello`,
-/// `eo9-coreutil-cat` → `cat`, `eo9-stub-time-frozen` → `time.frozen`, anything else
-/// (`eosh`) verbatim. `None` when the result would not be a valid dotted name.
+/// `eo9-coreutil-cat` → `cat`, `eo9-stub-time-frozen` → `time.frozen`,
+/// `eo9-stub-net-l4-loopback` → `net.l4.loopback`, anything else (`eosh`) verbatim.
+/// `None` when the result would not be a valid dotted name.
 pub fn shell_name_for(stem: &str) -> Option<String> {
     let name = if let Some(example) = stem.strip_prefix("eo9-example-") {
         example.to_string()
     } else if let Some(coreutil) = stem.strip_prefix("eo9-coreutil-") {
         coreutil.to_string()
     } else if let Some(stub) = stem.strip_prefix("eo9-stub-") {
-        match stub.split_once('-') {
-            Some((api, flavor)) => format!("{api}.{flavor}"),
-            None => stub.to_string(),
+        if let Some(api) = DASHED_APIS.iter().find(|api| {
+            stub.strip_prefix(**api)
+                .is_some_and(|rest| rest.starts_with('-'))
+        }) {
+            let flavor = &stub[api.len() + 1..];
+            format!("{}.{flavor}", api.replace('-', "."))
+        } else {
+            match stub.split_once('-') {
+                Some((api, flavor)) => format!("{api}.{flavor}"),
+                None => stub.to_string(),
+            }
         }
     } else {
         stem.to_string()
@@ -411,6 +426,19 @@ mod tests {
         assert_eq!(
             shell_name_for("eo9-stub-time-monotonic-stub").as_deref(),
             Some("time.monotonic-stub")
+        );
+        // Layered net stubs: the dash inside the API name becomes a dot too.
+        assert_eq!(
+            shell_name_for("eo9-stub-net-l4-loopback").as_deref(),
+            Some("net.l4.loopback")
+        );
+        assert_eq!(
+            shell_name_for("eo9-stub-net-l2-none").as_deref(),
+            Some("net.l2.none")
+        );
+        assert_eq!(
+            shell_name_for("eo9-stub-net-l3-deny").as_deref(),
+            Some("net.l3.deny")
         );
         assert_eq!(shell_name_for("eosh").as_deref(), Some("eosh"));
         // Something that cannot be a dotted name is skipped rather than mis-bound.
