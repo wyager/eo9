@@ -1333,9 +1333,9 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
 /// x86_64 (QEMU `q35`, PVH direct boot): the same host-AOT precompile pipeline as the other
 /// ports — the seed canary, the real hello program, the async pair, and the read-only store
 /// image — targeted at `x86_64-unknown-none`, then a kernel build with the wasm feature set
-/// minus on-target codegen (`wasm-seed,wasm-hello,wasm-async,wasm-store`): `$`/`&` refuses
-/// with the documented no-codegen message until milestone 5 brings 4 KiB W^X tables and the
-/// compiler, exactly as riscv64 did at this stage.
+/// with the full feature set (`wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen`):
+/// since milestone 5 (4 KiB W^X tables + the on-target compiler) the x86_64 shell composes
+/// and compiles `$`/`&` on the machine itself, exactly like the other two ports.
 ///
 /// Emitting x86_64 machine code needs that Cranelift backend in the host build; on an
 /// x86_64 host it is the host backend, but on this project's aarch64 development machines it
@@ -1429,6 +1429,15 @@ fn build_kernel_x86_64(root: &Path) -> Result<PathBuf, String> {
     // The read-only store image (the same component list as aarch64), AOT'd for x86_64.
     let store_image = build_store_image(root, KERNEL_X86_64_TARGET)?;
 
+    // The same seed component as *raw* (un-precompiled) wasm bytes, for the on-target
+    // codegen demo: the kernel compiles this with its own Cranelift (wasm-codegen) rather
+    // than deserializing a host-produced artifact.
+    let seed_wasm_path = kernel_precompiled_dir(root, KERNEL_X86_64_TARGET).join("seed.wasm");
+    std::fs::create_dir_all(seed_wasm_path.parent().unwrap())
+        .map_err(|err| format!("failed to create precompiled dir: {err}"))?;
+    std::fs::write(&seed_wasm_path, &seed_wasm)
+        .map_err(|err| format!("failed to write {}: {err}", seed_wasm_path.display()))?;
+
     run_with_env(
         &kernel_dir,
         "cargo",
@@ -1440,10 +1449,11 @@ fn build_kernel_x86_64(root: &Path) -> Result<PathBuf, String> {
             "--target",
             KERNEL_X86_64_TARGET,
             "--features",
-            "wasm-seed,wasm-hello,wasm-async,wasm-store",
+            "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen",
         ],
         &[
             ("EO9_SEED_CWASM", seed.as_os_str()),
+            ("EO9_SEED_WASM", seed_wasm_path.as_os_str()),
             ("EO9_HELLO_CWASM", hello.as_os_str()),
             ("EO9_SLEEPY_CWASM", sleepy.as_os_str()),
             ("EO9_ENTROPY_SEEDED_CWASM", entropy.as_os_str()),

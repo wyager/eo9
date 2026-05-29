@@ -93,6 +93,21 @@ pub fn new_engine() -> Result<Engine, wasmtime::Error> {
         config.x86_float_abi_ok(true);
         config.detect_host_feature(x86_detect_host_feature);
     }
+    // With the on-target compiler linked in, the engine's own ISA flags must mirror the
+    // precompile set (xtask's `precompile_for_kernel`): SSE3..SSE4.2 enabled, so code the
+    // kernel compiles on-target also emits float ceil/floor/trunc/nearest inline rather
+    // than as float libcalls (the `x86_float_abi_ok` safe condition above), and so the
+    // engine's flags agree with every embedded artifact's recorded flags. The CPUID probe
+    // installed above still verifies the CPU actually has them at load time.
+    #[cfg(all(target_arch = "x86_64", feature = "wasm-codegen"))]
+    // SAFETY: enabling ISA flags only changes which instructions may be emitted; the CPUID
+    // probe refuses to run anything the CPU does not support.
+    unsafe {
+        config.cranelift_flag_enable("has_sse3");
+        config.cranelift_flag_enable("has_ssse3");
+        config.cranelift_flag_enable("has_sse41");
+        config.cranelift_flag_enable("has_sse42");
+    }
     config.wasm_component_model(true);
     // The component-model async ABI plus the two sub-features the eo9 guest SDK relies on
     // (stackful async lifts and the extra async built-ins behind waitable-set waits).
