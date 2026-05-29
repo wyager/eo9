@@ -819,10 +819,7 @@ fn configure_spills_wide_parameter_lists_to_memory() {
             ("nums".to_string(), "[10, 20, 30]".to_string()),
         ])
         .collect();
-    let args: Vec<(&str, &str)> = args
-        .iter()
-        .map(|(n, v)| (n.as_str(), v.as_str()))
-        .collect();
+    let args: Vec<(&str, &str)> = args.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
 
     let once = configure(&kit("provider-f"), &args).unwrap();
     let twice = configure(&kit("provider-f"), &args).unwrap();

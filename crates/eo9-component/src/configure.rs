@@ -967,7 +967,11 @@ impl Lowerer<'_> {
         let align = self.sizes.align(element).align_wasm32();
         let base = self.reserve(size * elements.len(), align, "a list constant")?;
         for (index, element_value) in elements.iter().enumerate() {
-            self.store(element_value.as_ref(), element, base + (index * size) as u32)?;
+            self.store(
+                element_value.as_ref(),
+                element,
+                base + (index * size) as u32,
+            )?;
         }
         Ok((base, elements.len() as u32))
     }
