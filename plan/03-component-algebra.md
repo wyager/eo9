@@ -262,3 +262,27 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     with byte-identical content and an equal component). It is in-memory: a component loaded from the store is
     a `Leaf` (its history was never in its bytes); the full tree appears only for compositions built
     in-process (the CLI `describe --wiring` builds one — see plan/11).
+
+20. **Compound configuration values bake at compose time (owner approval 2026-05-29; lifts the "scalars,
+    strings, and enums only" half of the D11/D13 limitation).** `configure` now accepts — nested arbitrarily —
+    records, tuples, `option<…>`, and `list<…>` over the previously supported leaves (scalars, `char`,
+    `string`, enums). The WAVE text is parsed against the declared parameter type as before; lowering then
+    builds a *constant arena* alongside the flat constants: string bytes, list elements, and nested
+    aggregates are laid out in their canonical-ABI memory representation at compose time (little-endian,
+    `SizeAlign` offsets/strides, internal pointers kept arena-relative and rebased to absolute addresses when
+    the binder's memory layout is fixed), the arena becomes the binder's data segment, and the gate passes
+    pointers into it. Parameter lists too wide to pass flat (more than sixteen flat values) are no longer
+    rejected: all parameters are spilled to one canonically-laid-out parameter record in the arena and the
+    gate passes its address, exactly as the canonical ABI's indirect-parameter convention expects. Still not
+    bakeable (clear typed refusal): variants, results, flags, maps, fixed-length lists, and anything carrying
+    a handle/resource — variant-shaped values need discriminant-dependent flat joining that nothing yet
+    requires. Existing scalar/string/enum configurations produce byte-identical artifacts (checked against
+    the previous lowering for `entropy.seeded` and `time.frozen` during development), and the same arguments
+    remain byte-deterministic (unit + integration tests). End-to-end proof: the `eo9-tests:compound` fixture
+    provider (tests/eo9-integration, hand-written core) folds a `list<u32>`, a `list<record{u32, string}>`, a
+    `string`, an `option<u32>`, and an enum into an order-sensitive checksum at `configure` time, and the
+    composed consumer observes exactly the checksum computed host-side from the same arguments — including
+    the empty-list/`none` case (`compound_config.rs`, 4 tests). The wide/spilled path is exercised at
+    encode+validate level (`provider-f` unit fixture); nothing runnable needs it yet. The other half of the
+    D13 limitation — config interfaces on providers whose API interfaces own resources (fs, disk, net, pci) —
+    is unchanged and tracked separately (see Decision 21).

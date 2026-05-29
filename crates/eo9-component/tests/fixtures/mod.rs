@@ -101,6 +101,53 @@ world provider-none-a {
     export cap-a-optional;
 }
 
+/// Compound-typed configuration: records, lists, options, and tuples baked at
+/// compose time.
+interface cap-d-config {
+    record probe { offset: u32, label: string }
+    enum mode { fast, careful }
+    configure: func(
+        thresholds: list<u32>,
+        probes: list<probe>,
+        title: string,
+        scale: option<u32>,
+        mode: mode,
+        pair: tuple<u16, bool>,
+    ) -> result<_, string>;
+}
+
+/// A config interface with a parameter compose-time baking cannot handle (a variant).
+interface cap-e-config {
+    variant tweak { plain, scaled(u32) }
+    configure: func(t: tweak) -> result<_, string>;
+}
+
+/// A config interface wide enough that its parameters are passed indirectly.
+interface cap-f-config {
+    configure: func(
+        a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64, i: u64,
+        j: u64, k: u64, l: u64, m: u64, text: string, nums: list<u32>,
+    ) -> result<_, string>;
+}
+
+/// A configurable provider of cap-b with compound configuration.
+world provider-d {
+    export cap-b;
+    export cap-d-config;
+}
+
+/// A configurable provider whose configuration cannot be baked at compose time.
+world provider-e {
+    export cap-b;
+    export cap-e-config;
+}
+
+/// A configurable provider whose configuration parameters spill to memory.
+world provider-f {
+    export cap-b;
+    export cap-f-config;
+}
+
 /// The empty provider: the identity of the algebra.
 world empty {
 }

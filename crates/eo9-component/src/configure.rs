@@ -6,7 +6,10 @@
 //! `configure(provider, args)` bakes the given constants in:
 //!
 //! * the WAVE-encoded `args` are type-checked against `configure`'s declared parameters
-//!   and lowered to canonical-ABI constants;
+//!   and lowered to canonical-ABI constants -- scalars, `char`, `string`, enums, and
+//!   (nested arbitrarily) records, tuples, options, and lists of these. Strings, list
+//!   bodies, and spilled parameter records are laid out at compose time in a constant
+//!   arena that becomes the binder's data segment;
 //! * a small *binder* component is synthesized that imports the provider's config
 //!   interface **and** its API interfaces, and re-exports the API interfaces with
 //!   forwarding shims: the first forwarded call first invokes the provider's `configure`
@@ -59,8 +62,8 @@ use wasm_wave::wasm::WasmValue;
 use wit_parser::abi::{AbiVariant, FlatTypes, WasmSignature, WasmType};
 use wit_parser::decoding::{DecodedWasm, decode};
 use wit_parser::{
-    Function, FunctionKind, Handle, InterfaceId, Mangling, Resolve, SizeAlign, Type, TypeDefKind,
-    TypeId, TypeOwner, WorldItem, WorldKey,
+    Function, FunctionKind, Handle, Int, InterfaceId, Mangling, Resolve, SizeAlign, Type,
+    TypeDefKind, TypeId, TypeOwner, WorldItem, WorldKey,
 };
 
 use crate::compose::{
@@ -96,9 +99,27 @@ enum FlatConst {
     I64(i64),
     F32(f32),
     F64(f64),
-    /// A string constant: stored in the binder's data segment, passed as (ptr, len).
-    Str(String),
+    /// A pointer into the constant arena (an arena-relative offset; rebased to an
+    /// absolute address once the binder's memory layout is fixed).
+    ArenaPtr(u32),
 }
+
+/// The lowered `configure` arguments: the flat constants pushed at the call site plus
+/// the constant arena holding every string, list, and spilled-parameter body they
+/// reference (canonical-ABI layout, little-endian, built at compose time).
+struct LoweredArguments {
+    /// The flat core constants, in canonical flattening order (or a single arena
+    /// pointer when the parameters are passed indirectly).
+    flats: Vec<FlatConst>,
+    /// The constant arena: emitted verbatim as the binder's data segment.
+    arena: Vec<u8>,
+    /// Offsets within `arena` holding arena-relative `u32` pointers that must be
+    /// rebased by the arena's absolute base address at layout time.
+    relocs: Vec<u32>,
+}
+
+/// Hard cap on the constant arena (a runaway WAVE literal should fail cleanly, not OOM).
+const ARENA_LIMIT: usize = 64 * 1024 * 1024;
 
 /// One memory load the binder performs to turn a canonically-stored value into a flat
 /// core value (used to re-read an async call's results for `task.return`).
@@ -181,7 +202,7 @@ struct BinderPlan {
     /// `configure`'s sync-lowered core signature.
     config_sig: WasmSignature,
     /// The baked-in arguments, in parameter order.
-    constants: Vec<FlatConst>,
+    constants: LoweredArguments,
     /// The forwarded API functions, in interface/declaration order.
     forwards: Vec<ForwardFunction>,
     /// The resource-drop intrinsics referenced by [`ForwardFunction::borrow_drops`].
@@ -265,20 +286,18 @@ where
     };
     let function = function.clone();
 
-    // Type-check the WAVE arguments against the declared parameters and lower them.
-    let constants = bind_arguments(&resolve, &function, args)?;
     // `configure` is a synchronous export (it binds compile-time constants and must not
     // block), so it is sync-lowered: a plain canonical call that may itself synchronously
     // reenter another configured provider's `configure`. (It used to be async-lowered to
     // dodge the "a sync task may not block on an async export" rule; that made nested
     // configured compositions untypable -- the bug-1 trap. See plan/03 D17 + SPEC.)
     let config_sig = resolve.wasm_signature(AbiVariant::GuestImport, &function);
-    if config_sig.indirect_params {
-        return Err(internal(
-            "`configure` takes too many (or too large) parameters for compose-time baking"
-                .to_string(),
-        ));
-    }
+
+    // Type-check the WAVE arguments against the declared parameters and lower them to
+    // canonical-ABI constants (flat values plus the constant arena). When the parameter
+    // list is too wide to pass flat, the arguments are spilled to a single
+    // canonically-laid-out parameter record in the arena instead.
+    let constants = bind_arguments(&resolve, &function, &config_sig, args)?;
 
     // The provider's API interfaces (everything exported with functions, other than the
     // config interface) are re-exported through gating forwarders.
@@ -524,7 +543,7 @@ fn plan_binder(
     config_extern: &str,
     config_sig: WasmSignature,
     config_function: &Function,
-    constants: Vec<FlatConst>,
+    constants: LoweredArguments,
     forward_interfaces: &[(String, InterfaceId)],
 ) -> Result<BinderPlan, String> {
     let mut sizes = SizeAlign::default();
@@ -669,13 +688,16 @@ fn plan_binder(
     })
 }
 
-/// Checks the supplied arguments against `configure`'s parameters and lowers each one to
-/// its canonical-ABI constant(s), in parameter order.
+/// Checks the supplied arguments against `configure`'s parameters and lowers them to
+/// their canonical-ABI constants, in parameter order: flat core values when the
+/// parameter list passes flat, or a single pointer to a canonically-laid-out parameter
+/// record in the constant arena when it is passed indirectly.
 fn bind_arguments<N, V>(
     resolve: &Resolve,
     function: &Function,
+    config_sig: &WasmSignature,
     args: &[(N, V)],
-) -> Result<Vec<FlatConst>, ConfigureError>
+) -> Result<LoweredArguments, ConfigureError>
 where
     N: AsRef<str>,
     V: AsRef<str>,
@@ -687,7 +709,9 @@ where
         }
     }
 
-    let mut constants = Vec::new();
+    // Parse every parameter's WAVE text against its declared type first, so type errors
+    // surface per argument before any lowering happens.
+    let mut values = Vec::new();
     for param in &function.params {
         let supplied: Vec<&str> = args
             .iter()
@@ -704,24 +728,105 @@ where
                 });
             }
         };
-        constants.push(lower_argument(resolve, &param.name, &param.ty, text)?);
+        values.push(parse_argument(resolve, &param.name, &param.ty, text)?);
     }
-    Ok(constants)
+
+    let mut sizes = SizeAlign::default();
+    sizes.fill(resolve);
+    let mut lowerer = Lowerer {
+        resolve,
+        sizes,
+        arena: Vec::new(),
+        relocs: Vec::new(),
+    };
+
+    let mut flats = Vec::new();
+    if config_sig.indirect_params {
+        // The parameters are passed indirectly: lay them out as one canonical parameter
+        // record in the arena and pass its address as the single flat value.
+        let param_types: Vec<Type> = function.params.iter().map(|p| p.ty).collect();
+        let offsets = lowerer.sizes.field_offsets(param_types.iter());
+        let info = lowerer.sizes.record(param_types.iter());
+        let base = lowerer
+            .reserve(
+                info.size.size_wasm32(),
+                info.align.align_wasm32(),
+                "the spilled parameter record",
+            )
+            .map_err(ConfigureError::Internal)?;
+        let offsets: Vec<u32> = offsets
+            .iter()
+            .map(|(offset, _)| offset.size_wasm32() as u32)
+            .collect();
+        for ((param, value), offset) in function.params.iter().zip(&values).zip(offsets) {
+            lowerer
+                .store(value, &param.ty, base + offset)
+                .map_err(|message| ConfigureError::InvalidArgument {
+                    name: param.name.clone(),
+                    message,
+                })?;
+        }
+        flats.push(FlatConst::ArenaPtr(base));
+    } else {
+        for (param, value) in function.params.iter().zip(&values) {
+            lowerer
+                .lower_flat(value, &param.ty, &mut flats)
+                .map_err(|message| ConfigureError::InvalidArgument {
+                    name: param.name.clone(),
+                    message,
+                })?;
+        }
+        // The flat constants must line up one-for-one with `configure`'s lowered core
+        // parameters (minus the appended return pointer, pushed by the gate itself).
+        let expected = config_sig.params.len() - usize::from(config_sig.retptr);
+        if flats.len() != expected {
+            return Err(ConfigureError::Internal(format!(
+                "lowered {} flat constants for `configure` but its core signature takes \
+                 {expected}; this is a bug in compose-time configuration",
+                flats.len()
+            )));
+        }
+    }
+
+    Ok(LoweredArguments {
+        flats,
+        arena: lowerer.arena,
+        relocs: lowerer.relocs,
+    })
 }
 
-/// Parses one WAVE value against its declared WIT type and lowers it to a constant.
-fn lower_argument(
+/// Parses one WAVE value against its declared WIT type (following aliases), checking
+/// first that the type is something compose-time configuration can bake.
+fn parse_argument(
     resolve: &Resolve,
     name: &str,
     ty: &Type,
     text: &str,
-) -> Result<FlatConst, ConfigureError> {
-    let invalid = |message: String| ConfigureError::InvalidArgument {
+) -> Result<Value, ConfigureError> {
+    let ty = resolve_alias(resolve, ty);
+    if let Err(what) = ensure_bakeable(resolve, &ty) {
+        return Err(ConfigureError::Internal(format!(
+            "parameter `{name}` has a type that compose-time configuration cannot bake in \
+             yet ({what}; supported: scalars, char, string, enums, records, tuples, \
+             options, and lists of these)"
+        )));
+    }
+    let wave_type = wave_type(resolve, &ty).ok_or_else(|| {
+        ConfigureError::Internal(format!(
+            "parameter `{name}`: failed to derive a WAVE type for compose-time baking"
+        ))
+    })?;
+    wasm_wave::from_str(&wave_type, text).map_err(|err| ConfigureError::InvalidArgument {
         name: name.to_string(),
-        message,
-    };
+        message: format!(
+            "does not parse as `{}`: {err}",
+            crate::describe::type_text(resolve, &ty)
+        ),
+    })
+}
 
-    // Follow type aliases down to the underlying type.
+/// Follows type aliases down to the underlying type.
+fn resolve_alias(resolve: &Resolve, ty: &Type) -> Type {
     let mut ty = *ty;
     while let Type::Id(id) = ty {
         match &resolve.types[id].kind {
@@ -729,48 +834,63 @@ fn lower_argument(
             _ => break,
         }
     }
+    ty
+}
 
-    let wave_type = wave_type(resolve, &ty).ok_or_else(|| {
-        ConfigureError::Internal(format!(
-            "parameter `{name}` has a type that compose-time configuration cannot bake in \
-             yet (only scalars, strings, and enums are supported)"
-        ))
-    })?;
-    let value: Value = wasm_wave::from_str(&wave_type, text).map_err(|err| {
-        invalid(format!(
-            "does not parse as `{}`: {err}",
-            crate::describe::type_text(resolve, &ty)
-        ))
-    })?;
-
-    Ok(match ty {
-        Type::Bool => FlatConst::I32(i32::from(value.unwrap_bool())),
-        Type::U8 => FlatConst::I32(i32::from(value.unwrap_u8())),
-        Type::U16 => FlatConst::I32(i32::from(value.unwrap_u16())),
-        Type::U32 => FlatConst::I32(value.unwrap_u32() as i32),
-        Type::S8 => FlatConst::I32(i32::from(value.unwrap_s8())),
-        Type::S16 => FlatConst::I32(i32::from(value.unwrap_s16())),
-        Type::S32 => FlatConst::I32(value.unwrap_s32()),
-        Type::U64 => FlatConst::I64(value.unwrap_u64() as i64),
-        Type::S64 => FlatConst::I64(value.unwrap_s64()),
-        Type::F32 => FlatConst::F32(value.unwrap_f32()),
-        Type::F64 => FlatConst::F64(value.unwrap_f64()),
-        Type::Char => FlatConst::I32(value.unwrap_char() as i32),
-        Type::String => FlatConst::Str(value.unwrap_string().into_owned()),
+/// Checks that a parameter type is bakeable at compose time: scalars, `char`, `string`,
+/// enums, records, tuples, options, and lists of these, in any nesting. Anything that
+/// carries authority (handles, resources) or needs discriminant-dependent flattening
+/// beyond `option` (variants, results, flags) is rejected with a description of the
+/// offending piece.
+fn ensure_bakeable(resolve: &Resolve, ty: &Type) -> Result<(), String> {
+    let ty = resolve_alias(resolve, ty);
+    match ty {
+        Type::Bool
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::S8
+        | Type::S16
+        | Type::S32
+        | Type::S64
+        | Type::F32
+        | Type::F64
+        | Type::Char
+        | Type::String => Ok(()),
+        Type::ErrorContext => Err("an error-context value is not bakeable".to_string()),
         Type::Id(id) => match &resolve.types[id].kind {
-            TypeDefKind::Enum(e) => {
-                let case = value.unwrap_enum();
-                let index = e
-                    .cases
-                    .iter()
-                    .position(|c| c.name == case)
-                    .ok_or_else(|| invalid(format!("`{case}` is not a case of the enum")))?;
-                FlatConst::I32(index as i32)
+            TypeDefKind::Enum(_) => Ok(()),
+            TypeDefKind::List(element) => ensure_bakeable(resolve, element),
+            TypeDefKind::Option(payload) => ensure_bakeable(resolve, payload),
+            TypeDefKind::Record(record) => {
+                for field in &record.fields {
+                    ensure_bakeable(resolve, &field.ty)?;
+                }
+                Ok(())
             }
-            _ => unreachable!("unsupported types are rejected before parsing"),
+            TypeDefKind::Tuple(tuple) => {
+                for ty in &tuple.types {
+                    ensure_bakeable(resolve, ty)?;
+                }
+                Ok(())
+            }
+            TypeDefKind::Variant(_) => Err("a variant value is not bakeable".to_string()),
+            TypeDefKind::Result(_) => Err("a result value is not bakeable".to_string()),
+            TypeDefKind::Flags(_) => Err("a flags value is not bakeable".to_string()),
+            TypeDefKind::Handle(_) | TypeDefKind::Resource => {
+                Err("a resource handle is not bakeable".to_string())
+            }
+            TypeDefKind::Future(_) | TypeDefKind::Stream(_) => {
+                Err("a future or stream is not bakeable".to_string())
+            }
+            TypeDefKind::Map(..) | TypeDefKind::FixedLengthList(..) => {
+                Err("a map or fixed-length list is not bakeable".to_string())
+            }
+            TypeDefKind::Type(_) => unreachable!("aliases are resolved above"),
+            TypeDefKind::Unknown => Err("an unresolved type is not bakeable".to_string()),
         },
-        _ => unreachable!("unsupported types are rejected before parsing"),
-    })
+    }
 }
 
 /// The WAVE type used to parse a supported configuration parameter (None if the type is
@@ -790,12 +910,288 @@ fn wave_type(resolve: &Resolve, ty: &Type) -> Option<value::Type> {
         Type::F64 => value::Type::F64,
         Type::Char => value::Type::CHAR,
         Type::String => value::Type::STRING,
-        Type::Id(id) => match &resolve.types[*id].kind {
-            TypeDefKind::Enum(_) => value::resolve_wit_type(resolve, *id).ok()?,
-            _ => return None,
-        },
+        Type::Id(id) => value::resolve_wit_type(resolve, *id).ok()?,
         _ => return None,
     })
+}
+
+/// Lowers parsed WAVE values to canonical-ABI constants: flat core values for the call
+/// site plus the constant arena holding string bytes, list elements, and spilled
+/// parameter records (with relocations for every arena-internal pointer).
+struct Lowerer<'a> {
+    resolve: &'a Resolve,
+    sizes: SizeAlign,
+    arena: Vec<u8>,
+    relocs: Vec<u32>,
+}
+
+impl Lowerer<'_> {
+    /// Reserves `size` bytes at the next `align`-aligned arena offset, zero-filled.
+    fn reserve(&mut self, size: usize, align: usize, what: &str) -> Result<u32, String> {
+        let align = align.max(1);
+        let padded = self.arena.len().next_multiple_of(align);
+        let end = padded + size;
+        if end > ARENA_LIMIT {
+            return Err(format!(
+                "{what} does not fit in the compose-time constant arena ({size} bytes \
+                 requested, {ARENA_LIMIT} byte limit)"
+            ));
+        }
+        self.arena.resize(end, 0);
+        Ok(padded as u32)
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) {
+        let offset = offset as usize;
+        self.arena[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// Writes an arena-relative pointer at `offset` and records the relocation.
+    fn write_rel_ptr(&mut self, offset: u32, target: u32) {
+        self.write(offset, &target.to_le_bytes());
+        self.relocs.push(offset);
+    }
+
+    /// Appends a string's bytes to the arena, returning (relative pointer, length).
+    fn append_string(&mut self, text: &str) -> Result<(u32, u32), String> {
+        let offset = self.reserve(text.len(), 1, "a string constant")?;
+        self.write(offset, text.as_bytes());
+        Ok((offset, text.len() as u32))
+    }
+
+    /// Appends a list's elements to the arena in canonical layout, returning
+    /// (relative pointer, element count).
+    fn append_list(&mut self, value: &Value, element: &Type) -> Result<(u32, u32), String> {
+        let elements: Vec<_> = value.unwrap_list().collect();
+        let size = self.sizes.size(element).size_wasm32();
+        let align = self.sizes.align(element).align_wasm32();
+        let base = self.reserve(size * elements.len(), align, "a list constant")?;
+        for (index, element_value) in elements.iter().enumerate() {
+            self.store(element_value.as_ref(), element, base + (index * size) as u32)?;
+        }
+        Ok((base, elements.len() as u32))
+    }
+
+    /// Looks up a record field's value by name (the parse is typed, so a missing field
+    /// can only mean an internal mismatch).
+    fn record_field(value: &Value, name: &str) -> Result<Value, String> {
+        for (field_name, field_value) in value.unwrap_record() {
+            if field_name == name {
+                return Ok(field_value.into_owned());
+            }
+        }
+        Err(format!("record value is missing field `{name}`"))
+    }
+
+    /// Lowers one value to its flat core constants (the canonical flattening used when
+    /// the parameter list is passed by value).
+    fn lower_flat(
+        &mut self,
+        value: &Value,
+        ty: &Type,
+        flats: &mut Vec<FlatConst>,
+    ) -> Result<(), String> {
+        let resolve = self.resolve;
+        let ty = resolve_alias(resolve, ty);
+        match ty {
+            Type::Bool => flats.push(FlatConst::I32(i32::from(value.unwrap_bool()))),
+            Type::U8 => flats.push(FlatConst::I32(i32::from(value.unwrap_u8()))),
+            Type::U16 => flats.push(FlatConst::I32(i32::from(value.unwrap_u16()))),
+            Type::U32 => flats.push(FlatConst::I32(value.unwrap_u32() as i32)),
+            Type::S8 => flats.push(FlatConst::I32(i32::from(value.unwrap_s8()))),
+            Type::S16 => flats.push(FlatConst::I32(i32::from(value.unwrap_s16()))),
+            Type::S32 => flats.push(FlatConst::I32(value.unwrap_s32())),
+            Type::U64 => flats.push(FlatConst::I64(value.unwrap_u64() as i64)),
+            Type::S64 => flats.push(FlatConst::I64(value.unwrap_s64())),
+            Type::F32 => flats.push(FlatConst::F32(value.unwrap_f32())),
+            Type::F64 => flats.push(FlatConst::F64(value.unwrap_f64())),
+            Type::Char => flats.push(FlatConst::I32(value.unwrap_char() as i32)),
+            Type::String => {
+                let (ptr, len) = self.append_string(&value.unwrap_string())?;
+                flats.push(FlatConst::ArenaPtr(ptr));
+                flats.push(FlatConst::I32(len as i32));
+            }
+            Type::ErrorContext => return Err("error-context values are not bakeable".into()),
+            Type::Id(id) => match &resolve.types[id].kind {
+                TypeDefKind::Enum(e) => {
+                    flats.push(FlatConst::I32(enum_discriminant(e, value)? as i32));
+                }
+                TypeDefKind::List(element) => {
+                    let (ptr, len) = self.append_list(value, element)?;
+                    flats.push(FlatConst::ArenaPtr(ptr));
+                    flats.push(FlatConst::I32(len as i32));
+                }
+                TypeDefKind::Record(record) => {
+                    for field in &record.fields {
+                        let field_value = Self::record_field(value, &field.name)?;
+                        self.lower_flat(&field_value, &field.ty, flats)?;
+                    }
+                }
+                TypeDefKind::Tuple(tuple) => {
+                    let values: Vec<_> = value.unwrap_tuple().collect();
+                    if values.len() != tuple.types.len() {
+                        return Err("tuple value arity mismatch".into());
+                    }
+                    for (item, item_ty) in values.iter().zip(&tuple.types) {
+                        self.lower_flat(item.as_ref(), item_ty, flats)?;
+                    }
+                }
+                TypeDefKind::Option(payload) => match value.unwrap_option() {
+                    Some(inner) => {
+                        flats.push(FlatConst::I32(1));
+                        self.lower_flat(inner.as_ref(), payload, flats)?;
+                    }
+                    None => {
+                        flats.push(FlatConst::I32(0));
+                        self.push_zero_flats(payload, flats);
+                    }
+                },
+                other => {
+                    return Err(format!(
+                        "values of this kind ({}) are not bakeable",
+                        kind_name(other)
+                    ));
+                }
+            },
+        }
+        Ok(())
+    }
+
+    /// Pushes a zero constant for every flat core value of `ty` (the payload slots of an
+    /// absent `option`, which the canonical ABI still passes).
+    fn push_zero_flats(&self, ty: &Type, flats: &mut Vec<FlatConst>) {
+        let mut storage = [WasmType::I32; 32];
+        let mut flat = FlatTypes::new(&mut storage);
+        self.resolve.push_flat(ty, &mut flat);
+        for wasm_type in flat.to_vec() {
+            flats.push(match wasm_type {
+                WasmType::I64 | WasmType::PointerOrI64 => FlatConst::I64(0),
+                WasmType::F32 => FlatConst::F32(0.0),
+                WasmType::F64 => FlatConst::F64(0.0),
+                _ => FlatConst::I32(0),
+            });
+        }
+    }
+
+    /// Stores one value at `offset` in the arena using its canonical memory layout (the
+    /// region must already be reserved; strings and lists it contains are appended).
+    fn store(&mut self, value: &Value, ty: &Type, offset: u32) -> Result<(), String> {
+        let resolve = self.resolve;
+        let ty = resolve_alias(resolve, ty);
+        match ty {
+            Type::Bool => self.write(offset, &[u8::from(value.unwrap_bool())]),
+            Type::U8 => self.write(offset, &value.unwrap_u8().to_le_bytes()),
+            Type::S8 => self.write(offset, &value.unwrap_s8().to_le_bytes()),
+            Type::U16 => self.write(offset, &value.unwrap_u16().to_le_bytes()),
+            Type::S16 => self.write(offset, &value.unwrap_s16().to_le_bytes()),
+            Type::U32 => self.write(offset, &value.unwrap_u32().to_le_bytes()),
+            Type::S32 => self.write(offset, &value.unwrap_s32().to_le_bytes()),
+            Type::U64 => self.write(offset, &value.unwrap_u64().to_le_bytes()),
+            Type::S64 => self.write(offset, &value.unwrap_s64().to_le_bytes()),
+            Type::F32 => self.write(offset, &value.unwrap_f32().to_le_bytes()),
+            Type::F64 => self.write(offset, &value.unwrap_f64().to_le_bytes()),
+            Type::Char => self.write(offset, &(value.unwrap_char() as u32).to_le_bytes()),
+            Type::String => {
+                let (ptr, len) = self.append_string(&value.unwrap_string())?;
+                self.write_rel_ptr(offset, ptr);
+                self.write(offset + 4, &len.to_le_bytes());
+            }
+            Type::ErrorContext => return Err("error-context values are not bakeable".into()),
+            Type::Id(id) => match &resolve.types[id].kind {
+                TypeDefKind::Enum(e) => {
+                    let discriminant = enum_discriminant(e, value)?;
+                    self.store_discriminant(offset, e.tag(), discriminant);
+                }
+                TypeDefKind::List(element) => {
+                    let (ptr, len) = self.append_list(value, element)?;
+                    self.write_rel_ptr(offset, ptr);
+                    self.write(offset + 4, &len.to_le_bytes());
+                }
+                TypeDefKind::Record(record) => {
+                    let field_types: Vec<Type> = record.fields.iter().map(|f| f.ty).collect();
+                    let offsets = self.sizes.field_offsets(field_types.iter());
+                    let offsets: Vec<u32> = offsets
+                        .iter()
+                        .map(|(off, _)| off.size_wasm32() as u32)
+                        .collect();
+                    for (field, field_offset) in record.fields.iter().zip(offsets) {
+                        let field_value = Self::record_field(value, &field.name)?;
+                        self.store(&field_value, &field.ty, offset + field_offset)?;
+                    }
+                }
+                TypeDefKind::Tuple(tuple) => {
+                    let values: Vec<_> = value.unwrap_tuple().collect();
+                    if values.len() != tuple.types.len() {
+                        return Err("tuple value arity mismatch".into());
+                    }
+                    let offsets = self.sizes.field_offsets(tuple.types.iter());
+                    let offsets: Vec<u32> = offsets
+                        .iter()
+                        .map(|(off, _)| off.size_wasm32() as u32)
+                        .collect();
+                    for ((item, item_ty), item_offset) in
+                        values.iter().zip(&tuple.types).zip(offsets)
+                    {
+                        self.store(item.as_ref(), item_ty, offset + item_offset)?;
+                    }
+                }
+                TypeDefKind::Option(payload) => {
+                    let payload_offset = self
+                        .sizes
+                        .payload_offset(Int::U8, [None, Some(payload)])
+                        .size_wasm32() as u32;
+                    match value.unwrap_option() {
+                        Some(inner) => {
+                            self.write(offset, &[1]);
+                            self.store(inner.as_ref(), payload, offset + payload_offset)?;
+                        }
+                        None => self.write(offset, &[0]),
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "values of this kind ({}) are not bakeable",
+                        kind_name(other)
+                    ));
+                }
+            },
+        }
+        Ok(())
+    }
+
+    /// Stores an enum discriminant in its canonical tag width.
+    fn store_discriminant(&mut self, offset: u32, tag: Int, discriminant: u32) {
+        match tag {
+            Int::U8 => self.write(offset, &[discriminant as u8]),
+            Int::U16 => self.write(offset, &(discriminant as u16).to_le_bytes()),
+            Int::U32 | Int::U64 => self.write(offset, &discriminant.to_le_bytes()),
+        }
+    }
+}
+
+/// The case index of an enum value.
+fn enum_discriminant(e: &wit_parser::Enum, value: &Value) -> Result<u32, String> {
+    let case = value.unwrap_enum();
+    e.cases
+        .iter()
+        .position(|c| c.name == case)
+        .map(|index| index as u32)
+        .ok_or_else(|| format!("`{case}` is not a case of the enum"))
+}
+
+/// A short human name for a type kind (for "not bakeable" messages).
+fn kind_name(kind: &TypeDefKind) -> &'static str {
+    match kind {
+        TypeDefKind::Variant(_) => "variant",
+        TypeDefKind::Result(_) => "result",
+        TypeDefKind::Flags(_) => "flags",
+        TypeDefKind::Handle(_) | TypeDefKind::Resource => "resource handle",
+        TypeDefKind::Future(_) => "future",
+        TypeDefKind::Stream(_) => "stream",
+        TypeDefKind::Map(..) => "map",
+        TypeDefKind::FixedLengthList(..) => "fixed-length list",
+        _ => "unsupported type",
+    }
 }
 
 /// Synthesizes the binder component: it imports the provider's config and API
@@ -826,30 +1222,36 @@ fn build_binder(
 }
 
 /// The binder's memory layout: a fixed scratch area for indirect results starting at 16,
-/// then the baked-in string constants, then the bump heap.
+/// then the baked-in constant arena (strings, lists, spilled parameters), then the bump
+/// heap.
 struct Layout {
     scratch: u32,
-    string_offsets: Vec<u32>,
-    string_data: Vec<u8>,
+    /// The absolute base address of the constant arena (where the data segment lands).
+    arena_base: u32,
+    /// The arena bytes with every arena-relative pointer rebased to its absolute address.
+    arena: Vec<u8>,
     heap_base: u32,
 }
 
 fn layout(plan: &BinderPlan) -> Layout {
     let scratch = 16u32;
-    let string_base = scratch + plan.scratch_size;
-    let mut string_data = Vec::new();
-    let mut string_offsets = Vec::new();
-    for constant in &plan.constants {
-        if let FlatConst::Str(text) = constant {
-            string_offsets.push(string_base + string_data.len() as u32);
-            string_data.extend_from_slice(text.as_bytes());
-        }
+    let arena_base = scratch + plan.scratch_size;
+    let mut arena = plan.constants.arena.clone();
+    for &reloc in &plan.constants.relocs {
+        let reloc = reloc as usize;
+        let relative = u32::from_le_bytes([
+            arena[reloc],
+            arena[reloc + 1],
+            arena[reloc + 2],
+            arena[reloc + 3],
+        ]);
+        arena[reloc..reloc + 4].copy_from_slice(&(arena_base + relative).to_le_bytes());
     }
-    let heap_base = (string_base + string_data.len() as u32).next_multiple_of(16);
+    let heap_base = (arena_base + arena.len() as u32).next_multiple_of(16);
     Layout {
         scratch,
-        string_offsets,
-        string_data,
+        arena_base,
+        arena,
         heap_base,
     }
 }
@@ -1102,13 +1504,12 @@ fn synthesize_binder_module(plan: &BinderPlan) -> Vec<u8> {
     module.section(&globals);
     module.section(&exports);
     module.section(&code);
-    if !layout.string_data.is_empty() {
-        let string_base = layout.scratch + plan.scratch_size;
+    if !layout.arena.is_empty() {
         let mut data = DataSection::new();
         data.active(
             0,
-            &ConstExpr::i32_const(string_base as i32),
-            layout.string_data.clone(),
+            &ConstExpr::i32_const(layout.arena_base as i32),
+            layout.arena.iter().copied(),
         );
         module.section(&data);
     }
@@ -1171,8 +1572,7 @@ fn realloc_body() -> wasm_encoder::Function {
 /// caller and may itself reenter another configured provider's `configure`.
 fn gate_body(plan: &BinderPlan, layout: &Layout, configure_func: u32) -> wasm_encoder::Function {
     let mut f = wasm_encoder::Function::new([]);
-    let mut next_string = 0usize;
-    for constant in &plan.constants {
+    for constant in &plan.constants.flats {
         match constant {
             FlatConst::I32(v) => {
                 f.instruction(&Instruction::I32Const(*v));
@@ -1186,12 +1586,8 @@ fn gate_body(plan: &BinderPlan, layout: &Layout, configure_func: u32) -> wasm_en
             FlatConst::F64(v) => {
                 f.instruction(&Instruction::F64Const((*v).into()));
             }
-            FlatConst::Str(text) => {
-                f.instruction(&Instruction::I32Const(
-                    layout.string_offsets[next_string] as i32,
-                ));
-                f.instruction(&Instruction::I32Const(text.len() as i32));
-                next_string += 1;
+            FlatConst::ArenaPtr(offset) => {
+                f.instruction(&Instruction::I32Const((layout.arena_base + offset) as i32));
             }
         }
     }

@@ -1035,3 +1035,171 @@ world entropy-probe {
 "#;
     build_component(WIT, &["entropy"], "entropy-probe", CORE)
 }
+
+// -----------------------------------------------------------------------------------------
+// Compound compose-time configuration: eo9-tests:compound
+// -----------------------------------------------------------------------------------------
+
+/// The `eo9-tests:compound` fixture package: a configurable provider whose `configure`
+/// takes compound values (a list, a list of records carrying strings, a string, an
+/// option, and an enum) and folds every one of them into a single checksum that its
+/// `report` capability then exposes -- so a composed consumer observes exactly what the
+/// invoker baked in at compose time.
+const COMPOUND_WIT: &str = r#"
+package eo9-tests:compound@0.1.0;
+
+/// A capability that reports one configured checksum.
+interface report {
+    total: func() -> u64;
+}
+
+/// Compound-typed compose-time configuration for the report provider.
+interface report-config {
+    record probe { offset: u32, label: string }
+    enum mode { fast, careful }
+    configure: func(
+        thresholds: list<u32>,
+        probes: list<probe>,
+        title: string,
+        scale: option<u32>,
+        mode: mode,
+    ) -> result<_, string>;
+}
+
+/// A binary that reports the checksum its provider was configured with.
+world report-consumer {
+    import report;
+    export main: func() -> result<u64, string>;
+}
+
+/// The configurable provider (the checksum logic lives in the core module).
+world report-provider {
+    export report;
+    export report-config;
+}
+"#;
+
+/// One probe entry of the compound configuration: `(offset, label)`.
+pub type CompoundProbe<'a> = (u32, &'a str);
+
+/// The checksum [`compound_provider`]'s `configure` computes over its arguments (the
+/// same fold, in the same order, as the fixture's core module): an order- and
+/// content-sensitive fold of every configured value.
+pub fn compound_checksum(
+    thresholds: &[u32],
+    probes: &[CompoundProbe<'_>],
+    title: &str,
+    scale: Option<u32>,
+    mode_discriminant: u64,
+) -> u64 {
+    fn step(h: u64, b: u64) -> u64 {
+        h.wrapping_mul(131).wrapping_add(b).wrapping_add(1)
+    }
+    let mut h: u64 = 17;
+    for value in thresholds {
+        h = step(h, u64::from(*value));
+    }
+    for (offset, label) in probes {
+        h = step(h, u64::from(*offset));
+        for byte in label.as_bytes() {
+            h = step(h, u64::from(*byte));
+        }
+    }
+    for byte in title.as_bytes() {
+        h = step(h, u64::from(*byte));
+    }
+    h = match scale {
+        Some(value) => step(h, 1_000_000 + u64::from(value)),
+        None => step(h, 11),
+    };
+    step(h, 21 + mode_discriminant)
+}
+
+/// The configurable provider: `configure` folds its compound arguments into a checksum
+/// (see [`compound_checksum`]) and `report.total` returns it.
+pub fn compound_provider() -> Component {
+    const CORE: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 4096))
+  (global $h (mut i64) (i64.const 17))
+  (func (export "cabi_realloc") (param $old i32) (param $old-size i32) (param $align i32) (param $new-size i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr
+      (i32.and
+        (i32.add (global.get $heap) (i32.sub (local.get $align) (i32.const 1)))
+        (i32.sub (i32.const 0) (local.get $align))))
+    (global.set $heap (i32.add (local.get $ptr) (local.get $new-size)))
+    (local.get $ptr))
+  (func $step (param $b i64)
+    (global.set $h
+      (i64.add (i64.add (i64.mul (global.get $h) (i64.const 131)) (local.get $b)) (i64.const 1))))
+  (func $step-bytes (param $ptr i32) (param $len i32)
+    (local $i i32)
+    (block $done
+      (loop $next
+        (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
+        (call $step (i64.extend_i32_u (i32.load8_u (i32.add (local.get $ptr) (local.get $i)))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $next))))
+  (func (export "eo9-tests:compound/report-config@0.1.0#configure")
+        (param $t-ptr i32) (param $t-len i32)
+        (param $p-ptr i32) (param $p-len i32)
+        (param $title-ptr i32) (param $title-len i32)
+        (param $s-disc i32) (param $s-val i32)
+        (param $mode i32)
+        (result i32)
+    (local $i i32) (local $elem i32)
+    ;; thresholds: list<u32>, 4-byte stride
+    (local.set $i (i32.const 0))
+    (block $t-done
+      (loop $t-next
+        (br_if $t-done (i32.ge_u (local.get $i) (local.get $t-len)))
+        (call $step (i64.extend_i32_u
+          (i32.load (i32.add (local.get $t-ptr) (i32.mul (local.get $i) (i32.const 4))))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $t-next)))
+    ;; probes: list<probe>, 12-byte stride (offset u32, label ptr, label len)
+    (local.set $i (i32.const 0))
+    (block $p-done
+      (loop $p-next
+        (br_if $p-done (i32.ge_u (local.get $i) (local.get $p-len)))
+        (local.set $elem (i32.add (local.get $p-ptr) (i32.mul (local.get $i) (i32.const 12))))
+        (call $step (i64.extend_i32_u (i32.load (local.get $elem))))
+        (call $step-bytes
+          (i32.load (i32.add (local.get $elem) (i32.const 4)))
+          (i32.load (i32.add (local.get $elem) (i32.const 8))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $p-next)))
+    ;; title
+    (call $step-bytes (local.get $title-ptr) (local.get $title-len))
+    ;; scale: none -> 11, some(s) -> 1000000 + s
+    (if (local.get $s-disc)
+      (then (call $step (i64.add (i64.const 1000000) (i64.extend_i32_u (local.get $s-val)))))
+      (else (call $step (i64.const 11))))
+    ;; mode: 21 + discriminant
+    (call $step (i64.add (i64.const 21) (i64.extend_i32_u (local.get $mode))))
+    ;; ok: result<_, string> discriminant 0, returned indirectly
+    (i32.store8 (i32.const 8) (i32.const 0))
+    (i32.const 8))
+  (func (export "eo9-tests:compound/report@0.1.0#total") (result i64)
+    (global.get $h)))
+"#;
+    build_component(COMPOUND_WIT, &[], "report-provider", CORE)
+}
+
+/// A binary importing `report`; `main` returns `ok(total())`.
+pub fn compound_consumer() -> Component {
+    const CORE: &str = r#"
+(module
+  (import "eo9-tests:compound/report@0.1.0" "total" (func $total (result i64)))
+  (memory (export "memory") 1)
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+  (func (export "main") (result i32)
+    ;; result<u64, string>: ok(total()) at 32 (payload at +8)
+    (i32.store8 (i32.const 32) (i32.const 0))
+    (i64.store (i32.const 40) (call $total))
+    (i32.const 32)))
+"#;
+    build_component(COMPOUND_WIT, &[], "report-consumer", CORE)
+}
