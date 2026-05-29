@@ -123,8 +123,10 @@ fn run_entropy_seeded() -> Result<(u64, u64), wasmtime::Error> {
     // SAFETY: as above — produced by xtask for exactly this engine configuration.
     let component = unsafe { Component::deserialize(&engine, ENTROPY_SEEDED_CWASM)? };
 
-    // The seeded stub world imports nothing; an empty linker is the correct environment.
-    let linker: Linker<KernelState> = Linker::new(&engine);
+    // The seeded stub's only import is the runtime's `eo9:rt/diagnostics` trap-path sink
+    // (every SDK-built component carries it); the standard provider set registers it.
+    let mut linker: Linker<KernelState> = Linker::new(&engine);
+    providers::add_providers(&mut linker)?;
     let mut store = Store::new(&engine, KernelState::new());
     // The engine meters fuel (see `new_engine`); the demo gets an effectively-unlimited pool.
     store.set_fuel(u64::MAX)?;
