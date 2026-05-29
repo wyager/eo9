@@ -31,10 +31,10 @@
 /// * `world` — the world name, defined in the crate's own `wit/` directory (with the
 ///   repo-level packages it imports symlinked under `wit/deps/`).
 /// * `apis` — which eo9 APIs the world imports, as bare identifiers (`io`, `text`,
-///   `time`, `entropy`, `perf`, `disk`, `fs`, `net`, `pci`). Listing an API maps its
-///   interfaces onto [`crate::api`] instead of regenerating them; `io` must be listed
-///   exactly when the world's imports use `eo9:io/buffers` (i.e. for `disk`, `fs`, and
-///   `net`).
+///   `time`, `entropy`, `perf`, `disk`, `fs`, `pci`, and the net layers `net_l2`,
+///   `net_l3`, `net_l4`). Listing an API maps its interfaces onto [`crate::api`] instead
+///   of regenerating them; `io` must be listed exactly when the world's imports use
+///   `eo9:io/buffers` (i.e. for `disk`, `fs`, and the net layers).
 ///
 /// The API list must match the world's imports exactly — a missing entry fails with
 /// wit-bindgen's "no remapping found" error, an extra one with its "unused remappings"
@@ -130,12 +130,29 @@ macro_rules! __bindings_with {
             $($tail)*
         );
     };
-    (apis [net $($rest:ident)*] with [$($acc:tt)*] $($tail:tt)*) => {
+    (apis [net_l2 $($rest:ident)*] with [$($acc:tt)*] $($tail:tt)*) => {
         $crate::__bindings_with!(
             apis [$($rest)*]
             with [$($acc)*
-                "eo9:net/types@0.1.0": eo9_guest::api::net::types,
-                "eo9:net/net@0.1.0": eo9_guest::api::net::net,
+                "eo9:net/l2@0.1.0": eo9_guest::api::net::l2,
+            ]
+            $($tail)*
+        );
+    };
+    (apis [net_l3 $($rest:ident)*] with [$($acc:tt)*] $($tail:tt)*) => {
+        $crate::__bindings_with!(
+            apis [$($rest)*]
+            with [$($acc)*
+                "eo9:net/l3@0.1.0": eo9_guest::api::net::l3,
+            ]
+            $($tail)*
+        );
+    };
+    (apis [net_l4 $($rest:ident)*] with [$($acc:tt)*] $($tail:tt)*) => {
+        $crate::__bindings_with!(
+            apis [$($rest)*]
+            with [$($acc)*
+                "eo9:net/l4@0.1.0": eo9_guest::api::net::l4,
             ]
             $($tail)*
         );

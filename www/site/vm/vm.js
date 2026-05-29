@@ -1,53 +1,15 @@
-// The Eo9 web VM page: load the blob (wasmtime + Pulley, compiled to wasm32) and wire its
-// import surface to the page. Plain imports: terminal output, clocks, randomness. The
-// genuinely-blocking imports (sleep, read-line, fetch-from-store) are JSPI
-// `WebAssembly.Suspending` functions: the blob calls them synchronously, the browser parks
-// the whole blob on the underlying promise (a timer, the visitor's Enter key, a fetch), and
-// resumes it with the result. Everything Eo9-shaped happens inside the blob; this file is
-// just a terminal, a keyboard, and a fetch cache.
+// The Eo9 try-it page: load the blob (wasmtime + Pulley, compiled to wasm32), wire its import
+// surface to the page, and boot the eosh shell straight into the terminal. Plain imports:
+// terminal output, clocks, randomness. The genuinely-blocking imports (sleep, read-line,
+// fetch-from-store) are JSPI `WebAssembly.Suspending` functions: the blob calls them
+// synchronously, the browser parks the whole blob on the underlying promise (a timer, the
+// visitor's Enter key, a fetch), and resumes it with the result. Everything Eo9-shaped happens
+// inside the blob; this file is just a terminal, a keyboard, and a fetch cache.
 
 const output = document.getElementById("vm-output");
-const buttons = {
-  hello: document.getElementById("btn-hello"),
-  fuel: document.getElementById("btn-fuel"),
-  algebra: document.getElementById("btn-algebra"),
-  entropy: document.getElementById("btn-entropy"),
-  program: document.getElementById("btn-program"),
-  sleepy: document.getElementById("btn-sleepy"),
-  park: document.getElementById("btn-park"),
-  readline: document.getElementById("btn-readline"),
-  eosh: document.getElementById("btn-eosh"),
-};
-const seedInput = document.getElementById("seed");
-const countInput = document.getElementById("count");
-const programSelect = document.getElementById("program");
-const programArgs = document.getElementById("program-args");
 const terminalInput = document.getElementById("vm-input");
 
-const ARG_PLACEHOLDERS = {
-  hello: "browser true",
-  cruncher: "9 200000",
-  outcomes: 'fail "sad path"',
-  readwrite: '/scratch/note.txt "hello disk"',
-  cat: "/welcome.txt /docs/about.txt",
-  ls: "",
-  echo: '"hello from the web VM"',
-  rng: "5",
-  wc: "/welcome.txt",
-  head: "2 /docs/notes.txt",
-  cp: "/welcome.txt /docs/copy.txt",
-  mkdir: "/scratch",
-  rm: "/docs/notes.txt",
-  touch: "/scratch/empty",
-  stat: "/welcome.txt",
-  find: "/ .txt",
-};
-
-// Argument fields are joined with the ASCII unit separator before crossing into the blob.
-const FIELD_SEPARATOR = "\u001f";
-
 let memory = null;
-let exportsRef = null;
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 
@@ -117,7 +79,7 @@ function submitTerminalLine() {
 }
 
 const READLINE_HINT =
-  "(nothing is reading the terminal right now — boot the eosh shell, or press “Read a line”, then type below)";
+  "(the shell isn't reading right now — wait for the eosh> prompt, then type below and press Enter)";
 let lastHintAt = 0;
 function readlineHint() {
   const now = Date.now();
@@ -136,7 +98,7 @@ terminalInput.addEventListener("keydown", (event) => {
   submitTerminalLine();
 });
 
-// Behave like a terminal: clicking anywhere in the console focuses the input (when a program
+// Behave like a terminal: clicking anywhere in the console focuses the input (when the shell
 // is reading), and keystrokes that would otherwise be lost are routed to it.
 function focusTerminalInput() {
   if (!terminalInput.disabled) terminalInput.focus();
@@ -156,7 +118,7 @@ document.addEventListener("keydown", (event) => {
       target.isContentEditable);
   if (inFormField) return;
   if (pendingReadLine !== null && !terminalInput.disabled) {
-    // A program is reading: send the keystroke to the terminal input instead of losing it.
+    // The shell is reading: send the keystroke to the terminal input instead of losing it.
     if (event.key.length === 1) {
       terminalInput.focus();
       terminalInput.value += event.key;
@@ -170,7 +132,7 @@ document.addEventListener("keydown", (event) => {
       submitTerminalLine();
     }
   } else if (event.key === "Enter") {
-    // Nothing is reading: explain instead of doing nothing.
+    // The shell isn't reading: explain instead of doing nothing.
     readlineHint();
   }
 });
@@ -240,7 +202,7 @@ function hostFetchCopy(destPtr, len) {
 // to wire here.)
 
 // Fallbacks when the browser has no JSPI: report "unavailable" so the blob errors cleanly
-// (the page also disables the affected buttons and says why).
+// (the page also says why before trying to boot the shell).
 function unavailableSleep() {}
 function unavailableReadLine() {
   return -2;
@@ -249,39 +211,7 @@ function unavailableFetchLen() {
   return -2;
 }
 
-// --- helpers ----------------------------------------------------------------------------------
-
-function parseSeed(text) {
-  const trimmed = text.trim();
-  let value;
-  try {
-    value = BigInt(trimmed);
-  } catch {
-    return null;
-  }
-  if (value < 0n || value > 0xffffffffffffffffn) return null;
-  return value;
-}
-
-// Split an args string into fields (double quotes group words, e.g. `fail "sad path"`).
-function splitArgs(text) {
-  const fields = [];
-  const pattern = /"([^"]*)"|(\S+)/g;
-  let match;
-  while ((match = pattern.exec(text)) !== null) {
-    fields.push(match[1] !== undefined ? match[1] : match[2]);
-  }
-  return fields;
-}
-
-// Write a JS string into blob memory via web_alloc; returns [ptr, len].
-function intoBlob(text) {
-  const bytes = encoder.encode(text);
-  if (bytes.length === 0) return [0, 0];
-  const ptr = exportsRef.web_alloc(bytes.length);
-  new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
-  return [ptr, bytes.length];
-}
+// --- load, boot, and hand the page to eosh ------------------------------------------------------
 
 async function main() {
   let exports;
@@ -321,18 +251,17 @@ async function main() {
       result = await WebAssembly.instantiate(await response.arrayBuffer(), imports);
     }
     exports = result.instance.exports;
-    exportsRef = exports;
     memory = exports.memory;
   } catch (error) {
     // Report the actual cause; don't blame missing WebAssembly support for a network or
     // server problem.
     output.textContent = "";
-    writeLine(`could not load the Eo9 blob: ${error}`, "vm-error");
+    writeLine(`could not load the Eo9 OS: ${error}`, "vm-error");
     if (typeof WebAssembly !== "object") {
       writeLine("(this page needs a browser with WebAssembly enabled)", "vm-error");
     } else {
       writeLine(
-        "(the message above is the real cause — usually the blob failed to download; the browser console has details)",
+        "(the message above is the real cause — usually the download failed; the browser console has details)",
         "vm-error",
       );
     }
@@ -347,92 +276,25 @@ async function main() {
   }
   if (!hasJSPI) {
     writeLine(
-      "this browser has no JavaScript Promise Integration (JSPI), so the demos that genuinely " +
-        "block — the program store, sleepy, and read-line — are disabled; hello / fuel / " +
-        "entropy still work. Current Chrome or Edge has JSPI.",
+      "this browser has no JavaScript Promise Integration (JSPI), which the shell's read-line " +
+        "needs, so the interactive prompt cannot run here. Current Chrome or Edge has JSPI.",
       "vm-error",
     );
+    return;
   }
 
-  // Synchronous exports are called directly; the ones that may suspend (they call JSPI
-  // imports) must be wrapped with WebAssembly.promising and awaited.
-  const promising = (fn) => (hasJSPI ? WebAssembly.promising(fn) : fn);
-  const runSleepy = promising(exports.run_sleepy);
-  const probeSleep = promising(exports.probe_sleep);
-  const probeReadLine = promising(exports.probe_read_line);
-  const runProgram = promising(exports.run_program);
-  const eoshBoot = promising(exports.eosh_boot);
-
-  const enableIdleButtons = () => {
-    for (const button of [buttons.hello, buttons.fuel, buttons.algebra, buttons.entropy])
-      button.disabled = false;
-    const blocked = !hasJSPI;
-    for (const button of [
-      buttons.program,
-      buttons.sleepy,
-      buttons.park,
-      buttons.readline,
-      buttons.eosh,
-    ]) {
-      button.disabled = blocked;
-    }
-  };
-
-  let busy = false;
-  const run = async (name, fn) => {
-    if (busy) return;
-    busy = true;
-    for (const button of Object.values(buttons)) button.disabled = true;
-    writeLine(`· ${name}`, "vm-cmd");
-    try {
-      const code = await fn();
-      if (code !== 0) writeLine(`${name}: failed (see above)`, "vm-error");
-    } catch (error) {
-      writeLine(`${name}: trapped: ${error}`, "vm-error");
-    } finally {
-      busy = false;
-      enableIdleButtons();
-    }
-  };
-
-  buttons.hello.onclick = () => run("hello + add", () => exports.run_hello());
-  buttons.fuel.onclick = () => run("fuel metering", () => exports.run_fuel());
-  buttons.algebra.onclick = () => run("component algebra", () => exports.algebra_demo());
-  buttons.entropy.onclick = () =>
-    run("entropy.seeded", () => {
-      const seed = parseSeed(seedInput.value);
-      if (seed === null) {
-        writeLine("seed must be a u64 (decimal or 0x-hex)", "vm-error");
-        return 0;
-      }
-      const count = Math.min(64, Math.max(1, Number(countInput.value) || 1));
-      const lo = Number(seed & 0xffffffffn);
-      const hi = Number(seed >> 32n);
-      return exports.run_entropy(lo, hi, count);
-    });
-
-  buttons.park.onclick = () => run("park the VM (300 ms)", () => probeSleep(300));
-  buttons.sleepy.onclick = () => run("sleepy (stackful-lift canary)", () => runSleepy());
-  buttons.readline.onclick = () => run("read-line", () => probeReadLine());
-  buttons.eosh.onclick = () =>
-    run("eosh shell — type commands below; `exit` to end", () => eoshBoot());
-  buttons.program.onclick = () =>
-    run(`store: ${programSelect.value}`, async () => {
-      const [namePtr, nameLen] = intoBlob(programSelect.value);
-      const [argsPtr, argsLen] = intoBlob(splitArgs(programArgs.value).join(FIELD_SEPARATOR));
-      try {
-        return await runProgram(namePtr, nameLen, argsPtr, argsLen);
-      } finally {
-        if (nameLen) exportsRef.web_free(namePtr, nameLen);
-        if (argsLen) exportsRef.web_free(argsPtr, argsLen);
-      }
-    });
-
-  programSelect.onchange = () => {
-    programArgs.value = ARG_PLACEHOLDERS[programSelect.value] ?? "";
-  };
-
-  enableIdleButtons();
+  // Boot the shell. eosh_boot calls the JSPI read-line import, so it must be wrapped with
+  // WebAssembly.promising and awaited; it returns when the visitor types `exit`.
+  const eoshBoot = WebAssembly.promising(exports.eosh_boot);
+  writeLine("· booting eosh — type a command at the eosh> prompt below", "vm-cmd");
+  try {
+    const code = await eoshBoot();
+    if (code !== 0) writeLine("the shell reported a failure (see above)", "vm-error");
+  } catch (error) {
+    writeLine(`the shell trapped: ${error}`, "vm-error");
+  }
+  writeLine("· shell session ended — reload the page for a fresh one", "vm-cmd");
+  terminalInput.disabled = true;
 }
 
 main();

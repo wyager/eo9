@@ -160,3 +160,21 @@ Match the priority order above; (1)+(2) unblock I2.
     Rule for future stubs: if no sensible default exists (e.g. a net provider needing an address), the
     failure must be a clear pre-run/typed refusal — never a trap; implement it as a typed error from the
     API operations (or a loader-visible required-config marker once one exists), not a panic.
+15. **Per-layer net stubs, and `net.l4.loopback` as the standard transport mock (plan/02 D17).** The old
+    `net.none`/`net.deny` stubs are replaced by one none/deny pair per layer — `net.l2.none`/`.deny`,
+    `net.l3.none`/`.deny`, `net.l4.none`/`.deny` — so absence and refusal can be expressed at exactly the
+    layer a program imports, plus `net.l4.loopback`: a self-contained in-memory transport (TCP + UDP
+    between sockets created through the same instance, loopback addresses only, canonicalized to
+    127.0.0.1/::1, port 0 binds an ephemeral port). Loopback semantics chosen for single-task test flows:
+    `connect` requires a listener and completes immediately by queuing the server end on the listener's
+    backlog (so listen → connect → accept works sequentially); the provider never blocks — `accept` with
+    an empty backlog and `recv`/`recv-from` with nothing queued fail with a typed `io` error saying so;
+    a dropped peer reads as EOF (0 bytes) after the queue drains and `connection-reset` on send;
+    `recv-from` truncates to the destination buffer like real UDP. Default configuration per D14: the
+    documented default is the empty loopback network, self-bound lazily, identical to what the nullary
+    `configure` creates. The new example `sockcheck` (TCP both-ways echo + UDP round-trip against any l4
+    provider) plus the `net_loopback` integration suite cover `net.l4.loopback $ sockcheck` end to end and
+    `net.l4.deny $ sockcheck` failing in the layer's own vocabulary; all per-layer stubs joined the
+    soundness corpus. Follow-ups: an l4-over-l3 middleware provider (smoltcp-style) and a real l2/l3
+    backend over virtio-net (kernel root provider) are the planned next consumers; eosh-side docs/examples
+    still reference `net.none`/`net.deny` in comment strings only.
