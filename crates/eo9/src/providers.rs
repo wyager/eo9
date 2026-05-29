@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
 use eo9_providers_unix::disk::{
-    DiskHost, DiskProvider as UnixDisk, ReadCompletion as UnixDiskReadCompletion,
+    DiskProvider as UnixDisk, ReadCompletion as UnixDiskReadCompletion,
     ReadError as UnixDiskReadError, WriteCompletion as UnixDiskWriteCompletion,
     WriteError as UnixDiskWriteError,
 };
@@ -178,6 +178,13 @@ impl EntropyProvider for HostEntropy {
 /// grant). Containment is structural: the provider holds one already-opened image file
 /// and offers nothing beyond offset-addressed reads and writes inside it, so no other
 /// host path is reachable through this capability.
+///
+/// Operations complete *eagerly* (the synchronous `read_blocking`/`write_blocking` path
+/// of the unix provider, not its pool): the main consumer of a granted disk is the
+/// `fs.eofs` provider component, whose synchronous engine requires every disk call to
+/// have completed by the time it returns (plan/14 D15). A positioned read or write on a
+/// regular file is fast enough that blocking the drive loop for it is the right trade
+/// until the fully asynchronous bridge exists.
 struct HostDisk {
     inner: Arc<UnixDisk>,
 }
@@ -202,35 +209,24 @@ impl HostDisk {
 
 impl DiskProvider for HostDisk {
     fn read(&mut self, offset: u64, dst: Vec<u8>) -> BoxOp<(Vec<u8>, Result<u64, DiskError>)> {
-        let (op, complete) = oneshot();
-        self.inner.read(
-            offset,
-            OwnedBuffer::from_vec(dst),
-            completer(move |(buffer, result): UnixDiskReadCompletion| {
-                complete((
-                    buffer.into_vec(),
-                    result.map(|done| done.bytes_read).map_err(disk_read_error),
-                ));
-            }),
-        );
-        op
+        let (buffer, result): UnixDiskReadCompletion =
+            self.inner.read_blocking(offset, OwnedBuffer::from_vec(dst));
+        ready_op((
+            buffer.into_vec(),
+            result.map(|done| done.bytes_read).map_err(disk_read_error),
+        ))
     }
 
     fn write(&mut self, offset: u64, src: Vec<u8>) -> BoxOp<(Vec<u8>, Result<u64, DiskError>)> {
-        let (op, complete) = oneshot();
-        self.inner.write(
-            offset,
-            OwnedBuffer::from_vec(src),
-            completer(move |(buffer, result): UnixDiskWriteCompletion| {
-                complete((
-                    buffer.into_vec(),
-                    result
-                        .map(|done| done.bytes_written)
-                        .map_err(disk_write_error),
-                ));
-            }),
-        );
-        op
+        let (buffer, result): UnixDiskWriteCompletion = self
+            .inner
+            .write_blocking(offset, OwnedBuffer::from_vec(src));
+        ready_op((
+            buffer.into_vec(),
+            result
+                .map(|done| done.bytes_written)
+                .map_err(disk_write_error),
+        ))
     }
 }
 
