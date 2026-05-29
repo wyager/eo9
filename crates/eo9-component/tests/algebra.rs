@@ -747,6 +747,126 @@ fn configure_is_deterministic() {
 }
 
 // ---------------------------------------------------------------------------
+// configure -- compound argument values (lists, records, options, tuples)
+// ---------------------------------------------------------------------------
+
+/// A full compound argument set for the `provider-d` fixture.
+const COMPOUND_ARGS: &[(&str, &str)] = &[
+    ("thresholds", "[1, 2, 3]"),
+    (
+        "probes",
+        "[{offset: 4, label: \"alpha\"}, {offset: 9, label: \"beta\"}]",
+    ),
+    ("title", "\"compound\""),
+    ("scale", "some(5)"),
+    ("mode", "careful"),
+    ("pair", "(7, true)"),
+];
+
+#[test]
+fn configure_bakes_compound_arguments_and_seals_the_config_interface() {
+    let provider = kit("provider-d");
+    let info = provider.describe();
+    assert!(export_slots(&info).contains("fix:kit/cap-d-config"));
+
+    let configured = configure(&provider, COMPOUND_ARGS).unwrap();
+    let info = configured.describe();
+    assert_eq!(info.kind, ComponentKind::Provider);
+    let exports = export_slots(&info);
+    assert!(exports.contains("fix:kit/cap-b"));
+    assert!(!exports.contains("fix:kit/cap-d-config"));
+    assert!(info.args.is_empty());
+
+    // The encoded result is a valid component and composes like any provider.
+    Component::load(configured.bytes().to_vec()).expect("configured provider revalidates");
+    let bound = compose(&configured, &kit("app")).unwrap();
+    assert_eq!(bound.kind(), ComponentKind::Binary);
+    assert!(!import_slots(&bound.describe()).contains("fix:kit/cap-b"));
+}
+
+#[test]
+fn configure_with_compound_arguments_is_deterministic() {
+    let once = configure(&kit("provider-d"), COMPOUND_ARGS).unwrap();
+    let twice = configure(&kit("provider-d"), COMPOUND_ARGS).unwrap();
+    assert_eq!(once.save(), twice.save());
+}
+
+#[test]
+fn configure_accepts_empty_lists_and_absent_options() {
+    let configured = configure(
+        &kit("provider-d"),
+        &[
+            ("thresholds", "[]"),
+            ("probes", "[]"),
+            ("title", "\"\""),
+            ("scale", "none"),
+            ("mode", "fast"),
+            ("pair", "(0, false)"),
+        ],
+    )
+    .unwrap();
+    Component::load(configured.bytes().to_vec()).expect("configured provider revalidates");
+}
+
+#[test]
+fn configure_spills_wide_parameter_lists_to_memory() {
+    let args: Vec<(String, String)> = "abcdefghijklm"
+        .chars()
+        .enumerate()
+        .map(|(index, name)| (name.to_string(), (index as u64 * 1000 + 1).to_string()))
+        .chain([
+            ("text".to_string(), "\"spilled\"".to_string()),
+            ("nums".to_string(), "[10, 20, 30]".to_string()),
+        ])
+        .collect();
+    let args: Vec<(&str, &str)> = args.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+
+    let once = configure(&kit("provider-f"), &args).unwrap();
+    let twice = configure(&kit("provider-f"), &args).unwrap();
+    assert_eq!(once.save(), twice.save());
+    Component::load(once.bytes().to_vec()).expect("configured provider revalidates");
+
+    let info = once.describe();
+    assert!(!export_slots(&info).contains("fix:kit/cap-f-config"));
+    assert!(export_slots(&info).contains("fix:kit/cap-b"));
+}
+
+#[test]
+fn configure_rejects_unbakeable_parameter_types_with_a_clear_message() {
+    let err = configure(&kit("provider-e"), &[("t", "plain")]).unwrap_err();
+    match &err {
+        ConfigureError::Internal(message) => {
+            assert!(
+                message.contains("cannot bake") && message.contains("variant"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected an internal not-bakeable error, got {other:?}"),
+    }
+}
+
+#[test]
+fn configure_rejects_malformed_compound_values() {
+    // An unterminated list literal.
+    let mut args: Vec<(&str, &str)> = COMPOUND_ARGS.to_vec();
+    args[0] = ("thresholds", "[1, 2");
+    let err = configure(&kit("provider-d"), &args).unwrap_err();
+    assert!(
+        matches!(&err, ConfigureError::InvalidArgument { name, .. } if name == "thresholds"),
+        "{err:?}"
+    );
+
+    // A record value with a misnamed field.
+    let mut args: Vec<(&str, &str)> = COMPOUND_ARGS.to_vec();
+    args[1] = ("probes", "[{offset: 4, wrong: \"alpha\"}]");
+    let err = configure(&kit("provider-d"), &args).unwrap_err();
+    assert!(
+        matches!(&err, ConfigureError::InvalidArgument { name, .. } if name == "probes"),
+        "{err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // configure -- providers with async API functions (the time.frozen shape)
 // ---------------------------------------------------------------------------
 
