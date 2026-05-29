@@ -48,6 +48,7 @@ const MAX_ENTROPY_REQUEST_BYTES: u64 = 64 * 1024;
 pub(crate) fn add_providers(linker: &mut Linker<TaskState>, providers: &Providers) -> Result<()> {
     add_types(linker)?;
     add_buffers(linker)?;
+    add_diagnostics(linker)?;
 
     add_optional::<TextCap>(
         linker,
@@ -311,6 +312,25 @@ fn add_types(linker: &mut Linker<TaskState>) -> Result<()> {
         "entropy-impl",
         ResourceType::host::<EntropyCap>(),
         |_, _| Ok(()),
+    )?;
+    Ok(())
+}
+
+/// Register `eo9:rt/diagnostics`: the write-once panic-message sink for the trap path.
+///
+/// Always registered — it is part of the runtime contract between the SDK and the
+/// executor (the SDK's panic handler is its only intended caller), not a capability:
+/// the host stores at most one bounded message per task, no guest can ever read it, and
+/// it is surfaced in exactly one place — a subsequent `abnormal(trapped(reason))`
+/// outcome. A task that calls it and does not trap has said nothing observable.
+fn add_diagnostics(linker: &mut Linker<TaskState>) -> Result<()> {
+    let mut diagnostics = linker.instance("eo9:rt/diagnostics@0.1.0")?;
+    diagnostics.func_wrap(
+        "report-panic",
+        |store: StoreContextMut<'_, TaskState>, (message,): (String,)| -> Result<()> {
+            store.data().report_panic(message);
+            Ok(())
+        },
     )?;
     Ok(())
 }

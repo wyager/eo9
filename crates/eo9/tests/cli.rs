@@ -211,6 +211,21 @@ fn run_outcomes_covers_success_failure_and_abnormal() {
         "trap reason should be labelled a guest panic: {}",
         trapped.stderr
     );
+    // The guest's own panic message and source location lead the reason: the SDK panic
+    // handler reports them through `eo9:rt/diagnostics.report-panic` just before the
+    // trap, and the executor folds them into `trapped(reason)`.
+    assert!(
+        trapped
+            .stderr
+            .contains("guest panicked: outcomes: trapping as requested at "),
+        "trap reason should carry the panic message: {}",
+        trapped.stderr
+    );
+    assert!(
+        trapped.stderr.contains("lib.rs:"),
+        "trap reason should carry the panic source location: {}",
+        trapped.stderr
+    );
     assert!(
         trapped.stderr.contains("guest backtrace:") && trapped.stderr.contains("main"),
         "trap reason should name the panicking function: {}",
