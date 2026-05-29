@@ -990,3 +990,12 @@ preemption/hardening work.
     riscv64gc (the vendored no_std closure is expected to be arch-clean but is unproven there); then the
     baked store + eosh (milestone 4), Sv39 + W^X + on-target codegen (milestone 5), and fuel/preemption/Ctrl-C
     parity (milestone 6).
+46. **Basic coreutils baked into the kernel store (2026-05-28, branch `area/11-host-odds`).**
+    `KERNEL_STORE_COMPONENTS` gains ls, cat, echo, wc, head, and stat, so the metal shell can
+    inspect its own read-only filesystem (`ls`, `ls /bin`, `cat /session`, multi-path `wc`) —
+    exercising the D42 variadic-tail default interactively. Cost: the store image grows from
+    8 to 14 entries (917 KiB of components + 7.6 MiB of host-AOT artifacts), kernel image
+    25.1 MB → 29.0 MB (+3.9 MB; the precompiled artifacts dominate — dropping them for the
+    coreutils and relying on on-target codegen is the lever if the image ever needs trimming).
+    Verified on QEMU aarch64: bare `ls` → listed(2), `ls /bin` → listed(14), `cat /session` →
+    printed(903), `wc /session /session` → totals line, clean exit/PSCI off.
