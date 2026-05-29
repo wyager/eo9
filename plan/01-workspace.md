@@ -115,3 +115,9 @@ None. Everything else depends on this.
     live) → print the publish sequence. The host chain checks clean on stable Rust, so plain
     `cargo install eo9` needs no nightly. Publishing itself is owner-run; nothing uploads from
     xtask.
+13. **Build targets auto-run `make setup` (2026-05-28, owner ask).** `make shell`/`www-build`/`qemu`/`ci`
+    now depend on an `ensure-setup` target: when an installable prerequisite (the `wasm-tools` CLI or the
+    wasm32 target) is missing it announces "running 'make setup' first" and runs the idempotent setup,
+    instead of erroring with a pointer; when everything is present it is two silent `command -v`-style
+    checks. QEMU stays check-only (a system package we never install). `make setup`/`doctor` behavior is
+    unchanged.
