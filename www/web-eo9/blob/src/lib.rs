@@ -357,8 +357,11 @@ pub extern "C" fn eosh_instantiate() -> i32 {
 }
 
 /// Boot eosh one-shot on a command line written into a `web_alloc` buffer by the page.
+///
+/// # Safety
+/// `ptr`/`len` must describe a live [`web_alloc`] buffer the page filled with UTF-8.
 #[unsafe(no_mangle)]
-pub extern "C" fn eosh_command(ptr: *const u8, len: usize) -> i32 {
+pub unsafe extern "C" fn eosh_command(ptr: *const u8, len: usize) -> i32 {
     let command = unsafe { page_str(ptr, len) }.to_owned();
     report("eosh", execsurface::boot_eosh(&command))
 }
@@ -450,8 +453,12 @@ pub extern "C" fn probe_read_line() -> i32 {
 
 /// Fetch one of the page store's programs and run `main` with the given arguments
 /// (`args` = unit-separator-joined fields written into a `web_alloc` buffer by the page).
+///
+/// # Safety
+/// Both (pointer, length) pairs must describe live [`web_alloc`] buffers the page filled
+/// with UTF-8.
 #[unsafe(no_mangle)]
-pub extern "C" fn run_program(
+pub unsafe extern "C" fn run_program(
     name_ptr: *const u8,
     name_len: usize,
     args_ptr: *const u8,
