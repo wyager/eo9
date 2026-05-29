@@ -764,3 +764,14 @@ still ok (only vm.css/vm.js/index.html and their precompressed siblings changed)
 with real key events confirms the width, the absence of stray `> ` lines, `eosh> hello` rendering on one
 line while typing (cursor on the same line), and the bare `hello` command running to `ok: greeted`.
 The "Explore the sandbox" `env` line from D32 remains the deliberate follow-up.
+
+## Decision 34 — routine /vm asset refresh for the changed guest components (2026-05-29)
+
+The committed /vm assets were rebuilt once (`build-web-vm`) so the page's blob and store pick up the guest
+components that changed since the last rebuild — chiefly the eosh `&`-refusal wording (the operand-naming
+fix, plan/10 D15) and the WIT round-out's disk/net stub changes (plan/02 D20). Every store entry and the
+blob re-fingerprinted (blob now `web-eo9.563c4cb367d769bf.wasm`, 8,847,297 B raw / 1,730,029 B brotli);
+no page JS/CSS/HTML or blob source changed. Verified: check-web-vm ok, all four node/JSPI harnesses pass,
+and a one-off harness run confirmed `entropy.seeded & echo` at the browser prompt now names `echo` and
+suggests the `$` spelling. Few-byte drift in otherwise-unchanged components is the known checkout-path
+residue (D26).
