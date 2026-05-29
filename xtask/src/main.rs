@@ -20,6 +20,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-sockcheck",
     "eo9-example-lspci",
     "eo9-example-l2check",
+    "eo9-example-l4check",
     "eosh",
     // Basic coreutils (guest/coreutils/*, plan/17-coreutils.md).
     "eo9-coreutil-cat",
@@ -52,6 +53,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-net-l4-deny",
     "eo9-stub-net-l4-loopback",
     "eo9-stub-net-l4-none",
+    "eo9-stub-net-l4-over-l2",
     "eo9-stub-net-virtio",
     "eo9-stub-pci-none",
     "eo9-stub-perf-none",

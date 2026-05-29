@@ -1,0 +1,15 @@
+[package]
+name = "eo9-example-l4check"
+description = "Eo9 example program: prove a transport-layer (eo9:net/l4) provider carries real traffic — send a UDP DNS query to the QEMU user-net resolver (10.0.2.3) and report the answer, then attempt a TCP connection to the gateway and report its typed outcome (targets the eo9-examples:l4check/l4check world: net l4 + io)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

@@ -1,0 +1,25 @@
+/// eo9:net-l4-over-l2 — the TCP/IP middleware world (plan/09 Decision 18).
+///
+/// `net.l4.over-l2` is the layered-net design's payoff: a whole TCP/IP stack as
+/// ordinary provider middleware. It imports the link layer (`eo9:net/l2` — whichever
+/// provider is composed below it: `net.virtio` on metal, a mock in tests), the
+/// monotonic clock (`eo9:time/time` — TCP retransmission and ARP timers), and entropy
+/// (`eo9:entropy/entropy` — ephemeral ports and TCP initial sequence numbers), and
+/// exports transport sockets (`eo9:net/l4`), so a program that imports only `l4`
+/// gets working TCP and UDP by composition:
+///
+///   net.virtio $ net.l4.over-l2 $ program
+///
+/// There is no configure interface yet (adding one needs an `l4-over-l2-config`
+/// interface in `wit/net`, recorded as a follow-up): the documented default addressing
+/// is QEMU user-mode networking's layout — 10.0.2.15/24 with gateway 10.0.2.2 — bound
+/// lazily on first use, so plain composition works and never traps (plan/09 D14).
+package eo9:net-l4-over-l2@0.1.0;
+
+world l4-over-l2 {
+    import eo9:net/l2@0.1.0;
+    import eo9:time/time@0.1.0;
+    import eo9:entropy/entropy@0.1.0;
+
+    export eo9:net/l4@0.1.0;
+}
