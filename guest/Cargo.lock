@@ -195,6 +195,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-example-l2check"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-example-lspci"
 version = "0.0.0"
 dependencies = [
@@ -365,6 +373,14 @@ dependencies = [
 
 [[package]]
 name = "eo9-stub-net-l4-none"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-net-virtio"
 version = "0.0.0"
 dependencies = [
  "eo9-guest",

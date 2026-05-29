@@ -1106,7 +1106,24 @@ preemption/hardening work.
     feeding the `eo9:net` l2 layer, and store-on-disk so the artifact cache itself can live on the virtio
     device.
 
-51. **x86_64 port, milestones 1–2: PVH boot + serial + heap, timer + interrupt delivery + event-driven idle
+51. **The metal network demo: `net.virtio $ l2check` on QEMU aarch64 (2026-05-29, branch
+    `area/09-virtio-net`).** Like the storage stack (D50), the kernel needed no changes — the eo9:pci
+    provider was enough for a working virtio-net driver as a guest component (plan/09 D17). What this
+    branch adds around it: `KERNEL_STORE_COMPONENTS` gains `net.virtio` and `l2check` (store now 18
+    entries), and xtask's `qemu` accepts a bare `net` argument — consumed by xtask, never reaching the
+    kernel command line — that attaches a modern virtio-net PCI function backed by QEMU user-mode
+    networking (`-netdev user,id=eo9net -device virtio-net-pci,netdev=eo9net,disable-legacy=on`), so
+    `cargo xtask qemu aarch64 pci net` is the whole recipe. With the explicit netdev QEMU suppresses its
+    default transitional NIC, so the no-flag PCI view (and the `lspci` count of 3) is unchanged. Verified
+    on QEMU aarch64 metal: the composed `net.virtio $ l2check` compiles on-target, probes the NIC, and
+    ARP-resolves the slirp gateway (`10.0.2.2 is at 52:55:0a:00:02:02`); the aarch64 and riscv64 demo
+    transcripts and the aarch64 interactive/lspci paths are unchanged (the riscv64 store also carries the
+    two new components — the riscv64 PCI story itself is still the recorded follow-up, since the ECAM
+    bring-up in `src/pci.rs` is aarch64-virt-specific). Follow-ups unchanged from D50 plus: a riscv64 PCI
+    provider if drivers should run there too, and the l3/l4-over-l2 middleware as the first real consumer
+    of this link layer.
+
+52. **x86_64 port, milestones 1–2: PVH boot + serial + heap, timer + interrupt delivery + event-driven idle
     on QEMU `q35` (2026-05-29, branch `area/12-x86-64`).** The third architecture follows the same ladder as
     riscv64 (D45), reusing the D44 arch split unchanged — the shared core, heap, and wasm layers needed no
     edits. `cargo xtask build-kernel x86_64` builds the feature-less image for `x86_64-unknown-none` (linked
