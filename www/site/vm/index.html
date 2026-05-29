@@ -28,19 +28,43 @@
 <main>
 
   <pre id="vm-output">fetching the Eo9 OS (about 1.8&nbsp;MB compressed)…</pre>
+  <p class="vm-note">Type straight into the terminal — there is no separate input box.
+    <code>exit</code> ends the session; reload the page for a fresh one.</p>
 
-  <div id="vm-input-row">
-    <label for="vm-input">terminal input</label>
-    <input id="vm-input" type="text" placeholder="type a command and press Enter at the eosh> prompt…"
-           spellcheck="false" autocomplete="off" disabled>
-  </div>
+  <h2>Explore the sandbox</h2>
+  <p>The shell can tell you everything about itself — the loop is: see what exists, inspect it,
+    then compose it.</p>
+  <ul class="vm-examples">
+    <li>
+      <code>help</code>
+      <span>what the shell offers: the builtins below plus the composition operators
+        (<code>$</code>, <code>&amp;</code>, <code>only</code>, <code>with … as</code>).</span>
+    </li>
+    <li>
+      <code>ls /bin</code>
+      <span>every program and provider in this session's store — all of them Eo9 components.</span>
+    </li>
+    <li>
+      <code>describe hello</code> &nbsp;and&nbsp; <code>describe entropy.seeded</code>
+      <span>what something <em>is</em> before you run it: its kind, the capabilities it imports, the
+        arguments it takes (a binary like <code>hello</code>), or the APIs it provides
+        (a provider like <code>entropy.seeded</code>).</span>
+    </li>
+    <li>
+      <code>entropy.seeded --seed 7 $ rng --count 2</code>
+      <span>compose what you just learned: <code>rng</code> imports entropy,
+        <code>entropy.seeded</code> provides it, so <code>$</code> plugs one into the other.</span>
+    </li>
+  </ul>
 
   <h2>Things to try</h2>
   <ul class="vm-examples">
     <li>
-      <code>hello --name web --excited true</code>
-      <span>run a real Eo9 program: typed arguments in, a typed outcome (<code>greeted</code>) out —
-        no argv, no exit-code guessing.</span>
+      <code>describe hello</code><br>
+      <code>hello --name user</code>
+      <span>run a program: look at what it needs first, then run it — typed arguments in
+        (both are optional here, so a bare <code>hello</code> works too), a typed outcome
+        (<code>greeted</code>) out. No argv, no exit-code guessing.</span>
     </li>
     <li>
       <code>rng --count 3</code> &nbsp;then&nbsp; <code>entropy.seeded --seed 43 $ rng --count 3</code>
@@ -49,17 +73,17 @@
         fused composition is compiled right here in the page.</span>
     </li>
     <li>
-      <code>only eo9:text/text,eo9:time/time $ hello --name boxed --excited true</code>
+      <code>only eo9:text/text,eo9:time/time $ hello</code>
       <span>capability lockdown that passes: the allow-list grants exactly what <code>hello</code>
         needs, so it runs.</span>
     </li>
     <li>
-      <code>only eo9:text/text $ hello --name boxed --excited true</code>
+      <code>only eo9:text/text $ hello</code>
       <span>capability lockdown that refuses: drop the clock from the allow-list and the program is
         rejected <em>before it runs</em> — the import it needs simply isn't there.</span>
     </li>
     <li>
-      <code>time.frozen --now-seconds 0 --monotonic-ns 0 $ hello --name frozen --excited true</code>
+      <code>time.frozen --now-seconds 0 --monotonic-ns 0 $ hello</code>
       <span>a virtualized clock: the program asks the OS for the time and gets exactly the instant you
         composed in — its timestamp reads <code>0.000000000</code>, every run, in any browser.</span>
     </li>
@@ -69,7 +93,6 @@
         the same programs run unchanged on native Eo9 and on the bare-metal kernel.</span>
     </li>
   </ul>
-  <p class="vm-note"><code>exit</code> ends the session; reload the page for a fresh one.</p>
 
   <h2>What this is actually doing</h2>
   <p>

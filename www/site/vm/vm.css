@@ -1,4 +1,4 @@
-/* Eo9 try-it page: the terminal, its input row, and the example list. */
+/* Eo9 try-it page: the terminal (typed into directly) and the example list. */
 
 #vm-output {
   background: #111;
@@ -25,24 +25,22 @@
   color: #fb6962;
 }
 
-#vm-input-row {
-  display: flex;
-  gap: 0.5rem;
-  align-items: center;
-  margin: 0.5rem 0 1rem 0;
+/* The in-progress command line, rendered inside the terminal while the shell is reading. */
+
+#vm-output .vm-cursor {
+  display: inline-block;
+  width: 0.55em;
+  height: 1em;
+  margin-left: 1px;
+  vertical-align: text-bottom;
+  background: #8ec07c;
+  animation: vm-cursor-blink 1.1s steps(1) infinite;
 }
 
-#vm-input-row input {
-  flex: 1;
-  font: inherit;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  padding: 0.35rem 0.5rem;
-  border: 1px solid #888;
-  border-radius: 4px;
-}
-
-#vm-input-row input:disabled {
-  opacity: 0.6;
+@keyframes vm-cursor-blink {
+  50% {
+    opacity: 0;
+  }
 }
 
 /* The "things to try" list: a command line, then a one-line caption under it. */

@@ -1,5 +1,5 @@
 {
-  "blob": "/vm/web-eo9.0aaa54f42a161e3b.wasm",
+  "blob": "/vm/web-eo9.3e025d27e0759c90.wasm",
   "store": {
     "cat": "/vm/store/cat.c0433269724cf6ca.cwasm",
     "cp": "/vm/store/cp.7e0b284de206e3a7.cwasm",
@@ -7,7 +7,7 @@
     "echo": "/vm/store/echo.f64c8aced6acfac4.cwasm",
     "find": "/vm/store/find.9427bf33e505de57.cwasm",
     "head": "/vm/store/head.1e17b272266a8174.cwasm",
-    "hello": "/vm/store/hello.4478b0b5533d784e.cwasm",
+    "hello": "/vm/store/hello.3cdb93428c348a74.cwasm",
     "ls": "/vm/store/ls.769d09733edbc92c.cwasm",
     "mkdir": "/vm/store/mkdir.51753c872e4043a3.cwasm",
     "outcomes": "/vm/store/outcomes.37d50b907e394347.cwasm",
