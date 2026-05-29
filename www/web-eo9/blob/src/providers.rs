@@ -47,7 +47,15 @@ pub struct WebState {
     pub fs: crate::fs::MemFs,
     pub buffers: crate::fs::BufferTable,
     pub exec: crate::execsurface::ExecTables,
+    /// The store's `eo9:rt/diagnostics` slot: the panic message the guest reported just
+    /// before trapping, if any (write-once, bounded — see [`WebState::report_panic`]).
+    /// Read host-side when a trap is rendered into a `trapped(reason)`; never guest-readable.
+    pub panic_message: Option<String>,
 }
+
+/// Ceiling on a reported panic message (bytes); anything longer is truncated on a char
+/// boundary — mirrors `eo9-runtime`'s bound so diagnostics never hold unbounded data.
+const MAX_PANIC_MESSAGE_BYTES: usize = 1024;
 
 impl WebState {
     pub fn new() -> Self {
@@ -58,7 +66,37 @@ impl WebState {
             fs,
             buffers: crate::fs::BufferTable::default(),
             exec: crate::execsurface::ExecTables::default(),
+            panic_message: None,
         }
+    }
+
+    /// Record the guest's reported panic message (write-once: the first report wins).
+    pub fn report_panic(&mut self, message: String) {
+        if self.panic_message.is_some() {
+            return;
+        }
+        let mut message = message;
+        if message.len() > MAX_PANIC_MESSAGE_BYTES {
+            let mut end = MAX_PANIC_MESSAGE_BYTES;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+            message.push('…');
+        }
+        self.panic_message = Some(message);
+    }
+}
+
+/// Render a trap reason, folding in the guest's reported panic message when one exists —
+/// the same shape usermode's `eo9-runtime::trap` produces: the SDK panic handler reports
+/// "<message> at <file>:<line>" through `eo9:rt/diagnostics.report-panic` just before the
+/// panic lowers to the `unreachable` trap, so a message in the slot means the error that
+/// followed is that panic.
+pub fn trapped_reason(error: &wasmtime::Error, panic_message: Option<&str>) -> String {
+    match panic_message {
+        Some(message) => std::format!("guest panicked: {message} — {error}"),
+        None => std::format!("{error}"),
     }
 }
 
@@ -109,9 +147,28 @@ struct WitInstant {
 /// Register all browser root providers (text, time, entropy — each with its `types`
 /// resource). Used for an unrestricted run.
 pub fn add_providers(linker: &mut Linker<WebState>) -> Result<()> {
+    add_diagnostics(linker)?;
     add_text(linker)?;
     add_time(linker)?;
     add_entropy(linker)?;
+    Ok(())
+}
+
+/// Register `eo9:rt/diagnostics`: the write-once panic-message sink for the trap path.
+/// Always registered, never gated by an `only` allow-list — it is runtime contract between
+/// the SDK and the executor (every SDK-built component imports it from its panic handler),
+/// not a capability: the host stores at most one bounded message per store, no guest can
+/// ever read it back, and it is observable in exactly one place — a subsequent
+/// `trapped(reason)`. Mirrors `eo9-runtime::link::add_diagnostics` and the kernel.
+pub fn add_diagnostics(linker: &mut Linker<WebState>) -> Result<()> {
+    let mut diagnostics = linker.instance("eo9:rt/diagnostics@0.1.0")?;
+    diagnostics.func_wrap(
+        "report-panic",
+        |mut store: StoreContextMut<'_, WebState>, (message,): (String,)| -> Result<()> {
+            store.data_mut().report_panic(message);
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 
@@ -124,6 +181,10 @@ pub fn add_providers(linker: &mut Linker<WebState>) -> Result<()> {
 /// authority interface, so a program never needs a family's `types` unless it imports that
 /// family.
 pub fn add_providers_for(linker: &mut Linker<WebState>, allow: Option<&[String]>) -> Result<()> {
+    // The diagnostics sink is never subject to the allow-list (`only` always admits
+    // `eo9:rt/diagnostics` — see `eo9-component::restrict`): it grants no authority and is
+    // required for any SDK-built child to instantiate at all.
+    add_diagnostics(linker)?;
     if family_admitted(allow, "eo9:text/text") {
         add_text(linker)?;
     }

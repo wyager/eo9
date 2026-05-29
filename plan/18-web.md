@@ -663,3 +663,34 @@ alongside the already-recorded `wiring` registration — or newly built componen
 /bin program) will fail to instantiate in the browser. The committed assets predate the import and keep
 working until then. Registering it as a per-child write-once slot surfaced in the child's trapped outcome
 matches the usermode/kernel behavior; accepting and ignoring it is the minimum.
+
+## Decision 30 — the blob registers `eo9:rt/diagnostics`; guest panic messages reach the browser's trapped reasons (2026-05-29)
+
+The SDK's panic handler now reports the panic message and source location through a
+`eo9:rt/diagnostics.report-panic` import that every SDK-built component carries (plan/02 D19, plan/07 D13),
+so the blob had to serve that import before any `/vm` asset rebuild. Implemented as the full usermode mirror
+rather than the accept-and-ignore minimum:
+
+- `providers.rs`: `WebState` gains a write-once, 1 KiB-bounded `panic_message` slot (char-boundary
+  truncation, mirroring `eo9-runtime`); `add_diagnostics` registers `report-panic` into it and is called from
+  both `add_providers` and `add_providers_for` — never gated by an `only` allow-list, matching
+  `eo9-component::restrict`'s always-admit rule (the sink grants no authority and is required for any
+  SDK-built child to instantiate). `trapped_reason(error, panic_message)` renders
+  `guest panicked: <message> at <file>:<line> — <wasmtime error>` when a message was reported.
+- `execsurface.rs`: `run_child_inner` no longer `?`s the `main` error away — it flattens the three result
+  layers with the store still in scope and folds the slot into the child's `trapped(...)` outcome (the reason
+  eosh prints). `is_root_provided` adds `eo9:rt/diagnostics`, since the executor itself serves it — without
+  that, `compile` refused every freshly built program with `NotClosed(["eo9:rt/diagnostics"])`.
+- `store.rs` (`run_program`): same fold for the page/JS path. `lib.rs`'s `entropy.seeded` demo (a bare
+  `Linker<()>`) registers an accept-and-drop sink so the rebuilt stub still instantiates.
+- The demo `Linker<()>` paths for the hand-written seed component are untouched (it is not SDK-built).
+
+Assets rebuilt once (`build-web-vm`): every store/`/bin` program and eosh now carry the import; blob
+8,830,026 B raw / 1,725,392 B brotli (+74 KB raw / +11 KB wire over D29 — the import set grew in every
+embedded program). Verification: verify-eosh 19/19 (offline), verify-coreutils **15/15** including a new
+check that `outcomes` in trap mode reports
+`guest panicked: outcomes: trapping as requested at examples/outcomes/src/lib.rs:<line>` through
+`run_program`; verify-fs and verify-exec pass; `check-web-vm` ok; a headless-Chrome `--dump-dom` smoke
+against the served worktree site auto-boots to the `eosh>` prompt with no interaction. The eosh-spawn fold
+(`run_child`) shares the same slot/render code but is not separately driven by the harness — `/bin` ships no
+panicking program; if one is ever added, assert the message at the prompt too.
