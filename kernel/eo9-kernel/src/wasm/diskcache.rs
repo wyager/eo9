@@ -50,14 +50,20 @@ const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
 static MAC_KEY: &[u8; 32] = include_bytes!(env!("EO9_STOREDISK_MAC_KEY"));
 
 /// Magic introducing one cache entry on disk. Entry layout: magic, artifact length
-/// (u64 little-endian), keyed-blake3 tag over `length || artifact`, then the artifact.
+/// (u64 little-endian), keyed-blake3 tag over `cache-key || length || artifact`, then the
+/// artifact.
 const ENTRY_MAGIC: &[u8; 8] = b"EO9CACH1";
 const ENTRY_HEADER_BYTES: usize = 8 + 8 + 32;
 
-/// The keyed tag for one artifact. The length is folded in so a tag computed over a longer
-/// artifact cannot be reused for a truncated rewrite of the same entry.
-fn entry_tag(artifact: &[u8]) -> [u8; 32] {
+/// The keyed tag for one artifact. The cache key (the entry's own name) is folded in so a
+/// valid entry cannot be copied over a *different* entry's path — composition X can never
+/// be served composition Y's artifact, even though both tags verify under the same key.
+/// The length is folded in so a tag computed over a longer artifact cannot be reused for a
+/// truncated rewrite of the same entry. (The key is a fixed-length blake3 hex string, so
+/// the concatenation is unambiguous.)
+fn entry_tag(key: &str, artifact: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_keyed(MAC_KEY);
+    hasher.update(key.as_bytes());
     hasher.update(&(artifact.len() as u64).to_le_bytes());
     hasher.update(artifact);
     *hasher.finalize().as_bytes()
@@ -270,7 +276,7 @@ pub fn lookup(key: &str) -> Option<Vec<u8>> {
         stored_tag.copy_from_slice(&bytes[16..48]);
         let artifact = &bytes[ENTRY_HEADER_BYTES..];
         // blake3::Hash's equality is constant-time; compare through it.
-        if blake3::Hash::from(stored_tag) != blake3::Hash::from(entry_tag(artifact)) {
+        if blake3::Hash::from(stored_tag) != blake3::Hash::from(entry_tag(key, artifact)) {
             crate::kprintln!(
                 "storedisk: cached entry failed integrity verification (keyed tag mismatch); \
                  it will be recompiled"
@@ -300,7 +306,7 @@ pub fn store(key: &str, artifact: &[u8]) {
         let mut entry = Vec::with_capacity(ENTRY_HEADER_BYTES + artifact.len());
         entry.extend_from_slice(ENTRY_MAGIC);
         entry.extend_from_slice(&(artifact.len() as u64).to_le_bytes());
-        entry.extend_from_slice(&entry_tag(artifact));
+        entry.extend_from_slice(&entry_tag(key, artifact));
         entry.extend_from_slice(artifact);
         let result = (|| -> Result<(), eofs_core::FsError> {
             if mounted.fs.stat(CACHE_DIR).is_err() {
