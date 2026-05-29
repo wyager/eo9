@@ -1052,3 +1052,35 @@ preemption/hardening work.
     set: ~34.7 MB. Remaining for the port: milestone 6 parity checks — Ctrl-C / RX-ring consumption while a
     foreground child runs on riscv64, and an idle host-CPU measurement to confirm the WFI path is as quiet
     as aarch64's.
+49. **riscv64 milestone 6: interactive parity verified — Ctrl-C, idle power, and the first-byte root cause
+    (2026-05-29, branch `area/12-riscv64-m6`).** The riscv64 port is now at interactive parity with
+    aarch64; no kernel code changes were needed (the branch's delta is one stale module-header comment in
+    `arch/riscv64/boot.rs` plus this record).
+    - *Ctrl-C while a foreground child runs:* verified on QEMU riscv64 — `cruncher --seed 9 --rounds
+      100000000000` at the eosh prompt, `0x03` over the serial pipe → `abnormal: killed`, the prompt
+      returns, `hello --name afterctrlc` runs (`ok: greeted`), `exit` → clean SBI shutdown. The shared
+      `task.wait` interrupt-key check (D39) consumes the riscv64 16550 RX ring exactly as it does the
+      PL011's; nothing arch-specific was missing.
+    - *Idle power:* with the kernel parked at an idle eosh prompt, host `qemu-system-riscv64` measures
+      **0.0 % CPU across 5 samples** (4 s apart, `ps -o %cpu`), identical to `qemu-system-aarch64`
+      re-measured the same way on the same machine — the masked-`wfi` + SBI-timer/RX-interrupt wake design
+      is as quiet as the aarch64 original.
+    - *The "first byte of the first line is dropped" report (m5 review):* root-caused, and it is not a
+      kernel RX bug. When a scripted session pipes its input from the moment QEMU starts, the host chardev
+      parks the first byte in the 16550 receive register before any guest code has run; OpenSBI's own UART
+      bring-up (FIFO enable + clear) then discards it before the Eo9 kernel exists, so the kernel never
+      sees it. Once the kernel is running the path is lossless: the same script synchronized to the prompt
+      (sleep until `eosh>` appears, as the QEMU smoke scripts already do for every other case) delivers the
+      full first line — `hello --name rv64 --excited true` → `ok: greeted` — and the Ctrl-C transcript
+      above types three further full lines without loss. aarch64 is only "immune" because it boots with no
+      firmware stage: the parked byte survives in the PL011 until the kernel drains it (verified: the same
+      immediate pipe on aarch64 keeps its first byte). Convention recorded: scripted serial sessions should
+      wait for the prompt before sending input (which is also what a human at the console does); there is
+      nothing for the kernel to fix and no detection possible (the byte is destroyed before handoff, with
+      no overrun flag left behind).
+    - *Deliberate differences from aarch64, unchanged by this milestone:* S-mode under OpenSBI rather than
+      bare EL1 (so SBI calls for timer/power and a firmware stage that owns early console bring-up), PLIC +
+      16550A instead of GICv2 + PL011, the hard-float trap frame, the fixed 10 MHz timebase constant, and
+      the kernel image remaining RWX under Sv39 exactly as it is under the aarch64 map (D41/D48). Everything
+      observable at the shell — outcomes, digests, entropy streams, preemption, Ctrl-C, on-target codegen,
+      idle behaviour — matches aarch64.
