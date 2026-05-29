@@ -13,8 +13,13 @@ mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub(crate) use aarch64::*;
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "riscv64")]
+mod riscv64;
+#[cfg(target_arch = "riscv64")]
+pub(crate) use riscv64::*;
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
 compile_error!(
-    "the Eo9 bare-metal kernel covers aarch64 so far (riscv64 is next; plan/12-kernel.md); \
-     build for that target or on the host triple (where this crate is a stub)"
+    "the Eo9 bare-metal kernel covers aarch64 and riscv64 so far (plan/12-kernel.md); \
+     build for one of those targets or on the host triple (where this crate is a stub)"
 );

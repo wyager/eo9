@@ -893,3 +893,50 @@ preemption/hardening work.
     harness couldn't pace input over the interrupt-driven console to capture it separately.) Also corrected
     the now-stale `gic.rs` module header (IRQs are taken via `kirq` now, not masked-WFI). Remaining: finer
     W^X for the kernel image's own `.text`/`.rodata`; guard regions.
+
+42. **The architecture layer is split out of the shared core (2026-05-28).** Preparation for the riscv64
+    port (the breadth step of the roadmap). Everything aarch64-specific — the boot stub and exception
+    vectors, GICv2, the identity-map MMU + W^X flip, PL011, PL031, generic timer, PSCI — moved from flat
+    `src/*.rs` modules to `src/arch/aarch64/`, behind a per-architecture surface that every port provides
+    identically: the `mmu` / `power` / `rtc` / `timer` / `uart` modules (re-exported at the crate root by
+    main.rs, so the shared core keeps saying `crate::timer::…` with no `target_arch` cfgs anywhere outside
+    `src/arch/`), plus `banner()`, `interrupts_init()`, and `NAME`. Three formerly inline aarch64-isms moved
+    behind that surface: the wasmtime engine's target string (now the per-arch `NATIVE_TARGET`), the code
+    publisher's cache maintenance (`mmu::flush_code_range`), and the executor's masked-`wfi` idle step
+    (`timer::wait_for_interrupt`); build.rs selects the linker script per target arch (`linker-aarch64.ld` /
+    `linker-riscv64.ld`). One real bug surfaced by the split: the idle halt sequence used `options(nomem)` on
+    the `wfi`/unmask asm, so nothing told the compiler that the interrupt taken at the unmask writes memory
+    (the UART input ring) that the caller re-reads immediately — the old inline placement happened to provide
+    the barrier via call boundaries, and extracting the sequence produced a kernel whose console input stalled
+    after a few dozen bytes. `wait_for_interrupt` now omits `nomem` on the halt/unmask instructions (it *is*
+    the memory barrier) and the comment says why. Verified: featureless ci green; the aarch64 `qemu demo`
+    transcript is unchanged (modulo the heap-start address, the image got slightly smaller) and a scripted
+    interactive eosh session (ls / unknown command / parse error / exit) completes exactly as before.
+
+43. **riscv64 port, milestones 1–2: boot + serial + heap + timer + interrupt delivery on QEMU `virt`
+    (2026-05-28).** `cargo xtask build-kernel riscv64` builds a feature-less image
+    (`riscv64gc-unknown-none-elf`, linked at 0x8020_0000, `linker-riscv64.ld`) and `cargo xtask qemu riscv64`
+    boots it under `qemu-system-riscv64 -M virt,aia=none -smp 1 -m 512M -nographic` with QEMU's bundled
+    OpenSBI as `-bios`: banner (S-mode, 10 MHz timebase, Goldfish-RTC wall clock), bare-mode `mmu` notice,
+    507 MiB heap + self-test, SBI-timer 10 ms polled check, an end-to-end *delivered-through-the-trap-path*
+    timer-interrupt check, `cmdline:` from the DTB QEMU passes in `a1`, and a clean SBI SRST shutdown so QEMU
+    exits by itself. The arch layer mirrors aarch64 module for module: 16550A UART at 0x1000_0000 with the
+    same interrupt-filled RX ring (PLIC source 10 → S-mode context 1, `aia=none` pinned for the same reason
+    GICv2 is pinned on aarch64), `time` CSR + SBI TIME for the timer (`disable` = set-timer(MAX), which is how
+    the level drops before `sret`), Goldfish RTC for seconds-since-epoch, SBI SRST + the sifive_test finisher
+    as the power-off path, and a direct-mode trap entry that saves the caller-saved integer *and* FP registers
+    (the riscv64gc kernel is hard-float, unlike aarch64-unknown-none, and traps may land in Cranelift code) —
+    wrapped in `.option arch, +f, +d` because module-level asm is otherwise assembled against a baseline ISA
+    at higher opt levels. Known deltas from aarch64, all deliberate: translation stays off (`satp` Bare), so
+    `set_range_permissions` is a documented no-op and W^X for published JIT pages waits for the Sv39 step;
+    the heap stops 2 MiB short of the top of RAM because QEMU places the DTB there; the timebase frequency is
+    a constant (10 MHz on `virt`) rather than read back from the FDT; the UART RX interrupt path is wired and
+    enabled but has no consumer until the wasm executor lands, so it is design-verified only. `cargo xtask ci`
+    now builds and clippy-checks the feature-less kernel workspace for **both** bare-metal targets
+    (`KERNEL_CI_TARGETS`), so the port cannot rot silently; aarch64's `build-kernel`/`qemu` paths are
+    untouched (same QEMU invocation, same demo transcript). Next (milestone 3): host-AOT components against
+    the kernel providers — needs xtask's precompile step parameterized by target plus the `all-arch` cranelift
+    feature on the host wasmtime so it can emit riscv64, and the kernel's wasm features built for
+    riscv64gc (the vendored no_std closure is expected to be arch-clean but is unproven there); then the
+    baked store + eosh (milestone 4), Sv39 + W^X + on-target codegen (milestone 5), and fuel/preemption/Ctrl-C
+    parity (milestone 6).
