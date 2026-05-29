@@ -286,3 +286,34 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     encode+validate level (`provider-f` unit fixture); nothing runnable needs it yet. The other half of the
     D13 limitation — config interfaces on providers whose API interfaces own resources (fs, disk, net, pci) —
     is unchanged and tracked separately (see Decision 21).
+
+21. **Configuring resource-owning providers stays blocked on the binder-in-the-path design — wall analysis
+    and the recommended way out (2026-05-29).** With compound values baked (D20), the remaining blocker for
+    `configure(pci.filtered, --allow …)` and `configure(net.l4.over-l2, address …)` is structural, not about
+    argument encoding: both providers' API interfaces own resources (`eo9:pci/pci`: device/bar/interrupt/
+    dma-buffer; `eo9:net/l4`: l4-impl/tcp-connection/tcp-listener/udp-socket), and the binder gates
+    configuration by importing and re-exporting the provider's API interfaces through forwarders. Forwarding a
+    resource-owning interface means the binder must mint its own exported resource types and proxy every
+    handle in both directions (`[resource-new]`/`[resource-rep]`/`[dtor]` wrappers whose representation is the
+    provider-side handle), forward methods (not just freestanding functions), and reload variant-shaped async
+    results discriminant-dependently for `task.return` (every pci/l4 operation returns `result<…>`, many with
+    owned handles inside the payload). That is wit-component-adapter-generator territory re-implemented by
+    hand inside `configure.rs` — a multi-thousand-line, high-risk rewrite of the most delicate code in the
+    crate, and almost certainly the wrong direction. The component model also rules out the "obvious" dodge of
+    calling `configure` during instantiation (nothing may call out of a component while it is being
+    instantiated), which is why the binder sits in the API path at all. **Recommended way out (owner
+    decision needed, touches wit/ + all three executors, so it is not done on this branch):** stop putting the
+    binder in the API path. Let the configured wrapper re-export the provider's API instances *directly*
+    (plain wac aliases — no adapters, no proxying, resources keep their identity, zero per-call overhead) and
+    have the binder export a single parameterless entrypoint (e.g. `eo9:rt/configured@0.1.0#bind`) that calls
+    the provider's `configure` with the baked constants; the executor contract gains one uniform step — after
+    instantiation, before the first entry into the program, call `bind` on every instance that exports it
+    (usermode runtime, kernel shellexec/runner, browser blob: a few lines each). The artifact stays fully
+    algebraic (arguments and wiring are baked in; the runtime only pokes a no-argument function), it works for
+    every provider shape, and it would eventually let the forwarding binder — and its D13 caveat list — retire
+    entirely. Alternatives considered and not preferred: (a) the full binder-side resource-proxying rewrite
+    (cost/risk above); (b) host-side runtime-assisted configuration (the host marshals arbitrary WIT argument
+    values — strictly more host machinery than the bind hook for less algebraic purity); (c) per-feature
+    string-typed workarounds in the WIT (pushes the problem into every future compound config). The eosh
+    tokenizer's handling of unquoted `,` inside record/list literals should ride with whichever design is
+    chosen (today only quoted forms reach the algebra unscathed).
