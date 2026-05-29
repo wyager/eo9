@@ -1026,3 +1026,29 @@ preemption/hardening work.
     port: milestone 5 (Sv39 translation + W^X + the riscv64 backend in the vendored compile fork for
     on-target codegen) and milestone 6 parity checks (Ctrl-C / RX-ring consumption on riscv64, idle-power
     measurement); milestone 4's boot-to-eosh goal is already covered by the store image above.
+48. **riscv64 milestone 5: Sv39 + W^X + on-target codegen (2026-05-29, branch `area/12-riscv64-m5`).**
+    The riscv64 port now matches aarch64's depth. (a) `arch/riscv64/mmu.rs` builds an Sv39 identity map
+    mirroring the aarch64 layout: one read/write non-executable gigapage over the MMIO window
+    (UART/PLIC/RTC/test finisher), DRAM at 4 KiB page granularity (root → one mid-level table → 256 leaf
+    tables, ~1 MiB of static tables) with OpenSBI's reservation and the heap+DTB region read/write
+    non-executable and the kernel image+stack RWX, `satp` switched to Sv39 with `sfence.vma` on either
+    side; everything else is unmapped and faults. All leaf PTEs carry A/D/G so implementations without
+    hardware A/D updating never fault on first touch. (b) W^X: `set_range_permissions` rewrites the leaf
+    PTEs (R/W vs R/X) and issues per-page `sfence.vma`; the shared code publisher already orders writes and
+    runs `fence.i` (`flush_code_range`), so published code — deserialized or Cranelift-emitted — is never
+    writable and executable at once, exactly like aarch64 (D41). (c) On-target codegen: `build-kernel
+    riscv64` now enables `wasm-codegen` and passes the raw seed wasm; cranelift's riscv64 backend is
+    selected automatically by `host-arch` when compiling for the target. One vendored addition was needed:
+    registry `cranelift-codegen` 0.132.0 uses the std-only `f64::powi` in four constant comparisons in the
+    riscv64 backend (`src/isa/riscv64/inst/args.rs`), so the crate is now vendored with those four constants
+    spelled as exact power-of-two divisions — nothing else changed (kernel/vendor/README.md); the aarch64
+    build does not even compile that file. Verified on QEMU riscv64 `virt`: the demo runs entirely under
+    Sv39 (sched/preemption, seed/hello/async/entropy deserialize paths) and the on-target codegen step
+    compiles the seed component in ~99 ms and runs `hello()` / `add(17,25) -> 42` from W^X pages;
+    interactively, `time.frozen --now-seconds 5 --monotonic-ns 0 $ hello` composes, compiles on-target, and
+    prints the frozen instant (`[5.000000000] Hello, frozen!` → `ok: greeted`), and plain programs and
+    `exit` behave as before. aarch64 re-verified unchanged on the same branch (demo incl. on-target codegen,
+    interactive with a Ctrl-C kill, `pci program=lspci` → 3 devices). riscv64 image with the full feature
+    set: ~34.7 MB. Remaining for the port: milestone 6 parity checks — Ctrl-C / RX-ring consumption while a
+    foreground child runs on riscv64, and an idle host-CPU measurement to confirm the WFI path is as quiet
+    as aarch64's.
