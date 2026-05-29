@@ -254,7 +254,16 @@ mod entropy {
         let engine = engine(false)?;
         // SAFETY: produced by `cargo xtask build-web-vm` with the matching configuration.
         let component = unsafe { Component::deserialize(&engine, ENTROPY_SEEDED)? };
-        let linker: Linker<()> = Linker::new(&engine);
+        let mut linker: Linker<()> = Linker::new(&engine);
+        // The stub is SDK-built, so it imports the `eo9:rt/diagnostics` panic-report sink
+        // like every other guest; this demo path has no trap rendering of its own, so the
+        // message is accepted and dropped (the WebState paths fold it into `trapped(...)`).
+        linker.instance("eo9:rt/diagnostics@0.1.0")?.func_wrap(
+            "report-panic",
+            |_store: wasmtime::StoreContextMut<'_, ()>,
+             (_message,): (String,)|
+             -> wasmtime::Result<()> { Ok(()) },
+        )?;
         let mut store = Store::new(&engine, ());
         let instance = linker.instantiate(&mut store, &component)?;
         let configure = exported_func(

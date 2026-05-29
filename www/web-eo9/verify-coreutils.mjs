@@ -73,7 +73,7 @@ async function run(name, args) {
   return { rc, out: lines.join("\n") };
 }
 
-// (name, args, predicate over the combined output)
+// (name, args, predicate over the combined output, expected rc — defaults to 0)
 // The path-taking tools take a trailing variadic list of paths (positional, like the native
 // CLI): `cat` reads several files, a *bare* `ls` lists `/` (the missing tail defaults to []).
 const cases = [
@@ -95,12 +95,21 @@ const cases = [
   ["touch", ["/scratch/empty"], (o) => /success/.test(o)],
   ["rm", ["/docs/notes.txt"], (o) => /success/.test(o)],
   ["find", ["/", ".txt"], (o) => /welcome\.txt/.test(o)],
+  // Guest panic messages: a trapping program's reason carries the panic text it reported
+  // through `eo9:rt/diagnostics.report-panic` just before the trap (write-once, surfaced
+  // only on the trap path) — same shape as native `eo9 run` and the bare-metal kernel.
+  [
+    "outcomes",
+    ["trap", "panic-check"],
+    (o) => /guest panicked: outcomes: trapping as requested at .*outcomes\/src\/lib\.rs:\d+/.test(o),
+    1,
+  ],
 ];
 
 let pass = 0;
-for (const [name, args, ok] of cases) {
+for (const [name, args, ok, wantRc = 0] of cases) {
   const { rc, out } = await run(name, args);
-  const good = rc === 0 && ok(out);
+  const good = rc === wantRc && ok(out);
   if (good) pass++;
   const first = out.split("\n").filter((l) => /outcome|->|success|failure|error/.test(l)).slice(-1)[0] || out.split("\n")[0] || "";
   console.log(`${good ? "PASS" : "FAIL"}  ${name} ${args.join(" ")}  ::  ${first.slice(0, 90)}`);
