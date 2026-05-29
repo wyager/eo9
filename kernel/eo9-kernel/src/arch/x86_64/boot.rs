@@ -55,9 +55,10 @@ boot_gdt_descriptor:
 
 // ---------------------------------------------------------------------------------------
 // Statically assembled identity map: 0..4 GiB as 2 MiB pages, present + writable. Covers
-// the 512 MiB of RAM, the LAPIC/IOAPIC windows and the PCIe ECAM, so the running kernel
-// never has to touch these tables again (W^X for published JIT code arrives with the
-// codegen milestone, exactly as it did on riscv64 — plan/12).
+// the 512 MiB of RAM, the LAPIC/IOAPIC windows and the PCIe ECAM. Long mode cannot be
+// entered without paging, so this map exists only to reach `kmain`; mmu::init() then
+// builds the runtime 4 KiB-granular tables (with NX + WP for W^X) and switches CR3 away
+// from these.
 // Flags: 0x83 = present | writable | page-size (2 MiB leaf); 0x03 = present | writable.
 // ---------------------------------------------------------------------------------------
 .section .data.boot_pagetables, "aw"
