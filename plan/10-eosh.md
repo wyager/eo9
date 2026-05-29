@@ -139,3 +139,32 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
     `command-failed(string)` for every one-shot problem). `LineResult::ProgramFailed` carries a
     `CommandClass` (failed/trapped/killed) and `LineResult::Error` — nothing ran — maps to `not-runnable`,
     which is what lets the `eo9 shell -c` embedder report honest 0/1/2/3 exit codes (plan/11 D20).
+
+14. **Discoverability: help teaches by example, the banner points at it (2026-05-29, owner feedback).**
+    The owner's testing feedback: beyond `describe`, there was no good way for a new user to "explore the
+    sandbox". (a) `help` now shows a one-line example under each composition operator (`hello --name you`,
+    `entropy.seeded --seed 7 $ rng --count 2`, the `&` form, `only eo9:text,eo9:time $ hello`) and gained an
+    "explore the sandbox" block — `ls /bin`, `describe <name or expr>`, `imports <expr>`, `env`,
+    `env <expr>` — ahead of the builtins line; the two phrases the browser harness asserts on
+    ("compose: satisfy the program's imports", "builtins: help, env") are kept. (b) The interactive banner
+    is now "eosh — the Eo9 shell (type `help` to explore, `ls /bin` to see what's installed)" — the prefix
+    the CLI banner-count test matches is unchanged. (c) Confirmed (no change needed): `describe` of a
+    provider already lists its `configure` arguments (`describe entropy.seeded` → `--seed: u64`), because
+    `eo9-component::describe` extracts the configure signature for providers; the browser harness now
+    asserts it. (d) Deliberately not done: distinguishing providers from binaries in `ls /bin` — the listing
+    is a plain fs read and the kind is only known after a `describe` per entry; a `bin`-style builtin that
+    describes as it lists is the recorded follow-up if wanted.
+
+15. **`&` refusals name the offending operand (2026-05-29, owner-reported).** `entropy.seeded & echo` used
+    to be refused with "the left operand is not a provider" — wrong, since the left operand *is* a provider.
+    Root cause: `eo9-component`'s `extend` correctly checks both operands but its `ComposeError::NotAProvider`
+    carries no side, and the eosh backend rendered every such refusal with the `$` wording (which genuinely is
+    about the left operand). The check itself was never wrong; only the attribution was. Fix: the evaluator
+    now checks both operand kinds (one `describe` per side) before calling `extend`, where the operands'
+    source spellings are still known, and refuses with a message that names the operand at fault and — when
+    both operands are bare names — suggests the `$` spelling instead (`to run it with that provider use
+    `entropy.seeded $ echo``); when both operands are programs it says so plainly. The backend's rendering of
+    a raw `NotAProvider` from `&` (now only a backstop) no longer claims a side either; `$` keeps its
+    accurate left-operand wording. Cost: two metadata-only `describe` calls per `&` evaluation. Covered by
+    eosh-core unit tests (right/left/both/configured-operand cases) and a CLI transcript; the
+    eo9-component-level behaviour was already pinned by `algebra_properties`.

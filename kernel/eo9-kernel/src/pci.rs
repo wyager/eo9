@@ -1,4 +1,4 @@
-//! Minimal PCI Express host support for the QEMU `virt` machine: ECAM configuration-space
+//! Minimal PCI Express host support for the QEMU machines: ECAM configuration-space
 //! access, bus enumeration, BAR sizing/assignment, and bus-master control.
 //!
 //! This is the hardware half of the kernel's `eo9:pci` root provider
@@ -6,17 +6,16 @@
 //! interrupt routing yet — which is exactly the split the WIT draws: what registers *mean*
 //! is the wasm driver's business, this module just gets it to them safely.
 //!
-//! Address-map assumptions (QEMU `virt`, **`highmem=off`** — xtask passes it):
-//!
-//! * ECAM at `0x3f00_0000`, 16 MiB → buses 0–15, inside the identity-mapped device gigabyte
-//!   (`src/mmu.rs`), so configuration space is reachable without new page tables.
-//! * The 32-bit PCIe MMIO window at `0x1000_0000..0x3eff_0000`, also device-mapped. The
-//!   kernel boots without firmware, so nothing has assigned BAR addresses; [`assign_bar`]
-//!   hands out windows from this range with a bump allocator when a driver opens a BAR.
-//!
-//! With the default `highmem=on` QEMU moves the ECAM to `0x40_1000_0000`, outside the
-//! kernel's 4 GiB identity map — keep the xtask flag and this base in sync. Reading the
-//! ECAM base from the device tree instead is a noted follow-up (plan/12 Decisions).
+//! Where the ECAM and the 32-bit BAR window live differs per machine, so the addresses come
+//! from the per-architecture surface (`crate::arch::pci_map`): aarch64 `virt` with
+//! `highmem=off` (ECAM `0x3f00_0000`, BARs from `0x1000_0000..0x3eff_0000`), riscv64 `virt`
+//! (ECAM `0x3000_0000`, BARs from `0x4000_0000..0x8000_0000`), x86_64 `q35` (documented,
+//! not wired). Both verified machines keep these regions inside the identity map, so
+//! configuration space and assigned BARs are reachable without new page tables. The kernel
+//! boots without firmware BAR assignment on the `virt` machines; [`assign_bar`] hands out
+//! windows from the per-arch range with a bump allocator when a driver opens a BAR.
+//! Reading the ECAM base from the device tree instead is a noted follow-up (plan/12
+//! Decisions).
 //!
 //! Buses behind PCI-to-PCI bridges are not visible: assigning secondary bus numbers is a
 //! firmware job this kernel does not do yet, and every QEMU `virt` device added with a
@@ -24,16 +23,12 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// ECAM (PCIe configuration space) base on QEMU `virt` with `highmem=off`.
-const ECAM_BASE: usize = 0x3f00_0000;
-/// Buses covered by the 16 MiB low ECAM window (1 MiB per bus).
-const ECAM_BUSES: u8 = 16;
+use crate::arch::pci_map::{
+    ECAM_BASE, ECAM_BUSES, MMIO_BASE as PCIE_MMIO_BASE, MMIO_END as PCIE_MMIO_END,
+};
+
 /// Configuration space per PCIe function (extended config space).
 const CONFIG_SPACE_SIZE: u32 = 4096;
-
-/// 32-bit PCIe MMIO window on QEMU `virt`: where unassigned memory BARs get placed.
-const PCIE_MMIO_BASE: usize = 0x1000_0000;
-const PCIE_MMIO_END: usize = 0x3eff_0000;
 
 /// Bump pointer for BAR assignment (no firmware has placed anything, so the whole window
 /// is ours). Single core; the atomic is for soundness, not contention.

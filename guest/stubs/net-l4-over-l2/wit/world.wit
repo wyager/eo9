@@ -10,10 +10,11 @@
 ///
 ///   net.virtio $ net.l4.over-l2 $ program
 ///
-/// There is no configure interface yet (adding one needs an `l4-over-l2-config`
-/// interface in `wit/net`, recorded as a follow-up): the documented default addressing
-/// is QEMU user-mode networking's layout — 10.0.2.15/24 with gateway 10.0.2.2 — bound
-/// lazily on first use, so plain composition works and never traps (plan/09 D14).
+/// `eo9:net/l4-over-l2-config.configure` binds the static IPv4 addressing (address,
+/// prefix length, gateway, optional DNS server). The documented default — used whenever
+/// the provider is composed without `configure` — is QEMU user-mode networking's layout,
+/// 10.0.2.15/24 with gateway 10.0.2.2, bound lazily on first use, so plain composition
+/// works and never traps (plan/09 D14).
 package eo9:net-l4-over-l2@0.1.0;
 
 world l4-over-l2 {
@@ -22,4 +23,5 @@ world l4-over-l2 {
     import eo9:entropy/entropy@0.1.0;
 
     export eo9:net/l4@0.1.0;
+    export eo9:net/l4-over-l2-config@0.1.0;
 }

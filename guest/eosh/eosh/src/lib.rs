@@ -118,9 +118,16 @@ fn restrict_error(err: component_algebra::RestrictError) -> BackendError {
 fn compose_error(operation: &str, err: component_algebra::ComposeError) -> BackendError {
     use component_algebra::ComposeError as E;
     BackendError::new(match err {
-        E::NotAProvider => format!(
+        // `$` checks exactly its left operand; `&` refuses when either operand is not a
+        // provider, so its message must not claim a side (the evaluator usually catches
+        // this earlier and names the operand — this is the backstop).
+        E::NotAProvider if operation == "`$`" => format!(
             "{operation} refused: the left operand is not a provider (only providers can \
              satisfy imports)"
+        ),
+        E::NotAProvider => format!(
+            "{operation} refused: an operand is not a provider (`&` combines providers into \
+             an environment; use `$` to run a program with a provider)"
         ),
         E::TypeMismatch(msg) => {
             format!("{operation} refused: capability types do not match: {msg}")
@@ -412,9 +419,10 @@ impl Guest for Eosh {
             // Interactive mode: read lines until end of input or `exit`.
             None => {
                 let text = text::default();
-                session
-                    .backend_mut()
-                    .print("eosh — the Eo9 shell (type `help`)");
+                session.backend_mut().print(
+                    "eosh — the Eo9 shell (type `help` to explore, `ls /bin` to see what's \
+                         installed)",
+                );
                 loop {
                     if text::write(&text, text::OutputStream::Out, "eosh> ").is_err() {
                         return Err(ProgramFailure::Io("writing the prompt failed".to_string()));

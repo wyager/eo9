@@ -112,12 +112,17 @@ const STATUS_FEATURES_OK: u64 = 8;
 
 /// `VIRTIO_F_VERSION_1` is feature bit 32: bit 0 of the high feature word.
 const FEATURE_VERSION_1_HIGH: u64 = 1;
+/// `VIRTIO_BLK_F_FLUSH` is feature bit 9 (low feature word). Negotiating it lets the
+/// driver issue explicit cache-flush requests; a device that does not offer it is
+/// write-through by definition (the spec), so flush is then a successful no-op.
+const FEATURE_BLK_FLUSH_LOW: u64 = 1 << 9;
 
 /// virtio-blk sector size (fixed by the spec).
 const SECTOR: u64 = 512;
 /// virtio-blk request types.
 const BLK_T_IN: u32 = 0; // device-to-driver: our disk read
 const BLK_T_OUT: u32 = 1; // driver-to-device: our disk write
+const BLK_T_FLUSH: u32 = 4; // make every completed write durable
 /// Request status byte values; anything non-zero is a device-reported failure.
 const BLK_S_OK: u8 = 0;
 
@@ -206,6 +211,8 @@ struct Driver {
     /// Used-ring entries consumed so far (free-running).
     used_index: u16,
     capacity_bytes: u64,
+    /// Whether `VIRTIO_BLK_F_FLUSH` was offered and negotiated (see `flush_device`).
+    flush_supported: bool,
 }
 
 /// Failures of the byte-addressed disk operations, mapped to the WIT error variants by
@@ -299,6 +306,7 @@ impl Driver {
             avail_index: 0,
             used_index: 0,
             capacity_bytes: 0,
+            flush_supported: false,
         };
         driver.start(notify_multiplier)?;
         Ok(driver)
@@ -327,8 +335,10 @@ impl Driver {
             STATUS_ACKNOWLEDGE | STATUS_DRIVER,
         )?;
 
-        // Feature negotiation: accept exactly VIRTIO_F_VERSION_1. The device must offer
-        // it (it is what makes the modern register layout above valid at all).
+        // Feature negotiation: accept exactly VIRTIO_F_VERSION_1, plus VIRTIO_BLK_F_FLUSH
+        // when the device offers it (so `flush` can issue real cache flushes). The device
+        // must offer VERSION_1 (it is what makes the modern register layout above valid
+        // at all).
         self.common_write(COMMON_DEVICE_FEATURE_SELECT, pci::AccessWidth::Dword, 1)?;
         let high_features = self.common_read(COMMON_DEVICE_FEATURE, pci::AccessWidth::Dword)?;
         if high_features & FEATURE_VERSION_1_HIGH == 0 {
@@ -337,8 +347,12 @@ impl Driver {
                  (is it a legacy-only function?)",
             ));
         }
+        self.common_write(COMMON_DEVICE_FEATURE_SELECT, pci::AccessWidth::Dword, 0)?;
+        let low_features = self.common_read(COMMON_DEVICE_FEATURE, pci::AccessWidth::Dword)?;
+        self.flush_supported = low_features & FEATURE_BLK_FLUSH_LOW != 0;
+        let low_accepted = low_features & FEATURE_BLK_FLUSH_LOW;
         self.common_write(COMMON_DRIVER_FEATURE_SELECT, pci::AccessWidth::Dword, 0)?;
-        self.common_write(COMMON_DRIVER_FEATURE, pci::AccessWidth::Dword, 0)?;
+        self.common_write(COMMON_DRIVER_FEATURE, pci::AccessWidth::Dword, low_accepted)?;
         self.common_write(COMMON_DRIVER_FEATURE_SELECT, pci::AccessWidth::Dword, 1)?;
         self.common_write(
             COMMON_DRIVER_FEATURE,
@@ -565,6 +579,58 @@ impl Driver {
         pci::dma_write(&self.ring, DESC_OFFSET + index * 16, &descriptor);
     }
 
+    /// Issue one `VIRTIO_BLK_T_FLUSH` request, making every completed write durable.
+    /// When the device did not offer `VIRTIO_BLK_F_FLUSH` it is write-through by
+    /// definition and this is a successful no-op.
+    fn flush_device(&mut self) -> Result<(), DiskFail> {
+        if !self.flush_supported {
+            return Ok(());
+        }
+        // Header: type FLUSH, reserved 0, sector 0; status preset to a non-status value.
+        let mut header = [0u8; 16];
+        header[0..4].copy_from_slice(&BLK_T_FLUSH.to_le_bytes());
+        pci::dma_write(&self.request, REQ_HEADER_OFFSET, &header);
+        pci::dma_write(&self.request, REQ_STATUS_OFFSET, &[0xff]);
+
+        // Two-descriptor chain (header → status): a flush carries no data.
+        let request_address = pci::dma_address(&self.request);
+        self.write_descriptor(0, request_address + REQ_HEADER_OFFSET, 16, DESC_F_NEXT, 1);
+        self.write_descriptor(1, request_address + REQ_STATUS_OFFSET, 1, DESC_F_WRITE, 0);
+
+        let slot = u64::from(self.avail_index % self.queue_size);
+        pci::dma_write(&self.ring, AVAIL_OFFSET + 4 + 2 * slot, &0u16.to_le_bytes());
+        self.avail_index = self.avail_index.wrapping_add(1);
+        pci::dma_write(
+            &self.ring,
+            AVAIL_OFFSET + 2,
+            &self.avail_index.to_le_bytes(),
+        );
+
+        self.notify_queue().map_err(DiskFail::Io)?;
+        let mut spins: u64 = 0;
+        loop {
+            let raw = pci::dma_read(&self.ring, USED_OFFSET + 2, 2);
+            let used = u16::from_le_bytes([raw[0], raw[1]]);
+            if used != self.used_index {
+                self.used_index = self.used_index.wrapping_add(1);
+                break;
+            }
+            spins += 1;
+            if spins > POLL_LIMIT {
+                return Err(DiskFail::Io(String::from(
+                    "disk.virtio: the device did not complete the flush (poll limit)",
+                )));
+            }
+        }
+        let status = pci::dma_read(&self.request, REQ_STATUS_OFFSET, 1)[0];
+        if status != BLK_S_OK {
+            return Err(DiskFail::Io(format!(
+                "disk.virtio: the device reported flush status {status}"
+            )));
+        }
+        Ok(())
+    }
+
     // --- byte-addressed operations over the sector device -----------------------------------
 
     /// Read `len` bytes at byte offset `offset`.
@@ -719,6 +785,21 @@ impl types::GuestDiskImpl for VirtioDisk {}
 impl disk::Guest for Stub {
     fn default() -> types::DiskImpl {
         types::DiskImpl::new(VirtioDisk)
+    }
+
+    fn size(_dev: disk::DiskImplBorrow<'_>) -> u64 {
+        // Bring the device up if needed and report its capacity. A device that cannot be
+        // probed has no meaningful size; report 0 rather than trapping (the subsequent
+        // read/write will surface the typed `io` failure with the real reason).
+        with_driver(|driver| Ok(driver.capacity_bytes)).unwrap_or(0)
+    }
+
+    async fn flush(_dev: disk::DiskImplBorrow<'_>) -> Result<(), WriteError> {
+        match with_driver(|driver| driver.flush_device()) {
+            Ok(()) => Ok(()),
+            Err(DiskFail::OutOfRange) => Err(WriteError::OutOfRange),
+            Err(DiskFail::Io(message)) => Err(WriteError::Io(message)),
+        }
     }
 
     async fn read(

@@ -1248,7 +1248,41 @@ preemption/hardening work.
     (`sti; hlt` wake path; same effectively-zero class as the other ports), so no further idle work is
     needed — the x86_64 port is at functional parity with aarch64 and riscv64.
 
-56. **The persistent store disk: a disk-backed cache of on-target compile results (2026-05-29, branch
+56. **The eo9:pci provider works on riscv64: per-architecture PCI map (2026-05-29, branch
+    `area/12-pci-interrupts`).** The hardware half (`src/pci.rs`) had the QEMU aarch64-`virt` addresses baked
+    in; they now come from a `pci_map` module on the per-architecture surface (`crate::arch::pci_map`,
+    wasm-store builds only): aarch64 keeps ECAM `0x3f00_0000` / BARs `0x1000_0000..0x3eff_0000` (with the
+    existing `highmem=off` pin), riscv64 `virt` gets ECAM `0x3000_0000` / BARs `0x4000_0000..0x8000_0000`
+    (fixed addresses, no highmem dependence), and x86_64 `q35` carries documented-but-unwired MMCONFIG
+    values so the shared module compiles there (the x86_64 QEMU invocation does not pass the `pci` grant).
+    The riscv64 Sv39 map gains a second RW-NX gigapage over `0x4000_0000..0x8000_0000` so BARs the provider
+    assigns are reachable; the ECAM was already inside the MMIO gigapage. xtask's riscv64 QEMU invocation
+    adds `-device virtio-rng-pci`, mirroring aarch64's enumeration baseline. Containment is unchanged: the
+    provider still only links when the boot command line carries the bare `pci` token. Verified on QEMU
+    riscv64: `pci program=lspci` → host bridge `1b36:0008` + virtio-rng `1af4:1005`, `success(devices(2))`
+    (riscv64 `virt` adds no default NIC, unlike aarch64); and the full storage stack interactively —
+    `disk.virtio $ fs.eofs $ readwrite /rv64.txt …` → `round-tripped(17)`, `… $ ls` → `rv64.txt`,
+    `… $ cat /rv64.txt` → the contents — composed and compiled on-target against a riscv64 virtio disk.
+    aarch64 `pci program=lspci` still reports its 3 devices; the aarch64, riscv64, and x86_64 `demo` runs
+    are unchanged (same digests, exact entropy values, clean power-offs). Reading the ECAM base from the
+    DTB/MCFG instead of per-arch constants remains the recorded follow-up.
+
+57. **PCI interrupt delivery: no WIT gap, kernel design recorded, deferred with its driver proof
+    (2026-05-29).** The eo9:pci API already carries `enable-interrupts(device, kind, count)` and
+    `wait(interrupt)` (wit/pci), so exposing interrupts needs no WIT change; the kernel still answers
+    `unsupported` (D43b). The implementation the next pass needs: read the Interrupt Pin register, apply the
+    standard `(slot + pin − 1) mod 4` swizzle onto the `virt` gpex lines (GIC SPIs 35–38 on aarch64, PLIC
+    sources 0x20–0x23 on riscv64); on delivery mask the level-triggered line at the controller, EOI, and
+    count it; `wait` returns the count and re-arms (unmasks) on the next call, after the driver has cleared
+    the device-side cause; `wait` itself parks on the same drive-loop/wfi machinery the timer path uses.
+    MSI (GICv2m on aarch64) is cleaner long-term but riscv64 has no MSI path without AIA, so INTx covers
+    both verified arches first. Deferred from this branch because the honest end-to-end proof — converting
+    `disk.virtio`'s used-ring poll to `enable-interrupts`/`wait` and measuring the difference — is a guest
+    driver change that belongs in the same verified pass as the kernel machinery. The `pci.filtered`
+    attenuator landed separately (plan/09 D19); its allow-list `configure` is currently blocked by the
+    compose-time configuration binder supporting only scalars/strings/enums (see that decision).
+
+58. **The persistent store disk: a disk-backed cache of on-target compile results (2026-05-29, branch
     `area/12-store-on-eofs`) — store-on-eofs, first rung.** Booting with the bare `storedisk` command-line
     token (attached by the new xtask QEMU argument of the same name, which also keeps the token on the
     cmdline) makes the kernel claim a virtio-blk function for itself, mount the eofs filesystem on it
@@ -1273,7 +1307,7 @@ preemption/hardening work.
       `/cache`. Artifacts over 8 MiB are not cached.
     - **Trust/containment — disk bytes are never deserialized unverified.** `Component::deserialize` trusts
       its input (a tampered artifact is arbitrary native code), so every cache entry is written with a header
-      carrying a keyed-blake3 tag over `length || artifact`; the 32-byte key is generated per checkout by
+      carrying a keyed-blake3 tag over `cache-key || length || artifact` (binding the entry to its own name, so a valid entry cannot be copied over a different entry's path to make one composition run another's artifact); the 32-byte key is generated per checkout by
       xtask (`kernel/target/eo9-storedisk-mac.key`, /dev/urandom, never committed, never on the disk) and
       baked into the kernel image, and `lookup` recomputes and compares the tag (constant-time via
       `blake3::Hash` equality) **before** the artifact is returned for deserialization. A mismatch is a

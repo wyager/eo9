@@ -15,6 +15,15 @@
   word-break: break-word;
   cursor: text;
   margin-top: 1rem;
+  /* The shell's own output (help, env, describe) is laid out for ~100 monospace columns, which is
+     wider than the prose column the rest of the page uses. Let the terminal break out of `main`'s
+     44rem column and center itself in the viewport: 58rem (incl. this padding) gives ~109 columns
+     at this font size, and on narrow screens it falls back to the viewport width minus the page
+     gutters, exactly where the prose column already sits. Lines longer than the terminal still
+     wrap (pre-wrap) rather than scroll sideways. */
+  --vm-terminal-width: min(58rem, calc(100vw - 2.5rem));
+  width: var(--vm-terminal-width);
+  margin-left: calc((100% - var(--vm-terminal-width)) / 2);
 }
 
 #vm-output .vm-cmd {

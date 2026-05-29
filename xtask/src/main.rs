@@ -55,6 +55,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-net-l4-none",
     "eo9-stub-net-l4-over-l2",
     "eo9-stub-net-virtio",
+    "eo9-stub-pci-filtered",
     "eo9-stub-pci-none",
     "eo9-stub-perf-none",
     "eo9-stub-perf-null",
@@ -124,6 +125,9 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // virtio disk (boot with the `pci` grant and the xtask `disk` flag).
     ("eo9-stub-disk-virtio", "disk.virtio"),
     ("eo9-stub-fs-eofs", "fs.eofs"),
+    // The PCI attenuator, so a metal composition can grant a driver exactly one device:
+    // `pci.filtered --allow … $ lspci` (or `$ disk.virtio $ …`).
+    ("eo9-stub-pci-filtered", "pci.filtered"),
     // The network stack for real hardware: the virtio-net driver, its link-layer
     // check, the TCP/IP middleware, and its transport-layer check, so the metal shell
     // can compose `net.virtio $ l2check` and `net.virtio $ net.l4.over-l2 $ l4check`
@@ -1960,7 +1964,10 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         // Pin the SiFive-style PLIC (`aia=none`) for the same reason: the kernel's
         // interrupt bring-up (src/arch/riscv64/plic.rs) drives the PLIC, not the newer
         // AIA APLIC/IMSIC. The default CPU and QEMU's bundled OpenSBI `-bios` are used.
-        "riscv64" => &["-M", "virt,aia=none"],
+        // `virtio-rng-pci` mirrors the aarch64 invocation so the eo9:pci capability has
+        // the same baseline to enumerate (host bridge, default NIC, virtio-rng); the
+        // riscv64 `virt` ECAM is always at its low address, so no `highmem` pin is needed.
+        "riscv64" => &["-M", "virt,aia=none", "-device", "virtio-rng-pci"],
         // The image boots through QEMU's PVH direct-boot path (the ELF note in
         // src/arch/x86_64/boot.rs); SeaBIOS still POSTs first, which is why the firmware
         // banner appears before the kernel's. `-no-reboot` turns a triple fault into a QEMU

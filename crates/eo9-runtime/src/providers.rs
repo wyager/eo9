@@ -211,6 +211,9 @@ pub enum DiskError {
 /// the operation. An operation that would touch bytes outside the device fails with
 /// [`DiskError::OutOfRange`] without touching the backing store.
 pub trait DiskProvider: Send + 'static {
+    /// The device's total size in bytes, fixed for the life of the provider.
+    fn size(&mut self) -> u64;
+
     /// Read `dst.len()` bytes starting at byte `offset` into `dst`, returning the buffer
     /// and the number of bytes read.
     fn read(&mut self, offset: u64, dst: Vec<u8>) -> BoxOp<(Vec<u8>, Result<u64, DiskError>)>;
@@ -218,6 +221,10 @@ pub trait DiskProvider: Send + 'static {
     /// Write `src` starting at byte `offset`, returning the buffer and the number of
     /// bytes written.
     fn write(&mut self, offset: u64, src: Vec<u8>) -> BoxOp<(Vec<u8>, Result<u64, DiskError>)>;
+
+    /// Make every completed write durable on the backing store before the operation
+    /// resolves (fsync for a file-backed device; a no-op where there is nothing volatile).
+    fn flush(&mut self) -> BoxOp<Result<(), DiskError>>;
 }
 
 /// The set of root providers wired into one task at spawn.

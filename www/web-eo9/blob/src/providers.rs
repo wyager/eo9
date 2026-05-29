@@ -62,6 +62,12 @@ impl WebState {
         let mut fs = crate::fs::MemFs::seeded();
         // Seed `/bin/<name>.wasm` so eosh's `resolve` finds the page's programs.
         crate::execsurface::seed_bin(&mut fs);
+        // Leave the session manifest where eosh's `env` builtin reads it (the same
+        // `eo9-session 1` format the usermode and kernel embedders write to `/session`):
+        // a plain-text, informational description of what this browser session grants.
+        // The linker registrations in this module are the authority; this only describes
+        // them so `env` has something honest to say in the page.
+        fs.seed_file("/session", session_manifest().as_bytes());
         WebState {
             fs,
             buffers: crate::fs::BufferTable::default(),
@@ -86,6 +92,27 @@ impl WebState {
         }
         self.panic_message = Some(message);
     }
+}
+
+/// The session manifest the browser embedder leaves at `/session` for eosh's `env`
+/// builtin (the `eo9-session 1` format from eosh-core's `envinfo`; keep in sync with
+/// `eo9::providers::session_manifest` and the kernel's equivalent). Purely informational:
+/// it describes exactly what `add_providers`/`add_providers_for` and the exec surface
+/// register for this page — the registrations themselves are the authority.
+fn session_manifest() -> &'static str {
+    "eo9-session 1\n\
+     shell text the page terminal\n\
+     shell time the browser clock\n\
+     shell entropy the browser's crypto random generator\n\
+     shell fs an in-memory filesystem seeded with /welcome.txt, /docs, and the /bin programs\n\
+     shell exec the component algebra, the in-browser compiler, and spawn\n\
+     child text the page terminal (shared with the shell)\n\
+     child time the browser clock\n\
+     child entropy the browser's crypto random generator\n\
+     child fs a fresh in-memory filesystem per run; writes do not persist between commands\n\
+     note everything runs inside this page; nothing reaches the network or your machine\n\
+     note programs run from this shell do not receive exec (no nested spawning in the browser)\n\
+     note restrict any command with `only` (e.g. `only eo9:text/text $ hello`)\n"
 }
 
 /// Render a trap reason, folding in the guest's reported panic message when one exists —

@@ -307,3 +307,11 @@ its first milestones, and to be the place where cross-area seams get found.
     The canonical persistent-filesystem invocation is `eo9 mkfs.eofs data.img` once, then
     `eo9 --disk data.img -c "fs.eofs $ <program> …"` thereafter; the data lives in the image file and
     survives across processes. Help text documents both.
+23. **Shell spawns name `--disk` and `mkfs.eofs` when the block device is the missing piece
+    (2026-05-29).** `ChildPolicy` gained embedder-supplied spawn hints (`with_spawn_hint`):
+    when a child spawn fails and the failure text mentions `eo9:disk/` in a session launched
+    without `--disk`, the exec surface appends "relaunch with `--disk <image>` (create and
+    format one with `eo9 mkfs.eofs <image>`)" to the raw unsatisfied-import error — mirroring
+    `eo9 run`'s pre-check message, with the raw reason kept first. The CLI test
+    `disk_is_not_granted_without_an_explicit_disk_flag` asserts the flag and the formatter are
+    both named.

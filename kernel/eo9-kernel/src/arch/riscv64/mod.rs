@@ -17,6 +17,22 @@ pub(crate) mod uart;
 /// Architecture name as spelled in `cargo xtask build-kernel <arch>` / `cargo xtask qemu <arch>`.
 pub(crate) const NAME: &str = "riscv64";
 
+/// Where PCI Express lives on this machine (QEMU riscv64 `virt`; fixed addresses, no
+/// `highmem` dependence). The ECAM sits inside the MMIO gigapage the Sv39 map already
+/// covers; the 32-bit BAR window `0x4000_0000..0x8000_0000` gets its own RW-NX gigapage in
+/// `mmu::init`. Consumed by the shared `src/pci.rs` (wasm-store builds only).
+#[cfg(feature = "wasm-store")]
+pub(crate) mod pci_map {
+    /// ECAM (PCIe configuration space) base.
+    pub(crate) const ECAM_BASE: usize = 0x3000_0000;
+    /// Buses walked: the window is 256 MiB (256 buses), but everything QEMU `virt` plugs in
+    /// with a plain `-device …-pci` lands on bus 0; 16 keeps the walk identical to aarch64.
+    pub(crate) const ECAM_BUSES: u8 = 16;
+    /// 32-bit PCIe MMIO window: where unassigned memory BARs get placed.
+    pub(crate) const MMIO_BASE: usize = 0x4000_0000;
+    pub(crate) const MMIO_END: usize = 0x8000_0000;
+}
+
 /// Boot banner: machine identification, privilege mode, timer frequency, wall clock.
 pub(crate) fn banner() {
     crate::kprintln!();
