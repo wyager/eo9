@@ -1598,9 +1598,84 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                     let exec_bytes = eo9_component::Component::load(component.bytes.clone())
                         .map(|c| c.executable_bytes())
                         .unwrap_or_else(|_| component.bytes.clone());
-                    Component::new(&engine, &exec_bytes).map_err(|err| {
-                        WitCompileError::Codegen(format!("on-target compilation failed: {err:?}"))
-                    })
+
+                    // The persistent store disk, when this boot has one, caches compile
+                    // results by the blake3 of exactly these bytes: a hit deserializes the
+                    // artifact compiled on an earlier boot instead of re-running Cranelift;
+                    // a miss compiles and then writes the artifact back. The fused bytes are
+                    // deterministic for a given composition, so the key is stable across
+                    // boots. A cached artifact that fails to deserialize (different wasmtime
+                    // build, corruption eofs could not catch) falls through to a fresh
+                    // compile that overwrites it.
+                    #[cfg(feature = "wasm-storedisk")]
+                    let cached: Option<wasmtime::component::Component> =
+                        if super::diskcache::enabled() {
+                            let key = super::diskcache::key(&exec_bytes);
+                            super::diskcache::lookup(&key).and_then(|artifact| {
+                                let started = crate::timer::uptime_us();
+                                // SAFETY: the artifact was produced by this kernel's own
+                                // on-target compiler on a previous boot and stored on the
+                                // operator-attached store disk (same trust class as the
+                                // baked-in image); deserialize validates compatibility.
+                                match unsafe { Component::deserialize(&engine, &artifact) } {
+                                    Ok(component) => {
+                                        crate::kprintln!(
+                                            "storedisk: compile cache hit ({} KiB loaded in {} us)",
+                                            artifact.len() / 1024,
+                                            crate::timer::uptime_us() - started
+                                        );
+                                        Some(component)
+                                    }
+                                    Err(error) => {
+                                        crate::kprintln!(
+                                            "storedisk: cached artifact rejected ({error:?}); \
+                                             recompiling"
+                                        );
+                                        None
+                                    }
+                                }
+                            })
+                        } else {
+                            None
+                        };
+                    #[cfg(not(feature = "wasm-storedisk"))]
+                    let cached: Option<wasmtime::component::Component> = None;
+
+                    match cached {
+                        Some(component) => Ok(component),
+                        None => {
+                            let compile_started = crate::timer::uptime_us();
+                            let compiled = Component::new(&engine, &exec_bytes).map_err(|err| {
+                                WitCompileError::Codegen(format!(
+                                    "on-target compilation failed: {err:?}"
+                                ))
+                            });
+                            #[cfg(feature = "wasm-storedisk")]
+                            if let Ok(component) = &compiled {
+                                if super::diskcache::enabled() {
+                                    let elapsed_ms =
+                                        (crate::timer::uptime_us() - compile_started) / 1000;
+                                    crate::kprintln!(
+                                        "storedisk: compile cache miss (compiled on-target \
+                                         in {elapsed_ms} ms)"
+                                    );
+                                    match component.serialize() {
+                                        Ok(artifact) => {
+                                            let key = super::diskcache::key(&exec_bytes);
+                                            super::diskcache::store(&key, &artifact);
+                                        }
+                                        Err(error) => crate::kprintln!(
+                                            "storedisk: serializing the compiled artifact \
+                                             failed ({error:?}); not cached"
+                                        ),
+                                    }
+                                }
+                            }
+                            #[cfg(not(feature = "wasm-storedisk"))]
+                            let _ = compile_started;
+                            compiled
+                        }
+                    }
                 }
                 #[cfg(not(feature = "wasm-codegen"))]
                 None => Err(WitCompileError::Codegen(

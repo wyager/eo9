@@ -79,3 +79,10 @@ usermode binary's fs mapping), 12 (store image).
     writes it and the store layout/version marker are unchanged; the file sits beside `version` at the root
     and is ignored by `objects()`/`gc`/name resolution. If the store ever gains first-class metadata, this
     is the first candidate to migrate.
+14. **Kernel-side persistent compile cache (store-on-eofs, first rung — 2026-05-29).** The bare-metal kernel
+    now keeps a disk-backed cache of on-target compile results on an eofs-formatted virtio disk behind the
+    `storedisk` boot token (plan/12 D56). It deliberately does not reuse this crate (the kernel needs no
+    names/bindings/GC, just content-addressed artifacts), but it follows the same content-addressing
+    convention: blake3 of the exact bytes handed to the compiler. If/when the metal store grows shell-visible
+    bindings (a real writable /bin), revisiting whether `eo9-store`'s manifest format should be shared is the
+    first design question.

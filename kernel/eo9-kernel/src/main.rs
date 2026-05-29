@@ -35,6 +35,11 @@ mod panic;
 // with the store/runner feature to keep the featureless CI build lean.
 #[cfg(all(target_os = "none", feature = "wasm-store"))]
 mod pci;
+// The kernel's own polled virtio-blk driver, used only for the persistent store disk
+// (the `storedisk` boot token); guests keep getting their disks through the wasm
+// `disk.virtio` driver over `eo9:pci`.
+#[cfg(all(target_os = "none", feature = "wasm-storedisk"))]
+mod virtio_blk;
 #[cfg(all(
     target_os = "none",
     any(

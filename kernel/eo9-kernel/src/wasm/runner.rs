@@ -59,6 +59,13 @@ pub fn boot(bootargs: Option<&str>) -> bool {
     // is refused at instantiation with the capability story (PCI implies DMA, so it is
     // never linked by default; see `pci_provider` and `shellexec::missing_capability`).
     super::pci_provider::set_granted(tokenize(bootargs).iter().any(|token| token == "pci"));
+    // The bare `storedisk` token claims a virtio-blk function for the kernel's own
+    // persistent store: a disk-backed cache of on-target compile results (and nothing
+    // else); see `diskcache`. Independent of the guest-facing `pci` grant above.
+    #[cfg(feature = "wasm-storedisk")]
+    if tokenize(bootargs).iter().any(|token| token == "storedisk") {
+        super::diskcache::init();
+    }
     let (program, args) = parse_command_line(bootargs);
 
     // The bare `demo` token keeps the original boot sequence reachable:
