@@ -59,6 +59,11 @@
         rejected <em>before it runs</em> — the import it needs simply isn't there.</span>
     </li>
     <li>
+      <code>time.frozen --now-seconds 0 --monotonic-ns 0 $ hello --name frozen --excited true</code>
+      <span>a virtualized clock: the program asks the OS for the time and gets exactly the instant you
+        composed in — its timestamp reads <code>0.000000000</code>, every run, in any browser.</span>
+    </li>
+    <li>
       <code>ls /</code> &nbsp;and&nbsp; <code>cat /welcome.txt /docs/about.txt</code>
       <span>real coreutils (also Eo9 components) against an in-memory filesystem provided by the OS —
         the same programs run unchanged on native Eo9 and on the bare-metal kernel.</span>
