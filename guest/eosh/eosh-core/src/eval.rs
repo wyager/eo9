@@ -56,6 +56,18 @@ pub enum EvalError {
     ComponentArgumentUnsupported { name: String },
     /// Arguments are not allowed in this position (e.g. on an `&` operand).
     ArgumentsNotAllowed { context: &'static str },
+    /// An `&` operand is a program (binary), not a provider. Names the offending side
+    /// (and the operand itself when it is a simple name), and suggests the `$` spelling
+    /// when one is unambiguous.
+    ExtendOperandNotAProvider {
+        /// Which operand offends: `"left"`, `"right"`, or `"neither"` (both are programs).
+        side: &'static str,
+        /// The offending operand's name, when its expression is a simple name.
+        operand: Option<String>,
+        /// A `provider $ program` spelling to suggest instead, when both operands are
+        /// bare names and exactly one of them is a provider.
+        suggestion: Option<String>,
+    },
     /// An `only` entry that is a bare world name (policy worlds are not resolvable yet).
     NamedWorldUnsupported { name: String },
     /// A `with` provider that does not export exactly one interface.
@@ -106,6 +118,31 @@ impl fmt::Display for EvalError {
             ),
             EvalError::ArgumentsNotAllowed { context } => {
                 write!(f, "arguments cannot be applied to {context}")
+            }
+            EvalError::ExtendOperandNotAProvider {
+                side,
+                operand,
+                suggestion,
+            } => {
+                if *side == "neither" {
+                    return write!(
+                        f,
+                        "`&` refused: neither operand is a provider — `&` combines providers \
+                         into an environment; use `$` to run a program with a provider"
+                    );
+                }
+                match operand {
+                    Some(name) => write!(f, "`&` refused: `{name}` is a program, not a provider")?,
+                    None => write!(
+                        f,
+                        "`&` refused: the {side} operand is a program, not a provider"
+                    )?,
+                }
+                write!(f, " — `&` combines providers into an environment")?;
+                match suggestion {
+                    Some(text) => write!(f, "; to run it with that provider use `{text}`"),
+                    None => write!(f, "; use `$` to run a program with a provider"),
+                }
             }
             EvalError::NamedWorldUnsupported { name } => write!(
                 f,
@@ -165,9 +202,24 @@ impl<'a, B: Backend> Evaluator<'a, B> {
                 })
             }
             Expr::Extend { base, layer } => {
-                let base = self.eval_plain(base, "an `&` operand").await?;
-                let layer = self.eval_plain(layer, "an `&` operand").await?;
-                let component = self.backend.extend(base, layer)?;
+                let base_component = self.eval_plain(base, "an `&` operand").await?;
+                let layer_component = self.eval_plain(layer, "an `&` operand").await?;
+                // `&` requires providers on both sides. Check the kinds here, where the
+                // operands' source spellings are still known, so the refusal can name
+                // the offending operand (the algebra's own error cannot say which side).
+                let base_is_provider =
+                    self.backend.describe(&base_component).kind == ComponentKind::Provider;
+                let layer_is_provider =
+                    self.backend.describe(&layer_component).kind == ComponentKind::Provider;
+                if !base_is_provider || !layer_is_provider {
+                    return Err(extend_refusal(
+                        base,
+                        layer,
+                        base_is_provider,
+                        layer_is_provider,
+                    ));
+                }
+                let component = self.backend.extend(base_component, layer_component)?;
                 Ok(EvalOutput {
                     component,
                     args: Vec::new(),
@@ -446,6 +498,58 @@ pub fn operation_failed(operation: &str, err: &BackendError) -> String {
     format!("{operation} failed: {err}")
 }
 
+/// Build the `&`-operand refusal: name the offending side (and operand, when it has a
+/// simple name), and suggest the `$` spelling when both operands are bare names and
+/// exactly one of them is a provider.
+fn extend_refusal(
+    base: &Expr,
+    layer: &Expr,
+    base_is_provider: bool,
+    layer_is_provider: bool,
+) -> EvalError {
+    let (side, offender, provider) = match (base_is_provider, layer_is_provider) {
+        (true, false) => ("right", layer, Some(base)),
+        (false, true) => ("left", base, Some(layer)),
+        // Both operands are programs (the all-provider case never reaches this helper).
+        _ => ("neither", base, None),
+    };
+    let operand = if side == "neither" {
+        None
+    } else {
+        operand_name(offender)
+    };
+    let suggestion =
+        provider.and_then(
+            |provider| match (bare_name(provider), bare_name(offender)) {
+                (Some(provider), Some(program)) => Some(format!("{provider} $ {program}")),
+                _ => None,
+            },
+        );
+    EvalError::ExtendOperandNotAProvider {
+        side,
+        operand,
+        suggestion,
+    }
+}
+
+/// The operand's name when its expression is a name, with or without applied arguments.
+fn operand_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(name) => Some(name.clone()),
+        Expr::App { callee, .. } => operand_name(callee),
+        _ => None,
+    }
+}
+
+/// The operand's name only when it is a bare name (no arguments), so a suggestion built
+/// from it never silently drops applied flags.
+fn bare_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,10 +609,95 @@ mod tests {
             vec![
                 "resolve(time.frozen) -> c1",
                 "resolve(virtualnet) -> c2",
+                "describe(c1)",
+                "describe(c2)",
                 "extend(c1, c2) -> c3",
                 "resolve(app) -> c4",
                 "compose(c3, c4) -> c5",
             ]
+        );
+    }
+
+    #[test]
+    fn extend_with_a_binary_right_operand_names_it_and_suggests_compose() {
+        let mut backend = MockBackend::new();
+        backend.program("entropy.seeded", provider(&["eo9:entropy/entropy"]));
+        backend.program("echo", binary(&[]));
+        let err = eval(&mut backend, "entropy.seeded & echo").unwrap_err();
+        assert_eq!(
+            err,
+            EvalError::ExtendOperandNotAProvider {
+                side: "right",
+                operand: Some("echo".to_string()),
+                suggestion: Some("entropy.seeded $ echo".to_string()),
+            }
+        );
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("`echo` is a program, not a provider"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("entropy.seeded $ echo"), "{rendered}");
+        assert!(!rendered.contains("left operand"), "{rendered}");
+        assert!(
+            !backend.log.iter().any(|line| line.starts_with("extend(")),
+            "the refusal must happen before the algebra is called, log: {:?}",
+            backend.log
+        );
+    }
+
+    #[test]
+    fn extend_with_a_binary_left_operand_names_it_and_suggests_compose() {
+        let mut backend = MockBackend::new();
+        backend.program("entropy.seeded", provider(&["eo9:entropy/entropy"]));
+        backend.program("echo", binary(&[]));
+        let err = eval(&mut backend, "echo & entropy.seeded").unwrap_err();
+        assert_eq!(
+            err,
+            EvalError::ExtendOperandNotAProvider {
+                side: "left",
+                operand: Some("echo".to_string()),
+                suggestion: Some("entropy.seeded $ echo".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn extend_with_two_binaries_says_neither_is_a_provider() {
+        let mut backend = MockBackend::new();
+        backend.program("echo", binary(&[]));
+        backend.program("cat", binary(&[]));
+        let err = eval(&mut backend, "echo & cat").unwrap_err();
+        assert_eq!(
+            err,
+            EvalError::ExtendOperandNotAProvider {
+                side: "neither",
+                operand: None,
+                suggestion: None,
+            }
+        );
+        assert!(format!("{err}").contains("neither operand is a provider"));
+    }
+
+    #[test]
+    fn extend_refusal_with_a_configured_provider_still_names_the_program() {
+        // The suggestion is omitted when an operand carries flags (it would silently
+        // drop them), but the offending program is still named.
+        let mut backend = MockBackend::new();
+        backend.program_with_args(
+            "entropy.seeded",
+            provider(&["eo9:entropy/entropy"]),
+            &[("seed", "u64")],
+        );
+        backend.program("echo", binary(&[]));
+        let err = eval(&mut backend, "entropy.seeded --seed 7 & echo").unwrap_err();
+        assert_eq!(
+            err,
+            EvalError::ExtendOperandNotAProvider {
+                side: "right",
+                operand: Some("echo".to_string()),
+                suggestion: None,
+            }
         );
     }
 
@@ -916,6 +1105,8 @@ mod tests {
                 "describe(c1)",
                 "configure(c1, [seed=7]) -> c2",
                 "resolve(virtualnet) -> c3",
+                "describe(c2)",
+                "describe(c3)",
                 "extend(c2, c3) -> c4",
                 "resolve(app) -> c5",
                 "compose(c4, c5) -> c6",
