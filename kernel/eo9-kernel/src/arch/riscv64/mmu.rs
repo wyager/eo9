@@ -9,7 +9,11 @@
 //! layout in src/arch/aarch64/mmu.rs):
 //!
 //! * `0x0000_0000..0x4000_0000` → one 1 GiB leaf "gigapage": read/write, non-executable.
-//!   Covers the UART (0x1000_0000), PLIC (0x0c00_0000), Goldfish RTC and the test finisher.
+//!   Covers the UART (0x1000_0000), PLIC (0x0c00_0000), the PCIe ECAM (0x3000_0000),
+//!   Goldfish RTC and the test finisher.
+//! * `0x4000_0000..0x8000_0000` → a second RW-NX gigapage: the 32-bit PCIe BAR window,
+//!   where the `eo9:pci` provider places device registers when a driver opens a BAR
+//!   (src/pci.rs).
 //! * `0x8000_0000..0xa000_0000` → the 512 MiB of DRAM, mapped at **4 KiB page granularity**
 //!   (root → one mid-level table → 256 leaf tables) so per-page permissions exist:
 //!     - `[0x8000_0000, __kernel_start)` (OpenSBI's reservation; PMP-protected anyway) →
@@ -145,9 +149,12 @@ pub fn init() {
             mid_i += 1;
         }
 
-        // Root: [0] the MMIO gigapage (UART, PLIC, RTC, test finisher — never executed);
+        // Root: [0] the MMIO gigapage (UART, PLIC, RTC, PCIe ECAM, test finisher — never
+        // executed); [1] the 32-bit PCIe BAR window 0x4000_0000..0x8000_0000, so registers
+        // the eo9:pci provider assigns there are reachable (read/write, never executed);
         // [2] → the DRAM mid-level table (0x8000_0000 >> 30 == 2).
         (*root).0[0] = leaf_entry(0, T_RW_NX);
+        (*root).0[1] = leaf_entry(0x4000_0000, T_RW_NX);
         (*root).0[2] = table_entry((&raw const *mid).addr());
 
         let satp = SATP_MODE_SV39 | (((&raw const *root).addr() as u64) >> 12);
@@ -162,8 +169,8 @@ pub fn init() {
         );
     }
     crate::kprintln!(
-        "mmu: Sv39 identity map enabled (MMIO gigapage, DRAM 0x8000_0000..+512 MiB at \
-         4 KiB pages, heap W^X)"
+        "mmu: Sv39 identity map enabled (MMIO + PCIe gigapages, DRAM 0x8000_0000..+512 MiB \
+         at 4 KiB pages, heap W^X)"
     );
 }
 
