@@ -1270,14 +1270,24 @@ preemption/hardening work.
     - **eofs as the on-disk format** (`wasm/diskcache.rs`): the kernel now links `eofs-core` (and `blake3`)
       under the new `wasm-storedisk` feature — the same no_std engine the fs.eofs guest provider and usermode
       mkfs use, so a store disk formatted by any of them is mutually readable. Cached artifacts live under
-      `/cache`; eofs block checksums catch corruption and an artifact `Component::deserialize` rejects falls
-      back to a fresh compile that overwrites it. Artifacts over 8 MiB are not cached.
-    - **Trust/containment**: the disk is operator-attached and kernel-claimed only via the explicit boot
-      token; it is in the same trust class as the baked-in image (both are deserialized native code). It is
-      never exposed to guests; guests still need `pci`+`disk.virtio` for their own disks. Sharing one
-      virtio-blk function between the kernel store and a guest driver in the same boot is unsupported until
-      machine-global device claiming lands (the xtask doc says so), so the demo uses a separate image file
-      (`kernel/target/eo9-store-disk.raw`) from the guest scratch disk.
+      `/cache`. Artifacts over 8 MiB are not cached.
+    - **Trust/containment — disk bytes are never deserialized unverified.** `Component::deserialize` trusts
+      its input (a tampered artifact is arbitrary native code), so every cache entry is written with a header
+      carrying a keyed-blake3 tag over `length || artifact`; the 32-byte key is generated per checkout by
+      xtask (`kernel/target/eo9-storedisk-mac.key`, /dev/urandom, never committed, never on the disk) and
+      baked into the kernel image, and `lookup` recomputes and compares the tag (constant-time via
+      `blake3::Hash` equality) **before** the artifact is returned for deserialization. A mismatch is a
+      printed, typed refusal that falls back to recompiling, which overwrites the entry; deleting the key
+      file and rebuilding rotates the key and simply invalidates the whole cache. The defense layering is:
+      eofs's unkeyed block checksums catch plain corruption, the keyed tag catches an adversary who can
+      rewrite blocks *and* recompute those checksums but lacks the in-image key, and deserialize's own
+      compatibility checks catch artifacts from a different wasmtime build. The baked-in store image and the
+      kernel's own in-memory compile results stay untagged — same trust domain as the kernel image. The disk
+      is claimed only via the explicit boot token and is never exposed to guests; guests still need
+      `pci`+`disk.virtio` for their own disks. Sharing one virtio-blk function between the kernel store and a
+      guest driver in the same boot is unsupported until machine-global device claiming lands (the xtask doc
+      says so), so the demo uses a separate image file (`kernel/target/eo9-store-disk.raw`) from the guest
+      scratch disk.
     - **Feature scoping**: `wasm-storedisk` is enabled by xtask for the **aarch64** full build only (the ECAM
       bring-up in `src/pci.rs` is aarch64-virt specific); riscv64/x86_64 builds, the featureless CI gate, and
       any boot without the token are bit-for-bit unaffected (verified: all three `demo` transcripts unchanged,

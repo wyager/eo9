@@ -10,12 +10,19 @@
 //! changes — every call here degrades to "no cache".
 //!
 //! Trust model: the cache holds native-code artifacts and is loaded with
-//! `Component::deserialize`, exactly like the baked-in store image. The disk is attached by
-//! the operator and is granted to the kernel only via the explicit boot token, so it sits in
-//! the same trust class as the kernel image itself; eofs's block checksums catch corruption,
-//! and an artifact wasmtime cannot validate falls back to a fresh compile. Durability note:
-//! the in-kernel driver does not negotiate VIRTIO_BLK_F_FLUSH yet (same as the wasm driver);
-//! eofs commits are ordered but a host power cut may lose the most recent ones.
+//! `Component::deserialize`, which trusts its input — so disk-loaded bytes are **never**
+//! handed to it unverified. Every cache entry is written with a small header carrying a
+//! keyed-blake3 tag (the key is baked into the kernel image at build time by xtask and never
+//! stored on the disk), and `lookup` recomputes and compares the tag before returning the
+//! artifact; any mismatch is a typed refusal that falls back to recompiling, which
+//! overwrites the bad entry. The layering: eofs's (unkeyed) block checksums catch
+//! corruption, the keyed tag catches an adversary who can rewrite disk blocks *and* fix up
+//! those checksums but does not hold the kernel image's key, and `Component::deserialize`'s
+//! own compatibility checks catch artifacts from a different wasmtime build. The baked-in
+//! store image and the kernel's own in-memory compiles stay untagged — they are the same
+//! trust domain as the kernel image itself. Durability note: the in-kernel driver does not
+//! negotiate VIRTIO_BLK_F_FLUSH yet (same as the wasm driver); eofs commits are ordered but
+//! a host power cut may lose the most recent ones.
 
 use alloc::format;
 use alloc::string::String;
@@ -33,6 +40,28 @@ const CACHE_DIR: &str = "/cache";
 /// Upper bound on a single cached artifact (a fused composition's serialized native code).
 /// Larger results are simply not cached; they keep compiling on every boot.
 const MAX_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The MAC key baked into this kernel image by `cargo xtask build-kernel aarch64` (a
+/// 32-byte /dev/urandom value generated once per checkout; see `ensure_storedisk_mac_key`
+/// in xtask). Cached artifacts are deserialized only after their keyed-blake3 tag verifies
+/// under this key, so bytes written to the disk cannot become native code in this kernel
+/// without it. Deleting the key file and rebuilding rotates the key, which simply makes
+/// every previously cached artifact fail verification and recompile.
+static MAC_KEY: &[u8; 32] = include_bytes!(env!("EO9_STOREDISK_MAC_KEY"));
+
+/// Magic introducing one cache entry on disk. Entry layout: magic, artifact length
+/// (u64 little-endian), keyed-blake3 tag over `length || artifact`, then the artifact.
+const ENTRY_MAGIC: &[u8; 8] = b"EO9CACH1";
+const ENTRY_HEADER_BYTES: usize = 8 + 8 + 32;
+
+/// The keyed tag for one artifact. The length is folded in so a tag computed over a longer
+/// artifact cannot be reused for a truncated rewrite of the same entry.
+fn entry_tag(artifact: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_keyed(MAC_KEY);
+    hasher.update(&(artifact.len() as u64).to_le_bytes());
+    hasher.update(artifact);
+    *hasher.finalize().as_bytes()
+}
 
 /// `eofs_core::BlockDevice` over the in-kernel virtio-blk driver. The trait takes `&self`
 /// for reads, so the driver (whose ring indices advance on every request) sits in an
@@ -198,29 +227,62 @@ pub fn key(executable_bytes: &[u8]) -> String {
     blake3::hash(executable_bytes).to_hex().as_str().into()
 }
 
-/// Look up a cached artifact. `None` on any miss or error (errors are printed, never fatal).
+/// Look up a cached artifact. Returns the artifact bytes only after the entry's keyed tag
+/// verifies; `None` on any miss, parse failure, or verification failure (each is printed,
+/// never fatal — the caller falls back to compiling, which overwrites the entry).
 pub fn lookup(key: &str) -> Option<Vec<u8>> {
     STORE.with(|slot| {
         let mounted = slot.as_mut()?;
         let path = format!("{CACHE_DIR}/{key}.cwasm");
         let stat = mounted.fs.stat(&path).ok()?;
-        if stat.size == 0 || stat.size > MAX_ARTIFACT_BYTES {
+        if stat.size < ENTRY_HEADER_BYTES as u64
+            || stat.size > MAX_ARTIFACT_BYTES + ENTRY_HEADER_BYTES as u64
+        {
+            crate::kprintln!("storedisk: cached entry has an implausible size; ignoring it");
             return None;
         }
         let mut bytes = alloc::vec![0u8; stat.size as usize];
         match mounted.fs.read(&path, 0, &mut bytes) {
-            Ok(read) if read as u64 == stat.size => Some(bytes),
-            Ok(_) => None,
+            Ok(read) if read as u64 == stat.size => {}
+            Ok(_) => return None,
             Err(error) => {
                 crate::kprintln!("storedisk: reading a cached artifact failed: {error:?}");
-                None
+                return None;
             }
         }
+
+        // Parse and verify the entry header before anything else looks at the bytes.
+        if &bytes[0..8] != ENTRY_MAGIC {
+            crate::kprintln!("storedisk: cached entry has a bad header; ignoring it");
+            return None;
+        }
+        let mut length = [0u8; 8];
+        length.copy_from_slice(&bytes[8..16]);
+        let length = u64::from_le_bytes(length) as usize;
+        if length != bytes.len() - ENTRY_HEADER_BYTES {
+            crate::kprintln!(
+                "storedisk: cached entry failed integrity verification (length mismatch); \
+                 it will be recompiled"
+            );
+            return None;
+        }
+        let mut stored_tag = [0u8; 32];
+        stored_tag.copy_from_slice(&bytes[16..48]);
+        let artifact = &bytes[ENTRY_HEADER_BYTES..];
+        // blake3::Hash's equality is constant-time; compare through it.
+        if blake3::Hash::from(stored_tag) != blake3::Hash::from(entry_tag(artifact)) {
+            crate::kprintln!(
+                "storedisk: cached entry failed integrity verification (keyed tag mismatch); \
+                 it will be recompiled"
+            );
+            return None;
+        }
+        Some(artifact.to_vec())
     })
 }
 
-/// Store a freshly compiled artifact. Failures are printed and otherwise ignored — the
-/// composition still runs from the in-memory result.
+/// Store a freshly compiled artifact (header + keyed tag + bytes). Failures are printed and
+/// otherwise ignored — the composition still runs from the in-memory result.
 pub fn store(key: &str, artifact: &[u8]) {
     if artifact.len() as u64 > MAX_ARTIFACT_BYTES {
         crate::kprintln!(
@@ -235,14 +297,22 @@ pub fn store(key: &str, artifact: &[u8]) {
             return;
         };
         let path = format!("{CACHE_DIR}/{key}.cwasm");
+        let mut entry = Vec::with_capacity(ENTRY_HEADER_BYTES + artifact.len());
+        entry.extend_from_slice(ENTRY_MAGIC);
+        entry.extend_from_slice(&(artifact.len() as u64).to_le_bytes());
+        entry.extend_from_slice(&entry_tag(artifact));
+        entry.extend_from_slice(artifact);
         let result = (|| -> Result<(), eofs_core::FsError> {
             if mounted.fs.stat(CACHE_DIR).is_err() {
                 mounted.fs.mkdir(CACHE_DIR)?;
             }
-            if mounted.fs.stat(&path).is_err() {
-                mounted.fs.create_file(&path)?;
+            // Replace any existing entry wholesale so a shorter rewrite can never leave
+            // stale tail bytes behind the verified region.
+            if mounted.fs.stat(&path).is_ok() {
+                mounted.fs.remove(&path)?;
             }
-            mounted.fs.write(&path, 0, artifact)?;
+            mounted.fs.create_file(&path)?;
+            mounted.fs.write(&path, 0, &entry)?;
             mounted.fs.commit()?;
             Ok(())
         })();

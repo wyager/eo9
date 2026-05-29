@@ -1681,6 +1681,12 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
     // eosh's /bin view).
     let store_image = build_store_image(root, KERNEL_CHECK_TARGET)?;
 
+    // The MAC key for the persistent store disk's compile cache: artifacts read back from
+    // the disk are only deserialized after their keyed-blake3 tag verifies against this
+    // key, which is baked into the kernel image (see kernel diskcache). Generated once per
+    // checkout and reused so the cache survives kernel rebuilds; never committed.
+    let mac_key = ensure_storedisk_mac_key(root)?;
+
     let kernel_dir = root.join("kernel");
     run_with_env(
         &kernel_dir,
@@ -1705,6 +1711,7 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
             ("EO9_SLEEPY_CWASM", sleepy.as_os_str()),
             ("EO9_ENTROPY_SEEDED_CWASM", entropy.as_os_str()),
             ("EO9_STORE_IMAGE", store_image.as_os_str()),
+            ("EO9_STOREDISK_MAC_KEY", mac_key.as_os_str()),
         ],
     )?;
 
@@ -1847,6 +1854,42 @@ fn ensure_store_disk(root: &Path) -> Result<PathBuf, String> {
             "xtask: created blank 64 MiB store disk at {}",
             path.display()
         );
+    }
+    Ok(path)
+}
+
+/// Path of the 32-byte MAC key baked into the aarch64 kernel image for the store-disk
+/// compile cache (see kernel diskcache): generated from /dev/urandom on first use and
+/// reused on later builds so the on-disk cache stays valid across kernel rebuilds. Lives
+/// under kernel/target (never committed); deleting it rotates the key, which simply makes
+/// the kernel reject and recompile every previously cached artifact.
+fn ensure_storedisk_mac_key(root: &Path) -> Result<PathBuf, String> {
+    let dir = root.join("kernel").join("target");
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+    let path = dir.join("eo9-storedisk-mac.key");
+    if !path.exists() {
+        let mut key = [0u8; 32];
+        let mut urandom = std::fs::File::open("/dev/urandom").map_err(|err| {
+            format!("failed to open /dev/urandom for the store-disk MAC key: {err}")
+        })?;
+        std::io::Read::read_exact(&mut urandom, &mut key).map_err(|err| {
+            format!("failed to read 32 random bytes for the store-disk MAC key: {err}")
+        })?;
+        std::fs::write(&path, key)
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+        println!(
+            "xtask: generated a store-disk MAC key at {}",
+            path.display()
+        );
+    }
+    let metadata = std::fs::metadata(&path)
+        .map_err(|err| format!("failed to stat {}: {err}", path.display()))?;
+    if metadata.len() != 32 {
+        return Err(format!(
+            "{} is not 32 bytes; delete it and rebuild to regenerate the store-disk MAC key",
+            path.display()
+        ));
     }
     Ok(path)
 }
