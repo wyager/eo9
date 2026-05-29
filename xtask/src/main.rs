@@ -80,11 +80,21 @@ const KERNEL_CHECK_TARGET: &str = "aarch64-unknown-none";
 /// needed, so plain xtask builds stay lean).
 const KERNEL_RISCV64_TARGET: &str = "riscv64gc-unknown-none-elf";
 
+/// The x86_64 bare-metal target (QEMU `q35`, PVH direct boot). Milestones 1–2 only so far:
+/// `build-kernel x86_64` produces the feature-less image (boot, serial, heap, timer,
+/// interrupts); the wasm feature set follows in a later milestone (plan/12).
+const KERNEL_X86_64_TARGET: &str = "x86_64-unknown-none";
+
 /// Bare-metal targets the feature-less kernel workspace is built and clippy-checked for in
 /// `build`/`lint` (and therefore `ci`), so a change cannot silently break a ported
 /// architecture. Only aarch64 additionally gets the full wasm feature set exercised under
-/// QEMU (`build-kernel` / `qemu`); riscv64 is the in-progress second port (plan/12).
-const KERNEL_CI_TARGETS: &[&str] = &["aarch64-unknown-none", "riscv64gc-unknown-none-elf"];
+/// QEMU (`build-kernel` / `qemu`); riscv64 is the second full port, x86_64 the in-progress
+/// third (plan/12).
+const KERNEL_CI_TARGETS: &[&str] = &[
+    "aarch64-unknown-none",
+    "riscv64gc-unknown-none-elf",
+    "x86_64-unknown-none",
+];
 
 /// Architectures accepted by `build-kernel` and `qemu` (QEMU bring-up order).
 const KERNEL_ARCHES: &[&str] = &["aarch64", "riscv64", "x86_64"];
@@ -1311,11 +1321,45 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
     match arch {
         "aarch64" => build_kernel_aarch64(root),
         "riscv64" => build_kernel_riscv64(root),
+        "x86_64" => build_kernel_x86_64(root),
         _ => Err(format!(
-            "`build-kernel {arch}` is not implemented yet: the bare-metal kernel covers aarch64 \
-             and riscv64 so far (plan/12-kernel.md)"
+            "`build-kernel {arch}` is not implemented yet: the bare-metal kernel covers aarch64, \
+             riscv64 and x86_64 so far (plan/12-kernel.md)"
         )),
     }
+}
+
+/// x86_64 (QEMU `q35`, PVH direct boot): milestones 1–2 — the feature-less image (boot,
+/// serial console, heap, TSC/PIT timer, PIC interrupt delivery, event-driven idle). The
+/// wasm feature set and the host-AOT precompile pipeline follow in a later milestone
+/// (plan/12), at which point this grows the same precompile steps as the other ports.
+fn build_kernel_x86_64(root: &Path) -> Result<PathBuf, String> {
+    let kernel_dir = root.join("kernel");
+    run(
+        &kernel_dir,
+        "cargo",
+        [
+            "build",
+            "-p",
+            "eo9-kernel",
+            "--release",
+            "--target",
+            KERNEL_X86_64_TARGET,
+        ],
+    )?;
+    let image = kernel_dir
+        .join("target")
+        .join(KERNEL_X86_64_TARGET)
+        .join("release")
+        .join("eo9-kernel");
+    if !image.is_file() {
+        return Err(format!(
+            "kernel build succeeded but {} is missing",
+            image.display()
+        ));
+    }
+    println!("xtask: built kernel image {}", image.display());
+    Ok(image)
 }
 
 /// riscv64 (QEMU `virt`, S-mode under OpenSBI): the same host-AOT precompile pipeline as
@@ -1701,6 +1745,11 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         // interrupt bring-up (src/arch/riscv64/plic.rs) drives the PLIC, not the newer
         // AIA APLIC/IMSIC. The default CPU and QEMU's bundled OpenSBI `-bios` are used.
         "riscv64" => &["-M", "virt,aia=none"],
+        // The image boots through QEMU's PVH direct-boot path (the ELF note in
+        // src/arch/x86_64/boot.rs); SeaBIOS still POSTs first, which is why the firmware
+        // banner appears before the kernel's. `-no-reboot` turns a triple fault into a QEMU
+        // exit instead of a silent reboot loop, keeping scripted runs honest.
+        "x86_64" => &["-M", "q35", "-no-reboot"],
         other => {
             return Err(format!(
                 "`qemu {other}` is not implemented yet (plan/12-kernel.md)"
