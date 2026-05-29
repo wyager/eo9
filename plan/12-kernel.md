@@ -1084,3 +1084,24 @@ preemption/hardening work.
       the kernel image remaining RWX under Sv39 exactly as it is under the aarch64 map (D41/D48). Everything
       observable at the shell — outcomes, digests, entropy streams, preemption, Ctrl-C, on-target codegen,
       idle behaviour — matches aarch64.
+
+50. **The metal storage stack demo: `disk.virtio $ fs.eofs $ <program>` on QEMU aarch64 (2026-05-29, branch
+    `area/08-virtio-blk`).** The kernel itself needed no changes — the eo9:pci provider (D43) was enough to
+    write a working virtio-blk driver as a guest component (plan/09 D16). What this branch adds around it:
+    `KERNEL_STORE_COMPONENTS` gains `disk.virtio` and `fs.eofs` (store now 16 entries; aarch64 image
+    29.0 MB → 31.5 MB, the precompiled artifacts dominating as before), and `cargo xtask qemu <arch> …`
+    accepts a bare `disk` argument — consumed by xtask, never forwarded to the kernel command line — that
+    creates a blank 64 MiB raw scratch image under `kernel/target/eo9-scratch-disk.raw` on first use and
+    attaches it as `-device virtio-blk-pci,drive=…,disable-legacy=on` (modern only: the provider rejects
+    I/O-space BARs, so the legacy/transitional flavour is deliberately not offered). The existing flows are
+    untouched: without `disk` no drive is attached, so the lspci smoke still sees exactly 3 functions, and
+    the demo/interactive/program= transcripts on both architectures are unchanged (re-verified). Verified
+    end to end with `cargo xtask qemu aarch64 pci disk`, interactive: `disk.virtio $ fs.eofs $ ls` →
+    formats the blank disk, `listed(0)`, with the driver's probe line (131072 sectors, queue size 16);
+    `… $ readwrite /hello.txt eo9-on-real-disk` → `round-tripped(16)`; `… $ cat /hello.txt` → prints the
+    contents; and after a full QEMU power cycle a fresh boot shows `ls` → `hello.txt`, `cat` → the same
+    contents — real persistence through a wasm driver, an on-target-compiled composition, and eofs's
+    root-flip commits. Follow-ups recorded: interrupt delivery (MSI/INTx → GIC/PLIC) for a non-polled
+    driver, a FLUSH-on-commit story for durability against host crashes, virtio-net as the sibling driver
+    feeding the `eo9:net` l2 layer, and store-on-disk so the artifact cache itself can live on the virtio
+    device.

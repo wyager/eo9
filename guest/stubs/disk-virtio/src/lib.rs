@@ -316,7 +316,11 @@ impl Driver {
                 return Err(String::from("disk.virtio: device did not reset"));
             }
         }
-        self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, STATUS_ACKNOWLEDGE)?;
+        self.common_write(
+            COMMON_DEVICE_STATUS,
+            pci::AccessWidth::Byte,
+            STATUS_ACKNOWLEDGE,
+        )?;
         self.common_write(
             COMMON_DEVICE_STATUS,
             pci::AccessWidth::Byte,
@@ -342,7 +346,11 @@ impl Driver {
             FEATURE_VERSION_1_HIGH,
         )?;
         let with_features_ok = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK;
-        self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, with_features_ok)?;
+        self.common_write(
+            COMMON_DEVICE_STATUS,
+            pci::AccessWidth::Byte,
+            with_features_ok,
+        )?;
         let status = self.common_read(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte)?;
         if status & STATUS_FEATURES_OK == 0 {
             return Err(String::from(
@@ -361,7 +369,9 @@ impl Driver {
         // DMA page, remember the notify offset, and enable it.
         let queues = self.common_read(COMMON_NUM_QUEUES, pci::AccessWidth::Word)?;
         if queues == 0 {
-            return Err(String::from("disk.virtio: the device exposes no virtqueues"));
+            return Err(String::from(
+                "disk.virtio: the device exposes no virtqueues",
+            ));
         }
         self.common_write(COMMON_QUEUE_SELECT, pci::AccessWidth::Word, 0)?;
         let max_size = self.common_read(COMMON_QUEUE_SIZE, pci::AccessWidth::Word)?;
@@ -382,10 +392,8 @@ impl Driver {
         self.write_address(COMMON_QUEUE_DESC, ring_address + DESC_OFFSET)?;
         self.write_address(COMMON_QUEUE_DRIVER, ring_address + AVAIL_OFFSET)?;
         self.write_address(COMMON_QUEUE_DEVICE, ring_address + USED_OFFSET)?;
-        let queue_notify_off =
-            self.common_read(COMMON_QUEUE_NOTIFY_OFF, pci::AccessWidth::Word)?;
-        self.notify_offset =
-            self.notify.offset + queue_notify_off * u64::from(notify_multiplier);
+        let queue_notify_off = self.common_read(COMMON_QUEUE_NOTIFY_OFF, pci::AccessWidth::Word)?;
+        self.notify_offset = self.notify.offset + queue_notify_off * u64::from(notify_multiplier);
         // Avail ring starts empty: flags 0, idx 0 (the DMA buffer is zero-filled by the
         // provider, but make the driver's published state explicit).
         pci::dma_write(&self.ring, AVAIL_OFFSET, &[0, 0, 0, 0]);
@@ -684,9 +692,8 @@ fn find_windows(device: &pci::Device) -> Result<(Region, Region, u32, Region), S
     let common = common.ok_or_else(|| {
         String::from("disk.virtio: the function has no virtio common-config capability")
     })?;
-    let (notify, multiplier) = notify.ok_or_else(|| {
-        String::from("disk.virtio: the function has no virtio notify capability")
-    })?;
+    let (notify, multiplier) = notify
+        .ok_or_else(|| String::from("disk.virtio: the function has no virtio notify capability"))?;
     let device_config = device_config.ok_or_else(|| {
         String::from("disk.virtio: the function has no virtio device-config capability")
     })?;
@@ -741,7 +748,11 @@ impl disk::Guest for Stub {
         let len = src.len();
         // Copy out of the buffer before driving the device so no buffer call interleaves
         // with the request (same discipline as disk.mem).
-        let bytes = if len == 0 { Vec::new() } else { src.read(0, len) };
+        let bytes = if len == 0 {
+            Vec::new()
+        } else {
+            src.read(0, len)
+        };
         let outcome = with_driver(|driver| driver.write_bytes(offset, &bytes));
         match outcome {
             Ok(()) => (src, Ok(WriteResult { bytes_written: len })),
