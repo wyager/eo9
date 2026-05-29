@@ -1801,3 +1801,126 @@ fn describe_wiring_renders_a_leaf_and_a_composition_tree() {
         tree.stdout
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// eofs persistence: mkfs.eofs + --disk + fs.eofs (plan/14 milestone 3)
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn mkfs_eofs_formats_and_refuses_to_clobber_without_force() {
+    let store = temp_store("mkfs");
+    let dir = temp_store("mkfs-images");
+    let image = dir.join("disk.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+
+    // Creating + formatting a fresh image works and reports the geometry.
+    let format = eo9(&store, &["mkfs.eofs", image_arg, "--size", "4M"]);
+    assert_eq!(format.code, 0, "stderr: {}", format.stderr);
+    assert!(
+        format.stdout.contains("formatted"),
+        "stdout: {}",
+        format.stdout
+    );
+    assert_eq!(
+        fs::metadata(&image).expect("image exists").len(),
+        4 * 1024 * 1024
+    );
+
+    // A second mkfs without --force refuses: the image now carries an eofs filesystem,
+    // and reformatting it silently would be data loss.
+    let refuse = eo9(&store, &["mkfs.eofs", image_arg]);
+    assert_eq!(refuse.code, 3, "stderr: {}", refuse.stderr);
+    assert!(
+        refuse.stderr.contains("--force"),
+        "stderr: {}",
+        refuse.stderr
+    );
+
+    // With --force it reformats.
+    let force = eo9(&store, &["mkfs.eofs", image_arg, "--force"]);
+    assert_eq!(force.code, 0, "stderr: {}", force.stderr);
+}
+
+#[test]
+fn eofs_keeps_files_across_processes_on_a_disk_image() {
+    // The full milestone-3 story: format an image, write through the composed
+    // `fs.eofs $ readwrite` chain in one process, then read the data back with
+    // `fs.eofs $ cat` in a *new* process. The only state the two runs share is the
+    // image file named by --disk.
+    let store = temp_store("eofs-persist");
+    let dir = temp_store("eofs-persist-images");
+    let image = dir.join("disk.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+
+    let format = eo9(&store, &["mkfs.eofs", image_arg, "--size", "8M"]);
+    assert_eq!(format.code, 0, "stderr: {}", format.stderr);
+
+    let write = eo9(
+        &store,
+        &[
+            "--disk",
+            image_arg,
+            "-c",
+            "fs.eofs $ readwrite /keep.txt persistent-data",
+        ],
+    );
+    assert_eq!(write.code, 0, "stderr: {}", write.stderr);
+    assert!(
+        write.stderr.contains("round-tripped(15)"),
+        "stderr: {}",
+        write.stderr
+    );
+
+    // A brand-new process: nothing carries over but the image file itself.
+    let read = eo9(
+        &store,
+        &["--disk", image_arg, "-c", "fs.eofs $ cat /keep.txt"],
+    );
+    assert_eq!(read.code, 0, "stderr: {}", read.stderr);
+    assert!(
+        read.stdout.contains("persistent-data"),
+        "stdout: {}",
+        read.stdout
+    );
+
+    let list = eo9(&store, &["--disk", image_arg, "-c", "fs.eofs $ ls /"]);
+    assert_eq!(list.code, 0, "stderr: {}", list.stderr);
+    assert!(list.stdout.contains("keep.txt"), "stdout: {}", list.stdout);
+}
+
+#[test]
+fn disk_is_not_granted_without_an_explicit_disk_flag() {
+    // Same opt-in posture as the filesystem: without --disk there is no block device at
+    // all, and a composed chain that needs one is refused at spawn rather than handed
+    // some ambient file.
+    let store = temp_store("eofs-no-grant");
+    let run = eo9(&store, &["-c", "fs.eofs $ ls /"]);
+    assert_ne!(run.code, 0, "stdout: {} stderr: {}", run.stdout, run.stderr);
+    let all = format!("{}{}", run.stdout, run.stderr);
+    assert!(all.contains("eo9:disk"), "output: {all}");
+}
+
+#[test]
+fn a_damaged_disk_image_is_a_typed_error_not_a_crash() {
+    let store = temp_store("eofs-damaged");
+    let dir = temp_store("eofs-damaged-images");
+    let image = dir.join("disk.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+    let format = eo9(&store, &["mkfs.eofs", image_arg, "--size", "4M"]);
+    assert_eq!(format.code, 0, "stderr: {}", format.stderr);
+
+    // Truncate the image behind eofs's back: mounting must surface the program's own
+    // typed fs error, not a guest panic or a host crash.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(&image)
+        .expect("open image");
+    file.set_len(100).expect("truncate image");
+    drop(file);
+
+    let run = eo9(&store, &["--disk", image_arg, "-c", "fs.eofs $ ls /"]);
+    assert_eq!(run.code, 1, "stdout: {} stderr: {}", run.stdout, run.stderr);
+    let all = format!("{}{}", run.stdout, run.stderr);
+    assert!(!all.contains("panicked"), "output: {all}");
+    assert!(all.contains("error: fs("), "output: {all}");
+}

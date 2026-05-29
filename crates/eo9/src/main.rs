@@ -26,6 +26,7 @@ mod complete;
 mod describe;
 mod editor;
 mod interactive;
+mod mkfs;
 mod providers;
 mod run;
 mod seed;
@@ -105,6 +106,11 @@ fn dispatch(args: Vec<String>) -> Result<u8, String> {
             compile::cmd_compile(&cfg, &target)
         }
         "store" => storecmd::cmd_store(&mut stream, &mut cfg),
+        // Must precede the implicit-run arm: `mkfs.eofs` also reads as a dotted name.
+        "mkfs.eofs" => {
+            cli::consume_global_options(&mut stream, &mut cfg)?;
+            mkfs::cmd_mkfs(&cfg, &mut stream)
+        }
         "shell" => {
             let command = cli::parse_shell_args(&mut stream, &mut cfg)?;
             shell::cmd_shell(&cfg, command)
@@ -170,6 +176,11 @@ COMMANDS:
                               Evict compile-cache entries down to a size budget
     store reseed              Re-bind the bundled program names to this binary's components
                               (recovery for a store seeded by an older eo9; user bindings stay)
+    mkfs.eofs <image> [--size <bytes[K|M|G]>] [--force]
+                              Create (if needed) and format a disk-image file with eofs,
+                              Eo9's native filesystem; an image that already carries an
+                              eofs filesystem is only reformatted with --force. Mount it by
+                              granting --disk <image> and composing `fs.eofs $ <program>`
     shell [-c <command>]      Run eosh, the Eo9 shell: interactive REPL on the terminal, or
                               one command line with -c (programs resolve from the store's
                               bound names; --fs-root governs what children may touch)
@@ -180,6 +191,10 @@ OPTIONS (before the program name; `--<flag> <value>` after it belongs to the pro
         --store <path>        Module store root (default: $EO9_STORE, else ~/.eo9/store)
         --fs-root <dir>       Grant the program the eo9:fs capability, rooted at <dir>
                               (no filesystem access without it; guest paths cannot escape it)
+        --disk <image>        Grant the program the eo9:disk capability backed by <image>
+                              (a raw block device; no block device without it). Mount it as
+                              a persistent filesystem with `fs.eofs $ <program>`; create the
+                              image with `eo9 mkfs.eofs <image>`
         --exec-snapshot <clone-or-refuse|clone-or-copy>
                               How open-exec snapshots a path (default: clone-or-refuse)
         --max-memory <bytes>  Linear-memory ceiling for the spawned task
