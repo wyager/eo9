@@ -253,7 +253,15 @@ fn build_params(
                     format!("argument `{name}` (= `{raw}`) could not be parsed: {err}")
                 })?);
             }
-            None => return Err(format!("missing argument `{name}`")),
+            None => {
+                // An unsupplied `option<…>` parameter binds to `none`, mirroring the
+                // usermode runtime and the shell's argument completion.
+                if matches!(ty, Type::Option(_)) {
+                    params.push(Val::Option(None));
+                    continue;
+                }
+                return Err(format!("missing argument `{name}`"));
+            }
         }
     }
     if let Some(index) = used.iter().position(|used| !used) {
@@ -294,9 +302,20 @@ fn parse_scalar(ty: &Type, raw: &str) -> Result<Val, String> {
         Type::S64 => Val::S64(int(raw)?),
         Type::Float32 => Val::Float32(int(raw)?),
         Type::Float64 => Val::Float64(int(raw)?),
+        Type::Option(option) => {
+            // A literal `none` is the absent option; anything else is the inner value.
+            if raw == "none" {
+                Val::Option(None)
+            } else {
+                Val::Option(Some(alloc::boxed::Box::new(parse_scalar(
+                    &option.ty(),
+                    raw,
+                )?)))
+            }
+        }
         other => {
             return Err(format!(
-                "the kernel runner only parses scalar argument types, not {other:?}"
+                "the kernel runner only parses scalar and option argument types, not {other:?}"
             ));
         }
     })
