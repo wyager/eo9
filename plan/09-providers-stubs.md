@@ -178,3 +178,26 @@ Match the priority order above; (1)+(2) unblock I2.
     soundness corpus. Follow-ups: an l4-over-l3 middleware provider (smoltcp-style) and a real l2/l3
     backend over virtio-net (kernel root provider) are the planned next consumers; eosh-side docs/examples
     still reference `net.none`/`net.deny` in comment strings only.
+
+16. **`disk.virtio` — the first real device driver, as an ordinary provider component (2026-05-29, branch
+    `area/08-virtio-blk`).** `guest/stubs/disk-virtio` imports `eo9:pci/pci` (plus `eo9:text/text` for one
+    diagnostic line) and exports `eo9:disk/disk`: a modern (virtio 1.0, `disable-legacy=on`) virtio-blk
+    driver — capability walk through configuration space, common/notify/device-config windows through
+    `open-bar`/`bar-read`/`bar-write`, exactly `VIRTIO_F_VERSION_1` negotiated, one 16-entry split virtqueue
+    in `alloc-dma` buffers, requests kicked through the notify register and completed by polling the used
+    ring (the kernel PCI provider has no interrupt delivery yet; virtio is fine with that). The exported disk
+    is byte-addressed over the 512-byte-sector device: reads fetch covering sectors and copy out the range,
+    writes read–modify–write partial edge sectors, ranges that fall outside the capacity fail with
+    `out-of-range`, zero-length accesses up to the capacity succeed (the same contract as `disk.mem`).
+    Decisions: (a) it lives in `guest/stubs/` under the stub naming convention (`eo9-stub-disk-virtio` →
+    shell name `disk.virtio`) because that is what seeds/composes cleanly everywhere today — "the standard
+    providers directory also holds drivers" is the recorded reading, and a rename to a dedicated drivers/
+    area can happen wholesale later; (b) no configure interface — the documented default claims the first
+    virtio-blk function visible through the granted capability on first use, and "exactly this device" is
+    `pci.filtered`'s job composed in front; (c) like `fs.eofs`, every pci import is driven eagerly
+    (`poll_eager`), so the exported operations complete in a single poll and the driver works under
+    consumers that poll their disk import eagerly; (d) device errors surface as typed `io(...)` disk errors
+    naming the failing step, never traps; (e) v0 limits, recorded: one request in flight at a time, a 64 KiB
+    bounce buffer per request, no FLUSH (durability is QEMU's writeback cache for now), no MSI/INTx. Verified
+    on QEMU aarch64 metal (plan/12 D50): the full composed stack `disk.virtio $ fs.eofs $ ls / readwrite /
+    cat` runs compiled on-target, and data written through it survives a QEMU power cycle.
