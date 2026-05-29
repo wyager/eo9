@@ -144,6 +144,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-example-lspci"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-example-outcomes"
 version = "0.0.0"
 dependencies = [

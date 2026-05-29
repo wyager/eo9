@@ -16,4 +16,5 @@ world sdk {
     import eo9:disk/disk@0.1.0;
     import eo9:fs/fs@0.1.0;
     import eo9:net/net@0.1.0;
+    import eo9:pci/pci@0.1.0;
 }

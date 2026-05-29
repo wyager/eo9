@@ -17,6 +17,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-outcomes",
     "eo9-example-cruncher",
     "eo9-example-readwrite",
+    "eo9-example-lspci",
     "eosh",
     // Basic coreutils (guest/coreutils/*, plan/17-coreutils.md).
     "eo9-coreutil-cat",
@@ -79,6 +80,7 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-example-outcomes", "outcomes"),
     ("eo9-example-cruncher", "cruncher"),
     ("eo9-example-readwrite", "readwrite"),
+    ("eo9-example-lspci", "lspci"),
     ("eo9-stub-entropy-seeded", "entropy.seeded"),
     ("eo9-stub-time-frozen", "time.frozen"),
 ];

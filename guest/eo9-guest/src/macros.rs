@@ -31,9 +31,10 @@
 /// * `world` — the world name, defined in the crate's own `wit/` directory (with the
 ///   repo-level packages it imports symlinked under `wit/deps/`).
 /// * `apis` — which eo9 APIs the world imports, as bare identifiers (`io`, `text`,
-///   `time`, `entropy`, `perf`, `disk`, `fs`, `net`). Listing an API maps its interfaces
-///   onto [`crate::api`] instead of regenerating them; `io` must be listed exactly when
-///   the world's imports use `eo9:io/buffers` (i.e. for `disk`, `fs`, and `net`).
+///   `time`, `entropy`, `perf`, `disk`, `fs`, `net`, `pci`). Listing an API maps its
+///   interfaces onto [`crate::api`] instead of regenerating them; `io` must be listed
+///   exactly when the world's imports use `eo9:io/buffers` (i.e. for `disk`, `fs`, and
+///   `net`).
 ///
 /// The API list must match the world's imports exactly — a missing entry fails with
 /// wit-bindgen's "no remapping found" error, an extra one with its "unused remappings"
@@ -135,6 +136,16 @@ macro_rules! __bindings_with {
             with [$($acc)*
                 "eo9:net/types@0.1.0": eo9_guest::api::net::types,
                 "eo9:net/net@0.1.0": eo9_guest::api::net::net,
+            ]
+            $($tail)*
+        );
+    };
+    (apis [pci $($rest:ident)*] with [$($acc:tt)*] $($tail:tt)*) => {
+        $crate::__bindings_with!(
+            apis [$($rest)*]
+            with [$($acc)*
+                "eo9:pci/types@0.1.0": eo9_guest::api::pci::types,
+                "eo9:pci/pci@0.1.0": eo9_guest::api::pci::pci,
             ]
             $($tail)*
         );
