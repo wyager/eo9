@@ -1,7 +1,7 @@
 //! riscv64 on QEMU `virt`: S-mode under OpenSBI, NS16550A UART, Goldfish RTC, the `time`
 //! CSR + SBI timer, and a SiFive-style PLIC for UART interrupt delivery. The port follows
-//! the aarch64 reference layer (src/arch/aarch64/) module for module; translation (and with
-//! it W^X for published JIT pages) is still to come — see `mmu` and plan/12-kernel.md.
+//! the aarch64 reference layer (src/arch/aarch64/) module for module; `mmu` runs the hart
+//! under an Sv39 identity map with W^X for published JIT code pages.
 
 mod boot;
 mod plic;
