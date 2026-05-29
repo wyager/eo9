@@ -154,3 +154,17 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
     asserts it. (d) Deliberately not done: distinguishing providers from binaries in `ls /bin` — the listing
     is a plain fs read and the kind is only known after a `describe` per entry; a `bin`-style builtin that
     describes as it lists is the recorded follow-up if wanted.
+
+15. **`&` refusals name the offending operand (2026-05-29, owner-reported).** `entropy.seeded & echo` used
+    to be refused with "the left operand is not a provider" — wrong, since the left operand *is* a provider.
+    Root cause: `eo9-component`'s `extend` correctly checks both operands but its `ComposeError::NotAProvider`
+    carries no side, and the eosh backend rendered every such refusal with the `$` wording (which genuinely is
+    about the left operand). The check itself was never wrong; only the attribution was. Fix: the evaluator
+    now checks both operand kinds (one `describe` per side) before calling `extend`, where the operands'
+    source spellings are still known, and refuses with a message that names the operand at fault and — when
+    both operands are bare names — suggests the `$` spelling instead (`to run it with that provider use
+    `entropy.seeded $ echo``); when both operands are programs it says so plainly. The backend's rendering of
+    a raw `NotAProvider` from `&` (now only a backstop) no longer claims a side either; `$` keeps its
+    accurate left-operand wording. Cost: two metadata-only `describe` calls per `&` evaluation. Covered by
+    eosh-core unit tests (right/left/both/configured-operand cases) and a CLI transcript; the
+    eo9-component-level behaviour was already pinned by `algebra_properties`.

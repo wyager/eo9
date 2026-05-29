@@ -785,6 +785,47 @@ fn shell_composes_with_the_algebra() {
 }
 
 #[test]
+fn shell_extend_with_a_binary_names_the_offending_operand() {
+    // `&` combines providers; handing it a binary is refused. The refusal must name the
+    // operand that is actually at fault (here the right one — the left IS a provider)
+    // and point at the `$` spelling, instead of the old blanket "left operand" text.
+    let store = temp_store("shell-extend-binary");
+    let run = eo9(&store, &["shell", "-c", "entropy.seeded & echo"]);
+    assert_eq!(run.code, 3, "stdout: {}", run.stdout);
+    assert!(
+        run.stderr.contains("`echo` is a program, not a provider"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("entropy.seeded $ echo"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("left operand"),
+        "the refusal must not blame the provider operand: {}",
+        run.stderr
+    );
+
+    // The mirror image: a binary on the left is named too, with the same suggestion.
+    let swapped = eo9(&store, &["shell", "-c", "echo & entropy.seeded"]);
+    assert_eq!(swapped.code, 3, "stdout: {}", swapped.stdout);
+    assert!(
+        swapped
+            .stderr
+            .contains("`echo` is a program, not a provider"),
+        "{}",
+        swapped.stderr
+    );
+    assert!(
+        swapped.stderr.contains("entropy.seeded $ echo"),
+        "{}",
+        swapped.stderr
+    );
+}
+
+#[test]
 fn shell_maps_child_outcomes_to_honest_exit_codes() {
     // `-c` follows `eo9 run`'s contract: 1 the command reported failure, 2 it ended
     // abnormally, 3 the shell could not run it at all. eosh's `program-failure` carries

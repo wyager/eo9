@@ -118,9 +118,16 @@ fn restrict_error(err: component_algebra::RestrictError) -> BackendError {
 fn compose_error(operation: &str, err: component_algebra::ComposeError) -> BackendError {
     use component_algebra::ComposeError as E;
     BackendError::new(match err {
-        E::NotAProvider => format!(
+        // `$` checks exactly its left operand; `&` refuses when either operand is not a
+        // provider, so its message must not claim a side (the evaluator usually catches
+        // this earlier and names the operand — this is the backstop).
+        E::NotAProvider if operation == "`$`" => format!(
             "{operation} refused: the left operand is not a provider (only providers can \
              satisfy imports)"
+        ),
+        E::NotAProvider => format!(
+            "{operation} refused: an operand is not a provider (`&` combines providers into \
+             an environment; use `$` to run a program with a provider)"
         ),
         E::TypeMismatch(msg) => {
             format!("{operation} refused: capability types do not match: {msg}")
