@@ -18,7 +18,7 @@
 //!   composition works and never traps (plan/09 Decision 14). The exported
 //!   `eo9:net/l4-over-l2-config` entry binds different addressing; baking it through
 //!   `configure(…)` waits on compose-time configuration of resource-owning API
-//!   providers (plan/03 D13, plan/09 D19).
+//!   providers (plan/03 D13, plan/09 D20).
 //! * **Driving the link.** Every l2 import is driven eagerly (the same single-poll
 //!   pattern as `net.virtio` driving `eo9:pci`, and `fs.eofs` driving `eo9:disk`):
 //!   each exported l4 operation pumps the link — transmit what the stack queued,
