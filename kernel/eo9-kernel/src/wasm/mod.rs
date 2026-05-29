@@ -21,6 +21,8 @@
 pub mod async_demo;
 #[cfg(feature = "wasm-codegen")]
 pub mod codegen;
+#[cfg(feature = "wasm-storedisk")]
+pub mod diskcache;
 #[cfg(feature = "wasm-hello")]
 pub mod hello;
 #[cfg(feature = "wasm-store")]

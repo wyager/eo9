@@ -1693,7 +1693,10 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
             "--target",
             KERNEL_CHECK_TARGET,
             "--features",
-            "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen",
+            // `wasm-storedisk` (the persistent compile cache behind the `storedisk` boot
+            // token) is aarch64-only for now: the kernel's ECAM bring-up is aarch64-virt
+            // specific, so the other targets build without it.
+            "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen,wasm-storedisk",
         ],
         &[
             ("EO9_SEED_CWASM", seed.as_os_str()),
@@ -1825,6 +1828,29 @@ fn ensure_scratch_disk(root: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Path of the persistent store-disk image the `storedisk` QEMU argument attaches,
+/// creating it (blank, 64 MiB) on first use. The kernel formats a blank disk with eofs and
+/// keeps its compile cache on it, so this file is what makes on-target compile results
+/// survive across QEMU runs. Distinct from the scratch disk above so the guest-facing
+/// `disk` demo (which treats its disk as expendable) never clobbers the kernel's cache.
+fn ensure_store_disk(root: &Path) -> Result<PathBuf, String> {
+    let dir = root.join("kernel").join("target");
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+    let path = dir.join("eo9-store-disk.raw");
+    if !path.exists() {
+        let file = std::fs::File::create(&path)
+            .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
+        file.set_len(64 * 1024 * 1024)
+            .map_err(|err| format!("failed to size {}: {err}", path.display()))?;
+        println!(
+            "xtask: created blank 64 MiB store disk at {}",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
 /// Build the kernel image for `arch` and boot it under QEMU with serial on stdio.
 ///
 /// The exact invocation (aarch64): `qemu-system-aarch64 -M virt,gic-version=2,highmem=off
@@ -1839,6 +1865,12 @@ fn ensure_scratch_disk(root: &Path) -> Result<PathBuf, String> {
 /// same idea for networking: it attaches a modern virtio-net PCI function backed by QEMU
 /// user-mode networking (`-netdev user`) so the `net.virtio` driver has a NIC to claim —
 /// `cargo xtask qemu aarch64 pci net`.
+///
+/// A bare `storedisk` argument attaches the *persistent* store-disk image and also stays on
+/// the kernel command line: the kernel claims that virtio-blk function for its own
+/// disk-backed compile cache (on-target compile results survive reboots) —
+/// `cargo xtask qemu aarch64 storedisk`. Don't combine it with the guest-facing `disk`/`pci`
+/// flags in the same boot until machine-global device claiming lands.
 fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
     let image = build_kernel(root, arch)?;
     let qemu = format!("qemu-system-{arch}");
@@ -1904,17 +1936,40 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
     args.push(image.as_os_str().to_os_string());
     // The bare `disk` and `net` arguments are xtask's: attach the scratch virtio-blk disk
     // / a user-mode virtio-net NIC and keep the tokens off the kernel command line.
+    // `storedisk` is both: it attaches the persistent store-disk image *and* stays on the
+    // kernel command line, because the kernel itself acts on the token (it claims that
+    // virtio-blk function for its compile cache; see kernel diskcache). Combining
+    // `storedisk` with the guest-facing `disk`/`pci` flags in one boot is not supported
+    // until machine-global device claiming lands — the kernel claims the first virtio-blk
+    // function it finds.
     let mut cmdline: Vec<String> = Vec::new();
     let mut attach_disk = false;
     let mut attach_net = false;
+    let mut attach_store_disk = false;
     for argument in append {
         if argument == "disk" {
             attach_disk = true;
         } else if argument == "net" {
             attach_net = true;
+        } else if argument == "storedisk" {
+            attach_store_disk = true;
+            cmdline.push(argument.clone());
         } else {
             cmdline.push(argument.clone());
         }
+    }
+    if attach_store_disk {
+        let store = ensure_store_disk(root)?;
+        args.push("-drive".into());
+        args.push(
+            format!(
+                "if=none,format=raw,id=eo9storedisk,file={}",
+                store.display()
+            )
+            .into(),
+        );
+        args.push("-device".into());
+        args.push("virtio-blk-pci,drive=eo9storedisk,disable-legacy=on".into());
     }
     if attach_disk {
         let scratch = ensure_scratch_disk(root)?;

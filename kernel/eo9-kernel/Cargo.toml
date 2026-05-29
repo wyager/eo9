@@ -34,6 +34,12 @@ wasm-store = ["dep:wasmtime"]
 # Also links the no_std component algebra (eo9-component) so the shell can compose ($/&/
 # only/configure) and compile the fused result on-target (plan/12 Decisions 30–35).
 wasm-codegen = ["dep:wasmtime", "wasmtime/cranelift", "dep:eo9-component"]
+# The persistent store disk (plan/12: store-on-eofs): an in-kernel polled virtio-blk driver
+# plus the eofs engine, used as a disk-backed cache for on-target compile results. Activated
+# at boot only by the bare `storedisk` command-line token; without the token the feature is
+# inert. Off by default; xtask enables it for the aarch64 full build only (the ECAM bring-up
+# in src/pci.rs is aarch64-virt specific today).
+wasm-storedisk = ["wasm-store", "dep:eofs-core", "dep:blake3"]
 
 # These dependencies are only used by the real bare-metal build; host-triple builds (unit
 # tests, `cargo check` without --target) compile the stub entry point and need neither.
@@ -51,3 +57,11 @@ wasmtime = { workspace = true, optional = true, features = [
 # vendored copies by this workspace's [patch.crates-io]). Only linked under `wasm-codegen`,
 # since composing on metal requires the on-target compiler.
 eo9-component = { path = "../../crates/eo9-component", default-features = false, optional = true }
+# The eofs filesystem engine (no_std + alloc; the same crate the fs.eofs guest provider and
+# the usermode mkfs use) — the on-disk format for the persistent store disk. A path
+# dependency into the host workspace, like eo9-component above.
+eofs-core = { path = "../../crates/eofs-core", optional = true }
+# Content addressing for cached compile artifacts (cache key = blake3 of the fused
+# executable bytes). Same pin as the host workspace; `no_neon` because the bare-metal
+# targets have no C toolchain for the NEON kernels (mirrors crates/eofs-core).
+blake3 = { version = "1.8.5", default-features = false, features = ["no_neon"], optional = true }
