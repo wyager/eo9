@@ -208,6 +208,14 @@ impl HostDisk {
 }
 
 impl DiskProvider for HostDisk {
+    fn size(&mut self) -> u64 {
+        self.inner.size()
+    }
+
+    fn flush(&mut self) -> BoxOp<Result<(), DiskError>> {
+        ready_op(self.inner.flush_blocking().map_err(disk_write_error))
+    }
+
     fn read(&mut self, offset: u64, dst: Vec<u8>) -> BoxOp<(Vec<u8>, Result<u64, DiskError>)> {
         let (buffer, result): UnixDiskReadCompletion =
             self.inner.read_blocking(offset, OwnedBuffer::from_vec(dst));

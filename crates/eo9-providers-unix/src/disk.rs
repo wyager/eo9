@@ -197,6 +197,18 @@ impl DiskProvider {
         };
         (src, result)
     }
+
+    /// Make every completed write durable on the backing file (fsync), synchronously on
+    /// the calling thread. A read-only device has nothing volatile and succeeds
+    /// immediately.
+    pub fn flush_blocking(&self) -> Result<(), WriteError> {
+        if self.read_only {
+            return Ok(());
+        }
+        self.file
+            .sync_all()
+            .map_err(|err| WriteError::Io(err.to_string()))
+    }
 }
 
 impl DiskHost for DiskProvider {

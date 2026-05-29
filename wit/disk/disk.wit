@@ -43,6 +43,11 @@ interface disk {
         read-only,
     }
 
+    /// The device's total size in bytes, fixed for the life of the handle. Consumers
+    /// (the eofs provider, partitioners, …) read it here instead of probing with
+    /// out-of-range accesses.
+    size: func(dev: borrow<disk-impl>) -> u64;
+
     /// Owned buffer in, owned buffer back out (on both success and error), so the
     /// backend holds it uniquely across the async boundary. (The spec sketch writes
     /// `own<buffer>`; a bare `buffer` parameter/result is the same owned handle —
@@ -52,6 +57,12 @@ interface disk {
 
     write: async func(dev: borrow<disk-impl>, offset: u64, src: buffer)
         -> tuple<buffer, result<write-result, write-error>>;
+
+    /// Make every write that has already completed durable on the underlying device
+    /// before returning. A device with no volatile cache (an in-memory device, a
+    /// write-through file) succeeds without doing anything; `read-only` is never
+    /// returned (flushing a read-only device is a successful no-op).
+    flush: async func(dev: borrow<disk-impl>) -> result<_, write-error>;
 }
 
 /// Optional flavor of `disk` (hand-written for v0; see SPEC: The capability algebra).

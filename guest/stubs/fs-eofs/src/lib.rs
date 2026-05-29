@@ -34,9 +34,10 @@
 //!   rather than blocking. Every disk wired up today (disk.mem and other compute-only
 //!   backends) completes eagerly; the fully asynchronous bridge is a recorded follow-up
 //!   (plan/14-eofs.md).
-//! * The disk API has no size query yet, so the device size is discovered once per mount
-//!   by probing with zero-length reads (out-of-range marks the end) — ~120 probes,
-//!   recorded in plan/14 as an `eo9:disk` API gap to raise with the planner.
+//! * The device size comes from the disk API's `size` query (read once per mount), and
+//!   the engine's commit-boundary flushes call straight through to the disk's `flush`,
+//!   so durability is the underlying device's (fsync for a file-backed disk, a virtio
+//!   cache flush for `disk.virtio`, a no-op for purely in-memory devices).
 
 #![no_std]
 
@@ -87,48 +88,12 @@ struct DiskDevice {
 }
 
 impl DiskDevice {
-    /// Take the disk's root handle and discover its size.
+    /// Take the disk's root handle and read its size from the disk API.
     fn new() -> Result<DiskDevice, DeviceError> {
         let handle = disk::default();
-        let size = probe_size(&handle)?;
+        let size = disk::size(&handle);
         Ok(DiskDevice { handle, size })
     }
-}
-
-/// Discover the device size. The disk API has no size query (an API gap recorded in
-/// plan/14), but per the disk contract a zero-length read at `offset` succeeds iff
-/// `offset` lies within the device, so the boundary is found by galloping followed by a
-/// binary search — a bounded number of zero-byte reads, once per mount.
-fn probe_size(handle: &disk::DiskImpl) -> Result<u64, DeviceError> {
-    let in_range = |offset: u64| -> Result<bool, DeviceError> {
-        let dst = Buffer::new(0);
-        let (_dst, result) = poll_eager(disk::read(handle, offset, dst)).ok_or(DeviceError::Io)?;
-        match result {
-            Ok(_) => Ok(true),
-            Err(disk::ReadError::OutOfRange) => Ok(false),
-            Err(_) => Err(DeviceError::Io),
-        }
-    };
-    // Invariant: `low` is in range (offset 0 always is), `high` is not.
-    let mut low: u64 = 0;
-    let mut high: u64 = 1;
-    while in_range(high)? {
-        low = high;
-        if high >= 1 << 62 {
-            // An absurd claimed size; treat it as a device failure rather than looping.
-            return Err(DeviceError::Io);
-        }
-        high *= 2;
-    }
-    while high - low > 1 {
-        let mid = low + (high - low) / 2;
-        if in_range(mid)? {
-            low = mid;
-        } else {
-            high = mid;
-        }
-    }
-    Ok(low)
 }
 
 impl BlockDevice for DiskDevice {
@@ -177,9 +142,10 @@ impl BlockDevice for DiskDevice {
     }
 
     fn flush(&mut self) -> Result<(), DeviceError> {
-        // eo9:disk has no flush/sync operation yet (recorded in plan/14 as an API gap);
-        // writes are treated as durable once their result comes back.
-        Ok(())
+        // The engine calls this at every commit boundary (before and after the uberblock
+        // write), so durability rides on the imported disk's own flush.
+        let result = poll_eager(disk::flush(&self.handle)).ok_or(DeviceError::Io)?;
+        result.map_err(|_| DeviceError::Io)
     }
 }
 
