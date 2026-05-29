@@ -1746,32 +1746,23 @@ fn components_data_dir(root: &Path) -> PathBuf {
 }
 
 /// The built guest components as sorted `(stem, bytes)` pairs.
+///
+/// The set is derived from `GUEST_COMPONENTS` — the same list `build-guest` builds — not
+/// from whatever `.wasm` files happen to sit in the build directory, so a removed crate's
+/// stale artifact can never sneak into the published bundle (and a missing entry is a
+/// clear "run build-guest first" error rather than a silently smaller bundle).
 fn built_components(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let dir = components_build_dir(root);
-    let entries = std::fs::read_dir(&dir).map_err(|err| {
-        format!(
-            "cannot read {} ({err}); run `cargo xtask build-guest` first",
-            dir.display()
-        )
-    })?;
     let mut components = Vec::new();
-    for entry in entries {
-        let path = entry.map_err(|err| err.to_string())?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let bytes =
-            std::fs::read(&path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-        components.push((stem.to_string(), bytes));
-    }
-    if components.is_empty() {
-        return Err(format!(
-            "no built components under {}; run `cargo xtask build-guest` first",
-            dir.display()
-        ));
+    for package in GUEST_COMPONENTS {
+        let path = dir.join(format!("{package}.wasm"));
+        let bytes = std::fs::read(&path).map_err(|err| {
+            format!(
+                "cannot read {} ({err}); run `cargo xtask build-guest` first",
+                path.display()
+            )
+        })?;
+        components.push(((*package).to_string(), bytes));
     }
     components.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(components)
