@@ -510,7 +510,6 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
     the AOT fast path, run against the kernel roots with the existing child/capability rules, and test
     `entropy.seeded $ cruncher …` interactively with containment intact.
 
-
 32. **Checkpoint 4 — closure analysis (Decision 31 sharpened): it is a TWO-VERSION-FAMILY fork, and there is
     no intermediate building checkpoint.** Inspecting `cargo tree -p eo9-component --no-default-features`
     against the registry sources nails the real shape, which is materially larger than Decision 31 assumed:
@@ -1167,7 +1166,19 @@ preemption/hardening work.
       the UART RX ring consumed by the executor (wired but consumer-less today, as on riscv64 at this
       stage).
 
-53. **x86_64 milestones 3–4: host-AOT components run and the baked store boots eosh on QEMU q35
+53. **The metal sockets demo: `net.virtio $ net.l4.over-l2 $ l4check` on QEMU aarch64 (2026-05-29, branch
+    `area/09-net-l4-over-l2`).** The kernel store gains the TCP/IP middleware and its check program
+    (`KERNEL_STORE_COMPONENTS` += `net.l4.over-l2`, `l4check`; 20 entries, 1709 KiB of components +
+    13578 KiB of precompiled artifacts; aarch64 image ≈ 34.1 MiB). With the same `pci` boot grant and
+    xtask `net` flag the virtio-net demo already uses, the metal shell can now compose the full transport
+    stack and compile it on-target: the session prints the driver's probe line and then
+    `ok: resolved("example.com is 172.66.147.243; tcp 10.0.2.2:9 -> ConnectionRefused")` — a UDP DNS query
+    answered through the wasm driver + wasm TCP/IP stack + slirp, and a refused TCP SYN surfaced as a
+    typed error instead of a trap. No kernel source changes; the riscv64 image carries the same store
+    additions (its PCI provider remains the recorded follow-up). Scripted sessions keep the D49
+    convention: wait for the prompt, pace the input.
+
+54. **x86_64 milestones 3–4: host-AOT components run and the baked store boots eosh on QEMU q35
     (2026-05-29, branch `area/12-x86-64-m3`).** The same step riscv64 took in D47, with one x86-specific
     wrinkle. `cargo xtask build-kernel x86_64` now runs the full host-AOT precompile pipeline (seed, hello,
     the async pair, the 18-component store image) targeted at `x86_64-unknown-none` and builds the kernel
