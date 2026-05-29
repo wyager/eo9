@@ -725,3 +725,17 @@ the page with real key events):
 The /vm assets were rebuilt once for the new hello + blob (blob 8,829,574 B raw / 1,725,277 B brotli);
 all four node/JSPI harnesses pass (verify-eosh now 27 checks), check-web-vm is green, and the full
 `cargo xtask ci` gate passes.
+
+## Decision 32 — the blob seeds a session manifest, so `env` works in the browser (2026-05-29)
+
+The D31 gap is closed: `WebState::new()` now seeds `/session` (the `eo9-session 1` format from eosh-core's
+`envinfo`, the same file the usermode and kernel embedders write) into the in-memory filesystem, describing
+exactly what the page grants — shell: the page terminal, the browser clock, crypto entropy, the in-memory
+fs, and exec (algebra + in-browser compiler + spawn); children: the same minus exec, with a fresh fs per
+run; notes that nothing leaves the page and that `only` restricts a command. The text is informational
+(the linker registrations in `providers.rs`/`execsurface.rs` remain the authority) and lives next to the
+manifest function so the two stay in sync. eosh's `env` builtin therefore reports real capabilities in the
+browser; verify-eosh drives `env` (asserting the granted/receive sections) and now also asserts that
+`describe entropy.seeded` shows the provider's configure argument. The try-it page's "Explore the sandbox"
+copy can now add an `env` line — a one-line follow-up deliberately not made here (the page was left
+untouched in this change).
