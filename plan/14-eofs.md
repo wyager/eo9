@@ -95,6 +95,47 @@ Milestone 1 (`crates/eofs-core`; the on-disk format is described in `crates/eofs
     bounded during the walk), and the verify/GC directory walks are iterative with a visited set — so corrupted
     or adversarial images fail with `Corrupt` instead of unbounded allocation, fan-out, or recursion.
 
-Deferred to later milestones: the provider component and `eofs.mkfs` (M2), usermode end-to-end and
+Deferred to later milestones: usermode end-to-end over a *persistent* (file-backed/host) disk and
 store-on-eofs (M3), kernel adoption (M4), plus content-only node hashes, holes/sparse files, rename, and
 persistent free-space maps if they turn out to be needed.
+
+Milestone 2 (`guest/stubs/fs-eofs` → the `fs.eofs` component; tests in
+`tests/eo9-integration/tests/eofs.rs`):
+
+11. **The provider is a thin bridge, exactly as D1 intended.** `fs.eofs` targets a crate-local world
+    (`eo9:fs-eofs/eofs`: `import eo9:disk/disk`, `export eo9:fs/fs`) and implements `BlockDevice` over the
+    imported disk; the whole filesystem is the unmodified `eofs-core` engine (no eofs-core changes were
+    needed). `eofs-core` is now in the guest workspace pin table and builds for wasm32 unchanged.
+12. **mkfs = `Eofs::format` + format-on-first-mount; no separate `eofs.mkfs` tool yet.** The provider's
+    documented default (it has no configure interface, per the option-C rule): first use mounts the disk if
+    either uberblock slot carries the eofs magic, and formats a *blank* device (no magic anywhere) in place
+    with the default options; a device that has the magic but fails to mount is never reformatted — the error
+    surfaces instead of becoming data loss. Host-side tooling formats with `Eofs::format` directly. A
+    standalone `eofs.mkfs` sibling tool (and an `eo9 mkfs.eofs <file>` CLI hook) is deferred until there is a
+    persistent host disk to point it at (M3).
+13. **disk.mem gained its documented default** (16 MiB, zero-filled) so the canonical chain
+    `disk.mem $ fs.eofs $ program` runs with no `configure` anywhere — it previously trapped when
+    unconfigured, which the default-configuration rule (plan/09 D14) already said it must not.
+14. **Provider semantics** (documented in the crate): every mutating operation (`open` that creates or
+    truncates, `write`, `create-directory`, `remove`) ends with an eofs commit — durable and crash-consistent,
+    at the cost of write amplification (batching is a later refinement). Paths follow the same
+    `/`-separated, `.`/`..`-normalizing rules as fs.memfs. Open files are *path references* (removing a file
+    invalidates its open handles with `not-found`, unlike memfs's unlink semantics); `open-exec` snapshots
+    contents at open time (honest immutability by copy; pinning the Merkle object is a recorded refinement).
+    Truncate is remove + recreate (the engine has no truncate primitive yet). Snapshots, `verify`, `gc`, and
+    node hashes are not reachable through `eo9:fs` yet — that needs the planner's hash-query/snapshot surface
+    on the WIT side (the SPEC's open TODO).
+15. **Async bridging is eager-only for now.** The disk imports are `async func`s but the engine is
+    synchronous, so the provider polls each disk call to completion on the spot and fails with an `io` error
+    if the disk would genuinely suspend. Every disk it can be wired to today (disk.mem, other compute-only
+    backends) completes eagerly; the fully asynchronous bridge (or an async `BlockDevice`) is the follow-up
+    for when a genuinely suspending disk provider exists.
+16. **`eo9:disk` API gaps to raise with the planner** (not changed here — wit/ is owned elsewhere): no size
+    query (the provider discovers the device size by probing with zero-length reads, ~120 probes once per
+    mount) and no flush/sync operation (writes are treated as durable when they return). Both would make the
+    bridge cleaner and are needed for honest durability on real hardware.
+17. **Test coverage split.** The integration tests cover the provider layer: component shape, the
+    `disk.mem $ fs.eofs` seal, the behavioral `readwrite` round-trip over the full chain on documented
+    defaults, and cross-run determinism. Persistence across remounts, crash consistency, snapshots,
+    compression, and hostile images remain covered by `eofs-core`'s own suite; a component-level
+    remount/persistence test needs a host-backed persistent disk provider and lands with M3.
