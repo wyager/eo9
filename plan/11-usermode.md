@@ -283,3 +283,11 @@ its first milestones, and to be the place where cross-area seams get found.
     the binary seeded 36 bundled programs and ran `hello`). build.rs also falls back to the
     packaged `Cargo.lock` for the wasmtime-version half of the cache key when the workspace
     lockfile is absent (the published-crate case).
+20. **Honest `-c` exit codes + the eosh-side wiring view (closes the D14(d)/D16(c)/D17 follow-ups,
+    2026-05-28).** With eosh's `program-failure` now carrying the inner command's class (plan/10 D13),
+    `cmd_shell` maps the typed failure's *case name* — the case of a typed WAVE value, not free-form text —
+    onto `eo9 run`'s contract: `command-failed` → 1, `command-trapped`/`command-killed` → 2,
+    `not-runnable`/`io` → 3; an unrecognised case keeps the plain failure code, so an older eosh still exits
+    1. And eosh's `describe` builtin now shows the composition tree through `eo9:exec.wiring` (plan/02 D17),
+    the in-shell counterpart of `eo9 describe --wiring`. CLI transcripts cover fail→1, trap→2,
+    unresolvable→3, and the wiring tree for both a plain reference and a composed expression.
