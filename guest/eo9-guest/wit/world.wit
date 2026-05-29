@@ -9,6 +9,7 @@ package eo9-guest:sdk@0.1.0;
 
 world sdk {
     import eo9:io/buffers@0.1.0;
+    import eo9:rt/diagnostics@0.1.0;
     import eo9:text/text@0.1.0;
     import eo9:time/time@0.1.0;
     import eo9:entropy/entropy@0.1.0;

@@ -12,6 +12,10 @@ pub mod io {
     pub use crate::bindings::eo9::io::buffers;
 }
 
+pub mod rt {
+    pub use crate::bindings::eo9::rt::diagnostics;
+}
+
 pub mod text {
     pub use crate::bindings::eo9::text::{text, types};
 }
