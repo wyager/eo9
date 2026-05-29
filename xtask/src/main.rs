@@ -36,6 +36,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-disk-none",
     "eo9-stub-entropy-none",
     "eo9-stub-entropy-seeded",
+    "eo9-stub-fs-eofs",
     "eo9-stub-fs-memfs",
     "eo9-stub-fs-none",
     "eo9-stub-fs-overlay",
