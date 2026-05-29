@@ -588,7 +588,15 @@ fn split_top_level(body: &str) -> std::vec::Vec<&str> {
 fn is_root_provided(interface: &str) -> bool {
     matches!(
         interface,
-        "eo9:text/text" | "eo9:time/time" | "eo9:entropy/entropy" | "eo9:fs/fs" | "eo9:io/buffers"
+        "eo9:text/text"
+            | "eo9:time/time"
+            | "eo9:entropy/entropy"
+            | "eo9:fs/fs"
+            | "eo9:io/buffers"
+            // The write-once panic-report sink every SDK-built component imports; the
+            // executor itself serves it (see providers::add_diagnostics), so it is never an
+            // unmet import.
+            | "eo9:rt/diagnostics"
     )
 }
 
@@ -696,15 +704,27 @@ fn run_child_inner(
     let main = instance
         .get_func(&mut store, index)
         .ok_or_else(|| wasmtime::Error::msg("`main` is not a function"))?;
-    let outcome = block_on(
+    let run = block_on(
         "child main",
         store.run_concurrent(async move |accessor| -> Result<Val> {
             let mut result = [Val::Bool(false)];
             main.call_concurrent(accessor, &vals, &mut result).await?;
             Ok(result[0].clone())
         }),
-    )???;
-    Ok(val_to_outcome(&outcome))
+    );
+    // Flatten the three layers (executor / run_concurrent / the call itself) without
+    // discarding the store: a trap during `main` must be rendered with the panic message
+    // the guest reported through `eo9:rt/diagnostics` just before trapping.
+    let flattened: Result<Val> = match run {
+        Ok(Ok(Ok(value))) => Ok(value),
+        Ok(Ok(Err(error))) | Ok(Err(error)) | Err(error) => Err(error),
+    };
+    match flattened {
+        Ok(outcome) => Ok(val_to_outcome(&outcome)),
+        Err(error) => Ok(ProgramOutcome::Abnormal(WitAbnormalExit::Trapped(
+            crate::providers::trapped_reason(&error, store.data().panic_message.as_deref()),
+        ))),
+    }
 }
 
 // --- registration -------------------------------------------------------------------------

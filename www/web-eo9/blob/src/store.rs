@@ -267,14 +267,25 @@ pub fn run_program(name: &str, raw_args: &[&str]) -> wasmtime::Result<()> {
     let main = top_level_func(&mut store, &instance, "main")?;
 
     let started = host::monotonic_ns();
-    let outcome = block_on(
+    let run = block_on(
         "main",
         store.run_concurrent(async move |accessor| -> wasmtime::Result<Val> {
             let mut result = [Val::Bool(false)];
             main.call_concurrent(accessor, &args, &mut result).await?;
             Ok(result[0].clone())
         }),
-    )???;
+    );
+    // Flatten without discarding the store: on a trap, fold in the panic message the guest
+    // reported through `eo9:rt/diagnostics` just before trapping (see providers::trapped_reason).
+    let outcome = match run {
+        Ok(Ok(Ok(value))) => value,
+        Ok(Ok(Err(error))) | Ok(Err(error)) | Err(error) => {
+            return Err(wasmtime::Error::msg(providers::trapped_reason(
+                &error,
+                store.data().panic_message.as_deref(),
+            )));
+        }
+    };
     let elapsed = host::monotonic_ns().saturating_sub(started);
 
     crate::outf!("{name}: outcome = {}", render_val(&outcome));
