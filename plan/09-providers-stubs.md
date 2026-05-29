@@ -272,3 +272,19 @@ Match the priority order above; (1)+(2) unblock I2.
     pick: extend the binder's configure baking to lists/records (area 03), or respell the allow-list as a
     string in wit/pci. Until then the deny-all default is the usable behavior, and the wrapped-forwarding
     plumbing is in place for either resolution.
+
+20. **Disk flush/size in the stubs; the middleware's config entry exists but cannot be baked yet
+    (2026-05-29, branch `area/02-wit-roundout`).** `disk.mem` reports its configured size and
+    flushes as a no-op; `disk.virtio` now also negotiates `VIRTIO_BLK_F_FLUSH` when the device
+    offers it and issues a real two-descriptor `VIRTIO_BLK_T_FLUSH` request from `flush` (a
+    device that does not offer the feature is write-through by definition, so flush is then a
+    successful no-op); `fs.eofs` reads the device size from `disk.size` and forwards the engine's
+    commit-boundary flushes to `disk.flush`, so durability now rides on the real device.
+    `net.l4.over-l2` exports `eo9:net/l4-over-l2-config` and applies configured addressing on
+    first use (defaults unchanged: 10.0.2.15/24, gw 10.0.2.2) — but actually *baking* that
+    configuration through `configure(…)`/shell argument application is refused today because
+    `eo9:net/l4` declares its own resources and compose-time configuration of resource-owning API
+    providers is the parked plan/03 D13 design (same class as `fs.memfs`/`disk.mem` configs); the
+    integration test pins the typed refusal so the upgrade is visible when the binder learns it.
+    Configure-arg baking also has no `option<…>` support, which is why the config takes exactly
+    three required parameters.

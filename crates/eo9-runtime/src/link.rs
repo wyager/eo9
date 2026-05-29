@@ -858,6 +858,28 @@ fn add_disk(linker: &mut Linker<TaskState>) -> Result<()> {
     let mut disk = linker.instance("eo9:disk/disk@0.1.0")?;
     add_default_handle::<DiskCap>(&mut disk)?;
 
+    disk.func_wrap(
+        "size",
+        |mut store: StoreContextMut<'_, TaskState>,
+         (_dev,): (Resource<DiskCap>,)|
+         -> Result<(u64,)> { Ok((store.data_mut().disk_provider()?.size(),)) },
+    )?;
+
+    disk.func_wrap_concurrent(
+        "flush",
+        |accessor: &Accessor<TaskState>,
+         (_dev,): (Resource<DiskCap>,)|
+         -> ConcurrentFuture<'_, (Result<(), WitDiskWriteError>,)> {
+            Box::pin(async move {
+                let op = accessor.with(|mut access| -> Result<_> {
+                    Ok(access.data_mut().disk_provider()?.flush())
+                })?;
+                let result = op.await;
+                Ok((result.map_err(WitDiskWriteError::from),))
+            })
+        },
+    )?;
+
     disk.func_wrap_concurrent(
         "read",
         |accessor: &Accessor<TaskState>,
@@ -1521,7 +1543,16 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
                 Err(crate::task::SpawnError::BadArguments(msg)) => {
                     Err(WitSpawnError::BadArguments(msg))
                 }
-                Err(crate::task::SpawnError::Internal(msg)) => Err(WitSpawnError::Internal(msg)),
+                Err(crate::task::SpawnError::Internal(msg)) => {
+                    // Embedder-supplied hints turn a raw unsatisfied-import failure into
+                    // actionable advice (e.g. "relaunch with --disk <image>"); the raw
+                    // reason stays first so nothing is hidden.
+                    let msg = match exec.policy.hint_for(&msg) {
+                        Some(hint) => format!("{msg} ({hint})"),
+                        None => msg,
+                    };
+                    Err(WitSpawnError::Internal(msg))
+                }
             },))
         },
     )?;

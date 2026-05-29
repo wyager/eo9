@@ -261,3 +261,16 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
     asset rebuild, together with the D18 `wiring` registration):** the browser blob's exec/provider surface
     must register `eo9:rt/diagnostics.report-panic` (storing into the child's outcome path, or at minimum
     accepting and ignoring it) or newly built components will not instantiate there.
+20. **`eo9:disk` grows `size` and `flush`; `eo9:net` grows `l4-over-l2-config` (2026-05-29,
+    branch `area/02-wit-roundout`).** `disk.size: func(dev) -> u64` (bytes, fixed per handle)
+    and `disk.flush: async func(dev) -> result<_, write-error>` (make completed writes durable;
+    a no-op success for devices with nothing volatile, never `read-only`) close the two gaps the
+    eofs work recorded: the provider no longer discovers the device size by probing with
+    zero-length reads, and the engine's commit-boundary flushes now reach the device. Implemented
+    by every disk exporter (disk.mem trivially, disk.virtio with a real negotiated
+    `VIRTIO_BLK_F_FLUSH` cache flush, the usermode `--disk` file device with fsync) and by the
+    usermode runtime's `DiskProvider` trait/linker path. `l4-over-l2-config` binds the TCP/IP
+    middleware's static IPv4 addressing (address, prefix-length, gateway as dotted-quad strings);
+    a DNS server is deliberately not part of it (the middleware sends no DNS queries — resolvers
+    live above `l4`). The browser blob registers no `eo9:disk` host functions, so it needs no
+    change for these; that stays true until/unless the blob ever gains a disk provider.

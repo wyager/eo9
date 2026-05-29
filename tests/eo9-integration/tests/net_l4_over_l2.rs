@@ -9,7 +9,7 @@
 //! entropy.seeded $ time.monotonic-stub $ net.l2.deny $ net.l4.over-l2 $ l4check
 //! ```
 
-use eo9_component::compose;
+use eo9_component::{compose, configure};
 use eo9_integration::{guest, run};
 use eo9_runtime::{Outcome, Providers};
 
@@ -43,4 +43,34 @@ fn deny_at_l2_surfaces_through_the_middleware_as_the_programs_own_failure() {
         ),
         other => panic!("expected the program's own typed failure, got {other:?}"),
     }
+}
+
+/// The middleware now ships an `eo9:net/l4-over-l2-config` entry (address, prefix length,
+/// gateway), but actually *baking* that configuration through `configure(…)` is blocked on
+/// the parked compose-time-configuration design for resource-owning API providers
+/// (plan/03 D13): `eo9:net/l4` declares its own resources, and the binder refuses such
+/// providers with a typed error today. This test pins that refusal — the configure attempt
+/// must fail with the documented message, never trap, and the unconfigured default form
+/// (the test above) must keep working. When the binder learns resource-owning providers,
+/// this test fails and gets upgraded to a behavioural one.
+#[test]
+fn configuring_the_middleware_is_refused_typed_until_the_binder_learns_resource_apis() {
+    guest::ensure_components(&["eo9-stub-net-l4-over-l2"]);
+
+    let result = configure(
+        &guest::load_stub("net.l4.over-l2"),
+        &[
+            ("address", "\"192.168.7.2\""),
+            ("prefix-length", "24"),
+            ("gateway", "\"192.168.7.1\""),
+        ],
+    );
+    let message = format!(
+        "{:?}",
+        result.expect_err("configure must be refused, not baked")
+    );
+    assert!(
+        message.contains("defines its own resources"),
+        "expected the documented resource-owning-provider refusal, got: {message}"
+    );
 }

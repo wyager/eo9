@@ -91,6 +91,15 @@ impl disk::Guest for Stub {
         types::DiskImpl::new(MemDisk)
     }
 
+    fn size(_dev: disk::DiskImplBorrow<'_>) -> u64 {
+        with_device(|device| device.len() as u64)
+    }
+
+    async fn flush(_dev: disk::DiskImplBorrow<'_>) -> Result<(), WriteError> {
+        // Purely in-memory: every completed write is already as durable as it will ever be.
+        Ok(())
+    }
+
     async fn read(
         _dev: disk::DiskImplBorrow<'_>,
         offset: u64,

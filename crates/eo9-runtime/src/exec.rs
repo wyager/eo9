@@ -45,6 +45,11 @@ pub const MAX_CHILDREN: u32 = 8;
 /// policy hands out. The default policy grants nothing.
 pub struct ChildPolicy {
     providers: Box<dyn FnMut() -> Providers + Send>,
+    /// Embedder-supplied spawn hints: when a spawn fails and the failure text mentions
+    /// the import prefix on the left, the advice on the right is appended to the error
+    /// (e.g. `eo9:disk/` → "relaunch with --disk <image>"). The raw reason is never
+    /// replaced, only annotated.
+    spawn_hints: Vec<(String, String)>,
 }
 
 impl ChildPolicy {
@@ -52,6 +57,7 @@ impl ChildPolicy {
     pub fn no_providers() -> Self {
         Self {
             providers: Box::new(Providers::none),
+            spawn_hints: Vec::new(),
         }
     }
 
@@ -59,11 +65,32 @@ impl ChildPolicy {
     pub fn with_providers(factory: impl FnMut() -> Providers + Send + 'static) -> Self {
         Self {
             providers: Box::new(factory),
+            spawn_hints: Vec::new(),
         }
+    }
+
+    /// Add a spawn hint: when a spawn failure mentions `import_prefix`, `advice` is
+    /// appended to the reported error. Embedders use it to point at the flag or command
+    /// that grants the missing capability in *their* vocabulary.
+    pub fn with_spawn_hint(
+        mut self,
+        import_prefix: impl Into<String>,
+        advice: impl Into<String>,
+    ) -> Self {
+        self.spawn_hints.push((import_prefix.into(), advice.into()));
+        self
     }
 
     pub(crate) fn providers_for_child(&mut self) -> Providers {
         (self.providers)()
+    }
+
+    /// The first hint whose import prefix appears in `error_text`, if any.
+    pub(crate) fn hint_for(&self, error_text: &str) -> Option<&str> {
+        self.spawn_hints
+            .iter()
+            .find(|(prefix, _)| error_text.contains(prefix.as_str()))
+            .map(|(_, advice)| advice.as_str())
     }
 }
 
