@@ -21,6 +21,7 @@ static BUNDLED_COMPONENTS: &[(&str, &[u8])] = &[
     ("eo9-example-sockcheck", include_bytes!("eo9-example-sockcheck.wasm") as &[u8]),
     ("eo9-stub-disk-mem", include_bytes!("eo9-stub-disk-mem.wasm") as &[u8]),
     ("eo9-stub-disk-none", include_bytes!("eo9-stub-disk-none.wasm") as &[u8]),
+    ("eo9-stub-disk-virtio", include_bytes!("eo9-stub-disk-virtio.wasm") as &[u8]),
     ("eo9-stub-entropy-none", include_bytes!("eo9-stub-entropy-none.wasm") as &[u8]),
     ("eo9-stub-entropy-seeded", include_bytes!("eo9-stub-entropy-seeded.wasm") as &[u8]),
     ("eo9-stub-fs-eofs", include_bytes!("eo9-stub-fs-eofs.wasm") as &[u8]),
