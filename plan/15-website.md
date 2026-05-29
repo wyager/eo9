@@ -356,3 +356,17 @@ and the try-it page at `/vm/`, which was rebuilt around one idea: **the terminal
 - **Follow-ups (blob, not site):** add `time.frozen` to the blob's `/bin` so a frozen-clock
   example can join the list; optionally add a `help`-style listing of `/bin` at the prompt so
   visitors can discover the available programs without the old dropdown.
+
+## Decision 26 — the www server workspace joins the `cargo xtask ci` gate
+
+(Numbered 26 because Decision 25 — the /try removal and minimal try-it page — landed on master
+while this branch was in flight.)
+
+www-only changes could land with fmt/clippy/test drift because none of the gate's steps ever
+entered the `www/` workspace. `cargo xtask fmt|lint|test` (and therefore `ci`) now also run
+`cargo fmt --check` / `cargo clippy --all-targets -D warnings` / `cargo test --workspace` in
+`www/`. Scope is deliberately the *server* workspace only: the wasm32 blob workspace
+(`www/web-eo9`), `try-build`, `precompress` and `embed-spike` stay out of the gate — the blob's
+fmt/clippy run inside `cargo xtask build-web-vm` instead (plan/18 Decision 25), and the others
+remain build-on-demand tools. Gate cost is one small native workspace (hyper/tokio/rustls), a few
+seconds warm.
