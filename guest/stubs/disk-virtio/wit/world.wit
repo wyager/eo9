@@ -1,0 +1,25 @@
+/// eo9:disk-virtio — the virtio-blk driver world (plan/09, plan/12 D43(e)).
+///
+/// `disk.virtio` is the first real device driver written as an ordinary wasm component:
+/// it imports the PCI capability (`eo9:pci/pci`), drives a modern (virtio 1.0,
+/// `disable-legacy=on`) virtio-blk PCI function through configuration space, BAR
+/// registers, and DMA buffers, and exports `eo9:disk/disk` — so everything that already
+/// runs over a block device (`fs.eofs`, `disk.readonly`, …) runs over real hardware by
+/// composition: `disk.virtio $ fs.eofs $ program`.
+///
+/// `eo9:text/text` is imported only for one diagnostic line on first use (the probed
+/// device, capacity, and queue size); the driver works identically without a console.
+///
+/// There is no configure interface: the documented default behaviour is to claim the
+/// first virtio-blk function visible through the granted PCI capability on first use
+/// (the option-C default-configuration rule, plan/09 Decision 14). Selecting a specific
+/// device address is `pci.filtered`'s job, composed in front of the driver.
+package eo9:disk-virtio@0.1.0;
+
+world virtio {
+    import eo9:pci/pci@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    export eo9:disk/types@0.1.0;
+    export eo9:disk/disk@0.1.0;
+}

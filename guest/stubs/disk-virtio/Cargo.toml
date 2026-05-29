@@ -1,0 +1,15 @@
+[package]
+name = "eo9-stub-disk-virtio"
+description = "Eo9 device driver `disk.virtio`: drives a modern virtio-blk PCI function through the eo9:pci capability (config space, BARs, DMA, polled virtqueue) and exports eo9:disk, so filesystems and programs run over real block hardware by composition."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

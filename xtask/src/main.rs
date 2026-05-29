@@ -36,6 +36,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     // Standard stub providers (guest/stubs/*, plan/09-providers-stubs.md).
     "eo9-stub-disk-mem",
     "eo9-stub-disk-none",
+    "eo9-stub-disk-virtio",
     "eo9-stub-entropy-none",
     "eo9-stub-entropy-seeded",
     "eo9-stub-fs-eofs",
@@ -103,6 +104,11 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-example-lspci", "lspci"),
     ("eo9-stub-entropy-seeded", "entropy.seeded"),
     ("eo9-stub-time-frozen", "time.frozen"),
+    // The storage stack for real hardware: the virtio-blk driver and the eofs filesystem,
+    // so the metal shell can compose `disk.virtio $ fs.eofs $ <program>` against a QEMU
+    // virtio disk (boot with the `pci` grant and the xtask `disk` flag).
+    ("eo9-stub-disk-virtio", "disk.virtio"),
+    ("eo9-stub-fs-eofs", "fs.eofs"),
     // Basic coreutils, so the metal shell can inspect its own (read-only) filesystem:
     // `ls /bin`, `cat /session`, `wc`, `head`, `stat`.
     ("eo9-coreutil-ls", "ls"),
@@ -1612,12 +1618,39 @@ fn precompile_for_kernel(
     Ok(out_path)
 }
 
+/// Path of the scratch raw disk image the `disk` QEMU flag attaches as a virtio-blk
+/// function, creating it (blank, 64 MiB) on first use. Blank is all the demo needs:
+/// `fs.eofs` formats a blank device in place on first mount, and writes persist in this
+/// file across QEMU runs.
+fn ensure_scratch_disk(root: &Path) -> Result<PathBuf, String> {
+    let dir = root.join("kernel").join("target");
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+    let path = dir.join("eo9-scratch-disk.raw");
+    if !path.exists() {
+        let file = std::fs::File::create(&path)
+            .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
+        file.set_len(64 * 1024 * 1024)
+            .map_err(|err| format!("failed to size {}: {err}", path.display()))?;
+        println!(
+            "xtask: created blank 64 MiB scratch disk at {}",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
 /// Build the kernel image for `arch` and boot it under QEMU with serial on stdio.
 ///
 /// The exact invocation (aarch64): `qemu-system-aarch64 -M virt,gic-version=2,highmem=off
 /// -cpu max -smp 1 -m 512M -nographic -device virtio-rng-pci -kernel <image>`. The kernel
 /// powers the machine off via PSCI when its run completes (or on panic), so QEMU exits by
 /// itself; to quit earlier press Ctrl-A then X.
+///
+/// A bare `disk` argument is consumed by xtask itself (it never reaches the kernel command
+/// line): it attaches the scratch raw image as a modern virtio-blk PCI function
+/// (`-device virtio-blk-pci,disable-legacy=on`) so the `disk.virtio` driver has real
+/// hardware to claim — `cargo xtask qemu aarch64 pci disk`.
 fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
     let image = build_kernel(root, arch)?;
     let qemu = format!("qemu-system-{arch}");
@@ -1673,11 +1706,29 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         .map(Into::into)
         .collect();
     args.push(image.as_os_str().to_os_string());
-    // Anything after the architecture becomes the kernel command line, e.g.
+    // The bare `disk` argument is xtask's: attach the scratch virtio-blk disk and keep the
+    // token off the kernel command line.
+    let mut cmdline: Vec<String> = Vec::new();
+    let mut attach_disk = false;
+    for argument in append {
+        if argument == "disk" {
+            attach_disk = true;
+        } else {
+            cmdline.push(argument.clone());
+        }
+    }
+    if attach_disk {
+        let scratch = ensure_scratch_disk(root)?;
+        args.push("-drive".into());
+        args.push(format!("if=none,format=raw,id=eo9disk,file={}", scratch.display()).into());
+        args.push("-device".into());
+        args.push("virtio-blk-pci,drive=eo9disk,disable-legacy=on".into());
+    }
+    // Anything else after the architecture becomes the kernel command line, e.g.
     // `cargo xtask qemu aarch64 program=cruncher seed=9 rounds=200000`.
-    if !append.is_empty() {
+    if !cmdline.is_empty() {
         args.push("-append".into());
-        args.push(append.join(" ").into());
+        args.push(cmdline.join(" ").into());
     }
     run(root, &qemu, args)
 }
