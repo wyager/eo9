@@ -354,11 +354,11 @@ impl MemFs {
                 return Err(WitFsError::NotADirectory);
             }
             self.files.insert(path.clone(), Vec::new());
-        } else if flags.contains(WitOpenFlags::TRUNCATE) {
-            if let Some(bytes) = self.files.get_mut(&path) {
-                self.total_bytes = self.total_bytes.saturating_sub(bytes.len() as u64);
-                bytes.clear();
-            }
+        } else if flags.contains(WitOpenFlags::TRUNCATE)
+            && let Some(bytes) = self.files.get_mut(&path)
+        {
+            self.total_bytes = self.total_bytes.saturating_sub(bytes.len() as u64);
+            bytes.clear();
         }
         Ok(self.insert_open(path))
     }

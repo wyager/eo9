@@ -129,3 +129,13 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
     (`cat --paths a.txt`), and `complete_args` fills an omitted final `list<string>` with `[]` (so bare `ls`
     runs and lists `/`). Mixing the flag and positional spellings for the same parameter is a duplicate-argument
     error. The convention itself is plan/04 D13; the coreutil signatures that use it are plan/17 D6.
+13. **`describe` shows the wiring tree; `program-failure` carries the inner command's class (2026-05-28).**
+    (a) The `describe` builtin now ends with a `wiring:` section rendered from the new
+    `eo9:exec/component-algebra.wiring` (plan/02 D18): the composition tree of the described expression, so
+    an interposed attenuator (`fs.readonly $ cat`) is visible from inside the shell, where plain `describe`
+    shows only the residual surface. The `imports` builtin is unchanged. The `Backend` trait gains
+    `wiring()`; the mock logs it. (b) The eosh world's `program-failure` now distinguishes
+    `command-failed` / `command-trapped` / `command-killed` / `not-runnable` (was: a single
+    `command-failed(string)` for every one-shot problem). `LineResult::ProgramFailed` carries a
+    `CommandClass` (failed/trapped/killed) and `LineResult::Error` — nothing ran — maps to `not-runnable`,
+    which is what lets the `eo9 shell -c` embedder report honest 0/1/2/3 exit codes (plan/11 D20).

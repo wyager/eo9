@@ -113,19 +113,36 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
         // eosh (and its children) through the text capability.
         Outcome::Success(_) => vlog!(cfg, "shell outcome: {rendered}"),
         // One-shot (`-c`): eosh already surfaced the command's own outcome (on stderr) and
-        // the program's output, so re-printing eosh's `failure(command-failed(…))` wrapper
-        // here is the redundant "outcome one layer down" the user studies flagged — the
-        // exit code below carries it instead. An unexpected eosh trap/kill (which eosh
-        // could not report itself) still falls through to be surfaced.
+        // the program's output, so re-printing eosh's `failure(…)` wrapper here is the
+        // redundant "outcome one layer down" the user studies flagged — the exit code
+        // below carries it instead. An unexpected eosh trap/kill (which eosh could not
+        // report itself) still falls through to be surfaced.
         Outcome::Failure(_) if one_shot => vlog!(cfg, "shell outcome: {rendered}"),
         _ => run::print_outcome(cfg, &rendered),
     }
-    // Exit-code contract for `-c`, matching `eo9 run`: 0 success, 1 the command failed,
-    // 2 eosh itself trapped/was killed, 3 an eo9-level error before eosh produced an
-    // outcome (returned earlier as `Err`). Honest failure-vs-abnormal granularity for the
-    // *inner* command (1 vs 2) and a distinct code for "eosh couldn't run it" (3) would
-    // need eosh's world to carry the inner command's three-way class — a WIT change to
-    // `eo9-eosh:eosh` recorded in plan/11 D14; today both collapse to this command-failed = 1.
+    // Exit-code contract for `-c`, matching `eo9 run`: 0 success, 1 the command reported
+    // failure, 2 the command ended abnormally (trapped/killed) or eosh itself did, 3 the
+    // shell could not run the command at all (or an eo9-level error, returned earlier as
+    // `Err`). eosh's `program-failure` carries the inner command's three-way class as the
+    // variant case (plan/11 D14/D16), so the case name of the typed failure value is the
+    // class — no string parsing of free-form text.
+    let code = match &outcome {
+        Outcome::Failure(value) if one_shot => {
+            let case = value.value.split('(').next().unwrap_or("").trim();
+            match case {
+                // The command ran and reported failure in its own vocabulary.
+                "command-failed" => crate::cli::EXIT_FAILURE,
+                // The command ended abnormally — same class as `eo9 run`'s exit 2.
+                "command-trapped" | "command-killed" => crate::cli::EXIT_ABNORMAL,
+                // The command never ran (`not-runnable`), or eosh's own streams broke
+                // (`io`): an eosh/eo9-level error, not the command's outcome.
+                "not-runnable" | "io" => crate::cli::EXIT_ERROR,
+                // An older eosh (or an unexpected case) keeps the plain failure code.
+                _ => code,
+            }
+        }
+        _ => code,
+    };
     Ok(code)
 }
 

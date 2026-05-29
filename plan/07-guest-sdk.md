@@ -164,3 +164,22 @@ example programs used by every other area's tests.
       proactive output, only read by the executor on the trap path) and folds the result into
       `trapped(reason)`. This is an *export*, not an import, so it does not widen the guest's authority.
       Implement once the configure-sync WIT churn settles.
+12. **D11's post-trap export cannot work on wasmtime 45 — blocked, owner ruling needed (2026-05-28).**
+    Implementing the proposed `eo9:rt/diagnostics.last-trap-reason` export hit a hard runtime fact: any wasm
+    trap sets a **store-level** poison flag (`invoke_wasm_and_catch_traps` → `StoreOpaque::set_trapped`,
+    vendored wasmtime `src/runtime/func.rs`), and every component-level call first checks `may_enter`, which
+    returns false once the store has trapped (`src/runtime/component/concurrent.rs`), failing with
+    `Trap::CannotEnterComponent`. So the executor cannot call *any* export of the task after the panic's
+    `unreachable` trap — this is the component model's own "a trapped instance may not be re-entered" rule,
+    not a wasmtime quirk, so waiting for upstream is not a plan. Realistic alternatives, each needing an
+    owner ruling because each trades against a half of D11:
+    (a) a narrowly-scoped **import** `eo9:rt/diagnostics.report-panic(msg)` that only the SDK panic handler
+    calls, immediately before trapping; the executor implements it as write-once-into-the-task's-trap-slot
+    and surfaces it nowhere except a subsequent `trapped(reason)` — technically an import, but useless as an
+    output channel (the host discards it unless the task then traps);
+    (b) opportunistically routing the panic message through `eo9:text/write-err` when the world already
+    imports text — no new WIT, but the message lands on stderr rather than in the outcome and text-less
+    programs stay silent;
+    (c) keep the status quo: the cleaned, message-less backtrace from D11's done-now half.
+    Nothing implemented for this item this wave (the other two WIT follow-ups — exec `wiring`, eosh
+    `program-failure` classes — landed); GAPS keeps the panic-message line open citing this decision.

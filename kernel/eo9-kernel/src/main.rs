@@ -29,6 +29,10 @@ mod fdt;
 mod heap;
 #[cfg(target_os = "none")]
 mod panic;
+// Raw ECAM/PCIe support; only the wasm `eo9:pci` root provider drives it, so it is gated
+// with the store/runner feature to keep the featureless CI build lean.
+#[cfg(all(target_os = "none", feature = "wasm-store"))]
+mod pci;
 #[cfg(all(
     target_os = "none",
     any(

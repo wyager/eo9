@@ -196,6 +196,16 @@ impl Backend for MockBackend {
         self.info(*component)
     }
 
+    fn wiring(&mut self, component: &u32) -> String {
+        self.log.push(format!("wiring(c{component})"));
+        let info = self.info(*component);
+        let kind = match info.kind {
+            ComponentKind::Binary => "binary",
+            ComponentKind::Provider => "provider",
+        };
+        format!("c{component} [{kind}]\n")
+    }
+
     fn compose(&mut self, provider: u32, consumer: u32) -> Result<u32, BackendError> {
         // Kind preservation: the result is whatever the consumer is, with its exports
         // and argument signature (SPEC: Algebraic properties).

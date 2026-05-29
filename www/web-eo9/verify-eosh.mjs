@@ -98,6 +98,11 @@ inputQueue = [
   "entropy.seeded $ rng --count 3",
   "echo --text RNGMARK",
   "entropy.seeded $ rng --count 3",
+  // the `&` form (extend/shadow): the right operand wins where exports overlap, so layering a
+  // *configured* entropy.seeded over the default-configured one must change the stream rng sees.
+  // The fused three-op result (configure + extend + compose) is also compiled in-blob.
+  "echo --text AMPMARK",
+  "entropy.seeded & entropy.seeded --seed 7 $ rng --count 2",
   "exit",
 ];
 lines.length = 0;
@@ -107,13 +112,16 @@ const interactive = lines.join("\n");
 
 console.log("--- one-shot ---\n" + oneShot + "\n--- interactive ---\n" + interactive);
 
-// Pure-digit lines come only from rng (u64 per line); split on the marker to separate the two
-// runs and compare them for determinism.
-const parts = interactive.split("RNGMARK");
+// Pure-digit lines come only from rng (u64 per line); split on the markers to separate the
+// runs: two identical default-seeded `$` runs (determinism), then the `&` run with a
+// re-configured right layer (must differ from the default stream).
+const [beforeAmp, ampPart] = interactive.split("AMPMARK");
+const parts = beforeAmp.split("RNGMARK");
 const run1 = (parts[0]?.match(/^\d{3,}$/gm) || []).slice(-3);
 const run2 = (parts[1]?.match(/^\d{3,}$/gm) || []).slice(0, 3);
 const deterministic =
   run1.length === 3 && run2.length === 3 && run1.join(",") === run2.join(",");
+const ampRun = (ampPart?.match(/^\d{3,}$/gm) || []).slice(0, 2);
 
 const checks = [
   ["eosh instantiates (floor)", instRc === 0 && /eosh: instantiated/.test(oneShot)],
@@ -140,6 +148,11 @@ const checks = [
   ["in-blob compiled+ran entropy.seeded $ rng (no server)", run1.length === 3],
   ["compose did not hit the codegen refusal", !/needs the compiler/.test(interactive)],
   ["seeded compose is deterministic across runs", deterministic],
+  ["in-blob compiled+ran the & form (configure + extend + compose)", ampRun.length === 2],
+  [
+    "& is right-biased: the --seed 7 layer shadows the default-seeded one",
+    ampRun.length === 2 && run1.length === 3 && ampRun[0] !== run1[0],
+  ],
   ["interactive: session exited", bootRc === 0 && /success\(exited\)/.test(interactive)],
 ];
 let ok = true;

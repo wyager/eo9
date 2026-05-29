@@ -17,6 +17,8 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-outcomes",
     "eo9-example-cruncher",
     "eo9-example-readwrite",
+    "eo9-example-sockcheck",
+    "eo9-example-lspci",
     "eosh",
     // Basic coreutils (guest/coreutils/*, plan/17-coreutils.md).
     "eo9-coreutil-cat",
@@ -36,12 +38,18 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-disk-none",
     "eo9-stub-entropy-none",
     "eo9-stub-entropy-seeded",
+    "eo9-stub-fs-eofs",
     "eo9-stub-fs-memfs",
     "eo9-stub-fs-none",
     "eo9-stub-fs-overlay",
     "eo9-stub-fs-readonly",
-    "eo9-stub-net-deny",
-    "eo9-stub-net-none",
+    "eo9-stub-net-l2-deny",
+    "eo9-stub-net-l2-none",
+    "eo9-stub-net-l3-deny",
+    "eo9-stub-net-l3-none",
+    "eo9-stub-net-l4-deny",
+    "eo9-stub-net-l4-loopback",
+    "eo9-stub-net-l4-none",
     "eo9-stub-pci-none",
     "eo9-stub-perf-none",
     "eo9-stub-perf-null",
@@ -85,6 +93,7 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-example-outcomes", "outcomes"),
     ("eo9-example-cruncher", "cruncher"),
     ("eo9-example-readwrite", "readwrite"),
+    ("eo9-example-lspci", "lspci"),
     ("eo9-stub-entropy-seeded", "entropy.seeded"),
     ("eo9-stub-time-frozen", "time.frozen"),
 ];
@@ -463,7 +472,10 @@ fn test(root: &Path) -> Result<(), String> {
         &root.join("guest"),
         "cargo",
         ["test", "-p", "eosh-core", "--target", host.as_str()],
-    )
+    )?;
+    // The website server workspace (www/): its unit + integration tests are quick and
+    // native; the wasm32 blob workspace stays out of the gate (built by build-web-vm).
+    run(&root.join("www"), "cargo", ["test", "--workspace"])
 }
 
 fn build_guest(root: &Path) -> Result<(), String> {
@@ -779,8 +791,15 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
     )?;
 
     // Build the blob in its own workspace for wasm32-unknown-unknown.
+    //
+    // The build is made path-independent (the same sources produce the same blob bytes from
+    // any checkout directory) by remapping the absolute prefixes that otherwise leak into
+    // panic-location strings: the repository root, the cargo home (registry sources), and
+    // the rustup home (the toolchain's libcore/libstd paths). Without this the blob's
+    // content hash — and therefore its fingerprinted URL — changed per checkout path.
     let manifest = root.join("www").join("web-eo9").join("Cargo.toml");
-    run(
+    let remap_flags = blob_remap_rustflags(root);
+    run_with_env(
         root,
         "cargo",
         [
@@ -793,6 +812,29 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
             OsStr::new("-p"),
             OsStr::new("web-eo9-blob"),
         ],
+        &[("RUSTFLAGS", remap_flags.as_os_str())],
+    )?;
+    // Keep the blob workspace lint-clean: it is deliberately outside the `ci` gate (wasm32,
+    // heavy vendored closure), so its clippy/fmt run here, where the blob is built anyway.
+    run(
+        &root.join("www").join("web-eo9"),
+        "cargo",
+        ["fmt", "--all", "--check"],
+    )?;
+    run_with_env(
+        &root.join("www").join("web-eo9"),
+        "cargo",
+        [
+            "clippy",
+            "--workspace",
+            "--release",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &[("RUSTFLAGS", remap_flags.as_os_str())],
     )?;
 
     let built = root
@@ -825,6 +867,35 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
     // Regenerated blob/store artifacts need fresh pre-compressed siblings or the server
     // falls back to serving them uncompressed.
     precompress_site(root)
+}
+
+/// `RUSTFLAGS` for the wasm32 blob build: remap the absolute path prefixes that would
+/// otherwise end up in panic-location strings, so the blob's bytes (and its fingerprinted
+/// URL) do not depend on where the repository happens to be checked out, the cargo home, or
+/// the rustup home. Any RUSTFLAGS already present in the environment are preserved.
+fn blob_remap_rustflags(root: &Path) -> OsString {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(&home).join(".cargo"));
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(&home).join(".rustup"));
+    let mut flags = std::env::var_os("RUSTFLAGS").unwrap_or_default();
+    for (prefix, replacement) in [
+        (root.to_path_buf(), "/eo9"),
+        (cargo_home, "/cargo-home"),
+        (rustup_home, "/rustup-home"),
+    ] {
+        if !flags.is_empty() {
+            flags.push(" ");
+        }
+        flags.push("--remap-path-prefix=");
+        flags.push(prefix.as_os_str());
+        flags.push("=");
+        flags.push(replacement);
+    }
+    flags
 }
 
 /// The `/vm` immutable assets that get content-fingerprinted: the wasm blob and every Pulley
@@ -1412,9 +1483,10 @@ fn precompile_for_kernel(
 
 /// Build the kernel image for `arch` and boot it under QEMU with serial on stdio.
 ///
-/// The exact invocation (aarch64): `qemu-system-aarch64 -M virt,gic-version=2 -cpu max -smp 1 -m 512M
-/// -nographic -kernel <image>`. The kernel powers the machine off via PSCI when its run
-/// completes (or on panic), so QEMU exits by itself; to quit earlier press Ctrl-A then X.
+/// The exact invocation (aarch64): `qemu-system-aarch64 -M virt,gic-version=2,highmem=off
+/// -cpu max -smp 1 -m 512M -nographic -device virtio-rng-pci -kernel <image>`. The kernel
+/// powers the machine off via PSCI when its run completes (or on panic), so QEMU exits by
+/// itself; to quit earlier press Ctrl-A then X.
 fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
     let image = build_kernel(root, arch)?;
     let qemu = format!("qemu-system-{arch}");
@@ -1429,7 +1501,23 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         // can wfi-idle. With `-cpu max` QEMU would otherwise default to GICv3 (a
         // system-register CPU interface with per-PE redistributors), which that minimal
         // MMIO bring-up does not drive.
-        "aarch64" => &["-M", "virt,gic-version=2", "-cpu", "max"],
+        //
+        // `highmem=off` keeps the PCIe ECAM at its low address (0x3f00_0000, inside the
+        // kernel's identity-mapped device gigabyte — see kernel src/pci.rs); with the
+        // default highmem layout QEMU moves the ECAM above 4 GiB where the kernel has no
+        // mapping. RAM (512 MiB) is unaffected.
+        //
+        // The `virtio-rng-pci` device is a PCIe function with no host-side configuration,
+        // so the eo9:pci capability has something real to enumerate next to the host
+        // bridge (the `lspci` demo; the kernel never touches it otherwise).
+        "aarch64" => &[
+            "-M",
+            "virt,gic-version=2,highmem=off",
+            "-cpu",
+            "max",
+            "-device",
+            "virtio-rng-pci",
+        ],
         // Pin the SiFive-style PLIC (`aia=none`) for the same reason: the kernel's
         // interrupt bring-up (src/arch/riscv64/plic.rs) drives the PLIC, not the newer
         // AIA APLIC/IMSIC. The default CPU and QEMU's bundled OpenSBI `-bios` are used.
@@ -1471,6 +1559,9 @@ fn fmt(root: &Path, check: bool) -> Result<(), String> {
     for dir in workspaces(root) {
         run(&dir, "cargo", args.clone())?;
     }
+    // The website server workspace is part of the gate too (plan/15): www-only branches used
+    // to be able to land with fmt drift because nothing in `ci` touched that workspace.
+    run(&root.join("www"), "cargo", args.clone())?;
     Ok(())
 }
 
@@ -1515,7 +1606,21 @@ fn lint(root: &Path) -> Result<(), String> {
             ],
         )?;
     }
-    Ok(())
+    // The website server workspace (www/): native build, quick tests, no wasm32 blob —
+    // the in-browser blob workspace (www/web-eo9) is deliberately NOT in the gate; its
+    // clippy/fmt run as part of `build-web-vm` instead.
+    run(
+        &root.join("www"),
+        "cargo",
+        [
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )
 }
 
 /// The merge gate (plan/01-workspace.md): everything a reviewer agent runs before merging.

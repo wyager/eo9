@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use eo9_guest::buffer;
 
 use eosh_core::{
-    Backend, BackendError, LineResult, Session,
+    Backend, BackendError, CommandClass, LineResult, Session,
     backend::{
         AbnormalExit, ArgSpec, ComponentInfo, ComponentKind, ExportSlot, ImportNeed, Outcome,
         WaveValue,
@@ -264,6 +264,10 @@ impl Backend for WitBackend {
         info_from_wit(component_algebra::describe(component))
     }
 
+    fn wiring(&mut self, component: &Self::Component) -> String {
+        component_algebra::wiring(component)
+    }
+
     fn compose(
         &mut self,
         provider: Self::Component,
@@ -390,13 +394,19 @@ impl Guest for Eosh {
             // One-shot mode: run the single command line and report its result as the
             // shell's own outcome. The per-command outcome line goes to stderr so a `-c`
             // invocation's stdout carries only the program's own output (matching `eo9 run`).
+            // The failure case carries the inner command's three-way class (failed /
+            // trapped / killed) — or `not-runnable` when no program ran at all — so the
+            // embedder can map `-c` to the same honest exit codes as `eo9 run`.
             Some(line) => {
                 session.route_outcome_to_stderr();
                 match session.execute_line(&line).await {
                     LineResult::Ok | LineResult::Exit => Ok(ProgramSuccess::Exited),
-                    LineResult::ProgramFailed(rendered) | LineResult::Error(rendered) => {
-                        Err(ProgramFailure::CommandFailed(rendered))
-                    }
+                    LineResult::ProgramFailed(class, rendered) => Err(match class {
+                        CommandClass::Failed => ProgramFailure::CommandFailed(rendered),
+                        CommandClass::Trapped => ProgramFailure::CommandTrapped(rendered),
+                        CommandClass::Killed => ProgramFailure::CommandKilled(rendered),
+                    }),
+                    LineResult::Error(rendered) => Err(ProgramFailure::NotRunnable(rendered)),
                 }
             }
             // Interactive mode: read lines until end of input or `exit`.

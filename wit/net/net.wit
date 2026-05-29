@@ -1,22 +1,196 @@
-/// eo9:net — networking (MVP surface): TCP connect/listen/accept/send/recv and UDP,
-/// with the owned-buffer round-trip.
+/// eo9:net — networking, split into independently grantable layers:
 ///
-/// See SPEC.md: "Net API" (same concurrency goals as disk).
+///   * `l2` — link layer: network interfaces, MAC addresses, whole Ethernet frames.
+///   * `l3` — network layer: IP addresses, routes, raw IP datagrams (per protocol).
+///   * `l4` — transport layer: TCP connections/listeners and UDP sockets.
+///
+/// Each layer is its own capability with its own root handle, so a program imports
+/// exactly the level it speaks (a fetcher imports only `l4`, a DHCP client only `l2`,
+/// a ping tool only `l3`), any single layer can be granted, withheld, or mocked on its
+/// own, and a higher layer implemented over a lower one (an `l4`-over-`l3` TCP/IP
+/// stack, an `l3`-over-`l2` IP layer) is ordinary provider middleware in the algebra,
+/// not OS magic. The layers deliberately share no types: each is self-contained, so a
+/// pure-`l4` world never even names link- or network-layer concepts.
+///
+/// See SPEC.md: "Net API". Concurrency goals match the disk API: many in-flight async
+/// operations, awaited individually or jointly, with the owned-buffer round-trip.
 package eo9:net@0.1.0;
 
-/// Root-handle type, shared by the required and `-optional` flavors.
-/// (Types-only interface — see plan/02-wit.md Decisions.)
-interface types {
-    /// The net capability's root handle.
-    resource net-impl;
-}
-
-interface net {
+/// Link layer (L2): network interfaces and whole frames.
+interface l2 {
     use eo9:io/buffers@0.1.0.{buffer};
-    use types.{net-impl};
+
+    /// The L2 capability's root handle. Declared in the API interface itself (not in a
+    /// types-only sibling) so every named import of `l2` mints its own root-handle
+    /// type — see SPEC: "Multi-instance imports and type identity".
+    resource l2-impl;
 
     /// The capability's root handle (see SPEC: The capability algebra).
-    default: func() -> net-impl;
+    default: func() -> l2-impl;
+
+    /// A 48-bit IEEE MAC address.
+    type mac-address = tuple<u8, u8, u8, u8, u8, u8>;
+
+    record interface-info {
+        name: string,
+        mac: mac-address,
+        mtu: u32,
+        /// Whether the link is up.
+        up: bool,
+    }
+
+    variant l2-error {
+        /// Refused by policy — the error `net.l2.deny` answers every operation with.
+        denied,
+        no-such-interface,
+        link-down,
+        frame-too-large,
+        io(string),
+    }
+
+    record send-result {
+        bytes-sent: u64,
+    }
+
+    record recv-result {
+        bytes-received: u64,
+    }
+
+    /// An opened network interface: a send/receive endpoint for whole frames.
+    resource l2-interface;
+
+    /// The interfaces this capability exposes.
+    list-interfaces: async func(l2: borrow<l2-impl>)
+        -> result<list<interface-info>, l2-error>;
+
+    /// Open one interface by name for frame I/O.
+    open-interface: async func(l2: borrow<l2-impl>, name: string)
+        -> result<l2-interface, l2-error>;
+
+    /// The opened interface's current description.
+    info: func(iface: borrow<l2-interface>) -> interface-info;
+
+    /// Send one complete frame (destination MAC, source MAC, ethertype, payload).
+    /// Owned buffer in, owned buffer back out (on both success and error), as in the
+    /// disk API.
+    send-frame: async func(iface: borrow<l2-interface>, frame: buffer)
+        -> tuple<buffer, result<send-result, l2-error>>;
+
+    /// Receive the next frame addressed to this interface into `dst`.
+    recv-frame: async func(iface: borrow<l2-interface>, dst: buffer)
+        -> tuple<buffer, result<recv-result, l2-error>>;
+}
+
+/// Optional flavor of `l2` (hand-written for v0; see SPEC: The capability algebra).
+interface l2-optional {
+    use l2.{l2-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<l2-impl>;
+}
+
+/// Compose-time configuration entry for net.l2.deny: `configure` returns the root
+/// handle that the exported `l2` serves via `default()`.
+interface l2-deny-config {
+    use l2.{l2-impl};
+    configure: func() -> result<l2-impl, string>;
+}
+
+/// Network layer (L3): IP addresses, routes, and raw IP datagrams.
+interface l3 {
+    use eo9:io/buffers@0.1.0.{buffer};
+
+    /// The L3 capability's root handle (see the note on `l2-impl`).
+    resource l3-impl;
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> l3-impl;
+
+    variant ip-address {
+        v4(tuple<u8, u8, u8, u8>),
+        v6(tuple<u16, u16, u16, u16, u16, u16, u16, u16>),
+    }
+
+    /// An address block: an address plus its prefix length (CIDR).
+    record ip-prefix {
+        address: ip-address,
+        prefix-length: u8,
+    }
+
+    record route {
+        destination: ip-prefix,
+        /// `none` for an on-link (directly attached) route.
+        gateway: option<ip-address>,
+        /// The link-layer interface name the route uses, when the provider knows it.
+        interface-name: option<string>,
+    }
+
+    variant l3-error {
+        /// Refused by policy — the error `net.l3.deny` answers every operation with.
+        denied,
+        no-route,
+        unreachable,
+        address-unavailable,
+        protocol-unsupported,
+        packet-too-large,
+        io(string),
+    }
+
+    record send-result {
+        bytes-sent: u64,
+    }
+
+    record recv-result {
+        bytes-received: u64,
+    }
+
+    /// A raw datagram socket bound to one IP protocol number (e.g. 1 = ICMP).
+    /// The provider owns IP header construction and parsing: payloads cross this
+    /// interface, never raw headers.
+    resource raw-socket;
+
+    /// The local addresses this capability exposes.
+    addresses: async func(l3: borrow<l3-impl>) -> result<list<ip-prefix>, l3-error>;
+
+    /// The routing table this capability exposes.
+    routes: async func(l3: borrow<l3-impl>) -> result<list<route>, l3-error>;
+
+    /// Open a raw socket for one IP protocol.
+    open-raw: async func(l3: borrow<l3-impl>, protocol: u8)
+        -> result<raw-socket, l3-error>;
+
+    /// Send one datagram's payload to `destination` (owned-buffer round-trip).
+    send-datagram: async func(s: borrow<raw-socket>, destination: ip-address, payload: buffer)
+        -> tuple<buffer, result<send-result, l3-error>>;
+
+    /// Receive the next datagram's payload into `dst`, reporting the sender.
+    recv-datagram: async func(s: borrow<raw-socket>, dst: buffer)
+        -> tuple<buffer, result<tuple<recv-result, ip-address>, l3-error>>;
+}
+
+/// Optional flavor of `l3`.
+interface l3-optional {
+    use l3.{l3-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<l3-impl>;
+}
+
+/// Compose-time configuration entry for net.l3.deny.
+interface l3-deny-config {
+    use l3.{l3-impl};
+    configure: func() -> result<l3-impl, string>;
+}
+
+/// Transport layer (L4): TCP and UDP sockets.
+interface l4 {
+    use eo9:io/buffers@0.1.0.{buffer};
+
+    /// The L4 capability's root handle (see the note on `l2-impl`).
+    resource l4-impl;
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> l4-impl;
 
     variant ip-address {
         v4(tuple<u8, u8, u8, u8>),
@@ -28,23 +202,21 @@ interface net {
         port: u16,
     }
 
-    variant net-error {
-        /// Refused by policy — the error `net.deny` answers every op with.
+    variant l4-error {
+        /// Refused by policy — the error `net.l4.deny` answers every operation with.
         denied,
         unreachable,
         connection-refused,
         connection-reset,
         timed-out,
         address-in-use,
+        /// The local address requested from `listen`/`bind-udp` is not one the
+        /// provider can bind (e.g. a non-loopback address on `net.l4.loopback`).
+        address-unavailable,
+        not-connected,
+        message-too-large,
         io(string),
     }
-
-    /// An established TCP connection.
-    resource tcp-connection;
-    /// A listening TCP socket.
-    resource tcp-listener;
-    /// A bound UDP socket.
-    resource udp-socket;
 
     record send-result {
         bytes-sent: u64,
@@ -54,74 +226,114 @@ interface net {
         bytes-received: u64,
     }
 
+    /// An established TCP connection.
+    resource tcp-connection;
+    /// A listening TCP socket.
+    resource tcp-listener;
+    /// A bound UDP socket.
+    resource udp-socket;
+
     // --- TCP -----------------------------------------------------------------
 
-    connect: async func(n: borrow<net-impl>, remote: socket-address)
-        -> result<tcp-connection, net-error>;
+    connect: async func(l4: borrow<l4-impl>, remote: socket-address)
+        -> result<tcp-connection, l4-error>;
 
-    listen: async func(n: borrow<net-impl>, local: socket-address)
-        -> result<tcp-listener, net-error>;
+    listen: async func(l4: borrow<l4-impl>, local: socket-address)
+        -> result<tcp-listener, l4-error>;
 
     accept: async func(l: borrow<tcp-listener>)
-        -> result<tuple<tcp-connection, socket-address>, net-error>;
+        -> result<tuple<tcp-connection, socket-address>, l4-error>;
 
-    /// Owned buffer in, owned buffer back out (on both success and error), as in the disk API.
+    /// The address a listener is actually bound to (useful after binding port 0).
+    listener-address: func(l: borrow<tcp-listener>) -> socket-address;
+
+    /// The remote endpoint of an established connection.
+    peer-address: func(c: borrow<tcp-connection>) -> socket-address;
+
+    /// Owned buffer in, owned buffer back out (on both success and error), as in the
+    /// disk API.
     send: async func(c: borrow<tcp-connection>, src: buffer)
-        -> tuple<buffer, result<send-result, net-error>>;
+        -> tuple<buffer, result<send-result, l4-error>>;
 
     recv: async func(c: borrow<tcp-connection>, dst: buffer)
-        -> tuple<buffer, result<recv-result, net-error>>;
+        -> tuple<buffer, result<recv-result, l4-error>>;
 
     // --- UDP -----------------------------------------------------------------
 
-    bind-udp: async func(n: borrow<net-impl>, local: socket-address)
-        -> result<udp-socket, net-error>;
+    bind-udp: async func(l4: borrow<l4-impl>, local: socket-address)
+        -> result<udp-socket, l4-error>;
+
+    /// The address a UDP socket is actually bound to.
+    udp-address: func(s: borrow<udp-socket>) -> socket-address;
 
     send-to: async func(s: borrow<udp-socket>, remote: socket-address, src: buffer)
-        -> tuple<buffer, result<send-result, net-error>>;
+        -> tuple<buffer, result<send-result, l4-error>>;
 
     recv-from: async func(s: borrow<udp-socket>, dst: buffer)
-        -> tuple<buffer, result<tuple<recv-result, socket-address>, net-error>>;
+        -> tuple<buffer, result<tuple<recv-result, socket-address>, l4-error>>;
 }
 
-/// Optional flavor of `net` (hand-written for v0; see SPEC: The capability algebra).
-interface net-optional {
-    use types.{net-impl};
+/// Optional flavor of `l4`.
+interface l4-optional {
+    use l4.{l4-impl};
 
     /// `none` when the capability was not granted.
-    default: func() -> option<net-impl>;
+    default: func() -> option<l4-impl>;
 }
 
-/// Compose-time configuration entry for net.deny: `configure` returns the root handle
-/// that the exported `net` serves via `default()` (see SPEC: Binary or provider, never both).
-interface deny-config {
-    use types.{net-impl};
-    configure: func() -> result<net-impl, string>;
+/// Compose-time configuration entry for net.l4.deny.
+interface l4-deny-config {
+    use l4.{l4-impl};
+    configure: func() -> result<l4-impl, string>;
 }
 
-/// Compose-time configuration entry for net.loopback (same convention as `deny-config`).
-interface loopback-config {
-    use types.{net-impl};
-    configure: func() -> result<net-impl, string>;
+/// Compose-time configuration entry for net.l4.loopback.
+interface l4-loopback-config {
+    use l4.{l4-impl};
+    configure: func() -> result<l4-impl, string>;
 }
 
-/// net.none — absence: exports the optional flavor answering `none`.
-world none {
-    export types;
-    export net-optional;
+// --- stub worlds (one per standard stub provider) ------------------------------
+
+/// net.l2.none — absence: exports the optional flavor answering `none`.
+world l2-none {
+    export l2-optional;
 }
 
-/// net.deny — refusal: exports `net` with every operation failing with `denied`.
-world deny {
-    export types;
-    export net;
-    export deny-config;
+/// net.l2.deny — refusal: exports `l2` with every operation failing with `denied`.
+world l2-deny {
+    export l2;
+    export l2-deny-config;
 }
 
-/// net.loopback — a self-contained loopback-only network: only 127.0.0.1/::1
-/// destinations are reachable, and only within this provider instance.
-world loopback {
-    export types;
-    export net;
-    export loopback-config;
+/// net.l3.none — absence.
+world l3-none {
+    export l3-optional;
+}
+
+/// net.l3.deny — refusal.
+world l3-deny {
+    export l3;
+    export l3-deny-config;
+}
+
+/// net.l4.none — absence.
+world l4-none {
+    export l4-optional;
+}
+
+/// net.l4.deny — refusal: connect/listen/bind fail with `denied`, so no socket can
+/// ever exist.
+world l4-deny {
+    export l4;
+    export l4-deny-config;
+}
+
+/// net.l4.loopback — a self-contained, in-memory transport layer: TCP and UDP work
+/// between sockets created through this provider instance (loopback addresses only),
+/// and nothing outside it is reachable. The standard test/mock L4 — it needs no lower
+/// layers at all.
+world l4-loopback {
+    export l4;
+    export l4-loopback-config;
 }

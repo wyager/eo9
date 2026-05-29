@@ -41,7 +41,10 @@ wit-component = { path = "../../kernel/vendor/wit-component" }
 wasm-wave = { path = "../../kernel/vendor/wasm-wave" }
 
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = true
 codegen-units = 1
 strip = "symbols"
+# Panics in the blob can only abort anyway (wasm32-unknown-unknown has no unwinder); saying
+# so explicitly lets the compiler drop the unwinding scaffolding and shrinks the blob.
+panic = "abort"

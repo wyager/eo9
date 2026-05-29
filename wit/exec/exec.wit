@@ -128,6 +128,14 @@ interface component-algebra {
     load:     func(image: list<u8>) -> result<component, load-error>;
     save:     func(c: borrow<component>) -> list<u8>;
     describe: func(c: borrow<component>) -> component-info;
+    /// The composition tree of how `c` was built, rendered as an indented tree (one node
+    /// per line): every provider layer, what it satisfies or seals, `only` allow-lists,
+    /// renames, and bound configuration. Composition provenance is recorded by the
+    /// algebra operations themselves and is never carried in the bytes (`save`/`load`
+    /// round-trips drop it), so a freshly loaded component renders as a single leaf.
+    /// This is the executor-side view eosh's `describe` builtin shows; the host CLI's
+    /// `describe --wiring` renders the same tree.
+    wiring:   func(c: borrow<component>) -> string;
 
     /// `$` — composition: satisfy `c`'s imports from `p`'s matching exports (see SPEC).
     compose:  func(p: component, c: component) -> result<component, compose-error>;

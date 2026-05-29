@@ -1,37 +1,4 @@
-/* Eo9 web VM page (work in progress). Mirrors the /try terminal look, kept minimal. */
-
-#vm-controls {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.6rem;
-  align-items: center;
-  margin: 1rem 0;
-}
-
-#vm-controls button {
-  font: inherit;
-  padding: 0.35rem 0.8rem;
-  border: 1px solid #888;
-  border-radius: 4px;
-  background: #f4f4f4;
-  cursor: pointer;
-}
-
-#vm-controls button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-#entropy-controls {
-  display: inline-flex;
-  gap: 0.4rem;
-  align-items: center;
-}
-
-#entropy-controls input {
-  font: inherit;
-  padding: 0.2rem 0.4rem;
-}
+/* Eo9 try-it page: the terminal, its input row, and the example list. */
 
 #vm-output {
   background: #111;
@@ -47,6 +14,7 @@
   white-space: pre-wrap;
   word-break: break-word;
   cursor: text;
+  margin-top: 1rem;
 }
 
 #vm-output .vm-cmd {
@@ -55,42 +23,6 @@
 
 #vm-output .vm-error {
   color: #fb6962;
-}
-
-/* --- milestone 2: program store, sleep, terminal input ------------------------------------ */
-
-#vm-controls-m2 {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.6rem;
-  align-items: center;
-  margin: 0 0 1rem 0;
-}
-
-#vm-controls-m2 button {
-  font: inherit;
-  padding: 0.35rem 0.8rem;
-  border: 1px solid #888;
-  border-radius: 4px;
-  background: #f4f4f4;
-  cursor: pointer;
-}
-
-#vm-controls-m2 button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-#program-controls {
-  display: inline-flex;
-  gap: 0.4rem;
-  align-items: center;
-}
-
-#program-controls select,
-#program-controls input {
-  font: inherit;
-  padding: 0.2rem 0.4rem;
 }
 
 #vm-input-row {
@@ -111,4 +43,25 @@
 
 #vm-input-row input:disabled {
   opacity: 0.6;
+}
+
+/* The "things to try" list: a command line, then a one-line caption under it. */
+
+.vm-examples {
+  list-style: none;
+  padding: 0;
+  margin: 1rem 0;
+}
+
+.vm-examples li {
+  margin: 0 0 1rem 0;
+}
+
+.vm-examples li > span {
+  display: block;
+  color: var(--muted);
+}
+
+.vm-note {
+  color: var(--muted);
 }
