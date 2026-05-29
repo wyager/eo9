@@ -1247,3 +1247,42 @@ preemption/hardening work.
     (milestone 6's measurement): `qemu-system-x86_64` sits at ~0.2 % host CPU at an idle eosh prompt
     (`sti; hlt` wake path; same effectively-zero class as the other ports), so no further idle work is
     needed — the x86_64 port is at functional parity with aarch64 and riscv64.
+
+56. **The persistent store disk: a disk-backed cache of on-target compile results (2026-05-29, branch
+    `area/12-store-on-eofs`) — store-on-eofs, first rung.** Booting with the bare `storedisk` command-line
+    token (attached by the new xtask QEMU argument of the same name, which also keeps the token on the
+    cmdline) makes the kernel claim a virtio-blk function for itself, mount the eofs filesystem on it
+    (formatting **blank** disks in place; anything unrecognized is left untouched and the cache stays off),
+    and from then on the shell's `compile` operation consults `/cache/<blake3-of-the-executable-bytes>.cwasm`
+    before invoking Cranelift: a hit deserializes the artifact written by an earlier boot, a miss compiles
+    and writes the artifact back (commit per store). Measured on the acceptance demo
+    (`time.frozen … $ hello` at the interactive prompt): first boot `compile cache miss (compiled on-target
+    in 1497 ms)` + `cached 677 KiB`, second boot — a full QEMU power cycle later — `eofs mounted (txg 2),
+    1 cached compile artifact(s)` + `compile cache hit (677 KiB loaded in 2122 us)`, same
+    `[5.000000000] Hello, cached!` output. Pieces and choices:
+    - **In-kernel polled virtio-blk driver** (`src/virtio_blk.rs`): mirrors the `disk.virtio` wasm driver's
+      modern bring-up, three-descriptor requests, and polled used ring, but runs against `src/pci.rs`
+      directly with heap-allocated, identity-mapped DMA regions (volatile ring access, fences around
+      publish/notify/poll). The wasm driver remains how *programs* get a disk; this one exists because the
+      compile cache is kernel infrastructure that must work while the shell's own store is mid-call. This is
+      the "in-kernel Rust drivers only for boot-critical devices" carve-out the PCI provider review
+      anticipated.
+    - **eofs as the on-disk format** (`wasm/diskcache.rs`): the kernel now links `eofs-core` (and `blake3`)
+      under the new `wasm-storedisk` feature — the same no_std engine the fs.eofs guest provider and usermode
+      mkfs use, so a store disk formatted by any of them is mutually readable. Cached artifacts live under
+      `/cache`; eofs block checksums catch corruption and an artifact `Component::deserialize` rejects falls
+      back to a fresh compile that overwrites it. Artifacts over 8 MiB are not cached.
+    - **Trust/containment**: the disk is operator-attached and kernel-claimed only via the explicit boot
+      token; it is in the same trust class as the baked-in image (both are deserialized native code). It is
+      never exposed to guests; guests still need `pci`+`disk.virtio` for their own disks. Sharing one
+      virtio-blk function between the kernel store and a guest driver in the same boot is unsupported until
+      machine-global device claiming lands (the xtask doc says so), so the demo uses a separate image file
+      (`kernel/target/eo9-store-disk.raw`) from the guest scratch disk.
+    - **Feature scoping**: `wasm-storedisk` is enabled by xtask for the **aarch64** full build only (the ECAM
+      bring-up in `src/pci.rs` is aarch64-virt specific); riscv64/x86_64 builds, the featureless CI gate, and
+      any boot without the token are bit-for-bit unaffected (verified: all three `demo` transcripts unchanged,
+      full `cargo xtask ci` green).
+    - **Remaining for later rungs**: shell-visible store additions (`store add`-style bindings and programs on
+      the disk, surfaced under /bin), VIRTIO_BLK_F_FLUSH for commit durability, eviction/space management for
+      the cache directory, riscv64/x86_64 enablement once their PCI bring-up exists, and the
+      kernel-claims-vs-guest-claims arbitration (machine-global device claiming).
