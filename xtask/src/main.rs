@@ -90,6 +90,14 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-example-lspci", "lspci"),
     ("eo9-stub-entropy-seeded", "entropy.seeded"),
     ("eo9-stub-time-frozen", "time.frozen"),
+    // Basic coreutils, so the metal shell can inspect its own (read-only) filesystem:
+    // `ls /bin`, `cat /session`, `wc`, `head`, `stat`.
+    ("eo9-coreutil-ls", "ls"),
+    ("eo9-coreutil-cat", "cat"),
+    ("eo9-coreutil-echo", "echo"),
+    ("eo9-coreutil-wc", "wc"),
+    ("eo9-coreutil-head", "head"),
+    ("eo9-coreutil-stat", "stat"),
 ];
 
 fn main() -> ExitCode {
