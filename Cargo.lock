@@ -453,6 +453,7 @@ dependencies = [
  "eo9-providers-unix",
  "eo9-runtime",
  "eo9-store",
+ "eofs-core",
  "libc",
 ]
 

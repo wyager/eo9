@@ -48,6 +48,15 @@ pub fn cmd_run(cfg: &Config, reference: &str, flags: &[ProgramArg]) -> Result<u8
             source.origin
         ));
     }
+    // Same posture for the raw block device: never granted implicitly.
+    if cfg.disk.is_none() && requires_disk(&info.imports) {
+        return Err(format!(
+            "{} requires the eo9:disk block-device capability, which eo9 does not grant \
+             by default: pass `--disk <image>` to grant a file-backed block device \
+             (create and format one with `eo9 mkfs.eofs <image>`)",
+            source.origin
+        ));
+    }
     let args = bind_args(&info.args, flags)?;
 
     // Obtain the image through the compile cache: a hit is deserialized without codegen,
@@ -239,6 +248,14 @@ fn requires_fs(imports: &[ImportNeed]) -> bool {
     imports
         .iter()
         .any(|need| need.required && !need.authority_free && need.interface.starts_with("eo9:fs/"))
+}
+
+/// Whether the component has a *required* import of an `eo9:disk` interface — i.e. it
+/// cannot run without an explicit `--disk <image>` grant.
+fn requires_disk(imports: &[ImportNeed]) -> bool {
+    imports.iter().any(|need| {
+        need.required && !need.authority_free && need.interface.starts_with("eo9:disk/")
+    })
 }
 
 /// Render the executor's view of how the task ended as the spec's three-way

@@ -23,6 +23,9 @@ eo9-components = { workspace = true }
 eo9-providers-unix = { workspace = true }
 eo9-runtime = { workspace = true }
 eo9-store = { workspace = true }
+# `mkfs.eofs`: formatting disk images with Eo9's native filesystem happens host-side
+# through the same engine the fs.eofs guest provider uses.
+eofs-core = { workspace = true }
 # Raw-mode terminal control (tcgetattr/tcsetattr) for the interactive shell's line
 # editor; the same pin eo9-providers-unix already uses.
 libc = "0.2"

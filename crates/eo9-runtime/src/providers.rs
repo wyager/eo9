@@ -186,6 +186,40 @@ pub trait FsProvider: Send + 'static {
     fn close_exec(&mut self, handle: FsHandle);
 }
 
+/// Error type for block-device operations (the union of `eo9:disk/disk.read-error` and
+/// `write-error`; the linker maps each value onto whichever variant the failing operation
+/// declares).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiskError {
+    /// The backing device is gone.
+    NotFound,
+    /// The requested range does not lie entirely inside the device.
+    OutOfRange,
+    /// The device was opened read-only (writes only).
+    ReadOnly,
+    /// Any other I/O failure.
+    Io(String),
+}
+
+/// Root provider for `eo9:disk/disk` — a raw block device, a flat span of bytes addressed
+/// by offset. No filesystem semantics live here (that is `eo9:fs`'s business; the eofs
+/// provider component is the bridge between the two).
+///
+/// Reads and writes follow the owned-buffer round-trip of the WIT: the operation takes the
+/// buffer's bytes by value and gives them back when it completes, on both the success and
+/// the error path, so the provider has exclusive possession of the bytes for the life of
+/// the operation. An operation that would touch bytes outside the device fails with
+/// [`DiskError::OutOfRange`] without touching the backing store.
+pub trait DiskProvider: Send + 'static {
+    /// Read `dst.len()` bytes starting at byte `offset` into `dst`, returning the buffer
+    /// and the number of bytes read.
+    fn read(&mut self, offset: u64, dst: Vec<u8>) -> BoxOp<(Vec<u8>, Result<u64, DiskError>)>;
+
+    /// Write `src` starting at byte `offset`, returning the buffer and the number of
+    /// bytes written.
+    fn write(&mut self, offset: u64, src: Vec<u8>) -> BoxOp<(Vec<u8>, Result<u64, DiskError>)>;
+}
+
 /// The set of root providers wired into one task at spawn.
 ///
 /// Every field is optional: a task's component is linked only against the interfaces it
@@ -197,6 +231,9 @@ pub struct Providers {
     pub time: Option<Box<dyn TimeProvider>>,
     pub entropy: Option<Box<dyn EntropyProvider>>,
     pub fs: Option<Box<dyn FsProvider>>,
+    /// The raw block device (`eo9:disk`); usermode grants it only via an explicit
+    /// `--disk <image>` (no ambient default), mirroring the fs grant posture.
+    pub disk: Option<Box<dyn DiskProvider>>,
     /// The exec capability (component algebra + compile + task). Granting it makes the
     /// task a native executor; see [`crate::exec::ExecProvider`].
     pub exec: Option<crate::exec::ExecProvider>,

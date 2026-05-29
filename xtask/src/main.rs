@@ -1965,6 +1965,7 @@ const PUBLISH_CRATES: &[&str] = &[
     "eo9-store",
     "eo9-providers-unix",
     "eo9-components",
+    "eofs-core",
     "eo9-runtime",
     "eo9-embed",
     "eo9",
@@ -1977,6 +1978,7 @@ const PUBLISH_LEAF_CRATES: &[&str] = &[
     "eo9-store",
     "eo9-providers-unix",
     "eo9-components",
+    "eofs-core",
 ];
 
 fn components_build_dir(root: &Path) -> PathBuf {

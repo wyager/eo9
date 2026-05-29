@@ -10,7 +10,10 @@ description = "Eo9's native filesystem (eofs): copy-on-write, Merkle-hashed, com
 license = "MIT"
 version.workspace = true
 edition.workspace = true
-publish.workspace = true
+# Published: the `eo9` binary depends on it for `mkfs.eofs` (formatting disk images), so
+# it has to live on crates.io alongside the rest of the publish chain.
+publish = true
+repository.workspace = true
 
 [dependencies]
 blake3 = { workspace = true }

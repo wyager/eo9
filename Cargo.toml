@@ -65,4 +65,4 @@ eo9-providers-unix = { path = "crates/eo9-providers-unix", version = "0.1.0" }
 eo9-runtime = { path = "crates/eo9-runtime", version = "0.1.0" }
 eo9-sched = { path = "crates/eo9-sched" }
 eo9-store = { path = "crates/eo9-store", version = "0.1.0" }
-eofs-core = { path = "crates/eofs-core" }
+eofs-core = { path = "crates/eofs-core", version = "0.1.0" }

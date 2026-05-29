@@ -159,6 +159,46 @@ impl DiskProvider {
     }
 }
 
+impl DiskProvider {
+    /// Read synchronously on the calling thread, completing eagerly.
+    ///
+    /// The async [`DiskHost`] path completes on a pool thread, which a *synchronous*
+    /// consumer of the disk capability cannot wait for: the eofs provider component
+    /// drives its block device from a synchronous engine and requires every disk call to
+    /// have completed by the time the call returns (plan/14-eofs.md D15). Embedders that
+    /// hand a disk to such a consumer use this eager form instead of [`DiskHost::read`].
+    pub fn read_blocking(&self, offset: u64, mut dst: OwnedBuffer) -> ReadCompletion {
+        if !self.check_range(offset, dst.len()) {
+            return (dst, Err(ReadError::OutOfRange));
+        }
+        let result = match self.file.read_exact_at(dst.as_mut_slice(), offset) {
+            Ok(()) => Ok(ReadResult {
+                bytes_read: dst.len(),
+            }),
+            Err(err) => Err(io_to_read_error(&err)),
+        };
+        (dst, result)
+    }
+
+    /// Write synchronously on the calling thread, completing eagerly (see
+    /// [`DiskProvider::read_blocking`]).
+    pub fn write_blocking(&self, offset: u64, src: OwnedBuffer) -> WriteCompletion {
+        if self.read_only {
+            return (src, Err(WriteError::ReadOnly));
+        }
+        if !self.check_range(offset, src.len()) {
+            return (src, Err(WriteError::OutOfRange));
+        }
+        let result = match self.file.write_all_at(src.as_slice(), offset) {
+            Ok(()) => Ok(WriteResult {
+                bytes_written: src.len(),
+            }),
+            Err(err) => Err(WriteError::Io(err.to_string())),
+        };
+        (src, result)
+    }
+}
+
 impl DiskHost for DiskProvider {
     fn read(&self, offset: u64, mut dst: OwnedBuffer, complete: Completer<ReadCompletion>) {
         if !self.check_range(offset, dst.len()) {

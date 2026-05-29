@@ -16,6 +16,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
+use eo9_providers_unix::disk::{
+    DiskProvider as UnixDisk, ReadCompletion as UnixDiskReadCompletion,
+    ReadError as UnixDiskReadError, WriteCompletion as UnixDiskWriteCompletion,
+    WriteError as UnixDiskWriteError,
+};
 use eo9_providers_unix::entropy::{EntropyHost, EntropyProvider as UnixEntropy};
 use eo9_providers_unix::fs::{
     FileHost, FileReadCompletion, FileWriteCompletion, FsError as UnixFsError, FsHost,
@@ -27,7 +32,9 @@ use eo9_providers_unix::text::{
 };
 use eo9_providers_unix::time::{TimeHost, TimeProvider as UnixTime};
 use eo9_providers_unix::{BlockingPool, OwnedBuffer, completer};
-use eo9_runtime::providers::{BoxOp, FsError, FsHandle, FsProvider, NodeKind, NodeStat, OpenFlags};
+use eo9_runtime::providers::{
+    BoxOp, DiskError, DiskProvider, FsError, FsHandle, FsProvider, NodeKind, NodeStat, OpenFlags,
+};
 use eo9_runtime::{
     ChildPolicy, Datetime, EntropyProvider, ExecProvider, Image, OutputStream, Providers, Task,
     TextError, TextProvider, TimeProvider,
@@ -164,6 +171,78 @@ impl EntropyProvider for HostEntropy {
 
     fn get_u64(&mut self) -> u64 {
         self.inner.get_u64()
+    }
+}
+
+/// `eo9:disk/disk` backed by the unix file-backed block device (the `--disk <image>`
+/// grant). Containment is structural: the provider holds one already-opened image file
+/// and offers nothing beyond offset-addressed reads and writes inside it, so no other
+/// host path is reachable through this capability.
+///
+/// Operations complete *eagerly* (the synchronous `read_blocking`/`write_blocking` path
+/// of the unix provider, not its pool): the main consumer of a granted disk is the
+/// `fs.eofs` provider component, whose synchronous engine requires every disk call to
+/// have completed by the time it returns (plan/14 D15). A positioned read or write on a
+/// regular file is fast enough that blocking the drive loop for it is the right trade
+/// until the fully asynchronous bridge exists.
+struct HostDisk {
+    inner: Arc<UnixDisk>,
+}
+
+impl HostDisk {
+    /// Open the image file read-write. The device size is the file's current length.
+    fn open(image: &Path) -> Result<Self, String> {
+        let pool = Arc::new(BlockingPool::with_default_size());
+        let inner = UnixDisk::open(image, false, pool).map_err(|err| {
+            format!(
+                "cannot open the disk image {}: {err} (create and format one with \
+                 `eo9 mkfs.eofs {}`)",
+                image.display(),
+                image.display()
+            )
+        })?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+}
+
+impl DiskProvider for HostDisk {
+    fn read(&mut self, offset: u64, dst: Vec<u8>) -> BoxOp<(Vec<u8>, Result<u64, DiskError>)> {
+        let (buffer, result): UnixDiskReadCompletion =
+            self.inner.read_blocking(offset, OwnedBuffer::from_vec(dst));
+        ready_op((
+            buffer.into_vec(),
+            result.map(|done| done.bytes_read).map_err(disk_read_error),
+        ))
+    }
+
+    fn write(&mut self, offset: u64, src: Vec<u8>) -> BoxOp<(Vec<u8>, Result<u64, DiskError>)> {
+        let (buffer, result): UnixDiskWriteCompletion = self
+            .inner
+            .write_blocking(offset, OwnedBuffer::from_vec(src));
+        ready_op((
+            buffer.into_vec(),
+            result
+                .map(|done| done.bytes_written)
+                .map_err(disk_write_error),
+        ))
+    }
+}
+
+fn disk_read_error(err: UnixDiskReadError) -> DiskError {
+    match err {
+        UnixDiskReadError::NotFound => DiskError::NotFound,
+        UnixDiskReadError::OutOfRange => DiskError::OutOfRange,
+        UnixDiskReadError::Io(message) => DiskError::Io(message),
+    }
+}
+
+fn disk_write_error(err: UnixDiskWriteError) -> DiskError {
+    match err {
+        UnixDiskWriteError::OutOfRange => DiskError::OutOfRange,
+        UnixDiskWriteError::ReadOnly => DiskError::ReadOnly,
+        UnixDiskWriteError::Io(message) => DiskError::Io(message),
     }
 }
 
@@ -742,7 +821,12 @@ pub fn root_providers(cfg: &Config) -> Result<Providers, String> {
         Some(root) => Some(Box::new(HostFs::new(root, cfg.exec_snapshot)?)),
         None => None,
     };
-    Ok(assemble(fs, None))
+    // The block device follows the same opt-in posture: granted only via `--disk <image>`.
+    let disk: Option<Box<dyn DiskProvider>> = match &cfg.disk {
+        Some(image) => Some(Box::new(HostDisk::open(image)?)),
+        None => None,
+    };
+    Ok(assemble(fs, disk, None))
 }
 
 /// The layered session filesystem: the session directory's read-only program view
@@ -817,6 +901,7 @@ pub fn shell_providers(
     let exec_snapshot = cfg.exec_snapshot;
     let session_root = session_root.to_path_buf();
     let fs_root = cfg.fs_root.clone();
+    let disk_image = cfg.disk.clone();
 
     // A late-bound self-reference: `make` builds the session environment, and the exec
     // capability it installs carries a child policy that calls `make` again for the next
@@ -827,6 +912,20 @@ pub fn shell_providers(
         let slot = Arc::clone(&slot);
         Arc::new(move || {
             let fs = session_overlay_fs(&session_root, fs_root.as_deref(), exec_snapshot);
+            // The session's block device (when granted): each task opens its own handle on
+            // the same image file. Commands at the prompt run one at a time, so eofs
+            // mounts over the image do not overlap; like the fs layer, a broken image
+            // degrades to a warning rather than blocking the session.
+            let disk: Option<Box<dyn DiskProvider>> = match disk_image.as_deref() {
+                Some(image) => match HostDisk::open(image) {
+                    Ok(disk) => Some(Box::new(disk)),
+                    Err(err) => {
+                        eprintln!("eo9: warning: programs get no block device: {err}");
+                        None
+                    }
+                },
+                None => None,
+            };
             let child_slot = Arc::clone(&slot);
             let policy = ChildPolicy::with_providers(move || {
                 let make = child_slot
@@ -836,7 +935,7 @@ pub fn shell_providers(
                     .expect("the session child policy is initialized before the first spawn");
                 make()
             });
-            assemble(fs, Some(ExecProvider::new(&engine, policy)))
+            assemble(fs, disk, Some(ExecProvider::new(&engine, policy)))
         })
     };
     *slot.lock().unwrap() = Some(Arc::clone(&make));
@@ -882,6 +981,16 @@ pub fn session_manifest(cfg: &Config) -> String {
                 .to_string(),
         ),
     }
+    if let Some(image) = &cfg.disk {
+        lines.push(format!(
+            "shell disk file-backed block device {} (from --disk)",
+            image.display()
+        ));
+        lines.push(format!(
+            "child disk file-backed block device {} (from --disk); mount it with `fs.eofs $ …`",
+            image.display()
+        ));
+    }
     lines.push("child exec the component algebra, compile, and spawn".to_string());
     lines.push(
         "note children inherit the shell's full environment; restrict a command with `only` \
@@ -900,8 +1009,12 @@ pub fn session_manifest(cfg: &Config) -> String {
 }
 
 /// The fixed part of every provider set this binary hands out: terminal stdio, host
-/// clocks, and the OS RNG, plus whatever fs/exec grant the caller decided on.
-fn assemble(fs: Option<Box<dyn FsProvider>>, exec: Option<ExecProvider>) -> Providers {
+/// clocks, and the OS RNG, plus whatever fs/disk/exec grant the caller decided on.
+fn assemble(
+    fs: Option<Box<dyn FsProvider>>,
+    disk: Option<Box<dyn DiskProvider>>,
+    exec: Option<ExecProvider>,
+) -> Providers {
     Providers {
         text: Some(Box::new(StdioText {
             inner: UnixText::stdio(),
@@ -913,6 +1026,7 @@ fn assemble(fs: Option<Box<dyn FsProvider>>, exec: Option<ExecProvider>) -> Prov
             inner: UnixEntropy::new(),
         })),
         fs,
+        disk,
         exec,
     }
 }
