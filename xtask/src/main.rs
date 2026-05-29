@@ -124,10 +124,6 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("build-guest", rest)?;
             build_guest(&root)
         }
-        "build-web-demo" => {
-            expect_no_args("build-web-demo", rest)?;
-            build_web_demo(&root)
-        }
         "build-web-vm" => {
             expect_no_args("build-web-vm", rest)?;
             build_web_vm(&root)
@@ -204,9 +200,6 @@ COMMANDS:
                          tests and kernel workspace tests (host triple)
     build-guest          Build guest crates for {GUEST_TARGET} and componentize them with
                          `wasm-tools component new` into guest/target/components/*.wasm
-    build-web-demo       Build the guest components, then transpile the /try page's set into
-                         www/site/try/components/ via www/try-build (commit the result; the
-                         deployed site needs no extra tooling). Not part of `ci`.
     build-web-vm         Pre-AOT the web-VM demo components to pulley32, build the wasm32
                          blob (www/web-eo9, the real runtime stack for the /vm page), and
                          install it into www/site/vm/ (commit the result; ci does not need it)
@@ -549,37 +542,6 @@ fn build_guest_component(root: &Path, package: &str) -> Result<PathBuf, String> 
         ],
     )?;
     componentize_guest_package(root, package)
-}
-
-/// Build the guest components and regenerate the eo9.org `/try` page's transpiled bundle.
-///
-/// The transpiler (`www/try-build`, its own workspace) turns the example components into
-/// browser-runnable ES modules + core wasm and writes them, plus the launcher manifest, into
-/// `www/site/try/components/`. The output is committed, so this only needs re-running when the
-/// shipped components (or the transpiler pin) change; `ci` deliberately does not depend on it.
-fn build_web_demo(root: &Path) -> Result<(), String> {
-    build_guest(root)?;
-    let manifest = root.join("www").join("try-build").join("Cargo.toml");
-    let components = root.join("guest").join("target").join("components");
-    let out = root.join("www").join("site").join("try").join("components");
-    run(
-        root,
-        "cargo",
-        [
-            OsStr::new("run"),
-            OsStr::new("--release"),
-            OsStr::new("--manifest-path"),
-            manifest.as_os_str(),
-            OsStr::new("--"),
-            OsStr::new("--components"),
-            components.as_os_str(),
-            OsStr::new("--out"),
-            out.as_os_str(),
-        ],
-    )?;
-    // Regenerated bundles need fresh pre-compressed siblings or the server falls back to
-    // serving them uncompressed (it never serves a variant older than its original).
-    precompress_site(root)
 }
 
 /// Write brotli/gzip siblings next to the compressible static assets under `www/site`

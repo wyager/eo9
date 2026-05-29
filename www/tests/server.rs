@@ -330,7 +330,7 @@ fn precompressed_assets_are_served_by_content_negotiation() {
     let gzip = request_with_headers(
         site_server_addr(),
         "GET",
-        "/try/components/hello/hello.js",
+        "/vm/vm.js",
         &[("Accept-Encoding", "gzip")],
     );
     assert_eq!(gzip.status, 200);

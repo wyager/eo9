@@ -45,8 +45,8 @@ pub enum Transport {
 }
 
 /// The Content-Security-Policy for every page: first-party only, with the one extra
-/// permission the demo pages need — `'wasm-unsafe-eval'` so the browser may compile
-/// WebAssembly fetched from this origin (`/try`'s transpiled components, `/vm`'s blob).
+/// permission the try-it page needs — `'wasm-unsafe-eval'` so the browser may compile
+/// WebAssembly fetched from this origin (the `/vm` blob and program store).
 /// There is no inline script or style anywhere on the site.
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
      style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; \

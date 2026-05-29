@@ -4,7 +4,7 @@
 # successor of the `www/embed-spike` feasibility probe (plan/15 "wasm32 embed spike"); the
 # spike stays as the reference harness and regression probe.
 #
-# Standalone workspace (like www/, www/try-build, www/embed-spike): nothing here enters the
+# Standalone workspace (like www/, www/precompress, www/embed-spike): nothing here enters the
 # OS dependency tree, and `cargo xtask ci` neither builds nor needs it. Build via
 # `cargo xtask build-web-vm`.
 [workspace]
