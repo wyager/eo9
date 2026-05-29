@@ -223,6 +223,12 @@ wires `virtualnet` into `virtualfs` only, so `browser` sees `virtualfs`'s export
 - **Non-associativity.** `$` is not associative — re-association changes who serves whom, as above. Concretely, `(a $ b) $ c ≡ a $ (b $ c)` only when `a` exports nothing that `c` imports and `b` doesn't already provide; hence the fixed right-associative reading.
 - **Composition is early context-override.** Modulo fusion, running `p $ c` in context `Γ` behaves like running `c` in the context `exports(p)` layered over `Γ`. Doing the override with `$` — at compose time rather than run time — is exactly what lets the compiler inline the layer and erase its cost (see Performance).
 
+**What `≡` means.** `a ≡ b` means: under every closed completion, every argument vector, and the same root providers, running `a` and `b` yields the same program outcome (the same success/failure payload or the same abnormal class) and the same observable interactions on every granted capability, and `describe` reports the same residual import/export surface. Equivalence is observational — it does not require equal bytes, equal content hashes, or equal wiring trees.
+
+**Instance identity.** One `$` is one provider instantiation: `p $ c` instantiates `p` once and wires that single instance to every import slot of `c` it satisfies, so two slots satisfied by the same compose share that instance. Distinct `$` (or `with … as`) operations create distinct instances, even from the same bytes; the algebra never introduces sharing across separately composed values. The action laws (`only`, `rename`, `configure` distributing over `$`/`&`) preserve this: they re-wire the same single instantiation, never duplicate or merge it. A provider whose semantics depend on shared state across importers must expose that sharing in its API (a handle passed between calls), not rely on instantiation coincidence.
+
+**`empty`.** `empty` is the provider with no exports, no required imports, and no configuration; any component whose `describe` reports that empty surface is `≡ empty`. It is the identity of `&` (`empty & e ≡ e ≡ e & empty`) and a dead layer under `$` (`empty $ c ≡ c`: it satisfies nothing, and the wiring tree marks it as such).
+
 **Precedence.** Argument application binds tighter than `$`, so each module's flags attach to that module before composition:
 
 ```
