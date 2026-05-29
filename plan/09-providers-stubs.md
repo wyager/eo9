@@ -226,3 +226,32 @@ Match the priority order above; (1)+(2) unblock I2.
     delivery once the PCI provider grows it, multi-frame receive batching if a consumer ever needs it, and
     the planned consumers — an l3-over-l2 / l4-over-l3 middleware stack (smoltcp-style) so programs that
     speak sockets can run over this link layer.
+
+18. **`net.l4.over-l2` — the TCP/IP stack as ordinary middleware (2026-05-29, branch
+    `area/09-net-l4-over-l2`).** The layered-net design's payoff: a provider component that imports the
+    link layer (`eo9:net/l2`), the clock (`eo9:time/time`, for TCP/ARP timers and operation deadlines) and
+    entropy (`eo9:entropy/entropy`, for ephemeral ports and ISNs), and exports transport sockets
+    (`eo9:net/l4`), so a program that speaks only l4 gets working TCP and UDP by composition —
+    `net.virtio $ net.l4.over-l2 $ program` on metal, any mock l2 in tests. The engine is **smoltcp
+    0.12.0** (guest-workspace-only dependency, `default-features = false`, features `alloc`,
+    `medium-ethernet`, `proto-ipv4`, `socket-tcp`, `socket-udp`); the provider drives its l2 import
+    eagerly (the same single-poll convention as `net.virtio`'s pci and `fs.eofs`'s disk imports) and each
+    exported operation pumps frames between the link and the stack until it completes or its deadline
+    passes — nothing suspends mid-operation and nothing blocks forever (deadlines: 4 s receive, 6 s
+    connect, 1.5 s send-flush, all backed by a hard pump-round cap so a frozen test clock cannot hang an
+    operation). Bounds: 16 sockets, 16 KiB TCP buffers per direction, 8×1536 B / 4×1536 B UDP queues,
+    32-frame receive queue. Errors stay typed end to end: the l2 layer's `denied` surfaces as the l4
+    `denied`, everything else maps to `timed-out` / `connection-refused` / `io(...)`. **Defaults:** QEMU
+    user-mode networking's layout — 10.0.2.15/24, gateway 10.0.2.2 — bound lazily on first use
+    (plan/09 D14); address overrides need an `l4-over-l2-config` interface in `wit/net`, recorded as the
+    follow-up (wit/ is deliberately untouched by this branch). The `l4check` example (imports only
+    `eo9:net/l4`) sends a UDP DNS query for `example.com` to 10.0.2.3 and reports the answer plus the
+    typed outcome of a TCP connect to 10.0.2.2:9. Verified: usermode, the no-traffic chain
+    `entropy.seeded $ time.monotonic-stub $ net.l2.deny $ net.l4.over-l2 $ l4check` ends in the program's
+    own `denied` failure in 0.24 s (tests/eo9-integration/tests/net_l4_over_l2.rs); on metal,
+    `net.virtio $ net.l4.over-l2 $ l4check` compiled on-target and answered
+    `ok: resolved("example.com is 172.66.147.243; tcp 10.0.2.2:9 -> ConnectionRefused")` — real DNS through
+    three composed wasm layers and slirp, and the refused SYN reported as a typed error. Component sizes:
+    192 KiB (middleware), 83 KiB (l4check). Remaining for the track: the config interface above, DHCP and
+    IPv6 (smoltcp features exist, deliberately off), an l3 export over the same engine, listener/accept
+    coverage beyond the basic path, and riscv64 metal coverage once that arch has a PCI provider.
