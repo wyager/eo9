@@ -19,6 +19,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-readwrite",
     "eo9-example-sockcheck",
     "eo9-example-lspci",
+    "eo9-example-l2check",
     "eosh",
     // Basic coreutils (guest/coreutils/*, plan/17-coreutils.md).
     "eo9-coreutil-cat",
@@ -51,6 +52,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-net-l4-deny",
     "eo9-stub-net-l4-loopback",
     "eo9-stub-net-l4-none",
+    "eo9-stub-net-virtio",
     "eo9-stub-pci-none",
     "eo9-stub-perf-none",
     "eo9-stub-perf-null",
@@ -109,6 +111,11 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // virtio disk (boot with the `pci` grant and the xtask `disk` flag).
     ("eo9-stub-disk-virtio", "disk.virtio"),
     ("eo9-stub-fs-eofs", "fs.eofs"),
+    // The network stack for real hardware: the virtio-net driver and its link-layer
+    // check, so the metal shell can compose `net.virtio $ l2check` against a QEMU
+    // user-mode NIC (boot with the `pci` grant and the xtask `net` flag).
+    ("eo9-stub-net-virtio", "net.virtio"),
+    ("eo9-example-l2check", "l2check"),
     // Basic coreutils, so the metal shell can inspect its own (read-only) filesystem:
     // `ls /bin`, `cat /session`, `wc`, `head`, `stat`.
     ("eo9-coreutil-ls", "ls"),
@@ -1650,7 +1657,10 @@ fn ensure_scratch_disk(root: &Path) -> Result<PathBuf, String> {
 /// A bare `disk` argument is consumed by xtask itself (it never reaches the kernel command
 /// line): it attaches the scratch raw image as a modern virtio-blk PCI function
 /// (`-device virtio-blk-pci,disable-legacy=on`) so the `disk.virtio` driver has real
-/// hardware to claim — `cargo xtask qemu aarch64 pci disk`.
+/// hardware to claim — `cargo xtask qemu aarch64 pci disk`. A bare `net` argument is the
+/// same idea for networking: it attaches a modern virtio-net PCI function backed by QEMU
+/// user-mode networking (`-netdev user`) so the `net.virtio` driver has a NIC to claim —
+/// `cargo xtask qemu aarch64 pci net`.
 fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
     let image = build_kernel(root, arch)?;
     let qemu = format!("qemu-system-{arch}");
@@ -1706,13 +1716,16 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         .map(Into::into)
         .collect();
     args.push(image.as_os_str().to_os_string());
-    // The bare `disk` argument is xtask's: attach the scratch virtio-blk disk and keep the
-    // token off the kernel command line.
+    // The bare `disk` and `net` arguments are xtask's: attach the scratch virtio-blk disk
+    // / a user-mode virtio-net NIC and keep the tokens off the kernel command line.
     let mut cmdline: Vec<String> = Vec::new();
     let mut attach_disk = false;
+    let mut attach_net = false;
     for argument in append {
         if argument == "disk" {
             attach_disk = true;
+        } else if argument == "net" {
+            attach_net = true;
         } else {
             cmdline.push(argument.clone());
         }
@@ -1723,6 +1736,12 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         args.push(format!("if=none,format=raw,id=eo9disk,file={}", scratch.display()).into());
         args.push("-device".into());
         args.push("virtio-blk-pci,drive=eo9disk,disable-legacy=on".into());
+    }
+    if attach_net {
+        args.push("-netdev".into());
+        args.push("user,id=eo9net".into());
+        args.push("-device".into());
+        args.push("virtio-net-pci,netdev=eo9net,disable-legacy=on".into());
     }
     // Anything else after the architecture becomes the kernel command line, e.g.
     // `cargo xtask qemu aarch64 program=cruncher seed=9 rounds=200000`.

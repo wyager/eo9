@@ -201,3 +201,28 @@ Match the priority order above; (1)+(2) unblock I2.
     bounce buffer per request, no FLUSH (durability is QEMU's writeback cache for now), no MSI/INTx. Verified
     on QEMU aarch64 metal (plan/12 D50): the full composed stack `disk.virtio $ fs.eofs $ ls / readwrite /
     cat` runs compiled on-target, and data written through it survives a QEMU power cycle.
+
+17. **`net.virtio` — the virtio-net sibling of `disk.virtio` (2026-05-29, branch `area/09-virtio-net`).**
+    A second device driver as an ordinary provider component, `guest/stubs/net-virtio`
+    (`eo9-stub-net-virtio` → shell name `net.virtio`, ~137 KB raw): imports `eo9:pci/pci` (plus `eo9:text`
+    for one diagnostic line) and exports `eo9:net/l2` — the single interface `virtio0`, its MAC address,
+    and whole-frame send/receive. The probe and bring-up reuse `disk.virtio`'s shape verbatim (capability
+    walk, common/notify/device-config windows, modern device id 0x1041 preferred with the transitional
+    0x1000 accepted when it carries the modern capabilities); the deltas are network-specific:
+    `VIRTIO_NET_F_MAC` is negotiated alongside `VIRTIO_F_VERSION_1` so the device-config window carries a
+    stable MAC, two virtqueues are built (receive and transmit, 16 entries each, both rings sharing one
+    `alloc-dma` page), eight 2 KiB receive buffers are pre-posted and re-posted as they are consumed, and
+    every frame crosses the rings behind the 12-byte virtio-net header (zeroed on transmit — no offloads —
+    and stripped on receive). `recv-frame` is a bounded poll that reports a typed `io` error when nothing
+    arrives (never a hang); an oversized frame fails with `frame-too-large`; all device weirdness is a
+    typed error, never a trap. DMA addresses come only from `alloc-dma`/`dma-address`, so the containment
+    story is identical to the disk driver: two explicit grants (the `pci` boot token and the xtask `net`
+    flag) before the driver can touch anything. The new `l2check` example (`guest/examples/l2check`)
+    proves both directions end-to-end by ARP-resolving the QEMU user-net gateway: it lists the interface,
+    broadcasts a who-has-10.0.2.2 request, and waits for the reply. Verified interactively on QEMU aarch64
+    metal: `net.virtio $ l2check` (compiled on-target) prints the probe line
+    (`net.virtio: virtio-net 52:54:00:12:34:56, queues rx/tx 16/16`) and resolves
+    `10.0.2.2 is at 52:55:0a:00:02:02` → `ok: resolved(...)`. Remaining for the driver track: interrupt
+    delivery once the PCI provider grows it, multi-frame receive batching if a consumer ever needs it, and
+    the planned consumers — an l3-over-l2 / l4-over-l3 middleware stack (smoltcp-style) so programs that
+    speak sockets can run over this link layer.

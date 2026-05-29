@@ -1,0 +1,33 @@
+// l2check — the link-layer (eo9:net/l2) example: open the provider's interface, send a
+// broadcast ARP request for the QEMU user-net gateway (10.0.2.2), and wait for the
+// reply. Getting one proves whole frames move in both directions through whatever l2
+// provider the program is composed with (`net.virtio` on metal). Capabilities:
+// eo9:net/l2, eo9:text.
+package eo9-examples:l2check@0.1.0;
+
+/// ARP-resolves 10.0.2.2 (the QEMU user-mode-networking gateway) over the granted
+/// link-layer capability and reports the MAC address that answered.
+///
+///   net.virtio $ l2check
+world l2check {
+    import eo9:net/l2@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    variant program-success {
+        /// The gateway answered; carries its MAC address as text (`aa:bb:cc:dd:ee:ff`).
+        resolved(string),
+    }
+
+    variant program-failure {
+        /// The link-layer capability refused the request (e.g. composed over net.l2.deny).
+        denied,
+        /// A link-layer operation failed, carrying the l2 API's own error.
+        net(string),
+        /// Frames moved but no ARP reply for the gateway arrived.
+        no-reply(string),
+        /// A console error.
+        io(string),
+    }
+
+    export main: async func() -> result<program-success, program-failure>;
+}

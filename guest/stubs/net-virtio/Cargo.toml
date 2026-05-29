@@ -1,0 +1,15 @@
+[package]
+name = "eo9-stub-net-virtio"
+description = "Eo9 device driver `net.virtio`: drives a modern virtio-net PCI function through the eo9:pci capability (config space, BARs, DMA, polled virtqueues) and exports eo9:net/l2, so link-layer networking runs over real hardware by composition."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }
