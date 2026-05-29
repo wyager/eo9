@@ -146,3 +146,15 @@ landed; the remaining source-level changes beyond the dependency-feature edits a
   (host CPU inference needs the std-only `cranelift-native`) and the OS-less tunables, so
   wasmtime's native-host compatibility check — which the linked compiler runs on *every*
   engine, deserialize and on-target alike — passes (`Triple::host()` equals the build target).
+
+## cranelift-codegen (0.132.0)
+
+Vendored for one reason: the riscv64 backend's `FliConstant::maybe_from_u64`
+(`src/isa/riscv64/inst/args.rs`) compares against `2.0f64.powi(-16)` (and -15/-8/-7), and
+`f64::powi` is a `std`-only method — so the otherwise no_std-clean crate fails to build for
+`riscv64gc-unknown-none-elf` the moment the riscv64 ISA is enabled (which `host-arch` does
+when the kernel is compiled for that target). The vendored copy spells those four constants
+as exact power-of-two divisions (`1.0 / 65536.0`, …), which are bit-identical values, and
+changes nothing else. No codegen or safety logic is touched; aarch64 and every other
+backend are byte-identical to the registry crate. Drop this copy once upstream replaces the
+`powi` calls with `core`-compatible constants.

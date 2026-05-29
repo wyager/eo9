@@ -1,4 +1,4 @@
-//! On-target codegen: compile a WebAssembly component to native aarch64 **on the machine**
+//! On-target codegen: compile a WebAssembly component to native code **on the machine**
 //! and run it (plan/12-kernel.md Decisions 26-29).
 //!
 //! The rest of the kernel runs *precompiled* artifacts produced on the host by
@@ -46,7 +46,8 @@ fn try_run() -> Result<(String, u32, u64), wasmtime::Error> {
     // wasm via `Component::new`, which compiles on-target instead of deserializing.
     let engine = super::new_engine()?;
 
-    // The on-target compile: Cranelift turns the wasm bytes into native aarch64 code in a
+    // The on-target compile: Cranelift turns the wasm bytes into native code (for this
+    // machine's architecture) in a
     // heap allocation, and the code publisher does the I-/D-cache maintenance.
     let compile_start = crate::timer::uptime_us();
     let component = Component::new(&engine, SEED_WASM)?;
