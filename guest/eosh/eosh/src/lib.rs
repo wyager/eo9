@@ -412,9 +412,10 @@ impl Guest for Eosh {
             // Interactive mode: read lines until end of input or `exit`.
             None => {
                 let text = text::default();
-                session
-                    .backend_mut()
-                    .print("eosh — the Eo9 shell (type `help`)");
+                session.backend_mut().print(
+                    "eosh — the Eo9 shell (type `help` to explore, `ls /bin` to see what's \
+                         installed)",
+                );
                 loop {
                     if text::write(&text, text::OutputStream::Out, "eosh> ").is_err() {
                         return Err(ProgramFailure::Io("writing the prompt failed".to_string()));

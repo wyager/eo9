@@ -55,26 +55,33 @@ function hostRandomFill(ptr, len) {
 
 // --- suspending imports (JSPI) ----------------------------------------------------------------
 
-// One pending read-line at a time. There is no separate input box: while the shell is
-// reading, keystrokes anywhere on the page are typed straight into the terminal — a live
-// line (with a block cursor) is rendered inside the terminal output itself, exactly where
-// the command will end up.
+// One pending read-line at a time. While the shell is reading, keystrokes anywhere on the
+// page are typed straight into the terminal: the live input (with a block cursor) is rendered
+// at the end of the line the shell just printed — normally the `eosh>` prompt — so you type on
+// the prompt line itself, exactly like a real terminal, and the finished command stays there.
 let pendingReadLine = null;
-let liveLine = null; // the in-progress command line element, while the shell is reading
+let liveLine = null; // the line element the live input is appended to (usually the prompt line)
 let liveText = null; // its text span
+let liveCursor = null; // the blinking block cursor
 let liveBuffer = "";
 
 function armReadLine() {
   liveBuffer = "";
-  liveLine = document.createElement("div");
-  liveLine.className = "vm-cmd vm-live";
-  liveLine.append("> ");
+  liveLine = output.lastElementChild;
+  if (liveLine === null) {
+    liveLine = document.createElement("div");
+    output.appendChild(liveLine);
+  }
+  // Keep one space between the prompt text and the typed command.
+  if (liveLine.textContent !== "" && !liveLine.textContent.endsWith(" ")) {
+    liveLine.append(" ");
+  }
   liveText = document.createElement("span");
+  liveText.className = "vm-cmd";
   liveLine.appendChild(liveText);
-  const cursor = document.createElement("span");
-  cursor.className = "vm-cursor";
-  liveLine.appendChild(cursor);
-  output.appendChild(liveLine);
+  liveCursor = document.createElement("span");
+  liveCursor.className = "vm-cursor";
+  liveLine.appendChild(liveCursor);
   output.scrollTop = output.scrollHeight;
   return new Promise((resolve) => {
     pendingReadLine = resolve;
@@ -89,13 +96,12 @@ function renderLiveLine() {
 function submitTerminalLine() {
   if (pendingReadLine === null) return;
   const line = liveBuffer;
-  // Freeze the live line into the ordinary echoed command line.
-  if (liveLine !== null) {
-    liveLine.classList.remove("vm-live");
-    liveLine.textContent = `> ${line}`;
-  }
+  // Freeze the typed command where it is (on the prompt line) and drop the cursor.
+  if (liveText !== null) liveText.textContent = line;
+  if (liveCursor !== null) liveCursor.remove();
   liveLine = null;
   liveText = null;
+  liveCursor = null;
   liveBuffer = "";
   const resolve = pendingReadLine;
   pendingReadLine = null;

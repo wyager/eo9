@@ -86,8 +86,9 @@ inputQueue = [
   "ls /bin",
   "describe hello",
   "describe entropy.seeded",
-  // (`env` is not driven here and not on the page: the browser exec surface has no session
-  // manifest yet, so the builtin only reports that nothing is available — a recorded gap.)
+  // `env`: the blob seeds a session manifest at /session (the eo9-session 1 format), so
+  // the builtin reports the page's actual grants instead of "no information available".
+  "env",
   // Optional arguments: a bare `hello` greets the default name; --name still overrides.
   "hello",
   "hello --name user",
@@ -180,7 +181,16 @@ const checks = [
     "describe hello: a binary with optional typed arguments",
     /kind: binary/.test(interactive) && /--name: option<string>/.test(interactive),
   ],
-  ["describe entropy.seeded: a provider", /kind: provider/.test(interactive)],
+  [
+    "describe entropy.seeded: a provider with its configure argument",
+    /kind: provider/.test(interactive) && /--seed: u64/.test(interactive),
+  ],
+  [
+    "env reports the browser session's capabilities",
+    /capabilities granted to this shell:/.test(interactive) &&
+      /the page terminal/.test(interactive) &&
+      /programs started from this shell receive:/.test(interactive),
+  ],
   ["bare hello greets the default name", helloWorldCount >= 1],
   ["hello --name user overrides the default", /Hello, user/.test(interactive)],
   [

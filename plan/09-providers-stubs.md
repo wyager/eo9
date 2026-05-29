@@ -255,7 +255,25 @@ Match the priority order above; (1)+(2) unblock I2.
     192 KiB (middleware), 83 KiB (l4check). Remaining for the track: the config interface above, DHCP and
     IPv6 (smoltcp features exist, deliberately off), an l3 export over the same engine, listener/accept
     coverage beyond the basic path, and riscv64 metal coverage once that arch has a PCI provider.
-19. **Disk flush/size in the stubs; the middleware's config entry exists but cannot be baked yet
+
+19. **`pci.filtered` — the allow-listed PCI attenuator (2026-05-29, branch `area/12-pci-interrupts`).** The
+    stub world the WIT always specified (`eo9:pci/filtered`: import `pci`, export `pci` + `filtered-config`)
+    now has its provider: `guest/stubs/pci-filtered` forwards every operation to the underlying capability on
+    wrapped device/bar/interrupt/dma resources, filters `enumerate` down to the configured allow-list of
+    device addresses, and refuses `open` outside it with `denied`. The root handle is the underlying
+    provider's own (`pci-impl` still lives in the types interface; the filtering lives in the exported
+    operations, not the handle). Unconfigured, the documented default is the empty allow-list — nothing is
+    visible, every open is `denied`, nothing traps (the option-C rule, D14). Baked into the kernel store
+    (21 entries). Verified on QEMU aarch64 metal (boot with `pci`): plain `lspci` → 3 devices;
+    `pci.filtered $ lspci` → `devices(0)` — the attenuator composed, compiled on-target, and filtered
+    everything out. **Known gap:** the configured path (`pci.filtered --allow [{…}] $ lspci`) is not yet
+    reachable from the shell — the compose-time configuration binder bakes only scalars, strings, and enums,
+    and `allow` is a `list<device-address>`; the shell run fails with that typed error. Follow-ups, owner to
+    pick: extend the binder's configure baking to lists/records (area 03), or respell the allow-list as a
+    string in wit/pci. Until then the deny-all default is the usable behavior, and the wrapped-forwarding
+    plumbing is in place for either resolution.
+
+20. **Disk flush/size in the stubs; the middleware's config entry exists but cannot be baked yet
     (2026-05-29, branch `area/02-wit-roundout`).** `disk.mem` reports its configured size and
     flushes as a no-op; `disk.virtio` now also negotiates `VIRTIO_BLK_F_FLUSH` when the device
     offers it and issues a real two-descriptor `VIRTIO_BLK_T_FLUSH` request from `flush` (a

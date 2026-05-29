@@ -139,3 +139,18 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
     `command-failed(string)` for every one-shot problem). `LineResult::ProgramFailed` carries a
     `CommandClass` (failed/trapped/killed) and `LineResult::Error` — nothing ran — maps to `not-runnable`,
     which is what lets the `eo9 shell -c` embedder report honest 0/1/2/3 exit codes (plan/11 D20).
+
+14. **Discoverability: help teaches by example, the banner points at it (2026-05-29, owner feedback).**
+    The owner's testing feedback: beyond `describe`, there was no good way for a new user to "explore the
+    sandbox". (a) `help` now shows a one-line example under each composition operator (`hello --name you`,
+    `entropy.seeded --seed 7 $ rng --count 2`, the `&` form, `only eo9:text,eo9:time $ hello`) and gained an
+    "explore the sandbox" block — `ls /bin`, `describe <name or expr>`, `imports <expr>`, `env`,
+    `env <expr>` — ahead of the builtins line; the two phrases the browser harness asserts on
+    ("compose: satisfy the program's imports", "builtins: help, env") are kept. (b) The interactive banner
+    is now "eosh — the Eo9 shell (type `help` to explore, `ls /bin` to see what's installed)" — the prefix
+    the CLI banner-count test matches is unchanged. (c) Confirmed (no change needed): `describe` of a
+    provider already lists its `configure` arguments (`describe entropy.seeded` → `--seed: u64`), because
+    `eo9-component::describe` extracts the configure signature for providers; the browser harness now
+    asserts it. (d) Deliberately not done: distinguishing providers from binaries in `ls /bin` — the listing
+    is a plain fs read and the kind is only known after a `describe` per entry; a `bin`-style builtin that
+    describes as it lists is the recorded follow-up if wanted.
