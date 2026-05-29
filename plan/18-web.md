@@ -628,3 +628,11 @@ interactive prompt: a configure + extend + compose fusion with no pre-AOT'd arti
 in-blob and run. The checks assert the run produced output (no codegen refusal) and that `&` is
 right-biased — the `--seed 7` layer shadows the default-seeded left layer, so the stream rng sees
 differs from the plain `entropy.seeded $ rng` runs. 17/17 eosh harness checks pass.
+
+**Follow-up (2026-05-28, `eo9:rt/diagnostics`):** the guest SDK's panic handler now reports panic messages
+through a new `eo9:rt/diagnostics.report-panic` import that every SDK-built component carries. Before the
+next `/vm` asset rebuild (`build-web-vm`), the blob's exec/provider surface must register that import —
+alongside the already-recorded `wiring` registration — or newly built components (including eosh and every
+/bin program) will fail to instantiate in the browser. The committed assets predate the import and keep
+working until then. Registering it as a per-child write-once slot surfaced in the child's trapped outcome
+matches the usermode/kernel behavior; accepting and ignoring it is the minimum.
