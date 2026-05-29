@@ -1218,3 +1218,32 @@ preemption/hardening work.
       accepts); milestone 6 — parity checks (idle-power measurement; Ctrl-C already verified above). The
       full-feature x86_64 cargo build emits the same pre-existing dead-code warning class the riscv64 one
       does (`arch::NAME` unused there) — cargo-build only, outside the clippy gate.
+
+55. **x86_64 milestone 5: 4 KiB NX page tables, W^X for published code, and on-target codegen
+    (2026-05-29, branch `area/12-x86-64-m5`).** The boot stub's static 2 MiB RWX identity map is now used
+    only to reach `kmain`; `arch/x86_64/mmu.rs` builds runtime tables and switches `CR3` over early in
+    boot. Layout: the 512 MiB of RAM at **4 KiB granularity** (one PD → 256 leaf tables) — low RAM
+    (firmware/PVH structures) RW-NX, the kernel image + boot stack + the tables themselves RWX (trusted,
+    like the other ports), the heap RW-**NX**; the rest of the first 4 GiB (LAPIC/IOAPIC windows, q35
+    ECAM) as 2 MiB RW-NX device pages; above 4 GiB unmapped. `EFER.NXE` is enabled (the boot map carries
+    no NX bits, so turning it on first is harmless) and `CR0.WP` is set so ring 0 honours read-only
+    pages — that is what makes the published-code flip real on x86. `set_range_permissions` rewrites the
+    4 KiB leaf PTEs and `invlpg`s each page; `flush_code_range` stays a documented no-op (x86 keeps
+    instruction fetch coherent with same-CPU stores; aarch64/riscv64 need real maintenance there). The
+    publisher path is unchanged — heap allocations are now genuinely non-executable until
+    `publish_executable` flips them to read-only-executable, and `unpublish_executable` returns them to
+    RW-NX, so deserialized and on-target-compiled code never sits writable+executable. On-target codegen:
+    `build-kernel x86_64` now builds the full feature set (`…,wasm-codegen`) and ships the raw seed wasm
+    for the codegen demo, exactly like riscv64; the kernel engine, when the compiler is linked on x86_64,
+    enables the same `has_sse3/ssse3/sse41/sse42` ISA flags as xtask's precompile (so on-target-generated
+    code also never emits float libcalls — the `x86_float_abi_ok` condition from D54 — and engine and
+    artifact flags agree), with the CPUID probe still verifying them at load time. **No vendored changes:**
+    the existing cranelift fork's x86_64 backend builds no_std as-is. Verified on QEMU q35: the demo runs
+    every prior step unchanged plus `wasm codegen: compiled on-target in ~95 ms`, `add(17,25) -> 42` from
+    W^X pages; interactively, `time.frozen --now-seconds 5 --monotonic-ns 0 $ hello --name frozen
+    --excited true` composes, compiles on-target and prints `[5.000000000] Hello, frozen!` / `ok: greeted`,
+    and `entropy.seeded $ cruncher --seed 9 --rounds 200000` gives the cross-target digest
+    `14341732361190694547`; clean ACPI S5 power-off. aarch64 and riscv64 demos re-run unchanged. Idle
+    (milestone 6's measurement): `qemu-system-x86_64` sits at ~0.2 % host CPU at an idle eosh prompt
+    (`sti; hlt` wake path; same effectively-zero class as the other ports), so no further idle work is
+    needed — the x86_64 port is at functional parity with aarch64 and riscv64.
