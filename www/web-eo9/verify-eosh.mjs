@@ -91,6 +91,12 @@ inputQueue = [
   "only eo9:text/text $ echo --text restricted",
   "only eo9:text $ echo --text shorthand",
   "only eo9:text/text $ hello --name nope --excited true",
+  // describe of a composition: the new `wiring` exec function renders the composition tree
+  // (the interposed provider is visible), the same view `describe --wiring` gives natively.
+  "describe entropy.seeded $ rng",
+  // a virtualized clock: time.frozen (a /bin provider) is configured to the epoch and sealed
+  // over hello, so the timestamp it prints is exactly 0.000000000 — every run, in any browser.
+  "time.frozen --now-seconds 0 --monotonic-ns 0 $ hello --name frozen --excited true",
   // a `provider $ consumer` composition: entropy.seeded (a /bin provider) feeds rng. The fused
   // result has no pre-AOT'd artifact, so the blob compiles it *in-blob* (Cranelift -> Pulley) and
   // runs it — no server, no network (none is wired in this harness). Run twice (marker between)
@@ -143,6 +149,17 @@ const checks = [
   ["only-text runs a text-only program", /restricted/.test(interactive)],
   ["only with the package shorthand (eo9:text) runs echo", /shorthand/.test(interactive)],
   ["only-text refuses hello (needs time)", !/Hello, nope/.test(interactive)],
+  [
+    "describe shows the wiring tree (compose node, provider and consumer layers)",
+    /wiring:/.test(interactive) &&
+      /\$ compose/.test(interactive) &&
+      /provider:/.test(interactive) &&
+      /consumer:/.test(interactive),
+  ],
+  [
+    "frozen clock: time.frozen sealed over hello prints the configured instant",
+    /\[0\.000000000\] Hello, frozen!/.test(interactive) || /\[0\.0+\] Hello, frozen/.test(interactive),
+  ],
   // The composition was NOT refused — it compiled inside the blob and ran (3 rng numbers),
   // with no server reachable from this harness at all.
   ["in-blob compiled+ran entropy.seeded $ rng (no server)", run1.length === 3],

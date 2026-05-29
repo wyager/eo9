@@ -704,9 +704,10 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
         ("cat", "eo9-coreutil-cat"),
         ("ls", "eo9-coreutil-ls"),
         ("rng", "eo9-coreutil-rng"),
-        // A provider in /bin so a `provider $ consumer` composition is formable through eosh
-        // (e.g. `entropy.seeded $ rng`), compiled in-blob (plan/18 D22).
+        // Providers in /bin so `provider $ consumer` compositions are formable through eosh
+        // (e.g. `entropy.seeded $ rng`, `time.frozen ... $ hello`), compiled in-blob (plan/18 D22).
         ("entropy.seeded", "eo9-stub-entropy-seeded"),
+        ("time.frozen", "eo9-stub-time-frozen"),
     ] {
         let raw = std::fs::read(
             root.join("guest")

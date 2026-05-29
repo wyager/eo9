@@ -54,8 +54,11 @@ static BIN: &[BinProgram] = &[
     bin!("cat"),
     bin!("ls"),
     bin!("rng"),
-    // A provider, so `entropy.seeded $ rng` (and other `$`/`&`) is formable at the prompt.
+    // Providers, so `provider $ consumer` compositions are formable at the prompt:
+    // `entropy.seeded $ rng` (deterministic randomness) and `time.frozen ... $ hello`
+    // (a virtualized clock).
     bin!("entropy.seeded"),
+    bin!("time.frozen"),
 ];
 
 /// Seed `/bin/<name>.wasm` with each program's raw component bytes so eosh's `resolve`
@@ -768,6 +771,25 @@ fn add_component_algebra(linker: &mut Linker<WebState>) -> Result<()> {
                 .component
                 .describe();
             Ok((info_to_wit(info),))
+        },
+    )?;
+
+    ca.func_wrap(
+        "wiring",
+        |mut store: StoreContextMut<'_, WebState>,
+         (c,): (Resource<ComponentRes>,)|
+         -> Result<(String,)> {
+            // Composition provenance is in-memory metadata on the algebra value (see
+            // eo9-component's Wiring): a component this table built by composing renders its
+            // full tree, a freshly loaded one renders as a single leaf — the same view the
+            // usermode runtime and the CLI's `describe --wiring` give.
+            let tree = store
+                .data_mut()
+                .exec()
+                .component(c.rep())?
+                .component
+                .wiring_tree();
+            Ok((tree,))
         },
     )?;
 
