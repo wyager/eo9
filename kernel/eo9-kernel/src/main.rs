@@ -1,8 +1,10 @@
-//! The Eo9 bare-metal kernel (plan/12-kernel.md): aarch64 and riscv64 on QEMU `virt`.
+//! The Eo9 bare-metal kernel (plan/12-kernel.md): aarch64 and riscv64 on QEMU `virt`,
+//! x86_64 on QEMU `q35`.
 //!
 //! Boot path: QEMU's `-kernel` loader reads the ELF produced by `cargo xtask build-kernel
-//! <arch>` and jumps to `_start` (src/arch/<arch>/boot.rs) with translation off — at EL1 on
-//! aarch64, in S-mode (entered from OpenSBI) on riscv64. The per-architecture stub parks
+//! <arch>` and jumps to the per-architecture entry (src/arch/<arch>/boot.rs) — `_start` at
+//! EL1 on aarch64, `_start` in S-mode (entered from OpenSBI) on riscv64, and the PVH
+//! 32-bit entry `pvh_start` on x86_64. The per-architecture stub parks
 //! secondary cores, enables FP/SIMD for later wasm code, installs the trap vectors, sets up
 //! the boot stack, zeroes `.bss`, and calls [`kmain`]. From there everything is shared
 //! Rust — serial output, a global heap (no_std + alloc), the platform timer and RTC, and,
@@ -126,6 +128,6 @@ extern "C" fn kmain(dtb: *const u8) -> ! {
 #[cfg(not(target_os = "none"))]
 fn main() {
     eprintln!(
-        "eo9-kernel is a bare-metal image; build and run it via `cargo xtask build-kernel <arch>` and `cargo xtask qemu <arch>` (aarch64 or riscv64)"
+        "eo9-kernel is a bare-metal image; build and run it via `cargo xtask build-kernel <arch>` and `cargo xtask qemu <arch>` (aarch64, riscv64 or x86_64)"
     );
 }
