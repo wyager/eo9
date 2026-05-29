@@ -29,9 +29,20 @@ world eosh {
     variant program-failure {
         /// Reading from or writing to the text streams failed.
         io(string),
-        /// One-shot mode only: the command could not be run, or the program it ran
-        /// reported failure or ended abnormally (the rendered outcome or error).
+        /// One-shot mode only: the program ran and reported failure in its own
+        /// vocabulary (the rendered outcome).
         command-failed(string),
+        /// One-shot mode only: the program ended abnormally — it trapped (the rendered
+        /// reason).
+        command-trapped(string),
+        /// One-shot mode only: the program ended abnormally — it was killed before
+        /// producing an outcome (the rendered reason).
+        command-killed(string),
+        /// One-shot mode only: the command never ran — it did not parse, resolve,
+        /// compose, compile, or spawn (the rendered error). Distinct from
+        /// `command-failed` so an embedder can tell "the command failed" apart from
+        /// "the shell could not run the command".
+        not-runnable(string),
     }
 
     export main: async func(command: option<string>) -> result<program-success, program-failure>;

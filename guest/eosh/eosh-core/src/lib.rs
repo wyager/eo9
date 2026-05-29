@@ -56,7 +56,7 @@ pub use envinfo::SESSION_MANIFEST_PATH;
 pub use eval::{EvalError, EvalOutput, Evaluator};
 pub use parse::{ParseError, parse_command, parse_expr};
 pub use render::render_outcome;
-pub use session::{LineResult, Session};
+pub use session::{CommandClass, LineResult, Session};
 
 use alloc::format;
 use alloc::string::String;

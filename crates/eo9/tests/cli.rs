@@ -730,7 +730,11 @@ fn shell_composes_with_the_algebra() {
 }
 
 #[test]
-fn shell_maps_child_failures_to_exit_code_1() {
+fn shell_maps_child_outcomes_to_honest_exit_codes() {
+    // `-c` follows `eo9 run`'s contract: 1 the command reported failure, 2 it ended
+    // abnormally, 3 the shell could not run it at all. eosh's `program-failure` carries
+    // the inner command's class (plan/11 D14/D16), so the embedder no longer collapses
+    // everything to 1.
     let store = temp_store("shell-fail");
     let failed = eo9(
         &store,
@@ -751,8 +755,22 @@ fn shell_maps_child_failures_to_exit_code_1() {
         failed.stderr
     );
 
+    // The inner command trapping is the abnormal class — exit 2, like `eo9 run`.
+    let trapped = eo9(
+        &store,
+        &["shell", "-c", "outcomes --mode trap --detail ignored"],
+    );
+    assert_eq!(trapped.code, 2, "stdout: {}", trapped.stdout);
+    assert!(
+        trapped.stderr.contains("abnormal: trapped"),
+        "{}",
+        trapped.stderr
+    );
+
+    // A command eosh could not run at all (nothing was spawned) is an eosh-level error —
+    // exit 3, distinct from "the command failed".
     let unknown = eo9(&store, &["shell", "-c", "nosuchprogram"]);
-    assert_eq!(unknown.code, 1, "stdout: {}", unknown.stdout);
+    assert_eq!(unknown.code, 3, "stdout: {}", unknown.stdout);
     assert!(
         unknown.stderr.contains("cannot resolve `nosuchprogram`"),
         "{}",
