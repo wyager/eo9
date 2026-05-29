@@ -1,0 +1,17 @@
+/// eo9:fs-eofs — the eofs provider world (plan/14-eofs.md, milestone 2).
+///
+/// `fs.eofs` imports a raw block device (`eo9:disk/disk`) and exports `eo9:fs/fs` backed
+/// by Eo9's native filesystem (`crates/eofs-core`): copy-on-write, Merkle-hashed,
+/// lz4-compressed, snapshotting. The same provider component runs over any disk —
+/// `disk.mem $ fs.eofs $ program` in usermode today, a file-backed or virtio disk later —
+/// because all I/O goes through the imported disk capability.
+///
+/// There is no configure interface: the documented default behaviour is to mount the
+/// disk if it already carries an eofs image and to format a blank (all-zero uberblock
+/// slots) disk in place, so the unconfigured provider never traps (plan/09 Decision 14).
+package eo9:fs-eofs@0.1.0;
+
+world eofs {
+    import eo9:disk/disk@0.1.0;
+    export eo9:fs/fs@0.1.0;
+}

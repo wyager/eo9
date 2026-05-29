@@ -8,6 +8,9 @@
 //! * `demo` — run the original demo sequence (seed canary, hello, the async demos).
 //! * nothing — boot to the interactive eosh shell on the serial console.
 //!
+//! The bare `pci` token (combinable with any of the above) grants the `eo9:pci` root
+//! provider for the boot; without it a program importing PCI is refused at instantiation.
+//!
 //! Headless arguments are matched against `main`'s named, typed parameters (the same
 //! convention as `eo9 run` in usermode): `name="bare metal" excited=true`. The kernel
 //! parses the scalar types (strings, booleans, integers, floats, chars); anything richer
@@ -50,6 +53,12 @@ pub fn boot(bootargs: Option<&str>) -> bool {
     );
 
     let bootargs = bootargs.unwrap_or("");
+    // The bare `pci` token grants the `eo9:pci` root provider for this boot (and only this
+    // boot): linkers built for the headless runner and for shell children include it, so a
+    // program that imports `eo9:pci/pci` can instantiate. Without the token such a program
+    // is refused at instantiation with the capability story (PCI implies DMA, so it is
+    // never linked by default; see `pci_provider` and `shellexec::missing_capability`).
+    super::pci_provider::set_granted(tokenize(bootargs).iter().any(|token| token == "pci"));
     let (program, args) = parse_command_line(bootargs);
 
     // The bare `demo` token keeps the original boot sequence reachable:
@@ -181,6 +190,11 @@ fn try_run(entry: &StoreEntry, args: &[(String, String)]) -> Result<String, wasm
 
     let mut linker: Linker<KernelState> = Linker::new(&engine);
     providers::add_providers(&mut linker)?;
+    // The eo9:pci root provider is opt-in per boot (the `pci` command-line token), never a
+    // default grant — see `pci_provider`.
+    if super::pci_provider::granted() {
+        super::pci_provider::add_pci(&mut linker)?;
+    }
 
     let mut store = Store::new(&engine, KernelState::new());
     // The engine meters fuel (see `new_engine`). A headless run gets the whole budget in

@@ -742,7 +742,9 @@ fn try_preemption_demo(entries: &'static [super::store::StoreEntry]) -> Result<(
 // -----------------------------------------------------------------------------------------
 
 /// Bind `main`'s WAVE-encoded named arguments against its signature (the usermode
-/// `parse_args` rule: every declared parameter exactly once, no unknown arguments).
+/// `parse_args` rule: every declared parameter exactly once, no unknown arguments — except
+/// that a *final* `list<…>` parameter left unsupplied defaults to the empty list, the
+/// variadic-tail convention shared with the usermode binder).
 fn bind_args(
     signature: &wasmtime::component::types::ComponentFunc,
     args: &[WitNamedArg],
@@ -757,9 +759,15 @@ fn bind_args(
         }
     }
     let mut vals = Vec::with_capacity(params.len());
-    for (name, ty) in &params {
+    for (index, (name, ty)) in params.iter().enumerate() {
         let matching: Vec<&WitNamedArg> = args.iter().filter(|arg| arg.name == *name).collect();
         let arg = match matching.as_slice() {
+            // Variadic tail: a missing final `list<…>` parameter is the empty list, so
+            // bare `ls` and friends run without an explicit `paths` argument.
+            [] if index + 1 == params.len() && matches!(ty, Type::List(_)) => {
+                vals.push(Val::List(Vec::new()));
+                continue;
+            }
             [] => return Err(format!("missing argument `{name}`")),
             [arg] => *arg,
             _ => return Err(format!("argument `{name}` supplied more than once")),
@@ -821,6 +829,12 @@ fn spawn_child(
     super::shellfs::add_buffers(&mut linker).map_err(internal)?;
     super::shellfs::add_fs(&mut linker).map_err(internal)?;
     add_exec(&mut linker).map_err(internal)?;
+    // PCI is never granted by default (bus mastering means DMA): only when the boot's
+    // command line carried the `pci` token — and even then the loader rule applies, so only
+    // a child that imports `eo9:pci/pci` actually links it.
+    if super::pci_provider::granted() {
+        super::pci_provider::add_pci(&mut linker).map_err(internal)?;
+    }
 
     let mut state = KernelState::new();
     state.shell = Some(Box::new(super::shell::ShellState {
@@ -1760,7 +1774,8 @@ fn missing_capability(text: &str) -> Option<String> {
     } else if text.contains("eo9:disk/") {
         "raw disk access, which the bare-metal session does not provide"
     } else if text.contains("eo9:pci/") {
-        "PCI device access, which the bare-metal session does not provide"
+        "PCI device access, which this boot did not grant (add the `pci` token to the \
+         kernel command line — `cargo xtask qemu aarch64 pci` — to provide it)"
     } else {
         return None;
     };

@@ -288,6 +288,6 @@ its first milestones, and to be the place where cross-area seams get found.
     `cmd_shell` maps the typed failure's *case name* — the case of a typed WAVE value, not free-form text —
     onto `eo9 run`'s contract: `command-failed` → 1, `command-trapped`/`command-killed` → 2,
     `not-runnable`/`io` → 3; an unrecognised case keeps the plain failure code, so an older eosh still exits
-    1. And eosh's `describe` builtin now shows the composition tree through `eo9:exec.wiring` (plan/02 D17),
+    1. And eosh's `describe` builtin now shows the composition tree through `eo9:exec.wiring` (plan/02 D18),
     the in-shell counterpart of `eo9 describe --wiring`. CLI transcripts cover fail→1, trap→2,
     unresolvable→3, and the wiring tree for both a plain reference and a composed expression.

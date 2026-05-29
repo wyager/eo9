@@ -212,7 +212,27 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
     (plan/03 D18); the `det_env_guest` WAT fixture's three config imports. SPEC's `main`/`configure` paragraph
     now declares `configure` synchronous and "a wart we keep small on purpose." A provider that ever needs to
     do something dynamic does it lazily in its API, never in `configure`.
-17. **`component-algebra.wiring` (2026-05-28 — the plan/11 D17 eosh follow-up).** The interface gains
+17. **`eo9:net` split into independently grantable layers `l2` / `l3` / `l4` (owner direction 2026-05-28,
+    branch `area/02-net-layers`).** The placeholder single `net` interface is replaced by three
+    self-contained layer interfaces in the same package: `l2` (interfaces, MAC addresses, whole Ethernet
+    frames), `l3` (IP addresses, routes, raw per-protocol datagrams — the provider owns header
+    construction/parsing, payloads cross the interface), and `l4` (TCP connect/listen/accept/send/recv,
+    UDP bind/send-to/recv-from, plus listener/peer/udp address accessors). Rationale: a program imports
+    exactly the level it speaks, any single layer can be granted, withheld, or mocked on its own, and a
+    higher layer over a lower one (l4-over-l3 TCP/IP stack, l3-over-l2 IP) is ordinary provider middleware
+    in the algebra. Each layer follows the current conventions: root handle declared in the API interface
+    itself (D15's multi-instance rule), async ops with the owned-buffer round-trip, its own typed error
+    variant (each carrying `denied`), an `-optional` flavor, and sync `*-config` interfaces (D16). The
+    layers deliberately share no types (ip-address appears in both l3 and l4): full per-layer independence
+    was judged worth the small duplication, and it keeps the SDK's per-layer remappings (`net_l2`,
+    `net_l3`, `net_l4` in `eo9_guest::bindings!`) free of cross-interface coupling. Stub worlds are
+    per layer: `l2-none`/`l2-deny`, `l3-none`/`l3-deny`, `l4-none`/`l4-deny`, and `l4-loopback`.
+    Follow-ups recorded in plan/09 D15: an l4-over-l3 (smoltcp-style) middleware provider and a real
+    l2/l3 backend over virtio-net are the next consumers; `crates/eo9/src/complete.rs` still lists the
+    old `eo9:net/net` in its `only` completion table and the `eo9-components` bundle still carries the
+    old `net.none`/`net.deny` stubs until `cargo xtask refresh-components` is run (both host-side,
+    out of scope for this branch).
+18. **`component-algebra.wiring` (2026-05-28 — the plan/11 D17 eosh follow-up).** The interface gains
     `wiring: func(c: borrow<component>) -> string`: the indented composition tree (each provider layer and
     what it satisfies or seals, `only`/`rename`/`configure` gates) that the algebra records in memory — the
     same view as the host CLI's `describe --wiring`. Provenance is never carried in the bytes, so a freshly
