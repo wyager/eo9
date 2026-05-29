@@ -61,10 +61,7 @@ fn serves_index_at_root_with_html_content_type() {
         response.header("Content-Type"),
         Some("text/html; charset=utf-8")
     );
-    assert_eq!(
-        response.header("Cache-Control"),
-        Some("public, max-age=300")
-    );
+    assert_eq!(response.header("Cache-Control"), Some("no-cache"));
     let body = response.body_text();
     assert!(body.contains("<!doctype html>"));
     assert!(body.contains("capability-secure operating system"));
@@ -86,12 +83,15 @@ fn serves_css_and_svg_with_correct_content_types_and_caching() {
     let css = request(site_server_addr(), "GET", "/style.css");
     assert_eq!(css.status, 200);
     assert_eq!(css.header("Content-Type"), Some("text/css; charset=utf-8"));
-    assert_eq!(css.header("Cache-Control"), Some("public, max-age=3600"));
+    assert_eq!(css.header("Cache-Control"), Some("no-cache"));
 
     let svg = request(site_server_addr(), "GET", "/logo.svg");
     assert_eq!(svg.status, 200);
     assert_eq!(svg.header("Content-Type"), Some("image/svg+xml"));
-    assert_eq!(svg.header("Cache-Control"), Some("public, max-age=3600"));
+    assert_eq!(
+        svg.header("Cache-Control"),
+        Some("public, max-age=300, must-revalidate")
+    );
     assert!(svg.body_text().contains("<svg"));
 
     // The /vm manifest is the indirection point: never cached, so a new build is seen at once.
@@ -99,6 +99,42 @@ fn serves_css_and_svg_with_correct_content_types_and_caching() {
     assert_eq!(manifest.status, 200);
     assert_eq!(manifest.header("Content-Type"), Some("application/json"));
     assert_eq!(manifest.header("Cache-Control"), Some("no-cache"));
+}
+
+/// The purge-free deploy contract: every URL whose contents can change in place (the pages,
+/// the try-it page's script and style, the manifest) always revalidates, while only the
+/// hash-named assets are cached past a deploy. A CDN in front of this server therefore never
+/// needs a manual cache purge to pick up a new vm.js/vm.css/index.html.
+#[test]
+fn mutable_urls_always_revalidate_so_deploys_need_no_purge() {
+    for target in ["/", "/index.html", "/vm/", "/vm/vm.js", "/vm/vm.css"] {
+        let response = request(site_server_addr(), "GET", target);
+        assert_eq!(response.status, 200, "target: {target}");
+        assert_eq!(
+            response.header("Cache-Control"),
+            Some("no-cache"),
+            "target: {target}"
+        );
+        // Revalidation must be cheap: every such response carries a strong validator.
+        let etag = response
+            .header("ETag")
+            .unwrap_or_else(|| panic!("ETag missing on {target}"));
+        assert!(etag.starts_with('"') && etag.ends_with('"'), "{target}");
+    }
+
+    // A pre-compressed representation inherits the same policy as the original file (plus its
+    // own validator), so a CDN keyed on Accept-Encoding revalidates that variant too.
+    let brotli = request_with_headers(
+        site_server_addr(),
+        "GET",
+        "/vm/vm.js",
+        &[("Accept-Encoding", "br")],
+    );
+    assert_eq!(brotli.status, 200);
+    assert_eq!(brotli.header("Content-Encoding"), Some("br"));
+    assert_eq!(brotli.header("Cache-Control"), Some("no-cache"));
+    assert_eq!(brotli.header("Vary"), Some("Accept-Encoding"));
+    assert!(brotli.header("ETag").is_some());
 }
 
 #[test]

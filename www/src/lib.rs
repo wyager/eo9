@@ -384,30 +384,37 @@ pub fn is_fingerprinted(path: &Path) -> bool {
 
 /// The `Cache-Control` value for a file.
 ///
-/// Content-fingerprinted assets (see [`is_fingerprinted`]) are immutable: their URL changes
-/// whenever their bytes do, so they get a one-year lifetime plus `immutable` — Cloudflare and
-/// browsers hold them indefinitely and never revalidate, and a new OS build simply produces a
-/// new URL (nothing to purge). The `assets.json` manifest is the indirection that flips those
-/// URLs, so it must never be stale: it is served `no-cache` (revalidate every time; the cheap
-/// ETag makes that a 304 when unchanged). HTML revalidates quickly so content updates show up;
-/// other small static files (styles, scripts, images) get an hour. Any non-fingerprinted
-/// wasm/cwasm (e.g. a dev build before fingerprinting) keeps the previous one-day lifetime.
+/// The policy exists so that **a deploy never needs a CDN purge**:
+///
+/// - Content-fingerprinted assets (see [`is_fingerprinted`]) are immutable: their URL changes
+///   whenever their bytes do, so they get a one-year lifetime plus `immutable` — Cloudflare and
+///   browsers hold them indefinitely and never revalidate, and a new OS build simply produces a
+///   new URL (nothing to purge). These are the only files that may be cached past a deploy.
+/// - Every *mutable-in-place* text asset — HTML, scripts, styles, the `assets.json` manifest,
+///   and any non-fingerprinted wasm (a dev build before fingerprinting) — is served `no-cache`:
+///   caches may store it but must revalidate before reuse, so a deploy is visible on the next
+///   request with no purge. The strong [`etag`] makes that revalidation a bodiless 304 whenever
+///   the file is unchanged, so the steady-state cost is one conditional request, not a re-download.
+///   (Previously scripts and styles carried `max-age=3600`, which is exactly what made a
+///   Cloudflare purge necessary to pick up a new `vm.js`/`vm.css` within the hour.)
+/// - Cosmetic media (images, fonts) get a short shared lifetime with `must-revalidate`: at worst
+///   five minutes stale after a deploy, still purge-free, while absorbing repeat fetches.
 pub fn cache_control(path: &Path) -> &'static str {
+    if is_fingerprinted(path) {
+        return "public, max-age=31536000, immutable";
+    }
     let extension = path
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
-    if is_fingerprinted(path) {
-        "public, max-age=31536000, immutable"
-    } else if path.file_name().and_then(|n| n.to_str()) == Some("assets.json") {
-        "no-cache"
-    } else if content_type(path).starts_with("text/html") {
-        "public, max-age=300"
-    } else if matches!(extension.as_str(), "wasm" | "cwasm") {
-        "public, max-age=86400"
-    } else {
-        "public, max-age=3600"
+    match extension.as_str() {
+        // Anything that changes in place under a stable URL: never serve stale, always
+        // revalidate (cheap 304 via the strong ETag).
+        "html" | "htm" | "css" | "js" | "mjs" | "json" | "txt" | "md" | "xml" | "wasm"
+        | "cwasm" => "no-cache",
+        // Logos, icons, fonts and other rarely-edited media: bounded staleness, no purge needed.
+        _ => "public, max-age=300, must-revalidate",
     }
 }
 
@@ -628,18 +635,17 @@ mod tests {
             "application/octet-stream"
         );
 
+        // Mutable-in-place text assets always revalidate, so a deploy needs no CDN purge.
+        assert_eq!(cache_control(Path::new("index.html")), "no-cache");
+        assert_eq!(cache_control(Path::new("vm/vm.js")), "no-cache");
+        assert_eq!(cache_control(Path::new("vm/vm.css")), "no-cache");
+        assert_eq!(cache_control(Path::new("vm/assets.json")), "no-cache");
+        assert_eq!(cache_control(Path::new("vm/web-eo9.wasm")), "no-cache");
+        assert_eq!(cache_control(Path::new("vm/store/hello.cwasm")), "no-cache");
+        // Cosmetic media may be briefly stale, never purge-requiring.
         assert_eq!(
-            cache_control(Path::new("index.html")),
-            "public, max-age=300"
-        );
-        assert_eq!(cache_control(Path::new("logo.svg")), "public, max-age=3600");
-        assert_eq!(
-            cache_control(Path::new("vm/web-eo9.wasm")),
-            "public, max-age=86400"
-        );
-        assert_eq!(
-            cache_control(Path::new("vm/store/hello.cwasm")),
-            "public, max-age=86400"
+            cache_control(Path::new("logo.svg")),
+            "public, max-age=300, must-revalidate"
         );
         // Fingerprinted assets are immutable and cached for a year; the manifest that points
         // at them is never cached, so a new build is picked up immediately.
@@ -651,7 +657,6 @@ mod tests {
             cache_control(Path::new("vm/store/hello.5afedde1cf4b36c8.cwasm")),
             "public, max-age=31536000, immutable"
         );
-        assert_eq!(cache_control(Path::new("vm/assets.json")), "no-cache");
     }
 
     #[test]

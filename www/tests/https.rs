@@ -100,10 +100,7 @@ fn https_serves_index_with_html_content_type() {
         response.header("Content-Type"),
         Some("text/html; charset=utf-8")
     );
-    assert_eq!(
-        response.header("Cache-Control"),
-        Some("public, max-age=300")
-    );
+    assert_eq!(response.header("Cache-Control"), Some("no-cache"));
     assert!(
         response
             .body_text()
@@ -133,7 +130,10 @@ fn https_serves_assets_with_correct_content_types() {
     let svg = https_request("GET", "/logo.svg");
     assert_eq!(svg.status, 200);
     assert_eq!(svg.header("Content-Type"), Some("image/svg+xml"));
-    assert_eq!(svg.header("Cache-Control"), Some("public, max-age=3600"));
+    assert_eq!(
+        svg.header("Cache-Control"),
+        Some("public, max-age=300, must-revalidate")
+    );
 
     let css = https_request("GET", "/style.css");
     assert_eq!(css.status, 200);

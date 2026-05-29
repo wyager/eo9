@@ -382,3 +382,37 @@ no longer mentions /try (and `www-build` no longer invokes the removed subcomman
 `www/README.md`'s layout/“/try page” sections now describe the `/vm` try-it page and
 `web-eo9` instead. The front page and try-it page themselves are untouched. Everything is
 recoverable from git history if a jco-based comparison is ever wanted again.
+
+## Decision 28 — purge-free caching: every mutable URL revalidates (2026-05-29)
+
+Owner report: external advice said a Cloudflare purge was needed to pick up the latest
+`vm.js`/`vm.css`. The audit confirmed it: the server already sent explicit `Cache-Control`
+on every response (so Cloudflare's extension-default TTLs were not the issue), but
+non-fingerprinted scripts/styles/images carried `public, max-age=3600` and HTML carried
+`public, max-age=300` — so a CDN and browsers could legitimately serve a stale `vm.js`/`vm.css`
+for up to an hour (and a stale page for up to five minutes) after a deploy, with a manual purge
+as the only way to shorten that. That contradicts the intended design (fingerprinted-immutable
+for the big assets, immediate propagation for everything else).
+
+`cache_control()` now implements the purge-free contract directly:
+- fingerprinted `name.<16-hex>.wasm/.cwasm` assets keep `public, max-age=31536000, immutable`
+  (URL = version; never revalidated, never hashed on the request path);
+- every mutable-in-place text asset — HTML, `.js`, `.css`, `.json` (the manifest), and any
+  non-fingerprinted wasm/cwasm — is `no-cache`: caches may store but must revalidate, and the
+  existing strong ETag turns an unchanged revalidation into a bodiless 304, so a deploy is
+  visible on the very next request and a purge is never required;
+- cosmetic media (images, fonts) get `public, max-age=300, must-revalidate` — bounded staleness,
+  still purge-free.
+Pre-compressed `.br`/`.gz` variants inherit the original file's policy (plus `Vary:
+Accept-Encoding` and their own per-representation ETag), unchanged. Tests: the lib unit test
+covers each class, and a new integration test (`mutable_urls_always_revalidate_so_deploys_need_no_purge`)
+asserts `no-cache` + a strong ETag on `/`, `/index.html`, `/vm/`, `/vm/vm.js`, `/vm/vm.css` and on
+the brotli representation of `vm.js`.
+
+Deployment notes (outside this repo): `.wasm`/`.cwasm` are not on Cloudflare's default
+cacheable-extension list, so for the immutable assets to actually be served from the edge a
+Cache Rule (eligible-for-cache on `/vm/*`, respect origin TTL) is needed — harmless either way,
+since origin headers are now correct for every class. Optionally, `vm.js`/`vm.css` could later
+be content-fingerprinted like the blob (xtask rename + `index.html` reference rewrite) to make
+them edge-cacheable forever too; with `no-cache` + 304s they are correct without it, so that is
+an optimization, not a requirement.
