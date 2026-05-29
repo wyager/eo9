@@ -15,7 +15,9 @@
 //! 5. points the stack at `__stack_top` (linker script), zeroes `.bss`, and
 //! 6. calls the Rust entry point [`kmain`](crate::kmain) with the DTB pointer.
 //!
-//! Translation stays off (`satp` = Bare) for now; see `super::mmu`.
+//! The stub itself runs with translation off (`satp` = Bare); `kmain` then has
+//! [`super::mmu`] build the Sv39 identity map (with W^X for published JIT code pages) and
+//! switch `satp` over.
 
 use core::arch::global_asm;
 
