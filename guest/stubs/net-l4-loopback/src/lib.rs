@@ -224,7 +224,8 @@ fn buffer_capacity(buffer: &Buffer) -> usize {
     usize::try_from(buffer.len()).unwrap_or(usize::MAX)
 }
 
-const NO_DATA: &str = "no data queued — the loopback transport does not block; send before receiving";
+const NO_DATA: &str =
+    "no data queued — the loopback transport does not block; send before receiving";
 const NO_PENDING: &str =
     "nothing to accept — the loopback transport does not block; connect before accepting";
 const NO_DATAGRAM: &str =

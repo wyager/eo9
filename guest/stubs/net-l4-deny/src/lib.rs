@@ -27,9 +27,7 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-use exports::eo9::net::l4::{
-    self, Buffer, L4Error, RecvResult, SendResult, SocketAddress,
-};
+use exports::eo9::net::l4::{self, Buffer, L4Error, RecvResult, SendResult, SocketAddress};
 use exports::eo9::net::l4_deny_config;
 
 /// The `net.l4.deny` provider.

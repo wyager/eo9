@@ -27,9 +27,7 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-use exports::eo9::net::l2::{
-    self, Buffer, InterfaceInfo, L2Error, RecvResult, SendResult,
-};
+use exports::eo9::net::l2::{self, Buffer, InterfaceInfo, L2Error, RecvResult, SendResult};
 use exports::eo9::net::l2_deny_config;
 
 /// The `net.l2.deny` provider.
