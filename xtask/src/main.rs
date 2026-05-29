@@ -78,9 +78,10 @@ const KERNEL_CHECK_TARGET: &str = "aarch64-unknown-none";
 /// needed, so plain xtask builds stay lean).
 const KERNEL_RISCV64_TARGET: &str = "riscv64gc-unknown-none-elf";
 
-/// The x86_64 bare-metal target (QEMU `q35`, PVH direct boot). Milestones 1–2 only so far:
-/// `build-kernel x86_64` produces the feature-less image (boot, serial, heap, timer,
-/// interrupts); the wasm feature set follows in a later milestone (plan/12).
+/// The x86_64 bare-metal target (QEMU `q35`, PVH direct boot). `build-kernel x86_64` runs
+/// the same host-AOT precompile pipeline as the other ports (Cranelift's x86_64 backend is
+/// the host backend, so no extra feature is needed) and builds the wasm feature set minus
+/// on-target codegen, which arrives with the W^X milestone (plan/12).
 const KERNEL_X86_64_TARGET: &str = "x86_64-unknown-none";
 
 /// Bare-metal targets the feature-less kernel workspace is built and clippy-checked for in
@@ -1324,13 +1325,106 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// x86_64 (QEMU `q35`, PVH direct boot): milestones 1–2 — the feature-less image (boot,
-/// serial console, heap, TSC/PIT timer, PIC interrupt delivery, event-driven idle). The
-/// wasm feature set and the host-AOT precompile pipeline follow in a later milestone
-/// (plan/12), at which point this grows the same precompile steps as the other ports.
+/// x86_64 (QEMU `q35`, PVH direct boot): the same host-AOT precompile pipeline as the other
+/// ports — the seed canary, the real hello program, the async pair, and the read-only store
+/// image — targeted at `x86_64-unknown-none`, then a kernel build with the wasm feature set
+/// minus on-target codegen (`wasm-seed,wasm-hello,wasm-async,wasm-store`): `$`/`&` refuses
+/// with the documented no-codegen message until milestone 5 brings 4 KiB W^X tables and the
+/// compiler, exactly as riscv64 did at this stage.
+///
+/// Emitting x86_64 machine code needs that Cranelift backend in the host build; on an
+/// x86_64 host it is the host backend, but on this project's aarch64 development machines it
+/// is a non-host backend, so — exactly like riscv64 — the off-by-default `kernel-cross-aot`
+/// xtask feature (`wasmtime/all-arch`) provides it and this function re-runs itself with the
+/// feature when it is absent.
 fn build_kernel_x86_64(root: &Path) -> Result<PathBuf, String> {
     let kernel_dir = root.join("kernel");
-    run(
+    let image = kernel_dir
+        .join("target")
+        .join(KERNEL_X86_64_TARGET)
+        .join("release")
+        .join("eo9-kernel");
+
+    if !cfg!(feature = "kernel-cross-aot") && !cfg!(target_arch = "x86_64") {
+        println!(
+            "xtask: re-running with --features kernel-cross-aot (this xtask build does not \
+             link the x86_64 Cranelift backend)"
+        );
+        run(
+            root,
+            "cargo",
+            [
+                "run",
+                "-p",
+                "xtask",
+                "--features",
+                "kernel-cross-aot",
+                "--",
+                "build-kernel",
+                "x86_64",
+            ],
+        )?;
+        if !image.is_file() {
+            return Err(format!(
+                "the kernel-cross-aot build succeeded but {} is missing",
+                image.display()
+            ));
+        }
+        return Ok(image);
+    }
+
+    // The seed canary, assembled from WAT.
+    let seed_wat = root.join("kernel").join("seed").join("hello.wat");
+    let seed_wasm = wat::parse_file(&seed_wat)
+        .map_err(|err| format!("failed to assemble {}: {err}", seed_wat.display()))?;
+    let seed = precompile_for_kernel(
+        root,
+        &seed_wasm,
+        "seed component",
+        "seed.cwasm",
+        KERNEL_X86_64_TARGET,
+    )?;
+
+    // The async canary (awaits time.sleep against the kernel timer), assembled from WAT.
+    let sleepy_wat = root.join("kernel").join("seed").join("sleepy.wat");
+    let sleepy_wasm = wat::parse_file(&sleepy_wat)
+        .map_err(|err| format!("failed to assemble {}: {err}", sleepy_wat.display()))?;
+    let sleepy = precompile_for_kernel(
+        root,
+        &sleepy_wasm,
+        "sleepy canary",
+        "sleepy.cwasm",
+        KERNEL_X86_64_TARGET,
+    )?;
+
+    // The real hello program, built from the guest workspace.
+    let hello_component = build_guest_component(root, "eo9-example-hello")?;
+    let hello_wasm = std::fs::read(&hello_component)
+        .map_err(|err| format!("failed to read {}: {err}", hello_component.display()))?;
+    let hello = precompile_for_kernel(
+        root,
+        &hello_wasm,
+        "eo9-example-hello",
+        "hello.cwasm",
+        KERNEL_X86_64_TARGET,
+    )?;
+
+    // The unmodified entropy.seeded stub (async-ABI configure), exactly as on aarch64.
+    let entropy_component = build_guest_component(root, "eo9-stub-entropy-seeded")?;
+    let entropy_wasm = std::fs::read(&entropy_component)
+        .map_err(|err| format!("failed to read {}: {err}", entropy_component.display()))?;
+    let entropy = precompile_for_kernel(
+        root,
+        &entropy_wasm,
+        "eo9-stub-entropy-seeded",
+        "entropy-seeded.cwasm",
+        KERNEL_X86_64_TARGET,
+    )?;
+
+    // The read-only store image (the same component list as aarch64), AOT'd for x86_64.
+    let store_image = build_store_image(root, KERNEL_X86_64_TARGET)?;
+
+    run_with_env(
         &kernel_dir,
         "cargo",
         [
@@ -1340,13 +1434,18 @@ fn build_kernel_x86_64(root: &Path) -> Result<PathBuf, String> {
             "--release",
             "--target",
             KERNEL_X86_64_TARGET,
+            "--features",
+            "wasm-seed,wasm-hello,wasm-async,wasm-store",
+        ],
+        &[
+            ("EO9_SEED_CWASM", seed.as_os_str()),
+            ("EO9_HELLO_CWASM", hello.as_os_str()),
+            ("EO9_SLEEPY_CWASM", sleepy.as_os_str()),
+            ("EO9_ENTROPY_SEEDED_CWASM", entropy.as_os_str()),
+            ("EO9_STORE_IMAGE", store_image.as_os_str()),
         ],
     )?;
-    let image = kernel_dir
-        .join("target")
-        .join(KERNEL_X86_64_TARGET)
-        .join("release")
-        .join("eo9-kernel");
+
     if !image.is_file() {
         return Err(format!(
             "kernel build succeeded but {} is missing",
@@ -1630,6 +1729,26 @@ fn precompile_for_kernel(
     config
         .target(target)
         .map_err(|err| format!("wasmtime rejected target {target}: {err:#}"))?;
+    if target == KERNEL_X86_64_TARGET {
+        // The x86_64 kernel is compiled soft-float (`x86_64-unknown-none`), so no float value
+        // may ever cross the generated-code/host boundary in a register. The only such
+        // crossing wasmtime has is float "libcalls" (f32/f64 ceil/floor/trunc/nearest when
+        // the compilation target lacks SSE4.1), so enable SSE3..SSE4.2 here — then those
+        // instructions are emitted inline and no float libcall exists in any artifact. This
+        // is `Config::x86_float_abi_ok`'s documented safe condition (b); the kernel-side
+        // engine asserts the same thing (kernel/eo9-kernel/src/wasm/mod.rs) and probes the
+        // CPU for these features at load time, and xtask's QEMU invocation uses `-cpu max`
+        // so they are present under TCG.
+        //
+        // SAFETY: enabling ISA flags only changes which instructions may be emitted; the
+        // kernel engine refuses to load the artifact unless the CPU actually has them.
+        unsafe {
+            config.cranelift_flag_enable("has_sse3");
+            config.cranelift_flag_enable("has_ssse3");
+            config.cranelift_flag_enable("has_sse41");
+            config.cranelift_flag_enable("has_sse42");
+        }
+    }
     config.wasm_component_model(true);
     // The component-model async ABI (plus stackful lifts and the extra async built-ins
     // the eo9 guest SDK uses). Compile-relevant: the kernel engine enables exactly the
@@ -1743,8 +1862,11 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         // The image boots through QEMU's PVH direct-boot path (the ELF note in
         // src/arch/x86_64/boot.rs); SeaBIOS still POSTs first, which is why the firmware
         // banner appears before the kernel's. `-no-reboot` turns a triple fault into a QEMU
-        // exit instead of a silent reboot loop, keeping scripted runs honest.
-        "x86_64" => &["-M", "q35", "-no-reboot"],
+        // exit instead of a silent reboot loop, keeping scripted runs honest. `-cpu max`
+        // (as on aarch64) gives the guest SSE3..SSE4.2 under TCG, which the precompiled
+        // artifacts are built to assume so wasmtime never emits a float libcall against the
+        // soft-float kernel (see `precompile_for_kernel`).
+        "x86_64" => &["-M", "q35", "-no-reboot", "-cpu", "max"],
         other => {
             return Err(format!(
                 "`qemu {other}` is not implemented yet (plan/12-kernel.md)"
