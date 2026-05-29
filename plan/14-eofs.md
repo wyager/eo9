@@ -181,3 +181,9 @@ Milestone 3 (usermode persistence: `--disk`, `mkfs.eofs`, the file-backed device
     asynchronous disk bridge (or an async `BlockDevice`) once a genuinely suspending device exists,
     `eo9:disk` size/flush operations (D16) for honest durability, a guest-reachable verify/snapshot
     surface on `eo9:fs`, and the plan/06 evaluation of hosting the module store on an eofs image.
+23. **The disk API gaps are closed: size query and commit-boundary durability (2026-05-29).**
+    `DiskDevice` now reads the device size from `eo9:disk/disk.size` (the ~120 zero-length-read
+    probe is gone) and its `BlockDevice::flush` calls `eo9:disk/disk.flush`, so the engine's
+    root-flip commits (which flush before and after the uberblock write) reach fsync on a
+    `--disk` file device and a virtio cache flush on `disk.virtio`. Behaviour over `disk.mem`
+    is unchanged (no-op flush). The async-disk-bridge follow-up from D15 still stands.
