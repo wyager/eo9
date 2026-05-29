@@ -1,0 +1,25 @@
+/// eo9:net-virtio — the virtio-net driver world (plan/09, plan/12 D50's sibling).
+///
+/// `net.virtio` is the link-layer sibling of `disk.virtio`: it imports the PCI
+/// capability (`eo9:pci/pci`), drives a modern (virtio 1.0, `disable-legacy=on`)
+/// virtio-net PCI function through configuration space, BAR registers, and DMA buffers,
+/// and exports `eo9:net/l2` — network interfaces, MAC addresses, and whole Ethernet
+/// frames — so anything that speaks the link layer (an l3-over-l2 IP stack, a DHCP
+/// client, the `l2check` example) runs over real hardware by composition:
+/// `net.virtio $ program`.
+///
+/// `eo9:text/text` is imported only for one diagnostic line on first use (the probed
+/// MAC address and queue sizes); the driver works identically without a console.
+///
+/// There is no configure interface: the documented default behaviour is to claim the
+/// first virtio-net function visible through the granted PCI capability on first use
+/// (the option-C default-configuration rule, plan/09 Decision 14). Selecting a specific
+/// device address is `pci.filtered`'s job, composed in front of the driver.
+package eo9:net-virtio@0.1.0;
+
+world virtio-net {
+    import eo9:pci/pci@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    export eo9:net/l2@0.1.0;
+}
