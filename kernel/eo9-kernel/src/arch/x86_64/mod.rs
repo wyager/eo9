@@ -1,8 +1,9 @@
 //! x86_64 on QEMU `q35`: PVH direct boot into long mode, COM1 16550 UART, CMOS RTC, the
 //! TSC + PIT for the monotonic counter and wake timer, and the legacy 8259 PIC for
 //! timer/UART interrupt delivery. The port follows the aarch64 reference layer
-//! (src/arch/aarch64/) module for module; `mmu` keeps the boot identity map (W^X for
-//! published JIT code arrives with the codegen milestone, as it did on riscv64).
+//! (src/arch/aarch64/) module for module; `mmu` replaces the boot stub's 2 MiB RWX identity
+//! map with 4 KiB-granular tables (NXE + WP) so published JIT code gets the same W^X
+//! treatment as on the other ports.
 
 mod boot;
 mod io;
