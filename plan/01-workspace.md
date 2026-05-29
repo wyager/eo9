@@ -121,3 +121,13 @@ None. Everything else depends on this.
     instead of erroring with a pointer; when everything is present it is two silent `command -v`-style
     checks. QEMU stays check-only (a system package we never install). `make setup`/`doctor` behavior is
     unchanged.
+14. **The components bundle is derived from `GUEST_COMPONENTS`, not the build directory
+    (2026-05-28, branch `area/11-host-odds`).** `built_components` (used by both
+    `refresh-components` and the `package` drift check) reads exactly the components named in
+    `GUEST_COMPONENTS` and errors clearly when one is missing, instead of scanning
+    `guest/target/components/` — so a removed crate's stale artifact can never sneak into the
+    published bundle (verified by planting a fake leftover `.wasm`: the refresh produced
+    exactly the 44 listed components and ignored it). Note found while verifying, not fixed
+    here: guest component bytes still embed the absolute checkout path (panic locations), so a
+    bundle refreshed from a different checkout directory shows byte drift in some components —
+    the same path-dependence already documented for the web blob (plan/18 D26).
