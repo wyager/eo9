@@ -893,3 +893,15 @@ preemption/hardening work.
     harness couldn't pace input over the interrupt-driven console to capture it separately.) Also corrected
     the now-stale `gic.rs` module header (IRQs are taken via `kirq` now, not masked-WFI). Remaining: finer
     W^X for the kernel image's own `.text`/`.rodata`; guard regions.
+
+42. **Kernel argument codec: WAVE lists + the variadic-tail default (2026-05-28).** The kernel-side WAVE
+    codec (`wasm/wave.rs`) now parses `list<T>` values (`[…]`, top-level-comma split that respects quoted
+    strings and nesting), and `shellexec::bind_args` defaults a *final* `list<…>` parameter that was never
+    supplied to the empty list — the same variadic-tail rule as the usermode binder — so the re-signatured
+    coreutils (`cat a.txt b.txt`, bare `ls`) bind correctly when spawned from eosh on metal. Verified:
+    `build-kernel aarch64` + an interactive QEMU session (hello, an on-target `entropy.seeded $ cruncher`
+    composition, clean exit) — no regressions. Remaining gap, deliberately not done here: the coreutils are
+    not in `KERNEL_STORE_COMPONENTS` (xtask), so there is no list-taking program in the baked metal store to
+    exercise the new path end-to-end; adding `ls`/`cat` to that list (and re-baking) is the one-line
+    follow-up that makes bare `ls` actually runnable at the metal prompt. The headless `runner.rs` `program=`
+    path keeps its scalar-only parser for now.

@@ -62,14 +62,86 @@ pub fn parse(ty: &Type, text: &str) -> Result<Val, String> {
                 Val::Option(Some(Box::new(parse(&option.ty(), text)?)))
             }
         }
+        Type::List(list) => {
+            // `[a, b, c]` — used by the variadic-tail convention (a trailing
+            // `list<string>` parameter, e.g. the coreutils' `paths`). Elements are split
+            // at top-level commas (quotes and nesting respected) and parsed recursively.
+            let inner = text
+                .strip_prefix('[')
+                .and_then(|t| t.strip_suffix(']'))
+                .ok_or_else(|| "expected a WAVE list like `[…]`".to_owned())?;
+            let mut items = Vec::new();
+            for item in split_top_level(inner)? {
+                items.push(parse(&list.ty(), &item)?);
+            }
+            Val::List(items)
+        }
         other => {
             return Err(format!(
-                "the kernel only parses scalar, enum, and option arguments so far \
+                "the kernel only parses scalar, enum, option, and list arguments so far \
                  (got a {} parameter)",
                 type_text(other)
             ));
         }
     })
+}
+
+/// Split the inside of a WAVE list at top-level commas, respecting double-quoted strings
+/// (with `\\`-escapes) and nested `[…]` / `(…)` / `{…}` groups. An empty or
+/// whitespace-only input yields no items (the empty list).
+fn split_top_level(text: &str) -> Result<Vec<String>, String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in text.chars() {
+        if in_string {
+            current.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                current.push(ch);
+            }
+            '[' | '(' | '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ']' | ')' | '}' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| "unbalanced brackets in the list value".to_owned())?;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                items.push(current.trim().to_owned());
+                current.clear();
+            }
+            other => current.push(other),
+        }
+    }
+    if in_string {
+        return Err("unterminated string in the list value".to_owned());
+    }
+    if depth != 0 {
+        return Err("unbalanced brackets in the list value".to_owned());
+    }
+    let last = current.trim();
+    if !last.is_empty() {
+        items.push(last.to_owned());
+    } else if !items.is_empty() {
+        return Err("trailing comma in the list value".to_owned());
+    }
+    Ok(items)
 }
 
 fn int<T: core::str::FromStr>(text: &str) -> Result<T, String>
