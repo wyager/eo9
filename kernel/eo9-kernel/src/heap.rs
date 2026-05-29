@@ -1,19 +1,14 @@
 //! Global heap allocator (no_std + alloc).
 //!
 //! The heap spans from the end of the kernel image (`__heap_start`, linker script) to the
-//! top of the 512 MiB of RAM that xtask's QEMU invocation provides. A free-list allocator
+//! architecture's usable top of RAM (`mmu::HEAP_END`: the top of the 512 MiB xtask's QEMU
+//! invocation provides, minus any per-architecture reservation). A free-list allocator
 //! (`linked_list_allocator`) backs `#[global_allocator]`; it is small, reclaims frees, and
-//! is entirely adequate for the single-core spike — wasmtime's runtime allocates and frees
+//! is entirely adequate for the single-core kernel — wasmtime's runtime allocates and frees
 //! continuously, so a bump allocator would not do.
 
+use crate::mmu::HEAP_END;
 use linked_list_allocator::LockedHeap;
-
-/// Start of RAM on the QEMU `virt` machine.
-const RAM_BASE: usize = 0x4000_0000;
-/// RAM size the kernel assumes; must match the `-m` value in xtask's QEMU invocation.
-const RAM_SIZE: usize = 512 * 1024 * 1024;
-/// First byte past the heap.
-const HEAP_END: usize = RAM_BASE + RAM_SIZE;
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -23,7 +18,7 @@ unsafe extern "C" {
     static __heap_start: u8;
 }
 
-/// Hand every byte between the kernel image and the top of RAM to the allocator.
+/// Hand every byte between the kernel image and the usable top of RAM to the allocator.
 pub fn init() {
     let start = (&raw const __heap_start).addr();
     let size = HEAP_END

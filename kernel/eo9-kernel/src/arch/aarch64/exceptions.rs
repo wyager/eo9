@@ -35,7 +35,7 @@ const VECTOR_NAMES: [&str; 16] = [
 /// the executor's `wfi` idle path — the timer for sleep deadlines, the UART for input.
 #[unsafe(no_mangle)]
 extern "C" fn kirq() {
-    let iar = crate::gic::acknowledge();
+    let iar = super::gic::acknowledge();
     let intid = iar & 0x3ff;
     // 1020-1023 are spurious / special and must not be EOI'd.
     if intid >= 1020 {
@@ -51,7 +51,7 @@ extern "C" fn kirq() {
     if intid == 33 {
         crate::uart::drain_rx();
     }
-    crate::gic::end_of_interrupt(iar);
+    super::gic::end_of_interrupt(iar);
 }
 
 /// Called from every exception vector (src/boot.rs) with the vector index and the
@@ -68,5 +68,5 @@ extern "C" fn kexception(vector: u64, esr: u64, elr: u64, far: u64) -> ! {
     crate::kprintln!("  elr_el1 = {elr:#018x}");
     crate::kprintln!("  far_el1 = {far:#018x}");
     crate::kprintln!("parked; exit QEMU with Ctrl-A then X");
-    crate::psci::park()
+    crate::power::park()
 }
