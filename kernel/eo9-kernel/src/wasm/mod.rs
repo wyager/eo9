@@ -60,6 +60,8 @@ use wasmtime::{Config, CustomCodeMemory, Engine};
 const NATIVE_TARGET: &str = "aarch64-unknown-none";
 #[cfg(target_arch = "riscv64")]
 const NATIVE_TARGET: &str = "riscv64gc-unknown-none-elf";
+#[cfg(target_arch = "x86_64")]
+const NATIVE_TARGET: &str = "x86_64-unknown-none";
 
 /// Build the kernel's wasmtime engine.
 ///
@@ -74,6 +76,23 @@ pub fn new_engine() -> Result<Engine, wasmtime::Error> {
     // The kernel is built *for* this triple, so `Triple::host()` equals it and execution of
     // both deserialized and on-target-compiled code is accepted as native.
     config.target(NATIVE_TARGET)?;
+    // x86_64 only: this kernel is compiled soft-float (`x86_64-unknown-none`), which wasmtime
+    // refuses to load native code under by default, because Cranelift-generated code passes
+    // floats in XMM registers. The one boundary where a float crosses in a register is a
+    // float "libcall" (f32/f64 ceil/floor/trunc/nearest emitted when the compilation target
+    // lacks SSE4.1) — and xtask's `precompile_for_kernel` enables SSE3..SSE4.2 for exactly
+    // this target, so no artifact contains such a libcall (`x86_float_abi_ok`'s documented
+    // safe condition (b)). The kernel's own Rust code never touches XMM state (soft-float
+    // codegen), which is also why the trap entry does not save it. Verifying those enabled
+    // ISA flags at load time needs a host-feature probe, which on bare metal is a CPUID read.
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the precompile side guarantees no float libcalls exist in any artifact (see
+    // above), and `x86_detect_host_feature` answers from CPUID, so a flag is only accepted
+    // when the CPU really has the instruction set.
+    unsafe {
+        config.x86_float_abi_ok(true);
+        config.detect_host_feature(x86_detect_host_feature);
+    }
     config.wasm_component_model(true);
     // The component-model async ABI plus the two sub-features the eo9 guest SDK relies on
     // (stackful async lifts and the extra async built-ins behind waitable-set waits).
@@ -106,6 +125,23 @@ pub fn new_engine() -> Result<Engine, wasmtime::Error> {
     // (see `BareMetalCodeMemory` below).
     config.with_custom_code_memory(Some(Arc::new(BareMetalCodeMemory)));
     Engine::new(&config)
+}
+
+/// Host-feature probe for the ISA flags the x86_64 artifacts are compiled with
+/// (`precompile_for_kernel` enables SSE3..SSE4.2 so float libcalls are never emitted; see
+/// [`new_engine`]). Answers from CPUID leaf 1 ECX; anything not listed reports "unknown" so
+/// the engine fails closed instead of executing instructions the CPU may not have.
+#[cfg(target_arch = "x86_64")]
+fn x86_detect_host_feature(feature: &str) -> Option<bool> {
+    // SAFETY: the CPUID instruction is unprivileged and always present in long mode.
+    let ecx = unsafe { core::arch::x86_64::__cpuid(1) }.ecx;
+    match feature {
+        "sse3" => Some(ecx & (1 << 0) != 0),
+        "ssse3" => Some(ecx & (1 << 9) != 0),
+        "sse4.1" => Some(ecx & (1 << 19) != 0),
+        "sse4.2" => Some(ecx & (1 << 20) != 0),
+        _ => None,
+    }
 }
 
 /// Executable-memory "publisher" for this kernel's identity map, enforcing W^X.
