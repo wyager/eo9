@@ -211,6 +211,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-example-sockcheck"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-guest"
 version = "0.0.0"
 dependencies = [
@@ -292,7 +300,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "eo9-stub-net-deny"
+name = "eo9-stub-net-l2-deny"
 version = "0.0.0"
 dependencies = [
  "eo9-guest",
@@ -300,7 +308,47 @@ dependencies = [
 ]
 
 [[package]]
-name = "eo9-stub-net-none"
+name = "eo9-stub-net-l2-none"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-net-l3-deny"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-net-l3-none"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-net-l4-deny"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-net-l4-loopback"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-net-l4-none"
 version = "0.0.0"
 dependencies = [
  "eo9-guest",

@@ -1,0 +1,30 @@
+// sockcheck — the transport-layer (eo9:net/l4) example: TCP listen/connect/accept and
+// send/recv plus a UDP round-trip, entirely against whatever l4 provider the program is
+// composed with (net.l4.loopback in the tests). Every operation is an async function
+// awaited by an async `main`, and buffers make the owned round-trip (see SPEC.md,
+// "Ownership and buffers").
+package eo9-examples:sockcheck@0.1.0;
+
+/// Round-trips `payload` over a TCP connection (both directions) and a UDP datagram,
+/// reporting the total number of bytes verified.
+///
+///   net.l4.loopback $ sockcheck --payload "ping"
+world sockcheck {
+    import eo9:net/l4@0.1.0;
+
+    variant program-success {
+        /// Everything round-tripped intact; carries the number of bytes verified.
+        echoed(u64),
+    }
+
+    variant program-failure {
+        /// An argument value was rejected (e.g. an empty payload).
+        bad-arguments(string),
+        /// A transport operation failed, carrying the l4 API's own error.
+        net(string),
+        /// Bytes received differ from bytes sent (says which leg disagreed).
+        mismatch(string),
+    }
+
+    export main: async func(payload: string) -> result<program-success, program-failure>;
+}

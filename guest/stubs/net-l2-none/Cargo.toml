@@ -1,6 +1,6 @@
 [package]
-name = "eo9-stub-net-none"
-description = "Eo9 standard stub provider `net.none`: exports eo9:net/net-optional with default() answering none (absence of the network capability)."
+name = "eo9-stub-net-l2-none"
+description = "Eo9 standard stub provider `net.l2.none`: exports eo9:net/l2-optional with default() answering none (absence of the link-layer network capability)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
