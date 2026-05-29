@@ -742,7 +742,9 @@ fn try_preemption_demo(entries: &'static [super::store::StoreEntry]) -> Result<(
 // -----------------------------------------------------------------------------------------
 
 /// Bind `main`'s WAVE-encoded named arguments against its signature (the usermode
-/// `parse_args` rule: every declared parameter exactly once, no unknown arguments).
+/// `parse_args` rule: every declared parameter exactly once, no unknown arguments — except
+/// that a *final* `list<…>` parameter left unsupplied defaults to the empty list, the
+/// variadic-tail convention shared with the usermode binder).
 fn bind_args(
     signature: &wasmtime::component::types::ComponentFunc,
     args: &[WitNamedArg],
@@ -757,9 +759,15 @@ fn bind_args(
         }
     }
     let mut vals = Vec::with_capacity(params.len());
-    for (name, ty) in &params {
+    for (index, (name, ty)) in params.iter().enumerate() {
         let matching: Vec<&WitNamedArg> = args.iter().filter(|arg| arg.name == *name).collect();
         let arg = match matching.as_slice() {
+            // Variadic tail: a missing final `list<…>` parameter is the empty list, so
+            // bare `ls` and friends run without an explicit `paths` argument.
+            [] if index + 1 == params.len() && matches!(ty, Type::List(_)) => {
+                vals.push(Val::List(Vec::new()));
+                continue;
+            }
             [] => return Err(format!("missing argument `{name}`")),
             [arg] => *arg,
             _ => return Err(format!("argument `{name}` supplied more than once")),

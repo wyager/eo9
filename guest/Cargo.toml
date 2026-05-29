@@ -33,3 +33,7 @@ wit-bindgen = { git = "https://github.com/bytecodealliance/wit-bindgen", rev = "
 dlmalloc = { version = "0.2.9", default-features = false, features = ["global"] }
 
 eo9-guest = { path = "eo9-guest" }
+# The eofs engine (no_std + alloc, target-independent — see plan/14-eofs.md): the same
+# crate the host tests and the kernel use, consumed here by the fs.eofs provider. Its
+# own `workspace = true` pins (blake3, lz4_flex) resolve against the repo-root table.
+eofs-core = { path = "../crates/eofs-core" }

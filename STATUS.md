@@ -4,10 +4,28 @@ Maintained by the planner; refreshed when merges land. Companion docs: `PLAN.md`
 `plan/*.md` (per-area briefs + decisions), `GAPS.md` (known gaps and deferred items), `SPEC.md` (the design),
 `docs/user-studies/` (external-perspective findings and their triage).
 
-_Last updated: 2026-05-27 (overnight), master at 12449c0. Headline: **all three overnight goals are
-delivered — working algebra (the last correctness bug is fixed), a working browser eosh shell, and working
-compilation including in-browser `$` composition via the server-side `/vm/compile` round-trip.** The metal
-depth track is complete through W^X.**_
+_Last updated: 2026-05-28, master at 5f3731b (+ housekeeping). Headline: **working algebra (the last
+correctness bug is fixed), a working browser eosh shell, and working compilation everywhere — including
+fully in-browser composition: the Cranelift→Pulley compiler now runs inside the `/vm` blob, no server
+involved.** The metal depth track is complete through W^X._
+
+## Since the overnight batch (2026-05-28)
+
+- **In-blob compiler** (`cbe8fe6`): the kernel's no_std compile fork builds for wasm32 as-is, so `/vm`
+  compiles fused compositions client-side (Cranelift→Pulley, ~50–110 ms); the server-side `/vm/compile`
+  endpoint and its inputs were **removed** (`d844313`) — the browser VM is fully self-hosted.
+- **Positional + variadic arguments** (`55f5615`): bare values fill `main`'s params in order and a final
+  `list<string>` is the variadic tail — `cat a.txt b.txt`, bare `ls`, `head --lines 1 a b` (coreutils
+  re-signatured; browser blob updated; the kernel codec gained list parsing + the empty-tail default).
+- **Upgrade-safe stores** (`8f4eded`): seeded bindings auto-refresh when the binary's bundled set changes
+  (user bindings never touched); `eo9 store reseed` + a recovery hint on stale-component spawn failures.
+- **Fresh-machine UX**: top-level `Makefile` (`make setup/shell/www/qemu/ci`, auto-runs setup when a tool is
+  missing) and `cargo xtask doctor` with friendly missing-tool errors.
+- **`cargo install eo9` prep** (`ba2a358`): the `eo9-components` bundle crate + crates.io metadata across the
+  publish chain; stable Rust suffices; `cargo xtask package` dry-runs green — the publish sequence is ready
+  for the owner to run.
+- **Site refresh** (`731a2c3`, `5f3731b`): /vm terminal click/Enter fixes (verified with real browser
+  events) and the front/`/try`/`/vm` copy brought up to date with current reality.
 
 ## Overnight changes (since the 2026-05-27 daytime refresh)
 
@@ -31,6 +49,7 @@ depth track is complete through W^X.**_
   compositions compile+run in the browser — eosh POSTs a names+ops expression, the server resolves it
   against an allow-set, fuses with the real algebra, precompiles to a Pulley image, and returns it. Verified:
   `entropy.seeded $ rng --count 3` at the browser prompt compiles server-side and runs deterministically.
+  *(Superseded 2026-05-28: compilation moved **into the blob** and the server endpoint was removed.)*
 - **`describe --wiring`** (`00bfaf7`): a full composition tree showing each provider layer and what it
   satisfies/seals/attenuates (provenance is in-memory only — content hash and compile cache unchanged).
 - **Readable guest traps** (`dc53e70`): a trapped program now reports a clean reason (trap kind + demangled
@@ -52,7 +71,8 @@ depth track is complete through W^X.**_
   message and fs-optional programs observe absence.
 - **Coreutils** (12 guest programs, each importing only what it needs): `cat ls find wc head stat mkdir rm
   cp touch echo rng` — fs tools run only under a granted root, `echo` needs only text, `rng` consumes real
-  entropy (`entropy.seeded --seed 43 $ rng --count 3` is the canonical deterministic-RNG demo).
+  entropy (`entropy.seeded --seed 43 $ rng --count 3` is the canonical deterministic-RNG demo). Arguments
+  are positional and variadic where natural: `cat a.txt b.txt`, bare `ls`, `head --lines 1 a b`.
 - `eo9 store add|ls|gc`, `eo9 describe` (+ `describe --wiring` for the full composition tree), `eo9 compile`.
 - Deterministic execution proven on real components: seeded/frozen providers compose onto unmodified
   programs and runs are byte-identical and sealed against ambient providers (integration suites).
@@ -98,11 +118,11 @@ depth track is complete through W^X.**_
   content-fingerprinted URLs (`web-eo9.<hash>.wasm`, resolved via `vm/assets.json`) served `public,
   max-age=31536000, immutable` with **no per-request hashing**, while short-cached HTML/manifest flip to the
   new URLs the instant a rebuild changes the bytes. Two in-browser demos: `/try` (jco-transpiled example
-  components on the browser's engine, grant/revoke demo) and **`/vm` — the real runtime stack** as a ~6 MiB
-  wasm32+Pulley blob (~1.2 MiB brotli on the wire): the **eosh shell boots and runs**, 16 programs
-  (examples + coreutils) execute against browser root providers + an in-blob in-memory fs, with fuel +
-  entropy parity with native and JSPI suspension for sleep/read-line. A `cargo xtask check-web-vm` drift
-  guard keeps the committed assets current.
+  components on the browser's engine, grant/revoke demo) and **`/vm` — the real runtime stack** as a ~10 MiB
+  wasm32+Pulley blob (~1.8 MiB brotli on the wire, the in-blob Cranelift→Pulley compiler included): the
+  **eosh shell boots and runs**, 16 programs (examples + coreutils) execute against browser root providers +
+  an in-blob in-memory fs, with fuel + entropy parity with native and JSPI suspension for sleep/read-line.
+  A `cargo xtask check-web-vm` drift guard keeps the committed assets current.
 - **README.md** — every example verified against the current build.
 - `cargo xtask ci` — one gate over the host, guest, and kernel workspaces; build-guest precedes tests.
 - **Six user studies** (CLI dev, security engineer, embedded/OS engineer, web-platform dev, PL researcher,
@@ -117,10 +137,11 @@ The `/vm` page runs the **real stack**: `eosh>` boots, 16 programs run (hello/cr
 the 12 coreutils), the real algebra does `load`/`describe`, and execution is genuine wasmtime+Pulley with
 fuel and entropy matching native byte-for-byte.
 
-- **`$` composition compiles and runs** via the bounded server-side `/vm/compile` round-trip (the server
-  fuses store-program compositions and returns a Pulley image; "compiled on the server"). `&`/`rename`/
-  `configure` are not accepted by the endpoint and still return a clean refusal; in-blob codegen remains
-  std/mmap-blocked on wasm32.
+- **Composition compiles in the blob**: the kernel's no_std compile fork runs in the browser targeting
+  Pulley, so a fused composition compiles client-side in ~50–110 ms with **no server involvement** (the
+  former `/vm/compile` endpoint is removed). The `$` path is exercised end-to-end at the prompt
+  (`entropy.seeded $ rng --count 3`, deterministic across runs); `&`/`rename`/`configure` results are
+  compilable by the same path but the `&` form isn't yet driven through the eosh harness (plan/18 D22).
 - **`only` genuinely narrows**: a child is instantiated with a linker restricted to the admitted import set,
   so a program needing a sealed-away capability is refused.
 - **One un-automated step**: the full round-trip is verified by a node/JSPI harness against the real server
@@ -142,9 +163,9 @@ fuel and entropy matching native byte-for-byte.
 | Coreutils (cat, ls, find, wc, head, stat, mkdir, rm, cp, touch, echo, rng) | `guest/coreutils/` | complete; seeded under bare names; also run in the browser |
 | eosh (full grammar, evaluator, env/envinfo, friendly error rendering) | `guest/eosh` | done for current scope; runs as `eo9 shell`, recursively under itself (usermode + metal), and in the browser |
 | Integration suites (capability laws, determinism, invoker-configured env, default configuration, overlay layering, compose diagnostics, soundness corpus, generative property suite, interposition, kill/linearity, CLI transcripts) | `tests/eo9-integration` + `crates/eo9/tests` | green; QEMU tier not started |
-| Usermode binary `eo9` (run/store/describe/compile/cache/shell, layered session, recursive child env, stderr outcomes, --max-fuel, seeding, --wiring) | `crates/eo9` | done for current scope |
+| Usermode binary `eo9` (run/store/describe/compile/cache/shell, layered session, recursive child env, stderr outcomes, --max-fuel, positional/variadic args, seeding + upgrade auto-reseed, --wiring) | `crates/eo9` | done for current scope; crates.io publish prep complete (`cargo xtask package`, `eo9-components` bundle) |
 | Embeddable runtime (`Eo9` builder, Sandbox + Host backends behind a `ProviderSource` seam) | `crates/eo9-embed` | complete; foundation for `eo9 bundle` and the wasm32 backend |
-| Website + server + `/try` + `/vm` (real-stack wasm32+Pulley blob; eosh shell + 16 programs in-browser; browser providers, HTTP store, JSPI; `only`-narrowing; server-side `/vm/compile` for in-browser `$` composition; compression, security headers, fingerprinted immutable caching) | `www/` | deployable; in-browser `$` composition + `only`-narrowing done; retail-browser click-through + /try jco-dedup + blob-size trim queued |
+| Website + server + `/try` + `/vm` (real-stack wasm32+Pulley blob; eosh shell + 16 programs in-browser; browser providers, HTTP store, JSPI; `only`-narrowing; **in-blob Cranelift→Pulley compilation** for in-browser composition; compression, security headers, fingerprinted immutable caching) | `www/` | deployable; in-browser composition + `only`-narrowing done client-side; clean retail-browser click-through capture + /try jco-dedup + blob-size trim queued |
 | Bare-metal kernel (aarch64: boot, MMU, GICv2 + UART-RX event-driven idle, kernel providers, sync + async guests, baked-in store, boot-to-interactive-eosh, on-target Cranelift codegen, interactive composition, child fuel/preemption, Ctrl-C/kill-cascade/per-child-cap, nested eosh, W^X JIT code pages; vendored CM-async + compile-layer + algebra no_std forks) | `kernel/` | MVP + full preemption/interrupt/containment depth complete incl. W^X; riscv64/x86_64 + QEMU test tier not started |
 
 ## In progress right now
@@ -165,8 +186,8 @@ fuel and entropy matching native byte-for-byte.
    `cargo xtask ci`'s fmt/clippy scope (www-only branches currently can pass ci with fmt drift).
 4. **Kernel breadth**: riscv64/x86_64 ports and the QEMU test tier (real-board bring-up ordering is the one
    roadmap question the owner will settle once the demos look good — depth before breadth before hardware).
-5. Demo packaging (`cargo install eo9` without a checkout) and the Bundle milestone (`eo9 bundle` on
-   eo9-embed); `eo9 new` scaffold + per-package guest builds.
+5. Publishing: the owner runs the prepared `cargo publish` sequence (then a README install section); the
+   Bundle milestone (`eo9 bundle` on eo9-embed); `eo9 new` scaffold + per-package guest builds.
 6. eo9:pci follow-ups (deny/filtered stubs, a virtio-over-PCI consumer); net provider + Message API; eofs
    milestone 2+ (provider, mkfs, store-on-eofs, writable storage on metal).
 7. Housekeeping: crates.io name; upstream PR submission when the owner opens the staged branches.

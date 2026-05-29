@@ -1,0 +1,16 @@
+[package]
+name = "eo9-stub-fs-eofs"
+description = "Eo9 standard provider `fs.eofs`: imports an eo9:disk block device and exports eo9:fs backed by eofs, Eo9's native copy-on-write, Merkle-hashed, compressed filesystem."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+eofs-core = { workspace = true }
+wit-bindgen = { workspace = true }
