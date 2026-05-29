@@ -32,7 +32,7 @@ use wasmtime::component::{
 use wasmtime::{Result, StoreContextMut};
 
 use crate::providers::{
-    Datetime, FsError, NodeKind, OpenFlags, OutputStream, Providers, TextError,
+    Datetime, DiskError, FsError, NodeKind, OpenFlags, OutputStream, Providers, TextError,
 };
 use crate::task::TaskState;
 
@@ -66,6 +66,11 @@ pub(crate) fn add_providers(linker: &mut Linker<TaskState>, providers: &Provider
         providers.entropy.is_some(),
     )?;
     add_optional::<FsCap>(linker, "eo9:fs/fs-optional@0.1.0", providers.fs.is_some())?;
+    add_optional::<DiskCap>(
+        linker,
+        "eo9:disk/disk-optional@0.1.0",
+        providers.disk.is_some(),
+    )?;
 
     if providers.text.is_some() {
         add_text(linker)?;
@@ -80,6 +85,9 @@ pub(crate) fn add_providers(linker: &mut Linker<TaskState>, providers: &Provider
         add_fs(linker)?;
     } else {
         add_fs_handle_only(linker)?;
+    }
+    if providers.disk.is_some() {
+        add_disk(linker)?;
     }
     if providers.exec.is_some() {
         add_exec(linker)?;
@@ -98,6 +106,8 @@ pub struct TextCap;
 pub struct TimeCap;
 /// Host representation of `eo9:entropy/types.entropy-impl`.
 pub struct EntropyCap;
+/// Host representation of `eo9:disk/types.disk-impl`.
+pub struct DiskCap;
 /// Host representation of `eo9:fs/fs.fs-impl`.
 pub struct FsCap;
 /// Host representation of `eo9:fs/fs.file`; the rep is the provider's file handle.
@@ -276,12 +286,65 @@ struct WitWriteResult {
     bytes_written: u64,
 }
 
+/// `eo9:disk/disk.read-error`. Variant order matches the WIT declaration.
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(variant)]
+enum WitDiskReadError {
+    #[component(name = "not-found")]
+    NotFound,
+    #[component(name = "io")]
+    Io(String),
+    #[component(name = "out-of-range")]
+    OutOfRange,
+}
+
+impl From<DiskError> for WitDiskReadError {
+    fn from(value: DiskError) -> Self {
+        match value {
+            DiskError::NotFound => WitDiskReadError::NotFound,
+            DiskError::OutOfRange => WitDiskReadError::OutOfRange,
+            DiskError::Io(message) => WitDiskReadError::Io(message),
+            // Reads have no read-only arm; a provider that reports it anyway is still an
+            // I/O failure from the guest's point of view.
+            DiskError::ReadOnly => WitDiskReadError::Io("device is read-only".to_string()),
+        }
+    }
+}
+
+/// `eo9:disk/disk.write-error`. Variant order matches the WIT declaration.
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(variant)]
+enum WitDiskWriteError {
+    #[component(name = "io")]
+    Io(String),
+    #[component(name = "out-of-range")]
+    OutOfRange,
+    #[component(name = "read-only")]
+    ReadOnly,
+}
+
+impl From<DiskError> for WitDiskWriteError {
+    fn from(value: DiskError) -> Self {
+        match value {
+            DiskError::OutOfRange => WitDiskWriteError::OutOfRange,
+            DiskError::ReadOnly => WitDiskWriteError::ReadOnly,
+            DiskError::Io(message) => WitDiskWriteError::Io(message),
+            // Writes have no not-found arm; a vanished device is an I/O failure.
+            DiskError::NotFound => WitDiskWriteError::Io("device is gone".to_string()),
+        }
+    }
+}
+
 /// The payload of `eo9:text/text.read-line`.
 type ReadLineItem = Result<Option<String>, WitTextError>;
 /// The return value of the owned-buffer fs reads (`read` / `exec-read`).
 type FsReadReturn = (Resource<BufferRes>, Result<WitReadResult, WitFsError>);
 /// The return value of the owned-buffer fs write.
 type FsWriteReturn = (Resource<BufferRes>, Result<WitWriteResult, WitFsError>);
+/// The return value of the owned-buffer disk read.
+type DiskReadReturn = (Resource<BufferRes>, Result<WitReadResult, WitDiskReadError>);
+/// The return value of the owned-buffer disk write.
+type DiskWriteReturn = (Resource<BufferRes>, Result<WitWriteResult, WitDiskWriteError>);
 
 /// The boxed-future shape `func_wrap_concurrent` expects.
 type ConcurrentFuture<'a, R> = Pin<Box<dyn Future<Output = Result<R>> + Send + 'a>>;
@@ -311,6 +374,11 @@ fn add_types(linker: &mut Linker<TaskState>) -> Result<()> {
     linker.instance("eo9:entropy/types@0.1.0")?.resource(
         "entropy-impl",
         ResourceType::host::<EntropyCap>(),
+        |_, _| Ok(()),
+    )?;
+    linker.instance("eo9:disk/types@0.1.0")?.resource(
+        "disk-impl",
+        ResourceType::host::<DiskCap>(),
         |_, _| Ok(()),
     )?;
     Ok(())
@@ -777,6 +845,68 @@ fn add_fs(linker: &mut Linker<TaskState>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------------------
+// eo9:disk
+// ---------------------------------------------------------------------------------------
+
+/// Register `eo9:disk/disk` against the granted block-device provider. The `disk-impl`
+/// root-handle resource itself lives in `eo9:disk/types` and is registered by
+/// [`add_types`] unconditionally; only the operations require the grant.
+fn add_disk(linker: &mut Linker<TaskState>) -> Result<()> {
+    let mut disk = linker.instance("eo9:disk/disk@0.1.0")?;
+    add_default_handle::<DiskCap>(&mut disk)?;
+
+    disk.func_wrap_concurrent(
+        "read",
+        |accessor: &Accessor<TaskState>,
+         (_dev, offset, dst): (Resource<DiskCap>, u64, Resource<BufferRes>)|
+         -> ConcurrentFuture<'_, (DiskReadReturn,)> {
+            Box::pin(async move {
+                let buffer_rep = dst.rep();
+                let op = accessor.with(|mut access| -> Result<_> {
+                    let state = access.data_mut();
+                    let bytes = state.buffers.take(buffer_rep)?;
+                    Ok(state.disk_provider()?.read(offset, bytes))
+                })?;
+                let (bytes, result) = op.await;
+                accessor.with(|mut access| access.data_mut().buffers.restore(buffer_rep, bytes));
+                Ok(((
+                    Resource::new_own(buffer_rep),
+                    result
+                        .map(|bytes_read| WitReadResult { bytes_read })
+                        .map_err(WitDiskReadError::from),
+                ),))
+            })
+        },
+    )?;
+
+    disk.func_wrap_concurrent(
+        "write",
+        |accessor: &Accessor<TaskState>,
+         (_dev, offset, src): (Resource<DiskCap>, u64, Resource<BufferRes>)|
+         -> ConcurrentFuture<'_, (DiskWriteReturn,)> {
+            Box::pin(async move {
+                let buffer_rep = src.rep();
+                let op = accessor.with(|mut access| -> Result<_> {
+                    let state = access.data_mut();
+                    let bytes = state.buffers.take(buffer_rep)?;
+                    Ok(state.disk_provider()?.write(offset, bytes))
+                })?;
+                let (bytes, result) = op.await;
+                accessor.with(|mut access| access.data_mut().buffers.restore(buffer_rep, bytes));
+                Ok(((
+                    Resource::new_own(buffer_rep),
+                    result
+                        .map(|bytes_written| WitWriteResult { bytes_written })
+                        .map_err(WitDiskWriteError::from),
+                ),))
+            })
+        },
+    )?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------------------
 
@@ -831,6 +961,14 @@ impl TaskState {
             .ok_or_else(|| {
                 wasmtime::Error::msg("filesystem capability was not granted to this task")
             })
+    }
+
+    fn disk_provider(&mut self) -> Result<&mut dyn crate::providers::DiskProvider> {
+        self.providers
+            .disk
+            .as_deref_mut()
+            .map(|provider| provider as &mut dyn crate::providers::DiskProvider)
+            .ok_or_else(|| wasmtime::Error::msg("disk capability was not granted to this task"))
     }
 }
 

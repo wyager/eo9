@@ -28,7 +28,7 @@ pub use exec::{ChildPolicy, ExecProvider};
 pub use image::{CompileError, Image};
 pub use outcome::{Outcome, WaveValue};
 pub use providers::{
-    Datetime, EntropyProvider, FsError, FsHandle, FsProvider, MemFs, NodeKind, NodeStat, OpenFlags,
-    OutputStream, Providers, TextError, TextProvider, TimeProvider,
+    Datetime, DiskError, DiskProvider, EntropyProvider, FsError, FsHandle, FsProvider, MemFs,
+    NodeKind, NodeStat, OpenFlags, OutputStream, Providers, TextError, TextProvider, TimeProvider,
 };
 pub use task::{NamedArg, ResumeOutcome, SpawnError, SpawnLimits, Task};
