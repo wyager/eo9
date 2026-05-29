@@ -577,9 +577,16 @@ Standard stubs: `fs.overlay`, `fs.immutable` (and the shipped `programs`/coreuti
 
 ### Net API
 
-TODO - similar goals to disk
+Networking is three capabilities, not one: `eo9:net/l2` (interfaces, MAC addresses, whole frames),
+`eo9:net/l3` (IP addresses, routes, raw per-protocol datagrams), and `eo9:net/l4` (TCP and UDP sockets). A
+program imports exactly the layer it speaks, so each layer can be granted, withheld, attenuated, or mocked
+independently, and a higher layer implemented over a lower one — an l4-over-l3 TCP/IP stack, an l3-over-l2 IP
+layer — is ordinary provider middleware in the algebra rather than OS machinery. Each layer follows the
+standard conventions: a root handle minted per named import, async operations with the owned-buffer
+round-trip, and a typed error vocabulary that includes `denied`.
 
-Standard stubs: `net.none`, `net.deny`, `net.loopback`.
+Standard stubs: `net.l2.none`/`.deny`, `net.l3.none`/`.deny`, `net.l4.none`/`.deny`, and `net.l4.loopback` —
+a self-contained in-memory transport that gives tests working TCP/UDP sockets with no lower layers at all.
 
 ### Text API
 
