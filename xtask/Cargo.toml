@@ -15,3 +15,10 @@ publish.workspace = true
 eo9-component = { path = "../crates/eo9-component" }
 wasmtime = { workspace = true, features = ["cranelift", "component-model"] }
 wat = { workspace = true }
+
+[features]
+# Off by default. Links every Cranelift backend into the host wasmtime so xtask can
+# pre-compile kernel-store artifacts for non-host bare-metal targets (riscv64).
+# `cargo xtask build-kernel riscv64` re-runs itself with this feature automatically;
+# nothing else needs it, so plain xtask builds stay lean.
+kernel-cross-aot = ["wasmtime/all-arch"]
