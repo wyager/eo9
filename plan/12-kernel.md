@@ -905,3 +905,42 @@ preemption/hardening work.
     exercise the new path end-to-end; adding `ls`/`cat` to that list (and re-baking) is the one-line
     follow-up that makes bare `ls` actually runnable at the metal prompt. The headless `runner.rs` `program=`
     path keeps its scalar-only parser for now.
+
+43. **`eo9:pci` root provider — opt-in PCI on bare metal (2026-05-28, branch `area/12-pci-provider`).** The
+    kernel now implements the `eo9:pci` capability (wit/pci, plan/02 D14) directly against the machine, as the
+    foundation for wasm device drivers. Split: `src/pci.rs` is the hardware half (raw ECAM at `0x3f00_0000`
+    with `highmem=off`, bus walk, width-explicit config read/write, BAR sizing via the all-ones probe, BAR
+    assignment from a bump allocator over the 32-bit PCIe MMIO window `0x1000_0000..0x3eff_0000` + memory-
+    decode enable, bus-master toggle); `src/wasm/pci_provider.rs` is the provider half (WIT-shaped types,
+    per-store handle tables for device/bar/dma-buffer on `KernelState.pci`, registration mirroring the other
+    root providers). xtask's QEMU invocation adds `highmem=off` (the default highmem layout puts the ECAM
+    above 4 GiB, outside the kernel's identity map; reading the ECAM base from the DTB instead is a follow-up)
+    and `-device virtio-rng-pci` so enumeration finds real functions. Decisions and bounds:
+    (a) **Never linked by default.** PCI without an IOMMU is DMA, i.e. full-memory authority, so the provider
+        is only added to linkers when the boot's command line carries the bare `pci` token
+        (`cargo xtask qemu aarch64 pci …`); the loader rule then still applies (only programs importing
+        `eo9:pci/pci` link it). Without the token, spawn refuses with the capability story plus the exact
+        token to add (`shellexec::missing_capability`). Finer-grained grants (`pci.filtered` composed in
+        front of a driver) ride on top, unchanged.
+    (b) **Honest `unsupported`, never a wrong answer:** interrupt delivery (`enable-interrupts` / `wait` —
+        INTx/MSI-X routing through the GIC is the next kernel step a real driver needs, though virtio can
+        poll), function-level `reset`, I/O-space BARs (the arm64 PIO window is unmapped; QEMU's default
+        legacy/transitional virtio functions expose I/O BARs, so a driver demo should add a modern,
+        `disable-legacy=on` function), and qword config-space access (per the WIT).
+    (c) **DMA buffers** are page-aligned kernel-heap allocations (≤ 4 MiB each, ≤ 64 live per task); with the
+        identity map the CPU address *is* the bus address, and QEMU keeps DMA coherent — real hardware will
+        need non-cacheable mappings or explicit cache maintenance here. Handle tables are per-store, so
+        exclusive device claiming (`busy`) is per-task only for now; machine-global single-driver-per-device
+        arrives with the interrupt work.
+    (d) **`lspci` demo** (`guest/examples/lspci`, SDK gains the `pci` API arm): enumerates and prints one
+        line per function; baked into the kernel store (now 8 entries). Verified on QEMU: headless
+        `pci program=lspci` and interactive `lspci` both list the host bridge (1b36:0008), the default
+        virtio-net NIC (1af4:1000), and virtio-rng (1af4:1005) and exit `success(devices(3))`; without the
+        token the friendly refusal prints; existing flows (cruncher headless, boot-to-eosh, exit, power-off)
+        unchanged. CI green at each commit.
+    (e) **Next (recorded, not built): a virtio-blk driver as a wasm component** — imports `eo9:pci` (+ io
+        buffers), exports `eo9:disk`; QEMU side `-device virtio-blk-pci,disable-legacy=on,drive=…`; driver
+        side: find the virtio vendor capabilities in config space, map common/notify/device-cfg through
+        `open-bar`/`bar-read`/`bar-write`, build the virtqueue in `alloc-dma` buffers, kick via the notify
+        register and poll the used ring (no interrupts needed for v0). Its natural consumer is store-on-disk /
+        eofs-on-metal (area 14), which is what makes the metal artifact cache writable.

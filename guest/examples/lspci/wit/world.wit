@@ -1,0 +1,29 @@
+// lspci — list PCI devices: enumerate the granted eo9:pci capability and print one line
+// per function. Capabilities: eo9:pci, eo9:text.
+package eo9-examples:lspci@0.1.0;
+
+/// Prints `segment:bus:device.function vendor:device class cc.ss.pp rev rr` for every PCI
+/// function the granted capability exposes — the classic first step of writing a driver.
+/// Which functions are visible is the provider's business: the kernel root shows the real
+/// bus (only when the boot granted PCI), `pci.filtered` shows its allow-list, `pci.deny`
+/// answers `denied`.
+///
+///   lspci
+world lspci {
+    import eo9:pci/pci@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    variant program-success {
+        /// Number of PCI functions listed.
+        devices(u32),
+    }
+
+    variant program-failure {
+        /// The PCI capability refused the request (e.g. composed over pci.deny).
+        denied,
+        /// Any other PCI or console error.
+        io(string),
+    }
+
+    export main: async func() -> result<program-success, program-failure>;
+}
