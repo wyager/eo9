@@ -43,6 +43,11 @@ wasmtime-internal-cranelift = { path = "vendor/wasmtime-cranelift" }
 # their dependency feature lists, which (via feature unification) forces std on the whole
 # codegen graph. Vendored only to change those dep lines to the `core` profile (D28).
 cranelift-frontend = { path = "vendor/cranelift-frontend" }
+# cranelift-codegen itself is no_std (its `core` profile), but its riscv64 backend uses the
+# std-only `f64::powi` in four constant comparisons, which breaks the riscv64gc on-target
+# codegen build. Vendored only to spell those four constants as exact divisions
+# (src/isa/riscv64/inst/args.rs); everything else is byte-identical to the registry crate.
+cranelift-codegen = { path = "vendor/cranelift-codegen" }
 wasmtime-internal-unwinder = { path = "vendor/wasmtime-unwinder" }
 # The component-algebra closure (plan/12 Decisions 30–35): eo9-component (the kernel's
 # `eo9:exec` compose/$/&/only/configure surface, behind `wasm-codegen`) pulls these four

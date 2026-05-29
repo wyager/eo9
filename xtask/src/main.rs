@@ -1300,13 +1300,13 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// riscv64 (QEMU `virt`, S-mode under OpenSBI), milestone 3: the same host-AOT precompile
-/// pipeline as aarch64 — the seed canary, the real hello program, the async pair, and the
-/// read-only store image — targeted at riscv64, then a kernel build with the runtime
-/// feature set (`wasm-seed,wasm-hello,wasm-async,wasm-store`). On-target codegen
-/// (`wasm-codegen`) is not enabled for riscv64 yet — that is milestone 5 (Sv39 + W^X +
-/// the riscv64 backend in the vendored compile fork) — so the metal shell runs store
-/// programs and refuses `$`/`&` composition with the documented message.
+/// riscv64 (QEMU `virt`, S-mode under OpenSBI): the same host-AOT precompile pipeline as
+/// aarch64 — the seed canary, the real hello program, the async pair, and the read-only
+/// store image — targeted at riscv64, then a kernel build with the full feature set
+/// (`wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen`). With milestone 5 (Sv39 +
+/// W^X + on-target codegen) the riscv64 shell composes and compiles `$`/`&` on the machine
+/// itself, exactly like aarch64; cranelift's riscv64 backend is selected automatically by
+/// the `host-arch` feature when the kernel is compiled for this target.
 ///
 /// Emitting riscv64 machine code from the host needs the non-host Cranelift backends,
 /// which only the off-by-default `kernel-cross-aot` xtask feature links (so every other
@@ -1400,6 +1400,15 @@ fn build_kernel_riscv64(root: &Path) -> Result<PathBuf, String> {
     // The read-only store image (the same component list as aarch64), AOT'd for riscv64.
     let store_image = build_store_image(root, KERNEL_RISCV64_TARGET)?;
 
+    // The same seed component as *raw* (un-precompiled) wasm bytes, for the on-target
+    // codegen demo: the kernel compiles this with its own Cranelift (wasm-codegen) rather
+    // than deserializing a host-produced artifact.
+    let seed_wasm_path = kernel_precompiled_dir(root, KERNEL_RISCV64_TARGET).join("seed.wasm");
+    std::fs::create_dir_all(seed_wasm_path.parent().unwrap())
+        .map_err(|err| format!("failed to create precompiled dir: {err}"))?;
+    std::fs::write(&seed_wasm_path, &seed_wasm)
+        .map_err(|err| format!("failed to write {}: {err}", seed_wasm_path.display()))?;
+
     run_with_env(
         &kernel_dir,
         "cargo",
@@ -1411,10 +1420,11 @@ fn build_kernel_riscv64(root: &Path) -> Result<PathBuf, String> {
             "--target",
             KERNEL_RISCV64_TARGET,
             "--features",
-            "wasm-seed,wasm-hello,wasm-async,wasm-store",
+            "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen",
         ],
         &[
             ("EO9_SEED_CWASM", seed.as_os_str()),
+            ("EO9_SEED_WASM", seed_wasm_path.as_os_str()),
             ("EO9_HELLO_CWASM", hello.as_os_str()),
             ("EO9_SLEEPY_CWASM", sleepy.as_os_str()),
             ("EO9_ENTROPY_SEEDED_CWASM", entropy.as_os_str()),
