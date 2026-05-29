@@ -1869,6 +1869,8 @@ fn ensure_storedisk_mac_key(root: &Path) -> Result<PathBuf, String> {
         .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
     let path = dir.join("eo9-storedisk-mac.key");
     if !path.exists() {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
         let mut key = [0u8; 32];
         let mut urandom = std::fs::File::open("/dev/urandom").map_err(|err| {
             format!("failed to open /dev/urandom for the store-disk MAC key: {err}")
@@ -1876,7 +1878,17 @@ fn ensure_storedisk_mac_key(root: &Path) -> Result<PathBuf, String> {
         std::io::Read::read_exact(&mut urandom, &mut key).map_err(|err| {
             format!("failed to read 32 random bytes for the store-disk MAC key: {err}")
         })?;
-        std::fs::write(&path, key)
+        // Owner-only from the moment the file exists (mode 0o600 at create, not chmod'd
+        // after); the key also ends up inside the kernel image, so this is hygiene rather
+        // than a hard secrecy boundary — see plan/12 D56.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
+        file.write_all(&key)
             .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
         println!(
             "xtask: generated a store-disk MAC key at {}",

@@ -1278,7 +1278,11 @@ preemption/hardening work.
       baked into the kernel image, and `lookup` recomputes and compares the tag (constant-time via
       `blake3::Hash` equality) **before** the artifact is returned for deserialization. A mismatch is a
       printed, typed refusal that falls back to recompiling, which overwrites the entry; deleting the key
-      file and rebuilding rotates the key and simply invalidates the whole cache. The defense layering is:
+      file and rebuilding rotates the key and simply invalidates the whole cache. The key file is created
+      owner-only (mode 0600 at create), but note the key is also embedded in the kernel image itself, so its
+      secrecy is inherently limited — the keyed tag is **tamper-evidence for the disk**, not a secret-key
+      security boundary (anyone who can read the kernel image can forge tags; anyone who can replace the
+      kernel image never needed to). The defense layering is:
       eofs's unkeyed block checksums catch plain corruption, the keyed tag catches an adversary who can
       rewrite blocks *and* recompute those checksums but lacks the in-image key, and deserialize's own
       compatibility checks catch artifacts from a different wasmtime build. The baked-in store image and the
