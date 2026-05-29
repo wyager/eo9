@@ -15,6 +15,7 @@ static BUNDLED_COMPONENTS: &[(&str, &[u8])] = &[
     ("eo9-coreutil-wc", include_bytes!("eo9-coreutil-wc.wasm") as &[u8]),
     ("eo9-example-cruncher", include_bytes!("eo9-example-cruncher.wasm") as &[u8]),
     ("eo9-example-hello", include_bytes!("eo9-example-hello.wasm") as &[u8]),
+    ("eo9-example-lspci", include_bytes!("eo9-example-lspci.wasm") as &[u8]),
     ("eo9-example-outcomes", include_bytes!("eo9-example-outcomes.wasm") as &[u8]),
     ("eo9-example-readwrite", include_bytes!("eo9-example-readwrite.wasm") as &[u8]),
     ("eo9-example-sockcheck", include_bytes!("eo9-example-sockcheck.wasm") as &[u8]),
