@@ -370,3 +370,15 @@ entered the `www/` workspace. `cargo xtask fmt|lint|test` (and therefore `ci`) n
 fmt/clippy run inside `cargo xtask build-web-vm` instead (plan/18 Decision 25), and the others
 remain build-on-demand tools. Gate cost is one small native workspace (hyper/tokio/rustls), a few
 seconds warm.
+
+## Decision 27 — the leftover /try build machinery is retired
+
+Decision 25 removed the jco /try page but left its build tooling for "whoever next touches the
+www server/xtask lane"; that is this change. `cargo xtask build-web-demo` and the `www/try-build`
+workspace are deleted, the gzip-variant negotiation test in `www/tests/server.rs` now exercises
+`/vm/vm.js` instead of the old transpiled bundle, the orphaned `www/site/try/components/hello/`
+files are gone (so `site/try/` no longer exists at all), the Makefile's `www`/`www-build` wording
+no longer mentions /try (and `www-build` no longer invokes the removed subcommand), and
+`www/README.md`'s layout/“/try page” sections now describe the `/vm` try-it page and
+`web-eo9` instead. The front page and try-it page themselves are untouched. Everything is
+recoverable from git history if a jco-based comparison is ever wanted again.

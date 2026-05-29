@@ -12,8 +12,8 @@ help:
 	@echo "Eo9 — common entry points:"
 	@echo "  make setup      install/verify prerequisites (Rust targets, wasm-tools; checks QEMU)"
 	@echo "  make shell      build the components and drop into the eosh shell on your host"
-	@echo "  make www        serve the website + in-browser demos at http://127.0.0.1:8080/"
-	@echo "  make www-build  rebuild the /try and /vm demo assets from source, then serve"
+	@echo "  make www        serve the website + the in-browser shell at http://127.0.0.1:8080/"
+	@echo "  make www-build  rebuild the /vm in-browser shell assets from source, then serve"
 	@echo "  make qemu       boot the bare-metal kernel in QEMU to an eosh prompt (aarch64)"
 	@echo "  make ci         run the full local gate (host + guest + kernel workspaces)"
 
@@ -59,11 +59,10 @@ shell: ensure-setup
 	EO9_STORE=$(CURDIR)/target/eo9-store cargo run -p eo9
 
 www:
-	@echo "Serving the committed site (incl. the /try and /vm demos) at http://127.0.0.1:8080/  (Ctrl-C to stop)"
+	@echo "Serving the committed site (incl. the /vm in-browser shell) at http://127.0.0.1:8080/  (Ctrl-C to stop)"
 	cd www && cargo run
 
 www-build: ensure-setup
-	cargo xtask build-web-demo
 	cargo xtask build-web-vm
 	$(MAKE) www
 
