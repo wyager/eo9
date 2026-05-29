@@ -70,7 +70,14 @@ fn try_run() -> Result<String, wasmtime::Error> {
         .get_func(&mut store, "main")
         .ok_or_else(|| wasmtime::Error::msg("component does not export `main`"))?;
 
-    let params = [Val::String(NAME_ARG.to_string()), Val::Bool(EXCITED_ARG)];
+    // hello's arguments are optional (`option<string>`, `option<bool>`): pass them as
+    // explicit `some(…)` values so the demo keeps greeting its configured name.
+    let params = [
+        Val::Option(Some(alloc::boxed::Box::new(Val::String(
+            NAME_ARG.to_string(),
+        )))),
+        Val::Option(Some(alloc::boxed::Box::new(Val::Bool(EXCITED_ARG)))),
+    ];
     let mut results = [Val::Bool(false)];
     super::block_on(
         "hello main()",

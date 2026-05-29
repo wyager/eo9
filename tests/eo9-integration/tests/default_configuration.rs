@@ -44,8 +44,8 @@ fn unconfigured_time_frozen_defaults_to_the_documented_epoch() {
     let (outcome, stdout) = run_with_capture(
         &program,
         &[
-            NamedArg::new("name", "\"default\""),
-            NamedArg::new("excited", "true"),
+            NamedArg::new("name", "some(\"default\")"),
+            NamedArg::new("excited", "some(true)"),
         ],
     );
     assert!(

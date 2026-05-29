@@ -80,6 +80,17 @@ const oneShot = lines.join("\n");
 // the same path the page terminal uses. eosh runs each and reads the next until EOF/exit.
 inputQueue = [
   "echo --text hi",
+  // The try-it page's "Explore the sandbox" loop: help, ls /bin, describe (one binary, one
+  // provider), env — then "compose what you learned" runs at the end (after EXPLOREMARK).
+  "help",
+  "ls /bin",
+  "describe hello",
+  "describe entropy.seeded",
+  // (`env` is not driven here and not on the page: the browser exec surface has no session
+  // manifest yet, so the builtin only reports that nothing is available — a recorded gap.)
+  // Optional arguments: a bare `hello` greets the default name; --name still overrides.
+  "hello",
+  "hello --name user",
   // Positional + variadic arguments: the path-taking coreutils take a trailing
   // list<string>, so cat reads two files and a *bare* ls works (missing tail -> []).
   "cat /welcome.txt /docs/about.txt",
@@ -91,12 +102,18 @@ inputQueue = [
   "only eo9:text/text $ echo --text restricted",
   "only eo9:text $ echo --text shorthand",
   "only eo9:text/text $ hello --name nope --excited true",
+  // The page's bare-default forms of the same lockdowns: the pass case greets the default
+  // name, the refusal case must not add a greeting (the Hello-world count check below).
+  "only eo9:text/text,eo9:time/time $ hello",
+  "only eo9:text/text $ hello",
   // describe of a composition: the new `wiring` exec function renders the composition tree
   // (the interposed provider is visible), the same view `describe --wiring` gives natively.
   "describe entropy.seeded $ rng",
   // a virtualized clock: time.frozen (a /bin provider) is configured to the epoch and sealed
   // over hello, so the timestamp it prints is exactly 0.000000000 — every run, in any browser.
   "time.frozen --now-seconds 0 --monotonic-ns 0 $ hello --name frozen --excited true",
+  // the page's bare form of the same composition (hello's defaults).
+  "time.frozen --now-seconds 0 --monotonic-ns 0 $ hello",
   // a `provider $ consumer` composition: entropy.seeded (a /bin provider) feeds rng. The fused
   // result has no pre-AOT'd artifact, so the blob compiles it *in-blob* (Cranelift -> Pulley) and
   // runs it — no server, no network (none is wired in this harness). Run twice (marker between)
@@ -109,6 +126,9 @@ inputQueue = [
   // The fused three-op result (configure + extend + compose) is also compiled in-blob.
   "echo --text AMPMARK",
   "entropy.seeded & entropy.seeded --seed 7 $ rng --count 2",
+  // The explore section's "compose what you learned" example.
+  "echo --text EXPLOREMARK",
+  "entropy.seeded --seed 7 $ rng --count 2",
   "exit",
 ];
 lines.length = 0;
@@ -127,7 +147,12 @@ const run1 = (parts[0]?.match(/^\d{3,}$/gm) || []).slice(-3);
 const run2 = (parts[1]?.match(/^\d{3,}$/gm) || []).slice(0, 3);
 const deterministic =
   run1.length === 3 && run2.length === 3 && run1.join(",") === run2.join(",");
-const ampRun = (ampPart?.match(/^\d{3,}$/gm) || []).slice(0, 2);
+const [ampOnly, explorePart] = (ampPart || "").split("EXPLOREMARK");
+const ampRun = (ampOnly?.match(/^\d{3,}$/gm) || []).slice(0, 2);
+const exploreRun = (explorePart?.match(/^\d{3,}$/gm) || []).slice(0, 2);
+// Bare `hello` (default name), the bare only-pass form, and the bare frozen-clock form each
+// greet "world" exactly once; the bare only-refusal must not add a fourth.
+const helloWorldCount = (interactive.match(/Hello, world/g) || []).length;
 
 const checks = [
   ["eosh instantiates (floor)", instRc === 0 && /eosh: instantiated/.test(oneShot)],
@@ -145,6 +170,24 @@ const checks = [
     "interactive: bare ls listed / (empty-tail default)",
     /welcome\.txt/.test(interactive) && /listed\(/.test(interactive),
   ],
+  [
+    "help lists the operators and builtins",
+    /compose: satisfy the program's imports/.test(interactive) &&
+      /builtins: help, env/.test(interactive),
+  ],
+  ["ls /bin lists the program store", /hello\.wasm/.test(interactive)],
+  [
+    "describe hello: a binary with optional typed arguments",
+    /kind: binary/.test(interactive) && /--name: option<string>/.test(interactive),
+  ],
+  ["describe entropy.seeded: a provider", /kind: provider/.test(interactive)],
+  ["bare hello greets the default name", helloWorldCount >= 1],
+  ["hello --name user overrides the default", /Hello, user/.test(interactive)],
+  [
+    "bare lockdown/frozen forms ran (and the bare refusal did not)",
+    helloWorldCount === 3 && /\[0\.000000000\] Hello, world\./.test(interactive),
+  ],
+  ["explore composition (seed 7 over rng) ran with 2 values", exploreRun.length === 2],
   ["only admitting text+time runs hello", /Hello, boxed/.test(interactive)],
   ["only-text runs a text-only program", /restricted/.test(interactive)],
   ["only with the package shorthand (eo9:text) runs echo", /shorthand/.test(interactive)],

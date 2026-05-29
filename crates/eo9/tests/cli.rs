@@ -628,15 +628,30 @@ fn fs_is_not_granted_without_an_explicit_fs_root() {
 
 #[test]
 fn missing_arguments_are_a_spawn_error() {
+    // cruncher's parameters are required, so omitting one is still a typed spawn error.
     let store = temp_store("missing-args");
-    let hello = component_arg("hello");
-    let run = eo9(&store, &["run", &hello, "--name", "eo9"]);
+    let cruncher = component_arg("cruncher");
+    let run = eo9(&store, &["run", &cruncher, "--seed", "9"]);
     assert_eq!(run.code, 3, "stdout: {}", run.stdout);
     assert!(
-        run.stderr.contains("missing argument `excited`"),
+        run.stderr.contains("missing argument `rounds`"),
         "unexpected error: {}",
         run.stderr
     );
+}
+
+#[test]
+fn optional_arguments_fall_back_to_program_defaults() {
+    // hello declares both parameters as `option<…>`: a bare run greets the default name,
+    // and a partial flag set fills only what was given (the rest binds to `none`).
+    let store = temp_store("optional-args");
+    let hello = component_arg("hello");
+    let bare = eo9(&store, &["run", &hello]);
+    assert_eq!(bare.code, 0, "stderr: {}", bare.stderr);
+    assert!(bare.stdout.contains("Hello, world."), "{}", bare.stdout);
+    let partial = eo9(&store, &["run", &hello, "--name", "eo9"]);
+    assert_eq!(partial.code, 0, "stderr: {}", partial.stderr);
+    assert!(partial.stdout.contains("Hello, eo9."), "{}", partial.stdout);
 }
 
 // -----------------------------------------------------------------------------------
@@ -694,7 +709,11 @@ fn shell_describe_builtin_inspects_without_running() {
     let run = eo9(&store, &["shell", "-c", "describe hello"]);
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
     assert!(run.stdout.contains("kind: binary"), "{}", run.stdout);
-    assert!(run.stdout.contains("--name: string"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("--name: option<string>"),
+        "{}",
+        run.stdout
+    );
     assert!(run.stdout.contains("eo9:text/text"), "{}", run.stdout);
     // A plain reference is a single wiring leaf.
     assert!(run.stdout.contains("wiring:"), "{}", run.stdout);
@@ -1241,8 +1260,16 @@ fn describe_shows_kind_imports_and_arguments() {
         "{}",
         run.stdout
     );
-    assert!(run.stdout.contains("--name <string>"), "{}", run.stdout);
-    assert!(run.stdout.contains("--excited <bool>"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("--name <option<string>>"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("--excited <option<bool>>"),
+        "{}",
+        run.stdout
+    );
 }
 
 #[test]
@@ -1566,7 +1593,7 @@ fn store_reseed_recovers_a_legacy_store() {
     let describe = eo9(&store, &["describe", "hello"]);
     assert_eq!(describe.code, 0, "stderr: {}", describe.stderr);
     assert!(
-        describe.stdout.contains("--name <string>"),
+        describe.stdout.contains("--name <option<string>>"),
         "hello must be the bundled greeter again: {}",
         describe.stdout
     );

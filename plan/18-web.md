@@ -694,3 +694,34 @@ check that `outcomes` in trap mode reports
 against the served worktree site auto-boots to the `eosh>` prompt with no interaction. The eosh-spawn fold
 (`run_child`) shares the same slot/render code but is not separately driven by the harness — `/bin` ships no
 panicking program; if one is ever added, assert the message at the prompt too.
+
+## Decision 31 — try-it page: type into the terminal, an "Explore the sandbox" section, and bare-default examples (2026-05-29, owner feedback)
+
+Owner feedback on the simplified try-it page, all four items implemented and verified at the browser
+prompt (verify-eosh.mjs drives every command shown on the page; a headless-Chrome CDP smoke types into
+the page with real key events):
+
+- **No separate input box.** Keystrokes go straight into the terminal: while the shell's read-line is
+  pending, vm.js renders a live `> …` line with a blinking block cursor inside `#vm-output` itself;
+  printable keys, Backspace, Enter, and paste (newline submits) are captured at the document level, the
+  same place the previous routing already lived. The `#vm-input-row` element and its CSS are gone; the
+  finished line freezes into the ordinary echoed command line. Form fields and modifier chords are left
+  alone, so text selection/copy still works.
+- **`hello` takes optional arguments** (the cross-cutting part is recorded here because the page is why
+  it happened): `name`/`excited` are now `option<…>` with in-program defaults ("world", false), so a bare
+  `hello` works at every prompt. eosh already completed missing optional arguments to `none`; the CLI's
+  flag binder now wraps supplied values for `option<…>` parameters as `some(…)` and the runtime binds an
+  unsupplied `option<…>` parameter to `none` (both documented in their doc comments) — without those two
+  pieces the direct `eo9 hello --name user` path would have regressed. The blob's `algebra_demo`/
+  `compile_demo` exports pass `Val::Option`-wrapped arguments to match.
+- **"Explore the sandbox"** section before the examples teaches the discovery loop — `help`, `ls /bin`,
+  `describe hello` / `describe entropy.seeded`, then a first composition. **`env` is deliberately not on
+  the page**: the browser exec surface has no session manifest, so the builtin only prints "no session
+  capability information available" — surfacing the session manifest in the blob is the recorded gap.
+- **Examples simplified to defaults**: "Run a program" is now `describe hello` then `hello --name user`
+  (typed-arguments/typed-outcome caption kept); the `only` pass/refuse pair and the frozen-clock example
+  drop hello's arguments entirely.
+
+The /vm assets were rebuilt once for the new hello + blob (blob 8,829,574 B raw / 1,725,277 B brotli);
+all four node/JSPI harnesses pass (verify-eosh now 27 checks), check-web-vm is green, and the full
+`cargo xtask ci` gate passes.

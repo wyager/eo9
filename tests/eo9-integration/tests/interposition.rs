@@ -24,8 +24,8 @@ const STUBS: &[&str] = &[
 
 fn hello_args() -> Vec<NamedArg> {
     vec![
-        NamedArg::new("name", "\"layered\""),
-        NamedArg::new("excited", "false"),
+        NamedArg::new("name", "some(\"layered\")"),
+        NamedArg::new("excited", "some(false)"),
     ]
 }
 

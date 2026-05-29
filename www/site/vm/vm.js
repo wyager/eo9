@@ -7,7 +7,6 @@
 // inside the blob; this file is just a terminal, a keyboard, and a fetch cache.
 
 const output = document.getElementById("vm-output");
-const terminalInput = document.getElementById("vm-input");
 
 let memory = null;
 const decoder = new TextDecoder();
@@ -56,30 +55,55 @@ function hostRandomFill(ptr, len) {
 
 // --- suspending imports (JSPI) ----------------------------------------------------------------
 
-// One pending read-line at a time: the input box resolves it on Enter.
+// One pending read-line at a time. There is no separate input box: while the shell is
+// reading, keystrokes anywhere on the page are typed straight into the terminal — a live
+// line (with a block cursor) is rendered inside the terminal output itself, exactly where
+// the command will end up.
 let pendingReadLine = null;
+let liveLine = null; // the in-progress command line element, while the shell is reading
+let liveText = null; // its text span
+let liveBuffer = "";
 
 function armReadLine() {
-  terminalInput.disabled = false;
-  terminalInput.focus();
+  liveBuffer = "";
+  liveLine = document.createElement("div");
+  liveLine.className = "vm-cmd vm-live";
+  liveLine.append("> ");
+  liveText = document.createElement("span");
+  liveLine.appendChild(liveText);
+  const cursor = document.createElement("span");
+  cursor.className = "vm-cursor";
+  liveLine.appendChild(cursor);
+  output.appendChild(liveLine);
+  output.scrollTop = output.scrollHeight;
   return new Promise((resolve) => {
     pendingReadLine = resolve;
   });
 }
 
+function renderLiveLine() {
+  if (liveText !== null) liveText.textContent = liveBuffer;
+  output.scrollTop = output.scrollHeight;
+}
+
 function submitTerminalLine() {
   if (pendingReadLine === null) return;
-  const line = terminalInput.value;
-  terminalInput.value = "";
-  terminalInput.disabled = true;
+  const line = liveBuffer;
+  // Freeze the live line into the ordinary echoed command line.
+  if (liveLine !== null) {
+    liveLine.classList.remove("vm-live");
+    liveLine.textContent = `> ${line}`;
+  }
+  liveLine = null;
+  liveText = null;
+  liveBuffer = "";
   const resolve = pendingReadLine;
   pendingReadLine = null;
-  writeLine(`> ${line}`, "vm-cmd");
   resolve(line);
 }
 
 const READLINE_HINT =
-  "(the shell isn't reading right now — wait for the eosh> prompt, then type below and press Enter)";
+  "(the shell isn't reading right now — wait for the eosh> prompt, then just type and press Enter)";
 let lastHintAt = 0;
 function readlineHint() {
   const now = Date.now();
@@ -88,24 +112,8 @@ function readlineHint() {
   writeLine(READLINE_HINT, "vm-cmd");
 }
 
-terminalInput.addEventListener("keydown", (event) => {
-  if (event.key !== "Enter") return;
-  event.preventDefault();
-  if (pendingReadLine === null) {
-    readlineHint();
-    return;
-  }
-  submitTerminalLine();
-});
-
-// Behave like a terminal: clicking anywhere in the console focuses the input (when the shell
-// is reading), and keystrokes that would otherwise be lost are routed to it.
-function focusTerminalInput() {
-  if (!terminalInput.disabled) terminalInput.focus();
-}
-output.addEventListener("click", focusTerminalInput);
-document.getElementById("vm-input-row").addEventListener("click", focusTerminalInput);
-
+// Behave like a terminal: while the shell is reading, printable keys, Backspace, and Enter
+// anywhere on the page (outside text-selection modifiers and form fields) are the terminal's.
 document.addEventListener("keydown", (event) => {
   if (event.metaKey || event.ctrlKey || event.altKey) return;
   const target = event.target;
@@ -117,15 +125,14 @@ document.addEventListener("keydown", (event) => {
       target.tagName === "BUTTON" ||
       target.isContentEditable);
   if (inFormField) return;
-  if (pendingReadLine !== null && !terminalInput.disabled) {
-    // The shell is reading: send the keystroke to the terminal input instead of losing it.
+  if (pendingReadLine !== null) {
     if (event.key.length === 1) {
-      terminalInput.focus();
-      terminalInput.value += event.key;
+      liveBuffer += event.key;
+      renderLiveLine();
       event.preventDefault();
     } else if (event.key === "Backspace") {
-      terminalInput.focus();
-      terminalInput.value = terminalInput.value.slice(0, -1);
+      liveBuffer = liveBuffer.slice(0, -1);
+      renderLiveLine();
       event.preventDefault();
     } else if (event.key === "Enter") {
       event.preventDefault();
@@ -134,6 +141,27 @@ document.addEventListener("keydown", (event) => {
   } else if (event.key === "Enter") {
     // The shell isn't reading: explain instead of doing nothing.
     readlineHint();
+  }
+});
+
+// Pasting while the shell is reading types into the terminal too; a newline submits.
+document.addEventListener("paste", (event) => {
+  if (pendingReadLine === null) return;
+  const target = event.target;
+  if (target instanceof HTMLElement && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) {
+    return;
+  }
+  const text = event.clipboardData ? event.clipboardData.getData("text") : "";
+  if (text === "") return;
+  event.preventDefault();
+  const newline = text.indexOf("\n");
+  if (newline === -1) {
+    liveBuffer += text;
+    renderLiveLine();
+  } else {
+    liveBuffer += text.slice(0, newline).replace(/\r$/, "");
+    renderLiveLine();
+    submitTerminalLine();
   }
 });
 
@@ -286,7 +314,7 @@ async function main() {
   // Boot the shell. eosh_boot calls the JSPI read-line import, so it must be wrapped with
   // WebAssembly.promising and awaited; it returns when the visitor types `exit`.
   const eoshBoot = WebAssembly.promising(exports.eosh_boot);
-  writeLine("· booting eosh — type a command at the eosh> prompt below", "vm-cmd");
+  writeLine("· booting eosh — just type at the eosh> prompt", "vm-cmd");
   try {
     const code = await eoshBoot();
     if (code !== 0) writeLine("the shell reported a failure (see above)", "vm-error");
@@ -294,7 +322,6 @@ async function main() {
     writeLine(`the shell trapped: ${error}`, "vm-error");
   }
   writeLine("· shell session ended — reload the page for a fresh one", "vm-cmd");
-  terminalInput.disabled = true;
 }
 
 main();
