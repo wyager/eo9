@@ -1919,12 +1919,15 @@ fn eofs_keeps_files_across_processes_on_a_disk_image() {
 fn disk_is_not_granted_without_an_explicit_disk_flag() {
     // Same opt-in posture as the filesystem: without --disk there is no block device at
     // all, and a composed chain that needs one is refused at spawn rather than handed
-    // some ambient file.
+    // some ambient file. The refusal mirrors `eo9 run`'s friendly message: it names the
+    // `--disk` flag and the formatter instead of stopping at raw linker text.
     let store = temp_store("eofs-no-grant");
     let run = eo9(&store, &["-c", "fs.eofs $ ls /"]);
     assert_ne!(run.code, 0, "stdout: {} stderr: {}", run.stdout, run.stderr);
     let all = format!("{}{}", run.stdout, run.stderr);
     assert!(all.contains("eo9:disk"), "output: {all}");
+    assert!(all.contains("--disk"), "output: {all}");
+    assert!(all.contains("mkfs.eofs"), "output: {all}");
 }
 
 #[test]

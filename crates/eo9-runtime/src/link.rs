@@ -1543,7 +1543,16 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
                 Err(crate::task::SpawnError::BadArguments(msg)) => {
                     Err(WitSpawnError::BadArguments(msg))
                 }
-                Err(crate::task::SpawnError::Internal(msg)) => Err(WitSpawnError::Internal(msg)),
+                Err(crate::task::SpawnError::Internal(msg)) => {
+                    // Embedder-supplied hints turn a raw unsatisfied-import failure into
+                    // actionable advice (e.g. "relaunch with --disk <image>"); the raw
+                    // reason stays first so nothing is hidden.
+                    let msg = match exec.policy.hint_for(&msg) {
+                        Some(hint) => format!("{msg} ({hint})"),
+                        None => msg,
+                    };
+                    Err(WitSpawnError::Internal(msg))
+                }
             },))
         },
     )?;

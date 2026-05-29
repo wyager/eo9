@@ -935,6 +935,7 @@ pub fn shell_providers(
                 None => None,
             };
             let child_slot = Arc::clone(&slot);
+            let disk_granted = disk.is_some();
             let policy = ChildPolicy::with_providers(move || {
                 let make = child_slot
                     .lock()
@@ -943,6 +944,19 @@ pub fn shell_providers(
                     .expect("the session child policy is initialized before the first spawn");
                 make()
             });
+            // Mirror `eo9 run`'s friendly refusal: a program that hard-requires the block
+            // device in a session launched without `--disk` gets advice naming the flag
+            // and the formatter, not just the raw unsatisfied-import text.
+            let policy = if disk_granted {
+                policy
+            } else {
+                policy.with_spawn_hint(
+                    "eo9:disk/",
+                    "the program requires the eo9:disk block-device capability, which this \
+                     session does not grant: relaunch with `--disk <image>` (create and \
+                     format one with `eo9 mkfs.eofs <image>`)",
+                )
+            };
             assemble(fs, disk, Some(ExecProvider::new(&engine, policy)))
         })
     };
