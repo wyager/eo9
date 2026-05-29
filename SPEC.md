@@ -552,11 +552,14 @@ interface task {
 ### Disk API
 
 Raw block-device access: offset-addressed reads/writes of owned buffers against a `disk-impl`. Deliberately
-carries no filesystem semantics — that is the Filesystem API's job, layered on top.
+carries no filesystem semantics — that is the Filesystem API's job, layered on top. A disk also reports its
+`size` in bytes and offers `flush`, which makes every completed write durable before it returns; devices with
+nothing volatile succeed immediately.
 
 TODO - we want to support ultrahigh concurrency and DMA
 
-Standard stubs: `disk.none`, `disk.readonly`, `disk.mem` (RAM-backed).
+Standard stubs: `disk.none`, `disk.readonly`, `disk.mem` (RAM-backed). Real devices come from drivers — e.g.
+`disk.virtio`, a wasm component over `eo9:pci` exporting this API.
 
 ### Filesystem API
 
@@ -593,6 +596,9 @@ round-trip, and a typed error vocabulary that includes `denied`.
 
 Standard stubs: `net.l2.none`/`.deny`, `net.l3.none`/`.deny`, `net.l4.none`/`.deny`, and `net.l4.loopback` —
 a self-contained in-memory transport that gives tests working TCP/UDP sockets with no lower layers at all.
+The l4-over-l2 middleware (`net.l4.over-l2`, a smoltcp-based TCP/IP stack) accepts compose-time addressing
+(`address`, `prefix-length`, `gateway`) through `l4-over-l2-config`; unconfigured, it uses QEMU user-net's
+10.0.2.15/24 with gateway 10.0.2.2.
 
 ### Text API
 
