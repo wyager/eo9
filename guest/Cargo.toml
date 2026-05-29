@@ -37,3 +37,13 @@ eo9-guest = { path = "eo9-guest" }
 # crate the host tests and the kernel use, consumed here by the fs.eofs provider. Its
 # own `workspace = true` pins (blake3, lz4_flex) resolve against the repo-root table.
 eofs-core = { path = "../crates/eofs-core" }
+# The TCP/IP engine for the net.l4.over-l2 middleware provider (plan/09 Decision 18):
+# no_std + alloc, Ethernet + IPv4 + TCP + UDP only. Guest-workspace-only — it never
+# enters the host or kernel dependency tree.
+smoltcp = { version = "0.12.0", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+] }

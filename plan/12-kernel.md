@@ -1166,3 +1166,15 @@ preemption/hardening work.
       custom target spec or `-C target-feature=+sse,+sse2` plus FP state handling in the trap entry — and
       the UART RX ring consumed by the executor (wired but consumer-less today, as on riscv64 at this
       stage).
+
+53. **The metal sockets demo: `net.virtio $ net.l4.over-l2 $ l4check` on QEMU aarch64 (2026-05-29, branch
+    `area/09-net-l4-over-l2`).** The kernel store gains the TCP/IP middleware and its check program
+    (`KERNEL_STORE_COMPONENTS` += `net.l4.over-l2`, `l4check`; 20 entries, 1709 KiB of components +
+    13578 KiB of precompiled artifacts; aarch64 image ≈ 34.1 MiB). With the same `pci` boot grant and
+    xtask `net` flag the virtio-net demo already uses, the metal shell can now compose the full transport
+    stack and compile it on-target: the session prints the driver's probe line and then
+    `ok: resolved("example.com is 172.66.147.243; tcp 10.0.2.2:9 -> ConnectionRefused")` — a UDP DNS query
+    answered through the wasm driver + wasm TCP/IP stack + slirp, and a refused TCP SYN surfaced as a
+    typed error instead of a trap. No kernel source changes; the riscv64 image carries the same store
+    additions (its PCI provider remains the recorded follow-up). Scripted sessions keep the D49
+    convention: wait for the prompt, pace the input.

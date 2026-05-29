@@ -1,0 +1,17 @@
+# The TCP/IP middleware provider: eo9:net/l4 implemented over an imported eo9:net/l2.
+[package]
+name = "eo9-stub-net-l4-over-l2"
+description = "Eo9 provider `net.l4.over-l2`: a TCP/IP stack (smoltcp) as ordinary middleware — imports a link layer (eo9:net/l2) plus time and entropy, and exports transport sockets (eo9:net/l4), so a program that speaks only l4 gets real networking when an l2 driver such as net.virtio sits below it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }
+smoltcp = { workspace = true }
