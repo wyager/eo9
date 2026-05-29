@@ -52,6 +52,10 @@ pub struct KernelState {
     /// environment); headless demo runs carry `None`.
     #[cfg(feature = "wasm-store")]
     pub shell: Option<alloc::boxed::Box<super::shell::ShellState>>,
+    /// The task's PCI handles (open devices, BARs, DMA buffers); only populated when the
+    /// boot granted PCI and the program imports `eo9:pci` (see `super::pci_provider`).
+    #[cfg(feature = "wasm-store")]
+    pub pci: super::pci_provider::PciTables,
 }
 
 impl KernelState {
@@ -62,6 +66,8 @@ impl KernelState {
             limits: KernelLimits::default(),
             #[cfg(feature = "wasm-store")]
             shell: None,
+            #[cfg(feature = "wasm-store")]
+            pci: super::pci_provider::PciTables::default(),
         }
     }
 

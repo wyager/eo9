@@ -18,4 +18,5 @@ world sdk {
     import eo9:net/l2@0.1.0;
     import eo9:net/l3@0.1.0;
     import eo9:net/l4@0.1.0;
+    import eo9:pci/pci@0.1.0;
 }

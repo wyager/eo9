@@ -829,6 +829,12 @@ fn spawn_child(
     super::shellfs::add_buffers(&mut linker).map_err(internal)?;
     super::shellfs::add_fs(&mut linker).map_err(internal)?;
     add_exec(&mut linker).map_err(internal)?;
+    // PCI is never granted by default (bus mastering means DMA): only when the boot's
+    // command line carried the `pci` token — and even then the loader rule applies, so only
+    // a child that imports `eo9:pci/pci` actually links it.
+    if super::pci_provider::granted() {
+        super::pci_provider::add_pci(&mut linker).map_err(internal)?;
+    }
 
     let mut state = KernelState::new();
     state.shell = Some(Box::new(super::shell::ShellState {
@@ -1740,7 +1746,8 @@ fn missing_capability(text: &str) -> Option<String> {
     } else if text.contains("eo9:disk/") {
         "raw disk access, which the bare-metal session does not provide"
     } else if text.contains("eo9:pci/") {
-        "PCI device access, which the bare-metal session does not provide"
+        "PCI device access, which this boot did not grant (add the `pci` token to the \
+         kernel command line — `cargo xtask qemu aarch64 pci` — to provide it)"
     } else {
         return None;
     };

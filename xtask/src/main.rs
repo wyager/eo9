@@ -18,6 +18,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-cruncher",
     "eo9-example-readwrite",
     "eo9-example-sockcheck",
+    "eo9-example-lspci",
     "eosh",
     // Basic coreutils (guest/coreutils/*, plan/17-coreutils.md).
     "eo9-coreutil-cat",
@@ -86,6 +87,7 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-example-outcomes", "outcomes"),
     ("eo9-example-cruncher", "cruncher"),
     ("eo9-example-readwrite", "readwrite"),
+    ("eo9-example-lspci", "lspci"),
     ("eo9-stub-entropy-seeded", "entropy.seeded"),
     ("eo9-stub-time-frozen", "time.frozen"),
 ];
@@ -1439,9 +1441,10 @@ fn precompile_for_kernel(
 
 /// Build the kernel image for `arch` and boot it under QEMU with serial on stdio.
 ///
-/// The exact invocation (aarch64): `qemu-system-aarch64 -M virt,gic-version=2 -cpu max -smp 1 -m 512M
-/// -nographic -kernel <image>`. The kernel powers the machine off via PSCI when its run
-/// completes (or on panic), so QEMU exits by itself; to quit earlier press Ctrl-A then X.
+/// The exact invocation (aarch64): `qemu-system-aarch64 -M virt,gic-version=2,highmem=off
+/// -cpu max -smp 1 -m 512M -nographic -device virtio-rng-pci -kernel <image>`. The kernel
+/// powers the machine off via PSCI when its run completes (or on panic), so QEMU exits by
+/// itself; to quit earlier press Ctrl-A then X.
 fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
     let image = build_kernel(root, arch)?;
     let qemu = format!("qemu-system-{arch}");
@@ -1456,8 +1459,13 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         // With `-cpu max` QEMU would otherwise default to GICv3 (a system-register CPU
         // interface with per-PE redistributors), which that minimal MMIO bring-up does not
         // drive.
+        //
+        // `highmem=off` keeps the PCIe ECAM at its low address (0x3f00_0000, inside the
+        // kernel's identity-mapped device gigabyte — see kernel src/pci.rs); with the
+        // default highmem layout QEMU moves the ECAM above 4 GiB where the kernel has no
+        // mapping. RAM (512 MiB) is unaffected.
         "-M",
-        "virt,gic-version=2",
+        "virt,gic-version=2,highmem=off",
         "-cpu",
         "max",
         "-smp",
@@ -1465,6 +1473,11 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         "-m",
         KERNEL_QEMU_MEMORY,
         "-nographic",
+        // A PCIe function with no host-side configuration, so the eo9:pci capability has
+        // something real to enumerate next to the host bridge (the `lspci` demo; the kernel
+        // never touches it otherwise).
+        "-device",
+        "virtio-rng-pci",
         "-kernel",
     ]
     .into_iter()

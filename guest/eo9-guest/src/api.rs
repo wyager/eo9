@@ -39,3 +39,7 @@ pub mod fs {
 pub mod net {
     pub use crate::bindings::eo9::net::{l2, l3, l4};
 }
+
+pub mod pci {
+    pub use crate::bindings::eo9::pci::{pci, types};
+}

@@ -1,0 +1,15 @@
+[package]
+name = "eo9-example-lspci"
+description = "Eo9 example program: enumerate the PCI functions visible through the granted eo9:pci capability and print one line per function (targets the eo9-examples:lspci/lspci world: pci + text)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

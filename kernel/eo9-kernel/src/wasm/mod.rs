@@ -23,6 +23,8 @@ pub mod async_demo;
 pub mod codegen;
 #[cfg(feature = "wasm-hello")]
 pub mod hello;
+#[cfg(feature = "wasm-store")]
+pub mod pci_provider;
 #[cfg(any(feature = "wasm-hello", feature = "wasm-async", feature = "wasm-store"))]
 pub mod providers;
 #[cfg(feature = "wasm-store")]
