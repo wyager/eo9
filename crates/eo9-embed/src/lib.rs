@@ -417,6 +417,9 @@ fn assemble(roots: Roots, exec: Option<ExecProvider>) -> Providers {
         time: roots.time,
         entropy: roots.entropy,
         fs: roots.fs,
+        // The embed surface has no block-device root yet; a backend that wants to hand
+        // one out grows a `Roots.disk` field when the need appears.
+        disk: None,
         exec,
     }
 }

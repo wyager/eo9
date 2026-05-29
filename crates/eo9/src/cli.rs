@@ -31,6 +31,13 @@ pub struct Config {
     /// directory. Without the flag no filesystem is granted at all (no ambient default);
     /// guest paths can never escape the root (the unix fs provider enforces containment).
     pub fs_root: Option<PathBuf>,
+    /// `--disk`: grant the program the `eo9:disk` capability backed by this host image
+    /// file (a raw block device). Without the flag no block device is granted (no ambient
+    /// default); the typical use is `--disk <image>` plus a `fs.eofs $ …` composition to
+    /// mount the image as a persistent filesystem. Create and format an image with
+    /// `eo9 mkfs.eofs <image>`. Containment is structural: only the named file is
+    /// reachable through the capability.
+    pub disk: Option<PathBuf>,
     /// `--exec-snapshot`: how `open-exec` snapshots a path (default: clone-or-refuse).
     pub exec_snapshot: ExecSnapshotPolicy,
     /// `--max-memory`: linear-memory ceiling (bytes) for the spawned task.
@@ -133,6 +140,10 @@ pub fn consume_global_options(stream: &mut ArgStream, cfg: &mut Config) -> Resul
             "--fs-root" => {
                 stream.next();
                 cfg.fs_root = Some(PathBuf::from(stream.value_of("--fs-root")?));
+            }
+            "--disk" => {
+                stream.next();
+                cfg.disk = Some(PathBuf::from(stream.value_of("--disk")?));
             }
             "--exec-snapshot" => {
                 stream.next();

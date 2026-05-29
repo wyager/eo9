@@ -344,7 +344,10 @@ type FsWriteReturn = (Resource<BufferRes>, Result<WitWriteResult, WitFsError>);
 /// The return value of the owned-buffer disk read.
 type DiskReadReturn = (Resource<BufferRes>, Result<WitReadResult, WitDiskReadError>);
 /// The return value of the owned-buffer disk write.
-type DiskWriteReturn = (Resource<BufferRes>, Result<WitWriteResult, WitDiskWriteError>);
+type DiskWriteReturn = (
+    Resource<BufferRes>,
+    Result<WitWriteResult, WitDiskWriteError>,
+);
 
 /// The boxed-future shape `func_wrap_concurrent` expects.
 type ConcurrentFuture<'a, R> = Pin<Box<dyn Future<Output = Result<R>> + Send + 'a>>;
