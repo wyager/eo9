@@ -430,7 +430,7 @@ Dropping is therefore just composition, and the sealing law is what makes it a r
                                                      #     real net can never reach the composition
 ```
 
-The allow-list is just a **world** — a set of interface names (an entry admits both the required and `-optional` flavor of that interface, matched by the same semver rule as imports). `only w` is a *gate term*: not a component (what it must seal depends on its consumer), but a second kind of left operand for `$`, with `gate $ component -> component`. Argument application binds tighter than `$` as usual, and a named world may stand in for the inline list: `only sandbox.no-net $ …`.
+The allow-list is just a **world** — a set of interface names (an entry admits both the required and `-optional` flavor of that interface, matched by the same semver rule as imports; an entry naming just a package, like `eo9:text`, admits every interface of that package). `only w` is a *gate term*: not a component (what it must seal depends on its consumer), but a second kind of left operand for `$`, with `gate $ component -> component`. Argument application binds tighter than `$` as usual, and a named world may stand in for the inline list: `only sandbox.no-net $ …`. One interface is always admitted without being named: `eo9:rt/diagnostics`, the write-once panic-report sink every SDK-built component imports — it is runtime contract rather than a capability (it grants no authority, is never guest-readable, and is observable only inside a trap's `reason`), so allow-lists never have to mention it.
 
 Semantics of `only w $ c`, where `c` is the whole composition to the right (right-associativity has already collapsed it):
 
