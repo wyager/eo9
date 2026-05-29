@@ -1,6 +1,6 @@
 [package]
-name = "eo9-stub-net-deny"
-description = "Eo9 standard stub provider `net.deny`: exports eo9:net/net with every operation failing in net's own error vocabulary (denied)."
+name = "eo9-stub-net-l3-none"
+description = "Eo9 standard stub provider `net.l3.none`: exports eo9:net/l3-optional with default() answering none (absence of the network-layer capability)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

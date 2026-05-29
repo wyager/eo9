@@ -1,0 +1,15 @@
+[package]
+name = "eo9-stub-net-l2-deny"
+description = "Eo9 standard stub provider `net.l2.deny`: exports eo9:net/l2 with every operation failing in the layer's own error vocabulary (denied)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }
