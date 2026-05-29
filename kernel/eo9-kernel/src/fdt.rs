@@ -30,13 +30,51 @@ const FALLBACK_DTB: *const u8 = 0x4000_0000 as *const u8;
 #[cfg(not(target_arch = "aarch64"))]
 const FALLBACK_DTB: *const u8 = core::ptr::null();
 
-/// Return the `/chosen/bootargs` string from the device tree, if present.
+/// Return the kernel command line, if present.
 ///
-/// Tries the address the boot protocol passed first, then falls back to probing the
-/// architecture's fixed DTB location, if it has one (always validated by the FDT magic and
-/// size checks before anything is read).
+/// Tries the address the boot protocol passed as a device tree first (`/chosen/bootargs`),
+/// then the architecture's fixed DTB location, if it has one — always validated by the FDT
+/// magic and size checks before anything is read. If neither holds a device tree, the
+/// pointer is finally tried as a plain NUL-terminated command-line string, which is what
+/// the x86_64 PVH boot path hands the kernel instead of a DTB; on the device-tree
+/// architectures that fallback is unreachable in practice (their boot pointer is always a
+/// valid FDT).
 pub fn bootargs(dtb: *const u8) -> Option<&'static str> {
-    bootargs_at(dtb).or_else(|| bootargs_at(FALLBACK_DTB))
+    bootargs_at(dtb)
+        .or_else(|| bootargs_at(FALLBACK_DTB))
+        .or_else(|| cmdline_at(dtb))
+}
+
+/// Upper bound on a believable plain command line (QEMU's `-append` is far shorter).
+const MAX_CMDLINE: usize = 4096;
+
+/// Treat `ptr` as a NUL-terminated command-line string (the x86_64 PVH boot protocol's
+/// format). Returns `None` for a null pointer, an empty string, anything unreasonably long,
+/// or bytes outside printable ASCII — so a garbage pointer cannot be misread as arguments.
+fn cmdline_at(ptr: *const u8) -> Option<&'static str> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut len = 0;
+    while len < MAX_CMDLINE {
+        // SAFETY: the boot protocol hands a readable, NUL-terminated string in
+        // identity-mapped RAM; reads stop at the terminator or the size bound.
+        let byte = unsafe { core::ptr::read_volatile(ptr.add(len)) };
+        if byte == 0 {
+            break;
+        }
+        if !(0x20..=0x7e).contains(&byte) {
+            return None;
+        }
+        len += 1;
+    }
+    if len == 0 || len >= MAX_CMDLINE {
+        return None;
+    }
+    // SAFETY: the bytes were just validated as printable ASCII (hence valid UTF-8) and the
+    // backing memory is never modified or freed for the lifetime of the kernel.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    core::str::from_utf8(bytes).ok()
 }
 
 /// [`bootargs`] for one candidate DTB address. Returns `None` for a null pointer, a

@@ -24,9 +24,10 @@ fn main() {
     let script = match arch.as_str() {
         "aarch64" => "linker-aarch64.ld",
         "riscv64" => "linker-riscv64.ld",
+        "x86_64" => "linker-x86_64.ld",
         other => panic!(
-            "no linker script for target arch `{other}`: the bare-metal kernel covers aarch64 \
-             and riscv64 so far (plan/12-kernel.md)"
+            "no linker script for target arch `{other}`: the bare-metal kernel covers aarch64, \
+             riscv64 and x86_64 so far (plan/12-kernel.md)"
         ),
     };
     let linker_script = Path::new(&manifest_dir).join(script);
