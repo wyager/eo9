@@ -574,3 +574,57 @@ store assets and the blob's two argument paths did not yet understand.
 default for a missing trailing `list<string>` (bare `ls` on metal), and the pre-existing clippy
 findings in `web-eo9-blob` (`not_unsafe_ptr_arg_deref` on the exported `extern "C"` entry points,
 one `collapsible_if`) remain — the web-eo9 workspace is not in any clippy gate.
+
+## Decision 25 — the blob workspace gets a lint gate inside `build-web-vm`
+
+The `www/web-eo9` workspace stays out of `cargo xtask ci` (wasm32 target, heavy vendored closure),
+so its lint debt was invisible. `cargo xtask build-web-vm` now runs `cargo fmt --all --check` and
+`cargo clippy --workspace --release --target wasm32-unknown-unknown -- -D warnings` for the blob
+workspace right after building it — anyone refreshing the committed /vm assets gets the lint pass
+for free, and the gate cannot slow `ci` down. The pre-existing findings were fixed to make the
+gate start green: `eosh_command` / `run_program` are now `unsafe extern "C"` with their pointer
+contract documented (they dereference page-supplied pointers; the wasm export ABI is unchanged,
+the JS callers are unaffected), and the `TRUNCATE` branch of `MemFs::open` uses a let-chain.
+
+## Decision 26 — blob path-independence: remap flags in, a small cargo-metadata residue remains
+
+The committed blob used to embed the absolute checkout path 184 times (panic-location strings for
+the vendored path dependencies), so rebuilding the same sources from a different worktree changed
+the blob's bytes and its fingerprinted URL. `build-web-vm` now passes
+`--remap-path-prefix=<repo-root>=/eo9` (plus cargo-home and rustup-home prefixes) via `RUSTFLAGS`
+for the blob build: the rebuilt blob contains **zero** repository paths, and a clean rebuild at the
+same path is bit-identical.
+
+What the flags do *not* fix: building from a second checkout path still produces a blob that
+differs by ~410 bytes (~0.005%) with no path strings in either binary. The residue is cargo's
+per-unit metadata hash: the blob workspace's `[patch.crates-io]` path dependencies live *outside*
+its workspace root (`../../kernel/vendor/*`, `../../crates/eo9-component`), so their package ids —
+and therefore `-Cmetadata`, symbol hashes and the resulting code layout — incorporate the absolute
+checkout path (verified: the `libwasmtime-<hash>.rlib` unit hashes differ between two worktrees
+while registry crates' match). Fixing that needs either cargo-side support or restructuring where
+the vendored crates live relative to the blob workspace; not worth it now. Practical consequence:
+regenerate the committed /vm assets from one canonical checkout per change (as we already do), and
+expect a different-but-equivalent fingerprint if a different worktree regenerates them.
+
+## Decision 27 — blob size: smaller release profile kept, lazy `/bin` fetch designed but skipped
+
+`opt-level = "z"` + `panic = "abort"` (panics can only abort on wasm32-unknown-unknown anyway) on
+top of the existing fat-LTO/1-CGU/strip profile takes the blob from 9,991,322 to 8,582,558 bytes
+raw and 1,823,808 to 1,693,561 bytes brotli (−14% / −7%) with all four node/JSPI harnesses and the
+in-blob compile path still passing.
+
+The next real win would be lazily fetching the `/bin` raw+cwasm pairs and the embedded demo
+artifacts from the page's HTTP store instead of `include_bytes!` (roughly 2 MB of the raw blob):
+the store fetch path (`host_fetch_len`/`host_fetch_copy`) already exists, so the design is to seed
+`/bin` entries as *names* resolved through the store on first use rather than bytes baked into the
+blob. Skipped here because it changes the offline story (the node harnesses and the no-network
+boot currently exercise a fully self-contained blob) and touches the exec-surface seeding path;
+revisit if the blob needs to shrink further.
+
+## Decision 28 — the `&` form is exercised end-to-end through the browser eosh prompt
+
+`verify-eosh.mjs` now drives `entropy.seeded & entropy.seeded --seed 7 $ rng --count 2` at the
+interactive prompt: a configure + extend + compose fusion with no pre-AOT'd artifact, compiled
+in-blob and run. The checks assert the run produced output (no codegen refusal) and that `&` is
+right-biased — the `--seed 7` layer shadows the default-seeded left layer, so the stream rng sees
+differs from the plain `entropy.seeded $ rng` runs. 17/17 eosh harness checks pass.
