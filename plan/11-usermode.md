@@ -298,3 +298,12 @@ its first milestones, and to be the place where cross-area seams get found.
     every pre-existing name (including `time.monotonic-stub`) is unchanged, covered by the
     seed-name unit test. The `only` completion table drops the retired `eo9:net/net` and
     offers `eo9:net/l2`, `eo9:net/l3`, `eo9:net/l4`, and `eo9:pci/pci`.
+
+22. **`--disk <image>` and `mkfs.eofs` (eofs milestone 3, plan/14 D18–D21).** The CLI gained the disk
+    grant: a new global `--disk <image>` flag (opt-in, mirroring `--fs-root`; granted to `run` targets
+    and to shell-session children alike; listed in the session manifest), an `eo9 run` pre-check that
+    names the flag when a program hard-requires `eo9:disk`, and the `mkfs.eofs` subcommand (placed
+    before the implicit-run arm in the dispatcher, since the name also parses as a dotted store name).
+    The canonical persistent-filesystem invocation is `eo9 mkfs.eofs data.img` once, then
+    `eo9 --disk data.img -c "fs.eofs $ <program> …"` thereafter; the data lives in the image file and
+    survives across processes. Help text documents both.

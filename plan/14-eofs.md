@@ -139,3 +139,45 @@ Milestone 2 (`guest/stubs/fs-eofs` → the `fs.eofs` component; tests in
     defaults, and cross-run determinism. Persistence across remounts, crash consistency, snapshots,
     compression, and hostile images remain covered by `eofs-core`'s own suite; a component-level
     remount/persistence test needs a host-backed persistent disk provider and lands with M3.
+
+Milestone 3 (usermode persistence: `--disk`, `mkfs.eofs`, the file-backed device):
+
+18. **The `eo9:disk` root-provider seam now exists host-side.** `eo9-runtime` gained a `DiskProvider`
+    trait (owned-buffer read/write at byte offsets, one `DiskError` mapped onto the WIT's per-operation
+    error variants by the linker) plus a `Providers.disk` slot and the `eo9:disk/disk` linker path
+    (`disk-impl` lives in `eo9:disk/types`, registered unconditionally like the other types-only
+    interfaces; the operations and the `disk-optional` "granted" answer require the grant) — the same
+    shape as the fs seam. The unix file-backed `DiskProvider` (already in `eo9-providers-unix`) is wired
+    behind a new global `--disk <image>` flag with the same opt-in posture as `--fs-root`: no flag, no
+    block device, and a program/composition that hard-requires `eo9:disk` is refused up front
+    (`eo9 run` names the flag; the shell surfaces the spawn refusal). Containment is structural — only
+    the named image file is reachable. The grant flows into both `run` and the shell session (children
+    inherit it; the session manifest lists it).
+19. **Disk operations complete eagerly for the granted device.** `fs.eofs` drives its block device from
+    a synchronous engine and requires every disk call to be complete when it returns (D15), but the unix
+    provider's pool path completes on another thread — through the runtime that looks like a suspension
+    and every mount died with `device i/o failure`. The unix provider gained `read_blocking`/
+    `write_blocking` (same checks, same error mapping, calling-thread execution) and the `--disk`
+    adapter uses them, returning already-resolved operations. The fully asynchronous bridge remains the
+    follow-up for a device that genuinely must suspend; a positioned read/write on a host file is not
+    that device.
+20. **`eo9 mkfs.eofs <image> [--size <bytes[K|M|G]>] [--force]`.** Host-side formatting through the same
+    `eofs-core` engine the provider uses, over a small `FileDevice` (read/write/flush on a host file).
+    A missing image file is created at `--size` (default 16 MiB, matching disk.mem); an existing file
+    keeps its size. An image whose uberblock slots carry the eofs magic is never reformatted without
+    `--force` — surfacing the situation beats silent data loss — while a blank file formats without
+    ceremony (the provider's own format-on-first-mount rule still covers the no-mkfs path). `eofs-core`
+    is now `publish = true` (the `eo9` binary depends on it), which adds it to the crates.io publish
+    chain — xtask's `PUBLISH_CRATES`/`PUBLISH_LEAF_CRATES` lists still need the one-line addition
+    (xtask was outside this change's scope).
+21. **Milestone-3 test coverage.** CLI end-to-end tests now cover: mkfs format/refuse/`--force`; the
+    persistence story itself — `mkfs.eofs`, then `--disk img -c "fs.eofs $ readwrite /keep.txt …"` in
+    one process and `fs.eofs $ cat /keep.txt` + `fs.eofs $ ls /` in *new* processes reading the data
+    back (the image file is the only shared state); the no-`--disk` refusal; and a truncated image
+    surfacing the program's typed `fs(…)` error rather than a panic. Crash consistency itself remains
+    `eofs-core`'s suite (root-flip commits); the provider layer adds no caching that could weaken it.
+22. **What milestone 4 (store-on-eofs, kernel adoption) still needs.** A kernel-side `eo9:disk` root
+    provider (the virtio-blk wasm driver of plan/12 D43(e), or an in-kernel ramdisk for QEMU), the
+    asynchronous disk bridge (or an async `BlockDevice`) once a genuinely suspending device exists,
+    `eo9:disk` size/flush operations (D16) for honest durability, a guest-reachable verify/snapshot
+    surface on `eo9:fs`, and the plan/06 evaluation of hosting the module store on an eofs image.
