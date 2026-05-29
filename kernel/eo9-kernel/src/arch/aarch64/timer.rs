@@ -95,6 +95,30 @@ pub fn arm_wake(delay_ns: u64) {
     }
 }
 
+/// Mask IRQs, arm the timer to fire `delay_ns` from now, halt in `wfi` until an interrupt
+/// is pending, then unmask (taking the interrupt, which `kirq` services and EOIs). A pending
+/// but masked IRQ still wakes `wfi`, so an interrupt that lands between the caller's last
+/// poll and the `wfi` is not lost — masking only closes the lost-wakeup window. This is the
+/// executor's idle step (src/wasm/mod.rs `idle_wait`).
+///
+/// The `wfi`/unmask asm deliberately omits `nomem`: the interrupt taken at the unmask writes
+/// memory the caller re-reads right afterwards (the UART input ring), so this sequence must
+/// be a compiler-level memory barrier rather than relying on call/inlining boundaries to
+/// keep those reads from being cached across the halt.
+#[cfg(target_os = "none")]
+#[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
+pub fn wait_for_interrupt(delay_ns: u64) {
+    // SAFETY: mask IRQ (DAIF.I=1), arm the timer, `wfi`, then unmask; the instructions do
+    // not touch the stack or clobber registers the compiler relies on, and the missing
+    // `nomem` is the memory clobber discussed above.
+    unsafe {
+        core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
+        arm_wake(delay_ns);
+        core::arch::asm!("wfi", options(nostack, preserves_flags));
+        core::arch::asm!("msr daifclr, #2", options(nostack, preserves_flags));
+    }
+}
+
 /// Print counter readings and run a polled 10 ms timer-condition check.
 pub fn self_test() {
     let frequency = frequency();

@@ -1,7 +1,7 @@
 //! Minimal flattened-device-tree (FDT) reader: just enough to find `/chosen/bootargs`.
 //!
-//! QEMU's `-kernel` loader passes the DTB address in `x0`; the boot stub preserves it and
-//! hands it to `kmain`. The kernel command line (`-append "…"`) lands in the `bootargs`
+//! The boot protocol hands the DTB address to `kmain` (aarch64: `x0` from QEMU's loader;
+//! riscv64: `a1` from OpenSBI). The kernel command line (`-append "…"`) lands in the `bootargs`
 //! property of the `/chosen` node, which is what program selection reads
 //! (plan/12-kernel.md). Everything else in the tree is ignored, and any malformed or
 //! missing structure simply yields `None` — the kernel then boots its default program.
@@ -22,16 +22,21 @@ const FDT_END: u32 = 9;
 /// the header fields against a garbage pointer.
 const MAX_FDT_SIZE: u32 = 16 * 1024 * 1024;
 
-/// The base of RAM on the QEMU `virt` machine, where its DTB always lives; the fallback
-/// probe when the boot protocol did not hand the address over in `x0` (ELF entry points).
-const VIRT_RAM_BASE: *const u8 = 0x4000_0000 as *const u8;
+/// Fallback probe address for when the boot protocol did not hand the DTB address over.
+/// aarch64 QEMU `virt` always places its DTB at the base of RAM; on riscv64 OpenSBI always
+/// passes the address in `a1`, so there is no fixed fallback (a null probe yields `None`).
+#[cfg(target_arch = "aarch64")]
+const FALLBACK_DTB: *const u8 = 0x4000_0000 as *const u8;
+#[cfg(not(target_arch = "aarch64"))]
+const FALLBACK_DTB: *const u8 = core::ptr::null();
 
 /// Return the `/chosen/bootargs` string from the device tree, if present.
 ///
-/// Tries the address QEMU passed in `x0` first, then falls back to probing the start of
-/// RAM (always validated by the FDT magic and size checks before anything is read).
+/// Tries the address the boot protocol passed first, then falls back to probing the
+/// architecture's fixed DTB location, if it has one (always validated by the FDT magic and
+/// size checks before anything is read).
 pub fn bootargs(dtb: *const u8) -> Option<&'static str> {
-    bootargs_at(dtb).or_else(|| bootargs_at(VIRT_RAM_BASE))
+    bootargs_at(dtb).or_else(|| bootargs_at(FALLBACK_DTB))
 }
 
 /// [`bootargs`] for one candidate DTB address. Returns `None` for a null pointer, a

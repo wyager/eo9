@@ -1,13 +1,14 @@
-//! The Eo9 bare-metal kernel (plan/12-kernel.md): aarch64 on QEMU `virt`.
+//! The Eo9 bare-metal kernel (plan/12-kernel.md): aarch64 and riscv64 on QEMU `virt`.
 //!
 //! Boot path: QEMU's `-kernel` loader reads the ELF produced by `cargo xtask build-kernel
-//! aarch64` and jumps to `_start` (src/boot.rs) at EL1 with the MMU off. The assembly stub
-//! parks secondary cores, enables FP/SIMD for later wasm code, installs the exception
-//! vectors, sets up the boot stack, zeroes `.bss`, and calls [`kmain`]. From there
-//! everything is Rust: PL011 serial output, a global heap (no_std + alloc), the generic
-//! timer and PL031 RTC, and — behind the `wasm-seed` / `wasm-hello` features — a wasmtime
-//! embedding that runs host-precompiled components: the hand-written seed canary and the
-//! real `eo9-example-hello` program linked against the kernel's own eo9 root providers.
+//! <arch>` and jumps to `_start` (src/arch/<arch>/boot.rs) with translation off — at EL1 on
+//! aarch64, in S-mode (entered from OpenSBI) on riscv64. The per-architecture stub parks
+//! secondary cores, enables FP/SIMD for later wasm code, installs the trap vectors, sets up
+//! the boot stack, zeroes `.bss`, and calls [`kmain`]. From there everything is shared
+//! Rust — serial output, a global heap (no_std + alloc), the platform timer and RTC, and,
+//! behind the `wasm-*` features, a wasmtime embedding that runs host-precompiled components
+//! against the kernel's own eo9 root providers — reaching the hardware only through the
+//! per-architecture modules under src/arch/.
 //!
 //! On the host triple (where the kernel workspace's unit tests run) this crate compiles to
 //! a stub `main` so the workspace stays buildable and testable without a cross target.
@@ -21,31 +22,17 @@ mod ticks;
 extern crate alloc;
 
 #[cfg(target_os = "none")]
-mod boot;
-#[cfg(target_os = "none")]
-mod exceptions;
+mod arch;
 #[cfg(target_os = "none")]
 mod fdt;
 #[cfg(target_os = "none")]
-mod gic;
-#[cfg(target_os = "none")]
 mod heap;
-#[cfg(target_os = "none")]
-mod mmu;
 #[cfg(target_os = "none")]
 mod panic;
 // Raw ECAM/PCIe support; only the wasm `eo9:pci` root provider drives it, so it is gated
 // with the store/runner feature to keep the featureless CI build lean.
 #[cfg(all(target_os = "none", feature = "wasm-store"))]
 mod pci;
-#[cfg(target_os = "none")]
-mod psci;
-#[cfg(target_os = "none")]
-mod rtc;
-#[cfg(target_os = "none")]
-mod timer;
-#[cfg(target_os = "none")]
-mod uart;
 #[cfg(all(
     target_os = "none",
     any(
@@ -57,48 +44,41 @@ mod uart;
 ))]
 mod wasm;
 
-/// Rust entry point, called from the assembly boot stub with the stack set up and `.bss`
-/// zeroed. Banner, heap self-test, generic-timer readings, then the embedded wasm
-/// artifacts (the seed canary and the eo9-example-hello program, when built in) — and
-/// finally the machine powers off so QEMU exits cleanly.
+// The shared core (this file, src/heap.rs, src/wasm/) reaches the per-architecture drivers
+// through these crate-root names; every architecture provides the same modules with the same
+// public functions (src/arch/mod.rs). `rtc` is only consumed by the feature-gated providers,
+// so the re-export is otherwise-unused in the feature-less build.
+#[cfg(target_os = "none")]
+#[allow(unused_imports)]
+pub(crate) use arch::{mmu, power, rtc, timer, uart};
+
+/// Rust entry point, called from the per-architecture boot stub with the stack set up and
+/// `.bss` zeroed. Banner, heap self-test, timer readings, then the embedded wasm artifacts
+/// (the seed canary and the eo9-example-hello program, when built in) — and finally the
+/// machine powers off so QEMU exits cleanly.
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
 extern "C" fn kmain(dtb: *const u8) -> ! {
-    kprintln!();
-    kprintln!("Eo9 kernel — aarch64 (QEMU virt)");
-    kprintln!("  exception level: EL{}", current_el());
-    kprintln!("  counter-timer frequency: {} Hz", timer::frequency());
-    kprintln!(
-        "  wall clock: {}.{:09} s since the Unix epoch (PL031 + generic timer)",
-        rtc::seconds(),
-        timer::subsecond_ns()
-    );
+    // Machine identification, privilege level, timer frequency, wall clock.
+    arch::banner();
 
-    // Identity-map the machine and turn on the MMU and caches: compiled wasm programs
-    // perform unaligned accesses, which are only legal on Normal memory.
-    mmu::enable_identity_map();
+    // Bring up whatever memory translation the architecture needs before wasm code runs
+    // (aarch64: identity map + caches, because compiled wasm programs perform unaligned
+    // accesses that are only legal on Normal memory; riscv64: bare mode for now).
+    mmu::init();
 
-    // Heap: everything from the end of the kernel image to the top of RAM.
+    // Heap: everything from the end of the kernel image to the architecture's usable top of
+    // RAM.
     heap::init();
     heap::self_test();
 
-    // Generic timer: readable counter plus a polled 10 ms timer condition.
+    // Platform timer: readable counter plus a polled 10 ms timer condition.
     timer::self_test();
 
-    // Interrupt controller: bring up the GICv2 and forward the EL1 physical timer PPI
-    // (INTID 30) plus the PL011 UART (SPI 33 on `virt`) so the executor can `wfi`-idle and be
-    // woken either by the timer (a sleep deadline) or by a keystroke arriving on the console —
-    // instead of busy-polling. The IRQ vector (src/boot.rs `__irq_entry` → `kirq`) acknowledges
-    // and EOIs them (draining UART input into the ring); every other exception stays fatal.
-    gic::init();
-    for intid in [26u32, 27, 29, 30, 33] {
-        gic::configure_intid(intid);
-        gic::enable_intid(intid);
-    }
-    // Unmask the UART receive interrupt so an arriving byte asserts SPI 33.
-    uart::enable_rx_interrupt();
-    // SAFETY: clearing PSTATE.I (DAIF.I) enables IRQ delivery; the IRQ vector is installed.
-    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };
+    // Interrupt delivery: forward the timer and UART-receive interrupts to this core so the
+    // executor can idle in a low-power wait — woken by a sleep deadline or by a keystroke —
+    // instead of busy-polling (see each architecture's `interrupts_init`).
+    arch::interrupts_init();
 
     // The kernel command line (QEMU -append) selects what to run: `program=<name>` runs a
     // store entry headless, `demo` runs the original demo sequence below, and nothing at
@@ -127,22 +107,18 @@ extern "C" fn kmain(dtb: *const u8) -> ! {
             feature = "wasm-async",
             feature = "wasm-codegen"
         )))]
-        kprintln!("wasm: no components embedded (build with `cargo xtask build-kernel aarch64`)");
+        kprintln!(
+            "wasm: no components embedded (build with `cargo xtask build-kernel {}`)",
+            arch::NAME
+        );
     }
 
     kprintln!(
-        "[{:>8} us] kernel run complete; requesting PSCI SYSTEM_OFF",
-        timer::uptime_us()
+        "[{:>8} us] kernel run complete; requesting {}",
+        timer::uptime_us(),
+        power::OFF_REQUEST
     );
-    psci::system_off()
-}
-
-/// The current exception level (expected: 1 on QEMU `virt` without EL2/EL3 enabled).
-#[cfg(target_os = "none")]
-fn current_el() -> u64 {
-    let current_el: u64;
-    unsafe { core::arch::asm!("mrs {}, CurrentEL", out(reg) current_el, options(nomem, nostack)) };
-    (current_el >> 2) & 0b11
+    power::system_off()
 }
 
 /// Host-triple stub so `cargo test`/`cargo check` on the host keep working; the real
@@ -150,6 +126,6 @@ fn current_el() -> u64 {
 #[cfg(not(target_os = "none"))]
 fn main() {
     eprintln!(
-        "eo9-kernel is a bare-metal image; build and run it via `cargo xtask build-kernel aarch64` and `cargo xtask qemu aarch64`"
+        "eo9-kernel is a bare-metal image; build and run it via `cargo xtask build-kernel <arch>` and `cargo xtask qemu <arch>` (aarch64 or riscv64)"
     );
 }

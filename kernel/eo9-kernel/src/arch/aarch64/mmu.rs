@@ -45,6 +45,8 @@ static mut LEVEL3_TABLES: [TranslationTable; DRAM_L2_ENTRIES] =
 const RAM_BASE: usize = 0x4000_0000;
 const RAM_SIZE: usize = 512 * 1024 * 1024;
 const RAM_END: usize = RAM_BASE + RAM_SIZE;
+/// First byte past the heap (src/heap.rs): the top of DRAM on this machine.
+pub(crate) const HEAP_END: usize = RAM_END;
 /// Number of 2 MiB level-2 entries needed to cover DRAM (= number of level-3 tables).
 const DRAM_L2_ENTRIES: usize = RAM_SIZE / (2 * 1024 * 1024); // 256
 
@@ -109,7 +111,7 @@ const fn page_descriptor(va: usize, template: u64) -> u64 {
 /// Build the identity map and enable the MMU and caches. Called once, early in `kmain`, while
 /// still executing from the identity-mapped kernel image (so enabling translation does not
 /// move the program counter).
-pub fn enable_identity_map() {
+pub fn init() {
     let kernel_start = (&raw const __kernel_start).addr();
     let heap_start = (&raw const __heap_start).addr();
 
@@ -228,5 +230,49 @@ pub unsafe fn set_range_permissions(start: usize, len: usize, perm: PagePerm) {
     }
     // SAFETY: ordering + context synchronization so subsequent fetches/accesses see the new
     // permissions.
+    unsafe { asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
+}
+
+/// Make `[ptr, ptr+len)` coherent with the instruction-fetch path: clean the D-cache to the
+/// point of unification by line, then invalidate the I-cache to PoU by line, with the
+/// barriers the architecture requires between and after. Line sizes come from `CTR_EL0`
+/// (`DminLine`/`IminLine`, each `log2` of the line size in 32-bit words). The code publisher
+/// (src/wasm/mod.rs) calls this on freshly written code before flipping it executable.
+///
+/// # Safety
+/// `ptr`/`len` must describe a readable range that the caller owns; the ops are otherwise
+/// side-effect-free.
+#[allow(dead_code)] // used only by the feature-gated code publisher (see PagePerm)
+pub unsafe fn flush_code_range(ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let start = ptr as usize;
+    let end = start + len;
+
+    let ctr: usize;
+    // SAFETY: CTR_EL0 is readable at EL1 and has no side effects.
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
+    let dminline = 4usize << ((ctr >> 16) & 0xf); // D-cache line, bytes
+    let iminline = 4usize << (ctr & 0xf); // I-cache line, bytes
+
+    // Clean D-cache to PoU by line, then ensure completion before invalidating I.
+    let mut addr = start & !(dminline - 1);
+    while addr < end {
+        // SAFETY: `dc cvau` is a clean-by-VA op over owned memory.
+        unsafe { asm!("dc cvau, {}", in(reg) addr, options(nostack, preserves_flags)) };
+        addr += dminline;
+    }
+    // SAFETY: ordering barrier only.
+    unsafe { asm!("dsb ish", options(nostack, preserves_flags)) };
+
+    // Invalidate I-cache to PoU by line.
+    addr = start & !(iminline - 1);
+    while addr < end {
+        // SAFETY: `ic ivau` is an invalidate-by-VA op over owned memory.
+        unsafe { asm!("ic ivau, {}", in(reg) addr, options(nostack, preserves_flags)) };
+        addr += iminline;
+    }
+    // SAFETY: ordering + context-synchronization so the new instructions are fetched.
     unsafe { asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
 }

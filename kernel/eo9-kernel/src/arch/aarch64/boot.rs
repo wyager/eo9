@@ -13,7 +13,7 @@
 //!
 //! The stub itself leaves the MMU off (the `aarch64-unknown-none` target builds all Rust
 //! code with `+strict-align`, so that is safe); `kmain` then builds the identity map and
-//! turns on the MMU and caches via [`crate::mmu::enable_identity_map`] before any wasm
+//! turns on the MMU and caches via [`crate::mmu::init`] before any wasm
 //! code runs, because Cranelift-generated programs perform unaligned accesses that are
 //! only legal on Normal memory.
 

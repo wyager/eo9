@@ -25,6 +25,9 @@ pub fn system_off() -> ! {
     park()
 }
 
+/// The power-off mechanism named in the shared end-of-run banner (src/main.rs).
+pub const OFF_REQUEST: &str = "PSCI SYSTEM_OFF";
+
 /// Low-power spin, for when there is nothing left to do (or power-off failed).
 pub fn park() -> ! {
     loop {

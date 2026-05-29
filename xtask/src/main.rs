@@ -68,6 +68,12 @@ const GUEST_TARGET: &str = "wasm32-unknown-unknown";
 /// until area 12 introduces the real per-arch targets.
 const KERNEL_CHECK_TARGET: &str = "aarch64-unknown-none";
 
+/// Bare-metal targets the feature-less kernel workspace is built and clippy-checked for in
+/// `build`/`lint` (and therefore `ci`), so a change cannot silently break a ported
+/// architecture. Only aarch64 additionally gets the full wasm feature set exercised under
+/// QEMU (`build-kernel` / `qemu`); riscv64 is the in-progress second port (plan/12).
+const KERNEL_CI_TARGETS: &[&str] = &["aarch64-unknown-none", "riscv64gc-unknown-none-elf"];
+
 /// Architectures accepted by `build-kernel` and `qemu` (QEMU bring-up order).
 const KERNEL_ARCHES: &[&str] = &["aarch64", "riscv64", "x86_64"];
 
@@ -199,7 +205,8 @@ USAGE:
     cargo xtask <command>
 
 COMMANDS:
-    build                Build the host workspace and the kernel workspace ({KERNEL_CHECK_TARGET})
+    build                Build the host workspace and the feature-less kernel workspace for every
+                         ported bare-metal target
     test                 Refresh the guest components (build-guest), then run host workspace
                          tests and kernel workspace tests (host triple)
     build-guest          Build guest crates for {GUEST_TARGET} and componentize them with
@@ -224,11 +231,12 @@ COMMANDS:
     check-web-vm         Verify vm/assets.json matches the committed fingerprinted /vm assets
                          (the names encode the current content hash) — a drift guard; ci does
                          not run it (needs a built blob)
-    build-kernel <arch>  Precompile the seed/async canaries, eo9-example-hello, and entropy.seeded for
-                         bare metal and build the bootable kernel image (aarch64 only so far;
-                         ELF for QEMU's -kernel loader)
+    build-kernel <arch>  Build the bootable kernel image (an ELF for QEMU's -kernel loader).
+                         aarch64: precompiles the seed/async canaries, eo9-example-hello,
+                         entropy.seeded, and the store image and embeds them; riscv64: the
+                         feature-less image (boot/serial/heap/timer/interrupts so far)
     qemu <arch>          Build the kernel image and boot it under QEMU with serial on stdio
-                         (aarch64 only so far; exits when the kernel powers off, Ctrl-A X to quit)
+                         (aarch64 or riscv64; exits when the kernel powers off, Ctrl-A X to quit)
     fmt [--check]        Run `cargo fmt --all` in all three workspaces
     lint                 Run `cargo clippy -D warnings` in all three workspaces
     ci                   The merge gate: fmt --check, lint, build, build-guest, test
@@ -433,11 +441,13 @@ fn pinned_channel(root: &Path) -> Option<String> {
 
 fn build(root: &Path) -> Result<(), String> {
     run(root, "cargo", ["build", "--workspace"])?;
-    run(
-        &root.join("kernel"),
-        "cargo",
-        ["build", "--workspace", "--target", KERNEL_CHECK_TARGET],
-    )?;
+    for target in KERNEL_CI_TARGETS {
+        run(
+            &root.join("kernel"),
+            "cargo",
+            ["build", "--workspace", "--target", target],
+        )?;
+    }
     // eo9-sched is shared with the bare-metal kernel, so keep it honestly no_std by also
     // checking it against the bare-metal target. This runs after the kernel build so
     // rustup has already ensured that target is installed for the pinned toolchain (the
@@ -1288,13 +1298,45 @@ fn component_metadata(shell_name: &str, component: &[u8]) -> Result<String, Stri
 /// `eo9-kernel` in release mode with the `wasm-seed` and `wasm-hello` features so both are
 /// embedded in the image. The result is an ELF that QEMU's `-kernel` loader boots directly.
 fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
-    if arch != "aarch64" {
-        return Err(format!(
+    match arch {
+        "aarch64" => build_kernel_aarch64(root),
+        "riscv64" => build_kernel_riscv64(root),
+        _ => Err(format!(
             "`build-kernel {arch}` is not implemented yet: the bare-metal kernel covers aarch64 \
-             only so far (plan/12-kernel.md)"
+             and riscv64 so far (plan/12-kernel.md)"
+        )),
+    }
+}
+
+/// riscv64 (QEMU `virt`, S-mode under OpenSBI): the port currently covers boot, serial,
+/// heap, timer, and interrupt-driven idle (plan/12-kernel.md), so the image is built
+/// feature-less — no wasm artifacts are embedded yet. The milestone-3 step (host-AOT
+/// components against the kernel providers) will extend this with the same precompile
+/// pipeline aarch64 uses.
+fn build_kernel_riscv64(root: &Path) -> Result<PathBuf, String> {
+    const TARGET: &str = "riscv64gc-unknown-none-elf";
+    let kernel_dir = root.join("kernel");
+    run(
+        &kernel_dir,
+        "cargo",
+        ["build", "-p", "eo9-kernel", "--release", "--target", TARGET],
+    )?;
+    let image = kernel_dir
+        .join("target")
+        .join(TARGET)
+        .join("release")
+        .join("eo9-kernel");
+    if !image.is_file() {
+        return Err(format!(
+            "kernel build succeeded but {} is missing",
+            image.display()
         ));
     }
+    println!("xtask: built kernel image {}", image.display());
+    Ok(image)
+}
 
+fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
     // The seed canary, assembled from WAT.
     let seed_wat = root.join("kernel").join("seed").join("hello.wat");
     let seed_wasm = wat::parse_file(&seed_wat)
@@ -1453,36 +1495,52 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
          or press Ctrl-A then X to quit)",
         image.display()
     );
-    let mut args: Vec<std::ffi::OsString> = [
+    let machine: &[&str] = match arch {
         // Pin GICv2: the kernel brings up the GIC distributor + CPU interface over MMIO
-        // (src/gic.rs) to forward the generic-timer interrupt so the executor can wfi-idle.
-        // With `-cpu max` QEMU would otherwise default to GICv3 (a system-register CPU
-        // interface with per-PE redistributors), which that minimal MMIO bring-up does not
-        // drive.
+        // (src/arch/aarch64/gic.rs) to forward the generic-timer interrupt so the executor
+        // can wfi-idle. With `-cpu max` QEMU would otherwise default to GICv3 (a
+        // system-register CPU interface with per-PE redistributors), which that minimal
+        // MMIO bring-up does not drive.
         //
         // `highmem=off` keeps the PCIe ECAM at its low address (0x3f00_0000, inside the
         // kernel's identity-mapped device gigabyte — see kernel src/pci.rs); with the
         // default highmem layout QEMU moves the ECAM above 4 GiB where the kernel has no
         // mapping. RAM (512 MiB) is unaffected.
-        "-M",
-        "virt,gic-version=2,highmem=off",
-        "-cpu",
-        "max",
-        "-smp",
-        "1",
-        "-m",
-        KERNEL_QEMU_MEMORY,
-        "-nographic",
-        // A PCIe function with no host-side configuration, so the eo9:pci capability has
-        // something real to enumerate next to the host bridge (the `lspci` demo; the kernel
-        // never touches it otherwise).
-        "-device",
-        "virtio-rng-pci",
-        "-kernel",
-    ]
-    .into_iter()
-    .map(Into::into)
-    .collect();
+        //
+        // The `virtio-rng-pci` device is a PCIe function with no host-side configuration,
+        // so the eo9:pci capability has something real to enumerate next to the host
+        // bridge (the `lspci` demo; the kernel never touches it otherwise).
+        "aarch64" => &[
+            "-M",
+            "virt,gic-version=2,highmem=off",
+            "-cpu",
+            "max",
+            "-device",
+            "virtio-rng-pci",
+        ],
+        // Pin the SiFive-style PLIC (`aia=none`) for the same reason: the kernel's
+        // interrupt bring-up (src/arch/riscv64/plic.rs) drives the PLIC, not the newer
+        // AIA APLIC/IMSIC. The default CPU and QEMU's bundled OpenSBI `-bios` are used.
+        "riscv64" => &["-M", "virt,aia=none"],
+        other => {
+            return Err(format!(
+                "`qemu {other}` is not implemented yet (plan/12-kernel.md)"
+            ));
+        }
+    };
+    let mut args: Vec<std::ffi::OsString> = machine
+        .iter()
+        .copied()
+        .chain([
+            "-smp",
+            "1",
+            "-m",
+            KERNEL_QEMU_MEMORY,
+            "-nographic",
+            "-kernel",
+        ])
+        .map(Into::into)
+        .collect();
     args.push(image.as_os_str().to_os_string());
     // Anything after the architecture becomes the kernel command line, e.g.
     // `cargo xtask qemu aarch64 program=cruncher seed=9 rounds=200000`.
@@ -1533,19 +1591,21 @@ fn lint(root: &Path) -> Result<(), String> {
             "warnings",
         ],
     )?;
-    run(
-        &root.join("kernel"),
-        "cargo",
-        [
-            "clippy",
-            "--workspace",
-            "--target",
-            KERNEL_CHECK_TARGET,
-            "--",
-            "-D",
-            "warnings",
-        ],
-    )?;
+    for target in KERNEL_CI_TARGETS {
+        run(
+            &root.join("kernel"),
+            "cargo",
+            [
+                "clippy",
+                "--workspace",
+                "--target",
+                target,
+                "--",
+                "-D",
+                "warnings",
+            ],
+        )?;
+    }
     // The website server workspace (www/): native build, quick tests, no wasm32 blob —
     // the in-browser blob workspace (www/web-eo9) is deliberately NOT in the gate; its
     // clippy/fmt run as part of `build-web-vm` instead.
