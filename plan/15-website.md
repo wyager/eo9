@@ -306,3 +306,53 @@ in-blob compiler, and `only`-narrowing landed. Refreshed against what is actuall
 - All copy claims about the browser were checked against the node/JSPI harnesses or the committed
   code rather than asserted; sizes from the current fingerprinted assets. STATUS.md itself still
   describes the server-side `/vm/compile` era and is the planner's to refresh (out of scope here).
+
+## Decision 25 — the try-it page is just the shell; the jco /try page is removed (2026-05-28)
+
+Owner direction: the site had too much going on. It is now two pages — the front page (kept as-is,
+it explains the OS; its hero links are now exactly Try it / Source / Spec, with the /try link gone)
+and the try-it page at `/vm/`, which was rebuilt around one idea: **the terminal is the page.**
+
+- **/vm/ auto-boots eosh.** On load the page fetches the blob (loading line in the terminal),
+  instantiates it, and immediately calls `eosh_boot` — no buttons, no program picker, no per-demo
+  controls. The first row of embedded demos (hello/fuel/algebra), the entropy seed/draws controls,
+  the program-store dropdown, and the park/read-line/sleepy buttons are all gone from the page
+  (`vm.js` keeps the full host import surface — the blob is unchanged — but only drives
+  `boot()` + `eosh_boot()`). When the visitor types `exit` the page says so and suggests a reload
+  for a fresh session. Browsers without JSPI get a clear "the prompt cannot run here" message
+  (the shell's read-line needs JSPI; current Chrome/Edge have it).
+- **Five examples below the terminal**, each with a one-line caption, every one verified against
+  the committed blob via a node/JSPI harness driving the real `eosh>` prompt (and one re-verified
+  end-to-end in headless Chrome through the page's own input path):
+  `hello --name web --excited true` (typed args, typed outcome);
+  `rng --count 3` vs `entropy.seeded --seed 43 $ rng --count 3` (virtualization by substitution —
+  the seeded run is identical every time and the fused composition is compiled in-page);
+  `only eo9:text/text,eo9:time/time $ hello --name boxed --excited true` (allow-list that passes);
+  `only eo9:text/text $ hello --name boxed --excited true` (refused before it runs — the error
+  names the missing `eo9:time/time` import);
+  `ls /` and `cat /welcome.txt /docs/about.txt` (coreutils against the in-memory fs).
+  A `time.frozen … $ hello` example was wanted but `time.frozen` is not in the blob's `/bin`, so it
+  was dropped rather than shipped unverified (follow-up below).
+- **"What this is actually doing"** replaces the long bullet list: the full Eo9 OS — runtime,
+  capability algebra, compiler, eosh — compiled to WebAssembly and running entirely in the page;
+  the one difference from native/bare-metal is that programs execute on the Pulley bytecode
+  interpreter rather than as native machine code (there is no wasm→wasm codegen backend to hand
+  the browser), so it is slower; on real hardware Eo9 compiles to native code on the machine.
+  The honest-gaps line stays: no persistence (in-memory fs, resets on reload), no networking.
+- **The jco /try page is removed** (D8–D14's v1 demo): `try/index.html`, `try.js`, `try.css`,
+  `host.js`, the transpiled `cruncher`/`outcomes`/`readwrite` bundles and the manifest, plus their
+  precompressed siblings — all recoverable from git. `/try/` now 404s. `try/components/hello/` is
+  kept on disk (unlinked) only because `www/tests/server.rs`'s gzip-variant test hardcodes
+  `/try/components/hello/hello.js`; repointing that test (e.g. at `/vm/vm.js`) and deleting the
+  rest, plus retiring `cargo xtask build-web-demo` and the `www/try-build` workspace, is a
+  follow-up for whoever next touches the www server/xtask lane (out of scope here, which was
+  site-only). `vm/selftest.html`/`selftest.js` stay as unlinked harness artifacts.
+- **Verified**: the example transcript above (node/JSPI harness against the committed blob);
+  headless Chrome 148 on the locally served site auto-boots to `eosh>` with no clicks and runs
+  `hello --name web --excited true` through the page input (`Hello, web!` / `ok: greeted`);
+  `cargo test` in the www workspace green; `cargo xtask check-web-vm` green (no fingerprinted
+  asset touched); `precompress-site` regenerated the `.br`/`.gz` siblings of the four changed
+  text files.
+- **Follow-ups (blob, not site):** add `time.frozen` to the blob's `/bin` so a frozen-clock
+  example can join the list; optionally add a `help`-style listing of `/bin` at the prompt so
+  visitors can discover the available programs without the old dropdown.
