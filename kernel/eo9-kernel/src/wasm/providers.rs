@@ -45,6 +45,9 @@ const MAX_ENTROPY_REQUEST_BYTES: u64 = 64 * 1024;
 pub struct KernelState {
     /// Deterministic splitmix64 stream behind `eo9:entropy/entropy`.
     entropy_state: u64,
+    /// The task's `eo9:rt/diagnostics` slot: the panic message the guest reported just
+    /// before trapping (write-once, bounded; surfaced only in `trapped(reason)`).
+    pub panic_message: Option<alloc::string::String>,
     /// Resource limits enforced where wasm asks the host for memory/tables (set at spawn).
     limits: KernelLimits,
     /// The session's state (fs view, buffers, exec tables) — present on the store that
@@ -63,12 +66,32 @@ impl KernelState {
     pub fn new() -> Self {
         KernelState {
             entropy_state: crate::timer::counter() ^ 0x9e37_79b9_7f4a_7c15,
+            panic_message: None,
             limits: KernelLimits::default(),
             #[cfg(feature = "wasm-store")]
             shell: None,
             #[cfg(feature = "wasm-store")]
             pci: super::pci_provider::PciTables::default(),
         }
+    }
+
+    /// Record the guest's reported panic message (write-once: the first report wins;
+    /// truncated to 1 KiB so diagnostics can never make the kernel hold unbounded data).
+    pub fn report_panic(&mut self, message: alloc::string::String) {
+        const MAX: usize = 1024;
+        if self.panic_message.is_some() {
+            return;
+        }
+        let mut message = message;
+        if message.len() > MAX {
+            let mut end = MAX;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+            message.push('…');
+        }
+        self.panic_message = Some(message);
     }
 
     /// Next value of the splitmix64 stream (same generator as the usermode seeded stub).
@@ -182,9 +205,25 @@ struct WitInstant {
 /// entropy capability interfaces.
 pub fn add_providers(linker: &mut Linker<KernelState>) -> Result<()> {
     add_types(linker)?;
+    add_diagnostics(linker)?;
     add_text(linker)?;
     add_time(linker)?;
     add_entropy(linker)?;
+    Ok(())
+}
+
+/// `eo9:rt/diagnostics`: the write-once panic-message sink for the trap path (mirrors the
+/// usermode runtime). Always registered; carries no authority — the message is surfaced
+/// only inside a subsequent `trapped(reason)`.
+fn add_diagnostics(linker: &mut Linker<KernelState>) -> Result<()> {
+    let mut diagnostics = linker.instance("eo9:rt/diagnostics@0.1.0")?;
+    diagnostics.func_wrap(
+        "report-panic",
+        |mut store: StoreContextMut<'_, KernelState>, (message,): (String,)| -> Result<()> {
+            store.data_mut().report_panic(message);
+            Ok(())
+        },
+    )?;
     Ok(())
 }
 
