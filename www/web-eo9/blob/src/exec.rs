@@ -83,7 +83,10 @@ fn run_hello_pulley() -> wasmtime::Result<()> {
     run_component(
         &engine,
         &component,
-        &[Val::String("browser".into()), Val::Bool(true)],
+        &[
+            Val::Option(Some(Box::new(Val::String("browser".into())))),
+            Val::Option(Some(Box::new(Val::Bool(true)))),
+        ],
         "hello(name = \"browser\", excited = true)",
     )
 }
@@ -146,7 +149,10 @@ pub fn compile_demo() -> wasmtime::Result<()> {
     run_component(
         &engine,
         &compiled,
-        &[Val::String("compiled-here".into()), Val::Bool(true)],
+        &[
+            Val::Option(Some(Box::new(Val::String("compiled-here".into())))),
+            Val::Option(Some(Box::new(Val::Bool(true)))),
+        ],
         "hello(name = \"compiled-here\", excited = true), compiled in-blob",
     )?;
 

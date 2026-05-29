@@ -165,13 +165,18 @@ pub(crate) fn drive_to_completion(cfg: &Config, task: &mut Task) -> Outcome {
 ///
 /// * `--flag value` pairs bind by name: a flag filling a `string`-typed parameter is taken
 ///   literally and WAVE-quoted here; a flag filling a `list<string>` parameter with a
-///   value that isn't already WAVE list syntax is wrapped as a one-element list; every
-///   other value is passed through as WAVE text.
+///   value that isn't already WAVE list syntax is wrapped as a one-element list; a flag
+///   filling an `option<…>` parameter is wrapped as `some(…)` of the inner encoding (a
+///   bare `none` stays the absent option); every other value is passed through as WAVE
+///   text.
 /// * Bare positional values fill the still-unfilled parameters in declaration order
-///   (string parameters quoted, everything else passed through).
+///   (string parameters quoted, option parameters wrapped as above, everything else
+///   passed through).
 /// * When `main`'s **final** parameter is `list<string>` it is variadic: positional values
 ///   left over once the other parameters are filled are collected into it (so
 ///   `cat a.txt b.txt` works), and it defaults to the empty list when nothing fills it.
+/// * An `option<…>` parameter nothing supplies is simply omitted here; the runtime binds
+///   it to `none` (mirroring the shell's own argument completion).
 ///
 /// Unknown, duplicate, or type-mismatched arguments are reported by the runtime's
 /// spawn-time check against the signature; "more positionals than parameters" is the one
@@ -195,6 +200,9 @@ fn bind_args(params: &[ArgSpec], flags: &[ProgramArg]) -> Result<Vec<NamedArg>, 
                     Some("list<string>") if !value.trim_start().starts_with('[') => {
                         format!("[{}]", wave_string(value))
                     }
+                    Some(ty) if option_inner(ty).is_some() => {
+                        encode_option(option_inner(ty).unwrap_or(""), value)
+                    }
                     _ => value.clone(),
                 };
                 named.push(NamedArg::new(name.clone(), encoded));
@@ -206,8 +214,11 @@ fn bind_args(params: &[ArgSpec], flags: &[ProgramArg]) -> Result<Vec<NamedArg>, 
                     .find(|param| !named.iter().any(|arg| arg.name == param.name));
                 match (next_unfilled, variadic) {
                     (Some(param), _) => {
-                        let encoded = if param.ty.trim() == "string" {
+                        let ty = param.ty.trim();
+                        let encoded = if ty == "string" {
                             wave_string(value)
+                        } else if let Some(inner) = option_inner(ty) {
+                            encode_option(inner, value)
                         } else {
                             value.clone()
                         };
@@ -239,6 +250,29 @@ fn bind_args(params: &[ArgSpec], flags: &[ProgramArg]) -> Result<Vec<NamedArg>, 
         ));
     }
     Ok(named)
+}
+
+/// The inner type text of an `option<…>` parameter type, if `ty` is one.
+fn option_inner(ty: &str) -> Option<&str> {
+    ty.strip_prefix("option<")
+        .and_then(|rest| rest.strip_suffix('>'))
+        .map(str::trim)
+}
+
+/// Encode a command-line value destined for an `option<inner>` parameter: a bare `none`
+/// stays the absent option, an explicit `some(…)` is passed through, and anything else is
+/// the inner value (strings quoted) wrapped in `some(…)` — so `--name user` just works.
+fn encode_option(inner: &str, value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed == "none" || trimmed.starts_with("some(") {
+        return trimmed.to_string();
+    }
+    let encoded_inner = if inner == "string" {
+        wave_string(value)
+    } else {
+        value.to_string()
+    };
+    format!("some({encoded_inner})")
 }
 
 /// Whether the component has a *required* import of an `eo9:fs` interface — i.e. it
@@ -343,6 +377,25 @@ mod tests {
         let flags = [flag("nonsense", "1")];
         let args = bind_args(&params, &flags).unwrap();
         assert_eq!(args[0], NamedArg::new("nonsense", "1"));
+    }
+
+    #[test]
+    fn option_parameters_wrap_supplied_values_and_may_be_omitted() {
+        let params = [
+            spec("name", "option<string>"),
+            spec("excited", "option<bool>"),
+        ];
+        // Flags wrap as `some(…)` of the inner encoding (strings quoted, scalars literal).
+        let args = bind_args(&params, &[flag("name", "user"), flag("excited", "true")]).unwrap();
+        assert_eq!(args[0], NamedArg::new("name", "some(\"user\")"));
+        assert_eq!(args[1], NamedArg::new("excited", "some(true)"));
+        // Positionals get the same treatment; an explicit `none` stays the absent option.
+        let args = bind_args(&params, &[positional("user"), flag("excited", "none")]).unwrap();
+        assert_eq!(args[0], NamedArg::new("name", "some(\"user\")"));
+        assert_eq!(args[1], NamedArg::new("excited", "none"));
+        // Nothing supplied: nothing bound here — the runtime fills `none`.
+        let args = bind_args(&params, &[]).unwrap();
+        assert!(args.is_empty());
     }
 
     #[test]

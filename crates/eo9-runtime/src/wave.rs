@@ -36,10 +36,12 @@ impl NamedArg {
 /// `Val` list `main` is called with.
 ///
 /// Every declared parameter must be supplied exactly once and every supplied argument must
-/// name a declared parameter; anything else is a `bad-arguments` spawn error. The one
-/// exception is a **final `list<string>` parameter**, which is the variadic tail by
-/// convention (`cat a.txt b.txt`): when nothing supplies it, it defaults to the empty list
-/// instead of being a missing-argument error.
+/// name a declared parameter; anything else is a `bad-arguments` spawn error. Two
+/// exceptions: an **`option<…>` parameter** nothing supplies binds to `none` (mirroring
+/// the shell's argument completion, so a program can declare optional arguments with
+/// in-program defaults), and a **final `list<string>` parameter** is the variadic tail by
+/// convention (`cat a.txt b.txt`) — when nothing supplies it, it defaults to the empty
+/// list instead of being a missing-argument error.
 pub(crate) fn parse_args(signature: &ComponentFunc, args: &[NamedArg]) -> Result<Vec<Val>, String> {
     let params: Vec<(String, Type)> = signature
         .params()
@@ -57,6 +59,10 @@ pub(crate) fn parse_args(signature: &ComponentFunc, args: &[NamedArg]) -> Result
         let matching: Vec<&NamedArg> = args.iter().filter(|arg| arg.name == *name).collect();
         let arg = match matching.as_slice() {
             [] => {
+                if matches!(ty, Type::Option(_)) {
+                    vals.push(Val::Option(None));
+                    continue;
+                }
                 if index == params.len() - 1 && is_string_list(ty) {
                     vals.push(Val::List(Vec::new()));
                     continue;

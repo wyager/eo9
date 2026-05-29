@@ -5,7 +5,11 @@ package eo9-examples:hello@0.1.0;
 
 /// Greets `name` on standard output, stamped with the current wall-clock time.
 ///
-///   hello --name world --excited true
+/// Both arguments are optional: `name` defaults to "world" and `excited` to false, so a
+/// bare `hello` works; `hello --name user --excited true` overrides them.
+///
+///   hello
+///   hello --name user --excited true
 world hello {
     import eo9:text/text@0.1.0;
     import eo9:time/time@0.1.0;
@@ -22,5 +26,5 @@ world hello {
         io(string),
     }
 
-    export main: func(name: string, excited: bool) -> result<program-success, program-failure>;
+    export main: func(name: option<string>, excited: option<bool>) -> result<program-success, program-failure>;
 }
