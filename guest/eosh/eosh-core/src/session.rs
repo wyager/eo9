@@ -12,11 +12,25 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::ast::{Command, Expr};
-use crate::backend::{Backend, ComponentKind, Outcome};
+use crate::backend::{AbnormalExit, Backend, ComponentKind, Outcome};
 use crate::envinfo::{self, SessionManifest};
 use crate::eval::{EvalError, Evaluator, complete_args};
 use crate::parse::parse_command;
 use crate::render::{render_imports, render_info, render_outcome};
+
+/// How a program that ran went wrong: the executor's three-way view minus success.
+/// Carried by [`LineResult::ProgramFailed`] so the one-shot embedder can report an
+/// honest class (and exit code) for the *inner* command instead of collapsing failure
+/// and abnormal endings into one case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandClass {
+    /// The program ran and reported failure in its own vocabulary.
+    Failed,
+    /// The program trapped.
+    Trapped,
+    /// The program was killed before producing an outcome.
+    Killed,
+}
 
 /// What a line of input amounted to, for the embedding `main` (interactive loop or
 /// one-shot `--command` mode) to act on.
@@ -24,9 +38,11 @@ use crate::render::{render_imports, render_info, render_outcome};
 pub enum LineResult {
     /// The line was handled (including a program run that succeeded).
     Ok,
-    /// A program ran but reported failure or ended abnormally (rendered text included).
-    ProgramFailed(String),
-    /// The line could not be parsed or evaluated (rendered error included).
+    /// A program ran but reported failure or ended abnormally (the class says which;
+    /// rendered text included).
+    ProgramFailed(CommandClass, String),
+    /// The line could not be parsed or evaluated — no program ran (rendered error
+    /// included).
     Error(String),
     /// The user asked to leave the shell.
     Exit,
@@ -198,6 +214,16 @@ impl<B: Backend> Session<B> {
         for line in lines {
             self.backend.print(&line);
         }
+        if !imports_only {
+            // The composition tree: how the expression was wired together (each provider
+            // layer, what it satisfies or seals). `describe` of the residual surface
+            // alone cannot show interposed attenuators; the wiring view does.
+            let wiring = self.backend.wiring(&component);
+            self.backend.print("wiring:");
+            for line in wiring.lines() {
+                self.backend.print(&format!("  {line}"));
+            }
+        }
         LineResult::Ok
     }
 
@@ -249,7 +275,13 @@ impl<B: Backend> Session<B> {
         }
         match outcome {
             Outcome::Success(_) => LineResult::Ok,
-            Outcome::Failure(_) | Outcome::Abnormal(_) => LineResult::ProgramFailed(rendered),
+            Outcome::Failure(_) => LineResult::ProgramFailed(CommandClass::Failed, rendered),
+            Outcome::Abnormal(AbnormalExit::Trapped(_)) => {
+                LineResult::ProgramFailed(CommandClass::Trapped, rendered)
+            }
+            Outcome::Abnormal(AbnormalExit::Killed) => {
+                LineResult::ProgramFailed(CommandClass::Killed, rendered)
+            }
         }
     }
 
@@ -336,7 +368,10 @@ mod tests {
         let result = run(&mut session, "outcomes --mode fail");
         assert_eq!(
             result,
-            LineResult::ProgramFailed("error: requested-failure(\"went wrong\")".to_string())
+            LineResult::ProgramFailed(
+                CommandClass::Failed,
+                "error: requested-failure(\"went wrong\")".to_string()
+            )
         );
         assert_eq!(
             session.backend.out,
@@ -348,7 +383,17 @@ mod tests {
         let result = run(&mut session, "outcomes --mode trap");
         assert_eq!(
             result,
-            LineResult::ProgramFailed("abnormal: trapped: unreachable".to_string())
+            LineResult::ProgramFailed(
+                CommandClass::Trapped,
+                "abnormal: trapped: unreachable".to_string()
+            )
+        );
+
+        session.backend.outcome = Outcome::Abnormal(AbnormalExit::Killed);
+        let result = run(&mut session, "outcomes --mode trap");
+        assert_eq!(
+            result,
+            LineResult::ProgramFailed(CommandClass::Killed, "abnormal: killed".to_string())
         );
     }
 
@@ -464,6 +509,13 @@ mod tests {
         assert_eq!(run(&mut session, "describe memfs"), LineResult::Ok);
         assert!(session.backend.out.iter().any(|l| l == "kind: provider"));
         assert!(session.backend.out.iter().any(|l| l.contains("eo9:fs/fs")));
+        // The full describe view ends with the composition tree (a single leaf here).
+        assert!(session.backend.out.iter().any(|l| l == "wiring:"));
+        assert!(
+            session.backend.out.iter().any(|l| l == "  c1 [provider]"),
+            "out: {:?}",
+            session.backend.out
+        );
         assert!(
             !session
                 .backend
@@ -474,6 +526,7 @@ mod tests {
 
         session.backend.out.clear();
         assert_eq!(run(&mut session, "imports memfs"), LineResult::Ok);
+        // The imports-only view stays exactly the import list (no wiring section).
         assert_eq!(session.backend.out, vec!["imports: (none)"]);
     }
 

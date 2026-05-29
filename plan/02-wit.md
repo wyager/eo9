@@ -232,3 +232,15 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
     old `eo9:net/net` in its `only` completion table and the `eo9-components` bundle still carries the
     old `net.none`/`net.deny` stubs until `cargo xtask refresh-components` is run (both host-side,
     out of scope for this branch).
+18. **`component-algebra.wiring` (2026-05-28 — the plan/11 D17 eosh follow-up).** The interface gains
+    `wiring: func(c: borrow<component>) -> string`: the indented composition tree (each provider layer and
+    what it satisfies or seals, `only`/`rename`/`configure` gates) that the algebra records in memory — the
+    same view as the host CLI's `describe --wiring`. Provenance is never carried in the bytes, so a freshly
+    `load`ed component renders as a single leaf. Implementations: the usermode runtime renders the
+    table-held `eo9_component::Component`'s tree; the kernel stores algebra results as fused bytes
+    (provenance is dropped at `alg_binary_op`'s save), so its `wiring` reconstructs only the leaf view —
+    keeping in-memory `Component` values across kernel algebra operations (and with them the full tree) is
+    the recorded follow-up. **Web follow-up (must land before the next `/vm` asset rebuild):** the browser
+    blob's hand-rolled exec surface (`www/web-eo9/blob/execsurface.rs`) does not register `wiring` yet; a
+    freshly rebuilt eosh imports it, so `build-web-vm` would produce an eosh the blob cannot instantiate
+    until the blob adds the function. The committed `/vm` assets carry the older eosh and keep working.

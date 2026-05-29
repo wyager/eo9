@@ -681,8 +681,29 @@ fn shell_describe_builtin_inspects_without_running() {
     assert!(run.stdout.contains("kind: binary"), "{}", run.stdout);
     assert!(run.stdout.contains("--name: string"), "{}", run.stdout);
     assert!(run.stdout.contains("eo9:text/text"), "{}", run.stdout);
+    // A plain reference is a single wiring leaf.
+    assert!(run.stdout.contains("wiring:"), "{}", run.stdout);
     // Describing does not run the program.
     assert!(!run.stdout.contains("Hello"), "{}", run.stdout);
+}
+
+#[test]
+fn shell_describe_builtin_shows_the_composition_tree() {
+    // `describe` of an expression eosh composed shows the wiring tree (the eosh-side
+    // counterpart of `eo9 describe --wiring`): the `$` node with its provider and
+    // consumer leaves, fetched through `eo9:exec`'s `wiring`.
+    let store = temp_store("shell-describe-wiring");
+    let run = eo9(
+        &store,
+        &["shell", "-c", "describe entropy.seeded $ cruncher"],
+    );
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(run.stdout.contains("wiring:"), "{}", run.stdout);
+    assert!(run.stdout.contains("$ compose"), "{}", run.stdout);
+    assert!(run.stdout.contains("provider:"), "{}", run.stdout);
+    assert!(run.stdout.contains("consumer:"), "{}", run.stdout);
+    // Describing does not compile or run the composition.
+    assert!(!run.stdout.contains("digest("), "{}", run.stdout);
 }
 
 #[test]
@@ -730,7 +751,11 @@ fn shell_composes_with_the_algebra() {
 }
 
 #[test]
-fn shell_maps_child_failures_to_exit_code_1() {
+fn shell_maps_child_outcomes_to_honest_exit_codes() {
+    // `-c` follows `eo9 run`'s contract: 1 the command reported failure, 2 it ended
+    // abnormally, 3 the shell could not run it at all. eosh's `program-failure` carries
+    // the inner command's class (plan/11 D14/D16), so the embedder no longer collapses
+    // everything to 1.
     let store = temp_store("shell-fail");
     let failed = eo9(
         &store,
@@ -751,8 +776,22 @@ fn shell_maps_child_failures_to_exit_code_1() {
         failed.stderr
     );
 
+    // The inner command trapping is the abnormal class — exit 2, like `eo9 run`.
+    let trapped = eo9(
+        &store,
+        &["shell", "-c", "outcomes --mode trap --detail ignored"],
+    );
+    assert_eq!(trapped.code, 2, "stdout: {}", trapped.stdout);
+    assert!(
+        trapped.stderr.contains("abnormal: trapped"),
+        "{}",
+        trapped.stderr
+    );
+
+    // A command eosh could not run at all (nothing was spawned) is an eosh-level error —
+    // exit 3, distinct from "the command failed".
     let unknown = eo9(&store, &["shell", "-c", "nosuchprogram"]);
-    assert_eq!(unknown.code, 1, "stdout: {}", unknown.stdout);
+    assert_eq!(unknown.code, 3, "stdout: {}", unknown.stdout);
     assert!(
         unknown.stderr.contains("cannot resolve `nosuchprogram`"),
         "{}",

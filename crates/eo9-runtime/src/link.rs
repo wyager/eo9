@@ -1151,6 +1151,19 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
     )?;
 
     algebra.func_wrap(
+        "wiring",
+        |mut store: StoreContextMut<'_, TaskState>,
+         (component,): (Resource<AlgComponentRes>,)|
+         -> Result<(String,)> {
+            // Composition provenance is in-memory metadata on the algebra value (see
+            // eo9-component's Wiring); a component this table built by composing renders
+            // its full tree, a freshly loaded one renders as a single leaf.
+            let exec = store.data_mut().exec_provider()?;
+            Ok((exec.components.get_mut(component.rep())?.wiring_tree(),))
+        },
+    )?;
+
+    algebra.func_wrap(
         "compose",
         |mut store: StoreContextMut<'_, TaskState>,
          (provider, consumer): (Resource<AlgComponentRes>, Resource<AlgComponentRes>)|

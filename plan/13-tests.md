@@ -162,3 +162,25 @@ Everything; starts alongside Phase 1 (law tests) and grows with each milestone.
     same `program-outcome` value text under the same args and root providers — which is the testable
     stand-in but does not settle the instance-identity question. This wants a SPEC clarification (out of
     this area's scope); recorded here so it is not lost.
+17. **Proposed SPEC wording for `≡`, instance identity, and `empty` (the D16 follow-up — drafted for the
+    planner to fold into SPEC's "Algebraic properties"; not yet in SPEC, 2026-05-28).**
+    - *Equivalence (`≡`).* "`a ≡ b` means: under every closed completion, every argument vector, and the
+      same root providers, running `a` and `b` yields the same program outcome (the same success/failure
+      payload or the same abnormal class) and the same observable interactions on every granted capability,
+      and `describe` reports the same residual import/export surface. Equivalence is observational: it does
+      not require equal bytes, equal content hashes, or equal wiring trees." (The property suite's
+      operational check — same outcome value text under the same args and providers — remains the testable
+      stand-in for the first clause.)
+    - *Instance identity.* "One `$` is one provider instantiation: `p $ c` instantiates `p` once and wires
+      that single instance to every import slot of `c` it satisfies, so two slots satisfied by the same
+      compose share that instance. Distinct `$` (or `with … as`) operations create distinct instances, even
+      from the same bytes; the algebra never introduces sharing across separately composed values. The
+      action laws (`only`, `rename`, `configure` distributing over `$`/`&`) preserve this: they re-wire the
+      same single instantiation, never duplicate or merge it. A provider whose semantics depend on shared
+      state across importers must expose that sharing in its API (a handle passed between calls), not rely
+      on instantiation coincidence." (Matches the implementation: `eo9-component`'s compose builds one
+      `graph.instantiate(p_pkg)` per operation.)
+    - *`empty`.* "`empty` is the provider with no exports, no required imports, and no configuration; any
+      component whose `describe` reports that empty surface is `≡ empty`. It is the identity of `&`
+      (`empty & e ≡ e ≡ e & empty`) and a dead layer under `$` (`empty $ c ≡ c`: it satisfies nothing, and
+      the wiring tree marks it as such)."
