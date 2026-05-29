@@ -291,3 +291,10 @@ its first milestones, and to be the place where cross-area seams get found.
     1. And eosh's `describe` builtin now shows the composition tree through `eo9:exec.wiring` (plan/02 D18),
     the in-shell counterpart of `eo9 describe --wiring`. CLI transcripts cover fail→1, trap→2,
     unresolvable→3, and the wiring tree for both a plain reference and a composed expression.
+21. **Layered net stubs seed under fully dotted names; completion knows the new interfaces
+    (2026-05-28, branch `area/11-host-odds`).** `shell_name_for` special-cases the dashed API
+    family (`net-l2`/`net-l3`/`net-l4`) so `eo9-stub-net-l4-loopback` seeds as
+    `net.l4.loopback` — the spelling SPEC and the plans use — instead of `net.l4-loopback`;
+    every pre-existing name (including `time.monotonic-stub`) is unchanged, covered by the
+    seed-name unit test. The `only` completion table drops the retired `eo9:net/net` and
+    offers `eo9:net/l2`, `eo9:net/l3`, `eo9:net/l4`, and `eo9:pci/pci`.

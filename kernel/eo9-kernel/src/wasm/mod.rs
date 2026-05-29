@@ -1,16 +1,16 @@
 //! Running precompiled wasm components on the bare-metal kernel.
 //!
 //! This is the "runtime half" of on-target execution (plan/12-kernel.md): wasmtime built
-//! for `aarch64-unknown-none` with `default-features = false, features = ["runtime",
+//! for the bare-metal target with `default-features = false, features = ["runtime",
 //! "component-model"]`, i.e. no compiler, no std, no virtual memory, no signal handlers.
 //! In that configuration wasmtime's custom platform layer needs exactly two symbols from
 //! the embedder (the TLS accessors at the bottom of this file) plus a code-memory
 //! publisher; linear memories are plain heap allocations with explicit bounds checks, and
 //! traps are explicit checks in the generated code rather than CPU exceptions.
 //!
-//! The artifacts themselves are produced on the host by `cargo xtask build-kernel aarch64`
-//! (Cranelift targeting `aarch64-unknown-none`) and embedded via `include_bytes!`, keeping
-//! the kernel image self-contained:
+//! The artifacts themselves are produced on the host by `cargo xtask build-kernel <arch>`
+//! (Cranelift targeting this same bare-metal triple) and embedded via `include_bytes!`,
+//! keeping the kernel image self-contained:
 //!
 //! * [`seed`] — a tiny hand-written component (kernel/seed/hello.wat), the canary that the
 //!   platform/runtime layer itself works (`wasm-seed` feature).
@@ -53,19 +53,27 @@ use core::task::{Context, Poll, Waker};
 
 use wasmtime::{Config, CustomCodeMemory, Engine};
 
+/// The triple wasmtime knows this kernel build as. Precompiled artifacts and the on-target
+/// compiler must agree with it; xtask's `precompile_for_kernel` uses the same string per
+/// architecture.
+#[cfg(target_arch = "aarch64")]
+const NATIVE_TARGET: &str = "aarch64-unknown-none";
+#[cfg(target_arch = "riscv64")]
+const NATIVE_TARGET: &str = "riscv64gc-unknown-none-elf";
+
 /// Build the kernel's wasmtime engine.
 ///
 /// The compile-relevant parts of this configuration (tunables, wasm features) must agree
 /// with the host-side precompile configuration in xtask's `precompile_for_kernel`; the
 /// rest of the defaults are computed identically on both sides because wasmtime derives
-/// them from the `aarch64-unknown-none` target.
+/// them from the same bare-metal target ([`NATIVE_TARGET`]).
 pub fn new_engine() -> Result<Engine, wasmtime::Error> {
     let mut config = Config::new();
     // With the compiler (`wasm-codegen`) linked in, wasmtime would otherwise try to infer
     // the host target through `cranelift-native`, which needs `std` and is disabled here.
     // The kernel is built *for* this triple, so `Triple::host()` equals it and execution of
     // both deserialized and on-target-compiled code is accepted as native.
-    config.target("aarch64-unknown-none")?;
+    config.target(NATIVE_TARGET)?;
     config.wasm_component_model(true);
     // The component-model async ABI plus the two sub-features the eo9 guest SDK relies on
     // (stackful async lifts and the extra async built-ins behind waitable-set waits).
@@ -104,11 +112,11 @@ pub fn new_engine() -> Result<Engine, wasmtime::Error> {
 ///
 /// Code — whether deserialized from an AOT artifact or emitted on-target by Cranelift
 /// (plan/12 Decisions 26–27) — lands in an ordinary heap allocation, which the MMU maps
-/// writable-but-non-executable by default (src/mmu.rs), so it cannot be executed while
-/// wasmtime is writing it. Publishing does two things: (1) real cache maintenance — clean
-/// D to the point of unification then invalidate I over the range, so the I-fetch path sees
-/// the freshly written bytes (QEMU's TCG keeps coherency anyway, but physical hardware does
-/// not); then (2) flip the range to executable-and-read-only, so a code page is never
+/// writable-but-non-executable by default (the per-arch `mmu` module), so it cannot be
+/// executed while wasmtime is writing it. Publishing does two things: (1) real cache /
+/// instruction-stream maintenance (`mmu::flush_code_range`), so the instruction-fetch path
+/// sees the freshly written bytes (QEMU's TCG keeps coherency anyway, but physical hardware
+/// does not); then (2) flip the range to executable-and-read-only, so a code page is never
 /// simultaneously writable and executable. Unpublishing flips it back to writable/non-exec
 /// so the allocation can be reused. `required_alignment` is the page size, so wasmtime hands
 /// us whole pages that never share with non-code data.
@@ -126,7 +134,7 @@ impl CustomCodeMemory for BareMetalCodeMemory {
         // about to execute. Cache-maintain it while it is still the writable heap default,
         // then flip it to executable/read-only. A zero-length publish is a no-op.
         unsafe {
-            publish_code_range(ptr, len);
+            crate::mmu::flush_code_range(ptr, len);
             crate::mmu::set_range_permissions(
                 ptr as usize,
                 len,
@@ -148,50 +156,6 @@ impl CustomCodeMemory for BareMetalCodeMemory {
         }
         Ok(())
     }
-}
-
-/// Make `[ptr, ptr+len)` coherent with the instruction-fetch path on aarch64: clean the
-/// D-cache to the point of unification by line, then invalidate the I-cache to PoU by line,
-/// with the barriers the architecture requires between and after. Line sizes come from
-/// `CTR_EL0` (`DminLine`/`IminLine`, each `log2` of the line size in 32-bit words).
-///
-/// # Safety
-/// `ptr`/`len` must describe a readable range that the caller owns; the ops are otherwise
-/// side-effect-free.
-unsafe fn publish_code_range(ptr: *const u8, len: usize) {
-    if len == 0 {
-        return;
-    }
-    let start = ptr as usize;
-    let end = start + len;
-
-    let ctr: usize;
-    // SAFETY: CTR_EL0 is readable at EL1 and has no side effects.
-    unsafe {
-        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags))
-    };
-    let dminline = 4usize << ((ctr >> 16) & 0xf); // D-cache line, bytes
-    let iminline = 4usize << (ctr & 0xf); // I-cache line, bytes
-
-    // Clean D-cache to PoU by line, then ensure completion before invalidating I.
-    let mut addr = start & !(dminline - 1);
-    while addr < end {
-        // SAFETY: `dc cvau` is a clean-by-VA op over owned memory.
-        unsafe { core::arch::asm!("dc cvau, {}", in(reg) addr, options(nostack, preserves_flags)) };
-        addr += dminline;
-    }
-    // SAFETY: ordering barrier only.
-    unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
-
-    // Invalidate I-cache to PoU by line.
-    addr = start & !(iminline - 1);
-    while addr < end {
-        // SAFETY: `ic ivau` is an invalidate-by-VA op over owned memory.
-        unsafe { core::arch::asm!("ic ivau, {}", in(reg) addr, options(nostack, preserves_flags)) };
-        addr += iminline;
-    }
-    // SAFETY: ordering + context-synchronization so the new instructions are fetched.
-    unsafe { core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
 }
 
 // --- wasmtime custom-platform hooks ------------------------------------------------------
@@ -340,15 +304,11 @@ pub(crate) fn idle_wait(child_running: bool) {
     } else {
         requested.saturating_sub(now).clamp(MIN_WAKE_NS, cap)
     };
-    // SAFETY: mask IRQ (DAIF.I=1), arm the timer, `wfi`, then unmask. `wfi` wakes on a
-    // pending IRQ even while masked, so masking only closes the lost-wakeup window; none of
-    // these instructions touch memory or clobber registers the compiler relies on.
-    unsafe {
-        core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
-        crate::timer::arm_wake(delay);
-        core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
-        core::arch::asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags));
-    }
+    // Mask interrupts, arm the timer wake, halt until an interrupt is pending, then unmask
+    // and take it — the architecture-specific sequence lives in `timer::wait_for_interrupt`,
+    // which is also the compiler-level memory barrier that makes whatever the interrupt
+    // handler wrote (the UART input ring) visible to the re-poll below.
+    crate::timer::wait_for_interrupt(delay);
     wake_idle();
 }
 

@@ -1,12 +1,12 @@
-# The Eo9 bare-metal kernel (area 12: aarch64 / QEMU `virt` only so far).
+# The Eo9 bare-metal kernel (area 12: aarch64 and riscv64 on QEMU `virt`).
 #
-# Build and run it via xtask — `cargo xtask build-kernel aarch64` and `cargo xtask qemu
-# aarch64` — which supply the target, the linker script, and (for the `wasm-*` features)
+# Build and run it via xtask — `cargo xtask build-kernel <arch>` and `cargo xtask qemu
+# <arch>` — which supply the target, the linker script, and (for the `wasm-*` features)
 # the host-precompiled artifacts. A plain host build (as done by `cargo test` in this
 # workspace) compiles to a stub binary so the workspace stays testable on the host triple.
 [package]
 name = "eo9-kernel"
-description = "Eo9 bare-metal kernel: boot, serial, heap, timer, kernel-side eo9 root providers, and a wasmtime-based runner for precompiled components on QEMU aarch64 virt."
+description = "Eo9 bare-metal kernel: boot, serial, heap, timer, kernel-side eo9 root providers, and a wasmtime-based runner for precompiled components on QEMU virt (aarch64, riscv64 in progress)."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

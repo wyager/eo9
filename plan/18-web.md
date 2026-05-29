@@ -629,6 +629,33 @@ in-blob and run. The checks assert the run produced output (no codegen refusal) 
 right-biased — the `--seed 7` layer shadows the default-seeded left layer, so the stream rng sees
 differs from the plain `entropy.seeded $ rng` runs. 17/17 eosh harness checks pass.
 
+## Decision 29 — the blob registers `wiring`; `time.frozen` joins `/bin` (the frozen-clock example ships)
+
+Two follow-ups from other lanes, closed together because both force a blob/asset rebuild:
+
+- **`wiring` on the exec surface.** The eosh on master now imports
+  `eo9:exec/component-algebra.wiring` (plan/02 D18), so any future asset rebuild would have produced
+  an eosh the blob cannot instantiate. `execsurface.rs` registers `wiring` exactly like the usermode
+  runtime: it returns the algebra value's in-memory `wiring_tree()` — a composed value renders its
+  full tree, a freshly loaded one a single leaf. Verified at the browser prompt:
+  `describe entropy.seeded $ rng` ends with a `wiring:` section showing the `$ compose` node with the
+  provider and consumer layers (the interposed provider is visible in-browser, same as
+  `describe --wiring` natively).
+- **`time.frozen` in `/bin`.** The stub is built into the blob's `/bin` (raw + pulley32, via the same
+  xtask `/bin` loop as entropy.seeded — a one-line addition to that list), so the virtualized-clock
+  composition is formable at the prompt. The try-it page gains the previously-dropped frozen-clock
+  example (`time.frozen --now-seconds 0 --monotonic-ns 0 $ hello --name frozen --excited true`),
+  verified before shipping the copy: the harness asserts the output line is exactly
+  `[0.000000000] Hello, frozen!`.
+
+Verification: `verify-eosh.mjs` grew the two checks (19/19 pass, still fully offline);
+verify-coreutils 14/14, verify-fs, verify-exec pass; `check-web-vm` ok (18 assets);
+full `cargo xtask ci` (incl. the www gate) green; a headless-Chrome smoke against the served
+worktree site auto-boots to `eosh>` with no clicks and runs `hello` through the page's input
+handler. Blob: 8,756,332 bytes raw / 1,714,796 brotli (the new eosh + time.frozen raw+cwasm add
+~168 KB raw / ~21 KB wire over Decision 27's figures). Only the blob asset changed fingerprint —
+the store `.cwasm` set reproduced byte-identically.
+
 **Follow-up (2026-05-28, `eo9:rt/diagnostics`):** the guest SDK's panic handler now reports panic messages
 through a new `eo9:rt/diagnostics.report-panic` import that every SDK-built component carries. Before the
 next `/vm` asset rebuild (`build-web-vm`), the blob's exec/provider surface must register that import —

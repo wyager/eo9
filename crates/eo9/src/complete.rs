@@ -32,7 +32,10 @@ const INTERFACES: &[&str] = &[
     "eo9:disk/disk",
     "eo9:entropy/entropy",
     "eo9:fs/fs",
-    "eo9:net/net",
+    "eo9:net/l2",
+    "eo9:net/l3",
+    "eo9:net/l4",
+    "eo9:pci/pci",
     "eo9:perf/perf",
     "eo9:text/text",
     "eo9:time/time",
@@ -251,6 +254,20 @@ mod tests {
         assert_eq!(only, vec!["eo9:fs/fs".to_string()]);
         let many = candidates(&completer(), "only eo9:");
         assert!(many.len() >= 5, "{many:?}");
+        // The layered net interfaces and pci are offered; the retired eo9:net/net is not.
+        let net = candidates(&completer(), "only eo9:net/");
+        assert_eq!(
+            net,
+            vec![
+                "eo9:net/l2".to_string(),
+                "eo9:net/l3".to_string(),
+                "eo9:net/l4".to_string()
+            ]
+        );
+        assert_eq!(
+            candidates(&completer(), "only eo9:p"),
+            vec!["eo9:pci/pci".to_string(), "eo9:perf/perf".to_string()]
+        );
     }
 
     #[test]

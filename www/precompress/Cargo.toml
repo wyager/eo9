@@ -1,7 +1,7 @@
 # Build-time pre-compression of the eo9.org static assets: walks the site tree and writes
 # brotli (`.br`) and gzip (`.gz`) siblings next to every compressible file, so the server can
 # serve pre-compressed bytes by content negotiation without carrying any compressor itself.
-# Its own workspace (like try-build) so its dependencies never enter the server or the OS tree.
+# Its own workspace (like www/web-eo9) so its dependencies never enter the server or the OS tree.
 # Run it via `cargo xtask precompress-site`; the outputs are committed with the other built
 # site assets.
 [workspace]

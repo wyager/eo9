@@ -2,7 +2,7 @@
 # the future `eo9-embed` bundle milestone: can the real Eo9 stack — wasmtime included,
 # using the Pulley interpreter backend — run with wasm32 as the *host* architecture?
 #
-# This is a standalone workspace (like www/ itself and www/try-build): nothing here enters
+# This is a standalone workspace (like www/ itself and www/web-eo9): nothing here enters
 # the OS dependency tree, and `cargo xtask ci` neither builds nor needs it. See README.md
 # for how to run the experiment and plan/15-website.md for the recorded findings.
 [workspace]

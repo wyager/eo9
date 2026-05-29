@@ -68,6 +68,12 @@ const GUEST_TARGET: &str = "wasm32-unknown-unknown";
 /// until area 12 introduces the real per-arch targets.
 const KERNEL_CHECK_TARGET: &str = "aarch64-unknown-none";
 
+/// Bare-metal targets the feature-less kernel workspace is built and clippy-checked for in
+/// `build`/`lint` (and therefore `ci`), so a change cannot silently break a ported
+/// architecture. Only aarch64 additionally gets the full wasm feature set exercised under
+/// QEMU (`build-kernel` / `qemu`); riscv64 is the in-progress second port (plan/12).
+const KERNEL_CI_TARGETS: &[&str] = &["aarch64-unknown-none", "riscv64gc-unknown-none-elf"];
+
 /// Architectures accepted by `build-kernel` and `qemu` (QEMU bring-up order).
 const KERNEL_ARCHES: &[&str] = &["aarch64", "riscv64", "x86_64"];
 
@@ -90,6 +96,14 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-example-lspci", "lspci"),
     ("eo9-stub-entropy-seeded", "entropy.seeded"),
     ("eo9-stub-time-frozen", "time.frozen"),
+    // Basic coreutils, so the metal shell can inspect its own (read-only) filesystem:
+    // `ls /bin`, `cat /session`, `wc`, `head`, `stat`.
+    ("eo9-coreutil-ls", "ls"),
+    ("eo9-coreutil-cat", "cat"),
+    ("eo9-coreutil-echo", "echo"),
+    ("eo9-coreutil-wc", "wc"),
+    ("eo9-coreutil-head", "head"),
+    ("eo9-coreutil-stat", "stat"),
 ];
 
 fn main() -> ExitCode {
@@ -123,10 +137,6 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         "build-guest" => {
             expect_no_args("build-guest", rest)?;
             build_guest(&root)
-        }
-        "build-web-demo" => {
-            expect_no_args("build-web-demo", rest)?;
-            build_web_demo(&root)
         }
         "build-web-vm" => {
             expect_no_args("build-web-vm", rest)?;
@@ -199,14 +209,12 @@ USAGE:
     cargo xtask <command>
 
 COMMANDS:
-    build                Build the host workspace and the kernel workspace ({KERNEL_CHECK_TARGET})
+    build                Build the host workspace and the feature-less kernel workspace for every
+                         ported bare-metal target
     test                 Refresh the guest components (build-guest), then run host workspace
                          tests and kernel workspace tests (host triple)
     build-guest          Build guest crates for {GUEST_TARGET} and componentize them with
                          `wasm-tools component new` into guest/target/components/*.wasm
-    build-web-demo       Build the guest components, then transpile the /try page's set into
-                         www/site/try/components/ via www/try-build (commit the result; the
-                         deployed site needs no extra tooling). Not part of `ci`.
     build-web-vm         Pre-AOT the web-VM demo components to pulley32, build the wasm32
                          blob (www/web-eo9, the real runtime stack for the /vm page), and
                          install it into www/site/vm/ (commit the result; ci does not need it)
@@ -224,11 +232,12 @@ COMMANDS:
     check-web-vm         Verify vm/assets.json matches the committed fingerprinted /vm assets
                          (the names encode the current content hash) — a drift guard; ci does
                          not run it (needs a built blob)
-    build-kernel <arch>  Precompile the seed/async canaries, eo9-example-hello, and entropy.seeded for
-                         bare metal and build the bootable kernel image (aarch64 only so far;
-                         ELF for QEMU's -kernel loader)
+    build-kernel <arch>  Build the bootable kernel image (an ELF for QEMU's -kernel loader).
+                         aarch64: precompiles the seed/async canaries, eo9-example-hello,
+                         entropy.seeded, and the store image and embeds them; riscv64: the
+                         feature-less image (boot/serial/heap/timer/interrupts so far)
     qemu <arch>          Build the kernel image and boot it under QEMU with serial on stdio
-                         (aarch64 only so far; exits when the kernel powers off, Ctrl-A X to quit)
+                         (aarch64 or riscv64; exits when the kernel powers off, Ctrl-A X to quit)
     fmt [--check]        Run `cargo fmt --all` in all three workspaces
     lint                 Run `cargo clippy -D warnings` in all three workspaces
     ci                   The merge gate: fmt --check, lint, build, build-guest, test
@@ -433,11 +442,13 @@ fn pinned_channel(root: &Path) -> Option<String> {
 
 fn build(root: &Path) -> Result<(), String> {
     run(root, "cargo", ["build", "--workspace"])?;
-    run(
-        &root.join("kernel"),
-        "cargo",
-        ["build", "--workspace", "--target", KERNEL_CHECK_TARGET],
-    )?;
+    for target in KERNEL_CI_TARGETS {
+        run(
+            &root.join("kernel"),
+            "cargo",
+            ["build", "--workspace", "--target", target],
+        )?;
+    }
     // eo9-sched is shared with the bare-metal kernel, so keep it honestly no_std by also
     // checking it against the bare-metal target. This runs after the kernel build so
     // rustup has already ensured that target is installed for the pinned toolchain (the
@@ -549,37 +560,6 @@ fn build_guest_component(root: &Path, package: &str) -> Result<PathBuf, String> 
         ],
     )?;
     componentize_guest_package(root, package)
-}
-
-/// Build the guest components and regenerate the eo9.org `/try` page's transpiled bundle.
-///
-/// The transpiler (`www/try-build`, its own workspace) turns the example components into
-/// browser-runnable ES modules + core wasm and writes them, plus the launcher manifest, into
-/// `www/site/try/components/`. The output is committed, so this only needs re-running when the
-/// shipped components (or the transpiler pin) change; `ci` deliberately does not depend on it.
-fn build_web_demo(root: &Path) -> Result<(), String> {
-    build_guest(root)?;
-    let manifest = root.join("www").join("try-build").join("Cargo.toml");
-    let components = root.join("guest").join("target").join("components");
-    let out = root.join("www").join("site").join("try").join("components");
-    run(
-        root,
-        "cargo",
-        [
-            OsStr::new("run"),
-            OsStr::new("--release"),
-            OsStr::new("--manifest-path"),
-            manifest.as_os_str(),
-            OsStr::new("--"),
-            OsStr::new("--components"),
-            components.as_os_str(),
-            OsStr::new("--out"),
-            out.as_os_str(),
-        ],
-    )?;
-    // Regenerated bundles need fresh pre-compressed siblings or the server falls back to
-    // serving them uncompressed (it never serves a variant older than its original).
-    precompress_site(root)
 }
 
 /// Write brotli/gzip siblings next to the compressible static assets under `www/site`
@@ -704,9 +684,10 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
         ("cat", "eo9-coreutil-cat"),
         ("ls", "eo9-coreutil-ls"),
         ("rng", "eo9-coreutil-rng"),
-        // A provider in /bin so a `provider $ consumer` composition is formable through eosh
-        // (e.g. `entropy.seeded $ rng`), compiled in-blob (plan/18 D22).
+        // Providers in /bin so `provider $ consumer` compositions are formable through eosh
+        // (e.g. `entropy.seeded $ rng`, `time.frozen ... $ hello`), compiled in-blob (plan/18 D22).
         ("entropy.seeded", "eo9-stub-entropy-seeded"),
+        ("time.frozen", "eo9-stub-time-frozen"),
     ] {
         let raw = std::fs::read(
             root.join("guest")
@@ -1288,13 +1269,45 @@ fn component_metadata(shell_name: &str, component: &[u8]) -> Result<String, Stri
 /// `eo9-kernel` in release mode with the `wasm-seed` and `wasm-hello` features so both are
 /// embedded in the image. The result is an ELF that QEMU's `-kernel` loader boots directly.
 fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
-    if arch != "aarch64" {
-        return Err(format!(
+    match arch {
+        "aarch64" => build_kernel_aarch64(root),
+        "riscv64" => build_kernel_riscv64(root),
+        _ => Err(format!(
             "`build-kernel {arch}` is not implemented yet: the bare-metal kernel covers aarch64 \
-             only so far (plan/12-kernel.md)"
+             and riscv64 so far (plan/12-kernel.md)"
+        )),
+    }
+}
+
+/// riscv64 (QEMU `virt`, S-mode under OpenSBI): the port currently covers boot, serial,
+/// heap, timer, and interrupt-driven idle (plan/12-kernel.md), so the image is built
+/// feature-less — no wasm artifacts are embedded yet. The milestone-3 step (host-AOT
+/// components against the kernel providers) will extend this with the same precompile
+/// pipeline aarch64 uses.
+fn build_kernel_riscv64(root: &Path) -> Result<PathBuf, String> {
+    const TARGET: &str = "riscv64gc-unknown-none-elf";
+    let kernel_dir = root.join("kernel");
+    run(
+        &kernel_dir,
+        "cargo",
+        ["build", "-p", "eo9-kernel", "--release", "--target", TARGET],
+    )?;
+    let image = kernel_dir
+        .join("target")
+        .join(TARGET)
+        .join("release")
+        .join("eo9-kernel");
+    if !image.is_file() {
+        return Err(format!(
+            "kernel build succeeded but {} is missing",
+            image.display()
         ));
     }
+    println!("xtask: built kernel image {}", image.display());
+    Ok(image)
+}
 
+fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
     // The seed canary, assembled from WAT.
     let seed_wat = root.join("kernel").join("seed").join("hello.wat");
     let seed_wasm = wat::parse_file(&seed_wat)
@@ -1453,36 +1466,52 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
          or press Ctrl-A then X to quit)",
         image.display()
     );
-    let mut args: Vec<std::ffi::OsString> = [
+    let machine: &[&str] = match arch {
         // Pin GICv2: the kernel brings up the GIC distributor + CPU interface over MMIO
-        // (src/gic.rs) to forward the generic-timer interrupt so the executor can wfi-idle.
-        // With `-cpu max` QEMU would otherwise default to GICv3 (a system-register CPU
-        // interface with per-PE redistributors), which that minimal MMIO bring-up does not
-        // drive.
+        // (src/arch/aarch64/gic.rs) to forward the generic-timer interrupt so the executor
+        // can wfi-idle. With `-cpu max` QEMU would otherwise default to GICv3 (a
+        // system-register CPU interface with per-PE redistributors), which that minimal
+        // MMIO bring-up does not drive.
         //
         // `highmem=off` keeps the PCIe ECAM at its low address (0x3f00_0000, inside the
         // kernel's identity-mapped device gigabyte — see kernel src/pci.rs); with the
         // default highmem layout QEMU moves the ECAM above 4 GiB where the kernel has no
         // mapping. RAM (512 MiB) is unaffected.
-        "-M",
-        "virt,gic-version=2,highmem=off",
-        "-cpu",
-        "max",
-        "-smp",
-        "1",
-        "-m",
-        KERNEL_QEMU_MEMORY,
-        "-nographic",
-        // A PCIe function with no host-side configuration, so the eo9:pci capability has
-        // something real to enumerate next to the host bridge (the `lspci` demo; the kernel
-        // never touches it otherwise).
-        "-device",
-        "virtio-rng-pci",
-        "-kernel",
-    ]
-    .into_iter()
-    .map(Into::into)
-    .collect();
+        //
+        // The `virtio-rng-pci` device is a PCIe function with no host-side configuration,
+        // so the eo9:pci capability has something real to enumerate next to the host
+        // bridge (the `lspci` demo; the kernel never touches it otherwise).
+        "aarch64" => &[
+            "-M",
+            "virt,gic-version=2,highmem=off",
+            "-cpu",
+            "max",
+            "-device",
+            "virtio-rng-pci",
+        ],
+        // Pin the SiFive-style PLIC (`aia=none`) for the same reason: the kernel's
+        // interrupt bring-up (src/arch/riscv64/plic.rs) drives the PLIC, not the newer
+        // AIA APLIC/IMSIC. The default CPU and QEMU's bundled OpenSBI `-bios` are used.
+        "riscv64" => &["-M", "virt,aia=none"],
+        other => {
+            return Err(format!(
+                "`qemu {other}` is not implemented yet (plan/12-kernel.md)"
+            ));
+        }
+    };
+    let mut args: Vec<std::ffi::OsString> = machine
+        .iter()
+        .copied()
+        .chain([
+            "-smp",
+            "1",
+            "-m",
+            KERNEL_QEMU_MEMORY,
+            "-nographic",
+            "-kernel",
+        ])
+        .map(Into::into)
+        .collect();
     args.push(image.as_os_str().to_os_string());
     // Anything after the architecture becomes the kernel command line, e.g.
     // `cargo xtask qemu aarch64 program=cruncher seed=9 rounds=200000`.
@@ -1533,19 +1562,21 @@ fn lint(root: &Path) -> Result<(), String> {
             "warnings",
         ],
     )?;
-    run(
-        &root.join("kernel"),
-        "cargo",
-        [
-            "clippy",
-            "--workspace",
-            "--target",
-            KERNEL_CHECK_TARGET,
-            "--",
-            "-D",
-            "warnings",
-        ],
-    )?;
+    for target in KERNEL_CI_TARGETS {
+        run(
+            &root.join("kernel"),
+            "cargo",
+            [
+                "clippy",
+                "--workspace",
+                "--target",
+                target,
+                "--",
+                "-D",
+                "warnings",
+            ],
+        )?;
+    }
     // The website server workspace (www/): native build, quick tests, no wasm32 blob —
     // the in-browser blob workspace (www/web-eo9) is deliberately NOT in the gate; its
     // clippy/fmt run as part of `build-web-vm` instead.
@@ -1746,32 +1777,23 @@ fn components_data_dir(root: &Path) -> PathBuf {
 }
 
 /// The built guest components as sorted `(stem, bytes)` pairs.
+///
+/// The set is derived from `GUEST_COMPONENTS` — the same list `build-guest` builds — not
+/// from whatever `.wasm` files happen to sit in the build directory, so a removed crate's
+/// stale artifact can never sneak into the published bundle (and a missing entry is a
+/// clear "run build-guest first" error rather than a silently smaller bundle).
 fn built_components(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let dir = components_build_dir(root);
-    let entries = std::fs::read_dir(&dir).map_err(|err| {
-        format!(
-            "cannot read {} ({err}); run `cargo xtask build-guest` first",
-            dir.display()
-        )
-    })?;
     let mut components = Vec::new();
-    for entry in entries {
-        let path = entry.map_err(|err| err.to_string())?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let bytes =
-            std::fs::read(&path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-        components.push((stem.to_string(), bytes));
-    }
-    if components.is_empty() {
-        return Err(format!(
-            "no built components under {}; run `cargo xtask build-guest` first",
-            dir.display()
-        ));
+    for package in GUEST_COMPONENTS {
+        let path = dir.join(format!("{package}.wasm"));
+        let bytes = std::fs::read(&path).map_err(|err| {
+            format!(
+                "cannot read {} ({err}); run `cargo xtask build-guest` first",
+                path.display()
+            )
+        })?;
+        components.push(((*package).to_string(), bytes));
     }
     components.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(components)
