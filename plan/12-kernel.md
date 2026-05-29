@@ -510,7 +510,6 @@ Phase-1 areas have their first milestones; the spike can start as soon as 04's c
     the AOT fast path, run against the kernel roots with the existing child/capability rules, and test
     `entropy.seeded $ cruncher …` interactively with containment intact.
 
-
 32. **Checkpoint 4 — closure analysis (Decision 31 sharpened): it is a TWO-VERSION-FAMILY fork, and there is
     no intermediate building checkpoint.** Inspecting `cargo tree -p eo9-component --no-default-features`
     against the registry sources nails the real shape, which is materially larger than Decision 31 assumed:
@@ -1178,3 +1177,44 @@ preemption/hardening work.
     typed error instead of a trap. No kernel source changes; the riscv64 image carries the same store
     additions (its PCI provider remains the recorded follow-up). Scripted sessions keep the D49
     convention: wait for the prompt, pace the input.
+
+54. **x86_64 milestones 3–4: host-AOT components run and the baked store boots eosh on QEMU q35
+    (2026-05-29, branch `area/12-x86-64-m3`).** The same step riscv64 took in D47, with one x86-specific
+    wrinkle. `cargo xtask build-kernel x86_64` now runs the full host-AOT precompile pipeline (seed, hello,
+    the async pair, the 18-component store image) targeted at `x86_64-unknown-none` and builds the kernel
+    with `wasm-seed,wasm-hello,wasm-async,wasm-store` (no `wasm-codegen`: on-target codegen and the 4 KiB
+    W^X tables are milestone 5, so `$`/`&` refuses with the documented message). Emitting x86_64 from this
+    project's aarch64 development hosts needs the non-host Cranelift backend, so `build-kernel x86_64`
+    re-runs itself with the existing off-by-default `kernel-cross-aot` feature exactly as riscv64 does (an
+    x86_64 host would not need it).
+    - **The SSE/float-ABI question (D52) resolved without a custom target spec.** The kernel stays on plain
+      soft-float `x86_64-unknown-none` — so its own Rust code (including every interrupt handler) can never
+      touch XMM state, which is why the trap entry still saves no FP registers — and the boot stub now
+      enables SSE in hardware (clear CR0.EM/TS, set CR0.MP, set CR4.OSFXSR|OSXMMEXCPT) before any
+      Cranelift-generated code can run. wasmtime refuses to load native code on this target by default
+      because of the soft-float ABI; the one boundary where a float would cross in a register is a float
+      libcall (f32/f64 ceil/floor/trunc/nearest emitted when the compilation target lacks SSE4.1), so
+      xtask's `precompile_for_kernel` enables `has_sse3/ssse3/sse41/sse42` for this target only — no
+      artifact can contain such a libcall — and the kernel engine opts in via `x86_float_abi_ok` (its
+      documented safe condition) plus a CPUID-backed `detect_host_feature` probe so the enabled ISA flags
+      are verified against the real CPU at load time. The QEMU invocation gains `-cpu max` (as on aarch64)
+      so SSE4.2 is present under TCG. aarch64/riscv64 artifacts and engines are untouched (the flags are
+      keyed on the x86_64 target string).
+    - **Verified** (`cargo xtask qemu x86_64 …`): `program=hello name=pvh excited=true` → `Hello, pvh!` /
+      `success(greeted)` (42 ms instantiate+main); `program=cruncher seed=9 rounds=200000` →
+      `success(digest(14341732361190694547))` — the same digest as the other targets; `demo` → the
+      fuel-sliced sched/preemption demo (short and long finish, spinner `abnormal(killed)`), the seed
+      component (`add(17,25) -> 42`), the hello program, the sleepy canary (50 ms await observed at
+      62.2 ms), and entropy.seeded sync-configure with the exact SplitMix64 values; and an interactive
+      session — the baked store boots **eosh on x86_64**: `ls /bin` lists 18 programs, `hello` greets, a
+      `$` composition refuses with the no-codegen message, a runaway cruncher dies to **Ctrl-C**
+      (`abnormal: killed`, the prompt returns and the next program runs — the COM1 RX ring and the shared
+      `take_ctrl_c` path work as-is), `exit` → clean ACPI S5 power-off. aarch64 and riscv64 demos re-run
+      unchanged on the same branch (exact digests/entropy values, on-target codegen, clean power-off);
+      `cargo xtask ci` green. Milestone 4's boot-to-eosh goal is covered by the store image above.
+    - **Remaining for the port:** milestone 5 — 4 KiB tables with NX (replacing the 2 MiB RWX boot map),
+      W^X for published code, and `wasm-codegen` with Cranelift's x86_64 backend on-target (the engine-side
+      ISA flags must then mirror the precompile set so on-target output matches what the CPU probe
+      accepts); milestone 6 — parity checks (idle-power measurement; Ctrl-C already verified above). The
+      full-feature x86_64 cargo build emits the same pre-existing dead-code warning class the riscv64 one
+      does (`arch::NAME` unused there) — cargo-build only, outside the clippy gate.

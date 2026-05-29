@@ -143,6 +143,18 @@ long_mode_entry:
     mov gs, ax
     // Boot stack (the 32-bit esp value is fine, but reload it as a 64-bit pointer).
     mov rsp, offset __stack_top
+    // Enable SSE: Cranelift-generated wasm code uses SSE2 (XMM registers) for any f32/f64
+    // value, while the kernel's own Rust code is compiled soft-float (`x86_64-unknown-none`)
+    // and never touches them — which is also why the trap entry does not need to save XMM
+    // state. Clear CR0.EM (no x87 emulation) and CR0.TS (no lazy-switch trap), set CR0.MP,
+    // and set CR4.OSFXSR | CR4.OSXMMEXCPT so SSE instructions execute natively in ring 0.
+    mov rax, cr0
+    and rax, -13
+    or  rax, 0x2
+    mov cr0, rax
+    mov rax, cr4
+    or  rax, 0x600
+    mov cr4, rax
     // Zero .bss (both ends are 16-byte aligned by the linker script).
     lea rdi, [rip + __bss_start]
     lea rcx, [rip + __bss_end]
