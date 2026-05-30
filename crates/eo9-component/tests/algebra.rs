@@ -832,17 +832,23 @@ fn configure_spills_wide_parameter_lists_to_memory() {
 }
 
 #[test]
-fn configure_rejects_unbakeable_parameter_types_with_a_clear_message() {
+fn configure_rejects_unbakeable_parameter_types_with_a_typed_refusal() {
     let err = configure(&kit("provider-e"), &[("t", "plain")]).unwrap_err();
+    // The refusal is a typed variant carrying the parameter and the offending kind, so
+    // callers can match on it instead of substring-searching a message ...
     match &err {
-        ConfigureError::Internal(message) => {
-            assert!(
-                message.contains("cannot bake") && message.contains("variant"),
-                "unexpected message: {message}"
-            );
+        ConfigureError::UnbakeableType { name, kind } => {
+            assert_eq!(name, "t");
+            assert_eq!(kind, "variant");
         }
-        other => panic!("expected an internal not-bakeable error, got {other:?}"),
+        other => panic!("expected the typed unbakeable-type refusal, got {other:?}"),
     }
+    // ... and its rendered message still says what is and is not supported.
+    let message = format!("{err}");
+    assert!(
+        message.contains("cannot bake") && message.contains("variant"),
+        "unexpected message: {message}"
+    );
 }
 
 #[test]
@@ -922,18 +928,19 @@ fn configure_of_an_async_api_provider_is_deterministic() {
 }
 
 #[test]
-fn configure_still_rejects_resource_owning_providers_with_a_clear_error() {
+fn configure_still_rejects_resource_owning_providers_with_a_typed_refusal() {
     // fs.memfs's API interface defines its own resources (`file`, `immutable-handle`);
-    // binding it needs resource proxying in the binder, which is not implemented yet
-    // (plan/03 Decisions) -- the rejection must stay a clear, named error.
+    // binding it needs the bind-entrypoint design (plan/03 D21) -- the rejection is a
+    // typed variant whose message stays the clear, named one.
     let err = configure(&memfs_provider(), &[] as &[(&str, &str)]).unwrap_err();
-    match err {
-        ConfigureError::Internal(message) => {
+    match &err {
+        ConfigureError::UnsupportedProvider(message) => {
             assert!(
                 message.contains("defines its own resources"),
                 "unexpected message: {message}"
             );
         }
-        other => panic!("expected a clear internal error, got {other:?}"),
+        other => panic!("expected the typed unsupported-provider refusal, got {other:?}"),
     }
+    assert!(format!("{err}").contains("defines its own resources"));
 }

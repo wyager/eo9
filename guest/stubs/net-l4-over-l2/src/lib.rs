@@ -353,6 +353,11 @@ struct NetState {
     closing: Vec<SocketHandle>,
     /// Sockets currently backed by a live resource handle.
     live: usize,
+    /// Ports held by live `tcp-listener` resources. Tracked here (rather than inferred
+    /// from socket state) because a listener whose underlying socket is mid-handshake or
+    /// established-but-not-yet-accepted is *not* in the `Listen` state, yet its port is
+    /// still taken.
+    listening_ports: Vec<u16>,
 }
 
 impl NetState {
@@ -380,6 +385,7 @@ impl NetState {
             ephemeral: 49152u16.wrapping_add((seed % 16000) as u16),
             closing: Vec::new(),
             live: 0,
+            listening_ports: Vec::new(),
         }
     }
 
@@ -628,6 +634,7 @@ impl Drop for Listener {
                 n.sockets.get_mut::<tcp::Socket>(handle).abort();
                 n.sockets.remove(handle);
                 n.live = n.live.saturating_sub(1);
+                n.listening_ports.retain(|p| *p != self.local.port);
             });
         }
     }
@@ -763,15 +770,11 @@ impl l4::Guest for Stub {
             } else {
                 local.port
             };
-            for (_handle, socket) in n.sockets.iter() {
-                if let smoltcp::socket::Socket::Tcp(tcp_socket) = socket
-                    && tcp_socket.state() == tcp::State::Listen
-                    && tcp_socket
-                        .local_endpoint()
-                        .is_some_and(|ep| ep.port == port)
-                {
-                    return Err(L4Error::AddressInUse);
-                }
+            // A port is taken for as long as a listener resource holds it, whatever TCP
+            // state its current underlying socket is in (Listen, mid-handshake, or
+            // established-and-awaiting-accept).
+            if n.listening_ports.contains(&port) {
+                return Err(L4Error::AddressInUse);
             }
             let mut socket = new_tcp_socket();
             socket
@@ -779,6 +782,7 @@ impl l4::Guest for Stub {
                 .map_err(|err| L4Error::Io(format!("listen: {err:?}")))?;
             let handle = n.sockets.add(socket);
             n.live += 1;
+            n.listening_ports.push(port);
             Ok(l4::TcpListener::new(Listener {
                 handle: Cell::new(handle),
                 local: local_address(port),
@@ -804,7 +808,10 @@ impl l4::Guest for Stub {
         })?;
 
         // The socket that just went Established becomes the connection; a fresh socket
-        // takes over listening on the same port.
+        // takes over listening on the same port. After the swap there are two live
+        // resources where there was one (the connection plus the still-listening
+        // listener), so the live-socket count grows with the replacement — without this
+        // the MAX_SOCKETS bound under-counts by one per accept.
         let connection_handle = listener.handle.get();
         let port = listener.local.port;
         let replacement = with_net(|n| -> Result<SocketHandle, L4Error> {
@@ -812,7 +819,9 @@ impl l4::Guest for Stub {
             socket
                 .listen(port)
                 .map_err(|err| L4Error::Io(format!("listen: {err:?}")))?;
-            Ok(n.sockets.add(socket))
+            let handle = n.sockets.add(socket);
+            n.live += 1;
+            Ok(handle)
         })?;
         listener.handle.set(replacement);
 

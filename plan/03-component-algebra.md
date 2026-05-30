@@ -317,3 +317,17 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     string-typed workarounds in the WIT (pushes the problem into every future compound config). The eosh
     tokenizer's handling of unquoted `,` inside record/list literals should ride with whichever design is
     chosen (today only quoted forms reach the algebra unscathed).
+
+22. **The configure refusals callers need to distinguish are typed variants now (2026-05-30, branch
+    `area/15-tail-batch`).** Two refusals that had been reported through the catch-all
+    `ConfigureError::Internal(String)` — fine messages, but only matchable by substring — are their own
+    variants: `UnbakeableType { name, kind }` (a `configure` parameter whose declared type the binder cannot
+    encode; `kind` is the short kind name — "variant", "resource handle", … — the same vocabulary as
+    `kind_name`) and `UnsupportedProvider(String)` (the provider's API surface cannot be re-exported by the
+    binder: it defines its own resources, has non-freestanding functions, or trips a forwarder ABI limit —
+    the D21 class). `ensure_bakeable` now returns the short kind name instead of a prose phrase, and the
+    prose lives in the `Display` impl, essentially unchanged ("a variant value is not bakeable" became
+    "a variant is not bakeable"). The WIT surface is untouched: the runtime and the browser blob keep
+    mapping both refusals to `configure-error.internal(<the same rendered text>)` until `eo9:exec` grows
+    matching variants — recorded here as the follow-up to fold into the next exec-WIT change. `Internal`
+    remains for genuinely unexpected machinery failures only.

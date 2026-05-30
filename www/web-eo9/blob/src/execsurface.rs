@@ -465,6 +465,11 @@ fn configure_err(e: ConfigureError) -> WitConfigureError {
         ConfigureError::InvalidArgument { name, message } => {
             WitConfigureError::InvalidArgs(std::format!("`{name}`: {message}"))
         }
+        // Typed refusals whose message lives in their Display impl; the WIT surface keeps
+        // reporting them as `internal` with the same text as before they were typed.
+        err @ (ConfigureError::UnbakeableType { .. } | ConfigureError::UnsupportedProvider(_)) => {
+            WitConfigureError::Internal(std::format!("{err}"))
+        }
         ConfigureError::Internal(m) => WitConfigureError::Internal(m),
     }
 }
