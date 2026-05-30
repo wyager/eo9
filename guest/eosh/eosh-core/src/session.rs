@@ -123,6 +123,7 @@ impl<B: Backend> Session<B> {
             Command::EnvOf(expr) => self.run_env_of(&expr).await,
             Command::Exit => LineResult::Exit,
             Command::Let { name, expr } => self.run_let(name, &expr).await,
+            Command::Save { name, expr } => self.run_save(name, &expr).await,
             Command::Describe(expr) => self.run_describe(&expr, false).await,
             Command::Imports(expr) => self.run_describe(&expr, true).await,
             Command::Run(expr) => self.run_program(&expr).await,
@@ -195,6 +196,47 @@ impl<B: Backend> Session<B> {
                 LineResult::Ok
             }
             Err(err) => self.report(err),
+        }
+    }
+
+    /// `save name = expr`: evaluate to a component value and persist it to the
+    /// session's store as `/bin/<name>.wasm` (where the store is writable).
+    async fn run_save(&mut self, name: String, expr: &Expr) -> LineResult {
+        // The name becomes a store entry resolvable like any installed program: keep it
+        // to the dotted shell-name shape so it round-trips through `/bin/<name>.wasm`.
+        let name_ok = !name.is_empty()
+            && !name.starts_with('.')
+            && !name.ends_with('.')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_');
+        if !name_ok {
+            let message = format!(
+                "error: `save` refused: `{name}` is not a usable program name (letters, \
+                 digits, `-`, `_`, and interior `.` only)"
+            );
+            self.backend.print_error(&message);
+            return LineResult::Error(message);
+        }
+        let mut evaluator = Evaluator::new(&mut self.backend, &self.bindings);
+        let component = match evaluator
+            .eval_plain(expr, "a `save` command (arguments are bound at run time)")
+            .await
+        {
+            Ok(component) => component,
+            Err(err) => return self.report(err),
+        };
+        match self.backend.persist(&name, &component).await {
+            Ok(()) => {
+                self.backend
+                    .print(&format!("saved: /bin/{name}.wasm (run it as `{name}`)"));
+                LineResult::Ok
+            }
+            Err(err) => {
+                let message = format!("error: `save {name}` failed: {err}");
+                self.backend.print_error(&message);
+                LineResult::Error(message)
+            }
         }
     }
 
@@ -309,6 +351,7 @@ pub fn help_lines() -> &'static [&'static str] {
         "  rename <from> <to> $ …        relabel a capability slot",
         "  with <provider> as <slot>, …  bind providers to named slots (tuples bind positionally)",
         "  let <name> = <expr>           name a component or environment value",
+        "  save <name> = <expr>          persist a program or composition to /bin (where the store is writable)",
         "  (…)                           grouping; a parenthesized argument is passed open, not run",
         "",
         "explore the sandbox:",
@@ -318,7 +361,7 @@ pub fn help_lines() -> &'static [&'static str] {
         "  env                           what this session holds and what programs run from it receive",
         "  env <expr>                    how this session treats the expression's imports, without running it",
         "",
-        "builtins: help, env [<expr>], history, let, describe <expr>, imports <expr>, exit",
+        "builtins: help, env [<expr>], history, let, save, describe <expr>, imports <expr>, exit",
     ]
 }
 
@@ -484,6 +527,71 @@ mod tests {
         let mut session = session_with(&[("browser", binary(&[("url", "string")]))]);
         let result = run(&mut session, "let b = browser --url https://example.com");
         assert!(matches!(result, LineResult::Error(_)));
+    }
+
+    #[test]
+    fn save_persists_through_the_backend_and_reports_the_path() {
+        let mut session = session_with(&[
+            ("entropy.seeded", provider(&["eo9:entropy/entropy"])),
+            ("rng", binary(&[])),
+        ]);
+        assert_eq!(
+            run(&mut session, "save mything = entropy.seeded $ rng"),
+            LineResult::Ok
+        );
+        // The evaluated composition is what gets persisted, under the given name.
+        assert!(
+            session
+                .backend
+                .log
+                .iter()
+                .any(|line| line.starts_with("persist(mything, c")),
+            "log: {:?}",
+            session.backend.log
+        );
+        assert!(
+            session
+                .backend
+                .out
+                .iter()
+                .any(|line| line.contains("/bin/mything.wasm")),
+            "out: {:?}",
+            session.backend.out
+        );
+    }
+
+    #[test]
+    fn save_reports_the_embedders_refusal() {
+        let mut session = session_with(&[("rng", binary(&[]))]);
+        session.backend.persist_refusal = Some("this session's store is read-only".to_string());
+        let result = run(&mut session, "save mine = rng");
+        assert!(matches!(result, LineResult::Error(_)));
+        assert!(
+            session
+                .backend
+                .err
+                .iter()
+                .any(|line| line.contains("read-only")),
+            "err: {:?}",
+            session.backend.err
+        );
+    }
+
+    #[test]
+    fn save_refuses_unusable_names_before_evaluating() {
+        let mut session = session_with(&[("rng", binary(&[]))]);
+        let result = run(&mut session, "save ../escape = rng");
+        assert!(matches!(result, LineResult::Error(_)));
+        // Refused before anything was evaluated or persisted.
+        assert!(
+            !session
+                .backend
+                .log
+                .iter()
+                .any(|line| line.starts_with("persist(")),
+            "log: {:?}",
+            session.backend.log
+        );
     }
 
     #[test]

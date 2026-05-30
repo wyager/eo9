@@ -84,6 +84,8 @@ pub struct MockBackend {
     pub outcome: Outcome,
     /// The session manifest text `session_manifest` reports (settable by tests).
     pub manifest: Option<String>,
+    /// Whether `persist` succeeds (`None`) or fails with this refusal (`Some(reason)`).
+    pub persist_refusal: Option<String>,
     /// Every backend operation, one line each.
     pub log: Vec<String>,
     /// Lines printed to standard output.
@@ -105,6 +107,7 @@ impl MockBackend {
                 value: "done".to_string(),
             }),
             manifest: None,
+            persist_refusal: None,
             log: Vec::new(),
             out: Vec::new(),
             err: Vec::new(),
@@ -312,6 +315,14 @@ impl Backend for MockBackend {
     async fn wait(&mut self, task: u32) -> Outcome {
         self.log.push(format!("wait(t{task})"));
         self.outcome.clone()
+    }
+
+    async fn persist(&mut self, name: &str, component: &u32) -> Result<(), BackendError> {
+        self.log.push(format!("persist({name}, c{component})"));
+        match &self.persist_refusal {
+            Some(reason) => Err(BackendError::new(reason.clone())),
+            None => Ok(()),
+        }
     }
 
     async fn session_manifest(&mut self) -> Option<String> {

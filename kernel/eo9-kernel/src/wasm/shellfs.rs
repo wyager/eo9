@@ -11,10 +11,18 @@
 //! /session           the session manifest written by the kernel at boot (env reads it)
 //! ```
 //!
-//! Writes, creation, and removal answer `read-only`; everything else mirrors the usermode
-//! provider semantics in `crates/eo9-runtime/src/link.rs` (same WIT shapes, same
-//! owned-buffer round trip, same bounds). The `eo9:io/buffers` table is the same design as
-//! the usermode `BufferTable`, including the per-buffer and per-task byte ceilings.
+//! When the boot has a writable store disk (the `storedisk` token, plan/12 store-on-eofs),
+//! `/bin` becomes a **two-layer** view: the baked-in entries (immutable, always present,
+//! and shadowing) plus disk-resident programs saved at the shell. Creating
+//! `/bin/<name>.wasm` with `create`+`write` flags persists a program to the disk
+//! (write-through: every `write` call re-tags and commits the accumulated content, so the
+//! result the guest sees reflects the persist), and `remove` deletes disk entries; baked
+//! entries still answer `read-only`, and the write path always replaces entries wholesale
+//! (truncate-on-open semantics). Without the store disk every mutation answers `read-only`,
+//! exactly as before. Everything else mirrors the usermode provider semantics in
+//! `crates/eo9-runtime/src/link.rs` (same WIT shapes, same owned-buffer round trip, same
+//! bounds). The `eo9:io/buffers` table is the same design as the usermode `BufferTable`,
+//! including the per-buffer and per-task byte ceilings.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -29,6 +37,41 @@ use wasmtime::{Result, StoreContextMut};
 
 use super::providers::KernelState;
 use super::store::StoreEntry;
+
+/// The disk-backed half of `/bin` (the writable store layer). With the `wasm-storedisk`
+/// feature these delegate to [`super::diskcache`]; without it they compile to the empty,
+/// never-writable store, so the filesystem code below stays free of feature gates.
+mod disk {
+    #[cfg(feature = "wasm-storedisk")]
+    pub use crate::wasm::diskcache::{bin_has, bin_list, bin_read, bin_remove, bin_store, enabled};
+
+    #[cfg(not(feature = "wasm-storedisk"))]
+    mod inert {
+        use alloc::string::String;
+        use alloc::vec::Vec;
+
+        pub fn enabled() -> bool {
+            false
+        }
+        pub fn bin_list() -> Vec<String> {
+            Vec::new()
+        }
+        pub fn bin_has(_name: &str) -> bool {
+            false
+        }
+        pub fn bin_read(_name: &str) -> Option<Vec<u8>> {
+            None
+        }
+        pub fn bin_store(_name: &str, _component: &[u8]) -> Result<(), String> {
+            Err(String::from("this kernel has no writable store"))
+        }
+        pub fn bin_remove(_name: &str) -> Result<(), String> {
+            Err(String::from("this kernel has no writable store"))
+        }
+    }
+    #[cfg(not(feature = "wasm-storedisk"))]
+    pub use inert::*;
+}
 
 /// Boxed future shape for `func_wrap_concurrent` closures (same alias as the usermode
 /// runtime and the kernel root providers).
@@ -209,10 +252,24 @@ fn byte_range(size: usize, offset: u64, len: u64) -> Result<(usize, usize)> {
 
 /// What an open file handle points at.
 enum FileBacking {
-    /// `/bin/<name>.wasm`: the store entry's component bytes.
+    /// `/bin/<name>.wasm`: a baked store entry's component bytes.
     StoreComponent(usize),
     /// `/session`: the session manifest text.
     Manifest,
+    /// `/bin/<name>.wasm`: a disk-resident program's bytes (tag-verified at open).
+    DiskComponent(Vec<u8>),
+    /// `/bin/<name>.wasm` opened for writing: the accumulated content, persisted
+    /// write-through (every `write` call re-tags and commits what has accumulated).
+    DiskPending { name: String, data: Vec<u8> },
+}
+
+/// What an open immutable (exec) handle points at.
+#[derive(Clone)]
+enum ExecBacking {
+    /// A baked store entry.
+    Baked(usize),
+    /// A disk-resident program's bytes (tag-verified at open).
+    Disk(Vec<u8>),
 }
 
 /// The shell session's fs state: the store entries it serves, the session manifest, and
@@ -221,7 +278,7 @@ pub struct ShellFs {
     entries: &'static [StoreEntry],
     manifest: String,
     files: Vec<Option<FileBacking>>,
-    execs: Vec<Option<usize>>,
+    execs: Vec<Option<ExecBacking>>,
 }
 
 /// What a path names on the shell filesystem.
@@ -230,6 +287,8 @@ enum Node {
     BinDir,
     StoreComponent(usize),
     Manifest,
+    /// A disk-resident saved program (the name, without `.wasm`).
+    DiskComponent(String),
 }
 
 impl ShellFs {
@@ -254,10 +313,24 @@ impl ShellFs {
             "/session" => Some(Node::Manifest),
             _ => {
                 let name = path.strip_prefix("/bin/")?.strip_suffix(".wasm")?;
-                let index = self.entries.iter().position(|entry| entry.name == name)?;
-                Some(Node::StoreComponent(index))
+                // Baked entries shadow disk entries: the trust anchor for the standard
+                // names is the kernel image, never the disk.
+                if let Some(index) = self.entries.iter().position(|entry| entry.name == name) {
+                    return Some(Node::StoreComponent(index));
+                }
+                if disk::bin_has(name) {
+                    return Some(Node::DiskComponent(name.to_string()));
+                }
+                None
             }
         }
+    }
+
+    /// The `/bin/<name>.wasm` name a path refers to, if it is under `/bin`.
+    fn bin_name(path: &str) -> Option<&str> {
+        path.trim_end_matches('/')
+            .strip_prefix("/bin/")?
+            .strip_suffix(".wasm")
     }
 
     fn insert_file(&mut self, backing: FileBacking) -> u32 {
@@ -275,15 +348,15 @@ impl ShellFs {
         index as u32
     }
 
-    fn insert_exec(&mut self, entry: usize) -> u32 {
+    fn insert_exec(&mut self, backing: ExecBacking) -> u32 {
         let index = self.execs.iter().position(Option::is_none);
         let index = match index {
             Some(index) => {
-                self.execs[index] = Some(entry);
+                self.execs[index] = Some(backing);
                 index
             }
             None => {
-                self.execs.push(Some(entry));
+                self.execs.push(Some(backing));
                 self.execs.len() - 1
             }
         };
@@ -303,17 +376,44 @@ impl ShellFs {
     }
 
     fn open(&mut self, path: &str, flags: WitOpenFlags) -> Result<u32, WitFsError> {
-        if flags.contains(WitOpenFlags::WRITE)
+        let writing = flags.contains(WitOpenFlags::WRITE)
             || flags.contains(WitOpenFlags::CREATE)
-            || flags.contains(WitOpenFlags::TRUNCATE)
-        {
-            return Err(WitFsError::ReadOnly);
+            || flags.contains(WitOpenFlags::TRUNCATE);
+        if writing {
+            // The only writable place is `/bin/<name>.wasm` on a boot that has the store
+            // disk, and never a name the baked-in image already provides. The write path
+            // always replaces entries wholesale (truncate-on-open semantics).
+            if !disk::enabled() {
+                return Err(WitFsError::ReadOnly);
+            }
+            let Some(name) = Self::bin_name(path) else {
+                return match self.resolve(path) {
+                    Some(Node::RootDir) | Some(Node::BinDir) => Err(WitFsError::IsADirectory),
+                    Some(_) => Err(WitFsError::ReadOnly),
+                    None => Err(WitFsError::NotFound),
+                };
+            };
+            if self.entries.iter().any(|entry| entry.name == name) {
+                // Baked entries are the trust anchor; they can never be shadowed.
+                return Err(WitFsError::ReadOnly);
+            }
+            return Ok(self.insert_file(FileBacking::DiskPending {
+                name: name.to_string(),
+                data: Vec::new(),
+            }));
         }
         match self.resolve(path) {
             Some(Node::StoreComponent(index)) => {
                 Ok(self.insert_file(FileBacking::StoreComponent(index)))
             }
             Some(Node::Manifest) => Ok(self.insert_file(FileBacking::Manifest)),
+            Some(Node::DiskComponent(name)) => match disk::bin_read(&name) {
+                Some(bytes) => Ok(self.insert_file(FileBacking::DiskComponent(bytes))),
+                // Present in the listing but unreadable/unverifiable: surface as io.
+                None => Err(WitFsError::Io(format!(
+                    "the saved program `{name}` could not be read back (see the console)"
+                ))),
+            },
             Some(Node::RootDir) | Some(Node::BinDir) => Err(WitFsError::IsADirectory),
             None => Err(WitFsError::NotFound),
         }
@@ -322,7 +422,16 @@ impl ShellFs {
     fn open_exec(&mut self, path: &str) -> Result<u32, WitFsError> {
         match self.resolve(path) {
             // The store image is baked into the kernel image: immutable by construction.
-            Some(Node::StoreComponent(index)) => Ok(self.insert_exec(index)),
+            Some(Node::StoreComponent(index)) => Ok(self.insert_exec(ExecBacking::Baked(index))),
+            // A saved program is immutable-as-opened: the bytes are tag-verified and
+            // copied out of the disk store at open time; later writes replace the disk
+            // entry but never this handle's view.
+            Some(Node::DiskComponent(name)) => match disk::bin_read(&name) {
+                Some(bytes) => Ok(self.insert_exec(ExecBacking::Disk(bytes))),
+                None => Err(WitFsError::Io(format!(
+                    "the saved program `{name}` could not be read back (see the console)"
+                ))),
+            },
             Some(Node::Manifest) => Err(WitFsError::NotImmutable),
             Some(Node::RootDir) | Some(Node::BinDir) => Err(WitFsError::IsADirectory),
             None => Err(WitFsError::NotFound),
@@ -343,6 +452,15 @@ impl ShellFs {
                 kind: WitNodeKind::File,
                 size: self.manifest.len() as u64,
             }),
+            Some(Node::DiskComponent(name)) => match disk::bin_read(&name) {
+                Some(bytes) => Ok(WitNodeStat {
+                    kind: WitNodeKind::File,
+                    size: bytes.len() as u64,
+                }),
+                None => Err(WitFsError::Io(format!(
+                    "the saved program `{name}` could not be read back (see the console)"
+                ))),
+            },
             None => Err(WitFsError::NotFound),
         }
     }
@@ -350,13 +468,77 @@ impl ShellFs {
     fn list_directory(&self, path: &str) -> Result<Vec<String>, WitFsError> {
         match self.resolve(path) {
             Some(Node::RootDir) => Ok(vec!["bin".to_string(), "session".to_string()]),
-            Some(Node::BinDir) => Ok(self
-                .entries
-                .iter()
-                .map(|entry| format!("{}.wasm", entry.name))
-                .collect()),
-            Some(Node::StoreComponent(_)) | Some(Node::Manifest) => Err(WitFsError::NotADirectory),
+            Some(Node::BinDir) => {
+                let mut names: Vec<String> = self
+                    .entries
+                    .iter()
+                    .map(|entry| format!("{}.wasm", entry.name))
+                    .collect();
+                // Disk-resident programs follow the baked entries; baked names shadow.
+                for name in disk::bin_list() {
+                    if !self.entries.iter().any(|entry| entry.name == name) {
+                        names.push(format!("{name}.wasm"));
+                    }
+                }
+                Ok(names)
+            }
+            Some(Node::StoreComponent(_)) | Some(Node::Manifest) | Some(Node::DiskComponent(_)) => {
+                Err(WitFsError::NotADirectory)
+            }
             None => Err(WitFsError::NotFound),
+        }
+    }
+
+    /// Remove `/bin/<name>.wasm`. Only disk-resident programs can be removed; baked
+    /// entries and everything else stay read-only.
+    fn remove_path(&mut self, path: &str) -> Result<(), WitFsError> {
+        match self.resolve(path) {
+            Some(Node::DiskComponent(name)) => {
+                disk::bin_remove(&name).map_err(WitFsError::Io)?;
+                Ok(())
+            }
+            Some(Node::StoreComponent(_)) | Some(Node::Manifest) => Err(WitFsError::ReadOnly),
+            Some(Node::RootDir) | Some(Node::BinDir) => Err(WitFsError::IsADirectory),
+            None => Err(WitFsError::NotFound),
+        }
+    }
+
+    /// Append `data` at `offset` in a pending write and persist the accumulated content
+    /// (write-through). Returns the bytes accepted.
+    fn write_pending(&mut self, rep: u32, offset: u64, data: &[u8]) -> Result<u64, WitFsError> {
+        let backing = self
+            .files
+            .get_mut(rep as usize)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| WitFsError::Io(format!("unknown file handle {rep}")))?;
+        match backing {
+            FileBacking::DiskPending {
+                name,
+                data: pending,
+            } => {
+                let offset = usize::try_from(offset)
+                    .map_err(|_| WitFsError::Io("write offset out of range".to_string()))?;
+                if offset > pending.len() {
+                    return Err(WitFsError::Io(format!(
+                        "sparse writes are not supported (offset {offset} past the {} bytes \
+                         written so far)",
+                        pending.len()
+                    )));
+                }
+                // Overwrite any overlap, then extend.
+                let overlap = usize::min(pending.len() - offset, data.len());
+                pending[offset..offset + overlap].copy_from_slice(&data[..overlap]);
+                pending.extend_from_slice(&data[overlap..]);
+                // Write-through: persist what has accumulated, so the result the guest
+                // sees reflects whether the program is actually on the disk.
+                let name = name.clone();
+                let snapshot = pending.clone();
+                disk::bin_store(&name, &snapshot).map_err(WitFsError::Io)?;
+                Ok(data.len() as u64)
+            }
+            FileBacking::StoreComponent(_)
+            | FileBacking::Manifest
+            | FileBacking::DiskComponent(_) => Err(WitFsError::ReadOnly),
         }
     }
 
@@ -373,12 +555,15 @@ impl ShellFs {
     }
 
     fn exec_size(&self, rep: u32) -> Result<u64> {
-        let entry = self
+        let backing = self
             .execs
             .get(rep as usize)
-            .and_then(|slot| *slot)
+            .and_then(Option::as_ref)
             .ok_or_else(|| wasmtime::Error::msg(format!("unknown immutable handle {rep}")))?;
-        Ok(self.entries[entry].component.len() as u64)
+        Ok(match backing {
+            ExecBacking::Baked(entry) => self.entries[*entry].component.len() as u64,
+            ExecBacking::Disk(bytes) => bytes.len() as u64,
+        })
     }
 }
 
@@ -564,8 +749,9 @@ pub fn add_fs(linker: &mut Linker<KernelState>) -> Result<()> {
          (_cap, _path): (Resource<FsCap>, String)|
          -> ConcurrentFuture<'_, (Result<(), WitFsError>,)> {
             Box::pin(async move {
-                // The whole view is read-only; touch the accessor only to keep the shape
-                // identical to the other operations.
+                // Directory layout is fixed (`/`, `/bin`); only `/bin` entries are ever
+                // writable. Touch the accessor only to keep the shape identical to the
+                // other operations.
                 let _ = accessor;
                 Ok((Err(WitFsError::ReadOnly),))
             })
@@ -575,11 +761,13 @@ pub fn add_fs(linker: &mut Linker<KernelState>) -> Result<()> {
     fs.func_wrap_concurrent(
         "remove",
         |accessor: &Accessor<KernelState>,
-         (_cap, _path): (Resource<FsCap>, String)|
+         (_cap, path): (Resource<FsCap>, String)|
          -> ConcurrentFuture<'_, (Result<(), WitFsError>,)> {
             Box::pin(async move {
-                let _ = accessor;
-                Ok((Err(WitFsError::ReadOnly),))
+                let result = accessor.with(|mut access| -> Result<_> {
+                    Ok(access.data_mut().shell_fs()?.remove_path(&path))
+                })?;
+                Ok((result,))
             })
         },
     )?;
@@ -618,6 +806,12 @@ pub fn add_fs(linker: &mut Linker<KernelState>) -> Result<()> {
                             let dst = shell.buffers.bytes(buffer_rep)?;
                             ShellFs::read_at(source.as_bytes(), offset, dst)
                         }
+                        FileBacking::DiskComponent(bytes)
+                        | FileBacking::DiskPending { data: bytes, .. } => {
+                            let source = bytes.clone();
+                            let dst = shell.buffers.bytes(buffer_rep)?;
+                            ShellFs::read_at(&source, offset, dst)
+                        }
                     };
                     Ok(WitReadResult { bytes_read: read })
                 })?;
@@ -629,11 +823,23 @@ pub fn add_fs(linker: &mut Linker<KernelState>) -> Result<()> {
     fs.func_wrap_concurrent(
         "write",
         |accessor: &Accessor<KernelState>,
-         (_file, _offset, src): (Resource<FileRes>, u64, Resource<BufferRes>)|
+         (file, offset, src): (Resource<FileRes>, u64, Resource<BufferRes>)|
          -> ConcurrentFuture<'_, (FsWriteReturn,)> {
             Box::pin(async move {
-                let _ = accessor;
-                Ok(((Resource::new_own(src.rep()), Err(WitFsError::ReadOnly)),))
+                let buffer_rep = src.rep();
+                let result = accessor.with(|mut access| -> Result<_> {
+                    let state = access.data_mut();
+                    let shell = state
+                        .shell
+                        .as_mut()
+                        .ok_or_else(|| wasmtime::Error::msg("no shell session state"))?;
+                    // Split the borrow: copy the source bytes out of the buffer slot,
+                    // then hand them to the (write-through) pending write.
+                    let data = shell.buffers.bytes(buffer_rep)?.clone();
+                    let written = shell.fs.write_pending(file.rep(), offset, &data);
+                    Ok(written.map(|bytes_written| WitWriteResult { bytes_written }))
+                })?;
+                Ok(((Resource::new_own(buffer_rep), result),))
             })
         },
     )?;
@@ -658,20 +864,29 @@ pub fn add_fs(linker: &mut Linker<KernelState>) -> Result<()> {
                         .shell
                         .as_mut()
                         .ok_or_else(|| wasmtime::Error::msg("no shell session state"))?;
-                    let entry = shell
+                    let backing = shell
                         .fs
                         .execs
                         .get(handle.rep() as usize)
-                        .and_then(|slot| *slot)
+                        .and_then(Option::as_ref)
+                        .cloned()
                         .ok_or_else(|| {
                             wasmtime::Error::msg(format!(
                                 "unknown immutable handle {}",
                                 handle.rep()
                             ))
                         })?;
-                    let source = shell.fs.entries[entry].component;
-                    let dst = shell.buffers.bytes(buffer_rep)?;
-                    let read = ShellFs::read_at(source, offset, dst);
+                    let read = match backing {
+                        ExecBacking::Baked(entry) => {
+                            let source = shell.fs.entries[entry].component;
+                            let dst = shell.buffers.bytes(buffer_rep)?;
+                            ShellFs::read_at(source, offset, dst)
+                        }
+                        ExecBacking::Disk(bytes) => {
+                            let dst = shell.buffers.bytes(buffer_rep)?;
+                            ShellFs::read_at(&bytes, offset, dst)
+                        }
+                    };
                     Ok(WitReadResult { bytes_read: read })
                 })?;
                 Ok(((Resource::new_own(buffer_rep), Ok(result)),))
