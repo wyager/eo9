@@ -899,6 +899,16 @@ fn wait_for_intx(line: usize) -> Result<u64, WitPciError> {
     loop {
         let deliveries = crate::pci::intx_take(line);
         if deliveries > 0 {
+            // One diagnostic line per boot, the first time a wait is actually served by an
+            // interrupt delivery: evidence in every metal transcript that completions are
+            // interrupt-driven (not satisfied by the driver's pre-wait ring check).
+            static FIRST_SERVED: AtomicBool = AtomicBool::new(false);
+            if !FIRST_SERVED.swap(true, Ordering::Relaxed) {
+                crate::kprintln!(
+                    "pci: INTx delivery on line {line} served an interrupt wait \
+                     (the cpu halted instead of polling)"
+                );
+            }
             // The IRQ handler masked the line when it fired; leave it masked until the next
             // wait, after the driver has cleared the device-side cause.
             return Ok(deliveries);
