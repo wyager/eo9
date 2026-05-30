@@ -288,3 +288,31 @@ Match the priority order above; (1)+(2) unblock I2.
     integration test pins the typed refusal so the upgrade is visible when the binder learns it.
     Configure-arg baking also has no `option<…>` support, which is why the config takes exactly
     three required parameters.
+
+21. **TCP listen/accept depth: sockcheck exercises the server-side surface, and two middleware
+    accounting bugs found by inspection are fixed (2026-05-30, branch `area/15-tail-batch`).**
+    The `sockcheck` example now covers the listen/accept semantics every l4 provider must share:
+    listen is its *first* transport operation (so a denied/down link fails in the listen path —
+    pinned by a new integration test composing `sockcheck` over `net.l2.deny $ net.l4.over-l2`),
+    a duplicate bind of the listener's port must refuse with `address-in-use`, a connect to a
+    dead port must refuse with `connection-refused` (never hang), two connections queued on the
+    backlog before any accept must come back FIFO with their streams un-crossed (proved by
+    distinct payloads), and an accepted connection must be able to talk back to its client.
+    `net.l4.loopback $ sockcheck` runs all of it in-memory (`echoed(40)` for a 9-byte payload);
+    integration coverage lives in net_loopback.rs + net_l4_over_l2.rs. Three findings:
+    (a) **surfaced by the new test** — sockcheck used to bind its listener to a literal
+    `127.0.0.1`, which the loopback stub canonicalizes but the middleware refuses as
+    `address-unavailable` (it has no loopback interface), so the same program could not even
+    reach the middleware's listen path; the portable server spelling is binding the
+    *unspecified* address (0.0.0.0), which every l4 provider accepts and resolves to its own
+    local address — sockcheck now does that for TCP and UDP, and the doc comments say why.
+    Two more `net.l4.over-l2` bugs found by inspection while writing the tests (not reachable
+    without a live link, but real): (b) `accept` added its replacement listening socket without
+    incrementing the live-socket count, so the documented MAX_SOCKETS bound under-counted by one
+    per accept; (c) the `address-in-use` check inferred "port taken" from sockets in the `Listen`
+    TCP state, so a listener whose socket was mid-handshake or established-but-not-yet-accepted
+    did not count as holding its port. Listener-held ports are now tracked explicitly
+    (`listening_ports`) and released on listener drop. What is still *not* covered: the
+    middleware's happy-path listen→accept (needs a real or hairpin l2 — only the metal
+    `net.virtio` path could exercise it today), and accept-with-empty-backlog timeout semantics
+    over a live link.
