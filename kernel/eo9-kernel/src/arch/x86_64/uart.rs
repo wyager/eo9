@@ -173,6 +173,26 @@ pub fn take_ctrl_c() -> bool {
     false
 }
 
+/// Non-destructively check whether a Ctrl-C is waiting in the input ring, without consuming
+/// it (or anything before it). The wasm `eo9:pci` provider's interrupt `wait` peeks this so a
+/// console interrupt aborts a blocked device wait promptly; the *consuming* check (and the
+/// resulting kill) stays the shell's job (`take_ctrl_c` above).
+#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
+pub fn ctrl_c_pending() -> bool {
+    let head = RX_RING.head.load(Ordering::Acquire);
+    let mut i = RX_RING.tail.load(Ordering::Relaxed);
+    while i != head {
+        // SAFETY: the boot CPU is the sole consumer; this slot is published (it is before
+        // `head`, which was loaded with acquire ordering).
+        let byte = unsafe { (*RX_RING.buf.get())[i] };
+        if byte == CTRL_C {
+            return true;
+        }
+        i = (i + 1) % RX_RING_CAP;
+    }
+    false
+}
+
 /// Zero-sized serial console handle; `core::fmt::Write` goes straight to the hardware.
 pub struct Console;
 

@@ -51,6 +51,17 @@ extern "C" fn kirq() {
     if intid == 33 {
         crate::uart::drain_rx();
     }
+    // PCIe INTx (gpex SPIs 35-38 on `virt`): mask the level-sensitive line at the GIC — the
+    // device keeps asserting it until a driver clears the cause, which only happens after the
+    // wasm provider's `wait` returns — record the delivery for that `wait`, and EOI. Only the
+    // wasm-store builds route PCI interrupts (the lines are never enabled otherwise).
+    #[cfg(feature = "wasm-store")]
+    if let Some(line) = intid.checked_sub(super::pci_intx::BASE_INTID)
+        && (line as usize) < crate::pci::INTX_LINES
+    {
+        super::gic::disable_intid(intid);
+        crate::pci::intx_record(line as usize);
+    }
     super::gic::end_of_interrupt(iar);
 }
 
