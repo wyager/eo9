@@ -193,6 +193,13 @@ impl Parser {
                     let expr = self.expr()?;
                     return Ok(Command::Let { name, expr });
                 }
+                "save" => {
+                    self.next();
+                    let name = self.expect_word("a name to save under")?;
+                    self.expect_token(Token::Equals, "`=` after the saved name")?;
+                    let expr = self.expr()?;
+                    return Ok(Command::Save { name, expr });
+                }
                 "help" => return self.builtin_no_args(Command::Help),
                 "env" => {
                     // Bare `env` is the session view; `env <expr>` is the capability
@@ -826,6 +833,26 @@ mod tests {
                 name: "det-env".to_string(),
                 expr: extend(name("time.monotonic-stub"), name("virtualnet")),
             }
+        );
+    }
+
+    #[test]
+    fn save_persists_a_named_expression() {
+        let command = parse_command("save mything = entropy.seeded $ rng").expect("parses");
+        assert_eq!(
+            command,
+            Command::Save {
+                name: "mything".to_string(),
+                expr: compose(name("entropy.seeded"), name("rng")),
+            }
+        );
+        // Same `<name> = <expr>` shape as `let`.
+        assert_eq!(
+            parse_command("save x rng"),
+            Err(ParseError::UnexpectedToken {
+                found: "`rng`".to_string(),
+                expected: "`=` after the saved name",
+            })
         );
     }
 

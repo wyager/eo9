@@ -826,6 +826,25 @@ fn shell_extend_with_a_binary_names_the_offending_operand() {
 }
 
 #[test]
+fn shell_save_on_a_read_only_store_is_refused_with_guidance() {
+    // The `save` builtin persists a program to /bin where the session's store is
+    // writable (the kernel's storedisk boot). The usermode session's /bin layer is
+    // read-only, so `save` is refused with a clear pointer at the alternatives —
+    // never a trap or a partial write.
+    let store = temp_store("shell-save-readonly");
+    let run = eo9(
+        &store,
+        &["shell", "-c", "save mything = entropy.seeded $ rng"],
+    );
+    assert_eq!(run.code, 3, "stdout: {}", run.stdout);
+    assert!(
+        run.stderr.contains("read-only") && run.stderr.contains("eo9 store add"),
+        "the refusal should explain why and point at the usermode alternative: {}",
+        run.stderr
+    );
+}
+
+#[test]
 fn shell_maps_child_outcomes_to_honest_exit_codes() {
     // `-c` follows `eo9 run`'s contract: 1 the command reported failure, 2 it ended
     // abnormally, 3 the shell could not run it at all. eosh's `program-failure` carries

@@ -199,6 +199,16 @@ pub trait Backend {
     /// Wait for a task to finish and return its outcome.
     async fn wait(&mut self, task: Self::Task) -> Outcome;
 
+    /// Persist a component value under a name in the session's store
+    /// (`/bin/<name>.wasm`), where the embedder's filesystem allows writes. On a
+    /// read-only store this fails with the embedder's refusal — the shell reports it
+    /// and nothing changes.
+    async fn persist(
+        &mut self,
+        name: &str,
+        component: &Self::Component,
+    ) -> Result<(), BackendError>;
+
     /// The embedder-written session manifest (the capability picture rendered by the
     /// `env` builtin — see [`crate::envinfo`]), if one is available. The component
     /// backend reads it from the session filesystem; `None` simply means the

@@ -358,6 +358,58 @@ impl Backend for WitBackend {
         outcome_from_wit(task::wait(&task).await)
     }
 
+    async fn persist(
+        &mut self,
+        name: &str,
+        component: &Self::Component,
+    ) -> Result<(), BackendError> {
+        // The component's bytes are the algebra's own serialized form (`save`); they go
+        // to the session filesystem as `/bin/<name>.wasm`. Whether that location is
+        // writable is the embedder's call: the kernel's store-disk boot accepts it, a
+        // read-only store refuses with `read-only`, and the refusal is what the user
+        // sees.
+        let bytes = component_algebra::save(component);
+        let path = eosh_core::module_path(name);
+        let file = fs::open(
+            &self.fs,
+            path.clone(),
+            fs::OpenFlags::CREATE | fs::OpenFlags::WRITE | fs::OpenFlags::TRUNCATE,
+        )
+        .await
+        .map_err(|err| match err {
+            fs::FsError::ReadOnly => BackendError::new(
+                "this session's store is read-only (in usermode, add programs with \
+                 `eo9 store add`; on bare metal, boot with the `storedisk` disk attached)",
+            ),
+            other => BackendError::new(format!("cannot create `{path}`: {other:?}")),
+        })?;
+        let mut written: u64 = 0;
+        let total = bytes.len() as u64;
+        while written < total {
+            // Stay well under the per-buffer cap; saved components are small.
+            let end = usize::min(bytes.len(), (written + 8 * 1024 * 1024) as usize);
+            let chunk = buffer::from_bytes(&bytes[written as usize..end]);
+            let (_chunk, result) = fs::write(&file, written, chunk).await;
+            let wrote = result.map_err(|err| match err {
+                fs::FsError::ReadOnly => BackendError::new(
+                    "this session's store is read-only (in usermode, add programs with \
+                     `eo9 store add`; on bare metal, boot with the `storedisk` disk attached)",
+                ),
+                fs::FsError::Io(reason) => {
+                    BackendError::new(format!("the store refused the save: {reason}"))
+                }
+                other => BackendError::new(format!("writing `{path}` failed: {other:?}")),
+            })?;
+            if wrote.bytes_written == 0 {
+                return Err(BackendError::new(
+                    "writing the saved program ended early (zero bytes written)",
+                ));
+            }
+            written += wrote.bytes_written;
+        }
+        Ok(())
+    }
+
     async fn session_manifest(&mut self) -> Option<String> {
         // The embedder that built this session (usermode `eo9 shell`, later the kernel's
         // boot-to-shell) leaves a small manifest on the session filesystem describing

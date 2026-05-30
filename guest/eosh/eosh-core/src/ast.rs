@@ -80,6 +80,9 @@ pub enum Command {
     Empty,
     /// `let name = expr` — bind a component/environment value for the session.
     Let { name: String, expr: Expr },
+    /// `save name = expr` — persist a component value to the session's store
+    /// (`/bin/<name>.wasm`), where the store is writable.
+    Save { name: String, expr: Expr },
     /// A program expression to be composed with the shell's environment and run.
     Run(Expr),
     /// `describe <expr>` — print kind, arguments, imports, and exports.
