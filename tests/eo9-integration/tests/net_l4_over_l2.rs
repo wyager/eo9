@@ -11,7 +11,7 @@
 
 use eo9_component::{compose, configure};
 use eo9_integration::{guest, run};
-use eo9_runtime::{Outcome, Providers};
+use eo9_runtime::{NamedArg, Outcome, Providers};
 
 #[test]
 fn deny_at_l2_surfaces_through_the_middleware_as_the_programs_own_failure() {
@@ -39,6 +39,45 @@ fn deny_at_l2_surfaces_through_the_middleware_as_the_programs_own_failure() {
         Outcome::Failure(failure) => assert!(
             failure.value.to_lowercase().contains("denied"),
             "expected the link layer's refusal in the program's own failure value: {}",
+            failure.value
+        ),
+        other => panic!("expected the program's own typed failure, got {other:?}"),
+    }
+}
+
+/// The same denied-link stack, but through the middleware's *listen* path: sockcheck's
+/// first transport operation is `listen` (then `accept` would follow), so this pins that
+/// the middleware's server-side surface — not just `connect`/DNS like `l4check` — turns a
+/// dead link into the program's own typed failure rather than a hang or a trap.
+#[test]
+fn the_middlewares_listen_path_over_a_denied_link_is_refused_typed() {
+    guest::ensure_components(&[
+        "eo9-stub-entropy-seeded",
+        "eo9-stub-time-monotonic-stub",
+        "eo9-stub-net-l2-deny",
+        "eo9-stub-net-l4-over-l2",
+        "eo9-example-sockcheck",
+    ]);
+
+    let stack = compose(
+        &guest::load_stub("net.l4.over-l2"),
+        &guest::load_example("sockcheck"),
+    )
+    .expect("net.l4.over-l2 $ sockcheck");
+    let stack = compose(&guest::load_stub("net.l2.deny"), &stack).expect("net.l2.deny $ …");
+    let stack =
+        compose(&guest::load_stub("time.monotonic-stub"), &stack).expect("time.monotonic-stub $ …");
+    let stack = compose(&guest::load_stub("entropy.seeded"), &stack).expect("entropy.seeded $ …");
+
+    let outcome = run::run_component(
+        &stack,
+        &[NamedArg::new("payload", "\"ping\"")],
+        Providers::none(),
+    );
+    match outcome {
+        Outcome::Failure(failure) => assert!(
+            failure.value.to_lowercase().contains("denied"),
+            "expected the link layer's refusal out of the middleware's listen path: {}",
             failure.value
         ),
         other => panic!("expected the program's own typed failure, got {other:?}"),

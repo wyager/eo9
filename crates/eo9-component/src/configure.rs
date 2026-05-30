@@ -307,7 +307,8 @@ where
         {
             continue;
         }
-        check_forwardable(&resolve, extern_name, *id).map_err(internal)?;
+        check_forwardable(&resolve, extern_name, *id)
+            .map_err(ConfigureError::UnsupportedProvider)?;
         forward_interfaces.push((extern_name.clone(), *id));
     }
     if forward_interfaces.is_empty() {
@@ -805,11 +806,12 @@ fn parse_argument(
 ) -> Result<Value, ConfigureError> {
     let ty = resolve_alias(resolve, ty);
     if let Err(what) = ensure_bakeable(resolve, &ty) {
-        return Err(ConfigureError::Internal(format!(
-            "parameter `{name}` has a type that compose-time configuration cannot bake in \
-             yet ({what}; supported: scalars, char, string, enums, records, tuples, \
-             options, and lists of these)"
-        )));
+        // The message text lives in the Display impl; the variant carries the pieces so
+        // callers can match on the refusal instead of substring-searching it.
+        return Err(ConfigureError::UnbakeableType {
+            name: name.to_string(),
+            kind: what.to_string(),
+        });
     }
     let wave_type = wave_type(resolve, &ty).ok_or_else(|| {
         ConfigureError::Internal(format!(
@@ -842,7 +844,10 @@ fn resolve_alias(resolve: &Resolve, ty: &Type) -> Type {
 /// carries authority (handles, resources) or needs discriminant-dependent flattening
 /// beyond `option` (variants, results, flags) is rejected with a description of the
 /// offending piece.
-fn ensure_bakeable(resolve: &Resolve, ty: &Type) -> Result<(), String> {
+/// Checks that a parameter type is something compose-time configuration can bake; the
+/// `Err` is the short name of the offending kind ("variant", "resource handle", ...),
+/// which [`ConfigureError::UnbakeableType`] carries so callers can match on it.
+fn ensure_bakeable(resolve: &Resolve, ty: &Type) -> Result<(), &'static str> {
     let ty = resolve_alias(resolve, ty);
     match ty {
         Type::Bool
@@ -858,7 +863,7 @@ fn ensure_bakeable(resolve: &Resolve, ty: &Type) -> Result<(), String> {
         | Type::F64
         | Type::Char
         | Type::String => Ok(()),
-        Type::ErrorContext => Err("an error-context value is not bakeable".to_string()),
+        Type::ErrorContext => Err("error-context"),
         Type::Id(id) => match &resolve.types[id].kind {
             TypeDefKind::Enum(_) => Ok(()),
             TypeDefKind::List(element) => ensure_bakeable(resolve, element),
@@ -875,20 +880,17 @@ fn ensure_bakeable(resolve: &Resolve, ty: &Type) -> Result<(), String> {
                 }
                 Ok(())
             }
-            TypeDefKind::Variant(_) => Err("a variant value is not bakeable".to_string()),
-            TypeDefKind::Result(_) => Err("a result value is not bakeable".to_string()),
-            TypeDefKind::Flags(_) => Err("a flags value is not bakeable".to_string()),
-            TypeDefKind::Handle(_) | TypeDefKind::Resource => {
-                Err("a resource handle is not bakeable".to_string())
-            }
-            TypeDefKind::Future(_) | TypeDefKind::Stream(_) => {
-                Err("a future or stream is not bakeable".to_string())
-            }
-            TypeDefKind::Map(..) | TypeDefKind::FixedLengthList(..) => {
-                Err("a map or fixed-length list is not bakeable".to_string())
-            }
+            kind @ (TypeDefKind::Variant(_)
+            | TypeDefKind::Result(_)
+            | TypeDefKind::Flags(_)
+            | TypeDefKind::Handle(_)
+            | TypeDefKind::Resource
+            | TypeDefKind::Future(_)
+            | TypeDefKind::Stream(_)
+            | TypeDefKind::Map(..)
+            | TypeDefKind::FixedLengthList(..)) => Err(kind_name(kind)),
             TypeDefKind::Type(_) => unreachable!("aliases are resolved above"),
-            TypeDefKind::Unknown => Err("an unresolved type is not bakeable".to_string()),
+            TypeDefKind::Unknown => Err("unresolved type"),
         },
     }
 }

@@ -775,3 +775,15 @@ no page JS/CSS/HTML or blob source changed. Verified: check-web-vm ok, all four 
 and a one-off harness run confirmed `entropy.seeded & echo` at the browser prompt now names `echo` and
 suggests the `$` spelling. Few-byte drift in otherwise-unchanged components is the known checkout-path
 residue (D26).
+
+## Decision 35 — fingerprinting covers the page script/style; the manifest grows a "page" section (2026-05-30)
+
+Companion to plan/15 Decision 29 (where the caching rationale lives). `web_vm_fingerprint_plan`
+entries now carry a `keep_canonical` flag: build artifacts (blob, store images) are renamed to
+their hashed name as before; the hand-edited page sources `vm.js`/`vm.css` are *copied* so the
+canonical file remains the editable source. The fingerprint step rewrites `vm/index.html`'s
+quote-delimited references (canonical or previously-hashed → current hash; idempotent across
+rebuilds) and writes the hashed URLs under `assets.json`'s new `"page"` section, which
+`check-web-vm` covers automatically (now 20 fingerprinted assets). The blob in this rebuild also
+picks up the typed configure-error mapping in `execsurface.rs` (plan/03 D22) — behavior at the
+exec surface unchanged. All four node/JSPI harnesses pass against the rebuilt blob.
