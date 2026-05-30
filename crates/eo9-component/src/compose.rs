@@ -14,9 +14,9 @@ use alloc::vec::Vec;
 use wac_graph::types::{ItemKind, Package};
 use wac_graph::{CompositionGraph, EncodeOptions, InstantiationArgumentError, NodeId, PackageId};
 
-use crate::describe::{CONFIG_SUFFIX, OPTIONAL_SUFFIX};
+use crate::describe::{CONFIG_SUFFIX, CONFIGURED_INTERFACE, OPTIONAL_SUFFIX};
 use crate::error::ComposeError;
-use crate::{Component, ComponentKind, Wiring, externs, slots};
+use crate::{Component, ComponentKind, Wiring, externs, slots, synth};
 
 /// A non-fatal observation made while composing (SPEC.md "Composition and the `$`
 /// operator": unmatched provider exports are dropped, and the shell is expected to warn
@@ -97,7 +97,28 @@ pub fn compose_checked(
                 .collect(),
         });
     }
-    export_all(&mut graph, c_pkg, c_inst, None)?;
+
+    // The configured-entrypoint riders (`eo9:rt/configured`, see `configure`) of both
+    // operands must reach the result's exports, or the executor could never apply a
+    // nested configured provider's baked arguments. The consumer's rider flows through
+    // with its other exports; the provider's is aliased through alongside them; when
+    // both operands carry one, a merger is synthesized whose `bind` runs the provider's
+    // configuration first (a consumer-side `configure` may call through the provider's
+    // API), then the consumer's.
+    let p_bind = configured_export(&graph, p_pkg);
+    let c_bind = configured_export(&graph, c_pkg);
+    let rider_skip = [CONFIGURED_INTERFACE.to_string()];
+    let consumer_skip = if p_bind.is_some() && c_bind.is_some() {
+        Some(&rider_skip[..])
+    } else {
+        None
+    };
+    export_all(&mut graph, c_pkg, c_inst, consumer_skip)?;
+    propagate_binds(
+        &mut graph,
+        p_bind.map(|name| (p_inst, name)),
+        c_bind.map(|name| (c_inst, name)),
+    )?;
 
     let component = encode(&graph, &slot_annotations(&[provider, consumer]))?;
     let component = component.with_wiring(Wiring::Compose {
@@ -183,20 +204,43 @@ pub fn extend(base: &Component, layer: &Component) -> Result<Component, ComposeE
     )?;
 
     // Exports: everything from the layer, plus whatever the base exports that the layer
-    // does not shadow (shadowing is keyed by slot name).
-    export_all(&mut graph, y_pkg, y_inst, None)?;
+    // does not shadow (shadowing is keyed by slot name). The configured-entrypoint
+    // riders are never shadowed away: when both operands carry one they are merged
+    // (base's configuration first), exactly as `$` does -- which is what keeps the
+    // action law `(x & y) $ c = x $ y $ c` true for configured operands.
+    let x_bind = configured_export(&graph, x_pkg);
+    let y_bind = configured_export(&graph, y_pkg);
+    let both_bind = x_bind.is_some() && y_bind.is_some();
+    let rider_skip = [CONFIGURED_INTERFACE.to_string()];
+    export_all(
+        &mut graph,
+        y_pkg,
+        y_inst,
+        if both_bind {
+            Some(&rider_skip[..])
+        } else {
+            None
+        },
+    )?;
     let shadowed: Vec<String> = world_exports(&graph, y_pkg)
         .into_iter()
         .map(|(name, _)| slots::slot_name(&name).to_string())
         .collect();
     export_all(&mut graph, x_pkg, x_inst, Some(&shadowed))?;
+    if both_bind {
+        propagate_binds(
+            &mut graph,
+            x_bind.map(|name| (x_inst, name)),
+            y_bind.map(|name| (y_inst, name)),
+        )?;
+    }
 
     // Shadowing is only meaningful where the base also exported that slot; report just the
-    // base exports the layer actually overrode.
+    // base exports the layer actually overrode. The rider is bookkeeping, not an override.
     let base_slots: Vec<String> = base.meta().exports.iter().map(|e| e.slot.clone()).collect();
     let overridden: Vec<String> = shadowed
         .into_iter()
-        .filter(|slot| base_slots.contains(slot))
+        .filter(|slot| base_slots.contains(slot) && slot != CONFIGURED_INTERFACE)
         .collect();
     let component = encode(&graph, &slot_annotations(&[base, layer]))?;
     Ok(component.with_wiring(Wiring::Extend {
@@ -405,4 +449,77 @@ pub(crate) fn encode(
         .map_err(|err| ComposeError::Internal(format!("failed to restore slot names: {err}")))?;
     Component::load(bytes)
         .map_err(|err| ComposeError::Internal(format!("composition produced {err}")))
+}
+
+/// The configured-entrypoint export (`eo9:rt/configured`) of a registered package, if it
+/// carries one. Returns the full extern name (with version).
+fn configured_export(graph: &CompositionGraph, pkg: PackageId) -> Option<String> {
+    world_exports(graph, pkg)
+        .into_iter()
+        .find(|(name, kind)| {
+            matches!(kind, ItemKind::Instance(_)) && slots::slot_name(name) == CONFIGURED_INTERFACE
+        })
+        .map(|(name, _)| name)
+}
+
+/// Re-exports the operands' configured entrypoints on the result.
+///
+/// * Neither operand carries one, or only the operand whose exports `export_all`
+///   already re-exported does: nothing to do.
+/// * Only the `first` operand (the provider/base, whose exports are otherwise dropped or
+///   shadowed) carries one: alias it through.
+/// * Both carry one: synthesize the bind merger and wire `first`'s entrypoint before
+///   `second`'s -- the provider/base configuration must be applied before a
+///   consumer/layer configuration that may call through its API.
+fn propagate_binds(
+    graph: &mut CompositionGraph,
+    first: Option<(NodeId, String)>,
+    second: Option<(NodeId, String)>,
+) -> Result<(), ComposeError> {
+    let internal = |what: &str, err: alloc::string::String| {
+        ComposeError::Internal(format!("configured-entrypoint propagation ({what}): {err}"))
+    };
+    match (first, second) {
+        (Some((first_inst, first_name)), Some((second_inst, second_name))) => {
+            let merger = synth::bind_merger().map_err(|err| internal("merger synthesis", err))?;
+            let merger_pkg = register(graph, "bind-merge", &merger)?;
+            let merger_inst = graph.instantiate(merger_pkg);
+
+            let first_alias = graph
+                .alias_instance_export(first_inst, &first_name)
+                .map_err(|err| internal("first alias", err.to_string()))?;
+            graph
+                .set_instantiation_argument(merger_inst, "first", first_alias)
+                .map_err(|err| internal("first argument", err.to_string()))?;
+            let second_alias = graph
+                .alias_instance_export(second_inst, &second_name)
+                .map_err(|err| internal("second alias", err.to_string()))?;
+            graph
+                .set_instantiation_argument(merger_inst, "second", second_alias)
+                .map_err(|err| internal("second argument", err.to_string()))?;
+
+            let (merged_name, _) = world_exports(graph, merger_pkg)
+                .into_iter()
+                .find(|(name, _)| slots::slot_name(name) == CONFIGURED_INTERFACE)
+                .ok_or_else(|| {
+                    internal("merger exports", "no configured entrypoint".to_string())
+                })?;
+            let alias = graph
+                .alias_instance_export(merger_inst, &merged_name)
+                .map_err(|err| internal("merged alias", err.to_string()))?;
+            graph
+                .export(alias, &merged_name)
+                .map_err(|err| internal("merged export", err.to_string()))?;
+        }
+        (Some((inst, name)), None) => {
+            let alias = graph
+                .alias_instance_export(inst, &name)
+                .map_err(|err| internal("alias", err.to_string()))?;
+            graph
+                .export(alias, &name)
+                .map_err(|err| internal("export", err.to_string()))?;
+        }
+        _ => {}
+    }
+    Ok(())
 }

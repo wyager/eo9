@@ -928,19 +928,57 @@ fn configure_of_an_async_api_provider_is_deterministic() {
 }
 
 #[test]
-fn configure_still_rejects_resource_owning_providers_with_a_typed_refusal() {
-    // fs.memfs's API interface defines its own resources (`file`, `immutable-handle`);
-    // binding it needs the bind-entrypoint design (plan/03 D21) -- the rejection is a
-    // typed variant whose message stays the clear, named one.
-    let err = configure(&memfs_provider(), &[] as &[(&str, &str)]).unwrap_err();
-    match &err {
-        ConfigureError::UnsupportedProvider(message) => {
-            assert!(
-                message.contains("defines its own resources"),
-                "unexpected message: {message}"
-            );
-        }
-        other => panic!("expected the typed unsupported-provider refusal, got {other:?}"),
-    }
-    assert!(format!("{err}").contains("defines its own resources"));
+fn configure_binds_resource_owning_providers() {
+    // fs.memfs's API interface defines its own resources (`file`, `immutable-handle`).
+    // Under the alias + bind construction (plan/03 D21) that no longer matters: the API
+    // is re-exported by direct alias (resources keep their identity, nothing is
+    // proxied), and only the configuration call itself goes through the synthesized
+    // `eo9:rt/configured.bind` entrypoint.
+    let configured = configure(&memfs_provider(), &[] as &[(&str, &str)]).unwrap();
+    let info = configured.describe();
+
+    assert_eq!(info.kind, ComponentKind::Provider);
+    let exports = export_slots(&info);
+    assert!(exports.contains("eo9:fs/fs"), "{exports:?}");
+    assert!(!exports.contains("eo9:fs/memfs-config"), "{exports:?}");
+    assert!(
+        exports.contains("eo9:rt/configured"),
+        "the configured provider must carry the bind entrypoint: {exports:?}"
+    );
+}
+
+#[test]
+fn configured_components_carry_the_bind_entrypoint_through_composition() {
+    // The rider must survive `$` (and stay invisible to kind classification): an
+    // executor only ever sees the outermost component, so `configure(p) $ c` has to
+    // re-export p's entrypoint or the baked arguments could never be applied.
+    let configured = configure(&seeded_provider(), &[("seed", "42")]).unwrap();
+    assert!(
+        export_slots(&configured.describe()).contains("eo9:rt/configured"),
+        "{:?}",
+        export_slots(&configured.describe())
+    );
+
+    let bound = compose(&configured, &eo9_fixture("entropy-user")).unwrap();
+    assert_eq!(bound.kind(), ComponentKind::Binary);
+    assert!(
+        export_slots(&bound.describe()).contains("eo9:rt/configured"),
+        "the rider must propagate through compose: {:?}",
+        export_slots(&bound.describe())
+    );
+
+    // Both operands configured: `&` merges the two entrypoints into one.
+    let frozen = configure(
+        &frozen_provider(),
+        &[("now-seconds", "1111"), ("monotonic-ns", "2222")],
+    )
+    .unwrap();
+    let env = eo9_component::extend(&configured, &frozen).unwrap();
+    let riders = env
+        .describe()
+        .exports
+        .iter()
+        .filter(|e| e.interface == "eo9:rt/configured")
+        .count();
+    assert_eq!(riders, 1, "exactly one merged entrypoint");
 }

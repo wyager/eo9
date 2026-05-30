@@ -84,32 +84,60 @@ fn the_middlewares_listen_path_over_a_denied_link_is_refused_typed() {
     }
 }
 
-/// The middleware now ships an `eo9:net/l4-over-l2-config` entry (address, prefix length,
-/// gateway), but actually *baking* that configuration through `configure(…)` is blocked on
-/// the parked compose-time-configuration design for resource-owning API providers
-/// (plan/03 D13): `eo9:net/l4` declares its own resources, and the binder refuses such
-/// providers with a typed error today. This test pins that refusal — the configure attempt
-/// must fail with the documented message, never trap, and the unconfigured default form
-/// (the test above) must keep working. When the binder learns resource-owning providers,
-/// this test fails and gets upgraded to a behavioural one.
+/// The middleware's `eo9:net/l4-over-l2-config` (address, prefix length, gateway) bakes
+/// through `configure(…)` under the alias + bind construction (plan/03 D21): `eo9:net/l4`
+/// owning its own resources no longer matters, because the configured wrapper re-exports
+/// the API by direct alias and only the configuration call goes through the synthesized
+/// `eo9:rt/configured.bind` entrypoint. This test is the acceptance check for that design:
+/// the configured middleware composes, and the configured chain over `net.l2.deny` still
+/// surfaces the link layer's refusal as the program's own typed failure -- proving the
+/// configuration baked (and was applied at spawn) without breaking the chain.
 #[test]
-fn configuring_the_middleware_is_refused_typed_until_the_binder_learns_resource_apis() {
-    guest::ensure_components(&["eo9-stub-net-l4-over-l2"]);
+fn configuring_the_middleware_bakes_and_the_configured_chain_still_runs() {
+    guest::ensure_components(&[
+        "eo9-stub-entropy-seeded",
+        "eo9-stub-time-monotonic-stub",
+        "eo9-stub-net-l2-deny",
+        "eo9-stub-net-l4-over-l2",
+        "eo9-example-l4check",
+    ]);
 
-    let result = configure(
+    let configured = configure(
         &guest::load_stub("net.l4.over-l2"),
         &[
             ("address", "\"192.168.7.2\""),
             ("prefix-length", "24"),
             ("gateway", "\"192.168.7.1\""),
         ],
-    );
-    let message = format!(
-        "{:?}",
-        result.expect_err("configure must be refused, not baked")
-    );
+    )
+    .expect("configure(net.l4.over-l2, address/prefix/gateway) must bake under alias + bind");
+
+    // The configured provider carries the bind entrypoint and still exports l4.
+    let info = configured.describe();
+    let exports: Vec<&str> = info.exports.iter().map(|e| e.interface.as_str()).collect();
+    assert!(exports.contains(&"eo9:net/l4"), "{exports:?}");
+    assert!(exports.contains(&"eo9:rt/configured"), "{exports:?}");
     assert!(
-        message.contains("defines its own resources"),
-        "expected the documented resource-owning-provider refusal, got: {message}"
+        !exports.contains(&"eo9:net/l4-over-l2-config"),
+        "the config interface must be sealed away: {exports:?}"
     );
+
+    // The configured chain composes and runs: deny at l2 still surfaces as the program's
+    // own typed failure (the configured addressing does not change that), never a trap.
+    let stack = compose(&configured, &guest::load_example("l4check"))
+        .expect("configure(net.l4.over-l2, …) $ l4check");
+    let stack = compose(&guest::load_stub("net.l2.deny"), &stack).expect("net.l2.deny $ …");
+    let stack =
+        compose(&guest::load_stub("time.monotonic-stub"), &stack).expect("time.monotonic-stub $ …");
+    let stack = compose(&guest::load_stub("entropy.seeded"), &stack).expect("entropy.seeded $ …");
+
+    let outcome = run::run_component(&stack, &[], Providers::none());
+    match outcome {
+        Outcome::Failure(failure) => assert!(
+            failure.value.to_lowercase().contains("denied"),
+            "expected the link layer's refusal in the program's own failure value: {}",
+            failure.value
+        ),
+        other => panic!("expected the program's own typed failure, got {other:?}"),
+    }
 }

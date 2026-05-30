@@ -214,6 +214,12 @@ fn try_run(entry: &StoreEntry, args: &[(String, String)]) -> Result<String, wasm
         linker.instantiate_async(&mut store, &component),
     )??;
 
+    // Executor contract (plan/03 D21): apply compose-time configuration, if the
+    // artifact carries the `eo9:rt/configured` entrypoint, before the first entry.
+    if let Some(bind) = super::bind_entrypoint(&instance, &mut store) {
+        super::block_on("bind()", bind.call_async(&mut store, &[], &mut []))??;
+    }
+
     let main = instance
         .get_func(&mut store, "main")
         .ok_or_else(|| wasmtime::Error::msg("component does not export `main`"))?;

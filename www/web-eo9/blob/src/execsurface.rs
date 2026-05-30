@@ -703,6 +703,12 @@ fn run_child_inner(
         "child instantiation",
         linker.instantiate_async(&mut store, &component),
     )??;
+    // Executor contract (plan/03 D21): apply compose-time configuration before `main`.
+    // This is what makes `entropy.seeded --seed 43 $ rng` honor the baked seed: the
+    // composition's `eo9:rt/configured.bind` runs the provider's `configure` here.
+    if let Some(bind) = crate::store::bind_entrypoint(&mut store, &instance) {
+        block_on("child bind()", bind.call_async(&mut store, &[], &mut []))??;
+    }
     let index = instance
         .get_export_index(&mut store, None, "main")
         .ok_or_else(|| wasmtime::Error::msg("the program does not export `main`"))?;

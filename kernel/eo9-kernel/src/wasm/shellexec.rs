@@ -890,6 +890,52 @@ fn spawn_child(
             })?
     };
 
+    // Apply any compose-time configuration baked into the artifact (plan/03 D21): a
+    // configured composition exports `eo9:rt/configured`, whose parameterless `bind`
+    // runs every nested provider's `configure` with its baked constants. Executor
+    // contract: once, after instantiation, before the first entry. It shares the
+    // bounded spawn budget — configuration binds constants and must not block.
+    if let Some(bind) = super::bind_entrypoint(&instance, &mut store) {
+        let call = bind.call_async(&mut store, &[], &mut []);
+        let mut call = core::pin::pin!(call);
+        let waker = Waker::from(Arc::new(ChildWaker {
+            rung: AtomicBool::new(false),
+        }));
+        let mut cx = Context::from_waker(&waker);
+        let mut result = None;
+        for _ in 0..4096 {
+            match call.as_mut().poll(&mut cx) {
+                Poll::Ready(r) => {
+                    result = Some(r);
+                    break;
+                }
+                Poll::Pending => continue,
+            }
+        }
+        result
+            .ok_or_else(|| {
+                WitSpawnError::Internal(
+                    "compose-time configuration (`bind`) unexpectedly suspended".to_string(),
+                )
+            })?
+            .map_err(|err| {
+                if matches!(
+                    err.downcast_ref::<wasmtime::Trap>(),
+                    Some(wasmtime::Trap::OutOfFuel)
+                ) {
+                    WitSpawnError::Internal(format!(
+                        "compose-time configuration exceeded the spawn fuel budget \
+                         ({SPAWN_FUEL} fuel): `configure` must bind constants, not run \
+                         unbounded code"
+                    ))
+                } else {
+                    WitSpawnError::Internal(format!(
+                        "compose-time configuration (`bind`) failed: {err:#}"
+                    ))
+                }
+            })?;
+    }
+
     // Normal fuel regime for the child's life (usermode parity): an effectively-infinite
     // pool sliced by the fixed yield quantum, so every poll of the child runs at most
     // FUEL_QUANTUM units and then yields back to the drive loop — that slicing is what

@@ -274,3 +274,14 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
     a DNS server is deliberately not part of it (the middleware sends no DNS queries — resolvers
     live above `l4`). The browser blob registers no `eo9:disk` host functions, so it needs no
     change for these; that stays true until/unless the blob ever gains a disk provider.
+
+21. **`eo9:rt` grows `configured` — the bind entrypoint of configured components (2026-05-30, plan/03
+    D23).** `interface configured { bind: func(); }` joins `diagnostics` in wit/rt/rt.wit. Like
+    diagnostics it is runtime contract, not a capability: it grants nothing (the configuration is already
+    part of the artifact's identity), guests never import it, `only` allow-lists never name it, and kind
+    classification ignores it. It is exported (never imported) by components the algebra synthesizes:
+    `configure(provider, args)` adds it, and `$`/`&` propagate (or merge) it so the outermost component of
+    any composition carries exactly one. The executor contract: call `bind` once after instantiation,
+    before first entry. The synthesized exporters build the interface structurally (function-only
+    interfaces have no nominal identity), so the WIT file is the canonical documentation and the
+    executors' lookup name (`eo9:rt/configured@0.1.0` / `bind`) is the binding contract.

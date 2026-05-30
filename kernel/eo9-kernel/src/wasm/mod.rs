@@ -410,3 +410,16 @@ impl Wake for Doorbell {
     fn wake(self: Arc<Self>) {}
     fn wake_by_ref(self: &Arc<Self>) {}
 }
+
+/// The `eo9:rt/configured.bind` export of a configured composition, if the component
+/// carries one (see plan/03 D21 and wit/rt/rt.wit). Plain programs do not export it.
+/// The executor contract: call it once after instantiation, before the first entry into
+/// the program, so every compose-time configuration baked into the artifact is applied.
+pub(crate) fn bind_entrypoint<T>(
+    instance: &wasmtime::component::Instance,
+    store: &mut wasmtime::Store<T>,
+) -> Option<wasmtime::component::Func> {
+    let configured = instance.get_export_index(&mut *store, None, "eo9:rt/configured@0.1.0")?;
+    let bind = instance.get_export_index(&mut *store, Some(&configured), "bind")?;
+    instance.get_func(&mut *store, bind)
+}

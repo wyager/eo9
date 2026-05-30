@@ -173,7 +173,23 @@ fn instantiate(
         "instantiation",
         linker.instantiate_async(&mut store, &component),
     )??;
+    // Executor contract (plan/03 D21): apply compose-time configuration, if the artifact
+    // carries the `eo9:rt/configured` entrypoint, before the first entry into it.
+    if let Some(bind) = bind_entrypoint(&mut store, &instance) {
+        block_on("bind()", bind.call_async(&mut store, &[], &mut []))??;
+    }
     Ok((store, instance))
+}
+
+/// The `eo9:rt/configured.bind` export of a configured composition, if the component
+/// carries one (plain programs do not).
+pub(crate) fn bind_entrypoint(
+    store: &mut Store<WebState>,
+    instance: &wasmtime::component::Instance,
+) -> Option<wasmtime::component::Func> {
+    let configured = instance.get_export_index(&mut *store, None, "eo9:rt/configured@0.1.0")?;
+    let bind = instance.get_export_index(&mut *store, Some(&configured), "bind")?;
+    instance.get_func(&mut *store, bind)
 }
 
 fn top_level_func(

@@ -331,3 +331,32 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     mapping both refusals to `configure-error.internal(<the same rendered text>)` until `eo9:exec` grows
     matching variants — recorded here as the follow-up to fold into the next exec-WIT change. `Internal`
     remains for genuinely unexpected machinery failures only.
+
+23. **`configure` rebuilt on the bind-entrypoint design — alias + bind (owner approval 2026-05-30,
+    implements the D21 recommendation).** The forwarding binder is gone. `configure(provider, args)` now
+    produces: the provider's API and types exports re-exported by **direct wac alias** (no forwarding, no
+    resource proxying, zero per-call overhead, resources keep their nominal identity), the config interface
+    sealed away, and one extra export — `eo9:rt/configured` (wit/rt/rt.wit), whose parameterless `bind`
+    calls the provider's `configure` with the D20 constant arena baked into the synthesized binder's data
+    segment. `bind` is idempotent (a one-shot flag; later calls are no-ops) and traps if the provider
+    rejects a baked value, so a misconfigured composition fails before any observable behavior. The
+    executor contract gains one uniform step — after instantiation, before first entry, call `bind` if the
+    component exports it — implemented in all three executors (usermode `Task::spawn`, kernel
+    shellexec/runner, browser blob run paths). `$`/`&` propagate the entrypoint: `export_all` carries the
+    consumer/layer's rider; the provider/base's is aliased through; when **both** operands carry one, a
+    synthesized merger component (`synth::bind_merger`) imports both under inline-interface slots and
+    exports a single `bind` that runs the provider/base's configuration **first**, then the
+    consumer/layer's — the ordering that makes nested configuration sound (a consumer-side `configure` may
+    call through the provider's API) and that preserves the action law for configured operands. Kind
+    classification and `extend`'s shadowing bookkeeping treat the rider as runtime contract, not a
+    capability export (a binary carrying one is still a binary). Consequences: (a) resource-owning
+    providers configure — `pci.filtered --allow [{…}]` (a `list<device-address>`) and
+    `configure(net.l4.over-l2, address/prefix/gateway)` both bake, verified in usermode tests and on the
+    metal shell (the pci.filtered metal transcript shows exactly the allowed device); (b) the D13 caveat
+    list (async-shape limits, borrow-handling limits, variant-result limits, the >4-flat-param async limit)
+    is retired wholesale — there is nothing to forward anymore; (c) configured artifacts have a **new
+    byte shape** (same args still ⇒ byte-identical artifacts, but artifacts differ from the forwarding
+    construction's, so compile caches miss once and refill); (d) the eosh tokenizer accepts compound
+    literals in **quoted** form (`--allow "[{segment: 0, …}]"`, verified on metal); unquoted commas inside
+    record/list literals remain a tokenizer follow-up. `configure` of a provider that exports nothing but
+    its config interface is refused (there would be no API surface to apply the configuration to).
