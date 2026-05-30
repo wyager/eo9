@@ -50,6 +50,16 @@ pub(super) fn enable_source(source: u32) {
     mmio_write(enable, mmio_read(enable) | (1 << (source % 32)));
 }
 
+/// Stop forwarding one interrupt source (clear its enable bit). Used to quiet a
+/// level-sensitive PCI INTx line when it fires, until the driver has cleared the device-side
+/// cause and the wasm provider's `wait` re-arms it.
+// Only the wasm-store builds route PCI interrupts; the featureless build never masks.
+#[allow(dead_code)]
+pub(super) fn disable_source(source: u32) {
+    let enable = ENABLE_BASE + CONTEXT * ENABLE_STRIDE + (source as usize / 32) * 4;
+    mmio_write(enable, mmio_read(enable) & !(1 << (source % 32)));
+}
+
 /// Claim the highest-priority pending source for this context (0 = nothing pending). Pass
 /// the same value back to [`complete`] once it has been serviced.
 pub(super) fn claim() -> u32 {

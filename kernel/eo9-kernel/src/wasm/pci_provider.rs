@@ -16,12 +16,28 @@
 //! (the `pci.filtered` attenuator composed in front of a driver) ride on top of this root
 //! exactly as the WIT intends.
 //!
-//! Not implemented yet (drivers get `unsupported`, never a wrong answer): interrupt
-//! delivery (`enable-interrupts` / `wait` — INTx/MSI-X routing through the GIC is the next
-//! step for a real virtio driver), function-level `reset`, and I/O-space BARs (the arm64
-//! `virt` PIO window is not mapped). DMA buffers are plain kernel-heap allocations: with
-//! the identity map the CPU address *is* the bus address, and QEMU keeps DMA cache-coherent;
-//! real hardware will need non-cacheable mappings or explicit maintenance here.
+//! **Interrupt delivery (INTx).** `enable-interrupts` routes a function's legacy interrupt
+//! pin through the platform interrupt controller (the gpex lines: GIC SPIs 35-38 on aarch64
+//! `virt`, PLIC sources 0x20-0x23 on riscv64 `virt`; the standard `(slot + pin - 1) mod 4`
+//! swizzle picks the line), and `wait` blocks until a delivery arrives. The protocol with
+//! the IRQ handler: a fired line is masked at the controller (it is level-sensitive — the
+//! device keeps asserting until the driver clears the cause) and counted; `wait` re-arms
+//! (unmasks) the line when called, consumes the count when it fires, and returns with the
+//! line masked again. **`wait` blocks host-side** — on the same masked-`wfi` + timer
+//! primitives the executor's idle path uses, so the CPU sleeps rather than spinning, and a
+//! console Ctrl-C or a bound expiry aborts it — instead of suspending the calling task.
+//! That is deliberate: every existing driver chain (`fs.eofs $ disk.virtio`,
+//! `net.l4.over-l2 $ net.virtio`) drives its imports eagerly (single-poll, plan/09 D16/D18),
+//! so a `wait` that returned `Pending` would be unusable by exactly the drivers it exists
+//! for. A properly task-suspending wait (parking on the drive loop the way `time.sleep`
+//! does) becomes possible when the async disk/net bridge lands; the controller-side
+//! machinery here stays the same either way. MSI/MSI-X remain `unsupported`.
+//!
+//! Not implemented yet (drivers get `unsupported`, never a wrong answer): MSI/MSI-X,
+//! function-level `reset`, and I/O-space BARs (the arm64 `virt` PIO window is not mapped).
+//! DMA buffers are plain kernel-heap allocations: with the identity map the CPU address
+//! *is* the bus address, and QEMU keeps DMA cache-coherent; real hardware will need
+//! non-cacheable mappings or explicit maintenance here.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -48,6 +64,16 @@ const MAX_DMA_BUFFERS: usize = 64;
 /// DMA buffers are aligned to a page: enough for every virtio structure and friendly to a
 /// future IOMMU mapping path.
 const DMA_ALIGN: usize = 4096;
+
+/// How long a single `wait` call blocks for a delivery before giving up with a typed `io`
+/// error. Generous for any healthy device (QEMU completes block requests in well under a
+/// millisecond); a hung device falls back to the driver's polled path, which has its own
+/// bound. Bounded so a dead device cannot wedge the machine.
+const INTX_WAIT_BOUND_NS: u64 = 2_000_000_000;
+/// Timer backstop between `wfi` halts inside a blocked `wait`. The PCI interrupt itself (and
+/// any keystroke) wakes the halt immediately — this only bounds how stale the Ctrl-C / bound
+/// checks can get if a wake is missed.
+const INTX_WAIT_SLICE_NS: u64 = 10_000_000;
 
 // -----------------------------------------------------------------------------------------
 // Boot-time grant
@@ -77,8 +103,8 @@ struct PciCap;
 struct DeviceRes;
 /// Host representation of `eo9:pci/pci.bar`; the rep indexes the open-BAR table.
 struct BarRes;
-/// Host representation of `eo9:pci/pci.interrupt`; never instantiated yet (interrupt
-/// delivery answers `unsupported`).
+/// Host representation of `eo9:pci/pci.interrupt`; the rep indexes the interrupt-vector
+/// table.
 struct InterruptRes;
 /// Host representation of `eo9:pci/pci.dma-buffer`; the rep indexes the DMA-buffer table.
 struct DmaRes;
@@ -92,6 +118,12 @@ struct OpenDevice {
 struct OpenBar {
     base: usize,
     size: u64,
+}
+
+/// One allocated INTx vector: the gpex line the device's interrupt pin swizzles onto.
+/// The line is masked at the controller except while a `wait` is blocked on it.
+struct OpenInterrupt {
+    line: usize,
 }
 
 /// One DMA-able allocation. The page-aligned window `[offset, offset + len)` inside
@@ -140,6 +172,7 @@ impl DmaBuffer {
 pub struct PciTables {
     devices: Vec<Option<OpenDevice>>,
     bars: Vec<Option<OpenBar>>,
+    interrupts: Vec<Option<OpenInterrupt>>,
     buffers: Vec<Option<DmaBuffer>>,
 }
 
@@ -171,6 +204,13 @@ impl PciTables {
             .ok_or(WitPciError::NotFound)
     }
 
+    fn interrupt(&self, rep: u32) -> Result<&OpenInterrupt, WitPciError> {
+        self.interrupts
+            .get(rep as usize)
+            .and_then(Option::as_ref)
+            .ok_or(WitPciError::NotFound)
+    }
+
     fn buffer(&self, rep: u32) -> Result<&DmaBuffer, wasmtime::Error> {
         self.buffers
             .get(rep as usize)
@@ -194,6 +234,15 @@ impl PciTables {
     fn close_bar(&mut self, rep: u32) {
         if let Some(slot) = self.bars.get_mut(rep as usize) {
             *slot = None;
+        }
+    }
+
+    fn close_interrupt(&mut self, rep: u32) {
+        if let Some(slot) = self.interrupts.get_mut(rep as usize)
+            && let Some(vector) = slot.take()
+        {
+            // Dropping every handle disables delivery: leave the line masked.
+            crate::arch::pci_intx::mask(vector.line);
         }
     }
 
@@ -399,9 +448,14 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
             Ok(())
         },
     )?;
-    interface.resource("interrupt", ResourceType::host::<InterruptRes>(), |_, _| {
-        Ok(())
-    })?;
+    interface.resource(
+        "interrupt",
+        ResourceType::host::<InterruptRes>(),
+        |mut store: StoreContextMut<'_, KernelState>, rep| {
+            store.data_mut().pci_tables().close_interrupt(rep);
+            Ok(())
+        },
+    )?;
     interface.resource(
         "dma-buffer",
         ResourceType::host::<DmaRes>(),
@@ -688,25 +742,65 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
         },
     )?;
 
-    // --- interrupts (not wired to the GIC yet: honest `unsupported`) -------------------------
+    // --- interrupts (INTx through the platform interrupt controller) -------------------------
 
     interface.func_wrap_concurrent(
         "enable-interrupts",
-        |_accessor: &Accessor<KernelState>,
-         (_device, _kind, _count): (Resource<DeviceRes>, WitInterruptKind, u32)|
+        |accessor: &Accessor<KernelState>,
+         (device, kind, count): (Resource<DeviceRes>, WitInterruptKind, u32)|
          -> ConcurrentFuture<'_, (Result<Vec<Resource<InterruptRes>>, WitPciError>,)> {
-            Box::pin(async move { Ok((Err(WitPciError::Unsupported),)) })
+            Box::pin(async move {
+                let result = accessor.with(|mut access| {
+                    let tables = access.data_mut().pci_tables();
+                    let address = tables.device(device.rep())?.address;
+                    // Only legacy INTx is routed; MSI/MSI-X need a message-address allocator
+                    // (GICv2m / the PLIC has no MSI path without AIA) and stay unsupported.
+                    if !matches!(kind, WitInterruptKind::Intx) || !crate::arch::pci_intx::WIRED {
+                        return Err(WitPciError::Unsupported);
+                    }
+                    // "Allocate up to `count`": intx allocates exactly one; zero means none.
+                    if count == 0 {
+                        return Ok(Vec::new());
+                    }
+                    // The function must actually have an interrupt pin (0 = none), and its
+                    // INTx output must not be disabled at the command register.
+                    let pin = pci::interrupt_pin(address).ok_or(WitPciError::OutOfRange)?;
+                    if pin == 0 || pin > 4 {
+                        return Err(WitPciError::Unsupported);
+                    }
+                    if !pci::enable_intx_output(address) {
+                        return Err(WitPciError::Io(String::from(
+                            "command register write failed",
+                        )));
+                    }
+                    // The standard swizzle picks which host-bridge line this pin lands on.
+                    // The line starts (and stays) masked at the controller; `wait` unmasks it
+                    // for exactly the time it is waiting.
+                    let line = pci::intx_line(address, pin);
+                    let rep = PciTables::insert(&mut tables.interrupts, OpenInterrupt { line });
+                    Ok(alloc::vec![Resource::new_own(rep)])
+                });
+                Ok((result,))
+            })
         },
     )?;
 
     interface.func_wrap_concurrent(
         "wait",
-        |_accessor: &Accessor<KernelState>,
-         (_interrupt,): (Resource<InterruptRes>,)|
+        |accessor: &Accessor<KernelState>,
+         (interrupt,): (Resource<InterruptRes>,)|
          -> ConcurrentFuture<'_, (Result<u64, WitPciError>,)> {
-            // No interrupt vector can exist yet (`enable-interrupts` is unsupported), so a
-            // `wait` call can only be reached with a forged handle.
-            Box::pin(async move { Ok((Err(WitPciError::Unsupported),)) })
+            Box::pin(async move {
+                let line = accessor.with(|mut access| {
+                    access
+                        .data_mut()
+                        .pci_tables()
+                        .interrupt(interrupt.rep())
+                        .map(|vector| vector.line)
+                });
+                let result = line.and_then(wait_for_intx);
+                Ok((result,))
+            })
         },
     )?;
 
@@ -782,6 +876,60 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+/// Block until the gpex line `line` delivers an interrupt, the console interrupts the wait
+/// (Ctrl-C), or the wait bound expires. Returns the number of deliveries consumed (>= 1).
+///
+/// Protocol with the IRQ handler (the arch `kirq`/`ktrap`): the line is unmasked here, so a
+/// pending or future level-triggered assert is forwarded; when it fires, the handler masks
+/// the line (the device keeps asserting until the driver clears its cause) and bumps the
+/// delivery counter; this loop consumes the counter and returns with the line still masked.
+/// The next `wait` — after the driver has cleared the cause (e.g. read virtio's ISR
+/// register) — unmasks again.
+///
+/// The block happens *host-side*, halting the core in the same masked-`wfi` + timer step the
+/// executor's idle path uses (`timer::wait_for_interrupt`), so the CPU sleeps instead of
+/// spinning host calls. The PCI interrupt, a keystroke (UART RX), and the timer slice all
+/// wake the halt; each wake re-checks the counter, the console, and the bound. See the
+/// module docs for why this blocks rather than suspending the calling task.
+fn wait_for_intx(line: usize) -> Result<u64, WitPciError> {
+    crate::arch::pci_intx::unmask(line);
+    let deadline = crate::timer::uptime_ns().saturating_add(INTX_WAIT_BOUND_NS);
+    loop {
+        let deliveries = crate::pci::intx_take(line);
+        if deliveries > 0 {
+            // One diagnostic line per boot, the first time a wait is actually served by an
+            // interrupt delivery: evidence in every metal transcript that completions are
+            // interrupt-driven (not satisfied by the driver's pre-wait ring check).
+            static FIRST_SERVED: AtomicBool = AtomicBool::new(false);
+            if !FIRST_SERVED.swap(true, Ordering::Relaxed) {
+                crate::kprintln!(
+                    "pci: INTx delivery on line {line} served an interrupt wait \
+                     (the cpu halted instead of polling)"
+                );
+            }
+            // The IRQ handler masked the line when it fired; leave it masked until the next
+            // wait, after the driver has cleared the device-side cause.
+            return Ok(deliveries);
+        }
+        if crate::uart::ctrl_c_pending() {
+            crate::arch::pci_intx::mask(line);
+            return Err(WitPciError::Io(String::from(
+                "the interrupt wait was interrupted from the console",
+            )));
+        }
+        if crate::timer::uptime_ns() > deadline {
+            crate::arch::pci_intx::mask(line);
+            return Err(WitPciError::Io(String::from(
+                "no interrupt delivery within the wait bound",
+            )));
+        }
+        // Halt until an interrupt is pending: the PCI line itself, a keystroke, or the timer
+        // backstop. Masked-`wfi` semantics (a pending-but-masked IRQ still wakes the halt)
+        // close the lost-wakeup window between the checks above and the halt.
+        crate::timer::wait_for_interrupt(INTX_WAIT_SLICE_NS);
+    }
 }
 
 /// Bounds check for a BAR register access: `offset + width` must stay inside the window.
