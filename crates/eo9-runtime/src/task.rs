@@ -497,6 +497,49 @@ impl Task {
                 })?
         };
 
+        // A configured composition exports the `eo9:rt/configured` entrypoint (plan/03
+        // D21, SPEC "The capability algebra"): its parameterless `bind` applies every
+        // compose-time configuration baked into the artifact. The executor contract is
+        // to call it once, after instantiation and before the first entry into the
+        // program. It runs under the same bounded spawn budget as instantiation --
+        // configuration binds constants and must not block or do unbounded work.
+        if let Some(bind) = bind_entrypoint(&instance, &mut store) {
+            let call = bind.call_async(&mut store, &[], &mut []);
+            let mut call = std::pin::pin!(call);
+            let waker = Waker::from(doorbell.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut result = None;
+            for _ in 0..1024 {
+                match call.as_mut().poll(&mut cx) {
+                    Poll::Ready(r) => {
+                        result = Some(r);
+                        break;
+                    }
+                    Poll::Pending if doorbell.take() => continue,
+                    Poll::Pending => break,
+                }
+            }
+            result
+                .ok_or_else(|| {
+                    SpawnError::Internal(
+                        "configuration (`bind`) unexpectedly suspended".to_string(),
+                    )
+                })?
+                .map_err(|err| {
+                    if matches!(err.downcast_ref::<Trap>(), Some(Trap::OutOfFuel)) {
+                        SpawnError::Internal(format!(
+                            "compose-time configuration exceeded the spawn fuel budget \
+                             ({SPAWN_FUEL} fuel): `configure` must bind constants, not run \
+                             unbounded code"
+                        ))
+                    } else {
+                        SpawnError::Internal(format!(
+                            "compose-time configuration (`bind`) failed: {err:#}"
+                        ))
+                    }
+                })?;
+        }
+
         // Normal fuel regime for the task's life: an effectively-infinite pool sliced by
         // the fixed yield quantum. Both must be configured before the drive future takes
         // ownership of the store.
@@ -731,4 +774,16 @@ impl Task {
     pub fn unspent_fuel(&self) -> u64 {
         self.carried_fuel
     }
+}
+
+/// The `eo9:rt/configured.bind` export of a configured composition, if the component
+/// carries one (see `eo9-component::configure` and wit/rt/rt.wit). Components without
+/// compose-time configuration -- every plain program -- simply do not export it.
+fn bind_entrypoint<T>(
+    instance: &wasmtime::component::Instance,
+    store: &mut Store<T>,
+) -> Option<wasmtime::component::Func> {
+    let configured = instance.get_export_index(&mut *store, None, "eo9:rt/configured@0.1.0")?;
+    let bind = instance.get_export_index(&mut *store, Some(&configured), "bind")?;
+    instance.get_func(&mut *store, bind)
 }
