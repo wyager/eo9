@@ -168,3 +168,20 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
     accurate left-operand wording. Cost: two metadata-only `describe` calls per `&` evaluation. Covered by
     eosh-core unit tests (right/left/both/configured-operand cases) and a CLI transcript; the
     eo9-component-level behaviour was already pinned by `algebra_properties`.
+
+16. **The `save` builtin: persist a program or composition to the session's store (2026-05-30, branch
+    `area/12-writable-bin`).** `save <name> = <expr>` parses exactly like `let` (same `<name> = <expr>`
+    shape), evaluates the expression with compose-time arguments only (run-time arguments are refused, as
+    for `let`), and asks the backend to persist the component value as `/bin/<name>.wasm`. The Backend trait
+    gains one method — `persist(name, &component)` — implemented by the WIT backend as algebra `save` (the
+    bytes) + an ordinary `eo9:fs` `open(create|write|truncate)` + `write`: **no new WIT**. Where the
+    embedder's store is writable (the kernel's `storedisk` boot) the program lands on disk and resolves like
+    any installed name, including for children and after reboots; on a read-only store (usermode, the
+    browser page, metal without the disk) the embedder's `read-only` refusal is reported with pointers at
+    the alternatives (`eo9 store add` in usermode, the `storedisk` boot on metal). Names are validated to
+    the dotted shell-name shape *before* anything is evaluated. `help` lists the builtin; eosh-core covers
+    parse/persist/refusal/bad-name in unit tests; a CLI transcript pins the usermode refusal text. The
+    browser page ships an older eosh until its next asset rebuild; once it picks this up, whether a saved
+    name is resolvable there (the blob's MemFs serves /bin and accepts writes, but nothing persists across a
+    reload) should be verified and the page copy adjusted — recorded as a web follow-up, not a kernel
+    concern.

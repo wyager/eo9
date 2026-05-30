@@ -1334,3 +1334,49 @@ preemption/hardening work.
       the disk, surfaced under /bin), VIRTIO_BLK_F_FLUSH for commit durability, eviction/space management for
       the cache directory, riscv64/x86_64 enablement once their PCI bring-up exists, and the
       kernel-claims-vs-guest-claims arbitration (machine-global device claiming).
+
+59. **A writable /bin on metal: shell-saved programs persist on the store disk (2026-05-30, branch
+    `area/12-writable-bin`) — store-on-eofs, second rung.** On a `storedisk` boot, `/bin` is now a
+    **two-layer** view: the baked-in store image (immutable, always shadowing) plus disk-resident programs
+    saved at the shell. `save <name> = <expr>` in eosh (plan/10 D16) evaluates the expression and writes the
+    component's algebra-serialized bytes to `/bin/<name>.wasm` through the ordinary `eo9:fs` capability — no
+    new WIT. Pieces and choices:
+    - **shellfs** (`wasm/shellfs.rs`): `open` with `create`/`write`/`truncate` flags is accepted only for
+      `/bin/<name>.wasm`, only when the store disk is mounted, and never for a baked name (those answer
+      `read-only` — the kernel image stays the trust anchor for the standard names). Writes are
+      **write-through**: every `write` call re-tags and commits the accumulated content, so the result the
+      guest sees reflects whether the program is actually on disk (no destructor-swallowed failures). The
+      write path always replaces entries wholesale (truncate-on-open semantics). `remove` deletes
+      disk-resident entries (so `rm /bin/<name>.wasm` works); listings, stat, open, and open-exec serve both
+      layers; resolution order is baked-then-disk. Without the `wasm-storedisk` feature (riscv64/x86_64,
+      featureless CI) a module-local inert shim keeps the code identical and every mutation answers
+      `read-only` exactly as before.
+    - **diskcache** (`wasm/diskcache.rs`): saved programs live under `/bin` on the eofs disk with the **same
+      keyed-tag entry format** as the compile cache (magic ‖ length ‖ keyed-blake3 tag ‖ payload), tag key
+      `bin/<name>` so a `/bin` entry can never be replayed as a `/cache` entry or under another name.
+      Component bytes are wasm (the compiler validates them), but the tag still matters: without it, someone
+      who can rewrite disk blocks could swap what a saved name resolves to — e.g. replace an
+      `only`-attenuated composition with an unattenuated one. Saved programs are capped at 4 MiB; names are
+      validated (dotted shell-name shape) on every operation.
+    - **Spawn path**: a saved program resolves through the existing fs open-exec → algebra load → on-target
+      compile path, so the compile cache (D58) gives saved compositions ~2 ms reboot-warm starts for free —
+      `save` + the cache together are what make the metal shell feel installed rather than ephemeral.
+    - **rm joins the baked store** (xtask `KERNEL_STORE_COMPONENTS`, store now 22 entries): it completes the
+      lifecycle (`save` → `ls /bin` → run → `rm /bin/<name>.wasm`); on baked names it is inert (read-only
+      refusal). All three architecture demos re-verified with the grown store.
+    - **Acceptance transcript (QEMU aarch64, `storedisk` boot)**: `save frozen-hello = time.frozen
+      --now-seconds 5 --monotonic-ns 0 $ hello` → `saved: /bin/frozen-hello.wasm`; `ls /bin` → 23 entries;
+      `frozen-hello --name saved --excited true` → compile cache miss (1.7 s) → `[5.000000000] Hello,
+      saved!`; **full QEMU power cycle** → `eofs mounted (txg 3), 1 cached compile artifact(s), 1 saved
+      program(s)`; `frozen-hello --name reboot2 --excited true` → cache hit (677 KiB in 2.1 ms) → correct
+      output; `rm /bin/frozen-hello.wasm` → removed, `ls /bin` back to 22, resolution now NotFound;
+      `rm /bin/hello.wasm` → `read-only` (baked names protected).
+    - **Containment note**: the disk `/bin` is writable session-wide — any program granted `eo9:fs` can
+      create or remove disk entries, mirroring usermode's writable `--fs-root` layer. Writing a file never
+      executes it (running a saved name still goes through resolve → load → compile → spawn under the
+      session's grants), and the baked layer cannot be shadowed or removed. The store disk remains
+      kernel-claimed and is never exposed to guests as a raw disk.
+    - **Remaining for later rungs**: eviction/space management for both `/cache` and `/bin`,
+      VIRTIO_BLK_F_FLUSH durability, riscv64/x86_64 enablement (needs their PCI bring-up in the kernel's
+      claiming path), and surfacing disk-vs-baked provenance in listings (`ls /bin` shows both layers
+      undifferentiated today; the session manifest carries the layering note instead).

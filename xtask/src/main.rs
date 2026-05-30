@@ -144,6 +144,10 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-coreutil-wc", "wc"),
     ("eo9-coreutil-head", "head"),
     ("eo9-coreutil-stat", "stat"),
+    // rm completes the writable-store lifecycle on a `storedisk` boot: programs saved at
+    // the shell (`save <name> = <expr>`) are removed with `rm /bin/<name>.wasm`. Baked
+    // entries refuse removal (read-only), so rm on the standard names is inert.
+    ("eo9-coreutil-rm", "rm"),
 ];
 
 fn main() -> ExitCode {
