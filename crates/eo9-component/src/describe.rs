@@ -26,6 +26,12 @@ pub(crate) const CONFIG_SUFFIX: &str = "-config";
 /// The entry point of a `*-config` interface.
 pub(crate) const CONFIGURE: &str = "configure";
 
+/// The interface name of the configuration entrypoint configured components export
+/// (`wit/rt/rt.wit`). It is runtime contract, not a capability: kind classification
+/// ignores it (a binary that carries one is still a binary), composition propagates it,
+/// and executors call its `bind` once after instantiation.
+pub(crate) const CONFIGURED_INTERFACE: &str = "eo9:rt/configured";
+
 /// Slot-level metadata for one import of a component.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImportMeta {
@@ -168,7 +174,14 @@ impl Meta {
                 ));
             }
             (Some(main), None) => {
-                if !exports.is_empty() {
+                // The configured-entrypoint rider (`eo9:rt/configured`) does not count:
+                // it is runtime contract a composition carries so the executor can apply
+                // baked configuration, not a capability export.
+                let capability_exports = exports
+                    .iter()
+                    .filter(|e| e.interface != CONFIGURED_INTERFACE)
+                    .count();
+                if capability_exports != 0 {
                     return Err(LoadError::NotAnEo9Module(
                         "exports both `main` and interfaces; a module is a binary or a provider, \
                          never both"

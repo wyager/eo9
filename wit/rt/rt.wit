@@ -23,3 +23,27 @@ interface diagnostics {
     /// over-long messages. Calling this and then not trapping has no observable effect.
     report-panic: func(message: string);
 }
+
+/// The configuration entrypoint of a configured component.
+///
+/// `configure(provider, args)` (SPEC "The capability algebra") re-exports the provider's
+/// API interfaces unchanged — direct aliases, the algebra never interposes on the call
+/// path — and adds exactly one extra export: this interface, whose parameterless `bind`
+/// invokes the provider's own `configure` with the constants baked into the artifact at
+/// compose time. `$` and `&` propagate the export through every composition (merging the
+/// two operands' entrypoints into one when both carry it, provider's first), so the
+/// outermost component of any composition reaches every nested configured provider.
+///
+/// The executor contract gains one uniform step: after instantiating a component and
+/// before the first entry into it, call `bind` if the component exports this interface.
+/// Like `diagnostics`, this is runtime contract, not a capability: it grants nothing
+/// (the configuration is already part of the artifact's identity), guests never import
+/// it, and `only` allow-lists never need to name it.
+interface configured {
+    /// Apply the configuration baked into this component.
+    ///
+    /// Idempotent: the first call wins, later calls are no-ops. A configuration the
+    /// provider rejects (an invalid baked value) traps, so a misconfigured composition
+    /// fails before any of its observable behavior runs.
+    bind: func();
+}
