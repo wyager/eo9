@@ -86,3 +86,10 @@ usermode binary's fs mapping), 12 (store image).
     convention: blake3 of the exact bytes handed to the compiler. If/when the metal store grows shell-visible
     bindings (a real writable /bin), revisiting whether `eo9-store`'s manifest format should be shared is the
     first design question.
+15. **The metal store's shell-visible bindings need no manifest format (2026-05-30).** The D14 design
+    question — whether `eo9-store`'s manifest format should be shared once the metal store grows a writable
+    /bin — is answered: no. On the store disk, the entry's filename (`/bin/<name>.wasm`) *is* the binding;
+    there is no separate name→hash indirection because eofs already content-addresses blocks internally and
+    the keyed entry tag binds the name to the bytes (plan/12 D59). `eo9-store`'s manifest/profile machinery
+    stays a usermode concern. The two stores now mirror each other's user-visible contract (named programs,
+    add/remove, survive restarts) with implementations native to their environments.
