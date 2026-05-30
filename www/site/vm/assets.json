@@ -1,5 +1,9 @@
 {
-  "blob": "/vm/web-eo9.563c4cb367d769bf.wasm",
+  "blob": "/vm/web-eo9.4305bc346068eeba.wasm",
+  "page": {
+    "vm.js": "/vm/vm.8bf34611775c0ddf.js",
+    "vm.css": "/vm/vm.2a6a37de057ae53d.css"
+  },
   "store": {
     "cat": "/vm/store/cat.3388dd110fee6cb1.cwasm",
     "cp": "/vm/store/cp.f102f6a713dddd5e.cwasm",

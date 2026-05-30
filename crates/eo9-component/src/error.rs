@@ -113,8 +113,22 @@ pub enum ConfigureError {
         /// What went wrong.
         message: String,
     },
-    /// An unexpected failure in the underlying synthesis/wiring machinery, or a
-    /// configuration signature this implementation cannot bake in yet.
+    /// A parameter of `configure` has a type that compose-time configuration cannot bake
+    /// into the artifact (variants, results, flags, handles, futures/streams, maps,
+    /// fixed-length lists). Distinct from [`Self::InvalidArgument`]: the *value* may be
+    /// fine — the parameter's declared *type* is what the binder cannot encode.
+    UnbakeableType {
+        /// The parameter name.
+        name: String,
+        /// The unbakeable type kind ("variant", "resource handle", ...).
+        kind: String,
+    },
+    /// The provider's API surface cannot be re-exported by the configuration binder —
+    /// it defines its own resources, has non-freestanding functions, or uses an ABI
+    /// shape the forwarders cannot carry. Configuring such a provider needs the
+    /// bind-entrypoint design (plan/03 D21), not different arguments.
+    UnsupportedProvider(String),
+    /// An unexpected failure in the underlying synthesis/wiring machinery.
     Internal(String),
 }
 
@@ -134,6 +148,13 @@ impl fmt::Display for ConfigureError {
             Self::InvalidArgument { name, message } => {
                 write!(f, "invalid argument `{name}`: {message}")
             }
+            Self::UnbakeableType { name, kind } => write!(
+                f,
+                "parameter `{name}` has a type that compose-time configuration cannot bake \
+                 in yet (a {kind} is not bakeable; supported: scalars, char, string, enums, \
+                 records, tuples, options, and lists of these)"
+            ),
+            Self::UnsupportedProvider(msg) => write!(f, "{msg}"),
             Self::Internal(msg) => write!(f, "internal configure error: {msg}"),
         }
     }
