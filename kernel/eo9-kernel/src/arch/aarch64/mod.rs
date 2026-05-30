@@ -28,6 +28,36 @@ pub(crate) mod pci_map {
     pub(crate) const MMIO_END: usize = 0x3eff_0000;
 }
 
+/// PCI INTx delivery on this machine: the gpex host bridge's four legacy interrupt lines
+/// land on GIC SPIs 35-38 (`virt`'s irqmap entry 3 + the SPI base 32), level-sensitive.
+/// The IRQ handler (`exceptions::kirq`) masks a fired line and records it via
+/// `crate::pci::intx_record`; the wasm provider's `wait` consumes the count and unmasks
+/// through these functions. Consumed by `src/wasm/pci_provider.rs` (wasm-store builds only).
+#[cfg(feature = "wasm-store")]
+pub(crate) mod pci_intx {
+    /// GIC INTID of gpex line 0; lines 1-3 follow consecutively.
+    pub(crate) const BASE_INTID: u32 = 35;
+    /// Whether this architecture routes PCI interrupts at all (the provider answers
+    /// `unsupported` to `enable-interrupts` where it does not).
+    pub(crate) const WIRED: bool = true;
+
+    fn intid(line: usize) -> u32 {
+        BASE_INTID + (line % crate::pci::INTX_LINES) as u32
+    }
+
+    /// Unmask one gpex line at the GIC so a pending or future level-triggered assert is
+    /// delivered (and wakes a `wfi`).
+    pub(crate) fn unmask(line: usize) {
+        super::gic::configure_intid(intid(line));
+        super::gic::enable_intid(intid(line));
+    }
+
+    /// Mask one gpex line at the GIC.
+    pub(crate) fn mask(line: usize) {
+        super::gic::disable_intid(intid(line));
+    }
+}
+
 /// Boot banner: machine identification, exception level, timer frequency, wall clock.
 pub(crate) fn banner() {
     crate::kprintln!();
