@@ -349,22 +349,24 @@ pub fn content_type(path: &Path) -> &'static str {
     }
 }
 
-/// Is this a content-fingerprinted immutable asset (`name.<16-hex>.wasm` / `.cwasm`)?
+/// Is this a content-fingerprinted immutable asset (`name.<16-hex>.wasm` / `.cwasm` /
+/// `.js` / `.css`)?
 ///
 /// The web-VM build (`cargo xtask fingerprint-web-vm`) renames the large immutable assets —
-/// the wasm blob and the Pulley `.cwasm` store images — to carry a hash of their contents in
-/// the filename, and points the page at them through `vm/assets.json`. The URL therefore *is*
-/// the version: a different build yields a different URL, so these can be cached forever and
-/// never revalidated, and the server never hashes their bodies on the request path. The check
-/// is a cheap filename test (no I/O, no hashing): the stem's final dot-segment is exactly 16
-/// lowercase hex digits and the extension is one we fingerprint.
+/// the wasm blob and the Pulley `.cwasm` store images — and copies the page's own script and
+/// style to carry a hash of their contents in the filename, and points the page at them
+/// (through `vm/assets.json` for the wasm, directly from `index.html` for the script/style).
+/// The URL therefore *is* the version: a different build yields a different URL, so these can
+/// be cached forever and never revalidated, and the server never hashes their bodies on the
+/// request path. The check is a cheap filename test (no I/O, no hashing): the stem's final
+/// dot-segment is exactly 16 lowercase hex digits and the extension is one we fingerprint.
 pub fn is_fingerprinted(path: &Path) -> bool {
     let extension = path
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
-    if !matches!(extension.as_str(), "wasm" | "cwasm") {
+    if !matches!(extension.as_str(), "wasm" | "cwasm" | "js" | "css") {
         return false;
     }
     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -390,7 +392,8 @@ pub fn is_fingerprinted(path: &Path) -> bool {
 ///   whenever their bytes do, so they get a one-year lifetime plus `immutable` — Cloudflare and
 ///   browsers hold them indefinitely and never revalidate, and a new OS build simply produces a
 ///   new URL (nothing to purge). These are the only files that may be cached past a deploy.
-/// - Every *mutable-in-place* text asset — HTML, scripts, styles, the `assets.json` manifest,
+/// - Every *mutable-in-place* text asset — HTML, the `assets.json` manifest, un-hashed
+///   scripts/styles (the editable sources; the page references their fingerprinted copies),
 ///   and any non-fingerprinted wasm (a dev build before fingerprinting) — is served `no-cache`:
 ///   caches may store it but must revalidate before reuse, so a deploy is visible on the next
 ///   request with no purge. The strong [`etag`] makes that revalidation a bodiless 304 whenever
@@ -657,6 +660,16 @@ mod tests {
             cache_control(Path::new("vm/store/hello.5afedde1cf4b36c8.cwasm")),
             "public, max-age=31536000, immutable"
         );
+        // The page's hashed script/style copies are immutable too; their canonical
+        // (editable) sources above stay no-cache.
+        assert_eq!(
+            cache_control(Path::new("vm/vm.3872dc3f251945ac.js")),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            cache_control(Path::new("vm/vm.3872dc3f251945ac.css")),
+            "public, max-age=31536000, immutable"
+        );
     }
 
     #[test]
@@ -679,8 +692,13 @@ mod tests {
         assert!(!is_fingerprinted(Path::new(
             "vm/web-eo9.notarealhash16x.wasm"
         )));
-        assert!(!is_fingerprinted(Path::new("app.3872dc3f251945ac.js")));
         assert!(!is_fingerprinted(Path::new("3872dc3f251945ac.wasm")));
+        // Hashed page scripts/styles count as fingerprinted; their canonical sources do not.
+        assert!(is_fingerprinted(Path::new("app.3872dc3f251945ac.js")));
+        assert!(is_fingerprinted(Path::new("vm/vm.3872dc3f251945ac.css")));
+        assert!(!is_fingerprinted(Path::new("vm/vm.js")));
+        assert!(!is_fingerprinted(Path::new("vm/vm.css")));
+        assert!(!is_fingerprinted(Path::new("vm/selftest.js")));
     }
 
     #[test]

@@ -266,7 +266,8 @@ COMMANDS:
                          bytes (runs automatically at the end of the build-web-* commands;
                          commit the result; ci does not need it)
     fingerprint-web-vm   Rename the /vm immutable assets (the wasm blob and .cwasm store
-                         images) to carry a content hash, write vm/assets.json, and drop the
+                         images) and copy the page script/style (vm.js/vm.css) to carry a
+                         content hash, write vm/assets.json, and drop the
                          old siblings — so they can be cached forever and a rebuild changes the
                          URL (runs automatically inside build-web-vm; commit the result)
     check-web-vm         Verify vm/assets.json matches the committed fingerprinted /vm assets
@@ -909,11 +910,29 @@ fn blob_remap_rustflags(root: &Path) -> OsString {
     flags
 }
 
-/// The `/vm` immutable assets that get content-fingerprinted: the wasm blob and every Pulley
-/// `.cwasm` store image. Their URLs become the version, so they can be cached forever.
-fn web_vm_fingerprint_plan(site_dir: &Path) -> Result<Vec<(PathBuf, String)>, String> {
-    // (canonical file, logical key for the manifest)
-    let mut plan = vec![(site_dir.join("web-eo9.wasm"), "blob".to_owned())];
+/// One asset the web-VM fingerprint step processes.
+struct FingerprintEntry {
+    /// The canonical (un-hashed) file.
+    canonical: PathBuf,
+    /// The logical key for the manifest ("blob", "store/<name>", "page/<file>").
+    key: String,
+    /// Whether the canonical file stays after fingerprinting. Build artifacts (the blob,
+    /// the store images) are *renamed* — the hashed name is the only copy. Hand-edited
+    /// page sources (vm.js, vm.css) are *copied* — the canonical file remains the
+    /// editable source (and a no-cache fallback URL), and the hashed copy is what the
+    /// page references so the CDN can cache it forever.
+    keep_canonical: bool,
+}
+
+/// The `/vm` immutable assets that get content-fingerprinted: the wasm blob, every Pulley
+/// `.cwasm` store image, and the page's own script and style. Their URLs become the
+/// version, so they can be cached forever.
+fn web_vm_fingerprint_plan(site_dir: &Path) -> Result<Vec<FingerprintEntry>, String> {
+    let mut plan = vec![FingerprintEntry {
+        canonical: site_dir.join("web-eo9.wasm"),
+        key: "blob".to_owned(),
+        keep_canonical: false,
+    }];
     let store_dir = site_dir.join("store");
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&store_dir)
         .map_err(|err| format!("failed to read {}: {err}", store_dir.display()))?
@@ -930,12 +949,91 @@ fn web_vm_fingerprint_plan(site_dir: &Path) -> Result<Vec<(PathBuf, String)>, St
             .and_then(|s| s.to_str())
             .ok_or_else(|| format!("bad store artifact name: {}", entry.display()))?
             .to_owned();
-        plan.push((entry, format!("store/{name}")));
+        plan.push(FingerprintEntry {
+            canonical: entry,
+            key: format!("store/{name}"),
+            keep_canonical: false,
+        });
+    }
+    // The page's own script and style: hashed copies referenced by index.html, so they get
+    // the same immutable/edge-cacheable treatment as the blob instead of per-request
+    // revalidation.
+    for page_asset in ["vm.js", "vm.css"] {
+        let canonical = site_dir.join(page_asset);
+        if canonical.exists() {
+            plan.push(FingerprintEntry {
+                canonical,
+                key: format!("page/{page_asset}"),
+                keep_canonical: true,
+            });
+        }
     }
     Ok(plan)
 }
 
-/// Whether a path is a content-fingerprinted immutable asset (`name.<16-hex>.wasm`/`.cwasm`).
+/// Does a quoted HTML attribute value reference this `/vm` page asset, either by its
+/// canonical name (`/vm/vm.js`) or by any previously-fingerprinted name
+/// (`/vm/vm.<16-hex>.js`)?
+fn html_ref_matches_page_asset(token: &str, canonical: &str) -> bool {
+    let Some(name) = token.strip_prefix("/vm/") else {
+        return false;
+    };
+    if name == canonical {
+        return true;
+    }
+    let Some((stem, ext)) = canonical.rsplit_once('.') else {
+        return false;
+    };
+    let Some(hash) = name
+        .strip_prefix(&format!("{stem}."))
+        .and_then(|rest| rest.strip_suffix(&format!(".{ext}")))
+    else {
+        return false;
+    };
+    hash.len() == 16
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Rewrite `vm/index.html` so its script/style references point at the current
+/// fingerprinted copies. `replacements` maps canonical names ("vm.js") to fingerprinted
+/// ones ("vm.<hash>.js"). The rewrite is token-based on quote-delimited attribute values,
+/// so it is idempotent across rebuilds (a previously-rewritten reference is recognized
+/// and re-pointed).
+fn rewrite_page_asset_refs(
+    site_dir: &Path,
+    replacements: &[(String, String)],
+) -> Result<(), String> {
+    if replacements.is_empty() {
+        return Ok(());
+    }
+    let index_path = site_dir.join("index.html");
+    let html = std::fs::read_to_string(&index_path)
+        .map_err(|err| format!("failed to read {}: {err}", index_path.display()))?;
+    let mut out = String::with_capacity(html.len());
+    for (i, token) in html.split('"').enumerate() {
+        if i > 0 {
+            out.push('"');
+        }
+        let replaced = replacements.iter().find_map(|(canonical, hashed)| {
+            html_ref_matches_page_asset(token, canonical).then(|| format!("/vm/{hashed}"))
+        });
+        match replaced {
+            Some(reference) => out.push_str(&reference),
+            None => out.push_str(token),
+        }
+    }
+    if out != html {
+        std::fs::write(&index_path, out)
+            .map_err(|err| format!("failed to write {}: {err}", index_path.display()))?;
+        println!("xtask: pointed vm/index.html at the fingerprinted page assets");
+    }
+    Ok(())
+}
+
+/// Whether a path is a content-fingerprinted immutable asset (`name.<16-hex>.wasm` /
+/// `.cwasm` / `.js` / `.css`).
 /// Mirrors `eo9_www::is_fingerprinted`; duplicated here so xtask stays dependency-light (it
 /// must not pull in the web-server crate). Keep the two in sync.
 fn is_fingerprinted_name(path: &Path) -> bool {
@@ -944,7 +1042,7 @@ fn is_fingerprinted_name(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
-    if !matches!(ext.as_str(), "wasm" | "cwasm") {
+    if !matches!(ext.as_str(), "wasm" | "cwasm" | "js" | "css") {
         return false;
     }
     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -1022,24 +1120,43 @@ fn fingerprint_web_vm(root: &Path) -> Result<(), String> {
 
     let plan = web_vm_fingerprint_plan(&site_dir)?;
     let mut manifest_entries: Vec<(String, String)> = Vec::new();
-    for (canonical, key) in plan {
-        let bytes = std::fs::read(&canonical)
+    let mut page_replacements: Vec<(String, String)> = Vec::new();
+    for entry in plan {
+        let canonical = &entry.canonical;
+        let bytes = std::fs::read(canonical)
             .map_err(|err| format!("failed to read {}: {err}", canonical.display()))?;
         let hash = content_fingerprint(&bytes);
-        let new_name = fingerprinted_name(&canonical, &hash);
+        let new_name = fingerprinted_name(canonical, &hash);
         let new_path = canonical.with_file_name(&new_name);
-        std::fs::rename(&canonical, &new_path)
-            .map_err(|err| format!("failed to rename {}: {err}", canonical.display()))?;
-        // Drop the canonical file's stale precompressed siblings; precompress regenerates
-        // them for the fingerprinted name.
-        remove_with_siblings(&canonical);
+        if entry.keep_canonical {
+            // Page sources: the hashed file is a copy; the canonical stays as the
+            // editable source (served no-cache if requested directly).
+            std::fs::copy(canonical, &new_path)
+                .map_err(|err| format!("failed to copy {}: {err}", canonical.display()))?;
+            let canonical_name = canonical
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            page_replacements.push((canonical_name, new_name.clone()));
+        } else {
+            // Build artifacts: renamed — the hashed name is the only copy.
+            std::fs::rename(canonical, &new_path)
+                .map_err(|err| format!("failed to rename {}: {err}", canonical.display()))?;
+            // Drop the canonical file's stale precompressed siblings; precompress
+            // regenerates them for the fingerprinted name.
+            remove_with_siblings(canonical);
+        }
         // URL the page fetches: relative to the site root, always `/vm/...`.
         let rel = new_path
             .strip_prefix(root.join("www").join("site"))
             .map_err(|_| "fingerprinted asset escaped the site root".to_owned())?;
         let url = format!("/{}", rel.to_string_lossy().replace('\\', "/"));
-        manifest_entries.push((key, url));
+        manifest_entries.push((entry.key, url));
     }
+
+    // index.html references its own script/style by name; point it at the hashed copies.
+    rewrite_page_asset_refs(&site_dir, &page_replacements)?;
 
     write_assets_manifest(&site_dir, &manifest_entries)?;
     println!(
@@ -1064,26 +1181,39 @@ fn strip_precompressed_suffix(path: &Path) -> Option<PathBuf> {
 /// Hand-rolled JSON (xtask stays dependency-light); the values are build-controlled URLs.
 fn write_assets_manifest(site_dir: &Path, entries: &[(String, String)]) -> Result<(), String> {
     let mut blob = String::new();
+    let mut page: Vec<(String, String)> = Vec::new();
     let mut store: Vec<(String, String)> = Vec::new();
     for (key, url) in entries {
-        match key.strip_prefix("store/") {
-            Some(name) => store.push((name.to_owned(), url.clone())),
-            None if key == "blob" => blob = url.clone(),
-            None => store.push((key.clone(), url.clone())),
+        if let Some(name) = key.strip_prefix("store/") {
+            store.push((name.to_owned(), url.clone()));
+        } else if let Some(name) = key.strip_prefix("page/") {
+            page.push((name.to_owned(), url.clone()));
+        } else if key == "blob" {
+            blob = url.clone();
+        } else {
+            store.push((key.clone(), url.clone()));
         }
     }
+    let section = |json: &mut String, name: &str, entries: &[(String, String)], last: bool| {
+        json.push_str(&format!("  {}: {{\n", json_string(name)));
+        for (i, (name, url)) in entries.iter().enumerate() {
+            let comma = if i + 1 < entries.len() { "," } else { "" };
+            json.push_str(&format!(
+                "    {}: {}{comma}\n",
+                json_string(name),
+                json_string(url)
+            ));
+        }
+        json.push_str(if last { "  }\n" } else { "  },\n" });
+    };
     let mut json = String::from("{\n");
     json.push_str(&format!("  \"blob\": {},\n", json_string(&blob)));
-    json.push_str("  \"store\": {\n");
-    for (i, (name, url)) in store.iter().enumerate() {
-        let comma = if i + 1 < store.len() { "," } else { "" };
-        json.push_str(&format!(
-            "    {}: {}{comma}\n",
-            json_string(name),
-            json_string(url)
-        ));
-    }
-    json.push_str("  }\n}\n");
+    // The page's own fingerprinted script/style; index.html references them directly, the
+    // manifest records them so check-web-vm covers them like every other hashed asset.
+    section(&mut json, "page", &page, false);
+    section(&mut json, "store", &store, true);
+    json.push('}');
+    json.push('\n');
     let path = site_dir.join("assets.json");
     std::fs::write(&path, json).map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
