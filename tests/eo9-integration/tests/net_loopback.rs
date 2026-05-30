@@ -1,16 +1,18 @@
 //! The layered net API exercised through the algebra: `net.l4.loopback $ sockcheck`
-//! runs a real TCP both-ways echo and a UDP round-trip entirely inside the in-memory
-//! transport stub (no lower layers anywhere), and `net.l4.deny $ sockcheck` shows the
-//! same program failing in the layer's own vocabulary instead. Both compositions are
-//! plain `$` over real shipped components — no configuration, no host-side providers
-//! beyond the implicit buffer support.
+//! runs the full TCP listen/accept exercise — duplicate-bind and dead-port refusals, a
+//! two-deep backlog accepted in order with un-crossed streams, echoes both ways — plus
+//! a UDP round-trip, entirely inside the in-memory transport stub (no lower layers
+//! anywhere). `net.l4.deny $ sockcheck` shows the same program failing in the layer's
+//! own vocabulary instead. Both compositions are plain `$` over real shipped
+//! components — no configuration, no host-side providers beyond the implicit buffer
+//! support.
 
 use eo9_component::compose;
 use eo9_integration::{guest, run};
 use eo9_runtime::{NamedArg, Outcome, Providers};
 
 #[test]
-fn loopback_l4_round_trips_tcp_and_udp_through_the_algebra() {
+fn loopback_l4_listen_accept_and_udp_round_trip_through_the_algebra() {
     guest::ensure_components(&["eo9-stub-net-l4-loopback", "eo9-example-sockcheck"]);
     let program = compose(
         &guest::load_stub("net.l4.loopback"),
@@ -23,8 +25,9 @@ fn loopback_l4_round_trips_tcp_and_udp_through_the_algebra() {
         &[NamedArg::new("payload", "\"ping pong\"")],
         Providers::none(),
     );
-    // Two TCP legs plus one UDP leg, nine payload bytes each.
-    assert_eq!(run::success_value(&outcome), "echoed(27)");
+    // Backlog pair A both ways ("a:ping pong" = 11 down, 9 reversed back), pair B one
+    // way ("b:ping pong" = 11), plus one 9-byte UDP datagram: 11 + 11 + 9 + 9 = 40.
+    assert_eq!(run::success_value(&outcome), "echoed(40)");
 }
 
 #[test]

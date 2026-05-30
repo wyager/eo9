@@ -21,7 +21,7 @@
 //! firmware job this kernel does not do yet, and every QEMU `virt` device added with a
 //! plain `-device …-pci` flag lands directly on bus 0.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch::pci_map::{
     ECAM_BASE, ECAM_BUSES, MMIO_BASE as PCIE_MMIO_BASE, MMIO_END as PCIE_MMIO_END,
@@ -29,6 +29,62 @@ use crate::arch::pci_map::{
 
 /// Configuration space per PCIe function (extended config space).
 const CONFIG_SPACE_SIZE: u32 = 4096;
+
+// -----------------------------------------------------------------------------------------
+// INTx delivery state
+//
+// The PCIe host bridge (gpex on the QEMU `virt` machines) has four legacy interrupt lines;
+// every function's INTx pin lands on one of them through the standard swizzle
+// (`(slot + pin - 1) mod 4`). The architecture's IRQ/trap handler masks a fired line at its
+// interrupt controller and records the delivery here; the wasm `eo9:pci` provider's `wait`
+// consumes the count and re-arms (unmasks) the line on its next call, after the driver has
+// cleared the device-side cause. The counters are the only state shared between the two
+// sides, so they live in this arch-independent module.
+// -----------------------------------------------------------------------------------------
+
+/// Number of INTx lines on the host bridge (INTA..INTD; fixed by PCI).
+pub const INTX_LINES: usize = 4;
+
+/// Deliveries per gpex line since the last `intx_take`, written by the arch IRQ handler.
+static INTX_DELIVERIES: [AtomicU64; INTX_LINES] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Record one INTx delivery on gpex line `line`. Called from the architecture's IRQ/trap
+/// handler with the line already masked at the interrupt controller (so the level-triggered
+/// source cannot storm while the driver has not yet cleared its cause).
+pub fn intx_record(line: usize) {
+    INTX_DELIVERIES[line % INTX_LINES].fetch_add(1, Ordering::Release);
+}
+
+/// Consume the pending delivery count for gpex line `line` (0 = nothing delivered).
+pub fn intx_take(line: usize) -> u64 {
+    INTX_DELIVERIES[line % INTX_LINES].swap(0, Ordering::AcqRel)
+}
+
+/// The standard INTx swizzle: which host-bridge line the given function's interrupt pin
+/// lands on. `pin` is the configuration-space Interrupt Pin value (1 = INTA .. 4 = INTD).
+pub fn intx_line(address: FunctionAddress, pin: u8) -> usize {
+    (usize::from(address.device) + usize::from(pin) - 1) % INTX_LINES
+}
+
+/// Read a function's Interrupt Pin register (configuration space offset 0x3d):
+/// 0 = the function has no INTx pin, 1..=4 = INTA..INTD.
+pub fn interrupt_pin(address: FunctionAddress) -> Option<u8> {
+    config_read(address, 0x3d, AccessWidth::Byte).map(|pin| pin as u8)
+}
+
+/// Make sure the function's INTx output is not disabled (command register bit 10): clear
+/// the INTx Disable bit so the device can assert its pin. Returns `false` on access failure.
+pub fn enable_intx_output(address: FunctionAddress) -> bool {
+    let Some(command) = config_read(address, 0x04, AccessWidth::Word) else {
+        return false;
+    };
+    config_write(address, 0x04, AccessWidth::Word, command & !(1 << 10))
+}
 
 /// Bump pointer for BAR assignment (no firmware has placed anything, so the whole window
 /// is ours). Single core; the atomic is for soundness, not contention.

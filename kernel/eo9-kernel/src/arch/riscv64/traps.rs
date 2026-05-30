@@ -58,7 +58,10 @@ extern "C" fn ktrap(scause: u64, sepc: u64, stval: u64) {
             }
             // Supervisor external: claim every pending PLIC source; UART0 receive bytes go
             // into the input ring, which both deasserts the UART's line and captures the
-            // keystroke that woke the hart.
+            // keystroke that woke the hart. PCIe INTx sources (the gpex lines) are masked at
+            // the PLIC — the device keeps asserting them until a driver clears the cause —
+            // and recorded for the wasm provider's `wait` (wasm-store builds only; the
+            // sources are never enabled otherwise).
             IRQ_S_EXTERNAL => loop {
                 let source = super::plic::claim();
                 if source == 0 {
@@ -66,6 +69,13 @@ extern "C" fn ktrap(scause: u64, sepc: u64, stval: u64) {
                 }
                 if source == super::plic::UART0_SOURCE {
                     super::uart::drain_rx();
+                }
+                #[cfg(feature = "wasm-store")]
+                if let Some(line) = source.checked_sub(super::pci_intx::BASE_SOURCE)
+                    && (line as usize) < crate::pci::INTX_LINES
+                {
+                    super::plic::disable_source(source);
+                    crate::pci::intx_record(line as usize);
                 }
                 super::plic::complete(source);
             },

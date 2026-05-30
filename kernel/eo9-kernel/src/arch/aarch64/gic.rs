@@ -24,6 +24,8 @@ const GICC_BASE: usize = 0x0801_0000;
 const GICD_CTLR: usize = 0x000;
 /// Set-enable registers (one bit per INTID; write-1-to-set).
 const GICD_ISENABLER: usize = 0x100;
+/// Clear-enable registers (one bit per INTID; write-1-to-clear).
+const GICD_ICENABLER: usize = 0x180;
 
 /// CPU interface control register.
 const GICC_CTLR: usize = 0x000;
@@ -87,5 +89,16 @@ pub fn configure_intid(intid: u32) {
 pub fn enable_intid(intid: u32) {
     let register = GICD_ISENABLER + (intid as usize / 32) * 4;
     // ISENABLER is write-1-to-set: writing the single bit enables just that INTID.
+    gicd_write(register, 1u32 << (intid % 32));
+}
+
+/// Disable (mask) forwarding of a single interrupt ID. Used to quiet a level-sensitive PCI
+/// INTx line when it fires, until the driver has cleared the device-side cause and `wait`
+/// re-arms it.
+// Only the wasm-store builds route PCI interrupts; the featureless build never masks.
+#[allow(dead_code)]
+pub fn disable_intid(intid: u32) {
+    let register = GICD_ICENABLER + (intid as usize / 32) * 4;
+    // ICENABLER is write-1-to-clear: writing the single bit disables just that INTID.
     gicd_write(register, 1u32 << (intid % 32));
 }

@@ -276,7 +276,7 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
     change for these; that stays true until/unless the blob ever gains a disk provider.
 
 21. **`eo9:rt` grows `configured` — the bind entrypoint of configured components (2026-05-30, plan/03
-    D22).** `interface configured { bind: func(); }` joins `diagnostics` in wit/rt/rt.wit. Like
+    D23).** `interface configured { bind: func(); }` joins `diagnostics` in wit/rt/rt.wit. Like
     diagnostics it is runtime contract, not a capability: it grants nothing (the configuration is already
     part of the artifact's identity), guests never import it, `only` allow-lists never name it, and kind
     classification ignores it. It is exported (never imported) by components the algebra synthesizes:

@@ -1335,7 +1335,57 @@ preemption/hardening work.
       the cache directory, riscv64/x86_64 enablement once their PCI bring-up exists, and the
       kernel-claims-vs-guest-claims arbitration (machine-global device claiming).
 
-59. **Kernel executors call the configured bind entrypoint (2026-05-30, plan/03 D22).** `shellexec`'s
+59. **PCI INTx delivery is live, and disk.virtio completes requests on interrupts (2026-05-30, branch
+    `area/12-driver-interrupts`) — D57 implemented, with one deliberate adaptation.** The `eo9:pci`
+    provider's `enable-interrupts`/`wait` are no longer `unsupported` on aarch64 and riscv64:
+    - **Routing.** `enable-interrupts(device, intx, 1)` reads the function's Interrupt Pin register, clears
+      the command register's INTx-disable bit, and applies the standard `(slot + pin − 1) mod 4` swizzle to
+      pick the gpex line — GIC SPIs 35–38 on aarch64 `virt`, PLIC sources 0x20–0x23 on riscv64 `virt`
+      (`arch::pci_intx`, the per-arch mask/unmask surface). x86_64 keeps `unsupported` (`WIRED = false`):
+      its q35 PCI grant is not wired and legacy PIRQ routing through the 8259/IOAPIC is its own project.
+    - **Delivery protocol.** The arch IRQ/trap handler masks a fired level-sensitive line at the controller
+      (the device keeps asserting until the driver clears its cause) and counts it in the arch-independent
+      `pci::intx_record`; `wait` unmasks the line, blocks until a delivery / a console Ctrl-C / a 2 s bound,
+      consumes the count, and returns with the line masked again; the next `wait` — after the driver reads
+      virtio's ISR register, which clears the cause — re-arms it. The kernel prints one line per boot the
+      first time a delivery actually serves a wait, so every transcript shows whether completions are
+      interrupt-driven.
+    - **The adaptation: `wait` blocks host-side rather than suspending the task.** D57 sketched `wait`
+      parking on the drive loop the way `time.sleep` does. That is incompatible with how every existing
+      driver chain executes: `fs.eofs` polls its disk import eagerly (single poll, plan/14 D19) and
+      `disk.virtio`/`net.virtio`/`net.l4.over-l2` poll their pci/l2 imports eagerly (plan/09 D16–D18), so a
+      `wait` that returned `Pending` would make the exported disk/socket operation itself suspend — and the
+      consumer above it would fail with "the provider suspended". Instead `wait` blocks inside the host call
+      on the same masked-`wfi` + timer primitives the executor's idle path uses (`timer::wait_for_interrupt`):
+      the CPU halts (instead of the guest spinning host calls) and the PCI interrupt, a keystroke, or the
+      timer slice wakes it. Cost: while one task is blocked in `wait`, siblings and the shell do not run —
+      acceptable because the storage/net stacks are single-request run-to-completion by design (and a console
+      Ctrl-C aborts the block within an interrupt's notice, after which the driver's polled fallback is
+      preemptible as before). A properly task-suspending `wait` becomes possible when the async disk/net
+      bridge (plan/14 follow-up) lands; the controller-side machinery is identical either way.
+    - **disk.virtio conversion.** The driver discovers the virtio ISR window, asks for one INTx vector at
+      bring-up (feature-detected: `unsupported` or any failure → the polled used-ring loop, so the same
+      driver binary works on x86_64 or any provider without routing), and per request: check the used ring,
+      `wait` for a delivery (up to 4 retries), read the ISR to deassert, re-check; any wait failure falls
+      back to the polled loop. The probe line now reports the completion mode
+      (`completion: INTx interrupt` / `polled`). net.virtio still polls (its conversion is the natural
+      follow-up; same recipe).
+    - **Verified** (QEMU, fresh blank scratch disks): aarch64 `pci disk` interactive —
+      `disk.virtio $ fs.eofs $ readwrite/ls/cat` round-trips with
+      `pci: INTx delivery on line 3 served an interrupt wait` in the transcript; riscv64 `pci disk` — the
+      same storage session interrupt-driven through the PLIC (line 2); aarch64 `pci net` ARP demo, aarch64
+      `pci program=lspci`, and all three arch `demo` runs unchanged (same digests, exact entropy values,
+      on-target codegen, clean power-offs); full `cargo xtask ci` green.
+    - **Measurement (honest).** End-to-end wall-clock and QEMU CPU time for the three-command storage
+      session are within run-to-run noise of the polled baseline (~66 s wall / ~58 s CPU either way):
+      on-target Cranelift compilation of the three-component composition dominates both by ~95%, so the
+      completion strategy is invisible at session granularity under TCG. The structural win — the core
+      halts in `wfi` during device waits instead of burning host calls — is what matters on real hardware
+      and for I/O-heavy workloads, and is what the per-boot diagnostic line proves is happening.
+    - **Remaining**: convert net.virtio the same way; MSI/MSI-X (needs GICv2m on aarch64, AIA on riscv64);
+      x86_64 PIRQ routing; per-task interrupt-vector exclusivity alongside machine-global device claiming.
+
+60. **Kernel executors call the configured bind entrypoint (2026-05-30, plan/03 D23).** `shellexec`'s
     `spawn_child` and the headless `runner` call `eo9:rt/configured.bind` (via the shared
     `wasm::bind_entrypoint` lookup) after instantiation, before `main` — under the spawn fuel budget in
     `spawn_child` (mirroring usermode), via `block_on` in the runner. This is what applies compose-time

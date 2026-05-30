@@ -21,8 +21,12 @@
 //!   read the capacity from the device config window.
 //! * **I/O.** One request at a time: a three-descriptor chain (16-byte request header,
 //!   the data buffer, the 1-byte status), published through the avail ring, kicked via
-//!   the notify register, completion observed by polling the used ring (the kernel's
-//!   PCI provider does not deliver interrupts yet — and virtio is fine with polling).
+//!   the notify register. Completion is observed by **waiting on the device's INTx
+//!   interrupt** when the PCI provider routes interrupts (`enable-interrupts` granted a
+//!   vector at bring-up — the kernel halts the core until the device interrupts instead
+//!   of the driver spinning host calls), falling back to **polling the used ring** when
+//!   it does not (`unsupported`, e.g. x86_64) or when a wait fails — so the driver works
+//!   identically on every platform, just cheaper where interrupts exist.
 //!
 //! The exported `eo9:disk` operations are byte-addressed; the device is sector
 //! addressed (512 bytes). Reads fetch the covering sectors and copy out the requested
@@ -87,6 +91,7 @@ const PCI_CAP_WALK_LIMIT: usize = 48;
 /// virtio_pci_cap.cfg_type values.
 const VIRTIO_PCI_CAP_COMMON: u64 = 1;
 const VIRTIO_PCI_CAP_NOTIFY: u64 = 2;
+const VIRTIO_PCI_CAP_ISR: u64 = 3;
 const VIRTIO_PCI_CAP_DEVICE: u64 = 4;
 
 /// Offsets within the common configuration window (virtio 1.0 §4.1.4.3).
@@ -149,6 +154,10 @@ const DATA_BYTES: u64 = 64 * 1024;
 /// is minutes of wall clock even on a slow machine — hitting it means the device is not
 /// completing requests at all, which is reported as an `io` error rather than hanging.
 const POLL_LIMIT: u64 = 50_000_000;
+/// How many interrupt waits to attempt per request before falling back to the polled
+/// loop. Each wait is itself bounded by the provider, and a spurious delivery (a shared
+/// line) just re-checks the ring, so a couple of retries cover every healthy device.
+const INTERRUPT_WAIT_RETRIES: u32 = 4;
 
 // ------------------------------------------------------------------------------------------
 // Eager driving of the async pci imports (same pattern and reasoning as fs.eofs).
@@ -202,6 +211,12 @@ struct Driver {
     /// Base of the notify window plus this queue's precomputed notify offset.
     notify: Region,
     notify_offset: u64,
+    /// The ISR status window (read-to-clear; deasserts INTx). `None` when the device
+    /// exposes no ISR capability — interrupt mode is then never entered.
+    isr: Option<Region>,
+    /// The INTx vector the provider granted, or `None` when interrupts are not routed on
+    /// this platform/provider (completion falls back to polling the used ring).
+    interrupt: Option<pci::Interrupt>,
     ring: pci::DmaBuffer,
     request: pci::DmaBuffer,
     data: pci::DmaBuffer,
@@ -261,7 +276,7 @@ impl Driver {
         let device = pci_call("disk.virtio: open", pci::open(&root, address))?;
 
         // Walk the vendor-specific capabilities to find the virtio register windows.
-        let (common, notify_base, notify_multiplier, device_config) = find_windows(&device)?;
+        let (common, notify_base, notify_multiplier, device_config, isr) = find_windows(&device)?;
 
         // Open each BAR the windows live in exactly once.
         let mut bar_indices: Vec<u8> = Vec::new();
@@ -269,6 +284,11 @@ impl Driver {
             if !bar_indices.contains(&index) {
                 bar_indices.push(index);
             }
+        }
+        if let Some(isr) = &isr
+            && !bar_indices.contains(&isr.bar)
+        {
+            bar_indices.push(isr.bar);
         }
         let mut bars: Vec<(u8, pci::Bar)> = Vec::new();
         for index in bar_indices {
@@ -299,6 +319,8 @@ impl Driver {
             device_config,
             notify: notify_base,
             notify_offset: 0,
+            isr,
+            interrupt: None,
             ring,
             request,
             data,
@@ -309,6 +331,39 @@ impl Driver {
             flush_supported: false,
         };
         driver.start(notify_multiplier)?;
+
+        // Interrupt delivery: ask the provider for one INTx vector. `unsupported` (or any
+        // other failure) means this platform/provider does not route PCI interrupts —
+        // completion then falls back to polling the used ring, which works everywhere.
+        // Interrupt mode also needs the ISR window (reading it clears the device-side
+        // cause), so without one the vector is not requested at all.
+        if driver.isr.is_some() {
+            driver.interrupt = match poll_eager(pci::enable_interrupts(
+                &driver._device,
+                pci::InterruptKind::Intx,
+                1,
+            )) {
+                Some(Ok(mut vectors)) if !vectors.is_empty() => Some(vectors.remove(0)),
+                _ => None,
+            };
+        }
+
+        // One best-effort diagnostic line so a metal session shows what was probed and how
+        // completions are observed.
+        let handle = text::default();
+        let line = format!(
+            "disk.virtio: virtio-blk {} sectors ({} MiB), queue size {}, completion: {}",
+            driver.capacity_bytes / SECTOR,
+            driver.capacity_bytes / (1024 * 1024),
+            driver.queue_size,
+            if driver.interrupt.is_some() {
+                "INTx interrupt"
+            } else {
+                "polled"
+            },
+        );
+        let _ = text::write(&handle, text::OutputStream::Out, &line);
+        let _ = text::write(&handle, text::OutputStream::Out, "\n");
         Ok(driver)
     }
 
@@ -417,22 +472,13 @@ impl Driver {
         let live = with_features_ok | STATUS_DRIVER_OK;
         self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, live)?;
 
-        // Capacity (in 512-byte sectors) from the device configuration window.
+        // Capacity (in 512-byte sectors) from the device configuration window. The
+        // diagnostic line (probed capacity + completion mode) is printed by `bring_up` once
+        // it has also asked the provider for an interrupt vector.
         let capacity_low = self.device_read(0, pci::AccessWidth::Dword)?;
         let capacity_high = self.device_read(4, pci::AccessWidth::Dword)?;
-        let sectors = (capacity_high << 32) | capacity_low;
-        self.capacity_bytes = sectors * SECTOR;
+        self.capacity_bytes = ((capacity_high << 32) | capacity_low) * SECTOR;
         self.queue_size = queue_size;
-
-        // One best-effort diagnostic line so a metal session shows what was probed.
-        let handle = text::default();
-        let line = format!(
-            "disk.virtio: virtio-blk {} sectors ({} MiB), queue size {queue_size}",
-            sectors,
-            self.capacity_bytes / (1024 * 1024),
-        );
-        let _ = text::write(&handle, text::OutputStream::Out, &line);
-        let _ = text::write(&handle, text::OutputStream::Out, "\n");
         Ok(())
     }
 
@@ -538,23 +584,9 @@ impl Driver {
             &self.avail_index.to_le_bytes(),
         );
 
-        // Kick the device and poll the used ring for the completion.
+        // Kick the device and wait (interrupt) or poll (fallback) for the completion.
         self.notify_queue()?;
-        let mut spins: u64 = 0;
-        loop {
-            let raw = pci::dma_read(&self.ring, USED_OFFSET + 2, 2);
-            let used = u16::from_le_bytes([raw[0], raw[1]]);
-            if used != self.used_index {
-                self.used_index = self.used_index.wrapping_add(1);
-                break;
-            }
-            spins += 1;
-            if spins > POLL_LIMIT {
-                return Err(String::from(
-                    "disk.virtio: the device did not complete the request (poll limit)",
-                ));
-            }
-        }
+        self.wait_for_completion("the request")?;
 
         let status = pci::dma_read(&self.request, REQ_STATUS_OFFSET, 1)[0];
         if status != BLK_S_OK {
@@ -566,6 +598,85 @@ impl Driver {
             Ok(None)
         } else {
             Ok(Some(pci::dma_read(&self.data, 0, byte_len)))
+        }
+    }
+
+    /// Wait for the in-flight request (avail.idx was bumped and the queue notified) to
+    /// complete: the used ring's index advancing past `self.used_index`.
+    ///
+    /// Interrupt mode (a vector was granted at bring-up): ask the provider to `wait` for the
+    /// device's INTx — the kernel halts the core until the device interrupts — then confirm
+    /// against the used ring and read the ISR register, which clears the device-side cause
+    /// so the level-triggered line deasserts before the next wait re-arms it. Any wait
+    /// failure (bound expiry, console interrupt, no routing) falls back to the polled loop,
+    /// which works everywhere and is preemptible (it burns guest fuel), so a Ctrl-C that
+    /// aborted a blocked wait still kills the composition promptly.
+    fn wait_for_completion(&mut self, what: &str) -> Result<(), String> {
+        if let Some(vector) = self.interrupt.take() {
+            let mut waits = 0u32;
+            let completed = loop {
+                if self.used_advanced() {
+                    break true;
+                }
+                if waits >= INTERRUPT_WAIT_RETRIES {
+                    break false;
+                }
+                waits += 1;
+                match poll_eager(pci::wait(&vector)) {
+                    // A delivery arrived (possibly coalesced/spurious): clear the device's
+                    // ISR so the line deasserts, then re-check the used ring.
+                    Some(Ok(_deliveries)) => self.acknowledge_isr(),
+                    // Bound expiry, console interrupt, a suspending provider, or any other
+                    // failure: fall back to polling below.
+                    Some(Err(_)) | None => break false,
+                }
+            };
+            self.interrupt = Some(vector);
+            if completed {
+                return Ok(());
+            }
+        }
+
+        // Polled mode / fallback: spin on the used ring (each iteration is a host call).
+        let mut spins: u64 = 0;
+        loop {
+            if self.used_advanced() {
+                if self.interrupt.is_some() {
+                    // The completion may also have asserted INTx; clear it so the next
+                    // interrupt wait does not see a stale delivery.
+                    self.acknowledge_isr();
+                }
+                return Ok(());
+            }
+            spins += 1;
+            if spins > POLL_LIMIT {
+                return Err(format!(
+                    "disk.virtio: the device did not complete {what} (poll limit)"
+                ));
+            }
+        }
+    }
+
+    /// Whether the used ring has advanced past the requests consumed so far; consumes one
+    /// completion when it has.
+    fn used_advanced(&mut self) -> bool {
+        let raw = pci::dma_read(&self.ring, USED_OFFSET + 2, 2);
+        let used = u16::from_le_bytes([raw[0], raw[1]]);
+        if used != self.used_index {
+            self.used_index = self.used_index.wrapping_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Read (and thereby clear) the device's ISR status register, deasserting its INTx
+    /// line. Best-effort: a failure here only risks one spurious re-delivery.
+    fn acknowledge_isr(&self) {
+        if let Some(isr) = &self.isr
+            && let Ok(bar) = self.bar(isr.bar)
+        {
+            let _ = poll_eager(pci::bar_read(bar, isr.offset, pci::AccessWidth::Byte));
         }
     }
 
@@ -607,21 +718,8 @@ impl Driver {
         );
 
         self.notify_queue().map_err(DiskFail::Io)?;
-        let mut spins: u64 = 0;
-        loop {
-            let raw = pci::dma_read(&self.ring, USED_OFFSET + 2, 2);
-            let used = u16::from_le_bytes([raw[0], raw[1]]);
-            if used != self.used_index {
-                self.used_index = self.used_index.wrapping_add(1);
-                break;
-            }
-            spins += 1;
-            if spins > POLL_LIMIT {
-                return Err(DiskFail::Io(String::from(
-                    "disk.virtio: the device did not complete the flush (poll limit)",
-                )));
-            }
-        }
+        self.wait_for_completion("the flush")
+            .map_err(DiskFail::Io)?;
         let status = pci::dma_read(&self.request, REQ_STATUS_OFFSET, 1)[0];
         if status != BLK_S_OK {
             return Err(DiskFail::Io(format!(
@@ -715,8 +813,10 @@ impl Driver {
 // ------------------------------------------------------------------------------------------
 
 /// Walk the configuration-space capability list and return the common, notify (plus its
-/// multiplier), and device-config windows.
-fn find_windows(device: &pci::Device) -> Result<(Region, Region, u32, Region), String> {
+/// multiplier), device-config, and (optional) ISR windows.
+fn find_windows(
+    device: &pci::Device,
+) -> Result<(Region, Region, u32, Region, Option<Region>), String> {
     let read = |offset: u32, width: pci::AccessWidth| -> Result<u64, String> {
         pci_call(
             "disk.virtio: config read",
@@ -727,6 +827,7 @@ fn find_windows(device: &pci::Device) -> Result<(Region, Region, u32, Region), S
     let mut common: Option<Region> = None;
     let mut notify: Option<(Region, u32)> = None;
     let mut device_config: Option<Region> = None;
+    let mut isr: Option<Region> = None;
 
     let mut pointer = (read(PCI_CAP_POINTER, pci::AccessWidth::Byte)? & 0xfc) as u32;
     let mut steps = 0;
@@ -746,6 +847,9 @@ fn find_windows(device: &pci::Device) -> Result<(Region, Region, u32, Region), S
                     let multiplier = read(pointer + 16, pci::AccessWidth::Dword)? as u32;
                     notify = Some((Region { bar, offset }, multiplier));
                 }
+                VIRTIO_PCI_CAP_ISR if isr.is_none() => {
+                    isr = Some(Region { bar, offset });
+                }
                 VIRTIO_PCI_CAP_DEVICE if device_config.is_none() => {
                     device_config = Some(Region { bar, offset });
                 }
@@ -763,7 +867,7 @@ fn find_windows(device: &pci::Device) -> Result<(Region, Region, u32, Region), S
     let device_config = device_config.ok_or_else(|| {
         String::from("disk.virtio: the function has no virtio device-config capability")
     })?;
-    Ok((common, notify, multiplier, device_config))
+    Ok((common, notify, multiplier, device_config, isr))
 }
 
 // ------------------------------------------------------------------------------------------

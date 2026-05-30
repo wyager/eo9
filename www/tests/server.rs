@@ -168,6 +168,50 @@ fn fingerprinted_assets_are_immutable_and_unhashed() {
     assert!(!conditional.body.is_empty());
 }
 
+/// The page's own script and style ride the same fingerprinted-immutable path as the blob:
+/// `index.html` references hashed copies (`vm.<hash>.js` / `vm.<hash>.css`) that a CDN can
+/// hold forever, while the editable sources (`/vm/vm.js`, `/vm/vm.css`) stay `no-cache`. A
+/// deploy that changes the script/style changes their URL — still nothing to purge.
+#[test]
+fn page_script_and_style_are_fingerprinted_and_immutable() {
+    let manifest = request(site_server_addr(), "GET", "/vm/assets.json").body_text();
+    let index = request(site_server_addr(), "GET", "/vm/").body_text();
+    for canonical in ["vm.js", "vm.css"] {
+        let (stem, ext) = canonical.rsplit_once('.').unwrap();
+        // Discover the hashed copy via the manifest's "page" section (its hash changes
+        // whenever the source does).
+        let hashed_url = manifest
+            .split('"')
+            .find(|s| {
+                s.starts_with(&format!("/vm/{stem}."))
+                    && s.ends_with(&format!(".{ext}"))
+                    && *s != format!("/vm/{canonical}")
+            })
+            .unwrap_or_else(|| panic!("manifest names a fingerprinted copy of {canonical}"));
+
+        // The hashed copy is immutable and carries no ETag (the URL is the version).
+        let hashed = request(site_server_addr(), "GET", hashed_url);
+        assert_eq!(hashed.status, 200, "{hashed_url}");
+        assert_eq!(
+            hashed.header("Cache-Control"),
+            Some("public, max-age=31536000, immutable"),
+            "{hashed_url}"
+        );
+        assert_eq!(hashed.header("ETag"), None, "{hashed_url}");
+
+        // The page references the hashed copy, not the canonical name.
+        assert!(
+            index.contains(hashed_url),
+            "vm/index.html should reference {hashed_url}"
+        );
+
+        // The canonical (editable) source still revalidates like any mutable URL.
+        let source = request(site_server_addr(), "GET", &format!("/vm/{canonical}"));
+        assert_eq!(source.status, 200);
+        assert_eq!(source.header("Cache-Control"), Some("no-cache"));
+    }
+}
+
 #[test]
 fn conditional_requests_revalidate_with_a_304() {
     // First request: a strong ETag comes back with the body.

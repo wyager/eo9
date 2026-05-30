@@ -416,3 +416,24 @@ since origin headers are now correct for every class. Optionally, `vm.js`/`vm.cs
 be content-fingerprinted like the blob (xtask rename + `index.html` reference rewrite) to make
 them edge-cacheable forever too; with `no-cache` + 304s they are correct without it, so that is
 an optimization, not a requirement.
+
+## Decision 29 — the page's own script and style are hash-named and edge-cacheable (2026-05-30)
+
+The owner asked (after the Decision 28 audit) for hash-based URLs on anything we want CDNs to hold
+indefinitely. Decision 28 made `vm.js`/`vm.css` *correct* (no-cache + ETag revalidation = never
+stale, no purge) but every page view still pays a conditional request for each. They now ride the
+same fingerprinted-immutable path as the blob: `cargo xtask fingerprint-web-vm` (inside
+`build-web-vm`) copies each to `vm.<16-hex-content-hash>.js/.css`, rewrites `vm/index.html` to
+reference the hashed copy, and records both under a new `"page"` section of `vm/assets.json` so
+`check-web-vm` verifies them like every other hashed asset. The hashed copies serve
+`public, max-age=31536000, immutable` with no ETag; the *editable sources* (`/vm/vm.js`,
+`/vm/vm.css`) stay committed and stay `no-cache` (they are what you edit; nothing references them).
+Unlike the blob/store artifacts (renamed — the hashed name is the only copy), page sources are
+*copied*, because the canonical file is the source of truth a human edits. `eo9_www::is_fingerprinted`
+(and xtask's mirror) now treat `name.<16-hex>.js/.css` as fingerprinted; `selftest.js` and the root
+`style.css` are deliberately not fingerprinted (unlinked test artifact / trivial root page). Tests:
+the lib unit tests cover the new extensions, and `page_script_and_style_are_fingerprinted_and_immutable`
+(www/tests/server.rs) pins the whole contract — hashed copies immutable + ETag-free, index.html
+references them, sources still no-cache. Verified end-to-end with the served site in headless Chrome
+(both hashed references load, page renders). One side effect: `assets.json` grew past precompress's
+1 KiB minimum, so it now ships `.br`/`.gz` siblings too.

@@ -1453,6 +1453,14 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
                 Err(eo9_component::ConfigureError::InvalidArgument { name, message }) => {
                     Err(WitConfigureError::InvalidArgs(format!("{name}: {message}")))
                 }
+                // The typed unbakeable/unsupported refusals carry their message in their
+                // Display impl; the WIT surface keeps reporting them as `internal` (with
+                // the same text as before they were typed) until it grows variants of
+                // its own.
+                Err(
+                    err @ (eo9_component::ConfigureError::UnbakeableType { .. }
+                    | eo9_component::ConfigureError::UnsupportedProvider(_)),
+                ) => Err(WitConfigureError::Internal(format!("{err}"))),
                 Err(eo9_component::ConfigureError::Internal(msg)) => {
                     Err(WitConfigureError::Internal(msg))
                 }

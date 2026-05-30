@@ -35,6 +35,20 @@ pub(crate) mod pci_map {
     pub(crate) const MMIO_END: usize = 0xb000_0000;
 }
 
+/// PCI INTx delivery: not wired on x86_64 (the q35 PCI grant itself is not wired yet, and
+/// legacy PCI IRQ routing on q35 goes through the 8259/IOAPIC PIRQ machinery this kernel
+/// does not program). The provider answers `unsupported` to `enable-interrupts`, so drivers
+/// fall back to their polled paths; `mask`/`unmask` are unreachable but must compile.
+#[cfg(feature = "wasm-store")]
+pub(crate) mod pci_intx {
+    /// Whether this architecture routes PCI interrupts at all.
+    pub(crate) const WIRED: bool = false;
+
+    pub(crate) fn unmask(_line: usize) {}
+
+    pub(crate) fn mask(_line: usize) {}
+}
+
 /// Boot banner: machine identification, privilege level, timer frequency, wall clock.
 pub(crate) fn banner() {
     crate::kprintln!();

@@ -348,7 +348,7 @@ Coreutil signature changes that ride on this are plan/17 D6.
 - **E4 (area 01):** root pin entry for wasmtime could become `default-features = false`
   so the runtime can opt out of unused default features in the TCB build.
 
-### Bind entrypoint (2026-05-30, plan/03 D22)
+### Bind entrypoint (2026-05-30, plan/03 D23)
 
 `Task::spawn` gained the executor contract's configuration step: after instantiation (still under the
 bounded `SPAWN_FUEL` budget, with the same doorbell poll loop), it looks up `eo9:rt/configured.bind` and

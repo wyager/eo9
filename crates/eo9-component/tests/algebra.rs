@@ -832,17 +832,23 @@ fn configure_spills_wide_parameter_lists_to_memory() {
 }
 
 #[test]
-fn configure_rejects_unbakeable_parameter_types_with_a_clear_message() {
+fn configure_rejects_unbakeable_parameter_types_with_a_typed_refusal() {
     let err = configure(&kit("provider-e"), &[("t", "plain")]).unwrap_err();
+    // The refusal is a typed variant carrying the parameter and the offending kind, so
+    // callers can match on it instead of substring-searching a message ...
     match &err {
-        ConfigureError::Internal(message) => {
-            assert!(
-                message.contains("cannot bake") && message.contains("variant"),
-                "unexpected message: {message}"
-            );
+        ConfigureError::UnbakeableType { name, kind } => {
+            assert_eq!(name, "t");
+            assert_eq!(kind, "variant");
         }
-        other => panic!("expected an internal not-bakeable error, got {other:?}"),
+        other => panic!("expected the typed unbakeable-type refusal, got {other:?}"),
     }
+    // ... and its rendered message still says what is and is not supported.
+    let message = format!("{err}");
+    assert!(
+        message.contains("cannot bake") && message.contains("variant"),
+        "unexpected message: {message}"
+    );
 }
 
 #[test]
