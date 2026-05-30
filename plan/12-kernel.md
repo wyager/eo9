@@ -1334,3 +1334,15 @@ preemption/hardening work.
       the disk, surfaced under /bin), VIRTIO_BLK_F_FLUSH for commit durability, eviction/space management for
       the cache directory, riscv64/x86_64 enablement once their PCI bring-up exists, and the
       kernel-claims-vs-guest-claims arbitration (machine-global device claiming).
+
+59. **Kernel executors call the configured bind entrypoint (2026-05-30, plan/03 D22).** `shellexec`'s
+    `spawn_child` and the headless `runner` call `eo9:rt/configured.bind` (via the shared
+    `wasm::bind_entrypoint` lookup) after instantiation, before `main` — under the spawn fuel budget in
+    `spawn_child` (mirroring usermode), via `block_on` in the runner. This is what applies compose-time
+    configuration to compositions compiled on-target: verified interactively on QEMU aarch64 —
+    `time.frozen --now-seconds 5 --monotonic-ns 0 $ hello --name frozen --excited true` compiles on-target
+    and prints `[5.000000000] Hello, frozen!`, and `pci.filtered --allow "[{segment: 0, bus: 0, device: 1,
+    function: 0}]" $ lspci` (a baked list-of-records allow-list, the previously blocked consumer) shows
+    exactly `0000:00:01.0`, `ok: devices(1)` against a 3-device baseline. The demo path (raw components,
+    manual configure calls) is unaffected. Note: configured artifacts have a new byte shape, so the
+    storedisk compile cache misses once per composition and refills; nothing else changes.

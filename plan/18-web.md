@@ -775,3 +775,15 @@ no page JS/CSS/HTML or blob source changed. Verified: check-web-vm ok, all four 
 and a one-off harness run confirmed `entropy.seeded & echo` at the browser prompt now names `echo` and
 suggests the `$` spelling. Few-byte drift in otherwise-unchanged components is the known checkout-path
 residue (D26).
+
+## Decision 35 — the blob's run paths call the configured bind entrypoint (2026-05-30)
+
+Plan/03 D22 (alias + bind configure) adds one step to the executor contract; the blob implements it in
+both run paths — `store::instantiate` (the page's run_program/sleepy paths) and the exec surface's
+`run_child` (everything spawned from the eosh prompt, including in-blob-compiled compositions): after
+`instantiate_async`, look up `eo9:rt/configured` / `bind` and call it before `main`. Assets rebuilt once
+(only the blob's fingerprint changed; every store `.cwasm` reproduced byte-identically since no guest
+sources changed). Verified by the node/JSPI harnesses: verify-eosh 28/28 — including the frozen-clock
+composition, deterministic seeded streams across runs, and the `&` form with two configured operands
+(which exercises the bind merger in-blob) — verify-coreutils 15/15, verify-fs, verify-exec all PASS,
+check-web-vm ok.

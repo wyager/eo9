@@ -347,3 +347,13 @@ Coreutil signature changes that ride on this are plan/17 D6.
   a clear message and schedulers must use `wait`.
 - **E4 (area 01):** root pin entry for wasmtime could become `default-features = false`
   so the runtime can opt out of unused default features in the TCB build.
+
+### Bind entrypoint (2026-05-30, plan/03 D22)
+
+`Task::spawn` gained the executor contract's configuration step: after instantiation (still under the
+bounded `SPAWN_FUEL` budget, with the same doorbell poll loop), it looks up `eo9:rt/configured.bind` and
+calls it if the component exports it — that is what applies every compose-time configuration baked into a
+composed artifact. Configuration shares the spawn budget deliberately: `configure` binds constants and must
+not run unbounded code, so exhausting the budget there is reported as a spawn error naming `configure`.
+All three usermode spawn paths (`eo9 run`, the shell, exec-surface child spawns) route through
+`Task::spawn`, so this is the only change. Plain programs export no entrypoint and skip the step.
