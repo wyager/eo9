@@ -64,26 +64,54 @@ pub fn boot_to_eosh(entries: &'static [StoreEntry]) {
 /// Children read the same manifest through their own fs view (they inherit the full
 /// session environment, so the picture it paints is theirs too).
 pub(super) fn session_manifest(entries: &'static [StoreEntry]) -> String {
+    // Whether this boot has a writable store disk (the `storedisk` token): /bin then has
+    // a second, disk-resident layer behind the baked entries.
+    #[cfg(feature = "wasm-storedisk")]
+    let writable_store = super::diskcache::enabled();
+    #[cfg(not(feature = "wasm-storedisk"))]
+    let writable_store = false;
+
     let names: alloc::vec::Vec<&str> = entries.iter().map(|entry| entry.name).collect();
     let mut lines = vec![
         String::from("eo9-session 1"),
         String::from("shell text PL011 serial console"),
-        String::from("shell fs the baked-in read-only store image (program names under /bin)"),
+        if writable_store {
+            String::from(
+                "shell fs the baked-in store image plus a writable disk store (saved \
+                 programs persist under /bin across reboots)",
+            )
+        } else {
+            String::from("shell fs the baked-in read-only store image (program names under /bin)")
+        },
         String::from("shell exec spawn programs as children"),
         String::from("child text PL011 serial console (shared with the shell)"),
         String::from("child time generic timer + PL031 RTC"),
         String::from("child entropy counter-seeded splitmix64 (a stub, not a CSPRNG)"),
-        String::from(
-            "child fs the same read-only store image view (programs under /bin, /session)",
-        ),
+        if writable_store {
+            String::from(
+                "child fs the same two-layer store view (baked programs plus saved ones, \
+                 /session)",
+            )
+        } else {
+            String::from(
+                "child fs the same read-only store image view (programs under /bin, /session)",
+            )
+        },
         String::from(
             "child exec spawn programs as children (the full session environment is inherited, every generation)",
         ),
-        String::from("note programs get no writable filesystem on bare metal yet"),
+        if writable_store {
+            String::from(
+                "note `save <name> = <expr>` persists a program or composition on the store \
+                 disk (and `rm /bin/<name>.wasm` removes it); baked-in names cannot be replaced",
+            )
+        } else {
+            String::from("note programs get no writable filesystem on bare metal yet")
+        },
         String::from("note restrict a command with `only` to strip capabilities before it runs"),
         if cfg!(feature = "wasm-codegen") {
             String::from(
-                "note the store is read-only and baked into the kernel image; compositions \
+                "note the store is baked into the kernel image; compositions \
                  (`$`, `&`, `only`, configure) are fused and compiled on-target",
             )
         } else {
