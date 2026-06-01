@@ -338,3 +338,28 @@ Match the priority order above; (1)+(2) unblock I2.
     no trap, exit/refusal class unchanged. Until then every provider config interface shares this
     failure mode, and per-provider workarounds (panicking with the message, falling back to defaults)
     are all worse than the gap; none is taken.
+
+23. **The receive spin is dead; the consumer owns the wait (user study 08, findings F2 + F3 —
+    2026-05-31, branch `area/09-net-fixes`).** The study's packet capture showed every fresh ARP
+    resolution through the TCP/IP middleware stalling ~6.7 s although the wire answered in 10 µs, and a
+    wire-visible TCP RST being reported as `timed-out` because the stall had already burned the connect
+    deadline. Mechanism: `net.virtio`'s `recv-frame` with nothing waiting spun its full
+    2,000,000-host-call bound (~1.7 s) before reporting anything, and reported that "nothing" as a
+    typed *error*; the middleware's pump treated the error as end-of-round, so each quiet-wire moment
+    cost multi-second pump rounds. Three changes: (a) **net.virtio** — the receive poll bound drops to
+    2,000 host calls (~2 ms) and "nothing waiting" is now the WIT's own empty result
+    (`bytes-received: 0`), not an error; runts/unusable completions are also empty results (wire noise,
+    not failures). The driver no longer imposes a wait policy on its consumers — that was never its
+    job. (b) **l2check** — treats the empty result as "poll again" with a 64-attempt budget (~100–200 ms
+    ARP window). (c) **net.l4.over-l2** — `wait_until`'s deadline path pumps once more and re-checks
+    before declaring `timed-out` ("wire truth beats the clock"): frames that already reached the device
+    decide the outcome, so a SYN answered by an RST reports `connection-refused` even when the answer
+    is processed late. Verified on metal (QEMU aarch64, `pci net`): the three-layer
+    `net.virtio $ net.l4.over-l2 $ l4check` went from 60.8 s wall / `tcp 10.0.2.2:9 -> TimedOut`
+    (deadline burned by the ARP stall) to 45.9 s wall / `tcp 10.0.2.2:9 -> ConnectionRefused` — the
+    refused TCP probe now matches what `net.l4.loopback` reports for the same stimulus (the study's
+    mock-fidelity acceptance criterion), and the residual wall time is the on-target compile (study
+    finding F6, tracked separately). `net.virtio $ l2check` still resolves the gateway (the direct l2
+    consumer keeps working under the short poll). The remaining modernization — converting the
+    driver's receive to a PCI INTx interrupt wait like `disk.virtio` — stays the plan/12 D59 follow-up;
+    the polled path these fixes leave behind is its fallback either way.
