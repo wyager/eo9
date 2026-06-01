@@ -1476,3 +1476,25 @@ preemption/hardening work.
       net-l2-deny pattern.
     * The DMA contract (finding 9) is recorded as a proposed `wit/pci` doc-comment addition in
       plan/02 D22 and stated in disk.virtio's module docs for driver authors.
+
+63. **IOMMU spike: SMMUv3 is incremental, ~1k lines, and the only real-hardware path
+    (2026-06-01, branch `spike/12-iommu`, `docs/spikes/iommu.md`).** Owner-approved
+    investigation of study 09's no-IOMMU finding, run against QEMU 11's `-M virt,iommu=smmuv3`.
+    Findings: (1) the kernel boots and runs the full demo, lspci, and the storedisk DMA path
+    completely unchanged with the SMMU present — QEMU resets `GBPA.ABORT = 0`, so an
+    unprogrammed SMMU is global bypass, which means IOMMU support has no flag day and can land
+    in independently-verifiable steps; (2) the SMMU's MMIO (0x0905_0000, 128 KiB) is already
+    inside the kernel's identity-mapped device gigabyte, and the DTB's `iommu-map` is the
+    identity RID→StreamID mapping, so a linear stream table suffices; (3) a minimal stage-2-only
+    polled driver is ~800–1,200 lines (register bring-up, linear stream table, command/event
+    queues, a stage-2 page-table builder adapted from `mmu.rs`, and pci-provider lifecycle
+    integration) — no new concepts beyond what `pci.rs`/`virtio_blk.rs` already established;
+    (4) with stage-2 translate + `GBPA.ABORT = 1`, out-of-bounds device DMA becomes an
+    `F_TRANSLATION` event-queue fault attributable to the owning task instead of silent memory
+    corruption, closing the study's "disqualifying" finding structurally; (5) virtio-iommu would
+    be ~half the work but is a QEMU-only dead end — real aarch64 silicon has SMMUv3 (or nothing),
+    so that effort transfers nowhere. Recommendation: build the SMMUv3 driver as part of
+    real-board prep (not before; nothing on the roadmap is blocked by it), per the four-step
+    incremental plan in the spike doc. `wit/pci` needs no changes. The xtask `iommu` argument
+    added by the spike is experimental and aarch64-only; promote it to a documented flag when
+    step 1 of the incremental plan lands.
