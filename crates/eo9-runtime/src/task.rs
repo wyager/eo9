@@ -95,6 +95,10 @@ pub struct SpawnLimits {
 pub enum SpawnError {
     /// Argument WAVE parse / type-check failure against `main`'s signature.
     BadArguments(String),
+    /// The provider rejected its baked compose-time configuration: `eo9:rt/configured.bind`
+    /// returned the provider's own error text. A typed pre-run refusal -- the program was
+    /// never entered.
+    ConfigurationRefused(String),
     /// An import could not be satisfied by the fused component plus the root providers
     /// (the loader rule from SPEC "WASM runtime"), or instantiation failed.
     Internal(String),
@@ -104,6 +108,9 @@ impl std::fmt::Display for SpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SpawnError::BadArguments(msg) => write!(f, "bad arguments: {msg}"),
+            SpawnError::ConfigurationRefused(msg) => {
+                write!(f, "compose-time configuration refused: {msg}")
+            }
             SpawnError::Internal(msg) => write!(f, "spawn failed: {msg}"),
         }
     }
@@ -498,46 +505,58 @@ impl Task {
         };
 
         // A configured composition exports the `eo9:rt/configured` entrypoint (plan/03
-        // D21, SPEC "The capability algebra"): its parameterless `bind` applies every
+        // D23, SPEC "The capability algebra"): its parameterless `bind` applies every
         // compose-time configuration baked into the artifact. The executor contract is
         // to call it once, after instantiation and before the first entry into the
         // program. It runs under the same bounded spawn budget as instantiation --
         // configuration binds constants and must not block or do unbounded work.
+        //
+        // `bind` returns `result<_, string>`: a configuration the provider rejects is a
+        // typed pre-run refusal, never a trap. Artifacts composed before that signature
+        // existed export a result-less `bind`; calling through the dynamic API handles
+        // both shapes (an old artifact's configure error still traps -- pre-existing
+        // behavior for pre-existing bytes).
         if let Some(bind) = bind_entrypoint(&instance, &mut store) {
-            let call = bind.call_async(&mut store, &[], &mut []);
-            let mut call = std::pin::pin!(call);
-            let waker = Waker::from(doorbell.clone());
-            let mut cx = Context::from_waker(&waker);
-            let mut result = None;
-            for _ in 0..1024 {
-                match call.as_mut().poll(&mut cx) {
-                    Poll::Ready(r) => {
-                        result = Some(r);
-                        break;
+            let mut bind_results = vec![Val::Bool(false); bind.ty(&store).results().len()];
+            {
+                let call = bind.call_async(&mut store, &[], &mut bind_results);
+                let mut call = std::pin::pin!(call);
+                let waker = Waker::from(doorbell.clone());
+                let mut cx = Context::from_waker(&waker);
+                let mut result = None;
+                for _ in 0..1024 {
+                    match call.as_mut().poll(&mut cx) {
+                        Poll::Ready(r) => {
+                            result = Some(r);
+                            break;
+                        }
+                        Poll::Pending if doorbell.take() => continue,
+                        Poll::Pending => break,
                     }
-                    Poll::Pending if doorbell.take() => continue,
-                    Poll::Pending => break,
                 }
+                result
+                    .ok_or_else(|| {
+                        SpawnError::Internal(
+                            "configuration (`bind`) unexpectedly suspended".to_string(),
+                        )
+                    })?
+                    .map_err(|err| {
+                        if matches!(err.downcast_ref::<Trap>(), Some(Trap::OutOfFuel)) {
+                            SpawnError::Internal(format!(
+                                "compose-time configuration exceeded the spawn fuel budget \
+                                 ({SPAWN_FUEL} fuel): `configure` must bind constants, not run \
+                                 unbounded code"
+                            ))
+                        } else {
+                            SpawnError::Internal(format!(
+                                "compose-time configuration (`bind`) failed: {err:#}"
+                            ))
+                        }
+                    })?;
             }
-            result
-                .ok_or_else(|| {
-                    SpawnError::Internal(
-                        "configuration (`bind`) unexpectedly suspended".to_string(),
-                    )
-                })?
-                .map_err(|err| {
-                    if matches!(err.downcast_ref::<Trap>(), Some(Trap::OutOfFuel)) {
-                        SpawnError::Internal(format!(
-                            "compose-time configuration exceeded the spawn fuel budget \
-                             ({SPAWN_FUEL} fuel): `configure` must bind constants, not run \
-                             unbounded code"
-                        ))
-                    } else {
-                        SpawnError::Internal(format!(
-                            "compose-time configuration (`bind`) failed: {err:#}"
-                        ))
-                    }
-                })?;
+            if let Some(refused) = configuration_refused(&bind_results) {
+                return Err(SpawnError::ConfigurationRefused(refused));
+            }
         }
 
         // Normal fuel regime for the task's life: an effectively-infinite pool sliced by
@@ -786,4 +805,20 @@ fn bind_entrypoint<T>(
     let configured = instance.get_export_index(&mut *store, None, "eo9:rt/configured@0.1.0")?;
     let bind = instance.get_export_index(&mut *store, Some(&configured), "bind")?;
     instance.get_func(&mut *store, bind)
+}
+
+/// The provider's configure-error text, if `bind`'s results carry one.
+///
+/// `bind: func() -> result<_, string>` -- one `Val::Result` whose error arm is the
+/// provider's own message. Old artifacts (a result-less `bind`) produce an empty results
+/// slice and never report an error this way. Shared by every executor that calls `bind`
+/// through the dynamic `Val` API.
+pub(crate) fn configuration_refused(bind_results: &[wasmtime::component::Val]) -> Option<String> {
+    match bind_results.first() {
+        Some(wasmtime::component::Val::Result(Err(err))) => Some(match err.as_deref() {
+            Some(wasmtime::component::Val::String(msg)) => msg.clone(),
+            _ => "the provider rejected its baked configuration".to_string(),
+        }),
+        _ => None,
+    }
 }

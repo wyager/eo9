@@ -52,7 +52,8 @@ use wasm_wave::wasm::WasmValue;
 use wit_parser::abi::{AbiVariant, FlatTypes, WasmSignature, WasmType};
 use wit_parser::decoding::{DecodedWasm, decode};
 use wit_parser::{
-    Function, FunctionKind, Int, InterfaceId, Resolve, SizeAlign, Type, TypeDefKind, WorldItem,
+    Docs, Function, FunctionKind, Int, InterfaceId, Resolve, Result_, SizeAlign, Span, Stability,
+    Type, TypeDef, TypeDefKind, TypeOwner, WorldItem,
 };
 
 use crate::compose::{
@@ -832,7 +833,7 @@ fn ensure_configured_interface(
             resolve
                 .push_source(
                     "eo9-rt-configured.wit",
-                    "package eo9:rt@0.1.0;\n\ninterface configured {\n    bind: func();\n}\n",
+                    "package eo9:rt@0.1.0;\n\ninterface configured {\n    bind: func() -> result<_, string>;\n}\n",
                 )
                 .map_err(|err| format!("failed to add the eo9:rt package: {err:#}"))?
         }
@@ -852,23 +853,40 @@ fn ensure_configured_interface(
 
     // The provider's resolve has eo9:rt (diagnostics) but not `configured`: add it
     // programmatically, cloning the config interface/function as field skeletons.
-    let mut bind_function = config_function.clone();
-    bind_function.name = BIND.to_string();
-    bind_function.kind = FunctionKind::Freestanding;
-    bind_function.params = Vec::new();
-    bind_function.result = None;
-
     let mut configured_iface = resolve.interfaces[config_interface].clone();
     configured_iface.name = Some(CONFIGURED.to_string());
     configured_iface.types.clear();
     configured_iface.functions.clear();
-    configured_iface
-        .functions
-        .insert(BIND.to_string(), bind_function);
     configured_iface.package = Some(rt_pkg);
     configured_iface.clone_of = None;
-
     let configured_id = resolve.interfaces.alloc(configured_iface);
+
+    // `bind`'s result type: `result<_, string>` -- the provider's configure error text,
+    // carried out of the binder as a typed value instead of a trap. Anonymous type
+    // (`name: None`), so its owner is `None`: wit-parser's validity invariant is that
+    // interface-owned types appear in the interface's *named* type map, which an
+    // anonymous function-signature type cannot.
+    let bind_result = resolve.types.alloc(TypeDef {
+        name: None,
+        kind: TypeDefKind::Result(Result_ {
+            ok: None,
+            err: Some(Type::String),
+        }),
+        owner: TypeOwner::None,
+        docs: Docs::default(),
+        stability: Stability::default(),
+        span: Span::default(),
+    });
+
+    let mut bind_function = config_function.clone();
+    bind_function.name = BIND.to_string();
+    bind_function.kind = FunctionKind::Freestanding;
+    bind_function.params = Vec::new();
+    bind_function.result = Some(Type::Id(bind_result));
+
+    resolve.interfaces[configured_id]
+        .functions
+        .insert(BIND.to_string(), bind_function);
     resolve.packages[rt_pkg]
         .interfaces
         .insert(CONFIGURED.to_string(), configured_id);
@@ -944,8 +962,11 @@ fn synthesize_binder_module(plan: &BinderPlan, configured_extern: &str) -> Vec<u
     code.function(&realloc_body());
     let realloc_func = 1u32;
 
+    // `bind: func() -> result<_, string>` -- the result is wider than one flat value, so
+    // the canonical ABI has the lifted export return a pointer into linear memory where
+    // the result (discriminant + error string ptr/len) is laid out.
     let bind_type = types.len();
-    types.ty().function([], []);
+    types.ty().function([], [ValType::I32]);
     functions.function(bind_type);
     code.function(&bind_body(plan, &layout, configure_func));
     let bind_func = 2u32;
@@ -1006,68 +1027,43 @@ fn synthesize_binder_module(plan: &BinderPlan, configured_extern: &str) -> Vec<u
     module.finish()
 }
 
-/// The binder's `cabi_realloc`: a bump allocator over the exported memory (grown on
-/// demand) used by the canonical ABI to lift results into the binder. Allocations are
-/// never revisited; the bump pointer is reset at the start of every forwarded call, once
-/// the previous call's results have been consumed.
+/// The binder's `cabi_realloc`: see [`synth::realloc_body`] (shared with the bind
+/// merger, which needs the same bump allocator to receive error strings).
 fn realloc_body() -> wasm_encoder::Function {
-    let mut f = wasm_encoder::Function::new([(1, ValType::I32)]);
-    // Locals: 0 old_ptr, 1 old_size, 2 align, 3 new_size, 4 ptr (scratch).
-    let ptr = 4;
-
-    // ptr = (bump + align - 1) & -align
-    f.instruction(&Instruction::GlobalGet(0));
-    f.instruction(&Instruction::LocalGet(2));
-    f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::I32Const(1));
-    f.instruction(&Instruction::I32Sub);
-    f.instruction(&Instruction::I32Const(0));
-    f.instruction(&Instruction::LocalGet(2));
-    f.instruction(&Instruction::I32Sub);
-    f.instruction(&Instruction::I32And);
-    f.instruction(&Instruction::LocalSet(ptr));
-    // bump = ptr + new_size
-    f.instruction(&Instruction::LocalGet(ptr));
-    f.instruction(&Instruction::LocalGet(3));
-    f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::GlobalSet(0));
-    // while bump > memory.size * 64KiB: memory.grow(1), trapping if growth fails.
-    f.instruction(&Instruction::Block(BlockType::Empty));
-    f.instruction(&Instruction::Loop(BlockType::Empty));
-    f.instruction(&Instruction::GlobalGet(0));
-    f.instruction(&Instruction::MemorySize(0));
-    f.instruction(&Instruction::I32Const(65536));
-    f.instruction(&Instruction::I32Mul);
-    f.instruction(&Instruction::I32LeU);
-    f.instruction(&Instruction::BrIf(1));
-    f.instruction(&Instruction::I32Const(1));
-    f.instruction(&Instruction::MemoryGrow(0));
-    f.instruction(&Instruction::I32Const(-1));
-    f.instruction(&Instruction::I32Eq);
-    f.instruction(&Instruction::If(BlockType::Empty));
-    f.instruction(&Instruction::Unreachable);
-    f.instruction(&Instruction::End);
-    f.instruction(&Instruction::Br(0));
-    f.instruction(&Instruction::End);
-    f.instruction(&Instruction::End);
-    f.instruction(&Instruction::LocalGet(ptr));
-    f.instruction(&Instruction::End);
-    f
+    synth::realloc_body()
 }
 
 /// The `bind` entrypoint: call `configure` (sync-lowered) with the baked-in constants,
-/// require that it returned success, and mark the configuration applied. Idempotent --
-/// the first call wins, later calls return immediately. An error from `configure` (an
-/// invalid baked value) traps, so a misconfigured composition fails before any of its
-/// observable behavior runs. Because `configure` is synchronous it may itself reenter
-/// another configured provider's `configure` (the executor binds providers before the
-/// consumers layered on top of them -- see `compose.rs`).
+/// lift its result into bind's own `result<_, string>`, and mark the configuration
+/// applied on success. Idempotent -- the first call wins, later calls report success
+/// immediately. An error from `configure` (an invalid baked value) is *returned*, not
+/// trapped: bind's result and `configure`'s `result<x-impl, string>` share the same
+/// canonical layout for the discriminant and the error arm (the ok payload is simply
+/// ignored when the discriminant is 0), so the scratch area `configure` wrote is
+/// returned as bind's own result pointer verbatim. Because `configure` is synchronous
+/// it may itself reenter another configured provider's `configure` (the executor binds
+/// providers before the consumers layered on top of them -- see `compose.rs`).
+///
+/// Core signature: `[] -> [i32]` -- the returned i32 is a pointer to the result area
+/// (canonical ABI indirect results for a lifted export).
 fn bind_body(plan: &BinderPlan, layout: &Layout, configure_func: u32) -> wasm_encoder::Function {
     let mut f = wasm_encoder::Function::new([]);
+    let scratch = layout.scratch as i32;
 
-    // Idempotence: if configuration has already been applied, do nothing.
+    // Idempotence: if configuration has already been applied, report success. The
+    // success discriminant is written explicitly (the scratch area still holds whatever
+    // the first call produced, which on the success path already starts with 0 -- but a
+    // fresh store-8 keeps this arm independent of that).
     f.instruction(&Instruction::GlobalGet(1));
     f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::I32Const(scratch));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Store8(MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::I32Const(scratch));
     f.instruction(&Instruction::Return);
     f.instruction(&Instruction::End);
 
@@ -1091,7 +1087,7 @@ fn bind_body(plan: &BinderPlan, layout: &Layout, configure_func: u32) -> wasm_en
         }
     }
     if plan.config_sig.retptr {
-        f.instruction(&Instruction::I32Const(layout.scratch as i32));
+        f.instruction(&Instruction::I32Const(scratch));
     }
     f.instruction(&Instruction::Call(configure_func));
 
@@ -1105,20 +1101,39 @@ fn bind_body(plan: &BinderPlan, layout: &Layout, configure_func: u32) -> wasm_en
     }
 
     if plan.config_sig.retptr {
-        // The first byte of the written result is the `result<_, _>` discriminant.
-        f.instruction(&Instruction::I32Const(layout.scratch as i32));
+        // The first byte of the written result is the `result<_, _>` discriminant:
+        // 0 = configure succeeded (mark the configuration applied), 1 = the provider
+        // rejected the baked value (leave the flag clear; the error string `configure`
+        // lifted into [scratch+4, scratch+12) is exactly bind's own error arm).
+        f.instruction(&Instruction::I32Const(scratch));
         f.instruction(&Instruction::I32Load8U(MemArg {
             offset: 0,
             align: 0,
             memory_index: 0,
         }));
+        f.instruction(&Instruction::I32Eqz);
         f.instruction(&Instruction::If(BlockType::Empty));
-        f.instruction(&Instruction::Unreachable);
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::GlobalSet(1));
         f.instruction(&Instruction::End);
+    } else {
+        // `configure` has no indirect result to inspect (nothing can fail in a way the
+        // canonical ABI reports): mark applied and write the success discriminant.
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::GlobalSet(1));
+        f.instruction(&Instruction::I32Const(scratch));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Store8(MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 0,
+        }));
     }
 
-    f.instruction(&Instruction::I32Const(1));
-    f.instruction(&Instruction::GlobalSet(1));
+    // Either way the scratch area now holds bind's `result<_, string>`: discriminant at
+    // +0, and (on the error path) the string ptr/len at +4/+8 exactly where `configure`
+    // left them.
+    f.instruction(&Instruction::I32Const(scratch));
     f.instruction(&Instruction::End);
     f
 }

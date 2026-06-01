@@ -412,7 +412,7 @@ impl Wake for Doorbell {
 }
 
 /// The `eo9:rt/configured.bind` export of a configured composition, if the component
-/// carries one (see plan/03 D21 and wit/rt/rt.wit). Plain programs do not export it.
+/// carries one (see plan/03 D23 and wit/rt/rt.wit). Plain programs do not export it.
 /// The executor contract: call it once after instantiation, before the first entry into
 /// the program, so every compose-time configuration baked into the artifact is applied.
 pub(crate) fn bind_entrypoint<T>(
@@ -422,4 +422,30 @@ pub(crate) fn bind_entrypoint<T>(
     let configured = instance.get_export_index(&mut *store, None, "eo9:rt/configured@0.1.0")?;
     let bind = instance.get_export_index(&mut *store, Some(&configured), "bind")?;
     instance.get_func(&mut *store, bind)
+}
+
+/// The number of `Val` slots `bind`'s results need: 1 for the current
+/// `func() -> result<_, string>` signature, 0 for artifacts composed before the error
+/// channel existed (their configure errors still trap -- pre-existing behavior for
+/// pre-existing bytes).
+pub(crate) fn bind_result_slots<T>(
+    bind: &wasmtime::component::Func,
+    store: &wasmtime::Store<T>,
+) -> usize {
+    bind.ty(store).results().len()
+}
+
+/// The provider's configure-error text, if `bind`'s results carry one (the typed
+/// pre-run refusal of a configuration the provider rejected).
+pub(crate) fn configuration_refused(
+    bind_results: &[wasmtime::component::Val],
+) -> Option<alloc::string::String> {
+    use alloc::borrow::ToOwned;
+    match bind_results.first() {
+        Some(wasmtime::component::Val::Result(Err(err))) => Some(match err.as_deref() {
+            Some(wasmtime::component::Val::String(msg)) => msg.clone(),
+            _ => "the provider rejected its baked configuration".to_owned(),
+        }),
+        _ => None,
+    }
 }
