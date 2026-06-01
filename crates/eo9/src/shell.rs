@@ -200,26 +200,50 @@ fn materialize_session(cfg: &Config, store: &Store) -> Result<(PathBuf, Vec<Stri
     fs::create_dir_all(&shell_root)
         .map_err(|err| format!("cannot create {}: {err}", shell_root.display()))?;
 
-    // Pin this session BEFORE its directory exists: the lock file is a sibling of the
-    // session directory (`session-<pid>.lock` next to `session-<pid>/`), created and
-    // locked first, so no other process's sweep can ever observe a live session
-    // directory whose lock is not yet held.
+    // Pin this session BEFORE its directory exists, with two guarantees that make the
+    // sweep's "an unheld lock means a dead session" inference sound (a reviewer found the
+    // original create-then-lock version racing: a concurrent process's sweep could open
+    // the lock file in the instant between creation and locking, conclude the session was
+    // dead, unlink the lock — and a later sweep would then delete the live session
+    // directory while this process was still copying programs into it):
+    //
+    //  * Visible implies locked. The lock file is created and locked under a temporary
+    //    name, then renamed into place, so `session-<pid>.lock` can never be observed at
+    //    its final path in an unlocked state.
+    //
+    //  * Establishment and sweeps exclude each other. Establishment holds the shell
+    //    root's guard (`.sessions.lock`) shared from before the rename until the session
+    //    directory exists; every sweep holds it exclusive for its whole pass. Without
+    //    this, a sweep that had already opened a *dead* `session-<pid>.lock` (same pid,
+    //    reused) and seen it unheld could delete the path right after our live lock was
+    //    renamed over it.
     let session = shell_root.join(format!("session-{}", std::process::id()));
     let lock_path = shell_root.join(format!("session-{}.lock", std::process::id()));
-    let lock = fs::File::create(&lock_path)
-        .map_err(|err| format!("cannot create {}: {err}", lock_path.display()))?;
+    let tmp_path = shell_root.join(format!("session-{}.lock.tmp", std::process::id()));
+
+    let establish = open_session_guard(&shell_root)?;
+    establish
+        .lock_shared()
+        .map_err(|err| format!("cannot share the session guard: {err}"))?;
+
+    let lock = fs::File::create(&tmp_path)
+        .map_err(|err| format!("cannot create {}: {err}", tmp_path.display()))?;
     lock.lock()
-        .map_err(|err| format!("cannot lock {}: {err}", lock_path.display()))?;
+        .map_err(|err| format!("cannot lock {}: {err}", tmp_path.display()))?;
+    fs::rename(&tmp_path, &lock_path).map_err(|err| {
+        format!(
+            "cannot move the session lock into place ({} -> {}): {err}",
+            tmp_path.display(),
+            lock_path.display()
+        )
+    })?;
     // Held until the process exits; the sweep in other processes keys off it.
     Box::leak(Box::new(lock));
-
-    // Sweep what previous processes left behind (best-effort; never blocks a session).
-    sweep_dead_sessions(&shell_root);
 
     let bin = session.join("bin");
     if session.exists() {
         // Leftovers from a dead run that had our pid: ours to replace (our own lock is
-        // already held, so the sweep above did not touch this directory).
+        // already held, so no sweep will touch this directory).
         fs::remove_dir_all(&session).map_err(|err| {
             format!(
                 "cannot refresh the session directory {}: {err}",
@@ -233,6 +257,14 @@ fn materialize_session(cfg: &Config, store: &Store) -> Result<(PathBuf, Vec<Stri
             bin.display()
         )
     })?;
+
+    // Establishment is complete: the live lock is in place and the directory exists, so
+    // any future sweep will see the lock held and leave both alone. Release the guard and
+    // run our own sweep (it takes the guard exclusively and skips if anyone else holds it).
+    drop(establish);
+
+    // Sweep what previous processes left behind (best-effort; never blocks a session).
+    sweep_dead_sessions(&shell_root);
 
     let mut names: Vec<String> = Vec::new();
     for (name, hash) in store.names().map_err(|err| err.to_string())? {
@@ -292,13 +324,43 @@ fn place(source: &Path, target: &Path) -> Result<(), String> {
     })
 }
 
+/// Open (creating it if absent) the shell root's establishment/sweep guard,
+/// `.sessions.lock`.
+///
+/// Session establishment holds the guard *shared* while it puts its (already locked)
+/// session lock in place and creates its directory; `sweep_dead_sessions` holds it
+/// *exclusive* for its whole pass. The two therefore never interleave, which is what
+/// makes the sweep's path-based deletions safe — see `materialize_session` for the race
+/// this prevents.
+fn open_session_guard(shell_root: &Path) -> Result<fs::File, String> {
+    let path = shell_root.join(".sessions.lock");
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|err| format!("cannot open the session guard {}: {err}", path.display()))
+}
+
 /// Remove session directories (and their sibling lock files) whose owning process is
 /// gone, plus the legacy shared layout (`shell/bin` + `shell/session` from before
 /// sessions were per-process). A session is alive exactly while its `session-<pid>.lock`
-/// sibling is held; the lock is always created and acquired *before* the directory (see
-/// `materialize_session`), so a directory with an absent or unheld lock is always dead.
-/// Best-effort: a sweep failure never stops a session from starting.
+/// sibling is held; that lock is only ever visible at its final path in a locked state,
+/// and establishment excludes sweeps via the shared/exclusive guard (see
+/// `materialize_session`), so an unheld lock — or a directory with no lock at all — is
+/// always dead. Best-effort: a sweep failure (or a contended guard) never stops a
+/// session from starting; leftovers are picked up by a later sweep.
 fn sweep_dead_sessions(shell_root: &Path) {
+    // The whole pass runs under the exclusive guard so it can never interleave with a
+    // session establishment. If anyone is establishing (shared) or sweeping (exclusive)
+    // right now, skip — housekeeping can wait.
+    let Ok(guard) = open_session_guard(shell_root) else {
+        return;
+    };
+    if guard.try_lock().is_err() {
+        return;
+    }
+
     let legacy_bin = shell_root.join("bin");
     if legacy_bin.is_dir() {
         let _ = fs::remove_dir_all(&legacy_bin);
@@ -308,6 +370,7 @@ fn sweep_dead_sessions(shell_root: &Path) {
         return;
     };
     let our_lock = format!("session-{}.lock", std::process::id());
+    let our_tmp = format!("session-{}.lock.tmp", std::process::id());
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -316,14 +379,25 @@ fn sweep_dead_sessions(shell_root: &Path) {
         let Some(stem) = name.strip_prefix("session-") else {
             continue;
         };
-        // Look at lock files only (the dir is handled together with its lock).
+        let lock_path = entry.path();
+        // Orphaned temporary lock files: their creator died between creating one and
+        // renaming it into place (a live one cannot be observed here — its owner holds
+        // the guard shared, which excludes this sweep). Never our own.
+        if name.ends_with(".lock.tmp") {
+            if name != our_tmp
+                && fs::File::open(&lock_path).is_ok_and(|file| file.try_lock().is_ok())
+            {
+                let _ = fs::remove_file(&lock_path);
+            }
+            continue;
+        }
+        // Session lock files (the dir is handled together with its lock).
         let Some(pid) = stem.strip_suffix(".lock") else {
             continue;
         };
         if name == our_lock {
             continue;
         }
-        let lock_path = entry.path();
         let held = fs::File::open(&lock_path).is_ok_and(|file| file.try_lock().is_err());
         if !held {
             let _ = fs::remove_dir_all(shell_root.join(format!("session-{pid}")));
