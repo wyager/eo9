@@ -315,3 +315,20 @@ its first milestones, and to be the place where cross-area seams get found.
     `eo9 run`'s pre-check message, with the raw reason kept first. The CLI test
     `disk_is_not_granted_without_an_explicit_disk_flag` asserts the flag and the formatter are
     both named.
+24. **Per-process shell sessions and the study-07 usermode fixes (2026-05-31, branch
+    `area/14-eofs-integrity`).**
+    - **S7-6.** The session bin view moved from one shared `<store>/shell/bin` (rebuilt by every
+      invocation — concurrent `eo9 -c` runs corrupted each other ~⅓ of the time) to per-process
+      `<store>/shell/session-<pid>/`, pinned by a sibling lock file created and held *before* the
+      directory exists so a sweep can never remove a live session. Dead sessions are swept on the
+      next start. The bin view now uses copies (APFS clones), not hard links: the fs provider's
+      containment re-verification resolves a hard link's kernel path, which under per-process roots
+      could name another session's link and produced spurious `Denied` errors. Eight-way
+      concurrency regression test.
+    - **S7-1.** `HostDisk::open` probes the image (eofs_core::probe) and prints a loud warning when
+      the next mount will fall back past a damaged uberblock slot.
+    - **S7-13.** Spawn-hint rendering in the runtime now leads with the embedder's advice and
+      appends the raw linker reason in brackets, instead of burying the advice in a trailing
+      parenthesis (this is the one change outside the usermode crate: eo9-runtime/src/link.rs,
+      flagged in the merge report). The CLI test asserts the ordering.
+    - **S7-14.** README gained a verified "Persistent storage (eofs)" section.

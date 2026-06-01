@@ -191,7 +191,47 @@ struct HostDisk {
 
 impl HostDisk {
     /// Open the image file read-write. The device size is the file's current length.
+    ///
+    /// Within one eo9 process the same image is shared: the shell session and every child
+    /// it spawns reuse a single opened (and advisorily locked) device, because in-process
+    /// access is already serialized — commands run one at a time. The exclusive lock the
+    /// unix provider takes (study 07, S7-7) is aimed at *other* processes, whose writes
+    /// would interleave unpredictably with ours and corrupt the copy-on-write image.
     fn open(image: &Path) -> Result<Self, String> {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock, Weak};
+
+        static OPEN_IMAGES: OnceLock<Mutex<HashMap<std::path::PathBuf, Weak<UnixDisk>>>> =
+            OnceLock::new();
+
+        let canonical = image.canonicalize().unwrap_or_else(|_| image.to_path_buf());
+        let cache = OPEN_IMAGES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut map = cache.lock().unwrap();
+        if let Some(existing) = map.get(&canonical).and_then(Weak::upgrade) {
+            return Ok(Self { inner: existing });
+        }
+
+        // Pre-flight health probe (study 07, S7-1): if the image's newest uberblock is
+        // damaged, mounting it will silently serve an older transaction — committed,
+        // acknowledged data may be missing. The filesystem provider runs inside a wasm
+        // component with no warning channel, so the host says it here, *before* anything
+        // mounts, where the operator can actually see it.
+        // Healthy, blank, foreign, unmountable, or unreadable images get no warning here —
+        // the provider (or the open below) reports those through its own typed errors.
+        if let Ok(Ok(eofs_core::ImageState::Eofs {
+            txg,
+            degraded: true,
+        })) = crate::mkfs::FileDevice::open(image).map(|device| eofs_core::probe(&device))
+        {
+            eprintln!(
+                "eo9: warning: {}: one of the image's uberblock slots is damaged; the \
+                 filesystem will mount transaction {txg} from the surviving slot. If \
+                 the image was cleanly written after that transaction, the most recent \
+                 commit has been LOST (rolled back). If the last write was interrupted \
+                 (a crash or power cut), this is normal recovery.",
+                image.display()
+            );
+        }
         let pool = Arc::new(BlockingPool::with_default_size());
         let inner = UnixDisk::open(image, false, pool).map_err(|err| {
             format!(
@@ -201,9 +241,9 @@ impl HostDisk {
                 image.display()
             )
         })?;
-        Ok(Self {
-            inner: Arc::new(inner),
-        })
+        let inner = Arc::new(inner);
+        map.insert(canonical, Arc::downgrade(&inner));
+        Ok(Self { inner })
     }
 }
 

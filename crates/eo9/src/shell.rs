@@ -181,22 +181,49 @@ fn resolve_eosh(cfg: &Config, store: &Store) -> Result<ProgramSource, String> {
     ))
 }
 
-/// Build (refreshing on every shell start) the session directory the shell's filesystem
-/// is rooted at: `<store-root>/shell/bin/<name>.wasm`, one entry per bound store name —
+/// Build the session directory the shell's filesystem is rooted at, one per process:
+/// `<store-root>/shell/session-<pid>/bin/<name>.wasm`, one entry per bound store name —
 /// hard-linked to the store object when possible, copied otherwise — plus the dev-tree
 /// components under the names they answer to in a shell (`hello`, `entropy.seeded`, …).
 /// Store bindings win over dev-tree components of the same name.
 ///
+/// Sessions used to share a single `shell/bin` directory, rebuilt on every start — so two
+/// concurrent `eo9 -c` invocations corrupted each other's view about a third of the time
+/// (study 07, S7-6). Each process now owns its own session directory, pinned by a file
+/// lock held for the process's lifetime; dead sessions (lock no longer held) are swept on
+/// the next start.
+///
 /// Returns the session directory and the program names placed into the bin view (the
 /// names eosh can resolve — also the shell's tab-completion candidates).
 fn materialize_session(cfg: &Config, store: &Store) -> Result<(PathBuf, Vec<String>), String> {
-    let session = store.root().join("shell");
+    let shell_root = store.root().join("shell");
+    fs::create_dir_all(&shell_root)
+        .map_err(|err| format!("cannot create {}: {err}", shell_root.display()))?;
+
+    // Pin this session BEFORE its directory exists: the lock file is a sibling of the
+    // session directory (`session-<pid>.lock` next to `session-<pid>/`), created and
+    // locked first, so no other process's sweep can ever observe a live session
+    // directory whose lock is not yet held.
+    let session = shell_root.join(format!("session-{}", std::process::id()));
+    let lock_path = shell_root.join(format!("session-{}.lock", std::process::id()));
+    let lock = fs::File::create(&lock_path)
+        .map_err(|err| format!("cannot create {}: {err}", lock_path.display()))?;
+    lock.lock()
+        .map_err(|err| format!("cannot lock {}: {err}", lock_path.display()))?;
+    // Held until the process exits; the sweep in other processes keys off it.
+    Box::leak(Box::new(lock));
+
+    // Sweep what previous processes left behind (best-effort; never blocks a session).
+    sweep_dead_sessions(&shell_root);
+
     let bin = session.join("bin");
-    if bin.exists() {
-        fs::remove_dir_all(&bin).map_err(|err| {
+    if session.exists() {
+        // Leftovers from a dead run that had our pid: ours to replace (our own lock is
+        // already held, so the sweep above did not touch this directory).
+        fs::remove_dir_all(&session).map_err(|err| {
             format!(
-                "cannot refresh the session bin view {}: {err}",
-                bin.display()
+                "cannot refresh the session directory {}: {err}",
+                session.display()
             )
         })?;
     }
@@ -248,16 +275,79 @@ fn materialize_session(cfg: &Config, store: &Store) -> Result<(PathBuf, Vec<Stri
     Ok((session, names))
 }
 
-/// Put one program into the bin view: hard-link when source and view share a filesystem
-/// (the store objects always do), copy otherwise.
+/// Put one program into the bin view.
+///
+/// This must be a *copy*, never a hard link: the session filesystem provider re-verifies
+/// every opened file's real path against the session root (containment), and a
+/// hard-linked file's kernel-reported path can be any of its links — including another
+/// session's bin view or the store object itself, both outside this session's root, which
+/// surfaces as a spurious `Denied`. `fs::copy` clones on APFS (copy-on-write), so the
+/// per-session cost is an inode, not the bytes.
 fn place(source: &Path, target: &Path) -> Result<(), String> {
-    if fs::hard_link(source, target).is_ok() {
-        return Ok(());
-    }
     fs::copy(source, target).map(|_| ()).map_err(|err| {
         format!(
             "cannot place {} into the session bin view: {err}",
             source.display()
         )
     })
+}
+
+/// Remove session directories (and their sibling lock files) whose owning process is
+/// gone, plus the legacy shared layout (`shell/bin` + `shell/session` from before
+/// sessions were per-process). A session is alive exactly while its `session-<pid>.lock`
+/// sibling is held; the lock is always created and acquired *before* the directory (see
+/// `materialize_session`), so a directory with an absent or unheld lock is always dead.
+/// Best-effort: a sweep failure never stops a session from starting.
+fn sweep_dead_sessions(shell_root: &Path) {
+    let legacy_bin = shell_root.join("bin");
+    if legacy_bin.is_dir() {
+        let _ = fs::remove_dir_all(&legacy_bin);
+        let _ = fs::remove_file(shell_root.join("session"));
+    }
+    let Ok(entries) = fs::read_dir(shell_root) else {
+        return;
+    };
+    let our_lock = format!("session-{}.lock", std::process::id());
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(stem) = name.strip_prefix("session-") else {
+            continue;
+        };
+        // Look at lock files only (the dir is handled together with its lock).
+        let Some(pid) = stem.strip_suffix(".lock") else {
+            continue;
+        };
+        if name == our_lock {
+            continue;
+        }
+        let lock_path = entry.path();
+        let held = fs::File::open(&lock_path).is_ok_and(|file| file.try_lock().is_err());
+        if !held {
+            let _ = fs::remove_dir_all(shell_root.join(format!("session-{pid}")));
+            let _ = fs::remove_file(&lock_path);
+        }
+    }
+    // Directories with no lock file at all (interrupted before the lock existed, or
+    // created by something else) are dead by definition — but only sweep ones following
+    // our naming scheme, and never our own.
+    let Ok(entries) = fs::read_dir(shell_root) else {
+        return;
+    };
+    let ours = format!("session-{}", std::process::id());
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !path.is_dir() || !name.starts_with("session-") || name == ours {
+            continue;
+        }
+        if !shell_root.join(format!("{name}.lock")).exists() {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
 }
