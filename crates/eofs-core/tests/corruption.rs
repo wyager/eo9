@@ -105,3 +105,83 @@ fn a_blank_device_does_not_mount() {
         Err(FsError::Corrupt(_))
     ));
 }
+
+// --- probing and degraded-mount reporting (study 07, S7-1 & S7-2) -------------------------
+
+#[test]
+fn probe_distinguishes_eofs_blank_foreign_and_unmountable() {
+    use eofs_core::{ImageState, probe};
+
+    // A healthy image probes as Eofs at its committed transaction, not degraded.
+    let image = image_with_victim();
+    let dev = MemDevice::from_vec(image.clone());
+    assert_eq!(
+        probe(&dev).unwrap(),
+        ImageState::Eofs {
+            txg: 2,
+            degraded: false
+        }
+    );
+
+    // A zero-filled device is Blank.
+    assert_eq!(probe(&MemDevice::new(DEV_SIZE)).unwrap(), ImageState::Blank);
+
+    // A device full of someone else's data is Foreign — never auto-formatted.
+    let mut foreign = vec![0u8; DEV_SIZE as usize];
+    foreign[1024..2048].fill(0xA5); // an "ext4 superblock"
+    assert_eq!(
+        probe(&MemDevice::from_vec(foreign)).unwrap(),
+        ImageState::Foreign
+    );
+
+    // Foreign data far into the device but zeros up front still counts as Foreign when it
+    // is inside the probed span.
+    let mut late = vec![0u8; DEV_SIZE as usize];
+    late[60 * 1024] = 1;
+    assert_eq!(
+        probe(&MemDevice::from_vec(late)).unwrap(),
+        ImageState::Foreign
+    );
+
+    // An image whose every uberblock slot is damaged is Unmountable, not Blank or Foreign.
+    let mut dead = image;
+    dead[100] ^= 0xff;
+    dead[4096 + 100] ^= 0xff;
+    assert_eq!(
+        probe(&MemDevice::from_vec(dead)).unwrap(),
+        ImageState::Unmountable
+    );
+}
+
+#[test]
+fn falling_back_past_a_damaged_uberblock_is_reported() {
+    use eofs_core::{ImageState, probe};
+
+    // Two transactions: txg 1 (format, slot 1) and txg 2 (the file, slot 0).
+    let mut image = image_with_victim();
+
+    // Damage the NEWEST uberblock (txg 2 lives in slot 0 = bytes 0..4096). The mount
+    // falls back to txg 1 — correct for crash recovery, but it must SAY so, because if
+    // txg 2 was an acknowledged commit this is silent data loss.
+    image[100] ^= 0xff;
+
+    let dev = MemDevice::from_vec(image);
+    assert_eq!(
+        probe(&dev).unwrap(),
+        ImageState::Eofs {
+            txg: 1,
+            degraded: true
+        }
+    );
+
+    let (fs, report) = Eofs::mount_with_report(dev).unwrap();
+    assert_eq!(report.txg, 1);
+    assert!(report.fell_back_past_invalid_slot);
+    // The rolled-back state has no /victim (it was created in txg 2).
+    assert!(matches!(fs.stat("/victim"), Err(FsError::NotFound)));
+
+    // A healthy image, by contrast, reports no fallback.
+    let (_fs, report) = Eofs::mount_with_report(MemDevice::from_vec(image_with_victim())).unwrap();
+    assert_eq!(report.txg, 2);
+    assert!(!report.fell_back_past_invalid_slot);
+}

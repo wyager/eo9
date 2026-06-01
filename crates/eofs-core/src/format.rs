@@ -248,12 +248,25 @@ impl Uberblock {
     /// bytes) — the caller falls back to the other slot. Errors are reserved for slots that
     /// checksum correctly but still make no sense.
     pub fn from_slot_bytes(slot: &[u8]) -> Result<Option<Uberblock>, FsError> {
+        match Uberblock::classify_slot(slot)? {
+            SlotState::Valid(ub) => Ok(Some(ub)),
+            SlotState::NoMagic | SlotState::Invalid => Ok(None),
+        }
+    }
+
+    /// Classify a slot's bytes, distinguishing the three states a mount cares about:
+    /// no eofs magic at all (blank or foreign bytes), the *remains* of an uberblock (the
+    /// magic is there but the checksum fails — a torn write, bit rot, or tampering), and a
+    /// valid uberblock. The distinction matters because adopting an older valid slot while
+    /// the other slot holds remains may mean committed state has been lost (silently
+    /// rolled back), which the embedder must be able to report (study 07, S7-1).
+    pub fn classify_slot(slot: &[u8]) -> Result<SlotState, FsError> {
         if slot.len() < UBERBLOCK_SIZE || slot[0..8] != MAGIC {
-            return Ok(None);
+            return Ok(SlotState::NoMagic);
         }
         let checksum = blake3::hash(&slot[0..UBERBLOCK_BODY_SIZE]);
         if checksum.as_bytes() != &slot[UBERBLOCK_BODY_SIZE..UBERBLOCK_SIZE] {
-            return Ok(None);
+            return Ok(SlotState::Invalid);
         }
         let version = u32::from_le_bytes(slot[8..12].try_into().unwrap());
         if version != FORMAT_VERSION {
@@ -267,7 +280,7 @@ impl Uberblock {
         let device_size = u64::from_le_bytes(slot[40..48].try_into().unwrap());
         let live_root = ObjRef::read_from(&slot[48..48 + OBJ_REF_SIZE])?;
         let snapshots = ObjRef::read_from(&slot[120..120 + OBJ_REF_SIZE])?;
-        Ok(Some(Uberblock {
+        Ok(SlotState::Valid(Uberblock {
             block_size,
             alloc_unit,
             codec,
@@ -278,6 +291,18 @@ impl Uberblock {
             snapshots,
         }))
     }
+}
+
+/// What one uberblock slot holds (see [`Uberblock::classify_slot`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotState {
+    /// No eofs magic: the slot was never written by eofs (blank, or foreign data).
+    NoMagic,
+    /// The eofs magic is present but the slot does not checksum: the remains of an
+    /// uberblock — a torn write, bit rot, or tampering.
+    Invalid,
+    /// A valid uberblock.
+    Valid(Uberblock),
 }
 
 /// One directory entry: a name and the object it refers to.

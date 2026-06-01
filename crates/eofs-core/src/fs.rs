@@ -16,8 +16,8 @@ use crate::device::BlockDevice;
 use crate::error::FsError;
 use crate::format::{
     BLOCK_PTR_SIZE, BlockPtr, Codec, DATA_START, DirEntry, MAX_META_OBJECT_SIZE, MAX_NAME_LEN,
-    NodeKind, ObjRef, SLOT_OFFSETS, SLOT_SIZE, SnapEntry, Uberblock, parse_dir, parse_snapshots,
-    serialize_dir, serialize_snapshots,
+    NodeKind, ObjRef, SLOT_OFFSETS, SLOT_SIZE, SlotState, SnapEntry, Uberblock, parse_dir,
+    parse_snapshots, serialize_dir, serialize_snapshots,
 };
 use crate::space::{Allocator, Extent};
 
@@ -100,6 +100,103 @@ pub struct SpaceReport {
     pub free_bytes: u64,
     /// Device capacity in bytes.
     pub device_size: u64,
+}
+
+/// What [`Eofs::mount_with_report`] observed while electing the uberblock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MountReport {
+    /// The transaction the mount adopted.
+    pub txg: u64,
+    /// A slot held the *remains* of an uberblock (eofs magic present, checksum invalid)
+    /// while another, valid slot was adopted. Either the invalid slot was newer — a commit
+    /// that was acknowledged and has now been silently lost (rolled back) — or it was the
+    /// older slot rotting in place. The two cannot be distinguished from the disk alone,
+    /// so embedders must surface this loudly and let the operator decide (study 07, S7-1).
+    pub fell_back_past_invalid_slot: bool,
+}
+
+/// What [`probe`] found on a device, without mounting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageState {
+    /// The device holds an eofs filesystem; mounting it adopts `txg`. `degraded` is the
+    /// [`MountReport::fell_back_past_invalid_slot`] condition.
+    Eofs { txg: u64, degraded: bool },
+    /// The device holds no eofs filesystem and its leading bytes are all zero: a blank
+    /// device, safe to format in place.
+    Blank,
+    /// The device holds no eofs filesystem but its leading bytes are NOT all zero: it
+    /// contains someone else's data. Formatting it would destroy that data, so nothing in
+    /// Eo9 does so implicitly (study 07, S7-2) — formatting foreign data takes an
+    /// explicit, forced `mkfs`.
+    Foreign,
+    /// The device carries eofs remains (magic present) but nothing mounts: every slot is
+    /// invalid. Never reformatted implicitly; the data may be recoverable by hand.
+    Unmountable,
+}
+
+/// How many leading bytes [`probe`] checks for zeroness when no eofs magic is present:
+/// enough to cover both uberblock slots and the superblock locations of every common
+/// foreign filesystem (ext4 at 1024, FAT/NTFS/exFAT at 0, GPT at 512...).
+const PROBE_ZERO_SPAN: u64 = 64 * 1024;
+
+/// Inspect a device without mounting (or changing) anything: is there an eofs filesystem
+/// here, a blank device, foreign data, or unmountable eofs remains?
+///
+/// This is the decision function behind every "format on first use" convenience in Eo9:
+/// only [`ImageState::Blank`] devices are ever formatted implicitly.
+pub fn probe<D: BlockDevice>(dev: &D) -> Result<ImageState, FsError> {
+    let device_size = dev.size();
+    let mut best: Option<u64> = None;
+    let mut any_invalid = false;
+    let mut any_magic = false;
+    for offset in SLOT_OFFSETS {
+        if offset + SLOT_SIZE > device_size {
+            continue;
+        }
+        let mut slot = vec![0u8; SLOT_SIZE as usize];
+        dev.read_at(offset, &mut slot)?;
+        match Uberblock::classify_slot(&slot) {
+            Ok(SlotState::Valid(ub)) => {
+                any_magic = true;
+                if best.is_none_or(|txg| ub.txg > txg) {
+                    best = Some(ub.txg);
+                }
+            }
+            Ok(SlotState::Invalid) => {
+                any_magic = true;
+                any_invalid = true;
+            }
+            Ok(SlotState::NoMagic) => {}
+            // classify_slot errors mean "valid checksum, unsupported contents" — that is
+            // still unmistakably an eofs image.
+            Err(_) => {
+                any_magic = true;
+                any_invalid = true;
+            }
+        }
+    }
+    if let Some(txg) = best {
+        return Ok(ImageState::Eofs {
+            txg,
+            degraded: any_invalid,
+        });
+    }
+    if any_magic {
+        return Ok(ImageState::Unmountable);
+    }
+    // No magic anywhere: blank or foreign. Check the leading span for any non-zero byte.
+    let span = core::cmp::min(PROBE_ZERO_SPAN, device_size);
+    let mut offset = 0u64;
+    let mut chunk = vec![0u8; 4096];
+    while offset < span {
+        let len = core::cmp::min(4096, span - offset) as usize;
+        dev.read_at(offset, &mut chunk[..len])?;
+        if chunk[..len].iter().any(|byte| *byte != 0) {
+            return Ok(ImageState::Foreign);
+        }
+        offset += len as u64;
+    }
+    Ok(ImageState::Blank)
 }
 
 /// A mounted eofs filesystem over a block device.
@@ -192,23 +289,36 @@ impl<D: BlockDevice> Eofs<D> {
     /// Mount an existing filesystem: read both uberblock slots and adopt the valid one with
     /// the highest transaction number.
     pub fn mount(dev: D) -> Result<Eofs<D>, FsError> {
+        Ok(Self::mount_with_report(dev)?.0)
+    }
+
+    /// [`mount`](Eofs::mount), and also report what the uberblock election saw — in
+    /// particular whether the mount had to fall back past a slot holding the *remains* of
+    /// an uberblock, which can mean an acknowledged commit has been silently lost.
+    /// Embedders that talk to a user should surface that loudly (study 07, S7-1).
+    pub fn mount_with_report(dev: D) -> Result<(Eofs<D>, MountReport), FsError> {
         let device_size = dev.size();
         if device_size < DATA_START {
             return Err(FsError::Corrupt("device too small to hold an eofs image"));
         }
         let mut best: Option<Uberblock> = None;
         let mut deferred: Option<FsError> = None;
+        let mut fell_back = false;
         for offset in SLOT_OFFSETS {
             let mut slot = vec![0u8; SLOT_SIZE as usize];
             dev.read_at(offset, &mut slot)?;
-            match Uberblock::from_slot_bytes(&slot) {
-                Ok(Some(ub)) => {
+            match Uberblock::classify_slot(&slot) {
+                Ok(SlotState::Valid(ub)) => {
                     if best.as_ref().is_none_or(|b| ub.txg > b.txg) {
                         best = Some(ub);
                     }
                 }
-                Ok(None) => {}
-                Err(err) => deferred = Some(err),
+                Ok(SlotState::NoMagic) => {}
+                Ok(SlotState::Invalid) => fell_back = true,
+                Err(err) => {
+                    fell_back = true;
+                    deferred = Some(err);
+                }
             }
         }
         let Some(ub) = best else {
@@ -226,21 +336,28 @@ impl<D: BlockDevice> Eofs<D> {
         if ub.device_size > device_size || ub.frontier > device_size || ub.frontier < DATA_START {
             return Err(FsError::Corrupt("device smaller than the filesystem on it"));
         }
-        Ok(Eofs {
-            dev,
-            block_size: ub.block_size,
-            alloc_unit: ub.alloc_unit,
-            codec: ub.codec,
-            device_size,
-            format_device_size: ub.device_size,
-            committed_txg: ub.txg,
-            committed_live_root: ub.live_root,
-            committed_snapshots: ub.snapshots,
-            live_root: ub.live_root,
-            snapshots: ub.snapshots,
-            alloc: Allocator::new(ub.alloc_unit as u64, device_size, ub.frontier),
-            dirty: false,
-        })
+        let report = MountReport {
+            txg: ub.txg,
+            fell_back_past_invalid_slot: fell_back,
+        };
+        Ok((
+            Eofs {
+                dev,
+                block_size: ub.block_size,
+                alloc_unit: ub.alloc_unit,
+                codec: ub.codec,
+                device_size,
+                format_device_size: ub.device_size,
+                committed_txg: ub.txg,
+                committed_live_root: ub.live_root,
+                committed_snapshots: ub.snapshots,
+                live_root: ub.live_root,
+                snapshots: ub.snapshots,
+                alloc: Allocator::new(ub.alloc_unit as u64, device_size, ub.frontier),
+                dirty: false,
+            },
+            report,
+        ))
     }
 
     /// Give the device back. Uncommitted changes are discarded (they were never part of the

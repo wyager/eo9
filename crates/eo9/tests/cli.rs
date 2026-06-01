@@ -2130,3 +2130,59 @@ fn rm_frees_space_so_an_image_never_bricks() {
         run.stderr
     );
 }
+
+#[test]
+fn a_damaged_newest_uberblock_warns_instead_of_silently_rolling_back() {
+    // Study 07 finding S7-1: corrupting the newest uberblock used to make the filesystem
+    // silently serve the previous transaction — committed data vanished with exit 0 and
+    // no message anywhere. The mount still falls back (that is the correct recovery for a
+    // torn commit), but the host now WARNS, so an operator can tell "crash recovery" from
+    // "my acknowledged data just disappeared".
+    let store = temp_store("eofs-rollback-warn");
+    let dir = temp_store("eofs-rollback-warn-images");
+    let image = dir.join("disk.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+
+    let format = eo9(&store, &["mkfs.eofs", image_arg, "--size", "4M"]);
+    assert_eq!(format.code, 0, "stderr: {}", format.stderr);
+
+    // Two committed transactions (create, then write), so both uberblock slots hold valid
+    // uberblocks before the damage.
+    let write = eo9(
+        &store,
+        &[
+            "--disk",
+            image_arg,
+            "-c",
+            "fs.eofs $ readwrite /keep.txt important-data",
+        ],
+    );
+    assert_eq!(write.code, 0, "stderr: {}", write.stderr);
+
+    // Damage whichever slot holds the NEWER transaction (we don't know the parity, so
+    // find it: the newer slot is the one whose txg field is larger).
+    let mut bytes = fs::read(&image).expect("read image");
+    let txg_at = |bytes: &[u8], slot: usize| -> u64 {
+        u64::from_le_bytes(
+            bytes[slot * 4096 + 24..slot * 4096 + 32]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    let newest = if txg_at(&bytes, 0) > txg_at(&bytes, 1) {
+        0
+    } else {
+        1
+    };
+    bytes[newest * 4096 + 100] ^= 0xff;
+    fs::write(&image, &bytes).expect("write damaged image");
+
+    // The next use still works (fallback) but must warn loudly on stderr.
+    let run = eo9(&store, &["--disk", image_arg, "-c", "fs.eofs $ ls /"]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.contains("uberblock") && run.stderr.to_lowercase().contains("lost"),
+        "expected a loud rollback warning on stderr, got: {}",
+        run.stderr
+    );
+}
