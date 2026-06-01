@@ -32,7 +32,14 @@ function writeLine(text, cls) {
 
 function hostWrite(ptr, len) {
   const bytes = new Uint8Array(memory.buffer, ptr, len);
-  writeLine(decoder.decode(bytes));
+  const text = decoder.decode(bytes);
+  // Lines the OS wrote to standard error arrive with a leading U+0001 marker (an in-band
+  // signal from the blob, never visible text): strip it and render with the error style.
+  if (text.charCodeAt(0) === 1) {
+    writeLine(text.slice(1), "vm-error");
+  } else {
+    writeLine(text);
+  }
 }
 
 function hostNowMs() {
