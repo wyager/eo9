@@ -470,10 +470,12 @@ fn pump(link: &Link) -> Result<(), L4Error> {
                 });
                 received_any = true;
             }
+            // Nothing waiting right now (the link's short poll came back empty):
+            // this pump round is done.
             Ok(_) => break,
             Err(l2::L2Error::Denied) => return Err(L4Error::Denied),
-            // "Nothing waiting" and transient receive trouble look the same from here;
-            // the operation deadline decides whether it matters.
+            // Transient receive trouble: drop out of this round and let the operation
+            // deadline decide whether it matters.
             Err(_) => break,
         }
     }
@@ -498,10 +500,19 @@ fn wait_until<T>(
         if let Some(result) = check() {
             return result;
         }
-        if rounds >= MAX_PUMPS {
-            return Err(L4Error::TimedOut);
-        }
-        if now_ns(&link.clock).saturating_sub(start) >= deadline_ns {
+        let expired =
+            rounds >= MAX_PUMPS || now_ns(&link.clock).saturating_sub(start) >= deadline_ns;
+        if expired {
+            // Wire truth beats the clock (user study 08, finding F3): before declaring
+            // a timeout, pump once more and re-check, so frames that already reached
+            // the device -- an RST, a FIN, the very reply we were waiting for -- decide
+            // the outcome rather than the deadline. A connect whose SYN was answered
+            // with an RST must report `connection-refused`, never `timed-out`, no
+            // matter how late the answer is processed.
+            pump(link)?;
+            if let Some(result) = check() {
+                return result;
+            }
             return Err(L4Error::TimedOut);
         }
         pump(link)?;
