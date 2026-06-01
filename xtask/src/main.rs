@@ -305,8 +305,7 @@ COMMANDS:
                          (aarch64 or riscv64; exits when the kernel powers off, Ctrl-A X to quit)
     fmt [--check]        Run `cargo fmt --all` in all three workspaces
     lint                 Run `cargo clippy -D warnings` in all three workspaces
-    ci                   The merge gate: fmt --check, lint, build, build-guest,
-                         check-components-bundle, test
+    ci                   The merge gate: fmt --check, lint, build, build-guest, test
     doctor               Check the host prerequisites (rustup, the pinned nightly, the wasm32
                          target, the wasm-tools CLI; QEMU and node are optional) and print
                          install hints for anything missing
@@ -315,7 +314,9 @@ COMMANDS:
                          seeds from (run after build-guest; commit the result)
     check-components-bundle
                          Verify crates/eo9-components/data/ matches the built guest components
-                         byte-for-byte (the drift guard ci runs; needs build-guest first)
+                         byte-for-byte (run by `package`; needs build-guest first — note that
+                         fs-eofs only matches when built from the checkout that last refreshed
+                         the bundle, see plan/01 D15)
     package              Publishing pre-flight: build-guest, verify crates/eo9-components/data/
                          matches the freshly built components, assemble every publishable crate
                          with `cargo package`, dry-run-publish the leaf crates, and print the
@@ -2297,18 +2298,21 @@ fn lint(root: &Path) -> Result<(), String> {
 /// build-guest runs before test so the host integration tests never see stale prebuilt
 /// components under guest/target/components.
 ///
-/// The eo9-components bundle drift check sits between build-guest and test (study 11 D9b):
-/// the bundle went stale on master once because the check only ran inside `package`, so a
-/// merge that changed guest components without `refresh-components` passed every gate. It
-/// is a byte-compare against files build-guest just produced — effectively free here.
+/// The eo9-components bundle drift check (study 11 D9b) is NOT part of this gate yet:
+/// `fs.eofs` depends on `eofs-core`, a path dependency outside the guest workspace, and
+/// cargo bakes that dependency's absolute manifest path into its `-C metadata` hash — so
+/// fs-eofs's bytes still differ per checkout even under `--remap-path-prefix`, and a
+/// byte-compare gate would go red in every checkout except the one that last refreshed
+/// the bundle. Until the metadata residue is solved (plan/01 D15), the drift check runs
+/// only in `cargo xtask package` (and stand-alone via `check-components-bundle`), and the
+/// bundle is refreshed from the main checkout by convention.
 fn ci(root: &Path) -> Result<(), String> {
     fmt(root, true)?;
     lint(root)?;
     build(root)?;
     build_guest(root)?;
-    check_components_bundle(root)?;
     test(root)?;
-    println!("xtask: ci passed (fmt, lint, build, build-guest, check-components-bundle, test)");
+    println!("xtask: ci passed (fmt, lint, build, build-guest, test)");
     Ok(())
 }
 

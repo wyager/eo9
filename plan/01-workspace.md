@@ -136,15 +136,24 @@ None. Everything else depends on this.
 15. **Release tooling hardened after the distribution-engineer study (study 11, 2026-06-01).**
     (a) `eo9 --version`/`-V`/`version` identify the binary (crate version, bundled-component
     count and provenance, embedded compiler/target) and are intercepted before store-name
-    resolution. (b) `cargo xtask ci` now runs `check-components-bundle` between build-guest and
-    test, so a stale eo9-components bundle can never sit unnoticed on master again (D9b — this
-    exact failure happened once); to make that byte-compare meaningful from any checkout, guest
-    builds remap the checkout root / cargo home / rustup home out of panic-location strings
-    (the same `--remap-path-prefix` flags the web blob build uses), and the bundle was refreshed
-    once to those canonical bytes. Known residual: the registry *source directory name* (e.g.
-    a crates.io vs mirror hash) still appears in dependency panic paths, so the bundle is
-    checkout-independent on one machine but not yet machine-independent across different
-    registry configurations. (c) The package pre-flight reports real `.crate` sizes (cargo moved
+    resolution. (b) Guest builds now remap the checkout root / cargo home / rustup home out of
+    panic-location strings (the same `--remap-path-prefix` flags the web blob build uses), which
+    makes 50 of the 51 bundled components byte-identical from any checkout. **The drift check is
+    NOT in `cargo xtask ci` yet** (the original D9b goal): review found that `fs.eofs` is still
+    checkout-dependent — it depends on `eofs-core`, a path dependency *outside* the guest
+    workspace, and cargo bakes that dependency's absolute manifest path into its `-C metadata`
+    hash, which lands in mangled symbol names (and the panic/fmt data they reach) regardless of
+    path remapping. A byte-compare CI gate would therefore go red in every checkout except the
+    one that last refreshed the bundle. Until that residue is solved (candidate fixes: bring
+    eofs-core into the guest workspace's member set so it gets a workspace-relative source id;
+    or normalize the comparison to ignore metadata-hash strings; or pin `-C metadata` for the
+    guest profile), the drift check runs in `cargo xtask package` and stand-alone
+    (`check-components-bundle`), and the bundle is refreshed **from the main checkout** by
+    convention — the same convention as before, now needed only for fs-eofs. Known second
+    residual: the registry *source directory name* (e.g. a crates.io vs mirror hash) still
+    appears in dependency panic paths, so even the 50 stable components are checkout-independent
+    on one machine but not yet machine-independent across different registry
+    configurations. (c) The package pre-flight reports real `.crate` sizes (cargo moved
     dry-run output to `target/package/tmp-crate/`; a missing file is now reported, not "0 KiB").
     (d) `make setup` propagates a failing doctor (the `-@` ignore is gone) and pins the
     wasm-tools install to the `~1.250` family the repo expects, as does doctor's own hint.
