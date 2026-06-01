@@ -75,8 +75,12 @@ URL revalidates; only hash-named files cache forever._
   needs a second explicit grant (`disk` / `net` QEMU flags).
 - **Sockets on metal through three composed wasm layers** (`834f72e`): `net.l4.over-l2` (smoltcp 0.12,
   guest-workspace only) imports l2 and exports l4; `net.virtio $ net.l4.over-l2 $ l4check` resolves a real
-  DNS name on metal, compiled on-target; with `net.l2.deny` underneath the same program gets a typed denial
-  in under a second.
+  DNS name on metal, compiled on-target, and reports a refused TCP probe as `connection-refused` — the same
+  typed error the loopback mock gives. The per-layer deny/none stubs, `net.l4.loopback`, and `sockcheck`
+  are in the kernel's baked store (user study 08 F4 — earlier revisions of this claim predated that, and
+  the typed-denial demo could not actually be run at the metal prompt), so
+  `net.l2.deny $ net.l4.over-l2 $ l4check` → typed denial and `net.l4.loopback $ sockcheck` → `echoed(…)`
+  both run on metal.
 - **Persistent storage**: eofs M2+M3 — the `fs.eofs` provider (`877738d`), the `--disk <image>` grant +
   `eo9 mkfs.eofs` + cross-process persistence in usermode (`fee878b`), and on metal
   `disk.virtio $ fs.eofs $ …` surviving full power cycles.
