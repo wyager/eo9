@@ -92,7 +92,10 @@ impl WitBackend {
 }
 
 fn fs_error(doing: &str, err: fs::FsError) -> BackendError {
-    BackendError::new(format!("{doing} the module failed: {}", fs_error_text(&err)))
+    BackendError::new(format!(
+        "{doing} the module failed: {}",
+        fs_error_text(&err)
+    ))
 }
 
 /// Render a filesystem error as plain words, never as the raw `FsError::…` enum text
