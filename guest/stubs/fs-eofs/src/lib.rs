@@ -55,7 +55,7 @@ use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 
 use eo9_guest::provider::ProviderState;
-use eofs_core::{BlockDevice, DeviceError, Eofs, FormatOptions, format};
+use eofs_core::{BlockDevice, DeviceError, Eofs, FormatOptions};
 
 wit_bindgen::generate!({
     world: "eofs",
@@ -156,23 +156,26 @@ impl BlockDevice for DiskDevice {
 
 // --- state and error mapping -------------------------------------------------------------
 
-/// Mount the imported disk, formatting it first if it is blank (see the module docs).
+/// Mount the imported disk, formatting it first if — and only if — it is blank.
+///
+/// "Blank" means probed as [`eofs_core::ImageState::Blank`]: no eofs filesystem AND the
+/// device's leading bytes are all zero. A device holding anybody else's data (an ext4
+/// image, a tarball, a file pointed at by mistake) is refused, never formatted over —
+/// destroying foreign data is something only an explicit, forced `mkfs` may do (study 07,
+/// S7-2). A device with eofs remains that no longer mount is also never reformatted; its
+/// mount error is reported instead.
 fn mount_or_format() -> Result<Eofs<DiskDevice>, FsError> {
     let device = DiskDevice::new().map_err(device_error)?;
-    let mut has_magic = false;
-    let mut magic = [0u8; 8];
-    for slot in format::SLOT_OFFSETS {
-        if device.size() >= slot + magic.len() as u64 {
-            device.read_at(slot, &mut magic).map_err(device_error)?;
-            if magic == format::MAGIC {
-                has_magic = true;
-            }
+    match eofs_core::probe(&device).map_err(map_error)? {
+        eofs_core::ImageState::Eofs { .. } | eofs_core::ImageState::Unmountable => {
+            Eofs::mount(device).map_err(map_error)
         }
-    }
-    if has_magic {
-        Eofs::mount(device).map_err(map_error)
-    } else {
-        Eofs::format(device, &FormatOptions::default()).map_err(map_error)
+        eofs_core::ImageState::Blank => {
+            Eofs::format(device, &FormatOptions::default()).map_err(map_error)
+        }
+        eofs_core::ImageState::Foreign => Err(FsError::Io(String::from(
+            "the disk holds data that is not an eofs filesystem; refusing to format over              it. If that data is expendable, format the device explicitly:              `eo9 mkfs.eofs <image> --force`",
+        ))),
     }
 }
 

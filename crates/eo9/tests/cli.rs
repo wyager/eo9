@@ -2186,3 +2186,98 @@ fn a_damaged_newest_uberblock_warns_instead_of_silently_rolling_back() {
         run.stderr
     );
 }
+
+#[test]
+fn foreign_data_is_never_silently_formatted() {
+    // Study 07 finding S7-2: "blank" used to mean "no eofs magic", so pointing --disk at
+    // ANY file that was not already an eofs image — an ext4 image, a tarball, a typo —
+    // silently reformatted it on first mount, exit 0. Blank now means all-zero: a file
+    // holding someone else's data is refused by the provider AND by mkfs without --force,
+    // and its bytes are not touched.
+    let store = temp_store("eofs-foreign");
+    let dir = temp_store("eofs-foreign-images");
+    let image = dir.join("not-eofs.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+
+    // 1 MiB of pseudo-random bytes standing in for somebody's ext4 image / tarball.
+    let mut state = 0xDEADBEEFCAFEBABEu64;
+    let foreign: Vec<u8> = (0..1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    fs::write(&image, &foreign).expect("write foreign image");
+
+    // Composing fs.eofs over it must refuse — and must not modify a single byte.
+    let run = eo9(&store, &["--disk", image_arg, "-c", "fs.eofs $ ls /"]);
+    assert_eq!(run.code, 1, "stdout: {} stderr: {}", run.stdout, run.stderr);
+    let all = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        all.contains("not an eofs filesystem"),
+        "the refusal must say what is wrong: {all}"
+    );
+    assert!(
+        all.contains("mkfs.eofs"),
+        "the refusal must name the explicit way out: {all}"
+    );
+    assert_eq!(
+        fs::read(&image).expect("re-read image"),
+        foreign,
+        "the foreign file's bytes must be untouched"
+    );
+
+    // mkfs without --force refuses too; with --force it formats (the explicit path).
+    let refuse = eo9(&store, &["mkfs.eofs", image_arg]);
+    assert_eq!(refuse.code, 3, "stderr: {}", refuse.stderr);
+    assert!(
+        refuse.stderr.contains("--force"),
+        "stderr: {}",
+        refuse.stderr
+    );
+    assert_eq!(
+        fs::read(&image).expect("re-read image"),
+        foreign,
+        "a refused mkfs must not modify the file"
+    );
+
+    let force = eo9(&store, &["mkfs.eofs", image_arg, "--force"]);
+    assert_eq!(force.code, 0, "stderr: {}", force.stderr);
+    let run = eo9(&store, &["--disk", image_arg, "-c", "fs.eofs $ ls /"]);
+    assert_eq!(run.code, 0, "after an explicit format: {}", run.stderr);
+}
+
+#[test]
+fn a_blank_zero_filled_file_still_auto_formats() {
+    // The convenience the all-zero rule keeps: a genuinely blank device (all zeroes, like
+    // a fresh sparse file or a zeroed partition) still formats on first use with no
+    // ceremony — no mkfs step needed.
+    let store = temp_store("eofs-blank");
+    let dir = temp_store("eofs-blank-images");
+    let image = dir.join("blank.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+
+    let file = fs::File::create(&image).expect("create blank image");
+    file.set_len(1024 * 1024).expect("size blank image");
+    drop(file);
+
+    let run = eo9(
+        &store,
+        &[
+            "--disk",
+            image_arg,
+            "-c",
+            "fs.eofs $ readwrite /auto.txt formatted-on-first-use",
+        ],
+    );
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+
+    let read = eo9(
+        &store,
+        &["--disk", image_arg, "-c", "fs.eofs $ cat /auto.txt"],
+    );
+    assert_eq!(read.code, 0, "stderr: {}", read.stderr);
+    assert!(read.stdout.contains("formatted-on-first-use"));
+}
