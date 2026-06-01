@@ -1441,3 +1441,38 @@ preemption/hardening work.
     exactly `0000:00:01.0`, `ok: devices(1)` against a 3-device baseline. The demo path (raw components,
     manual configure calls) is unaffected. Note: configured artifacts have a new byte shape, so the
     storedisk compile cache misses once per composition and refills; nothing else changes.
+
+62. **PCI teardown quiesce, attributable disk errors, and pci.none on metal (2026-05-31, branch
+    `area/12-pci-teardown` — the study 09 fix-now batch).** Three fixes from the driver-developer
+    user study (docs/user-studies/09-driver-developer.md):
+
+    * **Quiesce before free (finding 6, the memory-safety hole).** `PciTables` now tracks, per open
+      device, whether bus mastering was enabled through that handle, and guarantees the ordering
+      "every armed device is disarmed before any of the task's DMA buffers are freed" on every path:
+      `Drop for PciTables` (task completion, trap, or kill — the store drops, the Drop body quiesces,
+      then the buffer storage drops), explicit `device` handle drop (revokes that device's licence),
+      and explicit `dma-buffer` drop (quiesces all armed devices first, since destructor order is not
+      ours to choose). Interrupt lines are masked at the same points. A once-per-boot diagnostic
+      (`pci: quiesced N device(s) at task teardown …`) makes the ordering visible in transcripts.
+      Verified on QEMU aarch64: `pci disk` normal completion (diagnostic prints between the task
+      ending and its outcome rendering), and the study's nightmare case — Ctrl-C killing
+      `net.virtio $ net.l4.over-l2 $ l4check` while the NIC has rx buffers posted and bus mastering
+      on — quiesces the device before `abnormal: killed` is even printed, and the same device is
+      then re-claimed and used by a fresh `net.virtio $ l2check` run (ARP resolves) in the same boot.
+      Out of scope, recorded: a *driver-side* mirror (bus-master off at clean exit) has nowhere to
+      live — providers have no exit hook; the kernel-side guarantee is the load-bearing one.
+    * **Attributable device errors (findings 2 + 3).** `eofs-core::DeviceError` gains `IoNamed(String)`
+      (Copy dropped, Clone kept; zero fallout — nothing relied on Copy), `fs.eofs` maps the disk API's
+      `Io(message)` errors onto it instead of flattening to the unit `Io`, and a disk reporting size 0
+      gets one probe read so its real error surfaces instead of `invalid format options: device too
+      small`. `disk.virtio`'s no-device message now names the remediation (the `disk` boot flag /
+      QEMU device flag / a too-narrow attenuator). Verified: a `pci` boot without the `disk` flag now
+      reports the driver's full message at the shell; the `pci disk` happy path is unchanged.
+    * **pci.none baked into the store (finding 4, partial).** The absence stub joins
+      `KERNEL_STORE_COMPONENTS` (23 entries). **Gap, needs a planner dispatch:** `pci.deny` — the
+      typed-refusal stub SPEC promises and wit/pci's `deny` world fully specifies — has no stub crate
+      anywhere (usermode or metal); the study could not distinguish "not in the store" from "does not
+      exist" because it does not exist. Creating it is one mechanical crate following the
+      net-l2-deny pattern.
+    * The DMA contract (finding 9) is recorded as a proposed `wit/pci` doc-comment addition in
+      plan/02 D22 and stated in disk.virtio's module docs for driver authors.
