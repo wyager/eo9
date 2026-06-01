@@ -242,15 +242,20 @@ impl MemFs {
     }
 
     /// A fresh filesystem pre-populated with a small sample tree, so the fs-backed coreutils
-    /// (`cat`, `ls`, `wc`, `stat`, `find`, `head`) have something to show on the page. The
-    /// content is informational only; programs may freely overwrite it (the fs is writable).
+    /// the page actually ships (`cat`, `ls`) have something to show. The content is
+    /// informational only; programs may freely overwrite it (the fs is writable).
+    ///
+    /// Every program `/welcome.txt` recommends must exist in the page's `/bin`
+    /// (`execsurface::BIN`) — a user study caught it recommending `wc`, which the browser
+    /// store does not carry, making the OS's own welcome file a broken example
+    /// (study 10, finding 2). The verify-eosh harness pins the rule.
     pub fn seeded() -> Self {
         let mut fs = MemFs::new();
         fs.seed_dir("/docs");
         fs.seed_file(
             "/welcome.txt",
             b"Hello from the Eo9 web VM filesystem!\nThis is an in-memory eo9:fs served to \
-              guest programs by the blob.\nTry: cat /welcome.txt, ls /, wc /welcome.txt.\n",
+              guest programs by the blob.\nTry: cat /welcome.txt, ls /, ls /docs.\n",
         );
         fs.seed_file(
             "/docs/about.txt",
