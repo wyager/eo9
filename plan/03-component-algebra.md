@@ -360,3 +360,28 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     literals in **quoted** form (`--allow "[{segment: 0, …}]"`, verified on metal); unquoted commas inside
     record/list literals remain a tokenizer follow-up. `configure` of a provider that exports nothing but
     its config interface is refused (there would be no API surface to apply the configuration to).
+
+24. **`bind` carries an error channel: configure refusals are typed, never traps (user study 08 finding
+    F1; 2026-06-01, branch `area/02-bind-error-channel`).** The D23 construction's one gap was error
+    handling: `bind: func()` had nowhere to put a configuration the provider rejects, so the binder
+    lowered `configure`'s error arm to `unreachable` and a malformed value (study 08's
+    `--address not-an-ip`) surfaced as an unsymbolized wasm trap — violating the WIT contract's "a
+    malformed address is a configure-time error, never a trap". `bind` is now
+    `func() -> result<_, string>` (wit/rt/rt.wit): the binder lifts `configure`'s own
+    `result<x-impl, string>` into it by returning the scratch result area verbatim — the two results
+    share their canonical layout for the discriminant and the error arm, and the ok payload (the root
+    handle) is simply not read — so the provider's exact validation message travels out. The bind merger
+    gains a memory + realloc and propagates the **first** error (provider/base before consumer/layer —
+    a nested refusal stops the chain; the second configuration is never applied). All three executors
+    size `bind`'s results dynamically (`Func::ty().results().len()`), so **old artifacts — a result-less
+    `bind` — keep loading and running unchanged** (their configure errors still trap; pre-existing
+    behavior for pre-existing bytes; the one incompatibility is composing an old configured artifact
+    with a new one through a both-configured merger, which wac rejects on the signature mismatch —
+    re-running `configure` refreshes it, compose is cheap). Executor rendering: usermode
+    `SpawnError::ConfigurationRefused` → "compose-time configuration refused: <reason>" (CLI exit 3);
+    kernel shellexec/runner and the browser blob render the same prefix through their existing refusal
+    paths (the exec WIT's `spawn-error` is unchanged — the refusal rides `internal`). Verified: the two
+    integration tests (plain + merged refusal), the metal smoke (`net.virtio $ net.l4.over-l2
+    --address not-an-ip $ l4check` → the typed refusal on the metal console, shell survives), the
+    browser harnesses (valid configs through the new construction), and byte determinism for valid
+    configs unchanged.
