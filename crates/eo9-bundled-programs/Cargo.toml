@@ -1,4 +1,4 @@
-# eo9-components: the prebuilt Eo9 guest components (eosh, the examples, the coreutils,
+# eo9-bundled-programs: the prebuilt Eo9 guest components (eosh, the examples, the coreutils,
 # and the standard stub providers), bundled as data so a `cargo install eo9` build can
 # seed a working shell without the guest toolchain (nightly + wasm32 target + wasm-tools).
 #
