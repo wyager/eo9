@@ -212,11 +212,42 @@ interface deny-config {
     configure: func() -> result<pci-impl, string>;
 }
 
-/// Compose-time configuration entry for pci.filtered: `configure` binds the allow-list of
-/// device addresses and returns the root handle that the exported `pci` serves via `default()`.
-interface filtered-config {
-    use types.{pci-impl, device-address};
-    configure: func(allow: list<device-address>) -> result<pci-impl, string>;
+/// A policy deciding which devices an attenuated PCI view admits ("policies are
+/// programs" — SPEC, Eo9 API design / Arguments vs. imports). One pure decision
+/// function: a device's identity in, admit or refuse out.
+///
+/// Policy providers should import nothing — purity is what makes a policy auditable
+/// (`describe` shows an empty capability surface) and deterministic. The standard
+/// policies are `pci.admit-address` (admit by bus address — the classic fixed
+/// allow-list) and `pci.admit-vendor` (admit by vendor:device identity — stable across
+/// boot configurations, see study 09); a custom policy is a few lines of component.
+/// (The `use` of `pci` below imports only the `device-info` type, not the capability —
+/// a types-only use carries no authority.)
+interface admit-policy {
+    use pci.{device-info};
+
+    /// Whether the attenuated view should expose this device.
+    admit: func(device: device-info) -> bool;
+}
+
+/// Compose-time configuration entry for pci.admit-address: `configure` binds the
+/// allow-list of device addresses the policy admits. Unconfigured, the policy admits
+/// nothing (deny-all), so plain composition never traps.
+interface address-admit-config {
+    use types.{device-address};
+    configure: func(allow: list<device-address>) -> result<_, string>;
+}
+
+/// Compose-time configuration entry for pci.admit-vendor: `configure` binds the
+/// allow-list of vendor:device identities the policy admits. Unconfigured, the policy
+/// admits nothing (deny-all).
+interface vendor-admit-config {
+    /// One PCI vendor/device identity pair (e.g. 0x1af4:0x1000 for virtio-net).
+    record vendor-device {
+        vendor-id: u16,
+        device-id: u16,
+    }
+    configure: func(allow: list<vendor-device>) -> result<_, string>;
 }
 
 /// pci.none — absence: exports the optional flavor answering `none`.
@@ -232,11 +263,28 @@ world deny {
     export deny-config;
 }
 
-/// pci.filtered — attenuation over an underlying PCI capability: only the configured
-/// allow-list of device addresses is visible through `enumerate` and openable; everything
-/// else answers `denied`. This is how "exactly this one device" grants are composed.
+/// pci.filtered — attenuation over an underlying PCI capability: only the devices an
+/// imported admit policy approves are visible through `enumerate` and openable;
+/// everything else answers `denied`. The policy is ordinary composed middleware
+/// (`pci.admit-vendor --allow … $ pci.filtered $ driver`), so it is fused at compile
+/// time, shows up in the wiring tree, and can never be bypassed by the consumer.
 world filtered {
     import pci;
+    import admit-policy;
     export pci;
-    export filtered-config;
+}
+
+/// pci.admit-address — the address allow-list policy: admits exactly the configured
+/// device addresses (the pre-policy `pci.filtered` behavior).
+world address-admit {
+    export admit-policy;
+    export address-admit-config;
+}
+
+/// pci.admit-vendor — the vendor/device identity policy: admits devices by what they
+/// are (vendor:device ID) rather than where they sit (bus address), so the grant is
+/// stable across boot configurations and slot changes.
+world vendor-admit {
+    export admit-policy;
+    export vendor-admit-config;
 }

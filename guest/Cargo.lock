@@ -361,6 +361,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-stub-fs-filtered"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-stub-fs-memfs"
 version = "0.0.0"
 dependencies = [
@@ -378,6 +386,14 @@ dependencies = [
 
 [[package]]
 name = "eo9-stub-fs-overlay"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-fs-policy-subtree"
 version = "0.0.0"
 dependencies = [
  "eo9-guest",
@@ -433,6 +449,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-stub-net-l4-filtered"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-stub-net-l4-loopback"
 version = "0.0.0"
 dependencies = [
@@ -458,7 +482,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-stub-net-policy-ports"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-stub-net-virtio"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-pci-admit-address"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-pci-admit-vendor"
 version = "0.0.0"
 dependencies = [
  "eo9-guest",

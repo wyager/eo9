@@ -1,31 +1,35 @@
-//! `pci.filtered` — an allow-listed view of an underlying PCI capability.
+//! `pci.filtered` — a policy-attenuated view of an underlying PCI capability.
 //!
-//! Targets the `eo9:pci/filtered` stub world: imports `eo9:pci/pci` and re-exports it with
-//! enumeration and `open` restricted to a configured allow-list of device addresses — the
-//! "exactly this one device" grant from SPEC.md ("PCI API"). Concretely:
+//! Targets the `eo9:pci/filtered` stub world: imports `eo9:pci/pci` plus an
+//! `eo9:pci/admit-policy` decision function, and re-exports `pci` with enumeration and
+//! `open` restricted to the devices the policy admits — the "exactly this device" grant
+//! from SPEC.md ("PCI API"), with the *which devices* question answered by a composed
+//! policy component ("policies are programs" — SPEC, Eo9 API design). Concretely:
 //!
-//! * `configure(allow)` binds the list of visible [`device addresses`](DeviceAddress);
-//!   unconfigured, the documented default is the **empty list** — nothing is visible and
-//!   every `open` answers `denied` (the option-C never-trap rule, plan/09 Decision 14).
-//! * `enumerate` forwards to the underlying capability and keeps only allow-listed
-//!   functions; `open` refuses anything outside the list with `denied`.
-//! * Everything reached *through* an allowed device (configuration space, BARs, bus-master
-//!   control, interrupts, DMA buffers) forwards to the underlying provider on resources
-//!   this provider owns and wraps — a consumer can never reach an underlying handle except
-//!   through the filtered view, and never for a device the list does not name.
+//! * `enumerate` forwards to the underlying capability and keeps only the functions the
+//!   admit policy approves; `open` refuses anything the policy does not admit with
+//!   `denied`.
+//! * The policy is ordinary middleware composed below this provider —
+//!   `pci.admit-vendor --allow … $ pci.filtered $ driver` — so it is fused at compile
+//!   time, appears in the wiring tree, and cannot be bypassed: a consumer can never
+//!   reach an underlying handle except through the filtered view, and never for a
+//!   device the policy refused.
+//! * Everything reached *through* an admitted device (configuration space, BARs,
+//!   bus-master control, interrupts, DMA buffers) forwards to the underlying provider on
+//!   resources this provider owns and wraps.
 //!
-//! Composed as `pci.filtered --allow … $ driver`, the driver sees a bus containing exactly
-//! the allowed functions; the kernel's root provider (and its own boot-time grant) sits
-//! underneath, unchanged.
+//! The standard policies are `pci.admit-address` (fixed bus addresses) and
+//! `pci.admit-vendor` (vendor:device identity, stable across boot configs); an
+//! unconfigured policy admits nothing, so plain composition stays deny-by-default.
 
 #![no_std]
 
 extern crate alloc;
 
-use alloc::string::String;
 use alloc::vec::Vec;
 
-use eo9_guest::provider::ProviderState;
+// Linked for the guest runtime profile (allocator + panic handler).
+use eo9_guest as _;
 
 wit_bindgen::generate!({
     world: "filtered",
@@ -33,23 +37,12 @@ wit_bindgen::generate!({
     generate_all,
 });
 
+use eo9::pci::admit_policy;
 use eo9::pci::pci as underlying;
 use eo9::pci::types::{DeviceAddress, PciImpl};
-use exports::eo9::pci::filtered_config;
 use exports::eo9::pci::pci::{
     self, AccessWidth, BarInfo, BarKind, DeviceInfo, HeaderType, InterruptKind, PciError,
 };
-
-/// The configured allow-list. Unconfigured means "allow nothing" (see the module docs).
-static ALLOW: ProviderState<Vec<(u16, u8, u8, u8)>> = ProviderState::new();
-
-/// Whether `address` is on the configured allow-list (empty / unconfigured: nothing is).
-fn allowed(segment: u16, bus: u8, device: u8, function: u8) -> bool {
-    if !ALLOW.is_set() {
-        return false;
-    }
-    ALLOW.with(|list| list.contains(&(segment, bus, device, function)))
-}
 
 /// Map the underlying provider's error onto this provider's (structurally identical)
 /// exported error type.
@@ -117,25 +110,46 @@ fn kind_to_underlying(kind: InterruptKind) -> underlying::InterruptKind {
     }
 }
 
+/// Whether the composed admit policy approves this (underlying-typed) device record.
+/// The policy interface's `use pci.{device-info}` makes its parameter the same type the
+/// underlying enumeration yields, so no mapping is needed.
+fn admitted(info: &underlying::DeviceInfo) -> bool {
+    admit_policy::admit(*info)
+}
+
+/// Find the underlying device record for `address`, if any.
+async fn lookup(p: &PciImpl, address: &DeviceAddress) -> Result<underlying::DeviceInfo, PciError> {
+    let devices = underlying::enumerate(p).await.map_err(map_error)?;
+    devices
+        .into_iter()
+        .find(|info| {
+            info.address.segment == address.segment
+                && info.address.bus == address.bus
+                && info.address.device == address.device
+                && info.address.function == address.function
+        })
+        .ok_or(PciError::NotFound)
+}
+
 /// The `pci.filtered` provider.
 struct Stub;
 
-/// An opened, allow-listed device of the filtered view: wraps the underlying device.
+/// An opened, policy-admitted device of the filtered view: wraps the underlying device.
 struct FilteredDevice {
     inner: underlying::Device,
 }
 
-/// An opened BAR of an allow-listed device: wraps the underlying BAR.
+/// An opened BAR of an admitted device: wraps the underlying BAR.
 struct FilteredBar {
     inner: underlying::Bar,
 }
 
-/// An interrupt vector of an allow-listed device: wraps the underlying vector.
+/// An interrupt vector of an admitted device: wraps the underlying vector.
 struct FilteredInterrupt {
     inner: underlying::Interrupt,
 }
 
-/// A DMA buffer mapped for an allow-listed device: wraps the underlying buffer.
+/// A DMA buffer mapped for an admitted device: wraps the underlying buffer.
 struct FilteredDmaBuffer {
     inner: underlying::DmaBuffer,
 }
@@ -144,20 +158,6 @@ impl pci::GuestDevice for FilteredDevice {}
 impl pci::GuestBar for FilteredBar {}
 impl pci::GuestInterrupt for FilteredInterrupt {}
 impl pci::GuestDmaBuffer for FilteredDmaBuffer {}
-
-impl filtered_config::Guest for Stub {
-    fn configure(allow: Vec<DeviceAddress>) -> Result<PciImpl, String> {
-        ALLOW.set(
-            allow
-                .iter()
-                .map(|a| (a.segment, a.bus, a.device, a.function))
-                .collect(),
-        );
-        // The root handle is the underlying provider's: the filtering lives in the exported
-        // operations (which are this component's), not in the handle.
-        Ok(underlying::default())
-    }
-}
 
 impl pci::Guest for Stub {
     type Device = FilteredDevice;
@@ -171,27 +171,14 @@ impl pci::Guest for Stub {
 
     async fn enumerate(p: &PciImpl) -> Result<Vec<DeviceInfo>, PciError> {
         let devices = underlying::enumerate(p).await.map_err(map_error)?;
-        Ok(devices
-            .into_iter()
-            .filter(|info| {
-                allowed(
-                    info.address.segment,
-                    info.address.bus,
-                    info.address.device,
-                    info.address.function,
-                )
-            })
-            .map(map_info)
-            .collect())
+        Ok(devices.into_iter().filter(admitted).map(map_info).collect())
     }
 
     async fn open(p: &PciImpl, address: DeviceAddress) -> Result<pci::Device, PciError> {
-        if !allowed(
-            address.segment,
-            address.bus,
-            address.device,
-            address.function,
-        ) {
+        // The policy decides on the device's *identity*, so look the address up first:
+        // an absent device is `not-found`, a present-but-refused one is `denied`.
+        let info = lookup(p, &address).await?;
+        if !admitted(&info) {
             return Err(PciError::Denied);
         }
         let inner = underlying::open(p, address).await.map_err(map_error)?;

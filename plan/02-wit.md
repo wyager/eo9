@@ -314,3 +314,40 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
 Design doc: `docs/design/policy-components.md` — the policy-components pattern ("prefer pure policy
 components over config enums"): the fusion question, the API inventory, and the adoption plan (owner
 review pending).
+
+24. **`eo9:pci` adopts the policy-component pattern: `admit-policy` replaces `filtered-config`
+    (2026-06-01, "policies are programs" — SPEC, docs/design/policy-components.md).** The
+    attenuator's *which devices* question is no longer compound configuration baked into
+    `pci.filtered`; it is a composed decision component. New interfaces: `admit-policy`
+    (`admit: func(device: device-info) -> bool`, with a types-only `use pci.{device-info}` so
+    implementing it carries no authority), `address-admit-config`, and `vendor-admit-config`
+    (each a `*-config` for one standard policy; both `configure` functions return
+    `result<_, string>` — policy providers have no root-handle resource to return, and the
+    bind-entrypoint machinery accepts the handle-less result because its canonical layout is
+    identical). `world filtered` becomes `import pci; import admit-policy; export pci` (the
+    `filtered-config` interface is gone); new worlds `address-admit` and `vendor-admit` are the
+    standard policies. Conventions this sets for every future policy interface: it lives in its
+    subject's package, it is one `decide`-shaped function plus the types it needs, policies bind
+    by composition (fused, wiring-tree-visible), and purity means "no capability imports" —
+    types-only uses and the `eo9:rt/*` runtime riders are not capabilities, and an impure
+    policy's extra imports stay visible as composition residuals (test-pinned).
+
+25. **`eo9:fs` gains `path-policy` and the `filtered`/`subtree-policy` worlds (2026-06-01,
+    plan/02 D24's conventions).** `path-policy` is the per-path decision function
+    (`check: func(path: string, op: fs-operation) -> verdict`, verdict = allow | deny |
+    read-only); `fs.filtered` is the attenuating middleware (`import fs; import path-policy;
+    export fs`); `subtree-config` configures the standard `fs.policy-subtree` policy (prefix +
+    read-write/read-only access). Path-traversal defense is part of the *interface contract*:
+    the middleware normalizes every path (`.`/`..` resolved, separators collapsed, root-escapes
+    refused) before the policy sees it and forwards that same normalized path to the underlying
+    fs, so the path ruled on is the path accessed; policies normalize defensively as well. The
+    fs interface itself, the existing fs worlds, and every existing fs stub are untouched.
+
+26. **`eo9:net` gains `connection-policy` and the `l4-filtered`/`ports-policy` worlds (2026-06-01,
+    plan/02 D24's conventions).** `connection-policy` is the per-endpoint decision function
+    (`admit: func(kind: endpoint-kind, endpoint: socket-address) -> bool`, kind = connect |
+    listen | bind-udp | send-to); `net.l4.filtered` is the firewall middleware (`import l4;
+    import connection-policy; export l4`); `ports-config` configures the standard
+    `net.policy-ports` allow-list policy. `send-to` is gated per datagram so an admitted local
+    UDP binding does not imply every remote is reachable. The l4 interface itself, the existing
+    net worlds, and every existing net stub are untouched.

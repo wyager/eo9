@@ -42,19 +42,25 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-entropy-none",
     "eo9-stub-entropy-seeded",
     "eo9-stub-fs-eofs",
+    "eo9-stub-fs-filtered",
     "eo9-stub-fs-memfs",
     "eo9-stub-fs-none",
     "eo9-stub-fs-overlay",
+    "eo9-stub-fs-policy-subtree",
     "eo9-stub-fs-readonly",
     "eo9-stub-net-l2-deny",
     "eo9-stub-net-l2-none",
     "eo9-stub-net-l3-deny",
     "eo9-stub-net-l3-none",
     "eo9-stub-net-l4-deny",
+    "eo9-stub-net-l4-filtered",
     "eo9-stub-net-l4-loopback",
     "eo9-stub-net-l4-none",
     "eo9-stub-net-l4-over-l2",
+    "eo9-stub-net-policy-ports",
     "eo9-stub-net-virtio",
+    "eo9-stub-pci-admit-address",
+    "eo9-stub-pci-admit-vendor",
     "eo9-stub-pci-deny",
     "eo9-stub-pci-filtered",
     "eo9-stub-pci-none",
@@ -126,9 +132,18 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // virtio disk (boot with the `pci` grant and the xtask `disk` flag).
     ("eo9-stub-disk-virtio", "disk.virtio"),
     ("eo9-stub-fs-eofs", "fs.eofs"),
-    // The PCI attenuator, so a metal composition can grant a driver exactly one device:
-    // `pci.filtered --allow … $ lspci` (or `$ disk.virtio $ …`).
+    // The path-policy fs attenuator and its standard subtree policy, so per-path grants
+    // compose at the metal prompt: `fs.policy-subtree --prefix /x --access read-only $
+    // fs.filtered $ <program>` ("policies are programs", SPEC).
+    ("eo9-stub-fs-filtered", "fs.filtered"),
+    ("eo9-stub-fs-policy-subtree", "fs.policy-subtree"),
+    // The PCI attenuator and its standard admit policies, so a metal composition can
+    // grant a driver exactly one device ("policies are programs", SPEC):
+    // `pci.admit-address --allow … $ pci.filtered $ lspci` (fixed bus address) or
+    // `pci.admit-vendor --allow … $ pci.filtered $ disk.virtio $ …` (device identity).
     ("eo9-stub-pci-filtered", "pci.filtered"),
+    ("eo9-stub-pci-admit-address", "pci.admit-address"),
+    ("eo9-stub-pci-admit-vendor", "pci.admit-vendor"),
     // The PCI absence stub, so optional-pci programs can be composed to observe "no
     // devices" on metal — and the refusal stub, so required-pci programs can be composed
     // to observe a typed `denied` (`pci.deny $ lspci`) instead of an unsatisfied import.
@@ -154,6 +169,10 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-stub-net-l4-deny", "net.l4.deny"),
     ("eo9-stub-net-l4-none", "net.l4.none"),
     ("eo9-stub-net-l4-loopback", "net.l4.loopback"),
+    // The transport firewall and its standard port policy ("policies are programs"):
+    //   net.policy-ports --allow "[7]" $ net.l4.filtered $ net.l4.loopback-backed program
+    ("eo9-stub-net-l4-filtered", "net.l4.filtered"),
+    ("eo9-stub-net-policy-ports", "net.policy-ports"),
     ("eo9-example-sockcheck", "sockcheck"),
     // Basic coreutils, so the metal shell can inspect its own (read-only) filesystem:
     // `ls /bin`, `cat /session`, `wc`, `head`, `stat`.

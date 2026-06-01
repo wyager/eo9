@@ -1,6 +1,6 @@
 [package]
 name = "eo9-stub-pci-filtered"
-description = "Eo9 standard stub provider `pci.filtered`: attenuates an underlying eo9:pci capability to a configured allow-list of device addresses; everything else answers denied."
+description = "Eo9 standard stub provider `pci.filtered`: attenuates an underlying eo9:pci capability to the devices a composed eo9:pci/admit-policy component approves; everything else answers denied."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

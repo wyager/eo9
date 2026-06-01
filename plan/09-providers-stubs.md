@@ -387,3 +387,61 @@ Match the priority order above; (1)+(2) unblock I2.
     kernel store (as `pci.deny`), and the eo9-components bundle; the integration test runs
     `text.null $ pci.deny $ lspci` against zero host providers and asserts lspci's own typed
     `denied` failure.
+
+26. **`pci.filtered` is policy-driven; `pci.admit-address` and `pci.admit-vendor` are the standard
+    policies (2026-06-01, plan/02 D24, "policies are programs").** The attenuator imports
+    `eo9:pci/admit-policy` instead of carrying an allow-list configuration, so which devices a
+    driver may see is decided by a composed, fused, wiring-tree-visible policy component:
+    `pci.admit-address --allow "[{segment: 0, bus: 0, device: 1, function: 0}]" $ pci.filtered $ lspci`
+    (fixed bus addresses — the original behavior) or
+    `pci.admit-vendor --allow "[{vendor-id: 6900, device-id: 4096}]" $ pci.filtered $ lspci`
+    (vendor:device identity — closes study 09's address-fragility finding: the grant follows what
+    the device *is*, not where it sits). Both policies are pure (no capability imports), default
+    to deny-all when unconfigured (never-trap rule), and live in the kernel store, so both forms
+    run at the metal prompt compiled on-target (verified: 3 visible devices filter down to exactly
+    0000:00:01.0 / 1af4:1000 on QEMU aarch64). `open` on the filtered view distinguishes
+    `not-found` (no such device) from `denied` (present but refused by policy). Follow-ups:
+    (a) the kernel's missing-capability hint maps *any* `eo9:pci/*` residual — including a
+    missing admit-policy — to the "add the `pci` token" message, which is misleading when the
+    missing thing is the policy middleware (kernel message fix, area 12); (b) the browser /bin
+    does not carry the policy stubs yet (recorded, not done).
+
+27. **`fs.filtered` + `fs.policy-subtree`: per-path filesystem attenuation as composed policy
+    (2026-06-01, plan/02 D25).** The most-requested attenuator shape — finer than `--fs-root`,
+    or `fs.readonly`'s all-or-nothing — now exists as ordinary middleware:
+    `fs.policy-subtree --prefix "/docs" --access read-write $ fs.filtered $ program` allows
+    operations under `/docs` and denies everything else;  `--access read-only` additionally
+    turns mutations inside the subtree into the fs API's own `read-only` error while reads pass
+    through. Both stubs are in GUEST_COMPONENTS and the kernel store. Security: both the
+    middleware and the policy normalize paths before any prefix comparison (and the middleware
+    forwards the normalized path), so `/docs/../secret.txt` is denied by the *policy gate* —
+    test-pinned in tests/eo9-integration/tests/fs_filtered.rs (`path_traversal_cannot_escape_the_subtree`),
+    along with allow/deny/read-only end-to-end over fs.memfs, deny-all-when-unconfigured, and
+    purity. Follow-up: a metal interactive demo and the browser /bin additions ride with the
+    later milestones of this branch.
+
+28. **`net.l4.filtered` + `net.policy-ports`: the transport firewall as composed policy
+    (2026-06-01, plan/02 D26).** A firewall is now ordinary middleware:
+    `net.policy-ports --allow "[80, 443]" $ net.l4.filtered $ program` admits only endpoints
+    whose port is on the list (connect remotes, listen/bind locals, and per-datagram send-to
+    remotes), answering everything else with the layer's own `denied`. Pure, deny-all when
+    unconfigured, in GUEST_COMPONENTS and the kernel store. Test-pinned over `net.l4.loopback`
+    (tests/eo9-integration/tests/net_l4_filtered.rs): a permissive policy lets sockcheck's full
+    TCP echo + UDP round-trip succeed with every endpoint gated; a restrictive or unconfigured
+    policy surfaces as the program's own typed denial. (The end-to-end success test pins the
+    loopback's deterministic ephemeral port sequence — documented in the test.) Follow-ups:
+    a metal demo over `net.virtio $ net.l4.over-l2` (the firewall composes above the TCP/IP
+    middleware unchanged — same l4-in/l4-out shape) and the browser /bin additions.
+
+29. **Policy-swap store/bundle accounting and final verification (2026-06-01, milestone 4 of the
+    policy-component swaps).** The kernel store grew 32 -> 38 entries (pci.admit-address,
+    pci.admit-vendor, fs.filtered, fs.policy-subtree, net.l4.filtered, net.policy-ports): store
+    image 26.5 MB (+~4.0 MB over the 32-entry baseline; precompiled artifacts dominate), aarch64
+    kernel image 46.8 MB. All six new stubs are also in GUEST_COMPONENTS and the soundness
+    corpus. Final metal smoke (QEMU aarch64, `pci` boot, everything compiled on-target): the fs
+    read-only policy forwards reads of the kernel shell fs (`ls` -> listed(2)) and denies
+    outside-prefix paths; the firewalled sockcheck full TCP+UDP run echoes over loopback
+    (`echoed(24)`); the pci vendor policy still admits exactly one device. Recorded follow-ups:
+    browser /bin additions for the six new stubs (the blob's store does not carry them yet);
+    the eo9-bundled-programs refresh happens at merge time per the established convention;
+    the kernel's missing-capability hint for a missing admit-policy (D26 follow-up (a)).
