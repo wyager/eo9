@@ -1,0 +1,16 @@
+# The exponential-backoff restart policy for detached services ("policies are programs").
+[package]
+name = "eo9-stub-restart-backoff"
+description = "Eo9 standard policy `restart.backoff`: an eo9:svc/restart-policy component that restarts with exponential backoff up to a configured budget. Pure (imports nothing); configured with `--max-restarts` and `--base-delay-ms`, then passed to `detach`."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }
