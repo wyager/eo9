@@ -703,11 +703,22 @@ fn run_child_inner(
         "child instantiation",
         linker.instantiate_async(&mut store, &component),
     )??;
-    // Executor contract (plan/03 D21): apply compose-time configuration before `main`.
+    // Executor contract (plan/03 D23): apply compose-time configuration before `main`.
     // This is what makes `entropy.seeded --seed 43 $ rng` honor the baked seed: the
-    // composition's `eo9:rt/configured.bind` runs the provider's `configure` here.
+    // composition's `eo9:rt/configured.bind` runs the provider's `configure` here. A
+    // configuration the provider rejects is `bind`'s typed error -- the child is refused
+    // before `main`, never trapped.
     if let Some(bind) = crate::store::bind_entrypoint(&mut store, &instance) {
-        block_on("child bind()", bind.call_async(&mut store, &[], &mut []))??;
+        let mut bind_results = vec![Val::Bool(false); bind.ty(&store).results().len()];
+        block_on(
+            "child bind()",
+            bind.call_async(&mut store, &[], &mut bind_results),
+        )??;
+        if let Some(refused) = crate::store::configuration_refused(&bind_results) {
+            return Err(wasmtime::Error::msg(format!(
+                "compose-time configuration refused: {refused}"
+            )));
+        }
     }
     let index = instance
         .get_export_index(&mut store, None, "main")
