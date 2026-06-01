@@ -2281,3 +2281,101 @@ fn a_blank_zero_filled_file_still_auto_formats() {
     assert_eq!(read.code, 0, "stderr: {}", read.stderr);
     assert!(read.stdout.contains("formatted-on-first-use"));
 }
+
+#[test]
+fn concurrent_processes_on_one_image_are_refused_not_corrupted() {
+    // Study 07 finding S7-7: there used to be no locking on --disk images, so two
+    // concurrent processes mounting the same image allocated from the same frontier and
+    // committed over each other — cross-writer checksum corruption and lost updates. The
+    // image file is now advisorily locked (exclusive) for the life of the process's disk
+    // handle: whichever process gets there second is refused up front with a clear
+    // message. This test launches two writers at once and accepts either interleaving —
+    // both succeeding (no overlap happened) or one being refused — but never corruption.
+    use std::thread;
+
+    let store_a = temp_store("eofs-lock-a");
+    let store_b = temp_store("eofs-lock-b");
+    let dir = temp_store("eofs-lock-images");
+    let image = dir.join("disk.img");
+    let image_arg = image.to_str().expect("utf-8 image path").to_string();
+
+    let format = eo9(&store_a, &["mkfs.eofs", &image_arg, "--size", "4M"]);
+    assert_eq!(format.code, 0, "stderr: {}", format.stderr);
+
+    // Pre-seed both stores so the concurrent runs don't also race on store seeding
+    // (a separate concern, covered by its own test).
+    let warm_a = eo9(&store_a, &["-c", "echo warm"]);
+    assert_eq!(warm_a.code, 0, "stderr: {}", warm_a.stderr);
+    let warm_b = eo9(&store_b, &["-c", "echo warm"]);
+    assert_eq!(warm_b.code, 0, "stderr: {}", warm_b.stderr);
+
+    let image_a = image_arg.clone();
+    let store_a2 = store_a.clone();
+    let writer_a = thread::spawn(move || {
+        eo9(
+            &store_a2,
+            &[
+                "--disk",
+                &image_a,
+                "-c",
+                "fs.eofs $ readwrite /from-a.txt written-by-process-a",
+            ],
+        )
+    });
+    let image_b = image_arg.clone();
+    let store_b2 = store_b.clone();
+    let writer_b = thread::spawn(move || {
+        eo9(
+            &store_b2,
+            &[
+                "--disk",
+                &image_b,
+                "-c",
+                "fs.eofs $ readwrite /from-b.txt written-by-process-b",
+            ],
+        )
+    });
+    let result_a = writer_a.join().expect("writer A thread");
+    let result_b = writer_b.join().expect("writer B thread");
+
+    // Each run either succeeded or was refused because the image was busy — never a
+    // checksum/corruption error.
+    for (name, result) in [("A", &result_a), ("B", &result_b)] {
+        let all = format!("{}{}", result.stdout, result.stderr);
+        assert!(
+            !all.contains("checksum"),
+            "writer {name} saw corruption: {all}"
+        );
+        if result.code != 0 {
+            assert!(
+                all.contains("in use"),
+                "writer {name} failed for a reason other than the image lock: {all}"
+            );
+        }
+    }
+    assert!(
+        result_a.code == 0 || result_b.code == 0,
+        "at least one writer must have succeeded\nA: {}\nB: {}",
+        result_a.stderr,
+        result_b.stderr
+    );
+
+    // The image is still healthy: it lists, and every file whose writer reported success
+    // is present with intact content.
+    let list = eo9(&store_a, &["--disk", &image_arg, "-c", "fs.eofs $ ls /"]);
+    assert_eq!(list.code, 0, "stderr: {}", list.stderr);
+    if result_a.code == 0 {
+        let read = eo9(
+            &store_a,
+            &["--disk", &image_arg, "-c", "fs.eofs $ cat /from-a.txt"],
+        );
+        assert!(read.stdout.contains("written-by-process-a"));
+    }
+    if result_b.code == 0 {
+        let read = eo9(
+            &store_a,
+            &["--disk", &image_arg, "-c", "fs.eofs $ cat /from-b.txt"],
+        );
+        assert!(read.stdout.contains("written-by-process-b"));
+    }
+}

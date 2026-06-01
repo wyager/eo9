@@ -16,9 +16,17 @@
 //! on a pool thread (a write issued before a kill may still reach the backing file), the
 //! completer receives the buffer back, and a dead caller's runtime drops it. Dropping
 //! the provider (and the pool) drains already-submitted operations first.
+//!
+//! Locking: the backing file is advisorily locked for the provider's lifetime — exclusive
+//! for read-write devices, shared for read-only ones — so two processes can never mount
+//! the same image read-write at once. Concurrent mounts of a copy-on-write filesystem
+//! corrupt it (each writer allocates from the same frontier and commits over the other);
+//! the second opener is refused up front with a clear error instead (study 07, S7-7). The
+//! lock is released when the provider (and every clone of its file handle) is dropped.
 
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -76,6 +84,32 @@ pub trait DiskHost: Send + Sync {
     fn write(&self, offset: u64, src: OwnedBuffer, complete: Completer<WriteCompletion>);
 }
 
+/// Take the advisory lock that makes a device single-writer: exclusive for read-write,
+/// shared for read-only. Refuses (does not block) when another process holds it.
+fn lock_device(file: &File, read_only: bool, path: &Path) -> io::Result<()> {
+    let operation = if read_only {
+        libc::LOCK_SH
+    } else {
+        libc::LOCK_EX
+    } | libc::LOCK_NB;
+    // SAFETY: flock on a valid, owned file descriptor; no memory is involved.
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::WouldBlock {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "{} is in use by another process (disk images are single-writer: a \
+                 concurrent second mount would corrupt the filesystem on it)",
+                path.display()
+            ),
+        ));
+    }
+    Err(err)
+}
+
 /// The unix disk provider: one file-backed block device. Corresponds to the WIT
 /// `disk-impl` root handle.
 pub struct DiskProvider {
@@ -98,6 +132,7 @@ impl DiskProvider {
             .read(true)
             .write(!read_only)
             .open(path.as_ref())?;
+        lock_device(&file, read_only, path.as_ref())?;
         let size = file.metadata()?.len();
         Ok(Self {
             file: Arc::new(file),
@@ -118,6 +153,7 @@ impl DiskProvider {
             .read(true)
             .write(!read_only)
             .open(path.as_ref())?;
+        lock_device(&file, read_only, path.as_ref())?;
         Ok(Self {
             file: Arc::new(file),
             size,
@@ -134,6 +170,7 @@ impl DiskProvider {
             .write(true)
             .create_new(true)
             .open(path.as_ref())?;
+        lock_device(&file, false, path.as_ref())?;
         file.set_len(size)?;
         Ok(Self {
             file: Arc::new(file),
@@ -407,6 +444,52 @@ mod tests {
             completions += 1;
         }
         assert_eq!(completions, 256);
+    }
+
+    #[test]
+    fn a_second_concurrent_open_is_refused_while_the_first_is_alive() {
+        // Study 07, S7-7: two concurrent read-write mounts of one image corrupt the
+        // filesystem on it. The device lock turns that into an up-front refusal.
+        let dir = TempDir::new();
+        let path = dir.path().join("disk.img");
+        let pool = Arc::new(BlockingPool::new(1));
+
+        let first = DiskProvider::create(&path, 4096, Arc::clone(&pool)).unwrap();
+        let err = match DiskProvider::open(&path, false, Arc::clone(&pool)) {
+            Ok(_) => panic!("the second read-write open must be refused"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(err.to_string().contains("in use"), "{err}");
+
+        // Dropping the first releases the lock; the image opens normally again.
+        drop(first);
+        DiskProvider::open(&path, false, Arc::clone(&pool)).unwrap();
+    }
+
+    #[test]
+    fn read_only_opens_share_the_image() {
+        // Multiple read-only mounts are harmless (nothing moves underneath them), so the
+        // lock is shared for read-only devices: N readers coexist, but a writer is still
+        // excluded while any reader is alive.
+        let dir = TempDir::new();
+        let path = dir.path().join("disk.img");
+        let pool = Arc::new(BlockingPool::new(1));
+        {
+            let disk = DiskProvider::create(&path, 4096, Arc::clone(&pool)).unwrap();
+            write_blocking(&disk, 0, b"shared").1.unwrap();
+        }
+
+        let reader_a = DiskProvider::open(&path, true, Arc::clone(&pool)).unwrap();
+        let reader_b = DiskProvider::open(&path, true, Arc::clone(&pool)).unwrap();
+        assert_eq!(read_blocking(&reader_a, 0, 6).0.as_slice(), b"shared");
+        assert_eq!(read_blocking(&reader_b, 0, 6).0.as_slice(), b"shared");
+
+        let kind = match DiskProvider::open(&path, false, Arc::clone(&pool)) {
+            Ok(_) => panic!("a writer must be excluded while readers are alive"),
+            Err(err) => err.kind(),
+        };
+        assert_eq!(kind, io::ErrorKind::WouldBlock);
     }
 
     #[test]
