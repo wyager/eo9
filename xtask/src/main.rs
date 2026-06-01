@@ -22,6 +22,8 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-l2check",
     "eo9-example-l4check",
     "eosh",
+    // The service-boot program (executor v1, docs/design/executor-model.md).
+    "init",
     // Basic coreutils (guest/coreutils/*, plan/17-coreutils.md).
     "eo9-coreutil-cat",
     "eo9-coreutil-ls",

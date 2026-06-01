@@ -1,0 +1,16 @@
+# init — the Eo9 service-boot program (executor v1).
+[package]
+name = "init"
+description = "The Eo9 service-boot program: an ordinary Eo9 binary that reads a service config, detaches each entry to the service registry under its restart policy, and keeps a console running in the foreground (exit restarts the console while services live)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

@@ -37,7 +37,7 @@ use crate::source::{self, ProgramSource};
 /// Where `cargo xtask build-guest` puts components in a development tree, relative to the
 /// current directory: the fallback source for eosh itself and the fill-in source for the
 /// session bin view.
-const DEV_COMPONENTS_DIR: &str = "guest/target/components";
+pub(crate) const DEV_COMPONENTS_DIR: &str = "guest/target/components";
 
 pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
     let store = cfg.open_store()?;
@@ -225,7 +225,10 @@ fn resolve_eosh(cfg: &Config, store: &Store) -> Result<ProgramSource, String> {
 ///
 /// Returns the session directory and the program names placed into the bin view (the
 /// names eosh can resolve — also the shell's tab-completion candidates).
-fn materialize_session(cfg: &Config, store: &Store) -> Result<(PathBuf, Vec<String>), String> {
+pub(crate) fn materialize_session(
+    cfg: &Config,
+    store: &Store,
+) -> Result<(PathBuf, Vec<String>), String> {
     let shell_root = store.root().join("shell");
     fs::create_dir_all(&shell_root)
         .map_err(|err| format!("cannot create {}: {err}", shell_root.display()))?;

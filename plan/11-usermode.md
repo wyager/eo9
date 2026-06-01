@@ -383,3 +383,23 @@ its first milestones, and to be the place where cross-area seams get found.
 * The eo9 binary's embedded component set now includes the three restart-policy stubs (60 bundled
   programs); `eo9-bundled-programs/data` is NOT refreshed on this branch (the post-merge
   refresh-components convention from the canonical checkout applies).
+
+### Executor v1: `eo9 init` and the init program (2026-06-01, area 11 + guest/init)
+
+* **`eo9 init [config]`** runs the service-boot program (`guest/init`, an ordinary guest binary —
+  no private powers, anyone can write a different one) with the svc capability. Config lines:
+  `<name> = <program> [--flag value …] restart <policy> [--flag value …]`, plus `console =
+  <program>` (default eosh) and `console-restart = always|never`.
+* **The svc grant reaches two generations** (`providers::init_providers`): init itself and its
+  console child (so `svc list`/`svc stop` work at that console); the console's children get
+  nothing (ruling B). Implemented by generalizing the recursive session factory with an
+  svc-generations counter (`session_providers`).
+* **Ruling D** (console exit restarts the console while services live) holds for interactive
+  sessions. Scripted/piped sessions default to `console-restart = never` (set by the CLI when
+  stdin is not a terminal): a console reading an exhausted pipe exits immediately, so the
+  ruling-D loop would respawn it forever. A 1000-restart hard cap backstops `always` too.
+* **Capability soundness through init**: a config entry whose program is not closed (beyond
+  text/rt) is refused with the named residuals and the boot continues — one bad line never
+  blocks the machine.
+* Demo config: `guest/init/demo/services.cfg`. Tests: `tests/eo9-integration/tests/svc_init.rs`
+  (6 subprocess tests incl. the runtime-level no-svc refusal).
