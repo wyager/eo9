@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eofs_core::{Eofs, FormatOptions, MemDevice, NodeKind};
+use eo9_eofs::{Eofs, FormatOptions, MemDevice, NodeKind};
 
 const DEV_SIZE: u64 = 16 * 1024 * 1024;
 const STEPS: usize = 400;

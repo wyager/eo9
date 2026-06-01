@@ -2386,6 +2386,56 @@ fn a_blank_zero_filled_file_still_auto_formats() {
 }
 
 #[test]
+fn zero_prefixed_foreign_volumes_are_refused_not_formatted() {
+    // Owner ruling on study 07 S7-2: "blank" must be judged over spans large enough that
+    // no common in-use disk format can masquerade as blank. Two victims the old 64 KiB
+    // prefix check would have destroyed:
+    //   - a btrfs volume: its primary superblock sits at exactly 64 KiB, so the first
+    //     64 KiB can legitimately be all zero;
+    //   - a device with a wiped start but surviving end-of-device backups (backup GPT,
+    //     ZFS end labels).
+    // Both must be refused by the provider and by un-forced mkfs, bytes untouched.
+    let store = temp_store("eofs-zero-prefix");
+    let dir = temp_store("eofs-zero-prefix-images");
+
+    // (image name, offset of the planted foreign structure, its magic bytes)
+    let cases: [(&str, usize, &[u8; 8]); 2] = [
+        ("btrfs-like.img", 64 * 1024, b"_BHRfS_M"),
+        ("tail-backup.img", 4 * 1024 * 1024 - 512, b"EFI PART"),
+    ];
+
+    for (name, offset, magic) in cases {
+        let image = dir.join(name);
+        let image_arg = image.to_str().expect("utf-8 image path");
+
+        // 4 MiB of zeros with one foreign structure planted outside the old probe span.
+        let mut bytes = vec![0u8; 4 * 1024 * 1024];
+        bytes[offset..offset + 8].copy_from_slice(magic);
+        fs::write(&image, &bytes).expect("write victim image");
+
+        let run = eo9(&store, &["--disk", image_arg, "-c", "fs.eofs $ ls /"]);
+        assert_eq!(
+            run.code, 1,
+            "{name}: must refuse, not format. stdout: {} stderr: {}",
+            run.stdout, run.stderr
+        );
+        assert!(
+            format!("{}{}", run.stdout, run.stderr).contains("not an eofs filesystem"),
+            "{name}: the refusal must say what is wrong"
+        );
+
+        let refuse = eo9(&store, &["mkfs.eofs", image_arg]);
+        assert_eq!(refuse.code, 3, "{name}: stderr: {}", refuse.stderr);
+
+        assert_eq!(
+            fs::read(&image).expect("re-read image"),
+            bytes,
+            "{name}: the volume's bytes must be untouched after both refusals"
+        );
+    }
+}
+
+#[test]
 fn concurrent_processes_on_one_image_are_refused_not_corrupted() {
     // Study 07 finding S7-7: there used to be no locking on --disk images, so two
     // concurrent processes mounting the same image allocated from the same frontier and

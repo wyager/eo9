@@ -2,7 +2,7 @@
 //!
 //! eofs itself (the on-disk format, copy-on-write engine, snapshots, compression,
 //! hashing, crash consistency, persistence across mounts) is exercised by
-//! `crates/eofs-core`'s own test suite. These tests cover the provider layer: the
+//! `crates/eo9-eofs`'s own test suite. These tests cover the provider layer: the
 //! component has the disk-to-fs shape the plan describes, the algebraic chain
 //! `disk.mem $ fs.eofs $ program` composes and validates, and a real program round-trips
 //! its data through eofs over an in-memory disk — including the documented defaults

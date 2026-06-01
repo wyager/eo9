@@ -1,7 +1,7 @@
 //! `fs.eofs` — Eo9's native filesystem as a provider component (plan/14-eofs.md, M2).
 //!
 //! Targets the crate-local `eo9:fs-eofs/eofs` world: imports a raw block device
-//! (`eo9:disk/disk`) and exports `eo9:fs/fs` backed by the `eofs-core` engine — the same
+//! (`eo9:disk/disk`) and exports `eo9:fs/fs` backed by the `eo9-eofs` engine — the same
 //! copy-on-write, Merkle-hashed, lz4-compressed, snapshotting filesystem the host tests
 //! and (later) the kernel use. All I/O goes through the imported disk capability, so the
 //! identical component runs over `disk.mem` in usermode today and over file-backed or
@@ -11,10 +11,11 @@
 //! there is no configure interface):
 //!
 //! * **First use mounts the disk.** If either uberblock slot carries the eofs magic the
-//!   image is mounted; a blank device (no magic in either slot) is formatted in place
-//!   with the default options (4 KiB blocks, lz4 on). A device that has the magic but
-//!   fails to mount is *never* reformatted — the error is reported instead, so corruption
-//!   can't silently become data loss.
+//!   image is mounted; a blank device (no magic, and all zero everywhere a common foreign
+//!   format would leave its mark — see [`eo9_eofs::probe`]) is formatted in place with
+//!   the default options (4 KiB blocks, lz4 on). A device that has the magic but fails to
+//!   mount is *never* reformatted — the error is reported instead, so corruption can't
+//!   silently become data loss; a device holding foreign data is refused outright.
 //! * **Every completed mutating operation commits; failed ones roll back.** `write`,
 //!   `create-directory`, and `remove` each end with an eofs commit (root flip), so
 //!   completed operations are durable on the disk and crash consistency is the engine's
@@ -54,8 +55,8 @@ use alloc::vec::Vec;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 
+use eo9_eofs::{BlockDevice, DeviceError, Eofs, FormatOptions};
 use eo9_guest::provider::ProviderState;
-use eofs_core::{BlockDevice, DeviceError, Eofs, FormatOptions};
 
 wit_bindgen::generate!({
     world: "eofs",
@@ -176,9 +177,10 @@ impl BlockDevice for DiskDevice {
 
 /// Mount the imported disk, formatting it first if — and only if — it is blank.
 ///
-/// "Blank" means probed as [`eofs_core::ImageState::Blank`]: no eofs filesystem AND the
-/// device's leading bytes are all zero. A device holding anybody else's data (an ext4
-/// image, a tarball, a file pointed at by mistake) is refused, never formatted over —
+/// "Blank" means probed as [`eo9_eofs::ImageState::Blank`]: no eofs filesystem AND the
+/// spans where any common format would leave its mark — the leading megabyte, the trailing
+/// 64 KiB, or the whole device when it is small — are all zero. A device holding anybody
+/// else's data (an ext4 image, a btrfs volume, a file pointed at by mistake) is refused, never formatted over —
 /// destroying foreign data is something only an explicit, forced `mkfs` may do (study 07,
 /// S7-2). A device with eofs remains that no longer mount is also never reformatted; its
 /// mount error is reported instead.
@@ -198,14 +200,14 @@ fn mount_or_format() -> Result<Eofs<DiskDevice>, FsError> {
             ))),
         };
     }
-    match eofs_core::probe(&device).map_err(map_error)? {
-        eofs_core::ImageState::Eofs { .. } | eofs_core::ImageState::Unmountable => {
+    match eo9_eofs::probe(&device).map_err(map_error)? {
+        eo9_eofs::ImageState::Eofs { .. } | eo9_eofs::ImageState::Unmountable => {
             Eofs::mount(device).map_err(map_error)
         }
-        eofs_core::ImageState::Blank => {
+        eo9_eofs::ImageState::Blank => {
             Eofs::format(device, &FormatOptions::default()).map_err(map_error)
         }
-        eofs_core::ImageState::Foreign => Err(FsError::Io(String::from(
+        eo9_eofs::ImageState::Foreign => Err(FsError::Io(String::from(
             "the disk holds data that is not an eofs filesystem; refusing to format over it. If that data is expendable, format the device explicitly: `eo9 mkfs.eofs <image> --force`",
         ))),
     }
@@ -238,11 +240,11 @@ fn with_fs<R>(f: impl FnOnce(&mut Eofs<DiskDevice>) -> Result<R, FsError>) -> Re
 /// half-applied (the `open` truncate path tolerates an already-removed file for this
 /// reason); see the per-operation comments.
 fn mutate<R>(
-    f: impl Fn(&mut Eofs<DiskDevice>) -> Result<R, eofs_core::FsError>,
+    f: impl Fn(&mut Eofs<DiskDevice>) -> Result<R, eo9_eofs::FsError>,
 ) -> Result<R, FsError> {
     with_fs(|eofs| {
         let result = match f(eofs) {
-            Err(eofs_core::FsError::NoSpace) => {
+            Err(eo9_eofs::FsError::NoSpace) => {
                 // Reclaim everything unreachable (the failed attempt's own orphaned
                 // blocks included — gc walks the committed and pending roots, and
                 // whatever the failure left behind is referenced by neither) and try
@@ -283,21 +285,19 @@ fn device_error(error: DeviceError) -> FsError {
 /// failures even though `eo9:fs` has no dedicated corruption variant yet — a flaky cable
 /// and rotting media must not read the same (study 07, S7-5). The complete fix is a WIT
 /// addition (`integrity(string)` in `fs-error`), recorded in plan/14.
-fn map_error(error: eofs_core::FsError) -> FsError {
+fn map_error(error: eo9_eofs::FsError) -> FsError {
     match error {
-        eofs_core::FsError::NotFound => FsError::NotFound,
-        eofs_core::FsError::AlreadyExists => FsError::AlreadyExists,
-        eofs_core::FsError::NotADirectory => FsError::NotADirectory,
-        eofs_core::FsError::IsADirectory => FsError::IsADirectory,
-        eofs_core::FsError::NoSpace => FsError::NoSpace,
-        eofs_core::FsError::DirectoryNotEmpty => {
-            FsError::Io(String::from("directory is not empty"))
-        }
-        eofs_core::FsError::ChecksumMismatch => FsError::Io(String::from(
+        eo9_eofs::FsError::NotFound => FsError::NotFound,
+        eo9_eofs::FsError::AlreadyExists => FsError::AlreadyExists,
+        eo9_eofs::FsError::NotADirectory => FsError::NotADirectory,
+        eo9_eofs::FsError::IsADirectory => FsError::IsADirectory,
+        eo9_eofs::FsError::NoSpace => FsError::NoSpace,
+        eo9_eofs::FsError::DirectoryNotEmpty => FsError::Io(String::from("directory is not empty")),
+        eo9_eofs::FsError::ChecksumMismatch => FsError::Io(String::from(
             "integrity check failed: block checksum mismatch (the stored data does not \
              match its recorded hash; the device is corrupted at this location)",
         )),
-        eofs_core::FsError::Corrupt(what) => FsError::Io(alloc::format!(
+        eo9_eofs::FsError::Corrupt(what) => FsError::Io(alloc::format!(
             "integrity check failed: corrupt filesystem structure ({what})"
         )),
         other => FsError::Io(alloc::format!("{other}")),
@@ -397,11 +397,11 @@ impl fs::Guest for Stub {
         mutate(|eofs| {
             match eofs.stat(&path) {
                 Ok(stat) => {
-                    if stat.kind == eofs_core::NodeKind::Directory {
-                        return Err(eofs_core::FsError::IsADirectory);
+                    if stat.kind == eo9_eofs::NodeKind::Directory {
+                        return Err(eo9_eofs::FsError::IsADirectory);
                     }
                 }
-                Err(eofs_core::FsError::NotFound) if create => {
+                Err(eo9_eofs::FsError::NotFound) if create => {
                     // Creating a brand-new (empty) file destroys nothing; commit it so a
                     // bare `touch` is durable on its own.
                     eofs.create_file(&path)?;
@@ -418,7 +418,7 @@ impl fs::Guest for Stub {
         if truncate {
             truncate_pending = with_fs(|eofs| {
                 Ok(matches!(eofs.stat(&path), Ok(stat) if stat.size > 0
-                    && stat.kind == eofs_core::NodeKind::File))
+                    && stat.kind == eo9_eofs::NodeKind::File))
             })?;
         }
         Ok(fs::File::new(OpenFile {
@@ -438,7 +438,7 @@ impl fs::Guest for Stub {
         }
         let bytes = with_fs(|eofs| {
             let stat = eofs.stat(&path).map_err(map_error)?;
-            if stat.kind == eofs_core::NodeKind::Directory {
+            if stat.kind == eo9_eofs::NodeKind::Directory {
                 return Err(FsError::IsADirectory);
             }
             let size = usize::try_from(stat.size)
@@ -468,13 +468,13 @@ impl fs::Guest for Stub {
             let stat = eofs.stat(&path).map_err(map_error)?;
             Ok(NodeStat {
                 kind: match stat.kind {
-                    eofs_core::NodeKind::File => NodeKind::File,
-                    eofs_core::NodeKind::Directory => NodeKind::Directory,
+                    eo9_eofs::NodeKind::File => NodeKind::File,
+                    eo9_eofs::NodeKind::Directory => NodeKind::Directory,
                 },
                 size: match stat.kind {
-                    eofs_core::NodeKind::File => stat.size,
+                    eo9_eofs::NodeKind::File => stat.size,
                     // The engine reports a directory's serialized size; the API promises 0.
-                    eofs_core::NodeKind::Directory => 0,
+                    eo9_eofs::NodeKind::Directory => 0,
                 },
             })
         })
