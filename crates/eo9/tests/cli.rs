@@ -1012,9 +1012,34 @@ fn shell_resolves_store_bound_names_and_eosh_from_the_store() {
     assert!(run.stdout.contains("Hello, store."), "{}", run.stdout);
     assert!(run.stderr.contains("ok: greeted"), "{}", run.stderr);
 
-    // The session bin view lives under the store root and holds the bound names.
-    assert!(store.join("shell/bin/greeter.wasm").is_file());
-    assert!(store.join("shell/bin/eosh.wasm").is_file());
+    // The session bin view lives under the store root (one directory per process since
+    // study 07 S7-6) and holds the bound names. The invocation above has exited, so its
+    // session directory may already have been swept by a later run; assert on whichever
+    // session directories remain, or — if a sweep already removed them all — accept that
+    // as the (correct) post-exit state and just re-run to confirm resolution still works.
+    let session_bins: Vec<std::path::PathBuf> = fs::read_dir(store.join("shell"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry.path().is_dir()
+                        && entry.file_name().to_string_lossy().starts_with("session-")
+                })
+                .map(|entry| entry.path().join("bin"))
+                .collect()
+        })
+        .unwrap_or_default();
+    for bin in &session_bins {
+        assert!(bin.join("greeter.wasm").is_file());
+        assert!(bin.join("eosh.wasm").is_file());
+    }
+    // Resolution keeps working on a fresh invocation either way.
+    let again = eo9(
+        &store,
+        &["shell", "-c", "greeter --name again --excited false"],
+    );
+    assert_eq!(again.code, 0, "stderr: {}", again.stderr);
+    assert!(again.stdout.contains("Hello, again."), "{}", again.stdout);
 }
 
 #[test]
@@ -1050,8 +1075,21 @@ fn shell_env_shows_the_session_capability_picture() {
         "{}",
         run.stdout
     );
-    // The manifest itself sits in the session directory the shell's fs is rooted at.
-    assert!(store.join("shell/session").is_file());
+    // The manifest itself sits in the (per-process) session directory the shell's fs is
+    // rooted at. The run above has exited, so its directory may have been swept; what
+    // matters is that any session directory that still exists carries a manifest.
+    if let Ok(entries) = fs::read_dir(store.join("shell")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && entry.file_name().to_string_lossy().starts_with("session-") {
+                assert!(
+                    path.join("session").is_file(),
+                    "session dir without a manifest: {}",
+                    path.display()
+                );
+            }
+        }
+    }
 
     // With --fs-root, the children's filesystem grant (and its root) shows up.
     let fs_root = store.join("data");
@@ -2378,4 +2416,53 @@ fn concurrent_processes_on_one_image_are_refused_not_corrupted() {
         );
         assert!(read.stdout.contains("written-by-process-b"));
     }
+}
+
+#[test]
+fn concurrent_invocations_of_one_store_do_not_corrupt_the_session() {
+    // Study 07 finding S7-6: every `eo9 -c` / `eo9 shell` rebuilds the session bin view,
+    // and that view used to be a single shared directory under the store — so concurrent
+    // invocations raced each other's remove/rebuild and roughly a third of them failed
+    // ("cannot place ... into the session bin view", "cannot resolve `echo`"). Sessions
+    // are now per-process: N concurrent invocations against ONE store must all succeed.
+    use std::thread;
+
+    let store = temp_store("concurrent-sessions");
+
+    // Seed once up front so the concurrent runs only exercise the session machinery, not
+    // first-run store seeding.
+    let warm = eo9(&store, &["-c", "echo warm"]);
+    assert_eq!(warm.code, 0, "stderr: {}", warm.stderr);
+
+    let runs: Vec<_> = (0..8)
+        .map(|i| {
+            let store = store.clone();
+            thread::spawn(move || {
+                let run = eo9(&store, &["-c", &format!("echo concurrent-{i}")]);
+                (i, run)
+            })
+        })
+        .collect();
+
+    let mut failures = Vec::new();
+    for handle in runs {
+        let (i, run) = handle.join().expect("runner thread");
+        if run.code != 0 || !run.stdout.contains(&format!("concurrent-{i}")) {
+            failures.push(format!(
+                "run {i}: exit {} stdout {:?} stderr {:?}",
+                run.code, run.stdout, run.stderr
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of 8 concurrent invocations failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+
+    // And a later invocation still works (the sweeps did not eat anything live).
+    let after = eo9(&store, &["-c", "echo after"]);
+    assert_eq!(after.code, 0, "stderr: {}", after.stderr);
+    assert!(after.stdout.contains("after"));
 }
