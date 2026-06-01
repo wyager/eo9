@@ -345,14 +345,14 @@ pub fn help_lines() -> &'static [&'static str] {
         "  provider $ program            compose: satisfy the program's imports (right-assoc)",
         "                                  e.g. entropy.seeded --seed 7 $ rng --count 2",
         "  base & layer                  extend an environment (later layers override)",
-        "                                  e.g. time.frozen --now-seconds 0 & entropy.seeded --seed 7",
+        "                                  e.g. time.frozen & entropy.seeded --seed 7",
         "  only <iface,…> $ …            restrict everything to the right to an allow-list",
         "                                  e.g. only eo9:text,eo9:time $ hello",
         "  rename <from> <to> $ …        relabel a capability slot",
         "  with <provider> as <slot>, …  bind providers to named slots (tuples bind positionally)",
         "  let <name> = <expr>           name a component or environment value",
         "  save <name> = <expr>          persist a program or composition to /bin (where the store is writable)",
-        "  (…)                           grouping; a parenthesized argument is passed open, not run",
+        "  (…)                           grouping; the inner expression is passed as a value, not run",
         "",
         "explore the sandbox:",
         "  ls /bin                       list what is installed (programs and providers)",
@@ -753,6 +753,82 @@ mod tests {
             LineResult::Error(
                 "error: cannot resolve `no-such-program`: no such module".to_string()
             )
+        );
+    }
+
+    /// Every example the shell's own `help` text shows must parse and evaluate cleanly.
+    ///
+    /// The mock programs mirror the *real* argument signatures of the components the
+    /// examples name (the standard stubs' and coreutils' WIT): `hello` takes two optional
+    /// arguments, `rng` a required `count`, `entropy.seeded` is configured by a `seed`,
+    /// and `time.frozen` requires *both* `now-seconds` and `monotonic-ns` when configured
+    /// at all (partial configuration is refused). A user study found the shipped `&`
+    /// example failing exactly that rule — this test makes the class of bug (an example
+    /// that the shell itself refuses) impossible to reintroduce. If a real signature
+    /// changes, update the mirror here and the help text together.
+    #[test]
+    fn every_help_example_evaluates_cleanly() {
+        use crate::backend::{ArgSpec, ImportNeed};
+
+        let mut hello = binary(&[("name", "option<string>"), ("excited", "option<bool>")]);
+        hello.imports = vec![
+            ImportNeed {
+                slot: "eo9:text/text".to_string(),
+                interface: "eo9:text/text".to_string(),
+                version: "0.1.0".to_string(),
+                required: true,
+            },
+            ImportNeed {
+                slot: "eo9:time/time".to_string(),
+                interface: "eo9:time/time".to_string(),
+                version: "0.1.0".to_string(),
+                required: true,
+            },
+        ];
+        let mut entropy_seeded = provider(&["eo9:entropy/entropy"]);
+        entropy_seeded.args = vec![ArgSpec {
+            name: "seed".to_string(),
+            ty: "u64".to_string(),
+        }];
+        let mut time_frozen = provider(&["eo9:time/time"]);
+        time_frozen.args = vec![
+            ArgSpec {
+                name: "now-seconds".to_string(),
+                ty: "u64".to_string(),
+            },
+            ArgSpec {
+                name: "monotonic-ns".to_string(),
+                ty: "u64".to_string(),
+            },
+        ];
+        let mut session = session_with(&[
+            ("hello", hello),
+            ("rng", binary(&[("count", "u64")])),
+            ("entropy.seeded", entropy_seeded),
+            ("time.frozen", time_frozen),
+        ]);
+
+        let mut examples = 0;
+        for line in help_lines() {
+            let Some(example) = line.split("e.g. ").nth(1) else {
+                continue;
+            };
+            examples += 1;
+            let result = run(&mut session, example);
+            if let LineResult::Error(message) = result {
+                // The one acceptable refusal: the example evaluates to a provider or
+                // environment (those are meant for `let`/`$`, not to be run bare). Any
+                // other error — a parse error, a missing argument, an unknown flag —
+                // means the help text ships an example the shell itself refuses.
+                assert!(
+                    message.contains("providers are composed"),
+                    "help example `{example}` fails: {message}"
+                );
+            }
+        }
+        assert!(
+            examples >= 4,
+            "expected the help text to carry at least four examples, found {examples}"
         );
     }
 }
