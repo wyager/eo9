@@ -185,3 +185,24 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
     name is resolvable there (the blob's MemFs serves /bin and accepts writes, but nothing persists across a
     reload) should be verified and the page copy adjusted — recorded as a web follow-up, not a kernel
     concern.
+
+17. **Study-10 fix batch: the shell's own surfaces must teach (2026-06-01, branch `area/10-ux-fixes`).**
+    Round-3 user study 10 (the returning novice) found the shell's polish cracking exactly where its own
+    materials point users: (a) the help text's `&` example failed when typed (partial `time.frozen`
+    configuration is refused) — the example is now the unconfigured-defaults form
+    (`time.frozen & entropy.seeded --seed 7`), and a new eosh-core test extracts every `e.g.` line from
+    `help_lines()` and evaluates it against mocks mirroring the real argument signatures, so an example the
+    shell itself refuses can never ship again; (b) `entropy.seeded & echo --text hi` got the blunt
+    "arguments cannot be applied" error instead of the teaching program-not-provider refusal — the
+    operand-kind check now runs first, and the suggested `$` spelling preserves the user's arguments on
+    either operand (`expr_spelling`); (c) `let` succeeded silently and a failed `let` cascaded into
+    "cannot resolve `det` (/bin/det.wasm): FsError::NotFound" — `let` now confirms the name, kind, and (for
+    providers) exports, and the WIT backend's resolve renders not-found as "no such binding or program
+    `<name>`" with pointers at `ls /bin` and `let`, never as enum text (a `fs_error_text` helper covers the
+    other resolution-path errors too); (d) `eo9:rt/*` imports in `describe`/`imports` carry an inline
+    " — carries no authority; always admitted by `only`" annotation, sized to stay within the try-it page
+    terminal's column budget; (e) the "passed open, not run" grouping line is reworded to "the inner
+    expression is passed as a value, not run". Browser-side checks for all of these live in
+    verify-eosh.mjs (plan/18 D37). Still open from the same study (tracked, not this branch): the
+    `ok:`/`success(…)` rendering split, `eo9 store --help`, fs errors leaking enum text from the *coreutils'*
+    own failure variants, and the owner-decision items (front-page voice, boot banner, save-vs-ls).

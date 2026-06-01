@@ -20,7 +20,9 @@ const lines = [];
 
 const imports = {
   env: {
-    host_write: (ptr, len) => lines.push(decoder.decode(new Uint8Array(memory.buffer, ptr, len))),
+    // Standard-error lines carry a leading U+0001 marker (the page styles them); strip it here.
+    host_write: (ptr, len) =>
+      lines.push(decoder.decode(new Uint8Array(memory.buffer, ptr, len)).replace(/^\u0001/, "")),
     host_now_ms: () => Date.now(),
     host_monotonic_ns: () => performance.now() * 1e6,
     host_random_fill: (ptr, len) => {

@@ -799,3 +799,23 @@ sources changed). Verified by the node/JSPI harnesses: verify-eosh 28/28 — inc
 composition, deterministic seeded streams across runs, and the `&` form with two configured operands
 (which exercises the bind merger in-blob) — verify-coreutils 15/15, verify-fs, verify-exec all PASS,
 check-web-vm ok.
+
+## Decision 37 — study-10 web fixes: the terminal renders honestly, the pages agree, the welcome file works (2026-06-01)
+
+Branch `area/10-ux-fixes` (companion to plan/10 D17). Three web-side fixes from round-3 user study 10:
+(1) **Line-buffered terminal output.** Guests write line text and the terminating newline as separate
+`text.write` calls; the page rendered one `<div>` per call, so refusals printed a `[stderr] error: …`
+line plus a stray empty `[stderr]` line, and all output was double-spaced. `WebState` now buffers each
+stream and emits one host write per complete line; standard-error lines carry an in-band U+0001 marker
+(never visible text) that `vm.js` strips and styles with the existing `vm-error` class, and that the
+four verify harnesses + selftest.js strip before matching. (2) **`/welcome.txt` recommends only what
+exists.** It suggested `wc`, which the browser's 7-program `/bin` does not carry — the OS's own welcome
+file was a broken example. The seeded text now recommends `cat`/`ls` forms only, and verify-eosh parses
+the welcome file's "Try:" line and asserts every named program resolves in `/bin`, so the rule is pinned.
+(3) **The two pages spell `only` the same way.** The front page taught the short package form while the
+try-it page used full interface refs; both now use the short form (with a note that the explicit form
+works too), and the harness drives the page's exact spellings. The harness also gains checks for the
+eosh-side fixes (help `&` example via `let`, the no-such-binding refusal, the diagnostics-rider
+annotation). Assets rebuilt once: blob 8,911,977 B raw / 1,747,183 B brotli; only the blob and page
+files changed (every store `.cwasm` reproduced byte-identically); check-web-vm ok at 20 assets; all
+four harnesses pass (verify-eosh now 33 checks).

@@ -72,12 +72,14 @@
         fused composition is compiled right here in the page.</span>
     </li>
     <li>
-      <code>only eo9:text/text,eo9:time/time $ hello</code>
+      <code>only eo9:text,eo9:time $ hello</code>
       <span>capability lockdown that passes: the allow-list grants exactly what <code>hello</code>
-        needs, so it runs.</span>
+        needs, so it runs. (Same spelling as the front page — a package name like
+        <code>eo9:text</code> covers its interfaces; the explicit
+        <code>eo9:text/text</code> form works too.)</span>
     </li>
     <li>
-      <code>only eo9:text/text $ hello</code>
+      <code>only eo9:text $ hello</code>
       <span>capability lockdown that refuses: drop the clock from the allow-list and the program is
         rejected <em>before it runs</em> — the import it needs simply isn't there.</span>
     </li>
@@ -120,6 +122,6 @@
      <a href="https://github.com/wyager/eo9/blob/master/SPEC.md">Spec</a></p>
 </footer>
 
-<script type="module" src="/vm/vm.8bf34611775c0ddf.js"></script>
+<script type="module" src="/vm/vm.894778b3eade9abb.js"></script>
 </body>
 </html>

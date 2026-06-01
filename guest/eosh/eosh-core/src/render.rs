@@ -69,7 +69,7 @@ pub fn render_imports(info: &ComponentInfo) -> Vec<String> {
         lines.push(String::from("imports:"));
         for import in &info.imports {
             lines.push(format!(
-                "  {} {} ({}@{})",
+                "  {} {} ({}@{}){}",
                 if import.required {
                     "required"
                 } else {
@@ -77,7 +77,18 @@ pub fn render_imports(info: &ComponentInfo) -> Vec<String> {
                 },
                 import.slot,
                 import.interface,
-                import.version
+                import.version,
+                // `eo9:rt/*` interfaces are runtime contract, not capabilities: every
+                // SDK-built component imports them, they grant no authority, and `only`
+                // allow-lists never need to (and never do) name them. Without this
+                // annotation they are the one import a user sees everywhere and can
+                // explain nowhere (user study 10, finding 7). Kept short enough that the
+                // rendered line stays within the try-it page terminal's column budget.
+                if import.interface.starts_with("eo9:rt/") {
+                    " — carries no authority; always admitted by `only`"
+                } else {
+                    ""
+                }
             ));
         }
     }
@@ -175,6 +186,42 @@ mod tests {
                 "imports: (none)",
                 "exports:",
                 "  eo9:fs/fs (eo9:fs/fs@0.1.0)",
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_contract_imports_carry_their_explanation() {
+        // `eo9:rt/diagnostics` shows up in every describe; without a note it reads as a
+        // capability the program needs and `only` mysteriously ignores (study 10,
+        // finding 7). The annotation explains both halves in one breath.
+        let info = ComponentInfo {
+            kind: ComponentKind::Binary,
+            imports: vec![
+                ImportNeed {
+                    slot: "eo9:text/text".to_string(),
+                    interface: "eo9:text/text".to_string(),
+                    version: "0.1.0".to_string(),
+                    required: true,
+                },
+                ImportNeed {
+                    slot: "eo9:rt/diagnostics".to_string(),
+                    interface: "eo9:rt/diagnostics".to_string(),
+                    version: "0.1.0".to_string(),
+                    required: true,
+                },
+            ],
+            exports: vec![],
+            args: vec![],
+        };
+        let lines = render_imports(&info);
+        assert_eq!(
+            lines,
+            vec![
+                "imports:",
+                "  required eo9:text/text (eo9:text/text@0.1.0)",
+                "  required eo9:rt/diagnostics (eo9:rt/diagnostics@0.1.0) — carries no \
+                 authority; always admitted by `only`",
             ]
         );
     }
