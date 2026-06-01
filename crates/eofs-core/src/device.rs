@@ -7,17 +7,23 @@
 //! on write atomicity — a torn write of anything, including an uberblock slot, is detected
 //! by checksums on the next mount (see `FORMAT.md`).
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
 /// An error from the underlying device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceError {
     /// A read or write touched bytes outside the device.
     OutOfRange,
     /// The device failed (for the simulated devices: the power was cut).
     Io,
+    /// The device failed and described why. The string is the device's own words — for
+    /// example a wasm driver's typed error text ("disk.virtio: the device reported request
+    /// status 1") — preserved verbatim so a real hardware failure, a hung device, and a
+    /// composition bug stay distinguishable all the way to the user (study 09 finding 2).
+    IoNamed(String),
 }
 
 impl fmt::Display for DeviceError {
@@ -25,6 +31,7 @@ impl fmt::Display for DeviceError {
         match self {
             DeviceError::OutOfRange => write!(f, "access outside the device"),
             DeviceError::Io => write!(f, "device i/o failure"),
+            DeviceError::IoNamed(what) => write!(f, "{what}"),
         }
     }
 }

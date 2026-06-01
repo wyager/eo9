@@ -269,7 +269,10 @@ impl Driver {
             .ok_or_else(|| {
                 String::from(
                     "disk.virtio: no virtio-blk function is visible through the granted \
-                     pci capability (expected vendor 0x1af4, device 0x1042)",
+                     pci capability (expected vendor 0x1af4, device 0x1042) — attach one \
+                     to this boot (`cargo xtask qemu <arch> pci disk`, or QEMU \
+                     `-device virtio-blk-pci,disable-legacy=on`), or check that an \
+                     attenuator composed in front of this driver allows the disk's address",
                 )
             })?;
         let address = target.address;
