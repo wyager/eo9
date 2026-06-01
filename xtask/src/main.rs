@@ -2105,6 +2105,14 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
          or press Ctrl-A then X to quit)",
         image.display()
     );
+    // EXPERIMENTAL (spike/12-iommu, docs/spikes/iommu.md): a bare `iommu` argument puts an
+    // SMMUv3 in front of the PCIe root complex (`-M …,iommu=smmuv3`) so the IOMMU spike can
+    // probe what an unconfigured SMMU does to the existing DMA paths. aarch64 only; consumed
+    // by xtask (never reaches the kernel command line); not part of any documented flow.
+    let attach_iommu = append.iter().any(|argument| argument == "iommu");
+    if attach_iommu && arch != "aarch64" {
+        return Err("the experimental `iommu` argument is aarch64-only (SMMUv3)".to_string());
+    }
     let machine: &[&str] = match arch {
         // Pin GICv2: the kernel brings up the GIC distributor + CPU interface over MMIO
         // (src/arch/aarch64/gic.rs) to forward the generic-timer interrupt so the executor
@@ -2120,6 +2128,14 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         // The `virtio-rng-pci` device is a PCIe function with no host-side configuration,
         // so the eo9:pci capability has something real to enumerate next to the host
         // bridge (the `lspci` demo; the kernel never touches it otherwise).
+        "aarch64" if attach_iommu => &[
+            "-M",
+            "virt,gic-version=2,highmem=off,iommu=smmuv3",
+            "-cpu",
+            "max",
+            "-device",
+            "virtio-rng-pci",
+        ],
         "aarch64" => &[
             "-M",
             "virt,gic-version=2,highmem=off",
@@ -2180,6 +2196,9 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
             attach_disk = true;
         } else if argument == "net" {
             attach_net = true;
+        } else if argument == "iommu" {
+            // EXPERIMENTAL: consumed above (machine-type selection); never reaches the
+            // kernel command line.
         } else if argument == "storedisk" {
             attach_store_disk = true;
             cmdline.push(argument.clone());

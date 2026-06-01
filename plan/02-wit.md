@@ -310,3 +310,7 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
     this change (result-less `bind`) still load and run — only the both-operands-configured merger
     requires both operands to share a signature (recompose to refresh). The canonical WIT text in
     wit/rt/rt.wit is the binding contract; the algebra's synthesized interfaces match it structurally.
+
+Design doc: `docs/design/policy-components.md` — the policy-components pattern ("prefer pure policy
+components over config enums"): the fusion question, the API inventory, and the adoption plan (owner
+review pending).

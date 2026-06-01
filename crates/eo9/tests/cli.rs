@@ -2579,6 +2579,61 @@ fn concurrent_invocations_of_one_store_do_not_corrupt_the_session() {
     // And a later invocation still works (the sweeps did not eat anything live).
     let after = eo9(&store, &["-c", "echo after"]);
     assert_eq!(after.code, 0, "stderr: {}", after.stderr);
+}
+
+#[test]
+fn session_sweeps_never_delete_a_live_session() {
+    // Regression test for the establishment-vs-sweep race a reviewer found after S7-6's
+    // per-process sessions landed: the session lock used to be created at its final path
+    // and *then* locked, so a concurrent process's sweep could open it in between,
+    // conclude the session was dead, and unlink the lock — after which a later sweep
+    // deleted the live session directory while its owner was still populating it
+    // ("cannot place ... into the session bin view: No such file or directory").
+    //
+    // Establishment is now atomic with respect to sweeps (the lock is renamed into place
+    // already locked, and establishment/sweeps exclude each other through the shell
+    // root's `.sessions.lock` guard). This test recreates the original collision shape:
+    // successive waves of concurrent invocations against one store, where every later
+    // wave's sweeps run against the earlier waves' dead sessions at the same moment its
+    // own siblings are establishing live ones. Every invocation must succeed.
+    use std::thread;
+
+    let store = temp_store("sweep-vs-establish");
+    let warm = eo9(&store, &["-c", "echo warm"]);
+    assert_eq!(warm.code, 0, "stderr: {}", warm.stderr);
+
+    let mut failures = Vec::new();
+    for wave in 0..4 {
+        let runs: Vec<_> = (0..6)
+            .map(|i| {
+                let store = store.clone();
+                thread::spawn(move || {
+                    let run = eo9(&store, &["-c", &format!("echo wave-{wave}-{i}")]);
+                    (i, run)
+                })
+            })
+            .collect();
+        for handle in runs {
+            let (i, run) = handle.join().expect("runner thread");
+            if run.code != 0 || !run.stdout.contains(&format!("wave-{wave}-{i}")) {
+                failures.push(format!(
+                    "wave {wave} run {i}: exit {} stdout {:?} stderr {:?}",
+                    run.code, run.stdout, run.stderr
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of 24 invocations across 4 waves failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+
+    // After the dust settles, a fresh invocation still works and a fresh sweep has
+    // nothing live left to harm.
+    let after = eo9(&store, &["-c", "echo after"]);
+    assert_eq!(after.code, 0, "stderr: {}", after.stderr);
     assert!(after.stdout.contains("after"));
 }
 
