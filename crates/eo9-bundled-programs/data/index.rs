@@ -51,6 +51,9 @@ static BUNDLED_COMPONENTS: &[(&str, &[u8])] = &[
     ("eo9-stub-pci-none", include_bytes!("eo9-stub-pci-none.wasm") as &[u8]),
     ("eo9-stub-perf-none", include_bytes!("eo9-stub-perf-none.wasm") as &[u8]),
     ("eo9-stub-perf-null", include_bytes!("eo9-stub-perf-null.wasm") as &[u8]),
+    ("eo9-stub-restart-always", include_bytes!("eo9-stub-restart-always.wasm") as &[u8]),
+    ("eo9-stub-restart-backoff", include_bytes!("eo9-stub-restart-backoff.wasm") as &[u8]),
+    ("eo9-stub-restart-never", include_bytes!("eo9-stub-restart-never.wasm") as &[u8]),
     ("eo9-stub-text-none", include_bytes!("eo9-stub-text-none.wasm") as &[u8]),
     ("eo9-stub-text-null", include_bytes!("eo9-stub-text-null.wasm") as &[u8]),
     ("eo9-stub-time-frozen", include_bytes!("eo9-stub-time-frozen.wasm") as &[u8]),
@@ -58,4 +61,5 @@ static BUNDLED_COMPONENTS: &[(&str, &[u8])] = &[
     ("eo9-stub-time-monotonic-stub", include_bytes!("eo9-stub-time-monotonic-stub.wasm") as &[u8]),
     ("eo9-stub-time-none", include_bytes!("eo9-stub-time-none.wasm") as &[u8]),
     ("eosh", include_bytes!("eosh.wasm") as &[u8]),
+    ("init", include_bytes!("init.wasm") as &[u8]),
 ];
