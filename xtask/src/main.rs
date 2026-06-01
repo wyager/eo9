@@ -55,6 +55,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-net-l4-none",
     "eo9-stub-net-l4-over-l2",
     "eo9-stub-net-virtio",
+    "eo9-stub-pci-deny",
     "eo9-stub-pci-filtered",
     "eo9-stub-pci-none",
     "eo9-stub-perf-none",
@@ -129,9 +130,10 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // `pci.filtered --allow … $ lspci` (or `$ disk.virtio $ …`).
     ("eo9-stub-pci-filtered", "pci.filtered"),
     // The PCI absence stub, so optional-pci programs can be composed to observe "no
-    // devices" on metal. (`pci.deny` — typed refusal for *required* pci — is specced in
-    // wit/pci's `deny` world but its stub crate does not exist yet; study 09 finding 4.)
+    // devices" on metal — and the refusal stub, so required-pci programs can be composed
+    // to observe a typed `denied` (`pci.deny $ lspci`) instead of an unsatisfied import.
     ("eo9-stub-pci-none", "pci.none"),
+    ("eo9-stub-pci-deny", "pci.deny"),
     // The network stack for real hardware: the virtio-net driver, its link-layer
     // check, the TCP/IP middleware, and its transport-layer check, so the metal shell
     // can compose `net.virtio $ l2check` and `net.virtio $ net.l4.over-l2 $ l4check`
@@ -250,6 +252,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("refresh-components", rest)?;
             refresh_components(&root)
         }
+        "check-components-bundle" => {
+            expect_no_args("check-components-bundle", rest)?;
+            check_components_bundle(&root)
+        }
         "package" => {
             expect_no_args("package", rest)?;
             package(&root)
@@ -279,9 +285,6 @@ COMMANDS:
     build-web-vm         Pre-AOT the web-VM demo components to pulley32, build the wasm32
                          blob (www/web-eo9, the real runtime stack for the /vm page), and
                          install it into www/site/vm/ (commit the result; ci does not need it)
-    check-web-vm         Rebuild the /vm blob and store artifacts to a temp staging dir and
-                         byte-compare against the committed www/site/vm/ files; nonzero exit
-                         if they drifted (run after changing guest sources; ci does not need it)
     precompress-site     Write brotli/gzip siblings next to the compressible files under
                          www/site via www/precompress, so the server can serve pre-compressed
                          bytes (runs automatically at the end of the build-web-* commands;
@@ -292,8 +295,8 @@ COMMANDS:
                          old siblings — so they can be cached forever and a rebuild changes the
                          URL (runs automatically inside build-web-vm; commit the result)
     check-web-vm         Verify vm/assets.json matches the committed fingerprinted /vm assets
-                         (the names encode the current content hash) — a drift guard; ci does
-                         not run it (needs a built blob)
+                         (the names encode the current content hash) — a cheap drift guard over
+                         the committed files; no rebuild needed
     build-kernel <arch>  Build the bootable kernel image (an ELF for QEMU's -kernel loader).
                          aarch64: precompiles the seed/async canaries, eo9-example-hello,
                          entropy.seeded, and the store image and embeds them; riscv64: the
@@ -302,13 +305,17 @@ COMMANDS:
                          (aarch64 or riscv64; exits when the kernel powers off, Ctrl-A X to quit)
     fmt [--check]        Run `cargo fmt --all` in all three workspaces
     lint                 Run `cargo clippy -D warnings` in all three workspaces
-    ci                   The merge gate: fmt --check, lint, build, build-guest, test
+    ci                   The merge gate: fmt --check, lint, build, build-guest,
+                         check-components-bundle, test
     doctor               Check the host prerequisites (rustup, the pinned nightly, the wasm32
                          target, the wasm-tools CLI; QEMU and node are optional) and print
                          install hints for anything missing
     refresh-components   Copy the built guest components into crates/eo9-components/data/ and
                          regenerate its index — the prebuilt set a `cargo install eo9` build
                          seeds from (run after build-guest; commit the result)
+    check-components-bundle
+                         Verify crates/eo9-components/data/ matches the built guest components
+                         byte-for-byte (the drift guard ci runs; needs build-guest first)
     package              Publishing pre-flight: build-guest, verify crates/eo9-components/data/
                          matches the freshly built components, assemble every publishable crate
                          with `cargo package`, dry-run-publish the leaf crates, and print the
@@ -420,7 +427,7 @@ fn doctor(root: &Path) -> Result<(), String> {
         }
         None => {
             println!(
-                "  MISSING  wasm-tools — run `cargo install --locked wasm-tools` (or `make setup`)"
+                "  MISSING  wasm-tools — run `cargo install --locked wasm-tools --version '~{PINNED_WASM_TOOLS_CLI}'` (or `make setup`)"
             );
             missing.push("wasm-tools");
         }
@@ -543,7 +550,10 @@ fn test(root: &Path) -> Result<(), String> {
 
 fn build_guest(root: &Path) -> Result<(), String> {
     let guest = root.join("guest");
-    run(
+    // Remapped paths make the component bytes identical from any checkout, so the
+    // eo9-components bundle (and the ci drift check over it) is checkout-independent.
+    let remap = remap_rustflags(root);
+    run_with_env(
         &guest,
         "cargo",
         [
@@ -553,6 +563,7 @@ fn build_guest(root: &Path) -> Result<(), String> {
             "--target",
             GUEST_TARGET,
         ],
+        &[("RUSTFLAGS", remap.as_os_str())],
     )?;
 
     for package in GUEST_COMPONENTS {
@@ -609,7 +620,8 @@ fn componentize_guest_package(root: &Path, package: &str) -> Result<PathBuf, Str
 /// used by `build-kernel` to refresh just the program it embeds).
 fn build_guest_component(root: &Path, package: &str) -> Result<PathBuf, String> {
     let guest = root.join("guest");
-    run(
+    let remap = remap_rustflags(root);
+    run_with_env(
         &guest,
         "cargo",
         [
@@ -620,6 +632,7 @@ fn build_guest_component(root: &Path, package: &str) -> Result<PathBuf, String> 
             "--target",
             GUEST_TARGET,
         ],
+        &[("RUSTFLAGS", remap.as_os_str())],
     )?;
     componentize_guest_package(root, package)
 }
@@ -831,7 +844,7 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
     // the rustup home (the toolchain's libcore/libstd paths). Without this the blob's
     // content hash — and therefore its fingerprinted URL — changed per checkout path.
     let manifest = root.join("www").join("web-eo9").join("Cargo.toml");
-    let remap_flags = blob_remap_rustflags(root);
+    let remap_flags = remap_rustflags(root);
     run_with_env(
         root,
         "cargo",
@@ -902,11 +915,13 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
     precompress_site(root)
 }
 
-/// `RUSTFLAGS` for the wasm32 blob build: remap the absolute path prefixes that would
-/// otherwise end up in panic-location strings, so the blob's bytes (and its fingerprinted
-/// URL) do not depend on where the repository happens to be checked out, the cargo home, or
-/// the rustup home. Any RUSTFLAGS already present in the environment are preserved.
-fn blob_remap_rustflags(root: &Path) -> OsString {
+/// `RUSTFLAGS` for reproducible wasm builds (the guest components and the wasm32 blob):
+/// remap the absolute path prefixes that would otherwise end up in panic-location strings,
+/// so the built bytes do not depend on where the repository happens to be checked out, the
+/// cargo home, or the rustup home. This is what lets the eo9-components bundle be compared
+/// byte-for-byte from any checkout (study 11 D9b: the ci drift check), and what keeps the
+/// blob's fingerprinted URL stable. Any RUSTFLAGS already present are preserved.
+fn remap_rustflags(root: &Path) -> OsString {
     let home = std::env::var_os("HOME").unwrap_or_default();
     let cargo_home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
@@ -2281,13 +2296,19 @@ fn lint(root: &Path) -> Result<(), String> {
 /// The merge gate (plan/01-workspace.md): everything a reviewer agent runs before merging.
 /// build-guest runs before test so the host integration tests never see stale prebuilt
 /// components under guest/target/components.
+///
+/// The eo9-components bundle drift check sits between build-guest and test (study 11 D9b):
+/// the bundle went stale on master once because the check only ran inside `package`, so a
+/// merge that changed guest components without `refresh-components` passed every gate. It
+/// is a byte-compare against files build-guest just produced — effectively free here.
 fn ci(root: &Path) -> Result<(), String> {
     fmt(root, true)?;
     lint(root)?;
     build(root)?;
     build_guest(root)?;
+    check_components_bundle(root)?;
     test(root)?;
-    println!("xtask: ci passed (fmt, lint, build, build-guest, test)");
+    println!("xtask: ci passed (fmt, lint, build, build-guest, check-components-bundle, test)");
     Ok(())
 }
 
@@ -2597,17 +2618,38 @@ fn package(root: &Path) -> Result<(), String> {
             ],
         )?;
     }
-    println!("xtask: dry-run-verified leaf crates (target/package):");
+    println!("xtask: dry-run-verified leaf crates:");
     for krate in PUBLISH_LEAF_CRATES {
-        let crate_file = root
-            .join("target")
-            .join("package")
-            .join(format!("{krate}-{PUBLISH_VERSION}.crate"));
-        let size = std::fs::metadata(&crate_file).map(|m| m.len()).unwrap_or(0);
-        println!(
-            "xtask:   {krate}-{PUBLISH_VERSION}.crate  {} KiB",
-            size / 1024
-        );
+        // Cargo has moved where dry-run .crate files land across versions: classically
+        // target/package/<name>-<version>.crate, currently a tmp-crate/ (and sometimes
+        // tmp-registry/) subdirectory. Probe the known locations and report which one
+        // held the file — and if none did, say so instead of printing "0 KiB" (study 11
+        // D10: a swallowed lookup failure made every crate report 0 KiB).
+        let package_dir = root.join("target").join("package");
+        let file_name = format!("{krate}-{PUBLISH_VERSION}.crate");
+        let candidates = [
+            package_dir.join(&file_name),
+            package_dir.join("tmp-crate").join(&file_name),
+            package_dir.join("tmp-registry").join(&file_name),
+        ];
+        match candidates
+            .iter()
+            .find_map(|path| std::fs::metadata(path).ok().map(|meta| (path, meta.len())))
+        {
+            Some((path, size)) => println!(
+                "xtask:   {file_name}  {} KiB  ({})",
+                size.div_ceil(1024),
+                path.strip_prefix(root).unwrap_or(path).display()
+            ),
+            None => println!(
+                "xtask:   {file_name}  size unknown — no .crate file found under {} \
+                 (cargo's dry-run output layout may have changed again)",
+                package_dir
+                    .strip_prefix(root)
+                    .unwrap_or(&package_dir)
+                    .display()
+            ),
+        }
     }
 
     // The remaining crates depend on the ones above, so cargo cannot package or verify

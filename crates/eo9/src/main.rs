@@ -119,6 +119,12 @@ fn dispatch(args: Vec<String>) -> Result<u8, String> {
             print_help();
             Ok(EXIT_SUCCESS)
         }
+        // Intercepted before the implicit-run arm so `version` can never fall through to
+        // store-name resolution (and a registry-installed binary can identify itself).
+        "version" | "--version" | "-V" => {
+            print_version();
+            Ok(EXIT_SUCCESS)
+        }
         // `eo9 -c "<command>"`: the default-to-shell one-shot form.
         "-c" | "--command" => {
             let line = stream
@@ -145,6 +151,21 @@ fn program_reference(stream: &mut ArgStream, command: &str) -> Result<String, St
         Some(option) => Err(format!("unknown option `{option}` for `{command}`")),
         None => Err(format!("`{command}` needs a program name or path")),
     }
+}
+
+fn print_version() {
+    let (count, local) = seed::bundled_provenance();
+    let provenance = if local {
+        "locally built"
+    } else {
+        "prebuilt eo9-components bundle"
+    };
+    println!(
+        "eo9 {} ({count} bundled components, {provenance})\ncompiler {} for {}",
+        env!("CARGO_PKG_VERSION"),
+        compile::COMPILER_VERSION,
+        compile::TARGET_TRIPLE,
+    );
 }
 
 fn print_help() {
@@ -184,6 +205,7 @@ COMMANDS:
     shell [-c <command>]      Run eosh, the Eo9 shell: interactive REPL on the terminal, or
                               one command line with -c (programs resolve from the store's
                               bound names; --fs-root governs what children may touch)
+    version, --version, -V    Show the eo9 version, bundled-component provenance, and compiler
     help                      Show this message
 
 OPTIONS (before the program name; `--<flag> <value>` after it belongs to the program):

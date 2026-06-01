@@ -54,6 +54,14 @@ pub fn embedded(stem: &str) -> Option<&'static [u8]> {
         .map(|(_, bytes)| *bytes)
 }
 
+/// How many components this binary carries, and where they came from — for `--version`.
+/// `true` means the locally built `guest/target/components` set (a repository build);
+/// `false` means the prebuilt `eo9-components` bundle (a registry install).
+pub fn bundled_provenance() -> (usize, bool) {
+    let local = !EMBEDDED_COMPONENTS.is_empty();
+    (carried_components().len(), local)
+}
+
 /// APIs whose own name contains a dash (the layered net family). For their stubs the
 /// dash inside the API name converts to a dot as well, so `eo9-stub-net-l4-loopback`
 /// seeds as `net.l4.loopback` — the spelling SPEC and the plans use — rather than

@@ -1,0 +1,15 @@
+[package]
+name = "eo9-stub-pci-deny"
+description = "Eo9 standard stub provider `pci.deny`: exports eo9:pci/pci with every operation failing with the API's own `denied` error."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }
