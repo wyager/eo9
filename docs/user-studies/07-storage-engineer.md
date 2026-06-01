@@ -459,9 +459,166 @@ images.)
 
 ## Participant reactions
 
-*(to be added after the demo transcript is complete.)*
+The participant received the full demo transcript (parts 1 and 2, with the facilitator's
+narration but not the findings below) and replied in one structured sitting. Condensed,
+their words where quoted.
 
-## Findings (running list, to be finalized with the participant)
+**What this is, in their terms.** "A single-writer, checksummed, copy-on-write object store
+with a bump allocator and a filesystem-shaped API. The data path — CoW, per-block blake3,
+txg commit by root flip, alternating uberblocks — is the ZFS skeleton, and the demo shows
+that skeleton actually works. What's missing is everything ZFS spent fifteen years building
+*around* that skeleton: space reclamation, multi-mount protection, scrub, recovery tooling,
+an error model, and operator safety." Summary verdict: "a correct core with no operational
+armor"; as a storage system, "pre-alpha."
+
+**What genuinely impressed them** (their three, "and I don't say this lightly"):
+
+1. *Corruption tests A–C had exactly the right blast radius.* Live data block → that file
+   errors, directory still lists; live directory → both error; stale CoW block → no effect.
+   "That last one is the tell. It means the Merkle tree boundary is real — the checksums
+   cover precisely the live tree and nothing else. A lot of 'we have checksums' systems
+   fail that test because their integrity coverage is approximate. This isn't."
+2. *The tampered compile cache (2.3).* "The best moment in the whole demo... Detect →
+   refuse → regenerate is the correct lifecycle for cached executable code, and almost
+   nobody does it." They also noted it produced "a real typed error" (`ChecksumMismatch`),
+   unlike the filesystem API.
+3. *Cross-environment portability (2.5), both directions, no conversion.* "You cannot fake
+   that. It means the on-disk format is genuinely well-defined... Most prototype
+   filesystems fail this the first time they leave the machine they were written on."
+
+Honorable mention: 1240 ms → 2.0 ms across a power cycle with an identical cache key —
+"the persistence layer doing its actual job."
+
+**What broke their trust** ("in descending order of how fast it ends someone's career"),
+each mapped to a production failure:
+
+1. **Test D (silent rollback) is the disqualifier.** "One 4-byte corruption in the live
+   uberblock and the filesystem *silently* rewinds to the prior txg. Exit 0. No warning. No
+   log line." Production failure: "silent data loss that *propagates*. An application reads
+   the rolled-back state, makes decisions on it, writes on top of it — now the lost
+   transaction is permanently unrecoverable. Worse: your next backup faithfully captures
+   the rolled-back state, so your backups are now wrong too." They distinguished the
+   legitimate case (torn write *during* an unacknowledged commit should fall back — "that's
+   the whole design") from this one: "this system can't distinguish 'commit never
+   completed' from 'commit completed, was acknowledged, then rotted,' and it handles both
+   silently. ZFS makes txg rewind (`zpool import -F`) an explicit, operator-invoked, loudly
+   logged disaster action for exactly this reason."
+2. **The uberblock geometry compounds it.** Two slots, adjacent, at offsets 0 and 4096:
+   "eight corrupted bytes total destroy the filesystem with no recovery path," and "a
+   *single* misdirected or torn 8 KiB write takes out both. ZFS puts four labels at both
+   ends of the device... because misdirected writes and head crashes are spatially local."
+3. **The auto-format of non-eofs files.** "This is 'I pointed the tool at the wrong LUN,'
+   the oldest data-loss story in storage... The implementation's definition of 'blank' —
+   *no eofs magic* — means *every file in the world that isn't already mine is blank*. That
+   is a data destroyer documented as a convenience feature."
+4. **The write-budget brick.** "This isn't 'GC is a TODO,' it's 'every volume bricks itself
+   at a deterministic write count regardless of logical usage.'" Production failure: "a
+   fleet of devices all hitting ENOSPC-of-death on roughly the same day, with reformat as
+   the only remedy." Plus, inside the same test: "rewrite #165 truncated the file in one
+   committed transaction, *then* failed the write for space — so the old contents are gone
+   too. Failed write = lost old data."
+5. **Zero concurrency control.** "Two writers on one image, both tripping checksum errors,
+   and the image 'happened to be consistent' afterward. *Happened to be* is not a property;
+   that's a coin that landed heads... Even SQLite gets file locking right." And on the
+   session race: "Race 1 is arguably worse for the project's credibility: two concurrent
+   `echo hi` invocations corrupt the *component store* a third of the time. That's not a
+   storage bug, that's the launcher."
+6. **The error model.** "Monitoring blindness. I cannot alert on corruption rate. I cannot
+   distinguish 'the media is dying' from 'file not found'... The integrity error class is
+   *the most important error class this filesystem has* — it's the headline feature — and
+   it does not exist at the API boundary. People will end up string-matching on debug
+   output, and it will break."
+
+**What they would demand to see next:** a real crash test ("you demonstrated
+corruption-at-rest detection, you did not demonstrate crash consistency... I want fault
+injection: kill -9 at every write offset in a commit, torn-write simulation on the
+uberblock itself"); flush semantics on each backend (macOS F_FULLFSYNC vs plain fsync; does
+the wasm virtio driver issue VIRTIO_BLK_T_FLUSH); allocator design and gc()'s crash story;
+scale (largest file, deep trees, 100k-entry directories, multi-GiB images); whether
+rename/atomic-replace exists ("on a CoW filesystem, atomic replace should be the *easy*
+path"); the MAC key's threat model; the engine's test/fuzzing coverage.
+
+**Would they put data on it today?** "No. Not negotiable, and Test D alone is sufficient: a
+system that can silently rewind committed, acknowledged data is not a storage system, it's
+a cache. What it *is* fit for today: regenerable data — exactly the compile cache. Anything
+where loss costs CPU time, not information." Re-evaluation preconditions, in their order:
+(1) uberblock fallback becomes loud and operator-gated, with more slots spread across the
+device; (2) auto-format removed entirely — "formatting is always explicit, always";
+(3) mount locking / multi-mount protection; (4) `rm` frees space and gc/df/scrub are
+reachable; (5) corruption is a typed error at the API; (6) crash fault-injection results,
+not corruption tests.
+
+**Top 3 pain points:** auto-format of non-eofs files; silent txg rollback; space exhaustion
+with reformat-only recovery. **Top 3 missing things:** concurrency control; operational
+tooling (df/scrub/fsck — "checksums without a reachable scrub means latent corruption sits
+in cold data until the day you finally read it, which is the day you needed it"); a typed
+integrity error class plus crash-injection evidence.
+
+**Where they think the project is misreading its own demo** (their sharpest section):
+
+- "They're conflating corruption detection with crash consistency. The pitch says 'crash
+  consistency by construction,' and every test in the demo is a *bit-flip at rest*. Those
+  are different failure models with different proofs."
+- "They've documented the auto-format rule as a feature... nobody on the team has ever
+  destroyed a volume by pointing a tool at the wrong path. Storage tooling earns its
+  confirmation prompts in blood."
+- "The capability model is securing the wrong direction for storage. They're proud —
+  justifiably — that a program can't touch the disk without a grant. But for storage, the
+  dangerous party isn't the program, it's the *operator issuing the grant*: `--disk
+  wrong-file.img` is itself the destructive act, because granting triggers auto-format.
+  They've built deny-by-default for programs and yes-by-default for data destruction."
+- "Their canonical example program teaches the worst pattern their own filesystem has"
+  (truncate-then-write; it caused both the data loss in 1.5 and the meaningless
+  "verification" in test G).
+- "The priority ordering is backwards, and the gap list proves it. They built on-target
+  Cranelift compilation, a wasm virtio driver, deterministic compile-cache keys across
+  power cycles — genuinely hard things — while gc() and verify() sit in the engine,
+  finished, *unreachable from any user-facing surface*... For a storage system, the boring
+  parts are the product."
+- "The compile cache is the one consumer in the entire demo that handles corruption
+  correctly... because *that* consumer was written by someone who knew the data was
+  disposable and thought through the failure path. The lesson: every consumer of this
+  filesystem needs the 2.3 treatment, and the API has to make that possible. Right now it
+  doesn't."
+
+**Their bottom line:** "The core is real, the integrity layer in the data path is genuinely
+good, the portability result is impressive — and I would not let this within a mile of data
+anyone cares about until Test D, 1.4, 1.5, and 1.6 are fixed. Those aren't polish items.
+Each one is a named, well-understood production disaster that the storage field already
+learned how to prevent twenty years ago."
+
+## Facilitator verification of the participant's factual challenges
+
+Three of the participant's claims were checked against the repository after the session
+(they had no way to know; the answers go to whoever owns the follow-up):
+
+1. **"Crash consistency is currently untested" — partly wrong, structurally right.** The
+   engine *does* have a power-cut test suite the demo never mentioned:
+   `crates/eofs-core/tests/crash.rs` runs a five-transaction scenario over a `CutDevice`
+   that loses power at **every write boundary**, with torn final writes, then remounts,
+   verifies, and compares state (`power_cut_at_every_write_boundary`). The engine-level
+   crash-consistency claim is tested. What does **not** exist is what the participant
+   actually asked for: fault injection through the *full stack* (provider + unix file
+   device + a real `kill -9` mid-commit), and any demonstration of it. Their structural
+   point — the demo (and the pitch) substitutes corruption-at-rest detection for crash
+   evidence — stands.
+2. **"Does flush actually reach stable media on macOS?" — yes.** Rust's
+   `File::sync_all()` on Apple targets issues `fcntl(F_FULLFSYNC)` (verified in the pinned
+   toolchain's std sources), which is the strong barrier the participant was worried plain
+   `fsync` doesn't provide.
+3. **"Does the wasm virtio driver issue VIRTIO_BLK_T_FLUSH?" — yes.** `disk.virtio`
+   negotiates `VIRTIO_BLK_F_FLUSH` (feature bit 9) and issues `BLK_T_FLUSH` requests; when
+   the device doesn't offer the feature it is write-through by spec and flush is a no-op
+   (`guest/stubs/disk-virtio/src/lib.rs`).
+
+Confirmed (participant right): there is **no rename or atomic-replace operation** in the
+`eo9:fs` WIT (open/open-exec/read/write/list/stat/create-directory/remove only); the MAC
+key is per-checkout, 0600, baked into the kernel image, and documented as tamper-evidence
+rather than a secrecy boundary (plan/12 D58); the engine's test suite covers roundtrip,
+crash, corruption, hostile images, snapshots, compression, and a model test, but there is
+no fuzzing of the on-disk parser.
+
+## Findings
 
 ### Verified during the usermode session
 
@@ -542,5 +699,72 @@ images.)
   did what it printed.
 - Cross-environment image portability (2.5) — written on bare metal through a wasm driver,
   read on macOS — with zero ceremony.
+- The engine's own test suite (crash/corruption/hostile/snapshots) is more serious than the
+  demo surface suggests — the gap is in what's *reachable*, not what's *written*.
 
-*(Triage table to be completed after the participant session.)*
+## Triage table
+
+Every finding from this study, dispositioned **Fix now**, **Tracked** (needs a recorded
+work item / roadmap slot), or **Owner decision** (design call). Nothing dropped.
+Attribution: F = facilitator demo, P = participant.
+
+| # | Finding | Who | Disposition |
+|---|---|---|---|
+| S7-1 | **Silent txg rollback when the newest uberblock is corrupted**: stale state served as current, exit 0, no warning anywhere; participant's #1 disqualifier ("not a storage system, it's a cache") | F+P | **Fix now** (minimum: a loud mount-time warning + the event surfaced in the fs error/reporting path when the highest-txg slot fails its checksum) **+ Owner decision** (the full design: operator-gated rewind vs warn-and-mount vs refuse; how to distinguish torn-commit fallback from rot) |
+| S7-2 | **`fs.eofs` auto-formats any non-eofs file on first mount** ("blank" = no eofs magic at 2 offsets); `mkfs.eofs` formats non-eofs data without `--force` too | F+P | **Fix now** (tighten "blank" to all-zero uberblock slots — a one-function change that removes the data-destroyer while keeping the blank-device convenience) **+ Owner decision** (participant's stronger ask: remove auto-format entirely, formatting always explicit) |
+| S7-3 | **Every image has a finite write budget then bricks**: CoW garbage never reclaimed, `gc()` exists but unreachable, `rm` frees nothing, no `df`, recovery = reformat | F+P | **Fix now** (run the engine's `gc()` at mount or post-remove in the provider, so space is reclaimed without new surface) **+ Tracked** (real space accounting: a `df`-equivalent, gc/scrub reachable from the CLI, eviction policy) |
+| S7-4 | **A failed rewrite destroys the previous file content** (TRUNCATE = remove+recreate as its own committed txn; the later write's NoSpace leaves 0 bytes) | F+P | **Fix now** (provider: stage truncate+write in one transaction; the engine's CoW already makes this natural) |
+| S7-5 | **Corruption errors flattened to `Io(string)`** — no integrity/corruption variant in the `eo9:fs` WIT error type; users get debug text, programs can't react, monitoring can't count | F+P | **Fix now** (WIT: add a `corruption` error case + map `ChecksumMismatch`/`Corrupt` onto it; planner owns wit/) |
+| S7-6 | **Concurrent `eo9 -c` invocations corrupt each other's session bin view** (store-level race, no disk involved; ~⅓ failure rate in the test) | F+P | **Fix now** (lock or per-process session view under the store; this is a launcher bug, not eofs) |
+| S7-7 | **No locking on `--disk` images**: concurrent mounts race at the allocation frontier, cross-writer checksum errors, lost updates; single-writer constraint neither enforced nor documented | F+P | **Fix now** (flock the image file on `--disk` open; refuse the second process with a clear message) **+ Tracked** (real multi-mount protection at the format level — owner/format change) |
+| S7-8 | **No fsck / scrub / verify / df surface anywhere** (engine `verify()` finished but unreachable) | F+P | **Tracked** (an `eo9 fsck.eofs <image>` host-side command is the cheap first step — same pattern as `mkfs.eofs`; guest-reachable verify needs the WIT hash/verify surface that plan/14 already parks) |
+| S7-9 | **Uberblock geometry**: 2 slots, adjacent, both in the first 8 KiB — one torn/misdirected 8 KiB write kills the volume; participant cites ZFS's 4 labels at both device ends | P | **Owner decision** (on-disk format change; weigh before any format-stability promise) |
+| S7-10 | **The pitch/demos conflate corruption-at-rest detection with crash consistency**; engine-level power-cut tests exist (`tests/crash.rs`) but no full-stack (kill-9-through-the-CLI) fault injection | P (corrected by F) | **Tracked** (full-stack crash-injection harness; cite the engine suite in SPEC/docs so the claim is evidenced) |
+| S7-11 | **The `readwrite` example teaches truncate-then-write** — the worst pattern for this fs (caused S7-4's loss and invalidated corruption-test methodology) | P | **Fix now** (rewrite the example as write-new-then-remove-old or add an atomic-replace example once S7-12 lands; also a docs note on read-back testing) |
+| S7-12 | **No rename / atomic replace in `eo9:fs`** — "on a CoW filesystem, atomic replace should be the easy path" | P | **Owner decision** (WIT addition; interacts with S7-11) |
+| S7-13 | **The missing-`--disk` refusal buries the remedy** after four clauses of linker internals | F | **Fix now** (same error-rendering pass as round-1 finding #3; flip the order: friendly sentence first, linker detail after) |
+| S7-14 | **README has no persistence story** (mkfs.eofs / `--disk` / fs.eofs absent from the repo front page while STATUS calls it a headline feature) | F | **Fix now** (README section with the verified 1.1 transcript) |
+| S7-15 | **Metal `env` omits the pci/disk grants** and still says "no writable filesystem on bare metal" in boots where writable persistent storage is demonstrably available | F | **Fix now** (kernel session-manifest text; same class as round-1 finding #18) |
+| S7-16 | **The compile cache and the guest-visible disk are mutually exclusive per boot** (storedisk vs `pci`/`disk`), so the flagship storage demo pays 20–35 s per command | F | **Tracked** (already in GAPS as machine-global device claiming; this study adds the user-visible cost) |
+| S7-17 | `ls /bin` shows baked vs disk-saved programs undifferentiated | F | **Tracked** (already recorded, plan/12 D60 remaining-rungs list) |
+| S7-18 | Outcome line glues onto unterminated program output (round-2 R2-19, still reproducing) | F | **Fix now** (already dispositioned fix-now in round 2; still open) |
+| S7-19 | **"Deny-by-default for programs, yes-by-default for data destruction"**: the operator-side hazard (the `--disk` grant itself triggers formatting) is outside the capability model's threat model | P | **Owner decision** (design framing; concretely resolved by S7-2's fix, but the blind spot deserves a SPEC paragraph on operator-side safety) |
+| S7-20 | Mount-time banner counts artifacts from the directory without verifying them ("1 cached compile artifact(s)" shown for a corrupt artifact) | F | **Tracked** (minor; honest-counting nit, fold into S7-8's scrub work) |
+| S7-21 | **Scale untested**: nothing in the demo (or the integration suite) exercises large files, deep indirect trees, large directories, or multi-GiB images | P | **Tracked** (test-suite work item alongside the round-1 hostile-component item) |
+| S7-22 | No fuzzing of the on-disk format parser (mount/walk paths) against adversarial images (the hostile-image tests are hand-written) | P | **Tracked** (extends the existing round-1 fuzzing item #12 to eofs) |
+
+### What this study adds to the cross-study picture
+
+Rounds 1–2 established the pattern "trust losses come from documentation overclaim and
+off-happy-path rough edges, never from the core model or speed." This round sharpens it
+for storage: **the data path is genuinely sound (checksums, CoW, portability, the metal
+cache lifecycle) and every trust loss came from the operational shell around it** —
+formatting safety, space lifecycle, concurrency, error surfacing, and tooling reachability.
+The participant's framing is the headline: *for a storage system, the boring parts are the
+product.*
+
+## Facilitator observations
+
+- **The lost study's "silent corruption" claim is now explained, three ways.** A naive
+  corruption test against this filesystem can produce a "silently read back corrupted
+  data" conclusion via (a) corrupting a stale CoW block (harmless, unreferenced — grep
+  finds those first), (b) corrupting the newest uberblock (the genuinely silent rollback,
+  finding S7-1), or (c) "verifying" with `readwrite`, which overwrites the corruption
+  before reading. Against *live data and metadata blocks* with a *real read*, detection
+  never failed once in this session. Corruption-test methodology for this design: map the
+  image, identify the live tree, corrupt that, and read with `cat` from a fresh process.
+- **Exit-code annotations** in the transcript are quoted only where the code was captured
+  directly after the command; a few probe runs during the session interposed an `echo` and
+  their codes were discarded rather than guessed.
+- **Timing caveat**: usermode numbers are a release build; the brief's `cargo build -p eo9`
+  (debug) build is functionally identical but ~12× slower per disk-composition run (2.0 s
+  vs 0.16 s), all of it host-side overhead. Metal numbers are QEMU TCG on an M-series Mac —
+  on-target compile times (~1.2–1.3 s guest-reported) are not comparable to real silicon.
+- **Driving QEMU**: the serial console was scripted (wait for the `eosh>` prompt, send one
+  command at a time, paced character-by-character per plan/12 D49); no input was ever lost
+  in six boots. The kernel's per-step narration (`storedisk: …` lines) made the metal demos
+  essentially self-documenting — the usermode CLI could borrow that habit.
+- **The store disk and scratch disk images** under `kernel/target/` were left as the demos
+  produced them (the tampered cache entry was already healed by the kernel's own
+  recompile); the usermode images under `/tmp` and the throwaway stores were deleted after
+  the session.
