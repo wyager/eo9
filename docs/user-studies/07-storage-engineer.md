@@ -299,9 +299,163 @@ single-writer-only constraint, and the image file is never locked.
 
 ## Demo round 2 — bare metal (QEMU aarch64)
 
-*(to be added: `storedisk` power-cycle persistence — `save` a composition, run it,
-power-cycle, the saved program + compile cache surviving; and `pci disk` — the wasm
-virtio-blk driver + fs.eofs round-trip.)*
+Six QEMU boots, driven over the serial console by a pacing script (one command per prompt,
+per the plan/12 D49 console conventions). The kernel image (22-component baked store,
+`wasm-storedisk` feature) rebuilt in ~14 s against a warm cache; each boot reaches the
+`eosh>` prompt in ~12–16 s of host wall including the xtask rebuild check.
+
+### 2.1 `storedisk` boot 1 — a blank disk becomes a persistent store
+
+`cargo xtask qemu aarch64 storedisk` created a blank 64 MiB raw image and attached it as
+virtio-blk; the kernel claimed and formatted it:
+
+```
+cmdline: storedisk
+store: 22 components baked in (1956 KiB components, 15442 KiB artifacts): eosh, hello, …
+storedisk: virtio-blk 131072 sectors (64 MiB) claimed for the kernel store
+storedisk: blank disk formatted with eofs (block 4096, lz4 on)
+storedisk: eofs mounted (txg 1), 0 cached compile artifact(s), 0 saved program(s)
+eosh> save frozen-hello = time.frozen --now-seconds 5 --monotonic-ns 0 $ hello
+storedisk: saved 82 KiB program as /bin/frozen-hello.wasm
+saved: /bin/frozen-hello.wasm (run it as `frozen-hello`)
+eosh> ls /bin
+…(22 baked names)…
+frozen-hello.wasm
+ok: listed(23)
+eosh> frozen-hello --name saved --excited true
+storedisk: compile cache miss (compiled on-target in 1240 ms)
+storedisk: cached 664 KiB of compiled code as 7e12829885de980e…
+[5.000000000] Hello, saved!
+ok: greeted
+eosh> exit
+eosh: session ended, outcome = ok(exited)
+[ 6691923 us] kernel run complete; requesting PSCI SYSTEM_OFF
+```
+
+### 2.2 `storedisk` boot 2 — full power cycle: everything survives
+
+A new QEMU process against the same image:
+
+```
+storedisk: eofs mounted (txg 3), 1 cached compile artifact(s), 1 saved program(s)
+eosh> ls /bin
+…ok: listed(23)                                  # frozen-hello.wasm still there
+eosh> frozen-hello --name reboot --excited true
+storedisk: compile cache hit (664 KiB loaded in 2037 us)
+[5.000000000] Hello, reboot!                     # identical deterministic output
+ok: greeted
+eosh> rm /bin/hello.wasm                         # a BAKED name
+error: fs("FsError::ReadOnly")                   # the kernel image stays the trust anchor
+eosh> rm /bin/frozen-hello.wasm                  # the disk-saved one
+storedisk: removed /bin/frozen-hello.wasm
+ok: removed
+eosh> frozen-hello --name gone --excited true
+error: cannot resolve `frozen-hello` (/bin/frozen-hello.wasm): FsError::NotFound
+```
+
+**1240 ms of on-target Cranelift became 2.0 ms across a full power cycle**, the saved
+program persisted, the deterministic output is bit-identical, baked names cannot be
+shadowed or removed, and the save → run → reboot → run → rm lifecycle worked exactly as
+documented in plan/12 D60. The cache key (`7e12829885de980e…`) is identical across boots —
+the algebra produces the same executable bytes for the same composition every time.
+
+### 2.3 `storedisk` boot 3 — tamper with the disk between boots
+
+One byte of the cached-artifact region of the store-disk image was flipped (offset
+247808, `dd`) while the machine was off. The cached artifact is 664 KiB of *native aarch64
+code* that the kernel would otherwise `Component::deserialize` and run:
+
+```
+storedisk: eofs mounted (txg 4), 1 cached compile artifact(s), 0 saved program(s)
+eosh> time.frozen --now-seconds 5 --monotonic-ns 0 $ hello --name tamper --excited true
+storedisk: reading a cached artifact failed: ChecksumMismatch
+storedisk: compile cache miss (compiled on-target in 1281 ms)
+storedisk: cached 664 KiB of compiled code as 7e12829885de980e…
+[5.000000000] Hello, tamper!
+ok: greeted
+eosh> time.frozen --now-seconds 5 --monotonic-ns 0 $ hello --name tamper2 --excited true
+storedisk: compile cache hit (664 KiB loaded in 1935 us)
+[5.000000000] Hello, tamper2!
+```
+
+Tampered native code was **detected, named, refused, recompiled, re-cached, and never
+executed** — and the user is told. (Layering note: this byte-flip was caught by the eofs
+block checksums, the *first* line of defense; the keyed-blake3 MAC behind it exists for an
+adversary who can rewrite blocks *and* recompute the eofs Merkle chain. Forging that chain
+end-to-end was out of scope for this session, so the MAC layer itself was not independently
+exercised.) Mount-time counting is directory-level: the banner said "1 cached compile
+artifact(s)" before discovering at read time that the artifact was corrupt.
+
+### 2.4 `pci disk` boots 4–5 — the wasm virtio-blk driver + fs.eofs, across a power cycle
+
+`cargo xtask qemu aarch64 pci disk`: a separate blank 64 MiB scratch image attached as a
+virtio-blk PCI function; the *driver for it is a wasm component* (`disk.virtio`).
+
+```
+eosh> disk.virtio $ fs.eofs $ readwrite /metal.txt persists-across-power-cycles
+disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx interrupt
+pci: INTx delivery on line 3 served an interrupt wait (the cpu halted instead of polling)
+ok: round-tripped(28)                                            # 32.9 s wall (on-target compile)
+eosh> disk.virtio $ fs.eofs $ ls /
+metal.txt
+ok: listed(1)                                                    # 21.2 s wall
+```
+
+Full power cycle, then:
+
+```
+eosh> disk.virtio $ fs.eofs $ cat /metal.txt
+persists-across-power-cycles                                     # 30.8 s wall
+eosh> disk.virtio $ fs.eofs $ stat /metal.txt
+file 28 bytes
+```
+
+The storage stack here is three composed wasm components — virtio-blk driver, eofs
+filesystem, program — compiled on the machine, with interrupt-driven request completion
+(the CPU halts in `wfi` during disk waits; the transcript line proves it). Data written
+before the power-off was read back after it.
+
+**The latency asymmetry is structural:** in `pci disk` mode there is no compile cache (the
+`storedisk` grant cannot be combined with the guest-facing `pci`/`disk` grants until
+machine-global device claiming lands), so *every* storage command pays 20–35 s of on-target
+compilation under TCG. The boot mode that has the persistent compile cache can't have a
+guest-visible disk, and the boot mode with the guest-visible disk can't have the cache.
+
+### 2.5 Cross-environment portability — the same image file, three worlds
+
+The scratch image was formatted and written *by the bare-metal kernel through the wasm
+virtio-blk driver*. The same file then mounted in usermode on macOS:
+
+```
+$ eo9 --disk kernel/target/eo9-scratch-disk.raw -c "fs.eofs $ cat /metal.txt"
+persists-across-power-cycles                                     # written on metal, read on macOS
+$ eo9 --disk kernel/target/eo9-scratch-disk.raw -c "fs.eofs $ readwrite /from-macos.txt written-by-usermode"
+ok: round-tripped(19)
+```
+
+…and back on metal (boot 6):
+
+```
+eosh> disk.virtio $ fs.eofs $ cat /from-macos.txt
+written-by-usermode
+```
+
+A file written on bare-metal ARM through a wasm device driver is readable on macOS through
+a host file device, and vice versa — same `fs.eofs` component, same engine, same on-disk
+format, no conversion step. (The metal compile cache disk is the same format too: usermode
+`mkfs.eofs`, the metal kernel, and the fs.eofs provider all produce mutually mountable
+images.)
+
+### Metal observations beyond the brief
+
+- `env` at the metal prompt does not mention the `pci` grant or the virtio disk at all,
+  even in the `pci disk` boot where the session clearly holds them (the composition runs).
+  It also still says "programs get no writable filesystem on bare metal yet," which is now
+  only true for the *fs* capability — `disk.virtio $ fs.eofs` is exactly a writable
+  persistent filesystem, and on `storedisk` boots `/bin` itself is writable.
+- `ls /bin` shows baked and disk-saved programs undifferentiated (known gap, plan/12 D60).
+- Metal error rendering has the same debug-text problem as usermode:
+  `error: fs("FsError::ReadOnly")`.
 
 ## Participant reactions
 
@@ -346,7 +500,30 @@ virtio-blk driver + fs.eofs round-trip.)*
 12. R2-19 (outcome line glues onto unterminated program output) still reproduces on every
     `cat` of a file with no trailing newline.
 
-### What landed well (usermode)
+### Verified during the metal session
+
+13. **The `storedisk` lifecycle works end to end exactly as documented**: blank disk →
+    kernel formats it → `save` persists a composition to `/bin` → on-target compile result
+    cached to disk → full power cycle → saved program still listed, **compile cache hit at
+    2.0 ms vs the 1240 ms miss**, bit-identical deterministic output, identical cache key
+    across boots → `rm` of the saved program works, `rm` of a baked name is refused.
+14. **Tampering with the metal store disk between boots is detected, named, and recovered
+    from**: `reading a cached artifact failed: ChecksumMismatch` → recompile → re-cache;
+    tampered native code never executed. The best corruption story in the system.
+15. **The wasm virtio-blk driver + fs.eofs round-trip survives power cycles**, with
+    interrupt-driven completion (`pci: INTx delivery … the cpu halted instead of polling`
+    in the transcript).
+16. **Full cross-environment format portability**: metal-written images mount in usermode
+    and vice versa, byte-for-byte, no conversion.
+17. **The cache and the guest disk are mutually exclusive on metal** (the storedisk vs
+    `pci`/`disk` don't-combine rule), so every `disk.virtio $ fs.eofs $ …` command pays
+    20–35 s of on-target compilation under TCG; the compile cache that would fix it cannot
+    be present in the same boot.
+18. **Metal `env` omits the pci/disk grants entirely** and still claims "no writable
+    filesystem on bare metal" in boots where writable persistent storage is demonstrably
+    available.
+
+### What landed well
 
 - The mkfs→grant→compose→persist loop is coherent and genuinely capability-shaped: the
   image file is the *only* shared state; no daemon, no mount table, no global namespace.
@@ -356,9 +533,14 @@ virtio-blk driver + fs.eofs round-trip.)*
 - Crash-consistency-by-construction (CoW + alternating uberblocks + commit = root flip) is
   the right architecture, and the both-slots-corrupted case fails loudly instead of
   guessing.
-- fsync is actually wired end-to-end (file device `sync_all` at commit boundaries), not
-  just claimed.
-- Performance is a non-issue for the demo workloads (0.16 s per cold-process disk
+- fsync is actually wired end-to-end (file device `sync_all` at commit boundaries; virtio
+  FLUSH on metal), not just claimed.
+- Usermode performance is a non-issue for the demo workloads (0.16 s per cold-process disk
   composition, release build).
+- The whole metal `storedisk` story (2.1–2.3): formatting, save/run/rm, the power-cycle
+  cache hit, and tamper detection with recovery — every step printed what it was doing and
+  did what it printed.
+- Cross-environment image portability (2.5) — written on bare metal through a wasm driver,
+  read on macOS — with zero ceremony.
 
-*(Triage table to be completed after the metal demos and the participant session.)*
+*(Triage table to be completed after the participant session.)*
