@@ -51,6 +51,13 @@ pub struct WebState {
     /// before trapping, if any (write-once, bounded — see [`WebState::report_panic`]).
     /// Read host-side when a trap is rendered into a `trapped(reason)`; never guest-readable.
     pub panic_message: Option<String>,
+    /// Partial-line buffers for the two terminal output streams. Guests write line text
+    /// and the terminating newline as separate `text.write` calls; the page renders one
+    /// terminal line per host write, so emitting on every call produced doubled spacing
+    /// and stray prefix-only lines (user study 10, finding 12). Buffering until a newline
+    /// arrives renders exactly the lines the guest meant to print.
+    out_line: String,
+    err_line: String,
 }
 
 /// Ceiling on a reported panic message (bytes); anything longer is truncated on a char
@@ -73,6 +80,29 @@ impl WebState {
             buffers: crate::fs::BufferTable::default(),
             exec: crate::execsurface::ExecTables::default(),
             panic_message: None,
+            out_line: String::new(),
+            err_line: String::new(),
+        }
+    }
+
+    /// Append terminal output, emitting one host write per *complete* line. Standard-error
+    /// lines are prefixed with U+0001 — an in-band marker the page strips and styles with
+    /// its error class (and the verify harnesses strip before matching). Empty content is
+    /// a no-op; a bare newline terminates whatever is buffered (possibly an intentionally
+    /// blank line).
+    ///
+    /// Module-private: the only caller is this module's `eo9:text/text.write` handler
+    /// (and `WitOutputStream` is itself module-private).
+    fn write_text(&mut self, stream: WitOutputStream, content: &str) {
+        let (buffer, marker) = match stream {
+            WitOutputStream::Out => (&mut self.out_line, ""),
+            WitOutputStream::Err => (&mut self.err_line, "\u{1}"),
+        };
+        buffer.push_str(content);
+        while let Some(newline) = buffer.find('\n') {
+            let line: String = buffer.drain(..=newline).collect();
+            let line = line.trim_end_matches('\n');
+            host::write_out(&std::format!("{marker}{line}"));
         }
     }
 
@@ -112,7 +142,7 @@ fn session_manifest() -> &'static str {
      child fs a fresh in-memory filesystem per run; writes do not persist between commands\n\
      note everything runs inside this page; nothing reaches the network or your machine\n\
      note programs run from this shell do not receive exec (no nested spawning in the browser)\n\
-     note restrict any command with `only` (e.g. `only eo9:text/text $ hello`)\n"
+     note restrict any command with `only` (e.g. `only eo9:text,eo9:time $ hello`)\n"
 }
 
 /// Render a trap reason, folding in the guest's reported panic message when one exists —
@@ -278,8 +308,10 @@ fn add_default_handle<C: 'static>(instance: &mut LinkerInstance<'_, WebState>) -
     )
 }
 
-/// `eo9:text/text`: the page terminal. Both output streams go to the one terminal pane
-/// (stderr lines are prefixed so they are distinguishable).
+/// `eo9:text/text`: the page terminal. Both output streams go to the one terminal pane;
+/// writes are line-buffered in [`WebState::write_text`], and standard-error lines carry an
+/// in-band U+0001 marker the page styles as errors (no visible prefix, no stray blank
+/// lines — user study 10, finding 12).
 fn add_text(linker: &mut Linker<WebState>) -> Result<()> {
     add_text_types(linker)?;
     let mut text = linker.instance("eo9:text/text@0.1.0")?;
@@ -287,13 +319,10 @@ fn add_text(linker: &mut Linker<WebState>) -> Result<()> {
 
     text.func_wrap(
         "write",
-        |_store: StoreContextMut<'_, WebState>,
+        |mut store: StoreContextMut<'_, WebState>,
          (_cap, to, content): (Resource<TextCap>, WitOutputStream, String)|
          -> Result<(core::result::Result<(), WitTextError>,)> {
-            match to {
-                WitOutputStream::Out => host::write_out(&content),
-                WitOutputStream::Err => host::write_out(&std::format!("[stderr] {content}")),
-            }
+            store.data_mut().write_text(to, &content);
             Ok((Ok(()),))
         },
     )?;

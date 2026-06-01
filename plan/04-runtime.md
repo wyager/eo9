@@ -357,3 +357,6 @@ composed artifact. Configuration shares the spawn budget deliberately: `configur
 not run unbounded code, so exhausting the budget there is reported as a spawn error naming `configure`.
 All three usermode spawn paths (`eo9 run`, the shell, exec-surface child spawns) route through
 `Task::spawn`, so this is the only change. Plain programs export no entrypoint and skip the step.
+
+> **Pending design (owner review):** the executor/detach model — services that outlive their spawner, the
+> boot `init` program, and single-owner device sharing — is drafted in `docs/design/executor-model.md`.

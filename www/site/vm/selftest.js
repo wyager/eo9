@@ -20,7 +20,10 @@ function note(line) {
 }
 
 function hostWrite(ptr, len) {
-  const text = decoder.decode(new Uint8Array(memory.buffer, ptr, len));
+  // Standard-error lines carry a leading U+0001 marker (the page styles them); strip it here.
+  const text = decoder
+    .decode(new Uint8Array(memory.buffer, ptr, len))
+    .replace(/^\u0001/, "");
   lines.push(text);
   terminal.textContent += text + "\n";
 }

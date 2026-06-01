@@ -202,15 +202,21 @@ impl<'a, B: Backend> Evaluator<'a, B> {
                 })
             }
             Expr::Extend { base, layer } => {
-                let base_component = self.eval_plain(base, "an `&` operand").await?;
-                let layer_component = self.eval_plain(layer, "an `&` operand").await?;
+                // Evaluate both operands keeping any applied `main` arguments, so the
+                // kind check below sees the operand even when the user wrote
+                // `… & echo --text hi`: diagnosing "echo is a program, not a provider"
+                // must come before (and instead of) the blunter "arguments cannot be
+                // applied to an `&` operand" — the most natural form of the mistake
+                // deserves the most helpful refusal (user study 10, finding 3).
+                let base_out = self.eval_boxed(base).await?;
+                let layer_out = self.eval_boxed(layer).await?;
                 // `&` requires providers on both sides. Check the kinds here, where the
                 // operands' source spellings are still known, so the refusal can name
                 // the offending operand (the algebra's own error cannot say which side).
                 let base_is_provider =
-                    self.backend.describe(&base_component).kind == ComponentKind::Provider;
+                    self.backend.describe(&base_out.component).kind == ComponentKind::Provider;
                 let layer_is_provider =
-                    self.backend.describe(&layer_component).kind == ComponentKind::Provider;
+                    self.backend.describe(&layer_out.component).kind == ComponentKind::Provider;
                 if !base_is_provider || !layer_is_provider {
                     return Err(extend_refusal(
                         base,
@@ -219,7 +225,17 @@ impl<'a, B: Backend> Evaluator<'a, B> {
                         layer_is_provider,
                     ));
                 }
-                let component = self.backend.extend(base_component, layer_component)?;
+                // Both operands are providers, whose arguments (if any) were consumed as
+                // compose-time configuration — so leftover run-time arguments cannot
+                // occur here. Keep the guard for the impossible case.
+                if !base_out.args.is_empty() || !layer_out.args.is_empty() {
+                    return Err(EvalError::ArgumentsNotAllowed {
+                        context: "an `&` operand",
+                    });
+                }
+                let component = self
+                    .backend
+                    .extend(base_out.component, layer_out.component)?;
                 Ok(EvalOutput {
                     component,
                     args: Vec::new(),
@@ -499,8 +515,10 @@ pub fn operation_failed(operation: &str, err: &BackendError) -> String {
 }
 
 /// Build the `&`-operand refusal: name the offending side (and operand, when it has a
-/// simple name), and suggest the `$` spelling when both operands are bare names and
-/// exactly one of them is a provider.
+/// simple name), and suggest the `$` spelling — preserving any applied arguments — when
+/// exactly one operand is a provider and both have writable spellings. The suggestion
+/// must teach in every form of the mistake, including `… & echo --text hi` (user study
+/// 10, finding 3).
 fn extend_refusal(
     base: &Expr,
     layer: &Expr,
@@ -520,7 +538,7 @@ fn extend_refusal(
     };
     let suggestion =
         provider.and_then(
-            |provider| match (bare_name(provider), bare_name(offender)) {
+            |provider| match (expr_spelling(provider), expr_spelling(offender)) {
                 (Some(provider), Some(program)) => Some(format!("{provider} $ {program}")),
                 _ => None,
             },
@@ -541,11 +559,37 @@ fn operand_name(expr: &Expr) -> Option<String> {
     }
 }
 
-/// The operand's name only when it is a bare name (no arguments), so a suggestion built
-/// from it never silently drops applied flags.
-fn bare_name(expr: &Expr) -> Option<String> {
+/// Re-spell an operand expression exactly as the user could type it — a bare name, or a
+/// name with its literal arguments — so a suggestion built from it never silently drops
+/// applied flags. Expressions with nested program arguments have no flat spelling.
+fn expr_spelling(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Name(name) => Some(name.clone()),
+        Expr::App { callee, args } => {
+            let mut spelling = match callee.as_ref() {
+                Expr::Name(name) => name.clone(),
+                _ => return None,
+            };
+            for arg in args {
+                let value = match arg {
+                    Arg::Flag { value, .. } | Arg::Positional(value) => value,
+                };
+                let text = match value {
+                    ArgValue::Word(text) => text.clone(),
+                    ArgValue::Quoted(text) => format!("\"{text}\""),
+                    ArgValue::Expr(_) => return None,
+                };
+                match arg {
+                    Arg::Flag { name, .. } => {
+                        spelling.push_str(&format!(" --{name} {text}"));
+                    }
+                    Arg::Positional(_) => {
+                        spelling.push_str(&format!(" {text}"));
+                    }
+                }
+            }
+            Some(spelling)
+        }
         _ => None,
     }
 }
@@ -680,9 +724,9 @@ mod tests {
     }
 
     #[test]
-    fn extend_refusal_with_a_configured_provider_still_names_the_program() {
-        // The suggestion is omitted when an operand carries flags (it would silently
-        // drop them), but the offending program is still named.
+    fn extend_refusal_with_a_configured_provider_keeps_its_flags_in_the_suggestion() {
+        // A configured provider operand keeps its flags in the suggested `$` spelling —
+        // the suggestion must never silently drop what the user typed.
         let mut backend = MockBackend::new();
         backend.program_with_args(
             "entropy.seeded",
@@ -696,7 +740,52 @@ mod tests {
             EvalError::ExtendOperandNotAProvider {
                 side: "right",
                 operand: Some("echo".to_string()),
-                suggestion: None,
+                suggestion: Some("entropy.seeded --seed 7 $ echo".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn extend_refusal_teaches_even_when_the_program_has_arguments() {
+        // The most natural form of the mistake — `provider & program --flag value` —
+        // must get the same teaching error as the bare form, with the program's
+        // arguments preserved in the suggestion (user study 10, finding 3). Before this,
+        // the args-on-`&` rule fired first and produced "arguments cannot be applied to
+        // an `&` operand" with no explanation of what was actually wrong.
+        let mut backend = MockBackend::new();
+        backend.program("entropy.seeded", provider(&["eo9:entropy/entropy"]));
+        backend.program("echo", binary(&[("text", "string")]));
+        let err = eval(&mut backend, "entropy.seeded & echo --text hi").unwrap_err();
+        assert_eq!(
+            err,
+            EvalError::ExtendOperandNotAProvider {
+                side: "right",
+                operand: Some("echo".to_string()),
+                suggestion: Some("entropy.seeded $ echo --text hi".to_string()),
+            }
+        );
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("`echo` is a program, not a provider"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("entropy.seeded $ echo --text hi"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("arguments cannot be applied"),
+            "the kind diagnosis must win over the argument rule: {rendered}"
+        );
+
+        // Quoted argument values keep their quotes in the suggestion.
+        let err = eval(&mut backend, "entropy.seeded & echo --text \"hi there\"").unwrap_err();
+        assert_eq!(
+            err,
+            EvalError::ExtendOperandNotAProvider {
+                side: "right",
+                operand: Some("echo".to_string()),
+                suggestion: Some("entropy.seeded $ echo --text \"hi there\"".to_string()),
             }
         );
     }
@@ -1139,15 +1228,20 @@ mod tests {
     }
 
     #[test]
-    fn arguments_on_amp_operands_are_rejected() {
+    fn a_program_with_arguments_on_an_amp_operand_gets_the_teaching_refusal() {
+        // A binary operand (with or without arguments) is diagnosed as
+        // not-a-provider — naming it and suggesting the `$` spelling with the
+        // arguments preserved — never as the blunt argument-position rule.
         let mut backend = MockBackend::new();
         backend.program("hello", binary(&[("name", "string")]));
         backend.program("memfs", provider(&["eo9:fs/fs"]));
         let err = eval(&mut backend, "hello --name x & memfs").unwrap_err();
         assert_eq!(
             err,
-            EvalError::ArgumentsNotAllowed {
-                context: "an `&` operand"
+            EvalError::ExtendOperandNotAProvider {
+                side: "left",
+                operand: Some("hello".to_string()),
+                suggestion: Some("memfs $ hello --name x".to_string()),
             }
         );
     }
