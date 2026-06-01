@@ -36,8 +36,8 @@ use eo9_runtime::providers::{
     BoxOp, DiskError, DiskProvider, FsError, FsHandle, FsProvider, NodeKind, NodeStat, OpenFlags,
 };
 use eo9_runtime::{
-    ChildPolicy, Datetime, EntropyProvider, ExecProvider, Image, OutputStream, Providers, Task,
-    TextError, TextProvider, TimeProvider,
+    ChildPolicy, Datetime, EntropyProvider, ExecProvider, Image, OutputStream, Providers,
+    SharedRegistry, SvcGrant, Task, TextError, TextProvider, TimeProvider,
 };
 
 use crate::cli::Config;
@@ -874,7 +874,7 @@ pub fn root_providers(cfg: &Config) -> Result<Providers, String> {
         Some(image) => Some(Box::new(HostDisk::open(image)?)),
         None => None,
     };
-    Ok(assemble(fs, disk, None))
+    Ok(assemble(fs, disk, None, None))
 }
 
 /// The layered session filesystem: the session directory's read-only program view
@@ -932,6 +932,39 @@ pub fn shell_providers(
     session_root: &Path,
     image: &Image,
     editor: Option<crate::interactive::InteractiveText>,
+    registry: Option<&SharedRegistry>,
+) -> Result<Providers, String> {
+    // `--svc` grants the shell itself (one generation); children never inherit it
+    // (owner ruling B: detaching is an explicit grant).
+    let svc_generations = if registry.is_some() { 1 } else { 0 };
+    session_providers(cfg, session_root, image, editor, registry, svc_generations)
+}
+
+/// The providers granted to the `init` task (`eo9 init`): the same session environment
+/// as the shell, with the svc capability granted to **two** generations — init itself
+/// and its direct children (the console it keeps running, so `svc list`/`svc stop` work
+/// at that console). The console's own children get no svc, exactly like shell children
+/// (owner ruling B).
+pub fn init_providers(
+    cfg: &Config,
+    session_root: &Path,
+    image: &Image,
+    registry: &SharedRegistry,
+) -> Result<Providers, String> {
+    session_providers(cfg, session_root, image, None, Some(registry), 2)
+}
+
+/// The generalized session-environment factory behind [`shell_providers`] and
+/// [`init_providers`]: text/time/entropy/fs/disk/exec, recursively handed down to
+/// children, with the svc capability granted to the top `svc_generations` generations
+/// (0 = nobody, 1 = just this task, 2 = this task and its direct children, …).
+fn session_providers(
+    cfg: &Config,
+    session_root: &Path,
+    image: &Image,
+    editor: Option<crate::interactive::InteractiveText>,
+    registry: Option<&SharedRegistry>,
+    svc_generations: u32,
 ) -> Result<Providers, String> {
     // The shell itself cannot work without its session filesystem (eosh resolves
     // `/bin/<name>.wasm` through it); surface a broken session root as a hard error here.
@@ -950,15 +983,18 @@ pub fn shell_providers(
     let session_root = session_root.to_path_buf();
     let fs_root = cfg.fs_root.clone();
     let disk_image = cfg.disk.clone();
+    let registry = registry.cloned();
 
-    // A late-bound self-reference: `make` builds the session environment, and the exec
-    // capability it installs carries a child policy that calls `make` again for the next
-    // generation. Boxing it as one `Arc<dyn Fn>` keeps the recursion a single type.
-    type MakeEnv = dyn Fn() -> Providers + Send + Sync;
+    // A late-bound self-reference: `make` builds the session environment for one
+    // generation (the argument is how many generations from here, this one included,
+    // still hold svc), and the exec capability it installs carries a child policy that
+    // calls `make` again for the next generation with that count decremented. Boxing it
+    // as one `Arc<dyn Fn>` keeps the recursion a single type.
+    type MakeEnv = dyn Fn(u32) -> Providers + Send + Sync;
     let slot: Arc<Mutex<Option<Arc<MakeEnv>>>> = Arc::new(Mutex::new(None));
     let make: Arc<MakeEnv> = {
         let slot = Arc::clone(&slot);
-        Arc::new(move || {
+        Arc::new(move |svc_generations: u32| {
             let fs = session_overlay_fs(&session_root, fs_root.as_deref(), exec_snapshot);
             // The session's block device (when granted): each task opens its own handle on
             // the same image file. Commands at the prompt run one at a time, so eofs
@@ -976,13 +1012,14 @@ pub fn shell_providers(
             };
             let child_slot = Arc::clone(&slot);
             let disk_granted = disk.is_some();
+            let child_svc_generations = svc_generations.saturating_sub(1);
             let policy = ChildPolicy::with_providers(move || {
                 let make = child_slot
                     .lock()
                     .unwrap()
                     .clone()
                     .expect("the session child policy is initialized before the first spawn");
-                make()
+                make(child_svc_generations)
             });
             // Mirror `eo9 run`'s friendly refusal: a program that hard-requires the block
             // device in a session launched without `--disk` gets advice naming the flag
@@ -997,12 +1034,18 @@ pub fn shell_providers(
                      format one with `eo9 mkfs.eofs <image>`)",
                 )
             };
-            assemble(fs, disk, Some(ExecProvider::new(&engine, policy)))
+            // The svc capability reaches exactly the configured number of generations
+            // (owner ruling B: never an ambient right; the embedder names who holds it).
+            let svc = match (&registry, svc_generations > 0) {
+                (Some(registry), true) => Some(SvcGrant::full(registry.clone())),
+                _ => None,
+            };
+            assemble(fs, disk, Some(ExecProvider::new(&engine, policy)), svc)
         })
     };
     *slot.lock().unwrap() = Some(Arc::clone(&make));
 
-    let mut providers = make();
+    let mut providers = make(svc_generations);
     if let Some(editor) = editor {
         providers.text = Some(Box::new(editor));
     }
@@ -1076,6 +1119,7 @@ fn assemble(
     fs: Option<Box<dyn FsProvider>>,
     disk: Option<Box<dyn DiskProvider>>,
     exec: Option<ExecProvider>,
+    svc: Option<SvcGrant>,
 ) -> Providers {
     Providers {
         text: Some(Box::new(StdioText {
@@ -1090,6 +1134,7 @@ fn assemble(
         fs,
         disk,
         exec,
+        svc,
     }
 }
 
@@ -1120,6 +1165,24 @@ pub fn wait_until_runnable(task: &Task) {
     let mut runnable = std::pin::pin!(runnable);
     while runnable.as_mut().poll(&mut context).is_pending() {
         std::thread::park();
+    }
+}
+
+/// Like [`wait_until_runnable`], but parks at most `timeout` so the caller can also
+/// service other work that becomes due on a clock (a service registry's pending
+/// restarts, for example) rather than sleeping until this task's own doorbell rings.
+pub fn wait_until_runnable_with_timeout(task: &Task, timeout: std::time::Duration) {
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let runnable = task.runnable();
+    let mut runnable = std::pin::pin!(runnable);
+    let deadline = std::time::Instant::now() + timeout;
+    while runnable.as_mut().poll(&mut context).is_pending() {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::park_timeout(deadline - now);
     }
 }
 

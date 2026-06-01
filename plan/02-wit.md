@@ -351,3 +351,17 @@ review pending).
     `net.policy-ports` allow-list policy. `send-to` is gated per datagram so an admitted local
     UDP binding does not imply every remote is reachable. The l4 interface itself, the existing
     net worlds, and every existing net stub are untouched.
+
+27. **The `eo9:svc` package: services and detachment (2026-06-01, executor v1).** Four interfaces
+    plus types: `restart-policy` (the pure decision function `decide: func(failure-history) ->
+    restart-action` — restart policies are programs, owner ruling C), `backoff-config` (the
+    standard configured policy's compose-time budget), `detach` (root handle + the one operation:
+    hand a composed child and a policy component to the registry), and `services`
+    (list/status/log/stop/clear). `detach` and `services` are separate interfaces so "may start
+    things that outlive you" and "may inspect them" are separable grants; both have `-optional`
+    flavors. Stub worlds: `restart-never`, `restart-always`, `restart-backoff`. One deliberate
+    deviation from the fs/disk pattern: executors register the svc **operations unconditionally**
+    (not only when granted) and only the `-optional` answers vary, because a client (eosh) must
+    import both the optional flavor *and* the operations to be able to call them when granted —
+    and must still instantiate everywhere when not. An operation called without the grant traps;
+    the optional flavor is the honest signal clients check first.

@@ -1,0 +1,16 @@
+# The always-restart policy for detached services ("policies are programs").
+[package]
+name = "eo9-stub-restart-always"
+description = "Eo9 standard policy `restart.always`: an eo9:svc/restart-policy component that restarts the service immediately after every completed run. Pure (imports nothing); passed to `detach` as its restart policy."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

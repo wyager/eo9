@@ -19,6 +19,15 @@ world eosh {
     import eo9:exec/task@0.1.0;
     import eo9:text/text@0.1.0;
     import eo9:fs/fs@0.1.0;
+    // The svc capability (background services). The shell imports both the optional
+    // flavors (to observe whether this session was granted them — most sessions are
+    // not) and the full interfaces (to call them when it was). Executors register the
+    // operations unconditionally; calling one without the grant traps, which the shell
+    // never does because it checks the optional first.
+    import eo9:svc/detach@0.1.0;
+    import eo9:svc/detach-optional@0.1.0;
+    import eo9:svc/services@0.1.0;
+    import eo9:svc/services-optional@0.1.0;
 
     variant program-success {
         /// The session ended cleanly (end of input, `exit`, or a one-shot command that

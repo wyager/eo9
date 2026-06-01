@@ -78,6 +78,23 @@ pub struct WaveValue {
     pub value: String,
 }
 
+/// One detached service's visible state (mirrors `eo9:svc/services.service-info`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceInfo {
+    pub name: String,
+    /// One of `running`, `blocked`, `waiting-restart`, `finished` (the WIT enum's case
+    /// names, kept as text so the shell renders whatever the registry reports).
+    pub state: String,
+    /// The composition tree the service was detached with.
+    pub wiring: String,
+    /// The rendered outcome of the last completed run, if any.
+    pub outcome: Option<String>,
+    /// Fuel consumed so far.
+    pub fuel_used: u64,
+    /// Restarts performed so far.
+    pub restarts: u32,
+}
+
 /// A run that never returned an outcome of its own (mirrors `abnormal-exit`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AbnormalExit {
@@ -214,6 +231,42 @@ pub trait Backend {
     /// backend reads it from the session filesystem; `None` simply means the
     /// information is unavailable and never affects what the shell can do.
     async fn session_manifest(&mut self) -> Option<String>;
+
+    // ----- services (`eo9:svc`) ---------------------------------------------------------
+    //
+    // The svc capability is split in two (detach = may start things that outlive you;
+    // services = may inspect/stop them) and is never part of the default grant. The
+    // shell observes what it holds through the `-optional` imports and degrades to a
+    // clear refusal when a builtin needs a half it does not have.
+
+    /// Which halves of the `eo9:svc` capability this session holds: `(detach, services)`.
+    fn svc_grants(&mut self) -> (bool, bool);
+
+    /// Hand a composed child (with its bound `main` arguments) to the service registry,
+    /// registered under `name` and governed by `policy` (a restart-policy component).
+    /// Requires the detach half.
+    fn svc_detach(
+        &mut self,
+        child: Self::Component,
+        policy: Self::Component,
+        name: &str,
+        args: &[NamedArg],
+    ) -> Result<String, BackendError>;
+
+    /// The registry's services. Requires the services half.
+    fn svc_list(&mut self) -> Result<Vec<ServiceInfo>, BackendError>;
+
+    /// The captured log of one service (`None`: unknown service, or its logs were
+    /// discarded). Requires the services half.
+    fn svc_log(&mut self, name: &str) -> Result<Option<String>, BackendError>;
+
+    /// Stop a service; returns its rendered final outcome (`None`: unknown service).
+    /// Requires the services half.
+    fn svc_stop(&mut self, name: &str) -> Result<Option<String>, BackendError>;
+
+    /// Remove a finished service's record (false: unknown or still running). Requires
+    /// the services half.
+    fn svc_clear(&mut self, name: &str) -> Result<bool, BackendError>;
 
     /// Write a line to the shell's standard output.
     fn print(&mut self, text: &str);

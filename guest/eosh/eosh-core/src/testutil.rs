@@ -11,7 +11,7 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::backend::{
     ArgSpec, Backend, BackendError, ComponentInfo, ComponentKind, ExportSlot, InterfaceRef,
-    NamedArg, Outcome, WaveValue,
+    NamedArg, Outcome, ServiceInfo, WaveValue,
 };
 
 /// Drive a future that never actually suspends (every await point in the mock backend
@@ -86,6 +86,11 @@ pub struct MockBackend {
     pub manifest: Option<String>,
     /// Whether `persist` succeeds (`None`) or fails with this refusal (`Some(reason)`).
     pub persist_refusal: Option<String>,
+    /// Which halves of the svc capability the mock session holds: `(detach, services)`.
+    /// Both false by default (the common, ungranted case).
+    pub svc_grants: (bool, bool),
+    /// The mock registry: services recorded by `svc_detach`, mutated by stop/clear.
+    pub services: Vec<ServiceInfo>,
     /// Every backend operation, one line each.
     pub log: Vec<String>,
     /// Lines printed to standard output.
@@ -108,6 +113,8 @@ impl MockBackend {
             }),
             manifest: None,
             persist_refusal: None,
+            svc_grants: (false, false),
+            services: Vec::new(),
             log: Vec::new(),
             out: Vec::new(),
             err: Vec::new(),
@@ -328,6 +335,82 @@ impl Backend for MockBackend {
     async fn session_manifest(&mut self) -> Option<String> {
         self.log.push("session_manifest()".to_string());
         self.manifest.clone()
+    }
+
+    fn svc_grants(&mut self) -> (bool, bool) {
+        self.svc_grants
+    }
+
+    fn svc_detach(
+        &mut self,
+        child: u32,
+        policy: u32,
+        name: &str,
+        args: &[NamedArg],
+    ) -> Result<String, BackendError> {
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|arg| format!("{}={}", arg.name, arg.value))
+            .collect();
+        self.log.push(format!(
+            "svc_detach(c{child}, policy=c{policy}, {name}, [{}])",
+            rendered.join(", ")
+        ));
+        if self.services.iter().any(|s| s.name == name) {
+            return Err(BackendError::new(format!(
+                "a service named `{name}` already exists"
+            )));
+        }
+        self.services.push(ServiceInfo {
+            name: name.to_string(),
+            state: "running".to_string(),
+            wiring: format!("c{child}"),
+            outcome: None,
+            fuel_used: 0,
+            restarts: 0,
+        });
+        Ok(name.to_string())
+    }
+
+    fn svc_list(&mut self) -> Result<Vec<ServiceInfo>, BackendError> {
+        self.log.push("svc_list()".to_string());
+        Ok(self.services.clone())
+    }
+
+    fn svc_log(&mut self, name: &str) -> Result<Option<String>, BackendError> {
+        self.log.push(format!("svc_log({name})"));
+        Ok(self
+            .services
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| format!("(log of {})", s.name)))
+    }
+
+    fn svc_stop(&mut self, name: &str) -> Result<Option<String>, BackendError> {
+        self.log.push(format!("svc_stop({name})"));
+        match self.services.iter_mut().find(|s| s.name == name) {
+            Some(service) => {
+                service.state = "finished".to_string();
+                service.outcome = Some("abnormal(killed)".to_string());
+                Ok(Some("abnormal(killed)".to_string()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn svc_clear(&mut self, name: &str) -> Result<bool, BackendError> {
+        self.log.push(format!("svc_clear({name})"));
+        let index = self
+            .services
+            .iter()
+            .position(|s| s.name == name && s.state == "finished");
+        match index {
+            Some(index) => {
+                self.services.remove(index);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     fn print(&mut self, text: &str) {

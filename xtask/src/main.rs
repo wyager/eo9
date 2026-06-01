@@ -22,6 +22,8 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-l2check",
     "eo9-example-l4check",
     "eosh",
+    // The service-boot program (executor v1, docs/design/executor-model.md).
+    "init",
     // Basic coreutils (guest/coreutils/*, plan/17-coreutils.md).
     "eo9-coreutil-cat",
     "eo9-coreutil-ls",
@@ -66,6 +68,9 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-pci-none",
     "eo9-stub-perf-none",
     "eo9-stub-perf-null",
+    "eo9-stub-restart-always",
+    "eo9-stub-restart-backoff",
+    "eo9-stub-restart-never",
     "eo9-stub-text-none",
     "eo9-stub-text-null",
     "eo9-stub-time-frozen",

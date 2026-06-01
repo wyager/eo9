@@ -1,0 +1,50 @@
+// init — the Eo9 service-boot program (executor v1, docs/design/executor-model.md).
+//
+// init is an ordinary Eo9 program with no private powers: it is granted the svc
+// capability (detach + services) by whoever starts it — `eo9 init` in usermode, the
+// kernel boot in v2 — plus text, a filesystem to resolve programs from (`/bin`), and
+// the exec capability to run its console in the foreground. Anyone can write a
+// different init; this one reads a small config, detaches each service line, and then
+// keeps a console running (exit restarts the console while services live — owner
+// ruling D).
+package eo9-init:init@0.1.0;
+
+/// The service-boot program: parse a config, detach the services it names, then run
+/// the console program in the foreground, restarting it while services remain.
+///
+///   eo9 init                  — the built-in default config (console = eosh)
+///   eo9 init services.cfg     — a config file
+///
+/// Config format (one entry per line; `#` comments):
+///
+///   <name> = <program> [--flag value …] restart <policy> [--flag value …]
+///   console = <program>                        (default: eosh)
+world init {
+    import eo9:exec/component-algebra@0.1.0;
+    import eo9:exec/compile@0.1.0;
+    import eo9:exec/task@0.1.0;
+    import eo9:text/text@0.1.0;
+    import eo9:fs/fs@0.1.0;
+    import eo9:svc/detach@0.1.0;
+    import eo9:svc/detach-optional@0.1.0;
+    import eo9:svc/services@0.1.0;
+    import eo9:svc/services-optional@0.1.0;
+
+    variant program-success {
+        /// init ended cleanly: the console exited and no services were left running.
+        exited,
+    }
+
+    variant program-failure {
+        /// This session does not hold the svc capability; init cannot do its job.
+        no-svc-capability(string),
+        /// The config could not be parsed (the offending line and why).
+        bad-config(string),
+        /// The console program could not be resolved, compiled, or spawned.
+        console-failed(string),
+        /// Reading from or writing to the text streams failed.
+        io(string),
+    }
+
+    export main: async func(config: string) -> result<program-success, program-failure>;
+}

@@ -244,6 +244,10 @@ pub struct Providers {
     /// The exec capability (component algebra + compile + task). Granting it makes the
     /// task a native executor; see [`crate::exec::ExecProvider`].
     pub exec: Option<crate::exec::ExecProvider>,
+    /// The svc capability (detach + services): the ability to start programs that
+    /// outlive this task, and/or to inspect them. Never granted by default (owner
+    /// ruling B); see [`crate::svc::SvcGrant`].
+    pub svc: Option<crate::svc::SvcGrant>,
 }
 
 impl Providers {

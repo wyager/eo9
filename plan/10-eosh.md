@@ -206,3 +206,26 @@ operator" (precedence), "Environments and `&`", "The capability algebra" (`only`
     verify-eosh.mjs (plan/18 D37). Still open from the same study (tracked, not this branch): the
     `ok:`/`success(…)` rendering split, `eo9 store --help`, fs errors leaking enum text from the *coreutils'*
     own failure variants, and the owner-decision items (front-page voice, boot banner, save-vs-ls).
+
+### Executor v1: `detach` and `svc` builtins (2026-06-01, area 10)
+
+eosh is the first client of `eo9:svc` (executor v1, docs/design/executor-model.md + owner rulings):
+
+* **Grammar.** `detach <name> = <program-expr> restart <policy-expr>` — the program side is a full
+  expression (compositions, args, `only`, …); the policy side too (so `restart.backoff
+  --max-restarts 5 --base-delay-ms 200` configures). The split is at the *last* top-level `restart`
+  word, so a program itself named `restart` still parses; a missing clause is the typed
+  `DetachNeedsRestart` parse error (the policy is required — owner ruling C). `svc` / `svc list` /
+  `svc log|stop|clear <name>` are the inspection builtins.
+* **Backend trait.** Six new methods (`svc_grants`, `svc_detach`, `svc_list`, `svc_log`, `svc_stop`,
+  `svc_clear`) + the `ServiceInfo` record. The component backend reads the `-optional` imports for
+  `svc_grants` and calls the full interfaces only when they answered `some` — sessions without the
+  grant get a friendly refusal naming `eo9 --svc`, never a trap.
+* **Top-level rule parity.** `detach` evaluates its program exactly like a foreground run (argument
+  completion against the signature, provider refusal, granted-environment composition) before the
+  handoff — a detached service runs with what *this session* could have given a foreground run.
+* **World.** eosh imports `eo9:svc/detach`, `detach-optional`, `services`, `services-optional`
+  (wit/svc dep symlink added). Executors must register all four (the runtime and the kernel both
+  do; the kernel's registration answers "absent" until executor v2).
+* eosh-core: 117 unit tests (16 new — parsing, grant refusals, lifecycle, soundness-at-the-shell);
+  end-to-end: tests/eo9-integration/tests/svc_shell.rs (7 subprocess session tests).

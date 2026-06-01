@@ -52,6 +52,12 @@ pub struct Config {
     /// stays on stdout; the outcome line defaults to stderr so pipes carry only program
     /// output (the exit code already encodes success/failure/abnormal).
     pub outcome: OutcomeChannel,
+    /// `--svc`: grant the shell session the `eo9:svc` capability (detach + services),
+    /// backed by a service registry that lives exactly as long as this `eo9` process
+    /// (owner ruling E: registry lifetime is the root process's choice). Without the
+    /// flag the shell has no way to start anything that outlives a command — `detach`
+    /// is never an ambient right (owner ruling B).
+    pub svc: bool,
 }
 
 /// Where `eo9 run` writes the rendered `program-outcome` line.
@@ -162,6 +168,10 @@ pub fn consume_global_options(stream: &mut ArgStream, cfg: &mut Config) -> Resul
                 cfg.max_fuel = Some(value.parse().map_err(|err| {
                     format!("invalid --max-fuel value {value:?} (fuel units expected): {err}")
                 })?);
+            }
+            "--svc" => {
+                cfg.svc = true;
+                stream.next();
             }
             "--outcome" => {
                 stream.next();

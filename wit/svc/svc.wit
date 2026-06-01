@@ -1,0 +1,218 @@
+/// eo9:svc — services and detachment: the "run my child for me" capability.
+///
+/// See SPEC.md "Execution APIs" and docs/design/executor-model.md. A program holding
+/// `detach` can hand a composed child to the longer-lived service registry and walk
+/// away; the child keeps running after its detacher exits. Holding `detach` is real
+/// authority — it is the ability to consume the machine after you are gone — so it is
+/// **never part of the default child grant**: it is granted explicitly (owner ruling B),
+/// the same posture as fs/disk/exec.
+///
+/// `detach` (may start things that outlive you) and `services` (may inspect and stop
+/// them) are separate interfaces so the two grants are separable.
+///
+/// Restart policies are programs (SPEC "Policies are programs", owner ruling C): a tiny
+/// pure provider exporting `restart-policy` decides what happens when a service's run
+/// ends. The standard policies are `restart.never`, `restart.always`, and
+/// `restart.backoff` (configured); anyone can write another.
+///
+/// Registry lifetime is the root process's choice (owner ruling E): the usermode CLI
+/// binds it to the `eo9` process; the kernel (v2) binds it to the machine.
+package eo9:svc@0.1.0;
+
+/// Shared, authority-free vocabulary: what restart policies decide on.
+interface types {
+    /// How a completed service run ended, as the class a policy decides on. (Policies
+    /// decide on classes, not payloads; the rendered detail is for humans.)
+    enum outcome-class {
+        /// The program returned its own success value.
+        success,
+        /// The program returned its own failure value.
+        failure,
+        /// The run trapped.
+        trapped,
+        /// The run was killed (by `services.stop` or the registry shutting down).
+        killed,
+    }
+
+    /// One completed run of a service.
+    record failure-record {
+        /// Milliseconds since the service was first detached (the registry's monotonic
+        /// clock), at the moment the run ended.
+        at-ms: u64,
+        /// How the run ended.
+        class: outcome-class,
+        /// The rendered outcome (human-readable; never parsed by policies).
+        detail: string,
+    }
+
+    /// Everything a restart policy may consider.
+    record failure-history {
+        /// Every completed run so far, oldest first (bounded by the registry).
+        failures: list<failure-record>,
+        /// Restarts already performed (the run count is `failures` length; this is how
+        /// many of those were policy-ordered restarts).
+        total-restarts: u32,
+    }
+
+    /// What the registry should do after a run ends.
+    variant restart-action {
+        /// Start the service again now.
+        restart,
+        /// Start it again after this many milliseconds.
+        restart-after-ms(u64),
+        /// Leave it finished; the record stays inspectable until cleared.
+        give-up,
+    }
+}
+
+/// The restart-policy interface: a pure decision function, exported by a policy
+/// component. The registry instantiates the policy and calls `decide` each time a
+/// service run ends; policies must import nothing (purity is enforced by the capability
+/// system: an impure policy's imports are visible residuals and are refused at detach).
+interface restart-policy {
+    use types.{failure-history, restart-action};
+
+    /// Given everything that has happened to this service, what should happen next?
+    decide: func(history: failure-history) -> restart-action;
+}
+
+/// Compose-time configuration for `restart.backoff`: at most `max-restarts` restarts,
+/// the n-th delayed by `base-delay-ms * 2^(n-1)`, capped at one hour. Unconfigured, the
+/// policy gives up immediately (deny-all posture: plain composition never silently
+/// retries forever).
+interface backoff-config {
+    configure: func(max-restarts: u32, base-delay-ms: u64) -> result<_, string>;
+}
+
+/// The detach capability: hand a composed child to the service registry.
+interface detach {
+    use eo9:exec/component-algebra@0.1.0.{component};
+    use eo9:exec/args@0.1.0.{named-arg};
+
+    /// The capability's root handle. Declared in the API interface itself so every
+    /// named import mints its own root-handle type (see SPEC: "Multi-instance imports
+    /// and type identity").
+    resource detach-impl;
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> detach-impl;
+
+    /// How the service's terminal output is kept.
+    enum log-policy {
+        /// Keep a bounded ring the inspector can read (`services.log`).
+        capture,
+        /// Discard output (the service is expected to use its own fs/net).
+        discard,
+    }
+
+    variant detach-error {
+        /// The composition still requires capabilities the registry will not supply,
+        /// named. Compose them in before detaching: a detached child runs with exactly
+        /// what its detacher composed, plus log capture — never the registry's own
+        /// authority (capability soundness; see the design doc).
+        not-closed(list<string>),
+        /// The child is a provider, not a binary.
+        not-a-binary,
+        /// A service with this name already exists.
+        name-taken(string),
+        /// The name is not a usable service name.
+        invalid-name(string),
+        /// The restart policy is not a valid policy component: it must be a provider
+        /// exporting `eo9:svc/restart-policy` and must import nothing (pure).
+        invalid-policy(string),
+        /// The registry's service cap is reached.
+        exhausted,
+        internal(string),
+    }
+
+    /// Hand `child` (with `main` arguments `args`) off to run under the registry,
+    /// registered under `name` and governed by the `restart` policy component.
+    /// Returns the service name immediately; the caller may exit — the service keeps
+    /// running for as long as the registry lives (the root process, in usermode).
+    detach: func(d: borrow<detach-impl>, child: component, restart: component,
+                 name: string, args: list<named-arg>, logs: log-policy)
+        -> result<string, detach-error>;
+}
+
+/// Optional flavor of `detach` (see SPEC: The capability algebra).
+interface detach-optional {
+    use detach.{detach-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<detach-impl>;
+}
+
+/// Inspect and control detached services ("may look", separable from "may start").
+interface services {
+    /// The capability's root handle (see the note on `detach-impl`).
+    resource services-impl;
+
+    /// The capability's root handle.
+    default: func() -> services-impl;
+
+    enum service-state {
+        /// The service has runnable work right now.
+        running,
+        /// The service is parked on I/O or a timer.
+        blocked,
+        /// A restart policy ordered a delayed restart; the service starts again when
+        /// the delay elapses.
+        waiting-restart,
+        /// The service finished (its last run ended and the policy gave up, or it was
+        /// stopped). The record stays until `clear`.
+        finished,
+    }
+
+    record service-info {
+        name: string,
+        state: service-state,
+        /// The composition tree the service was detached with (the wiring view): the
+        /// capability audit of a running daemon.
+        wiring: string,
+        /// The rendered outcome of the last completed run, if any.
+        outcome: option<string>,
+        /// Fuel consumed so far across all runs (the cost meter).
+        fuel-used: u64,
+        /// Restarts performed so far.
+        restarts: u32,
+    }
+
+    %list:  func(s: borrow<services-impl>) -> list<service-info>;
+    status: func(s: borrow<services-impl>, name: string) -> option<service-info>;
+    /// Read a window of the captured log (absent when the service is unknown or its
+    /// logs were discarded).
+    log:    func(s: borrow<services-impl>, name: string, offset: u64, max-len: u32)
+        -> option<list<u8>>;
+    /// Kill a running service; returns its rendered final outcome. Absent when the
+    /// service is unknown.
+    stop:   func(s: borrow<services-impl>, name: string) -> option<string>;
+    /// Remove a finished service's record. False when the service is unknown or still
+    /// running.
+    clear:  func(s: borrow<services-impl>, name: string) -> bool;
+}
+
+/// Optional flavor of `services`.
+interface services-optional {
+    use services.{services-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<services-impl>;
+}
+
+// --- stub worlds (one per standard restart policy) ------------------------------
+
+/// restart.never — give up after the first completed run, whatever it was.
+world restart-never {
+    export restart-policy;
+}
+
+/// restart.always — restart immediately, every time, forever. (Pair with `stop`.)
+world restart-always {
+    export restart-policy;
+}
+
+/// restart.backoff — exponential backoff up to a configured restart budget.
+world restart-backoff {
+    export restart-policy;
+    export backoff-config;
+}

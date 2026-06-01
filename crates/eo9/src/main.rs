@@ -25,6 +25,7 @@ mod compile;
 mod complete;
 mod describe;
 mod editor;
+mod initcmd;
 mod interactive;
 mod mkfs;
 mod providers;
@@ -114,6 +115,13 @@ fn dispatch(args: Vec<String>) -> Result<u8, String> {
         "shell" => {
             let command = cli::parse_shell_args(&mut stream, &mut cfg)?;
             shell::cmd_shell(&cfg, command)
+        }
+        "init" => {
+            cli::consume_global_options(&mut stream, &mut cfg)?;
+            let config_path = stream.next();
+            cli::consume_global_options(&mut stream, &mut cfg)?;
+            cli::expect_end(&mut stream, "init")?;
+            initcmd::cmd_init(&cfg, config_path.as_deref())
         }
         "help" | "--help" | "-h" => {
             print_help();
@@ -205,6 +213,13 @@ COMMANDS:
     shell [-c <command>]      Run eosh, the Eo9 shell: interactive REPL on the terminal, or
                               one command line with -c (programs resolve from the store's
                               bound names; --fs-root governs what children may touch)
+    init [<config>]           Run Eo9 as a service host: detach each service named in the
+                              config to the background registry, then keep a console (eosh)
+                              running — leaving the console restarts it while services live;
+                              everything stops when this process ends. Config lines:
+                              <name> = <program> [--flag v ...] restart <policy> [--flag v ...]
+                              and an optional `console = <program>`. Without a config: just
+                              the console (like `eo9 --svc` with console restarts)
     version, --version, -V    Show the eo9 version, bundled-component provenance, and compiler
     help                      Show this message
 
@@ -224,6 +239,10 @@ OPTIONS (before the program name; `--<flag> <value>` after it belongs to the pro
                               (abnormal(killed), exit 2). Default: unlimited
         --outcome <where>     Where the typed outcome line is printed: stderr (default),
                               stdout, or quiet (exit codes always carry the outcome)
+        --svc                 Grant the session the eo9:svc capability (background services):
+                              the shell gains `detach <name> = <expr> restart <policy>` and
+                              `svc list/log/stop/clear`. Services live exactly as long as
+                              this eo9 process. (`eo9 init` implies it)
         --debug-info          Compile with debug info
 
 EXIT CODES (run):

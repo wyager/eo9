@@ -1,6 +1,33 @@
 # The executor model: detached programs, services, and single-owner devices
 
-Status: **DESIGN — for owner review.** Nothing here is implemented; WIT shown is PROPOSED.
+Status: **APPROVED with rulings (2026-06-01); v1 (usermode) IMPLEMENTED.** The owner
+answered the open questions of §8; the rulings below amend the proposal and are what v1
+implements. The WIT lives at `wit/svc/svc.wit`; the registry in
+`crates/eo9-runtime/src/svc.rs`; the standard policies in `guest/stubs/restart-*`; the
+shell builtins in eosh; the boot program in `guest/init` (`eo9 init`). v2 (the kernel
+registry + boot-runs-init), v3 (the virtual-NIC switch), and v4 (the post-Message-API
+supervisor) remain per the staged plan in §7.
+
+## Owner rulings (2026-06-01)
+
+| # | Question | Ruling |
+|---|---|---|
+| A | Names | **`eo9:svc` + `init`** — "executor" stays a role word. |
+| B | Default child grant? | **Explicit grant only.** `detach` is never in the default child environment; the CLI grants it via `--svc` (to the shell) or `eo9 init` (to init and its console). |
+| C | Restart policy in v1? | **Required, and it is a policy component** ("policies are programs", SPEC): `detach` takes a restart-policy component; the standard policies ship as the stubs `restart.never`, `restart.always`, `restart.backoff` (configured). The original §2 proposal (no restart in v1, flag-based later) is superseded. |
+| D | `exit` at the console once init exists | **Restarts the console; halting is explicit.** In usermode v1: init restarts its console while services are still running and exits when the console exits with none left. A `poweroff`/`shutdown` builtin is the metal (v2) follow-up. |
+| E | Usermode service lifetime | **Bound to the root process, as a root-process configuration** — the CLI binds the registry to the `eo9` process; the kernel (v2) binds it to the machine; embedders choose. No host daemon. |
+
+Two design refinements that fell out of ruling C (see also `docs/design/policy-components.md`):
+
+* The policy is **runtime-passed** (a component argument to `detach`) and is instantiated
+  per decision — the cold-path binding from the policy-components doc. The registry
+  validates it at detach time: it must be a provider exporting `eo9:svc/restart-policy`,
+  and it must import nothing (impure policies are refused with `invalid-policy`, naming
+  their residuals).
+* `failure-history` carries **outcome classes** (`success`/`failure`/`trapped`/`killed`)
+  plus rendered detail strings, not full typed payloads: policies decide on classes; the
+  payloads stay with the service record for humans.
 Owner direction this responds to (2026-06-01): a standardized API for detaching programs and
 running them in the background ("a shell command that wants to launch a child and then exit
 passes the child off to a service provided by programs like eosh"); a boot-time "executor"

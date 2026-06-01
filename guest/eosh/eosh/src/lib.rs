@@ -21,7 +21,7 @@ use eosh_core::{
     Backend, BackendError, CommandClass, LineResult, Session,
     backend::{
         AbnormalExit, ArgSpec, ComponentInfo, ComponentKind, ExportSlot, ImportNeed, Outcome,
-        WaveValue,
+        ServiceInfo, WaveValue,
     },
 };
 
@@ -42,6 +42,9 @@ mod bindings {
 }
 
 use bindings::eo9::exec::{compile, component_algebra, task};
+use bindings::eo9::svc::{
+    detach as svc_detach_api, detach_optional, services as svc_services_api, services_optional,
+};
 use bindings::{Guest, ProgramFailure, ProgramSuccess, export};
 use eo9_guest::api::fs::fs;
 use eo9_guest::api::text::text;
@@ -470,12 +473,133 @@ impl Backend for WitBackend {
         String::from_utf8(bytes).ok()
     }
 
+    fn svc_grants(&mut self) -> (bool, bool) {
+        // The optional flavors are the honest signal of what this session holds; the
+        // handles they mint are unit tokens, dropped immediately.
+        (
+            detach_optional::default().is_some(),
+            services_optional::default().is_some(),
+        )
+    }
+
+    fn svc_detach(
+        &mut self,
+        child: Self::Component,
+        policy: Self::Component,
+        name: &str,
+        args: &[eosh_core::NamedArg],
+    ) -> Result<String, BackendError> {
+        let Some(handle) = detach_optional::default() else {
+            return Err(BackendError::new(
+                "this session does not hold the detach half of the svc capability",
+            ));
+        };
+        let args: Vec<svc_detach_api::NamedArg> = args
+            .iter()
+            .map(|arg| svc_detach_api::NamedArg {
+                name: arg.name.clone(),
+                value: arg.value.clone(),
+            })
+            .collect();
+        svc_detach_api::detach(
+            &handle,
+            child,
+            policy,
+            name,
+            &args,
+            svc_detach_api::LogPolicy::Capture,
+        )
+        .map_err(|err| BackendError::new(detach_error_text(&err)))
+    }
+
+    fn svc_list(&mut self) -> Result<Vec<ServiceInfo>, BackendError> {
+        let Some(handle) = services_optional::default() else {
+            return Err(BackendError::new(
+                "this session does not hold the services half of the svc capability",
+            ));
+        };
+        Ok(svc_services_api::list(&handle)
+            .into_iter()
+            .map(service_info_from_wit)
+            .collect())
+    }
+
+    fn svc_log(&mut self, name: &str) -> Result<Option<String>, BackendError> {
+        let Some(handle) = services_optional::default() else {
+            return Err(BackendError::new(
+                "this session does not hold the services half of the svc capability",
+            ));
+        };
+        Ok(svc_services_api::log(&handle, name, 0, u32::MAX)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    fn svc_stop(&mut self, name: &str) -> Result<Option<String>, BackendError> {
+        let Some(handle) = services_optional::default() else {
+            return Err(BackendError::new(
+                "this session does not hold the services half of the svc capability",
+            ));
+        };
+        Ok(svc_services_api::stop(&handle, name))
+    }
+
+    fn svc_clear(&mut self, name: &str) -> Result<bool, BackendError> {
+        let Some(handle) = services_optional::default() else {
+            return Err(BackendError::new(
+                "this session does not hold the services half of the svc capability",
+            ));
+        };
+        Ok(svc_services_api::clear(&handle, name))
+    }
+
     fn print(&mut self, line: &str) {
         self.write(text::OutputStream::Out, line);
     }
 
     fn print_error(&mut self, line: &str) {
         self.write(text::OutputStream::Err, line);
+    }
+}
+
+/// Render a detach refusal in plain words (the same wording the registry's host side
+/// uses), never as the raw enum text.
+fn detach_error_text(err: &svc_detach_api::DetachError) -> String {
+    use svc_detach_api::DetachError as E;
+    match err {
+        E::NotClosed(needs) => format!(
+            "the composition still requires {} — a detached service runs with exactly what its detacher composed (plus log capture); compose those capabilities in before detaching (e.g. `time.frozen $ <program>` to seal a time import)",
+            needs.join(", ")
+        ),
+        E::NotABinary => String::from("the detached child is a provider, not a runnable program"),
+        E::NameTaken(name) => format!(
+            "a service named `{name}` already exists (`svc list` shows it; `svc stop {name}` then `svc clear {name}` frees the name)"
+        ),
+        E::InvalidName(name) => format!(
+            "`{name}` is not a usable service name (letters, digits, `-`, `_`, and interior `.` only)"
+        ),
+        E::InvalidPolicy(reason) => format!("invalid restart policy: {reason}"),
+        E::Exhausted => String::from(
+            "the service registry is full; `svc clear` finished services or `svc stop`              running ones first",
+        ),
+        E::Internal(reason) => reason.clone(),
+    }
+}
+
+/// The WIT service-info record, converted to eosh-core's backend type.
+fn service_info_from_wit(info: svc_services_api::ServiceInfo) -> ServiceInfo {
+    let state = match info.state {
+        svc_services_api::ServiceState::Running => "running",
+        svc_services_api::ServiceState::Blocked => "blocked",
+        svc_services_api::ServiceState::WaitingRestart => "waiting-restart",
+        svc_services_api::ServiceState::Finished => "finished",
+    };
+    ServiceInfo {
+        name: info.name,
+        state: String::from(state),
+        wiring: info.wiring,
+        outcome: info.outcome,
+        fuel_used: info.fuel_used,
+        restarts: info.restarts,
     }
 }
 
