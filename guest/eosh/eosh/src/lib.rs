@@ -92,7 +92,25 @@ impl WitBackend {
 }
 
 fn fs_error(doing: &str, err: fs::FsError) -> BackendError {
-    BackendError::new(format!("{doing} the module failed: {err:?}"))
+    BackendError::new(format!("{doing} the module failed: {}", fs_error_text(&err)))
+}
+
+/// Render a filesystem error as plain words, never as the raw `FsError::…` enum text
+/// (user studies flag the debug form as the one place the shell's polish cracks).
+fn fs_error_text(err: &fs::FsError) -> String {
+    match err {
+        fs::FsError::NotFound => String::from("not found"),
+        fs::FsError::AlreadyExists => String::from("it already exists"),
+        fs::FsError::NotADirectory => String::from("not a directory"),
+        fs::FsError::IsADirectory => String::from("it is a directory"),
+        fs::FsError::Denied => String::from("refused by the filesystem's policy"),
+        fs::FsError::ReadOnly => String::from("the filesystem is read-only"),
+        fs::FsError::NoSpace => String::from("the filesystem is out of space"),
+        fs::FsError::NotImmutable => {
+            String::from("the backend cannot promise the bytes stay immutable")
+        }
+        fs::FsError::Io(reason) => format!("i/o failure: {reason}"),
+    }
 }
 
 fn algebra_error(operation: &str, err: impl core::fmt::Debug) -> BackendError {
@@ -249,9 +267,24 @@ impl Backend for WitBackend {
     async fn resolve(&mut self, name: &str) -> Result<Self::Component, BackendError> {
         let path = eosh_core::module_path(name);
         // `open-exec` is an async import, so its string argument is passed by value.
-        let handle = fs::open_exec(&self.fs, path.clone()).await.map_err(|err| {
-            BackendError::new(format!("cannot resolve `{name}` ({path}): {err:?}"))
-        })?;
+        // Resolution is only ever reached after the session's `let` bindings were
+        // checked, so a missing program means the name is neither — say so in plain
+        // language instead of leaking the filesystem error variant (user study 10,
+        // finding 5: a failed `let` followed by a use of the name produced
+        // "cannot resolve `det` (/bin/det.wasm): FsError::NotFound", which points away
+        // from the actual problem).
+        let handle = fs::open_exec(&self.fs, path.clone())
+            .await
+            .map_err(|err| match err {
+                fs::FsError::NotFound => BackendError::new(format!(
+                    "no such binding or program `{name}` — `ls /bin` lists installed \
+                     programs, and `let` bindings exist only in this session"
+                )),
+                other => BackendError::new(format!(
+                    "cannot resolve `{name}` ({path}): {}",
+                    fs_error_text(&other)
+                )),
+            })?;
         let bytes = Self::read_exec(&handle).await?;
         component_algebra::load(&bytes)
             .map_err(|err| BackendError::new(format!("cannot load `{name}`: {err:?}")))

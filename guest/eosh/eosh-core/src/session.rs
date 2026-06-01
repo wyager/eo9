@@ -192,6 +192,27 @@ impl<B: Backend> Session<B> {
             .await
         {
             Ok(component) => {
+                // Confirm what was bound — a silent success reads as nothing having
+                // happened, and the user cannot tell the binding exists until they use
+                // it (user study 10, finding 6). One line: the name, its kind, and (for
+                // a provider) what it offers.
+                let info = self.backend.describe(&component);
+                let confirmation = match info.kind {
+                    ComponentKind::Binary => format!("{name}: bound (a program)"),
+                    ComponentKind::Provider => {
+                        let exports: Vec<&str> = info
+                            .exports
+                            .iter()
+                            .map(|export| export.interface.as_str())
+                            .collect();
+                        if exports.is_empty() {
+                            format!("{name}: bound (a provider)")
+                        } else {
+                            format!("{name}: bound (a provider of {})", exports.join(", "))
+                        }
+                    }
+                };
+                self.backend.print(&confirmation);
                 self.bindings.insert(name, component);
                 LineResult::Ok
             }
@@ -520,6 +541,56 @@ mod tests {
             .filter(|line| line.starts_with("duplicate"))
             .count();
         assert_eq!(duplicates, 2);
+    }
+
+    #[test]
+    fn let_confirms_what_was_bound() {
+        // A successful `let` says what it bound — a silent success means the user
+        // cannot tell the binding exists until they try to use it (study 10, finding 6).
+        let mut session = session_with(&[
+            ("time.frozen", provider(&["eo9:time/time"])),
+            ("entropy.seeded", provider(&["eo9:entropy/entropy"])),
+            ("hello", binary(&[])),
+        ]);
+        assert_eq!(run(&mut session, "let t = time.frozen"), LineResult::Ok);
+        assert!(
+            session
+                .backend
+                .out
+                .iter()
+                .any(|l| l == "t: bound (a provider of eo9:time/time)"),
+            "out: {:?}",
+            session.backend.out
+        );
+
+        // An environment built with `&` reports everything it provides.
+        assert_eq!(
+            run(&mut session, "let det = time.frozen & entropy.seeded"),
+            LineResult::Ok
+        );
+        assert!(
+            session
+                .backend
+                .out
+                .iter()
+                .any(|l| l.starts_with("det: bound (a provider of ")
+                    && l.contains("eo9:time/time")
+                    && l.contains("eo9:entropy/entropy")),
+            "out: {:?}",
+            session.backend.out
+        );
+
+        // Binding a program is confirmed too.
+        assert_eq!(run(&mut session, "let h = hello"), LineResult::Ok);
+        assert!(
+            session
+                .backend
+                .out
+                .iter()
+                .any(|l| l == "h: bound (a program)"),
+            "out: {:?}",
+            session.backend.out
+        );
     }
 
     #[test]
