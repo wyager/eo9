@@ -128,6 +128,10 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // The PCI attenuator, so a metal composition can grant a driver exactly one device:
     // `pci.filtered --allow … $ lspci` (or `$ disk.virtio $ …`).
     ("eo9-stub-pci-filtered", "pci.filtered"),
+    // The PCI absence stub, so optional-pci programs can be composed to observe "no
+    // devices" on metal. (`pci.deny` — typed refusal for *required* pci — is specced in
+    // wit/pci's `deny` world but its stub crate does not exist yet; study 09 finding 4.)
+    ("eo9-stub-pci-none", "pci.none"),
     // The network stack for real hardware: the virtio-net driver, its link-layer
     // check, the TCP/IP middleware, and its transport-layer check, so the metal shell
     // can compose `net.virtio $ l2check` and `net.virtio $ net.l4.over-l2 $ l4check`
