@@ -19,6 +19,7 @@ pub mod image;
 mod link;
 pub mod outcome;
 pub mod providers;
+pub mod svc;
 pub mod task;
 mod trap;
 pub mod wave;
@@ -30,5 +31,8 @@ pub use outcome::{Outcome, WaveValue};
 pub use providers::{
     Datetime, DiskError, DiskProvider, EntropyProvider, FsError, FsHandle, FsProvider, MemFs,
     NodeKind, NodeStat, OpenFlags, OutputStream, Providers, TextError, TextProvider, TimeProvider,
+};
+pub use svc::{
+    DetachError, LogPolicy, ServiceInfo, ServiceRegistry, ServiceState, SharedRegistry, SvcGrant,
 };
 pub use task::{NamedArg, ResumeOutcome, SpawnError, SpawnLimits, Task};

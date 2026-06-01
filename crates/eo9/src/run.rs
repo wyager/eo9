@@ -131,6 +131,51 @@ pub(crate) fn print_outcome(cfg: &Config, rendered: &str) {
     }
 }
 
+/// The drive loop for a session with a service registry: pump the foreground task and
+/// every detached service from the same root loop, until the foreground finishes.
+/// Services then die with the registry (owner ruling E: usermode services live exactly
+/// as long as the `eo9` process; the registry is dropped by the caller after this
+/// returns).
+pub(crate) fn drive_with_services(
+    cfg: &Config,
+    task: &mut Task,
+    registry: &eo9_runtime::SharedRegistry,
+) -> Outcome {
+    let mut donated: u64 = 0;
+    loop {
+        if let Some(max_fuel) = cfg.max_fuel
+            && donated.saturating_sub(task.unspent_fuel()) >= max_fuel
+        {
+            vlog!(cfg, "fuel budget of {max_fuel} exhausted; killing the task");
+            break task.kill_in_place();
+        }
+        donated += RESUME_DONATION;
+        let foreground = task.resume(RESUME_DONATION);
+        // One slice for the services, paid from the root loop exactly like the
+        // foreground's slice (fuel still has a single source: this process's CPU).
+        let services_progressed = registry.lock().unwrap().pump(RESUME_DONATION);
+        match foreground {
+            ResumeOutcome::Done(outcome) => break outcome,
+            ResumeOutcome::OutOfFuel => {}
+            ResumeOutcome::Blocked => {
+                let services_runnable =
+                    services_progressed || registry.lock().unwrap().any_runnable();
+                if services_runnable {
+                    // Services still want CPU: keep looping without parking.
+                    continue;
+                }
+                // Everything is parked. Wait for the foreground's doorbell, but wake on
+                // a short timer too so due service restarts (and clock-driven service
+                // work) are picked up promptly.
+                providers::wait_until_runnable_with_timeout(
+                    task,
+                    std::time::Duration::from_millis(10),
+                );
+            }
+        }
+    }
+}
+
 /// The built-in drive loop: donate fuel, run, park the thread on I/O, repeat until the
 /// task finishes. Shared by `eo9 run` and `eo9 shell`.
 pub(crate) fn drive_to_completion(cfg: &Config, task: &mut Task) -> Outcome {

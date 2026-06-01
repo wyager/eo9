@@ -92,6 +92,7 @@ pub(crate) fn add_providers(linker: &mut Linker<TaskState>, providers: &Provider
     if providers.exec.is_some() {
         add_exec(linker)?;
     }
+    add_svc(linker, providers)?;
     Ok(())
 }
 
@@ -995,6 +996,13 @@ impl TaskState {
             .map(|provider| provider as &mut dyn crate::providers::DiskProvider)
             .ok_or_else(|| wasmtime::Error::msg("disk capability was not granted to this task"))
     }
+
+    fn svc_grant(&self) -> Result<&crate::svc::SvcGrant> {
+        self.providers
+            .svc
+            .as_ref()
+            .ok_or_else(|| wasmtime::Error::msg("svc capability was not granted to this task"))
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1691,6 +1699,244 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
             })
         },
     )?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// eo9:svc — services and detachment (granted only through Providers::svc)
+// ---------------------------------------------------------------------------------------
+
+/// Host representation of `eo9:svc/detach.detach-impl` (stateless token: the registry
+/// lives in the svc grant).
+pub struct SvcDetachCap;
+/// Host representation of `eo9:svc/services.services-impl`.
+pub struct SvcServicesCap;
+
+#[derive(Clone, Copy, ComponentType, Lift, Lower)]
+#[component(enum)]
+#[repr(u8)]
+// Constructed by the generated `Lift` implementation (values come in from the guest).
+#[allow(dead_code)]
+enum WitLogPolicy {
+    #[component(name = "capture")]
+    Capture,
+    #[component(name = "discard")]
+    Discard,
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(variant)]
+enum WitDetachError {
+    #[component(name = "not-closed")]
+    NotClosed(Vec<String>),
+    #[component(name = "not-a-binary")]
+    NotABinary,
+    #[component(name = "name-taken")]
+    NameTaken(String),
+    #[component(name = "invalid-name")]
+    InvalidName(String),
+    #[component(name = "invalid-policy")]
+    InvalidPolicy(String),
+    #[component(name = "exhausted")]
+    Exhausted,
+    #[component(name = "internal")]
+    Internal(String),
+}
+
+impl From<crate::svc::DetachError> for WitDetachError {
+    fn from(err: crate::svc::DetachError) -> Self {
+        use crate::svc::DetachError;
+        match err {
+            DetachError::NotClosed(needs) => WitDetachError::NotClosed(needs),
+            DetachError::NotABinary => WitDetachError::NotABinary,
+            DetachError::NameTaken(name) => WitDetachError::NameTaken(name),
+            DetachError::InvalidName(name) => WitDetachError::InvalidName(name),
+            DetachError::InvalidPolicy(reason) => WitDetachError::InvalidPolicy(reason),
+            DetachError::Exhausted => WitDetachError::Exhausted,
+            DetachError::Internal(msg) => WitDetachError::Internal(msg),
+        }
+    }
+}
+
+#[derive(Clone, Copy, ComponentType, Lift, Lower)]
+#[component(enum)]
+#[repr(u8)]
+#[allow(dead_code)]
+enum WitServiceState {
+    #[component(name = "running")]
+    Running,
+    #[component(name = "blocked")]
+    Blocked,
+    #[component(name = "waiting-restart")]
+    WaitingRestart,
+    #[component(name = "finished")]
+    Finished,
+}
+
+impl From<crate::svc::ServiceState> for WitServiceState {
+    fn from(state: crate::svc::ServiceState) -> Self {
+        use crate::svc::ServiceState;
+        match state {
+            ServiceState::Running => WitServiceState::Running,
+            ServiceState::Blocked => WitServiceState::Blocked,
+            ServiceState::WaitingRestart => WitServiceState::WaitingRestart,
+            ServiceState::Finished => WitServiceState::Finished,
+        }
+    }
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitServiceInfo {
+    name: String,
+    state: WitServiceState,
+    wiring: String,
+    outcome: Option<String>,
+    #[component(name = "fuel-used")]
+    fuel_used: u64,
+    restarts: u32,
+}
+
+impl From<crate::svc::ServiceInfo> for WitServiceInfo {
+    fn from(info: crate::svc::ServiceInfo) -> Self {
+        WitServiceInfo {
+            name: info.name,
+            state: info.state.into(),
+            wiring: info.wiring,
+            outcome: info.outcome,
+            fuel_used: info.fuel_used,
+            restarts: info.restarts,
+        }
+    }
+}
+
+/// Register the `eo9:svc` interfaces.
+///
+/// The interface instances and their root-handle resources are always registered (the
+/// optional flavors reference the resource types, and any program may import an optional
+/// flavor); the operations are registered only for the halves the task was actually
+/// granted. A task granted `detach` must also hold `exec` — component handles live in
+/// the exec provider's table — which the embedder is responsible for (the shell and init
+/// always hold both).
+fn add_svc(linker: &mut Linker<TaskState>, providers: &Providers) -> Result<()> {
+    let (detach_granted, services_granted) = match &providers.svc {
+        Some(grant) => (grant.detach, grant.services),
+        None => (false, false),
+    };
+
+    // ----- detach -------------------------------------------------------------------------
+    let mut detach = linker.instance("eo9:svc/detach@0.1.0")?;
+    detach.resource(
+        "detach-impl",
+        ResourceType::host::<SvcDetachCap>(),
+        |_, _| Ok(()),
+    )?;
+    if detach_granted {
+        add_default_handle::<SvcDetachCap>(&mut detach)?;
+        detach.func_wrap(
+            "detach",
+            |mut store: StoreContextMut<'_, TaskState>,
+             (_d, child, restart, name, args, logs): (
+                Resource<SvcDetachCap>,
+                Resource<AlgComponentRes>,
+                Resource<AlgComponentRes>,
+                String,
+                Vec<WitNamedArg>,
+                WitLogPolicy,
+            )|
+             -> Result<(Result<String, WitDetachError>,)> {
+                let state = store.data_mut();
+                // Component handles live in the caller's exec table (holding them
+                // requires exec); detach consumes both.
+                let exec = state.exec_provider()?;
+                let child_component = take_component(exec, child.rep())?;
+                let policy_component = take_component(exec, restart.rep())?;
+                let registry = state.svc_grant()?.registry.clone();
+                let args: Vec<crate::wave::NamedArg> = args
+                    .into_iter()
+                    .map(|arg| crate::wave::NamedArg::new(arg.name, arg.value))
+                    .collect();
+                let logs = match logs {
+                    WitLogPolicy::Capture => crate::svc::LogPolicy::Capture,
+                    WitLogPolicy::Discard => crate::svc::LogPolicy::Discard,
+                };
+                let result = registry.lock().unwrap().detach(
+                    child_component,
+                    policy_component,
+                    &name,
+                    args,
+                    logs,
+                );
+                Ok((result.map_err(WitDetachError::from),))
+            },
+        )?;
+    }
+
+    // ----- services -----------------------------------------------------------------------
+    let mut services = linker.instance("eo9:svc/services@0.1.0")?;
+    services.resource(
+        "services-impl",
+        ResourceType::host::<SvcServicesCap>(),
+        |_, _| Ok(()),
+    )?;
+    if services_granted {
+        add_default_handle::<SvcServicesCap>(&mut services)?;
+        services.func_wrap(
+            "list",
+            |store: StoreContextMut<'_, TaskState>,
+             (_s,): (Resource<SvcServicesCap>,)|
+             -> Result<(Vec<WitServiceInfo>,)> {
+                let registry = store.data().svc_grant()?.registry.clone();
+                let list = registry.lock().unwrap().list();
+                Ok((list.into_iter().map(WitServiceInfo::from).collect(),))
+            },
+        )?;
+        services.func_wrap(
+            "status",
+            |store: StoreContextMut<'_, TaskState>,
+             (_s, name): (Resource<SvcServicesCap>, String)|
+             -> Result<(Option<WitServiceInfo>,)> {
+                let registry = store.data().svc_grant()?.registry.clone();
+                let status = registry.lock().unwrap().status(&name);
+                Ok((status.map(WitServiceInfo::from),))
+            },
+        )?;
+        services.func_wrap(
+            "log",
+            |store: StoreContextMut<'_, TaskState>,
+             (_s, name, offset, max_len): (Resource<SvcServicesCap>, String, u64, u32)|
+             -> Result<(Option<Vec<u8>>,)> {
+                let registry = store.data().svc_grant()?.registry.clone();
+                let window = registry.lock().unwrap().log(&name, offset, max_len);
+                Ok((window,))
+            },
+        )?;
+        services.func_wrap(
+            "stop",
+            |store: StoreContextMut<'_, TaskState>,
+             (_s, name): (Resource<SvcServicesCap>, String)|
+             -> Result<(Option<String>,)> {
+                let registry = store.data().svc_grant()?.registry.clone();
+                let outcome = registry.lock().unwrap().stop(&name);
+                Ok((outcome,))
+            },
+        )?;
+        services.func_wrap(
+            "clear",
+            |store: StoreContextMut<'_, TaskState>,
+             (_s, name): (Resource<SvcServicesCap>, String)|
+             -> Result<(bool,)> {
+                let registry = store.data().svc_grant()?.registry.clone();
+                let cleared = registry.lock().unwrap().clear(&name);
+                Ok((cleared,))
+            },
+        )?;
+    }
+
+    // ----- optional flavors (always present; answer per the grant) -------------------------
+    add_optional::<SvcDetachCap>(linker, "eo9:svc/detach-optional@0.1.0", detach_granted)?;
+    add_optional::<SvcServicesCap>(linker, "eo9:svc/services-optional@0.1.0", services_granted)?;
 
     Ok(())
 }

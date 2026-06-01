@@ -71,7 +71,14 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
         .then(|| InteractiveText::new(ShellCompleter::new(session_names, cfg.fs_root.clone())));
 
     let loaded = compile::load_image(cfg, &store, &eosh)?;
-    let shell_providers = providers::shell_providers(cfg, &session_root, &loaded.image, editor)?;
+
+    // `--svc`: a service registry whose lifetime is this process (owner ruling E). The
+    // shell gets both halves of the capability; children it spawns get none (ruling B).
+    let registry = cfg
+        .svc
+        .then(|| eo9_runtime::ServiceRegistry::new(loaded.image.engine()));
+    let shell_providers =
+        providers::shell_providers(cfg, &session_root, &loaded.image, editor, registry.as_ref())?;
 
     // Spawn-time visibility of what children inherit (user-study finding #8): the full
     // picture is in the session manifest that `env` renders, but a `-v` line states it up
@@ -105,7 +112,27 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
         )
     })?;
 
-    let outcome = run::drive_to_completion(cfg, &mut task);
+    let outcome = match &registry {
+        // With a registry: the same loop also pumps detached services. When the shell
+        // exits, the registry (and every service in it) is dropped — process-bound
+        // lifetime, ruling E.
+        Some(registry) => {
+            let outcome = run::drive_with_services(cfg, &mut task, registry);
+            let mut registry = registry.lock().unwrap();
+            if registry.any_alive() {
+                eprintln!(
+                    "eo9: the shell exited; stopping the services still running (services \
+                     live only as long as this eo9 process)"
+                );
+                for service in registry.list() {
+                    eprintln!("eo9:   stopped: {}", service.name);
+                }
+            }
+            registry.stop_all();
+            outcome
+        }
+        None => run::drive_to_completion(cfg, &mut task),
+    };
     let (rendered, code) = run::render_outcome(&outcome);
     let one_shot = command.is_some();
     match &outcome {

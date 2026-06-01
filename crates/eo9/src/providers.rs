@@ -36,8 +36,8 @@ use eo9_runtime::providers::{
     BoxOp, DiskError, DiskProvider, FsError, FsHandle, FsProvider, NodeKind, NodeStat, OpenFlags,
 };
 use eo9_runtime::{
-    ChildPolicy, Datetime, EntropyProvider, ExecProvider, Image, OutputStream, Providers, Task,
-    TextError, TextProvider, TimeProvider,
+    ChildPolicy, Datetime, EntropyProvider, ExecProvider, Image, OutputStream, Providers,
+    SharedRegistry, SvcGrant, Task, TextError, TextProvider, TimeProvider,
 };
 
 use crate::cli::Config;
@@ -874,7 +874,7 @@ pub fn root_providers(cfg: &Config) -> Result<Providers, String> {
         Some(image) => Some(Box::new(HostDisk::open(image)?)),
         None => None,
     };
-    Ok(assemble(fs, disk, None))
+    Ok(assemble(fs, disk, None, None))
 }
 
 /// The layered session filesystem: the session directory's read-only program view
@@ -932,6 +932,7 @@ pub fn shell_providers(
     session_root: &Path,
     image: &Image,
     editor: Option<crate::interactive::InteractiveText>,
+    registry: Option<&SharedRegistry>,
 ) -> Result<Providers, String> {
     // The shell itself cannot work without its session filesystem (eosh resolves
     // `/bin/<name>.wasm` through it); surface a broken session root as a hard error here.
@@ -997,7 +998,9 @@ pub fn shell_providers(
                      format one with `eo9 mkfs.eofs <image>`)",
                 )
             };
-            assemble(fs, disk, Some(ExecProvider::new(&engine, policy)))
+            // Children never inherit the svc capability (owner ruling B: detaching is an
+            // explicit grant, not an ambient right of every program in the session).
+            assemble(fs, disk, Some(ExecProvider::new(&engine, policy)), None)
         })
     };
     *slot.lock().unwrap() = Some(Arc::clone(&make));
@@ -1005,6 +1008,11 @@ pub fn shell_providers(
     let mut providers = make();
     if let Some(editor) = editor {
         providers.text = Some(Box::new(editor));
+    }
+    // The shell itself holds svc when the embedder passed a registry (the `--svc` flag
+    // or `eo9 init`): both halves — it may start services and inspect them.
+    if let Some(registry) = registry {
+        providers.svc = Some(SvcGrant::full(registry.clone()));
     }
     Ok(providers)
 }
@@ -1076,6 +1084,7 @@ fn assemble(
     fs: Option<Box<dyn FsProvider>>,
     disk: Option<Box<dyn DiskProvider>>,
     exec: Option<ExecProvider>,
+    svc: Option<SvcGrant>,
 ) -> Providers {
     Providers {
         text: Some(Box::new(StdioText {
@@ -1090,6 +1099,7 @@ fn assemble(
         fs,
         disk,
         exec,
+        svc,
     }
 }
 
@@ -1120,6 +1130,24 @@ pub fn wait_until_runnable(task: &Task) {
     let mut runnable = std::pin::pin!(runnable);
     while runnable.as_mut().poll(&mut context).is_pending() {
         std::thread::park();
+    }
+}
+
+/// Like [`wait_until_runnable`], but parks at most `timeout` so the caller can also
+/// service other work that becomes due on a clock (a service registry's pending
+/// restarts, for example) rather than sleeping until this task's own doorbell rings.
+pub fn wait_until_runnable_with_timeout(task: &Task, timeout: std::time::Duration) {
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let runnable = task.runnable();
+    let mut runnable = std::pin::pin!(runnable);
+    let deadline = std::time::Instant::now() + timeout;
+    while runnable.as_mut().poll(&mut context).is_pending() {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::park_timeout(deadline - now);
     }
 }
 

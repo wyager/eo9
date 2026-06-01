@@ -358,5 +358,30 @@ not run unbounded code, so exhausting the budget there is reported as a spawn er
 All three usermode spawn paths (`eo9 run`, the shell, exec-surface child spawns) route through
 `Task::spawn`, so this is the only change. Plain programs export no entrypoint and skip the step.
 
-> **Pending design (owner review):** the executor/detach model — services that outlive their spawner, the
-> boot `init` program, and single-owner device sharing — is drafted in `docs/design/executor-model.md`.
+### Executor v1: the service registry (2026-06-01, area 04)
+
+The executor model was approved with rulings (see `docs/design/executor-model.md` § Owner rulings) and its
+usermode v1 is implemented:
+
+* **`crates/eo9-runtime/src/svc.rs`** — the host-side service registry (stage A of the design): the name
+  table, bounded per-service log rings, restart bookkeeping, and the `pump` the embedder's root drive loop
+  calls to give detached services CPU. `Providers.svc: Option<SvcGrant>` is the grant (split into `detach`
+  and `services` halves); `link.rs` registers `eo9:svc/detach`, `eo9:svc/services`, and their optional
+  flavors (resources always, operations only when granted — the fs-handle-only pattern).
+* **Capability soundness** is enforced at `detach`: residual *required* imports must be within
+  eo9:text/* + eo9:rt/* + eo9:io/* (what the registry's log capture and the runtime contract supply);
+  anything else is the typed `not-closed` refusal naming the offenders. The registry never lends its own
+  authority — handing a child off cannot escalate it.
+* **Restart policies are programs** (ruling C): `detach` takes a restart-policy component, validated
+  (provider, exports `eo9:svc/restart-policy`, pure) and instantiated per decision — compile, instantiate,
+  `bind` (so configured policies like `restart.backoff --max-restarts N` work), one `decide(history)` call
+  under a hard fuel budget (`POLICY_FUEL`). Any policy failure (trap, fuel, bad answer) is `give-up`: a
+  broken policy can never wedge the registry or restart-loop a service.
+* **Lifetime** (ruling E): the registry lives exactly as long as the `SharedRegistry` handle the embedder
+  holds. The CLI binds it to the `eo9` process (`--svc`); `Task` / `ChildSet` / kill-cascade are untouched —
+  a detached service is a top-level `Task` owned by the registry, which is the reparenting rule.
+* **Stops never consult the policy**: a killed run is final (`stop` means stop), so `restart.always`
+  services are still stoppable.
+* Verified by `tests/eo9-integration/tests/svc_registry.rs` (13 tests: detach/run/log/finish, soundness
+  refusals, policy validation, never/always/backoff behavior including configured backoff delays and
+  budget exhaustion, stop/clear, names).

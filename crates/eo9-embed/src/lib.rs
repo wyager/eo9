@@ -421,6 +421,9 @@ fn assemble(roots: Roots, exec: Option<ExecProvider>) -> Providers {
         // one out grows a `Roots.disk` field when the need appears.
         disk: None,
         exec,
+        // Same for the svc capability (detach + services): browser/embedded surfaces get
+        // it when a registry-bearing backend appears (executor v1 is usermode-first).
+        svc: None,
     }
 }
 

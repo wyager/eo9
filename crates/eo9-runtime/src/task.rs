@@ -243,6 +243,17 @@ pub(crate) struct TaskState {
 const MAX_PANIC_MESSAGE_BYTES: usize = 1024;
 
 impl TaskState {
+    /// A bare task state for host-mediated component calls that are not full tasks
+    /// (restart-policy invocation in [`crate::svc`]): the given providers, no limits.
+    pub(crate) fn bare(providers: Providers) -> Self {
+        TaskState {
+            providers,
+            buffers: BufferTable::default(),
+            limits: StoreLimits::new(&SpawnLimits::default()),
+            panic_message: Arc::new(Mutex::new(None)),
+        }
+    }
+
     /// Record the guest's reported panic message (write-once: the first report wins).
     pub(crate) fn report_panic(&self, message: String) {
         let mut slot = self.panic_message.lock().unwrap();
@@ -798,7 +809,7 @@ impl Task {
 /// The `eo9:rt/configured.bind` export of a configured composition, if the component
 /// carries one (see `eo9-component::configure` and wit/rt/rt.wit). Components without
 /// compose-time configuration -- every plain program -- simply do not export it.
-fn bind_entrypoint<T>(
+pub(crate) fn bind_entrypoint<T>(
     instance: &wasmtime::component::Instance,
     store: &mut Store<T>,
 ) -> Option<wasmtime::component::Func> {
