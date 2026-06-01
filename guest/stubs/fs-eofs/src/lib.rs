@@ -185,11 +185,19 @@ fn with_fs<R>(f: impl FnOnce(&mut Eofs<DiskDevice>) -> Result<R, FsError>) -> Re
     STATE.with(f)
 }
 
-/// Run a *mutating* operation over the mounted filesystem with rewrite atomicity:
-/// if the operation fails, every uncommitted change is discarded (`Eofs::rollback`), so a
-/// half-applied multi-step change — a truncation whose rewrite never landed, a partially
-/// built directory edit — can never be published by a later commit. The committed,
-/// on-disk state only ever moves from one fully-applied operation to the next.
+/// Run a *mutating* operation over the mounted filesystem with rewrite atomicity and
+/// space reclamation:
+///
+/// * If the operation runs out of space, the copy-on-write garbage no root references any
+///   more — superseded copies of rewritten files, the contents of removed files — is
+///   reclaimed (`Eofs::gc`) and the operation retried once. This is what keeps an image
+///   usable forever instead of bricking once its append frontier reaches the end (study
+///   07, S7-3): `rm` frees space, rewrites reuse the space of the copies they replace.
+/// * If the operation still fails, every uncommitted change is discarded
+///   (`Eofs::rollback`), so a half-applied multi-step change — a truncation whose rewrite
+///   never landed, a partially built directory edit — can never be published by a later
+///   commit. The committed, on-disk state only ever moves from one fully-applied
+///   operation to the next.
 ///
 /// The operation must be re-runnable from any pending state it may itself have
 /// half-applied (the `open` truncate path tolerates an already-removed file for this
@@ -197,15 +205,34 @@ fn with_fs<R>(f: impl FnOnce(&mut Eofs<DiskDevice>) -> Result<R, FsError>) -> Re
 fn mutate<R>(
     f: impl Fn(&mut Eofs<DiskDevice>) -> Result<R, eofs_core::FsError>,
 ) -> Result<R, FsError> {
-    with_fs(|eofs| match f(eofs) {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            // Discard whatever the failed operation half-applied (and, deliberately, any
-            // earlier uncommitted state it was meant to complete — e.g. the pending
-            // truncate of a rewrite whose write just failed). What was last committed is
-            // exactly what a remount sees, so old content is never lost to a failure.
-            eofs.rollback();
-            Err(map_error(error))
+    with_fs(|eofs| {
+        let result = match f(eofs) {
+            Err(eofs_core::FsError::NoSpace) => {
+                // Reclaim everything unreachable (the failed attempt's own orphaned
+                // blocks included — gc walks the committed and pending roots, and
+                // whatever the failure left behind is referenced by neither) and try
+                // again. The walk reads every live block, so it only runs when an
+                // allocation has actually failed, never on the fast path.
+                match eofs.gc() {
+                    Ok(_) => f(eofs),
+                    // gc itself failing (a corrupt image) is more important to report
+                    // than the space condition that triggered it.
+                    Err(error) => Err(error),
+                }
+            }
+            other => other,
+        };
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                // Discard whatever the failed operation half-applied (and, deliberately,
+                // any earlier uncommitted state it was meant to complete — e.g. the
+                // pending truncate of a rewrite whose write just failed). What was last
+                // committed is exactly what a remount sees, so old content is never lost
+                // to a failure.
+                eofs.rollback();
+                Err(map_error(error))
+            }
         }
     })
 }
@@ -275,11 +302,18 @@ struct Stub;
 /// The root-handle resource: a token referring to the mounted filesystem.
 struct EofsRoot;
 
-/// An open file: a canonical path into the mounted filesystem plus the write permission
-/// captured at open time.
+/// An open file: a canonical path into the mounted filesystem, the write permission
+/// captured at open time, and whether a TRUNCATE request is still pending.
+///
+/// Truncation is applied *lazily*: `open` only records it, and the first `write` through
+/// the handle replaces the file (remove + recreate + write + commit) as one atomic
+/// engine transaction. Until then the on-disk file is untouched, so an abandoned or
+/// failed rewrite can never lose the previous contents (study 07, S7-4). Reads through a
+/// truncate-pending handle see an empty file, matching what the truncation promised.
 struct OpenFile {
     path: String,
     writable: bool,
+    truncate_pending: core::cell::Cell<bool>,
 }
 
 /// An immutable execution handle: a snapshot of the file's contents at open-exec time.
@@ -311,25 +345,12 @@ impl fs::Guest for Stub {
         }
         let create = options.contains(OpenFlags::CREATE);
         let truncate = options.contains(OpenFlags::TRUNCATE);
+        let mut truncate_pending = false;
         mutate(|eofs| {
             match eofs.stat(&path) {
                 Ok(stat) => {
                     if stat.kind == eofs_core::NodeKind::Directory {
                         return Err(eofs_core::FsError::IsADirectory);
-                    }
-                    if truncate && stat.size > 0 {
-                        // eofs has no truncate primitive yet: replace the file with an
-                        // empty one (same name, fresh object). Deliberately NOT committed
-                        // here — the truncation becomes durable together with the write
-                        // that follows it (or the next committing operation), so a rewrite
-                        // is atomic: if the write never happens or fails, the previous
-                        // content is still what the on-disk filesystem holds (study 07
-                        // finding S7-4). The `stat` guard makes this step re-runnable
-                        // after a partial failure.
-                        if eofs.stat(&path).is_ok() {
-                            eofs.remove(&path)?;
-                        }
-                        eofs.create_file(&path)?;
                     }
                 }
                 Err(eofs_core::FsError::NotFound) if create => {
@@ -342,9 +363,20 @@ impl fs::Guest for Stub {
             }
             Ok(())
         })?;
+        // Truncation of an existing, non-empty file is recorded on the handle and applied
+        // by the first write through it — the whole rewrite (remove + recreate + write)
+        // commits as one transaction, so the previous contents survive anything short of
+        // a completed replacement (study 07, S7-4).
+        if truncate {
+            truncate_pending = with_fs(|eofs| {
+                Ok(matches!(eofs.stat(&path), Ok(stat) if stat.size > 0
+                    && stat.kind == eofs_core::NodeKind::File))
+            })?;
+        }
         Ok(fs::File::new(OpenFile {
             path,
             writable: options.contains(OpenFlags::WRITE),
+            truncate_pending: core::cell::Cell::new(truncate_pending),
         }))
     }
 
@@ -432,6 +464,11 @@ impl fs::Guest for Stub {
         dst: Buffer,
     ) -> (Buffer, Result<ReadResult, FsError>) {
         let file = f.get::<OpenFile>();
+        // A handle whose truncation has not been written yet reads as the empty file the
+        // truncation promised; the on-disk contents are still the previous ones.
+        if file.truncate_pending.get() {
+            return (dst, Ok(ReadResult { bytes_read: 0 }));
+        }
         let wanted = usize::try_from(dst.len()).unwrap_or(usize::MAX);
         let result = with_fs(|eofs| {
             let mut bytes = vec![0u8; wanted];
@@ -468,11 +505,26 @@ impl fs::Guest for Stub {
         } else {
             src.read(0, len)
         };
+        let path = file.path.clone();
+        let truncating = file.truncate_pending.get();
         let result = mutate(|eofs| {
-            eofs.write(&file.path, offset, &bytes)?;
+            if truncating {
+                // The pending truncation and this write commit as one transaction: the
+                // file is replaced wholesale (eofs has no truncate primitive, so the
+                // replacement is remove + recreate). Every step is guarded so the closure
+                // can be re-run from scratch by the NoSpace retry.
+                if eofs.stat(&path).is_ok() {
+                    eofs.remove(&path)?;
+                }
+                eofs.create_file(&path)?;
+            }
+            eofs.write(&path, offset, &bytes)?;
             eofs.commit()?;
             Ok(WriteResult { bytes_written: len })
         });
+        if result.is_ok() {
+            file.truncate_pending.set(false);
+        }
         (src, result)
     }
 

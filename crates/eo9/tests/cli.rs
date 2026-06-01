@@ -2080,3 +2080,53 @@ fn a_failed_rewrite_never_destroys_the_previous_file_content() {
         read.stdout.len()
     );
 }
+
+#[test]
+fn rm_frees_space_so_an_image_never_bricks() {
+    // Study 07 finding S7-3: an image used to have a finite write budget — once the
+    // copy-on-write frontier hit the end of the device, even an EMPTY filesystem refused
+    // every further write, forever, with reformat as the only recovery. With reclamation
+    // wired into the provider (gc on NoSpace), removing a file makes its space usable
+    // again: write big file A, remove it, write big file B — on an image that cannot hold
+    // both at once.
+    let store = temp_store("eofs-rm-frees");
+    let dir = temp_store("eofs-rm-frees-images");
+    let image = dir.join("disk.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+
+    let format = eo9(&store, &["mkfs.eofs", image_arg, "--size", "32K"]);
+    assert_eq!(format.code, 0, "stderr: {}", format.stderr);
+
+    // ~12 KiB of pseudo-random alphanumeric text per file: incompressible enough that two
+    // cannot coexist in the 32 KiB image's ~24 KiB data area, while one fits comfortably.
+    let payload = |seed: u64| -> String {
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut state = 0x9E3779B97F4A7C15u64 ^ seed.wrapping_mul(0xD1B54A32D192ED03);
+        (0..12 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                CHARS[(state % 62) as usize] as char
+            })
+            .collect()
+    };
+
+    let first = format!("fs.eofs $ readwrite /first.txt {}", payload(1));
+    let run = eo9(&store, &["--disk", image_arg, "-c", &first]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+
+    let rm = eo9(
+        &store,
+        &["--disk", image_arg, "-c", "fs.eofs $ rm /first.txt"],
+    );
+    assert_eq!(rm.code, 0, "stderr: {}", rm.stderr);
+
+    let second = format!("fs.eofs $ readwrite /second.txt {}", payload(2));
+    let run = eo9(&store, &["--disk", image_arg, "-c", &second]);
+    assert_eq!(
+        run.code, 0,
+        "after rm the space must be reusable; stderr: {}",
+        run.stderr
+    );
+}
