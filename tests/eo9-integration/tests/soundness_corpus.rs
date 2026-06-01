@@ -20,6 +20,8 @@ const PROVIDERS: &[&str] = &[
     "fs.none",
     "fs.readonly",
     "fs.overlay",
+    "fs.filtered",
+    "fs.policy-subtree",
     "text.null",
     "text.none",
     "net.l2.none",
@@ -29,9 +31,14 @@ const PROVIDERS: &[&str] = &[
     "net.l4.none",
     "net.l4.deny",
     "net.l4.loopback",
+    "net.l4.filtered",
+    "net.policy-ports",
     "perf.null",
     "disk.mem",
     "pci.none",
+    "pci.filtered",
+    "pci.admit-address",
+    "pci.admit-vendor",
 ];
 
 /// Shipped programs (and one provider) exercised as the right operand.

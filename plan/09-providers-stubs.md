@@ -432,3 +432,16 @@ Match the priority order above; (1)+(2) unblock I2.
     loopback's deterministic ephemeral port sequence — documented in the test.) Follow-ups:
     a metal demo over `net.virtio $ net.l4.over-l2` (the firewall composes above the TCP/IP
     middleware unchanged — same l4-in/l4-out shape) and the browser /bin additions.
+
+29. **Policy-swap store/bundle accounting and final verification (2026-06-01, milestone 4 of the
+    policy-component swaps).** The kernel store grew 32 -> 38 entries (pci.admit-address,
+    pci.admit-vendor, fs.filtered, fs.policy-subtree, net.l4.filtered, net.policy-ports): store
+    image 26.5 MB (+~4.0 MB over the 32-entry baseline; precompiled artifacts dominate), aarch64
+    kernel image 46.8 MB. All six new stubs are also in GUEST_COMPONENTS and the soundness
+    corpus. Final metal smoke (QEMU aarch64, `pci` boot, everything compiled on-target): the fs
+    read-only policy forwards reads of the kernel shell fs (`ls` -> listed(2)) and denies
+    outside-prefix paths; the firewalled sockcheck full TCP+UDP run echoes over loopback
+    (`echoed(24)`); the pci vendor policy still admits exactly one device. Recorded follow-ups:
+    browser /bin additions for the six new stubs (the blob's store does not carry them yet);
+    the eo9-bundled-programs refresh happens at merge time per the established convention;
+    the kernel's missing-capability hint for a missing admit-policy (D26 follow-up (a)).
