@@ -174,7 +174,7 @@ fn mount_or_format() -> Result<Eofs<DiskDevice>, FsError> {
             Eofs::format(device, &FormatOptions::default()).map_err(map_error)
         }
         eofs_core::ImageState::Foreign => Err(FsError::Io(String::from(
-            "the disk holds data that is not an eofs filesystem; refusing to format over              it. If that data is expendable, format the device explicitly:              `eo9 mkfs.eofs <image> --force`",
+            "the disk holds data that is not an eofs filesystem; refusing to format over it. If that data is expendable, format the device explicitly: `eo9 mkfs.eofs <image> --force`",
         ))),
     }
 }

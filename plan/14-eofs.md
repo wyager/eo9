@@ -187,3 +187,33 @@ Milestone 3 (usermode persistence: `--disk`, `mkfs.eofs`, the file-backed device
     root-flip commits (which flush before and after the uberblock write) reach fsync on a
     `--disk` file device and a virtio cache flush on `disk.virtio`. Behaviour over `disk.mem`
     is unchanged (no-op flush). The async-disk-bridge follow-up from D15 still stands.
+24. **Study-07 hardening: the operational shell around the engine (2026-05-31, branch
+    `area/14-eofs-integrity`).** The round-3 storage-engineer study (docs/user-studies/07) found
+    that while the data path held up (corruption always detected, blast radius exact, portability
+    real), every operational edge around it was a data-loss trap. All fix-now findings are closed:
+    - **S7-4, atomic rewrites.** The provider's `open(TRUNCATE)` no longer commits a remove+recreate
+      transaction of its own; truncation is recorded on the handle and applied by the first `write`
+      as one engine transaction (remove + recreate + write + commit), with `Eofs::rollback()` (new)
+      discarding the pending state of any failed multi-step operation. A failed rewrite leaves the
+      previous contents on disk. Engine + CLI regression tests.
+    - **S7-3, space reclamation.** Mutating provider operations run `Eofs::gc()` on `NoSpace` and
+      retry once: rewrites reuse the space of the copies they replace, `rm` frees space, images no
+      longer brick at a finite write count. The no-gc control test documents the old behaviour.
+    - **S7-1, loud uberblock fallback.** New engine API: `Uberblock::classify_slot` (NoMagic /
+      Invalid / Valid), `Eofs::mount_with_report`, and `probe()` → Eofs/Blank/Foreign/Unmountable.
+      The CLI probes every `--disk` image before composing and warns when the mount will fall back
+      past a damaged slot. (The wasm provider itself still cannot warn — that needs a diagnostics
+      channel; the *policy* question of operator-gated rewind vs warn-and-mount is the owner
+      decision recorded in the study triage.)
+    - **S7-2, blank means all-zero.** Auto-format (provider and mkfs alike) only touches devices
+      probed `Blank`: no eofs magic AND all-zero leading 64 KiB. Foreign data refuses with the
+      explicit `mkfs.eofs --force` way out. The kernel storedisk path already had this rule.
+    - **S7-5, integrity error fidelity.** ChecksumMismatch / Corrupt map to messages led by a fixed
+      `integrity check failed:` marker. The complete fix is an `integrity(string)` case in the
+      `eo9:fs` `fs-error` WIT variant, mapped from those two engine errors — **WIT addition needed,
+      next WIT round** (also wanted by the kernel's metal error rendering).
+    - **S7-11.** With S7-4 in place, the `readwrite` truncate-then-write pattern is safe (atomic);
+      the corruption-test methodology note lives in the study report.
+    Findings that remain open by design: S7-12 (rename/atomic-replace in WIT — owner decision),
+    S7-8 (fsck/scrub/df surface), S7-9 (uberblock geometry), S7-19 (operator-side threat model
+    SPEC paragraph) — all tracked in the study triage table.

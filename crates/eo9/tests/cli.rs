@@ -2026,6 +2026,18 @@ fn disk_is_not_granted_without_an_explicit_disk_flag() {
     assert!(all.contains("eo9:disk"), "output: {all}");
     assert!(all.contains("--disk"), "output: {all}");
     assert!(all.contains("mkfs.eofs"), "output: {all}");
+    // The remedy must LEAD; the raw linker text follows it (study 07, S7-13). Before this
+    // ordering, the actionable sentence was a parenthetical after four clauses of linker
+    // internals.
+    let remedy_at = all.find("--disk").expect("remedy present");
+    let jargon_at = all
+        .find("imports instance")
+        .or_else(|| all.find("implementation"))
+        .expect("raw reason still present");
+    assert!(
+        remedy_at < jargon_at,
+        "the remedy must come before the linker internals: {all}"
+    );
 }
 
 #[test]

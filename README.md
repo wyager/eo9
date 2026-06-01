@@ -116,6 +116,42 @@ ok: greeted
 Runaway compute is a flag away from being bounded: `eo9 --max-fuel 100000 cruncher --rounds 200000000`
 ends in `abnormal(killed)` instead of a hot loop.
 
+## Persistent storage (eofs)
+
+Eo9 ships its own filesystem — copy-on-write, every block blake3-checksummed, lz4-compressed.
+Format any host file as a disk image, grant it explicitly with `--disk`, and compose `fs.eofs`
+in front of a program (every command below is a separate process; the image file is the only
+shared state):
+
+```sh
+eo9 mkfs.eofs data.img --size 16M
+#> formatted data.img: 16777216 bytes, eofs (block size 4096, lz4 compression on)
+
+eo9 --disk data.img -c "fs.eofs $ readwrite /notes.txt capability-systems-are-neat"
+#> ok: round-tripped(27)
+
+eo9 --disk data.img -c "fs.eofs $ cat /notes.txt"      # a new process reads it back
+#> capability-systems-are-neat
+#> ok: printed(27)
+
+eo9 --disk data.img -c "fs.eofs $ ls /"
+#> notes.txt
+#> ok: listed(1)
+```
+
+The same rules as everything else in Eo9:
+
+- **The grant is explicit.** No `--disk`, no block device — the refusal names the flag and the
+  formatter, before anything runs.
+- **Corruption is detected, never returned.** Every read checks its block against the hash in
+  the Merkle tree; damaged data is a typed `integrity check failed` error, not garbage output.
+- **Rewrites are atomic.** A failed or interrupted rewrite leaves the previous contents intact —
+  the file holds the old version or the new one, never neither.
+- **Foreign data is safe.** Pointing `--disk` at a file that holds something else (an ext4
+  image, a tarball, a typo) refuses; only all-zero blank files format on first use.
+- **Images are portable.** The same image file mounts in usermode on macOS/Linux and on
+  bare-metal Eo9 through the wasm virtio-blk driver — same format, no conversion.
+
 ## Bare-metal mode (aarch64 / QEMU)
 
 Prerequisites: a nightly Rust toolchain and `qemu-system-aarch64`.
