@@ -197,7 +197,7 @@ const checks = [
   ],
   [
     "an unknown name gets the no-such-binding-or-program refusal (no enum leak)",
-    /no such binding or program `frobnicate`/.test(interactive) &&
+    /cannot resolve `frobnicate`: no such binding or program/.test(interactive) &&
       !/FsError::/.test(interactive),
   ],
   [

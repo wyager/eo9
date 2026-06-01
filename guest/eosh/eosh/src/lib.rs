@@ -280,8 +280,8 @@ impl Backend for WitBackend {
             .await
             .map_err(|err| match err {
                 fs::FsError::NotFound => BackendError::new(format!(
-                    "no such binding or program `{name}` — `ls /bin` lists installed \
-                     programs, and `let` bindings exist only in this session"
+                    "cannot resolve `{name}`: no such binding or program — `ls /bin` lists \
+                     installed programs; `let` bindings exist only in this session"
                 )),
                 other => BackendError::new(format!(
                     "cannot resolve `{name}` ({path}): {}",
