@@ -12,8 +12,13 @@ description = "Prebuilt Eo9 guest components (the shell, examples, coreutils, an
 version.workspace = true
 edition.workspace = true
 publish = true
+readme = "README.md"
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+homepage.workspace = true
 repository.workspace = true
 license = "MIT"
-include = ["/src", "/data", "/Cargo.toml"]
+include = ["/src", "/data", "/Cargo.toml", "/README.md"]
 
 [dependencies]
