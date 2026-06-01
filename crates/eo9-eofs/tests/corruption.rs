@@ -2,7 +2,7 @@
 //! damaged uberblock slot falls back to the previous transaction (or fails the mount when
 //! both slots are gone).
 
-use eofs_core::{Eofs, FormatOptions, FsError, MemDevice};
+use eo9_eofs::{Eofs, FormatOptions, FsError, MemDevice};
 
 const DEV_SIZE: u64 = 4 * 1024 * 1024;
 const MARKER: &[u8] = b"EOFS-CORRUPTION-MARKER-";
@@ -110,7 +110,7 @@ fn a_blank_device_does_not_mount() {
 
 #[test]
 fn probe_distinguishes_eofs_blank_foreign_and_unmountable() {
-    use eofs_core::{ImageState, probe};
+    use eo9_eofs::{ImageState, probe};
 
     // A healthy image probes as Eofs at its committed transaction, not degraded.
     let image = image_with_victim();
@@ -196,7 +196,7 @@ fn probe_distinguishes_eofs_blank_foreign_and_unmountable() {
 
 #[test]
 fn falling_back_past_a_damaged_uberblock_is_reported() {
-    use eofs_core::{ImageState, probe};
+    use eo9_eofs::{ImageState, probe};
 
     // Two transactions: txg 1 (format, slot 1) and txg 2 (the file, slot 0).
     let mut image = image_with_victim();

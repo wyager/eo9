@@ -218,10 +218,10 @@ impl HostDisk {
         // mounts, where the operator can actually see it.
         // Healthy, blank, foreign, unmountable, or unreadable images get no warning here —
         // the provider (or the open below) reports those through its own typed errors.
-        if let Ok(Ok(eofs_core::ImageState::Eofs {
+        if let Ok(Ok(eo9_eofs::ImageState::Eofs {
             txg,
             degraded: true,
-        })) = crate::mkfs::FileDevice::open(image).map(|device| eofs_core::probe(&device))
+        })) = crate::mkfs::FileDevice::open(image).map(|device| eo9_eofs::probe(&device))
         {
             eprintln!(
                 "eo9: warning: {}: one of the image's uberblock slots is damaged; the \

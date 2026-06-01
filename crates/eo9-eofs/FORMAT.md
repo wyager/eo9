@@ -1,6 +1,6 @@
 # eofs on-disk format (version 1)
 
-This document is the authoritative description of what `eofs-core` writes to a block device.
+This document is the authoritative description of what `eo9-eofs` writes to a block device.
 `src/format.rs` is its code twin; if the two ever disagree, one of them is a bug. The design
 goals come from SPEC.md "Filesystem API": copy-on-write with never-overwrite-in-place, atomic
 root flips, a blake3 Merkle tree over everything, snapshots as retained roots, per-block
@@ -222,5 +222,5 @@ read, giving later versions room without relayout.
 
 Multi-device/RAID, deduplication, quotas, encryption, hard links, sparse files (holes), and
 online/automatic GC are out of scope for this format version. Concurrency is the embedder's
-business: `eofs-core` is a single-writer library; the provider layer above it serialises
+business: `eo9-eofs` is a single-writer library; the provider layer above it serialises
 access.

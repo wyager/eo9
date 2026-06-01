@@ -333,22 +333,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-eofs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "lz4_flex",
+]
+
+[[package]]
 name = "eo9-kernel"
 version = "0.0.0"
 dependencies = [
  "blake3",
  "eo9-component",
- "eofs-core",
+ "eo9-eofs",
  "linked_list_allocator",
  "wasmtime",
-]
-
-[[package]]
-name = "eofs-core"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "lz4_flex",
 ]
 
 [[package]]

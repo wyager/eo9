@@ -158,7 +158,7 @@ fn print_version() {
     let provenance = if local {
         "locally built"
     } else {
-        "prebuilt eo9-components bundle"
+        "prebuilt eo9-bundled-programs bundle"
     };
     println!(
         "eo9 {} ({count} bundled components, {provenance})\ncompiler {} for {}",

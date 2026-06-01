@@ -5,7 +5,7 @@
 //! (uberblock layout, block pointers, object references, directory entries), which also
 //! doubles as a check that the documented layout matches the implementation.
 
-use eofs_core::{Eofs, FormatOptions, FsError, MemDevice};
+use eo9_eofs::{Eofs, FormatOptions, FsError, MemDevice};
 
 const SLOT_SIZE: usize = 4096;
 const DATA_START: u64 = 8192;

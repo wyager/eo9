@@ -1,4 +1,4 @@
-# eofs-core
+# eo9-eofs
 
 The engine of eofs, Eo9's native filesystem: a copy-on-write, Merkle-hashed,
 checksummed, lz4-compressed on-disk format over an abstract block device.

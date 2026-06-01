@@ -1,11 +1,11 @@
-# eofs-core is the target-independent heart of Eo9's native filesystem (plan/14-eofs.md,
+# eo9-eofs is the target-independent heart of Eo9's native filesystem (plan/14-eofs.md,
 # SPEC.md "Filesystem API"): the on-disk format plus a copy-on-write read/write engine over
 # an abstract `BlockDevice` trait. It is `no_std` + `alloc` so the same code serves host
 # tests, the guest provider component, and the bare-metal kernel.
 #
-# no_std claim is kept honest with:   cargo check -p eofs-core --target aarch64-unknown-none
+# no_std claim is kept honest with:   cargo check -p eo9-eofs --target aarch64-unknown-none
 [package]
-name = "eofs-core"
+name = "eo9-eofs"
 description = "Eo9's native filesystem (eofs): copy-on-write, Merkle-hashed, compressed on-disk format and engine over an abstract block device."
 license = "MIT"
 version.workspace = true

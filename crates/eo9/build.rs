@@ -15,7 +15,7 @@
 //! empty store and offer a working shell out of the box. When that directory is absent
 //! (a fresh checkout built before `build-guest`, or a build from the published crate —
 //! `cargo install eo9`) the generated set is empty and `seed.rs` falls back to the
-//! prebuilt bundle in the `eo9-components` crate, so installed binaries still seed a
+//! prebuilt bundle in the `eo9-bundled-programs` crate, so installed binaries still seed a
 //! working shell.
 
 use std::env;

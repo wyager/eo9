@@ -54,7 +54,7 @@ wac-graph = "0.10.0"
 # with the first release whose bundled wit-parser is >= 0.249. See plan/07-guest-sdk.md
 # Decisions 9-10.
 wit-bindgen = { git = "https://github.com/bytecodealliance/wit-bindgen", rev = "ea49687c8db0c6abb5de9fa3ea3c7c298587c8f3" }
-# blake3 is pinned without default features so no_std crates (eofs-core, later the kernel) can
+# blake3 is pinned without default features so no_std crates (eo9-eofs, later the kernel) can
 # use it; the hashing API used by std crates is identical, they just don't get the std-only
 # io::Write/Error impls.
 blake3 = { version = "1.8.5", default-features = false }
@@ -66,11 +66,11 @@ lz4_flex = { version = "0.13.0", default-features = false, features = ["safe-enc
 # crates carry a version alongside the path so `cargo publish` can resolve them from
 # crates.io while local builds keep using the in-tree sources.
 eo9-component = { path = "crates/eo9-component", version = "0.1.0" }
-eo9-components = { path = "crates/eo9-components", version = "0.1.0" }
+eo9-bundled-programs = { path = "crates/eo9-bundled-programs", version = "0.1.0" }
 eo9-embed = { path = "crates/eo9-embed", version = "0.1.0" }
 eo9-placeholder = { path = "crates/eo9-placeholder" }
 eo9-providers-unix = { path = "crates/eo9-providers-unix", version = "0.1.0" }
 eo9-runtime = { path = "crates/eo9-runtime", version = "0.1.0" }
 eo9-sched = { path = "crates/eo9-sched" }
 eo9-store = { path = "crates/eo9-store", version = "0.1.0" }
-eofs-core = { path = "crates/eofs-core", version = "0.1.0" }
+eo9-eofs = { path = "crates/eo9-eofs", version = "0.1.0" }

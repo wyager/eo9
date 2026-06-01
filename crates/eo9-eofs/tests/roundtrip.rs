@@ -1,7 +1,7 @@
 //! Round-trips of every milestone-1 operation: create, write, read, mkdir, list, stat,
 //! remove, commit, remount — plus determinism of the produced image bytes.
 
-use eofs_core::{Eofs, FormatOptions, FsError, MemDevice, NodeKind};
+use eo9_eofs::{Eofs, FormatOptions, FsError, MemDevice, NodeKind};
 
 const DEV_SIZE: u64 = 8 * 1024 * 1024;
 

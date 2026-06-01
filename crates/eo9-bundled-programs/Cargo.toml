@@ -7,7 +7,7 @@
 # `cargo xtask package`); it is never edited by hand. Components are wasm, so one
 # artifact set serves every host platform.
 [package]
-name = "eo9-components"
+name = "eo9-bundled-programs"
 description = "Prebuilt Eo9 guest components (the shell, examples, coreutils, and standard stub providers) bundled for the eo9 binary."
 version.workspace = true
 edition.workspace = true
