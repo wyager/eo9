@@ -33,6 +33,15 @@
 //! does) becomes possible when the async disk/net bridge lands; the controller-side
 //! machinery here stays the same either way. MSI/MSI-X remain `unsupported`.
 //!
+//! **Teardown (quiesce before free).** When a driver task ends — normal completion, a
+//! trap, or a kill — every device it armed is quiesced *before* any of its DMA buffers
+//! are freed: bus mastering is cleared (revoking the device's licence to DMA) and its
+//! interrupt lines are masked, and only then does the buffer memory return to the kernel
+//! heap. The same ordering holds for explicit handle drops (`device` drop revokes the
+//! licence; a `dma-buffer` drop quiesces first if any armed device remains). Without
+//! this, a killed virtio-net driver would leave its device DMA-ing into reclaimed kernel
+//! memory (study 09 finding 6).
+//!
 //! Not implemented yet (drivers get `unsupported`, never a wrong answer): MSI/MSI-X,
 //! function-level `reset`, and I/O-space BARs (the arm64 `virt` PIO window is not mapped).
 //! DMA buffers are plain kernel-heap allocations: with the identity map the CPU address
@@ -112,6 +121,11 @@ struct DmaRes;
 /// One claimed PCI function.
 struct OpenDevice {
     address: pci::FunctionAddress,
+    /// Whether bus mastering was enabled through this handle (`set-bus-master(true)`).
+    /// Tracked so teardown can revoke exactly the DMA licence this task granted: quiesce
+    /// must clear it *before* any of the task's DMA buffers are freed (study 09 finding 6),
+    /// and must not touch devices some other holder is legitimately driving.
+    bus_master_enabled: bool,
 }
 
 /// One opened (assigned and decode-enabled) BAR window.
@@ -197,6 +211,13 @@ impl PciTables {
             .ok_or(WitPciError::NotFound)
     }
 
+    fn device_mut(&mut self, rep: u32) -> Result<&mut OpenDevice, WitPciError> {
+        self.devices
+            .get_mut(rep as usize)
+            .and_then(Option::as_mut)
+            .ok_or(WitPciError::NotFound)
+    }
+
     fn bar(&self, rep: u32) -> Result<&OpenBar, WitPciError> {
         self.bars
             .get(rep as usize)
@@ -226,8 +247,15 @@ impl PciTables {
     }
 
     fn close_device(&mut self, rep: u32) {
-        if let Some(slot) = self.devices.get_mut(rep as usize) {
-            *slot = None;
+        if let Some(slot) = self.devices.get_mut(rep as usize)
+            && let Some(device) = slot.take()
+        {
+            // Dropping the device handle revokes the DMA licence granted through it,
+            // *before* any of this task's DMA buffers can be reclaimed by later
+            // destructor calls (study 09 finding 6).
+            if device.bus_master_enabled {
+                pci::set_bus_master(device.address, false);
+            }
         }
     }
 
@@ -247,9 +275,73 @@ impl PciTables {
     }
 
     fn close_buffer(&mut self, rep: u32) {
+        // Memory-safety ordering (study 09 finding 6): a DMA buffer must never be freed
+        // while any of this task's devices can still master the bus — the device would be
+        // left with descriptors pointing into reclaimed kernel heap. Resource-destructor
+        // order is not ours to choose, so if a buffer is about to go while a device this
+        // task armed is still bus-mastering, quiesce the task's devices first.
+        if self
+            .devices
+            .iter()
+            .flatten()
+            .any(|device| device.bus_master_enabled)
+        {
+            let quiesced = self.quiesce_all();
+            quiesce_diagnostic(quiesced);
+        }
         if let Some(slot) = self.buffers.get_mut(rep as usize) {
             *slot = None;
         }
+    }
+
+    /// Quiesce every device this task armed: clear bus mastering on each device that had
+    /// it enabled through this task's handles (revoking its licence to DMA), and mask
+    /// every interrupt line the task allocated. Idempotent; returns how many devices had
+    /// bus mastering revoked.
+    ///
+    /// This is the teardown half of the DMA contract (study 09 finding 6): it must run
+    /// *before* any of the task's DMA buffers are freed, so a device can never master the
+    /// bus into memory the kernel has already reclaimed — whether the task completed,
+    /// trapped, or was killed mid-request.
+    fn quiesce_all(&mut self) -> usize {
+        let mut quiesced = 0;
+        for device in self.devices.iter_mut().flatten() {
+            if device.bus_master_enabled {
+                pci::set_bus_master(device.address, false);
+                device.bus_master_enabled = false;
+                quiesced += 1;
+            }
+        }
+        for vector in self.interrupts.iter().flatten() {
+            crate::arch::pci_intx::mask(vector.line);
+        }
+        quiesced
+    }
+}
+
+impl Drop for PciTables {
+    /// Task teardown — normal completion, trap, or kill — drops the task's store, which
+    /// drops this table. The `Drop` body runs before the fields are dropped, so quiescing
+    /// here guarantees the ordering the memory-safety property needs: every device this
+    /// task armed has bus mastering cleared (and its interrupt lines masked) before the
+    /// DMA buffer storage in `buffers` is freed back to the kernel heap.
+    fn drop(&mut self) {
+        let quiesced = self.quiesce_all();
+        if quiesced > 0 {
+            quiesce_diagnostic(quiesced);
+        }
+    }
+}
+
+/// Once-per-boot diagnostic that the teardown ordering held: evidence in metal transcripts
+/// that bus mastering was revoked before the owning task's DMA buffers were freed.
+fn quiesce_diagnostic(devices: usize) {
+    static FIRST: AtomicBool = AtomicBool::new(false);
+    if devices > 0 && !FIRST.swap(true, Ordering::Relaxed) {
+        crate::kprintln!(
+            "pci: quiesced {devices} device(s) at task teardown \
+             (bus-master cleared before the task's DMA buffers were freed)"
+        );
     }
 }
 
@@ -512,8 +604,13 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
                         if already_claimed {
                             Err(WitPciError::Busy)
                         } else {
-                            let rep =
-                                PciTables::insert(&mut tables.devices, OpenDevice { address });
+                            let rep = PciTables::insert(
+                                &mut tables.devices,
+                                OpenDevice {
+                                    address,
+                                    bus_master_enabled: false,
+                                },
+                            );
                             Ok(Resource::new_own(rep))
                         }
                     }),
@@ -711,21 +808,20 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
          (device, enable): (Resource<DeviceRes>, bool)|
          -> ConcurrentFuture<'_, (Result<(), WitPciError>,)> {
             Box::pin(async move {
-                let address = accessor.with(|mut access| {
-                    access
-                        .data_mut()
-                        .pci_tables()
-                        .device(device.rep())
-                        .map(|device| device.address)
-                });
-                let result = address.and_then(|address| {
-                    if pci::set_bus_master(address, enable) {
-                        Ok(())
-                    } else {
-                        Err(WitPciError::Io(String::from(
+                let result = accessor.with(|mut access| {
+                    let tables = access.data_mut().pci_tables();
+                    let address = tables.device(device.rep())?.address;
+                    if !pci::set_bus_master(address, enable) {
+                        return Err(WitPciError::Io(String::from(
                             "command register write failed",
-                        )))
+                        )));
                     }
+                    // Track the DMA licence on the handle, so teardown revokes exactly
+                    // what this task granted (quiesce-before-free, study 09 finding 6).
+                    if let Ok(open) = tables.device_mut(device.rep()) {
+                        open.bus_master_enabled = enable;
+                    }
+                    Ok(())
                 });
                 Ok((result,))
             })
