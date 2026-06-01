@@ -24,10 +24,28 @@ The trusted computing base is correspondingly small and explicit: the compiler (
 native code), the root scheduler, and the hardware-root capabilities held by the OS core. Everything else —
 interpreters, user-level schedulers, providers, the shell — is unprivileged by construction (see *Execution APIs*).
 
+**Hardware mitigations are insurance, never load-bearing.** The policy: use hardware-level security mitigations
+when they are approximately free, but never strictly rely on them. In an ideal world where the compiler is
+correct, Eo9 is secure even on hardware with no MMU at all — language-level safety is the security model, and
+every hardware feature is defense-in-depth against bugs in the things that *implement* that model (the compiler,
+the runtime's unsafe code). Concretely: W^X for generated code pages is kept (page-table bits, zero runtime
+cost, and it converts a compiler miscompilation from "arbitrary ring-0 code execution" into "data corruption
+that needs further chaining"); the IOMMU is adopted on hardware that has one (DMA is outside language-level
+safety entirely, so it is the one place hardware protection is the *only* protection); and the rest of the
+classical mitigation zoo — ASLR, stack canaries, CFI, guard pages, shadow stacks — is deliberately not built,
+because the language makes the attack patterns they defend against inexpressible.
+
 Spectre-class side channels are mitigated capability-style: fine-grained time is itself a capability. Untrusted
 programs are composed with noisy, adversarial, or stubbed timers (`time.fuzzy`, `time.frozen`, `time.none`) and are
 not granted shared-memory threads (thread spawning is itself a capability — see *Execution APIs*) or other primitives from which a high-resolution clock could be rebuilt —
 attenuating the attacker's clock is just provider substitution, the same mechanism as everything else.
+Two further layers exist for programs that *are* legitimately granted precise time: the compiler's speculative
+bounds-check masking stays enabled (this matters most on no-MMU targets, where bounds checks are explicit
+branches rather than guard pages), and the executor may flush microarchitectural state (caches, branch
+predictors) when switching between programs in different trust domains. That flush is an *execution attribute*
+a secret-holding program requests for itself or a scheduler policy at distrust boundaries — not an importable
+capability, since erasing one's own traces grants no authority; and it is paid only where it is needed, not on
+every context switch.
 
 ## Virtualization
 
