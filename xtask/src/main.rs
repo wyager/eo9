@@ -136,6 +136,19 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-example-l2check", "l2check"),
     ("eo9-stub-net-l4-over-l2", "net.l4.over-l2"),
     ("eo9-example-l4check", "l4check"),
+    // The per-layer net stubs, the in-memory transport, and the transport conformance
+    // check, so the typed-denial and mock-vs-real comparisons run at the metal prompt
+    // exactly as they do in usermode (user study 08, finding F4):
+    //   net.l2.deny $ net.l4.over-l2 $ l4check   -> the program's own typed denial
+    //   net.l4.loopback $ sockcheck --payload p  -> ok: echoed(...)
+    ("eo9-stub-net-l2-deny", "net.l2.deny"),
+    ("eo9-stub-net-l2-none", "net.l2.none"),
+    ("eo9-stub-net-l3-deny", "net.l3.deny"),
+    ("eo9-stub-net-l3-none", "net.l3.none"),
+    ("eo9-stub-net-l4-deny", "net.l4.deny"),
+    ("eo9-stub-net-l4-none", "net.l4.none"),
+    ("eo9-stub-net-l4-loopback", "net.l4.loopback"),
+    ("eo9-example-sockcheck", "sockcheck"),
     // Basic coreutils, so the metal shell can inspect its own (read-only) filesystem:
     // `ls /bin`, `cat /session`, `wc`, `head`, `stat`.
     ("eo9-coreutil-ls", "ls"),

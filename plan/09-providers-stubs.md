@@ -363,3 +363,18 @@ Match the priority order above; (1)+(2) unblock I2.
     consumer keeps working under the short poll). The remaining modernization — converting the
     driver's receive to a PCI INTx interrupt wait like `disk.virtio` — stays the plan/12 D59 follow-up;
     the polled path these fixes leave behind is its fallback either way.
+
+24. **The per-layer net stubs, the loopback transport, and sockcheck are in the kernel store (user
+    study 08, finding F4 — 2026-05-31, branch `area/09-net-fixes`).** STATUS claimed the
+    typed-denial-on-metal demo (`net.l2.deny` under the middleware) but none of the per-layer
+    deny/none stubs, `net.l4.loopback`, or `sockcheck` were in `KERNEL_STORE_COMPONENTS` — the demo
+    could not be typed at the metal prompt at all (`FsError::NotFound`), and the study's facilitator
+    only discovered this live, mid-session. All eight are now baked in (store: 22 → 30 entries; aarch64
+    image: 38.1 → 42.3 MB, +4.2 MB of components + precompiled artifacts), and the demos are verified
+    on QEMU aarch64 (`pci net` boot, compiled on-target): `net.l2.deny $ net.l4.over-l2 $ l4check` →
+    `error: denied`; `net.l4.loopback $ sockcheck --payload metal-ping` → `ok: echoed(44)` — the
+    transport conformance test passing on metal against the same in-memory transport it passes against
+    in usermode is the foundation of the mock-fidelity story (the full mock-vs-real conformance run
+    stays tracked as study finding F3b). STATUS's networking section is corrected to say what is
+    actually in the store and what each demo reports. Process note for demo prep: the kernel store
+    list — not STATUS — is the contract for what can be composed at the metal prompt.
