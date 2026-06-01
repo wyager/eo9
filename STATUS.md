@@ -4,13 +4,70 @@ Maintained by the planner; refreshed when merges land. Companion docs: `PLAN.md`
 `plan/*.md` (per-area briefs + decisions), `GAPS.md` (known gaps and deferred items), `SPEC.md` (the design),
 `docs/user-studies/` (external-perspective findings and their triage).
 
-_Last updated: 2026-05-30, master at ca255c8. Headline: **the try-it page is now a real terminal (type
-straight into it, full-width, explorable via `help`/`ls /bin`/`describe`/`env` on every target including the
-browser), the metal shell has a persistent MAC-verified compile cache on a real disk (`storedisk` grant:
-~1.4 s on-target compiles become ~2 ms across reboots), the PCI substrate reaches riscv64 plus a
-`pci.filtered` attenuator, `eo9:disk` gained `size`/`flush` durability, and the algebra now bakes compound
-configure arguments (lists/records/options/tuples).** Deploys never need a CDN purge again: every mutable
-URL revalidates; only hash-named files cache forever._
+_Last updated: 2026-06-01, master at acb6c5e. Headline: **round 3 of the virtual user studies (five
+personas: storage, network, driver, returning novice, distribution) produced 96 findings, and the 37
+fix-now items are already fixed and merged — including three real data-loss bugs, a kernel memory-safety
+hole, a contract violation, and a release blocker that internal testing had missed. Alongside the studies,
+the bind entrypoint landed (resource-owning providers are configurable; configure refusals are typed
+errors, never traps), PCI drivers got real interrupt delivery, and the metal shell got a writable
+MAC-verified `/bin` (`save` a composition, power-cycle, it's still there).**_
+
+## Round 3 user studies and the fix wave (2026-05-30 → 06-01)
+
+The wave began with four feature merges, then five user studies, then six fix merges driven by what the
+studies found.
+
+**The feature merges that set the stage:**
+- **The bind entrypoint** (`eebc10e`, hardened by `c1bd95c`): `configure` is now realized as direct API
+  aliases + one `eo9:rt/configured.bind` export that executors call after instantiation. Resource-owning
+  providers are configurable — `pci.filtered --allow "[{segment: 0, bus: 0, device: 1, function: 0}]" $
+  lspci` shows exactly one device on metal, compiled on-target — and the forwarding binder (with its whole
+  caveat list) is deleted. `bind` returns `result<_, string>`, so an invalid configuration is a typed
+  pre-run refusal ("compose-time configuration refused: …") on every target, never a trap. In SPEC.
+- **PCI INTx interrupt delivery** (`9d048e5`): the gpex lines route through the GIC (aarch64) and PLIC
+  (riscv64) to drivers; `disk.virtio` now halts the CPU in WFI during device waits instead of polling
+  (verified by per-boot diagnostics on both architectures). x86_64 keeps the polled fallback.
+- **Writable /bin on metal** (`00d1eb2`): `save <name> = <expr>` at the metal prompt persists the program
+  to the store disk under the same keyed-MAC discipline as the compile cache (namespaced tags — a reviewer
+  attack that copied one entry over another's path through eofs's own write machinery was rejected); baked
+  programs can't be shadowed or deleted; everything survives power cycles.
+- **The tail batch** (`89eebb7`): TCP listen/accept depth (which found and fixed two middleware bugs),
+  typed configure refusals, and hash-named immutable vm.js/vm.css.
+
+**The studies (sessions 07–11, `docs/user-studies/`):** five context-free personas, all demos real
+(release builds, QEMU on up to three architectures, packet captures, the served site). Verdicts ranged
+from "It wasn't me. They made it make sense" (the returning novice who bounced off round 1) to "most
+'capability OS' papers never get this far" (the driver developer). Full triage in
+`docs/user-studies/00-synthesis.md`.
+
+**The fix merges the studies drove:**
+- **eofs data integrity** (`cb410c2`): rewrites are atomic (a failed write can no longer destroy the old
+  content); CoW garbage is reclaimed (images no longer brick — `rm` frees space); the silent
+  transaction-rollback on uberblock corruption now warns loudly; foreign (non-eofs) images are refused
+  instead of silently reformatted; `--disk` images are flock'd; concurrent `eo9 -c` invocations no longer
+  corrupt each other; integrity failures are distinguishable from I/O errors; README gained a verified
+  persistence section.
+- **PCI device quiesce** (`02460f9`): a driver task's devices are disarmed (bus-master cleared, interrupts
+  masked) before any of its DMA buffers are freed, on every teardown path — closing a real memory-safety
+  hole (devices DMA-ing into freed kernel heap). Driver error text now survives the disk→fs boundary.
+- **Net stack fixes** (`9b2bc10`): the ~6.7 s ARP stall is gone (wire-visible replies are picked up in
+  milliseconds); a TCP RST is now reported as `connection-refused` (matching the loopback mock — mock and
+  metal agree on error semantics); the per-layer net stubs + sockcheck are baked into the kernel store so
+  the typed-denial-on-metal demos actually run.
+- **Shell/website teaching fixes** (`9fee776`): every example in `help` is machine-verified by a test (the
+  broken `&` example can't recur); the `&` teaching error survives applied arguments; `let` confirms what
+  it bound; `eo9:rt/*` imports are annotated as no-authority; the page terminal renders stderr styled
+  (no more `[stderr]` noise); welcome.txt only recommends programs that exist.
+- **Release tooling** (`be91552`): `eo9 --version` (which never falls through to program resolution); real
+  package sizes in the publish pre-flight; `make setup` failures propagate; crates.io metadata + MSRV 1.94
+  on all 8 publishable crates; the `pci.deny` stub now exists; guest builds are checkout-independent
+  (--remap-path-prefix) for 50 of 51 components.
+- **The bind error channel** (`c1bd95c`, counted above): study 08's "configure traps" finding fixed at the
+  root.
+
+**Found by the wave's own reviews (the process working on itself):** a session-lock ordering race in the
+per-process-sessions fix (fix in flight), and the fs-eofs checkout-dependence that keeps the bundle drift
+check out of `cargo xtask ci` for now (plan/01 D15).
 
 ## The polish / persistence / configure-baking wave (2026-05-29 → 30)
 
@@ -189,27 +246,29 @@ genuine wasmtime+Pulley with fuel and entropy matching native byte-for-byte.
 | Usermode binary `eo9` (run/store/describe/compile/cache/shell, `--disk` + `mkfs.eofs`, layered session, positional/variadic + optional args, seeding + auto-reseed) | `crates/eo9` | done for current scope; crates.io publish prep complete (8-crate sequence) |
 | Embeddable runtime (`Eo9` builder, Sandbox + Host backends) | `crates/eo9-embed` | complete |
 | Website + server + the auto-booting try-it terminal (type-in-terminal, full-width, explore-the-sandbox examples, in-blob compiler, browser `env`; purge-free caching; www in the CI gate) | `www/` | deployable; live-site redeploy + click-through awaits the owner |
-| Bare-metal kernel: **aarch64, riscv64, x86_64 at parity** (boot-to-eosh from the 21-entry store, on-target codegen from W^X pages, preemption, Ctrl-C, ~0% idle); `eo9:pci` on aarch64 + riscv64 with the virtio wasm drivers and `pci.filtered`; the `storedisk` MAC-verified persistent compile cache; vendored no_std forks | `kernel/` | breadth complete for QEMU; real-board bring-up unscheduled; x86_64 PCI grant + MSI/INTx + QEMU test tier queued |
+| Bare-metal kernel: **aarch64, riscv64, x86_64 at parity** (boot-to-eosh from the 32-entry store, on-target codegen from W^X pages, preemption, Ctrl-C, ~0% idle); `eo9:pci` on aarch64 + riscv64 with the virtio wasm drivers, INTx interrupt delivery, device quiesce, `pci.filtered`/`pci.deny`/`pci.none`; the `storedisk` MAC-verified persistent compile cache + writable `/bin` (`save` survives power cycles); vendored no_std forks | `kernel/` | breadth complete for QEMU; real-board bring-up unscheduled; x86_64 PCI grant + MSI/MSI-X + net.virtio interrupt conversion + QEMU test tier queued |
 
 ## In progress right now
 
-- **Driver interrupt delivery**: the recorded INTx/GIC-PLIC design (plan/12 D57) + converting virtio-blk's
-  used-ring poll as its proof.
-- **Writable /bin on metal**: the next store-on-eofs rung — `store add` at the metal prompt persisting to
-  the disk (cache eviction and FLUSH-durability ride along).
-- **Virtual user studies, round 3**: fresh-perspective passes over the grown surface (drivers, networking,
-  persistence, the redesigned try-it page, discoverability).
-- **A small-items batch**: x86_64 `pci` grant wiring, kernel headless-runner panic messages, deeper TCP
-  listen/accept coverage, the unbakeable-config error-variant tidy-up, hash-named vm.js/vm.css.
+- **The session-lock race fix**: the per-process-sessions change (eofs-integrity wave) creates the lock
+  file non-atomically, so a concurrent sweep can delete a live session dir (~50% flake under load; found
+  by the dist-fixes reviewer). Fix: create+lock under a temp name, then rename into place.
 
 ## Next up (rough order)
 
-1. **The plan/03 D21 owner decision**: the `bind`-entrypoint design for configuring resource-owning
-   providers — re-export the provider's API directly and have executors call a parameterless `bind` once
-   after instantiation. This is what unblocks `pci.filtered --allow […]` and `l4-over-l2-config`.
-2. **Real-board bring-up (aarch64)** when the owner has hardware.
-3. **Publishing**: the owner runs the prepared 8-crate `cargo publish` sequence (then a README install
-   section); `eo9 bundle`; `eo9 new` scaffold.
-4. **Upstreaming**: the three staged branches remain on ice until the owner reviews/pushes them.
+1. **The round-3 owner decisions** (the full list with evidence is at the top of `GAPS.md`): storage
+   policy (rollback / auto-format / uberblock geometry / `rename` / operator threat model), networking
+   design (NIC sharing, l4 deadlines, error catch-alls), driver model (IOMMU, vendor:device filtering,
+   long-running drivers), website voice (authoring statement, jargon, banner, browser `save`), and
+   release process (hosted CI, publish automation/rehearsal, crate naming, guest-SDK publishing).
+2. **The round-3 tracked queue**, highest-leverage first: the nested-forwarding bug (the flagship
+   `pci.filtered $ disk.virtio $ fs.eofs` attenuation pattern fails at first I/O), the fused-composition
+   compile-cache miss (blocks all metal networking/driver iteration), the fsck/scrub/df storage surface,
+   net.virtio's interrupt conversion, and the "tools must tell the truth" env/refusal pass.
+3. **Real-board bring-up (aarch64)** when the owner has hardware.
+4. **Publishing**: the owner runs the prepared 8-crate `cargo publish` sequence (then a README install
+   section); `eo9 bundle`; `eo9 new` scaffold. The publish pre-flight is green; hosted CI and the
+   local-registry rehearsal are owner decisions above.
+5. **Upstreaming**: the three staged branches remain on ice until the owner reviews/pushes them.
 
 See `GAPS.md` for known limitations and the user-study triage.
