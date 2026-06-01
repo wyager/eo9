@@ -2054,6 +2054,59 @@ fn a_damaged_disk_image_is_a_typed_error_not_a_crash() {
 }
 
 #[test]
+fn corruption_reads_as_an_integrity_failure_not_generic_io() {
+    // Study 07 finding S7-5: corruption used to surface as FsError::Io("block checksum
+    // mismatch") — indistinguishable from a flaky cable except by string-matching debug
+    // text. The provider now prefixes every integrity failure with a fixed marker, so
+    // users (and, until the WIT gains a corruption variant, programs) can tell rot from
+    // I/O trouble.
+    let store = temp_store("eofs-integrity-error");
+    let dir = temp_store("eofs-integrity-error-images");
+    let image = dir.join("disk.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+
+    let format = eo9(&store, &["mkfs.eofs", image_arg, "--size", "4M"]);
+    assert_eq!(format.code, 0, "stderr: {}", format.stderr);
+    let write = eo9(
+        &store,
+        &[
+            "--disk",
+            image_arg,
+            "-c",
+            "fs.eofs $ readwrite /keep.txt integrity-canary-payload-x",
+        ],
+    );
+    assert_eq!(write.code, 0, "stderr: {}", write.stderr);
+
+    // Corrupt the file's data: flip bytes well past the uberblocks, in the data region.
+    let mut bytes = fs::read(&image).expect("read image");
+    let needle = b"integrity-canary-payload-x";
+    let at = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .expect("canary stored raw (incompressible short payload)");
+    bytes[at] ^= 0x40;
+    fs::write(&image, &bytes).expect("write corrupted image");
+
+    let read = eo9(
+        &store,
+        &["--disk", image_arg, "-c", "fs.eofs $ cat /keep.txt"],
+    );
+    assert_eq!(read.code, 1, "stdout: {}", read.stdout);
+    let all = format!("{}{}", read.stdout, read.stderr);
+    assert!(
+        all.contains("integrity check failed"),
+        "corruption must read as an integrity failure: {all}"
+    );
+    // And the corrupted bytes were never returned.
+    assert!(
+        !read.stdout.contains("integrity-canary"),
+        "stdout: {}",
+        read.stdout
+    );
+}
+
+#[test]
 fn a_failed_rewrite_never_destroys_the_previous_file_content() {
     // Study 07 finding S7-4: `readwrite` (open with TRUNCATE, then write) used to commit
     // the truncation as its own transaction, so a rewrite whose write failed (NoSpace)

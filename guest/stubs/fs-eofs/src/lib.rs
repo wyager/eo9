@@ -245,6 +245,12 @@ fn device_error(error: DeviceError) -> FsError {
 }
 
 /// Map the engine's error type onto the `eo9:fs` error variants.
+///
+/// Integrity failures (checksum mismatches, corrupt structures) lead with a fixed
+/// "integrity check failed:" prefix so they are distinguishable from ordinary I/O
+/// failures even though `eo9:fs` has no dedicated corruption variant yet — a flaky cable
+/// and rotting media must not read the same (study 07, S7-5). The complete fix is a WIT
+/// addition (`integrity(string)` in `fs-error`), recorded in plan/14.
 fn map_error(error: eofs_core::FsError) -> FsError {
     match error {
         eofs_core::FsError::NotFound => FsError::NotFound,
@@ -255,6 +261,13 @@ fn map_error(error: eofs_core::FsError) -> FsError {
         eofs_core::FsError::DirectoryNotEmpty => {
             FsError::Io(String::from("directory is not empty"))
         }
+        eofs_core::FsError::ChecksumMismatch => FsError::Io(String::from(
+            "integrity check failed: block checksum mismatch (the stored data does not \
+             match its recorded hash; the device is corrupted at this location)",
+        )),
+        eofs_core::FsError::Corrupt(what) => FsError::Io(alloc::format!(
+            "integrity check failed: corrupt filesystem structure ({what})"
+        )),
         other => FsError::Io(alloc::format!("{other}")),
     }
 }
