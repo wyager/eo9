@@ -405,3 +405,17 @@ Match the priority order above; (1)+(2) unblock I2.
     missing admit-policy — to the "add the `pci` token" message, which is misleading when the
     missing thing is the policy middleware (kernel message fix, area 12); (b) the browser /bin
     does not carry the policy stubs yet (recorded, not done).
+
+27. **`fs.filtered` + `fs.policy-subtree`: per-path filesystem attenuation as composed policy
+    (2026-06-01, plan/02 D25).** The most-requested attenuator shape — finer than `--fs-root`,
+    or `fs.readonly`'s all-or-nothing — now exists as ordinary middleware:
+    `fs.policy-subtree --prefix "/docs" --access read-write $ fs.filtered $ program` allows
+    operations under `/docs` and denies everything else;  `--access read-only` additionally
+    turns mutations inside the subtree into the fs API's own `read-only` error while reads pass
+    through. Both stubs are in GUEST_COMPONENTS and the kernel store. Security: both the
+    middleware and the policy normalize paths before any prefix comparison (and the middleware
+    forwards the normalized path), so `/docs/../secret.txt` is denied by the *policy gate* —
+    test-pinned in tests/eo9-integration/tests/fs_filtered.rs (`path_traversal_cannot_escape_the_subtree`),
+    along with allow/deny/read-only end-to-end over fs.memfs, deny-all-when-unconfigured, and
+    purity. Follow-up: a metal interactive demo and the browser /bin additions ride with the
+    later milestones of this branch.

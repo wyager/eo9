@@ -1,0 +1,16 @@
+# The subtree path policy for fs.filtered ("policies are programs").
+[package]
+name = "eo9-stub-fs-policy-subtree"
+description = "Eo9 standard policy `fs.policy-subtree`: an eo9:fs/path-policy component permitting operations under a configured path prefix (read-write or read-only) and denying everything outside it. Pure (imports nothing); composed as `fs.policy-subtree --prefix ... --access ... $ fs.filtered $ program`."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

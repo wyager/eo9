@@ -331,3 +331,14 @@ review pending).
     by composition (fused, wiring-tree-visible), and purity means "no capability imports" —
     types-only uses and the `eo9:rt/*` runtime riders are not capabilities, and an impure
     policy's extra imports stay visible as composition residuals (test-pinned).
+
+25. **`eo9:fs` gains `path-policy` and the `filtered`/`subtree-policy` worlds (2026-06-01,
+    plan/02 D24's conventions).** `path-policy` is the per-path decision function
+    (`check: func(path: string, op: fs-operation) -> verdict`, verdict = allow | deny |
+    read-only); `fs.filtered` is the attenuating middleware (`import fs; import path-policy;
+    export fs`); `subtree-config` configures the standard `fs.policy-subtree` policy (prefix +
+    read-write/read-only access). Path-traversal defense is part of the *interface contract*:
+    the middleware normalizes every path (`.`/`..` resolved, separators collapsed, root-escapes
+    refused) before the policy sees it and forwards that same normalized path to the underlying
+    fs, so the path ruled on is the path accessed; policies normalize defensively as well. The
+    fs interface itself, the existing fs worlds, and every existing fs stub are untouched.

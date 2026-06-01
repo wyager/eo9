@@ -42,9 +42,11 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-entropy-none",
     "eo9-stub-entropy-seeded",
     "eo9-stub-fs-eofs",
+    "eo9-stub-fs-filtered",
     "eo9-stub-fs-memfs",
     "eo9-stub-fs-none",
     "eo9-stub-fs-overlay",
+    "eo9-stub-fs-policy-subtree",
     "eo9-stub-fs-readonly",
     "eo9-stub-net-l2-deny",
     "eo9-stub-net-l2-none",
@@ -128,6 +130,11 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // virtio disk (boot with the `pci` grant and the xtask `disk` flag).
     ("eo9-stub-disk-virtio", "disk.virtio"),
     ("eo9-stub-fs-eofs", "fs.eofs"),
+    // The path-policy fs attenuator and its standard subtree policy, so per-path grants
+    // compose at the metal prompt: `fs.policy-subtree --prefix /x --access read-only $
+    // fs.filtered $ <program>` ("policies are programs", SPEC).
+    ("eo9-stub-fs-filtered", "fs.filtered"),
+    ("eo9-stub-fs-policy-subtree", "fs.policy-subtree"),
     // The PCI attenuator and its standard admit policies, so a metal composition can
     // grant a driver exactly one device ("policies are programs", SPEC):
     // `pci.admit-address --allow … $ pci.filtered $ lspci` (fixed bus address) or

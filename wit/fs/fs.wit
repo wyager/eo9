@@ -133,6 +133,55 @@ interface memfs-config {
     configure: func() -> result<fs-impl, string>;
 }
 
+/// A policy deciding what an attenuated filesystem view permits, per path and
+/// operation ("policies are programs" — SPEC, Eo9 API design). Policy providers should
+/// import nothing — purity is what makes a policy auditable and deterministic.
+///
+/// The `fs.filtered` middleware **normalizes** every path (`.` and `..` segments
+/// resolved, repeated separators collapsed) before consulting the policy, and uses that
+/// same normalized path for the underlying operation — so the path the policy ruled on
+/// is exactly the path that gets accessed, and `/docs/../etc/passwd` can never sneak
+/// past a `/docs` rule. Paths that try to escape the root (more `..` than depth) are
+/// denied outright, before the policy is even asked. Policies should normalize
+/// defensively as well (the standard ones do), so a rule holds even under a middleware
+/// that forgets.
+interface path-policy {
+    /// The class of filesystem operation being attempted.
+    enum fs-operation {
+        /// Reading: open for read, stat, list-directory, open-exec.
+        read,
+        /// Mutating: open for write/create/truncate, create-directory, remove.
+        write,
+    }
+
+    /// What the policy decides for one path + operation.
+    enum verdict {
+        /// Permit the operation.
+        allow,
+        /// Refuse with the fs API's own `denied` error.
+        deny,
+        /// Permit reads of this path; refuse mutations with `read-only`.
+        read-only,
+    }
+
+    /// Decide whether `op` on `path` is permitted. `path` arrives normalized (see above).
+    check: func(path: string, op: fs-operation) -> verdict;
+}
+
+/// Compose-time configuration entry for fs.policy-subtree: `configure` binds the path
+/// prefix under which operations are permitted, and what kind of access the subtree
+/// gets. Unconfigured, the policy denies everything (never-trap rule).
+interface subtree-config {
+    /// What the policy grants inside the configured subtree.
+    enum subtree-access {
+        /// Reads and writes are allowed inside the subtree.
+        read-write,
+        /// Reads are allowed inside the subtree; writes get `read-only`.
+        read-only,
+    }
+    configure: func(prefix: string, access: subtree-access) -> result<_, string>;
+}
+
 /// fs.none — absence: exports the optional flavor answering `none`.
 world none {
     export fs-optional;
@@ -156,4 +205,22 @@ world readonly {
 world memfs {
     export fs;
     export memfs-config;
+}
+
+/// fs.filtered — attenuation over an underlying filesystem: every path operation is
+/// submitted to an imported path policy before it is forwarded. The policy is ordinary
+/// composed middleware (`fs.policy-subtree --prefix /docs --access read-write $
+/// fs.filtered $ program`), so it is fused at compile time, shows up in the wiring
+/// tree, and cannot be bypassed by the consumer.
+world filtered {
+    import fs;
+    import path-policy;
+    export fs;
+}
+
+/// fs.policy-subtree — the subtree path policy: operations are permitted under a
+/// configured prefix (read-write or read-only) and denied outside it.
+world subtree-policy {
+    export path-policy;
+    export subtree-config;
 }
