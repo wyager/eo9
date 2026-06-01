@@ -41,11 +41,15 @@ not granted shared-memory threads (thread spawning is itself a capability — se
 attenuating the attacker's clock is just provider substitution, the same mechanism as everything else.
 Two further layers exist for programs that *are* legitimately granted precise time: the compiler's speculative
 bounds-check masking stays enabled (this matters most on no-MMU targets, where bounds checks are explicit
-branches rather than guard pages), and the executor may flush microarchitectural state (caches, branch
-predictors) when switching between programs in different trust domains. That flush is an *execution attribute*
-a secret-holding program requests for itself or a scheduler policy at distrust boundaries — not an importable
-capability, since erasing one's own traces grants no authority; and it is paid only where it is needed, not on
-every context switch.
+branches rather than guard pages), and microarchitectural state (caches, branch predictors) can be flushed at
+trust boundaries. Flushing **is a granted capability** (`cache.flush`-style), not an ambient right or a free
+execution attribute — not because erasing your own traces reads or writes anything, but because a flush
+externalizes cost: the next programs to run find cold caches and run slower, so the ability to flush is the
+ability to degrade the rest of the system. The symmetric principle: *reading* microarchitectural state (via
+timing) requires the time capability; *perturbing* it (flushing) requires the cache capability; both default to
+denied. The flush's own cost is charged to the flusher's fuel, and the executor may additionally apply
+flush-on-switch as a scheduling policy at distrust boundaries — paid only where needed, never on every context
+switch.
 
 ## Virtualization
 
