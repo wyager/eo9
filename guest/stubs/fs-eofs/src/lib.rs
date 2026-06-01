@@ -15,11 +15,16 @@
 //!   with the default options (4 KiB blocks, lz4 on). A device that has the magic but
 //!   fails to mount is *never* reformatted — the error is reported instead, so corruption
 //!   can't silently become data loss.
-//! * **Every mutating operation commits.** `open` (when it creates or truncates),
-//!   `write`, `create-directory`, and `remove` each end with an eofs commit (root flip),
-//!   so completed operations are durable on the disk and crash consistency is the
-//!   engine's by construction. This trades write amplification for simplicity — fine for
-//!   the MVP, batching is a later refinement.
+//! * **Every completed mutating operation commits; failed ones roll back.** `write`,
+//!   `create-directory`, and `remove` each end with an eofs commit (root flip), so
+//!   completed operations are durable on the disk and crash consistency is the engine's
+//!   by construction. The one deliberate exception is `open` with TRUNCATE on an existing
+//!   file: the truncation is *staged* but not committed, so it becomes durable together
+//!   with the write that follows it — a rewrite is atomic, and a failed or abandoned
+//!   rewrite leaves the file's previous contents untouched on disk (study 07, S7-4). Any
+//!   operation that fails discards every uncommitted change (`Eofs::rollback`), so
+//!   half-applied state is never published. This trades write amplification for
+//!   simplicity — fine for the MVP, batching is a later refinement.
 //! * **Paths** are `/`-separated; empty and `.` segments are ignored and `..` steps up
 //!   one level (never above the root) — the same rules `fs.memfs` documents. The root is
 //!   a directory that cannot be opened, removed, or recreated.
@@ -180,6 +185,31 @@ fn with_fs<R>(f: impl FnOnce(&mut Eofs<DiskDevice>) -> Result<R, FsError>) -> Re
     STATE.with(f)
 }
 
+/// Run a *mutating* operation over the mounted filesystem with rewrite atomicity:
+/// if the operation fails, every uncommitted change is discarded (`Eofs::rollback`), so a
+/// half-applied multi-step change — a truncation whose rewrite never landed, a partially
+/// built directory edit — can never be published by a later commit. The committed,
+/// on-disk state only ever moves from one fully-applied operation to the next.
+///
+/// The operation must be re-runnable from any pending state it may itself have
+/// half-applied (the `open` truncate path tolerates an already-removed file for this
+/// reason); see the per-operation comments.
+fn mutate<R>(
+    f: impl Fn(&mut Eofs<DiskDevice>) -> Result<R, eofs_core::FsError>,
+) -> Result<R, FsError> {
+    with_fs(|eofs| match f(eofs) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            // Discard whatever the failed operation half-applied (and, deliberately, any
+            // earlier uncommitted state it was meant to complete — e.g. the pending
+            // truncate of a rewrite whose write just failed). What was last committed is
+            // exactly what a remount sees, so old content is never lost to a failure.
+            eofs.rollback();
+            Err(map_error(error))
+        }
+    })
+}
+
 fn device_error(error: DeviceError) -> FsError {
     FsError::Io(alloc::format!("device error: {error}"))
 }
@@ -281,29 +311,34 @@ impl fs::Guest for Stub {
         }
         let create = options.contains(OpenFlags::CREATE);
         let truncate = options.contains(OpenFlags::TRUNCATE);
-        with_fs(|eofs| {
-            let mut mutated = false;
+        mutate(|eofs| {
             match eofs.stat(&path) {
                 Ok(stat) => {
                     if stat.kind == eofs_core::NodeKind::Directory {
-                        return Err(FsError::IsADirectory);
+                        return Err(eofs_core::FsError::IsADirectory);
                     }
                     if truncate && stat.size > 0 {
                         // eofs has no truncate primitive yet: replace the file with an
-                        // empty one (same name, fresh object).
-                        eofs.remove(&path).map_err(map_error)?;
-                        eofs.create_file(&path).map_err(map_error)?;
-                        mutated = true;
+                        // empty one (same name, fresh object). Deliberately NOT committed
+                        // here — the truncation becomes durable together with the write
+                        // that follows it (or the next committing operation), so a rewrite
+                        // is atomic: if the write never happens or fails, the previous
+                        // content is still what the on-disk filesystem holds (study 07
+                        // finding S7-4). The `stat` guard makes this step re-runnable
+                        // after a partial failure.
+                        if eofs.stat(&path).is_ok() {
+                            eofs.remove(&path)?;
+                        }
+                        eofs.create_file(&path)?;
                     }
                 }
                 Err(eofs_core::FsError::NotFound) if create => {
-                    eofs.create_file(&path).map_err(map_error)?;
-                    mutated = true;
+                    // Creating a brand-new (empty) file destroys nothing; commit it so a
+                    // bare `touch` is durable on its own.
+                    eofs.create_file(&path)?;
+                    eofs.commit()?;
                 }
-                Err(error) => return Err(map_error(error)),
-            }
-            if mutated {
-                eofs.commit().map_err(map_error)?;
+                Err(error) => return Err(error),
             }
             Ok(())
         })?;
@@ -370,9 +405,9 @@ impl fs::Guest for Stub {
         if path.is_empty() {
             return Err(FsError::AlreadyExists);
         }
-        with_fs(|eofs| {
-            eofs.mkdir(&path).map_err(map_error)?;
-            eofs.commit().map_err(map_error)?;
+        mutate(|eofs| {
+            eofs.mkdir(&path)?;
+            eofs.commit()?;
             Ok(())
         })
     }
@@ -384,9 +419,9 @@ impl fs::Guest for Stub {
                 "cannot remove the root directory",
             )));
         }
-        with_fs(|eofs| {
-            eofs.remove(&path).map_err(map_error)?;
-            eofs.commit().map_err(map_error)?;
+        mutate(|eofs| {
+            eofs.remove(&path)?;
+            eofs.commit()?;
             Ok(())
         })
     }
@@ -433,9 +468,9 @@ impl fs::Guest for Stub {
         } else {
             src.read(0, len)
         };
-        let result = with_fs(|eofs| {
-            eofs.write(&file.path, offset, &bytes).map_err(map_error)?;
-            eofs.commit().map_err(map_error)?;
+        let result = mutate(|eofs| {
+            eofs.write(&file.path, offset, &bytes)?;
+            eofs.commit()?;
             Ok(WriteResult { bytes_written: len })
         });
         (src, result)

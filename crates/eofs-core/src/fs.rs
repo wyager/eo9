@@ -310,6 +310,20 @@ impl<D: BlockDevice> Eofs<D> {
         Ok(txg)
     }
 
+    /// Discard every change made since the last commit: the pending state returns to the
+    /// last committed transaction, exactly as a remount would see it. The blocks the
+    /// discarded changes wrote are unreferenced afterwards and are reclaimed by the next
+    /// [`gc`](Eofs::gc).
+    ///
+    /// This is what lets an embedder make a multi-step change (say, a truncate followed by
+    /// a write) atomic: apply the steps without committing, and if any step fails, roll
+    /// back — the on-disk filesystem never holds the half-applied state.
+    pub fn rollback(&mut self) {
+        self.live_root = self.committed_live_root;
+        self.snapshots = self.committed_snapshots;
+        self.dirty = false;
+    }
+
     // --- namespace operations --------------------------------------------------------------
 
     /// Create an empty file.

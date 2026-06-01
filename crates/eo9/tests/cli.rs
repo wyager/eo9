@@ -2014,3 +2014,69 @@ fn a_damaged_disk_image_is_a_typed_error_not_a_crash() {
     assert!(!all.contains("panicked"), "output: {all}");
     assert!(all.contains("error: fs("), "output: {all}");
 }
+
+#[test]
+fn a_failed_rewrite_never_destroys_the_previous_file_content() {
+    // Study 07 finding S7-4: `readwrite` (open with TRUNCATE, then write) used to commit
+    // the truncation as its own transaction, so a rewrite whose write failed (NoSpace)
+    // left a permanently empty file. The provider now stages the truncate and commits it
+    // together with the write — a rewrite is atomic. This test rewrites a small file with
+    // incompressible content on a deliberately tiny image until either a rewrite fails
+    // (pre-reclamation behaviour) or the iteration budget runs out (post-reclamation
+    // behaviour); in BOTH cases the file must hold the last successfully written content
+    // — never be empty, never hold a torn mixture.
+    let store = temp_store("eofs-atomic-rewrite");
+    let dir = temp_store("eofs-atomic-rewrite-images");
+    let image = dir.join("disk.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+
+    let format = eo9(&store, &["mkfs.eofs", image_arg, "--size", "32K"]);
+    assert_eq!(format.code, 0, "stderr: {}", format.stderr);
+
+    // Pseudo-random hex content per iteration: incompressible enough that lz4 cannot hide
+    // the space cost, unique per iteration so we can tell which write the file holds.
+    let content = |iteration: usize| -> String {
+        let mut state = 0x9E3779B97F4A7C15u64 ^ (iteration as u64).wrapping_mul(0xD1B54A32D192ED03);
+        let mut out = format!("iteration-{iteration}-");
+        for _ in 0..2048 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.push_str(&format!("{:02x}", state as u8));
+        }
+        out
+    };
+
+    let mut last_successful = String::new();
+    for iteration in 1..=12 {
+        let payload = content(iteration);
+        let command = format!("fs.eofs $ readwrite /keep.txt {payload}");
+        let run = eo9(&store, &["--disk", image_arg, "-c", &command]);
+        if run.code == 0 {
+            last_successful = payload;
+        } else {
+            // The rewrite failed (out of space). That is allowed; silently losing the
+            // previous content is not.
+            assert!(
+                !last_successful.is_empty(),
+                "the very first write failed: stderr: {}",
+                run.stderr
+            );
+            break;
+        }
+    }
+    assert!(!last_successful.is_empty());
+
+    // Whatever happened above, the file now holds the last successfully written content.
+    let read = eo9(
+        &store,
+        &["--disk", image_arg, "-c", "fs.eofs $ cat /keep.txt"],
+    );
+    assert_eq!(read.code, 0, "stderr: {}", read.stderr);
+    assert!(
+        read.stdout.contains(&last_successful),
+        "the file does not hold the last successfully written content (it holds {} bytes); \
+         a failed rewrite destroyed data",
+        read.stdout.len()
+    );
+}
