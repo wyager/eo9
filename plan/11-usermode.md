@@ -339,3 +339,32 @@ its first milestones, and to be the place where cross-area seams get found.
     *before* the implicit-run arm, so none of the spellings can fall through to store-name
     resolution (the study's shadowing hazard: `eo9 version` used to be looked up as a program
     named `version`). Help documents it; a CLI test pins all three spellings.
+
+26. **Session establishment is atomic with respect to sweeps (2026-06-01, branch
+    `area/11-session-lock-race`).** D24's per-process sessions had a race a reviewer caught
+    during the dist-fixes merge: the session lock was created at its final path and *then*
+    locked, so a concurrent process's sweep could open it in that window, see it unheld,
+    conclude the session dead, and unlink the lock — after which a later sweep deleted the
+    live session directory while its owner was still populating it (the flaky
+    `concurrent_invocations_of_one_store_do_not_corrupt_the_session` failures: "cannot place
+    … into the session bin view: No such file or directory"). Two changes close it, both in
+    `materialize_session`/`sweep_dead_sessions`:
+    - *Visible implies locked.* The session lock is created and locked under a temporary
+      name (`session-<pid>.lock.tmp`), then renamed into place — `session-<pid>.lock` can
+      never be observed unlocked at its final path.
+    - *Establishment and sweeps exclude each other.* A new shell-root guard
+      (`shell/.sessions.lock`) is held shared by establishment (from before the rename until
+      the session directory exists) and exclusively by every sweep (`try_lock`; a contended
+      sweep is skipped — it is best-effort housekeeping). This also closes the pid-reuse
+      variant the rename alone cannot: a sweep that had already opened a *dead* same-pid
+      lock and seen it unheld can no longer delete the path after a live lock is renamed
+      over it, because that rename cannot happen while the sweep holds the guard. Sweeps
+      additionally clean up orphaned `.lock.tmp` files (a creator that died before its
+      rename).
+    Reproduction and verification (release-shaped stress: waves of 16 concurrent `eo9 -c`
+    invocations against one store under CPU saturation, so preemption lands inside the
+    create-then-lock window): unfixed 2 failures / 640 invocations; fixed 0 / 640. The
+    previously-flaky CLI test passed 25/25 under suite load + CPU hogs after the fix, and a
+    new `session_sweeps_never_delete_a_live_session` regression test (4 waves × 6
+    invocations, so each wave's sweeps run against the prior wave's dead sessions while its
+    siblings establish) covers the collision shape in CI.
