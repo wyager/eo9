@@ -21,7 +21,7 @@ setup:
 	@command -v rustup >/dev/null 2>&1 || { \
 	  echo "error: rustup not found — install it from https://rustup.rs and re-run 'make setup'"; exit 1; }
 	rustup target add wasm32-unknown-unknown
-	@command -v wasm-tools >/dev/null 2>&1 || cargo install --locked wasm-tools
+	@command -v wasm-tools >/dev/null 2>&1 || cargo install --locked wasm-tools --version '~1.250'
 	@echo ""
 	@echo "Prerequisite summary:"
 	@command -v rustup >/dev/null 2>&1 \
@@ -32,12 +32,12 @@ setup:
 	  || echo "  MISSING  wasm32-unknown-unknown target (rustup target add wasm32-unknown-unknown)"
 	@command -v wasm-tools >/dev/null 2>&1 \
 	  && echo "  ok       wasm-tools" \
-	  || echo "  MISSING  wasm-tools (cargo install --locked wasm-tools)"
+	  || echo "  MISSING  wasm-tools (cargo install --locked wasm-tools --version '~1.250')"
 	@command -v qemu-system-aarch64 >/dev/null 2>&1 \
 	  && echo "  ok       qemu-system-aarch64" \
 	  || { echo "  optional qemu-system-aarch64 not found — only needed for 'make qemu'; install it with"; \
 	       echo "           your package manager (e.g. 'brew install qemu' / 'apt install qemu-system-arm')"; }
-	-@cargo xtask doctor
+	@cargo xtask doctor
 
 # Auto-setup: build targets depend on this so a missing installable prerequisite
 # (wasm-tools, the wasm32 target) triggers `make setup` automatically instead of an error.

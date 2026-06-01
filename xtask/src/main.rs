@@ -425,7 +425,7 @@ fn doctor(root: &Path) -> Result<(), String> {
         }
         None => {
             println!(
-                "  MISSING  wasm-tools — run `cargo install --locked wasm-tools` (or `make setup`)"
+                "  MISSING  wasm-tools — run `cargo install --locked wasm-tools --version '~{PINNED_WASM_TOOLS_CLI}'` (or `make setup`)"
             );
             missing.push("wasm-tools");
         }
