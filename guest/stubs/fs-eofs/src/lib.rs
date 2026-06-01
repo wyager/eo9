@@ -114,14 +114,20 @@ impl BlockDevice for DiskDevice {
         let dst = Buffer::new(len);
         let (dst, result) =
             poll_eager(disk::read(&self.handle, offset, dst)).ok_or(DeviceError::Io)?;
+        // Preserve the device's own error text (a driver's typed, labelled message) so a
+        // real hardware failure stays attributable at the console (study 09 finding 2).
         let read = result.map_err(|err| match err {
             disk::ReadError::OutOfRange => DeviceError::OutOfRange,
-            disk::ReadError::NotFound | disk::ReadError::Io(_) => DeviceError::Io,
+            disk::ReadError::Io(message) => DeviceError::IoNamed(message),
+            disk::ReadError::NotFound => DeviceError::Io,
         })?;
         if read.bytes_read < len {
             // eofs never issues reads past the end it knows about; a short read is a
             // device failure, not end-of-device.
-            return Err(DeviceError::Io);
+            return Err(DeviceError::IoNamed(alloc::format!(
+                "short read from the device ({} of {len} bytes)",
+                read.bytes_read
+            )));
         }
         buf.copy_from_slice(&dst.read(0, len));
         Ok(())
@@ -138,10 +144,16 @@ impl BlockDevice for DiskDevice {
             poll_eager(disk::write(&self.handle, offset, src)).ok_or(DeviceError::Io)?;
         let written = result.map_err(|err| match err {
             disk::WriteError::OutOfRange => DeviceError::OutOfRange,
-            disk::WriteError::ReadOnly | disk::WriteError::Io(_) => DeviceError::Io,
+            disk::WriteError::Io(message) => DeviceError::IoNamed(message),
+            disk::WriteError::ReadOnly => {
+                DeviceError::IoNamed(String::from("the device is read-only"))
+            }
         })?;
         if written.bytes_written < len {
-            return Err(DeviceError::Io);
+            return Err(DeviceError::IoNamed(alloc::format!(
+                "short write to the device ({} of {len} bytes)",
+                written.bytes_written
+            )));
         }
         Ok(())
     }
@@ -150,7 +162,13 @@ impl BlockDevice for DiskDevice {
         // The engine calls this at every commit boundary (before and after the uberblock
         // write), so durability rides on the imported disk's own flush.
         let result = poll_eager(disk::flush(&self.handle)).ok_or(DeviceError::Io)?;
-        result.map_err(|_| DeviceError::Io)
+        result.map_err(|err| match err {
+            disk::WriteError::OutOfRange => DeviceError::OutOfRange,
+            disk::WriteError::Io(message) => DeviceError::IoNamed(message),
+            disk::WriteError::ReadOnly => {
+                DeviceError::IoNamed(String::from("the device is read-only"))
+            }
+        })
     }
 }
 
@@ -166,6 +184,20 @@ impl BlockDevice for DiskDevice {
 /// mount error is reported instead.
 fn mount_or_format() -> Result<Eofs<DiskDevice>, FsError> {
     let device = DiskDevice::new().map_err(device_error)?;
+    // A device that reports size 0 is not "too small" — it is a device that could not be
+    // probed at all (the `eo9:disk` size query cannot fail, so an unreachable device has
+    // no meaningful size). Issue one read so the device reports its *real* typed error —
+    // e.g. a driver's "no virtio-blk function is visible …" — instead of burying the cause
+    // under a format-options message (study 09 finding 3).
+    if device.size() == 0 {
+        let mut probe = [0u8; 1];
+        return match device.read_at(0, &mut probe) {
+            Err(error) => Err(device_error(error)),
+            Ok(()) => Err(FsError::Io(String::from(
+                "the disk reports a size of 0 bytes",
+            ))),
+        };
+    }
     match eofs_core::probe(&device).map_err(map_error)? {
         eofs_core::ImageState::Eofs { .. } | eofs_core::ImageState::Unmountable => {
             Eofs::mount(device).map_err(map_error)

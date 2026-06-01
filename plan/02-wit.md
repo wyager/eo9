@@ -285,3 +285,20 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
     before first entry. The synthesized exporters build the interface structurally (function-only
     interfaces have no nominal identity), so the WIT file is the canonical documentation and the
     executors' lookup name (`eo9:rt/configured@0.1.0` / `bind`) is the binding contract.
+
+22. **The DMA contract needs to be stated in `wit/pci` (study 09 finding 9 — proposed doc-comment
+    addition, not yet applied; wit/ is owned by other in-flight work).** Drivers today discover the
+    `alloc-dma` rules by hitting `exhausted`. The kernel root provider's actual contract, which the
+    `alloc-dma` / `dma-buffer` doc comments should state verbatim:
+
+    * Every allocation is **physically contiguous** and **page-aligned** (4 KiB).
+    * Per-allocation ceiling **4 MiB**; at most **64 live buffers per task**; exceeding either
+      answers `exhausted` (the cap signal — drivers should treat it as "ask for less", not retry).
+    * `dma-address` is the device-visible address of the whole buffer; with the kernel's identity
+      map it equals the CPU address (no IOMMU yet — see the provider module docs' containment note).
+    * **Lifetime / teardown:** a buffer lives until its handle drops or its task ends. The kernel
+      guarantees quiesce-before-free: when a task ends (completion, trap, or kill) or a buffer is
+      dropped, every device the task armed via `set-bus-master(true)` has bus mastering cleared
+      *before* any of the task's buffer memory is reclaimed, so a driver that never tears down
+      explicitly is still memory-safe (kernel/src/wasm/pci_provider.rs, plan/12 D62). Drivers should
+      still quiesce their own device (reset / bus-master off) at clean shutdown when they can.

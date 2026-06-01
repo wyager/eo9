@@ -42,6 +42,17 @@
 //! state (no configure interface) is "claim the first virtio-blk function on first
 //! use"; first use also prints one `disk.virtio: …` diagnostic line so a metal session
 //! shows what was probed.
+//!
+//! **The DMA contract this driver relies on** (what `alloc-dma` actually guarantees on the
+//! kernel root — proposed for the WIT doc comments in plan/02 D22): allocations are
+//! physically contiguous and page-aligned (4 KiB); at most 4 MiB per allocation and 64
+//! live buffers per task, with `exhausted` as the cap signal; `dma-address` equals the CPU
+//! address under the kernel's identity map (no IOMMU yet); and the kernel quiesces every
+//! device a task armed (bus mastering cleared, interrupt lines masked) *before* any of the
+//! task's DMA buffers are freed, so even a killed driver never leaves its device DMA-ing
+//! into reclaimed memory. Driver authors should still disable bus mastering themselves at
+//! clean shutdown where the design allows it; this driver's per-command lifetime means it
+//! relies on the kernel-side guarantee.
 
 #![no_std]
 
@@ -269,7 +280,10 @@ impl Driver {
             .ok_or_else(|| {
                 String::from(
                     "disk.virtio: no virtio-blk function is visible through the granted \
-                     pci capability (expected vendor 0x1af4, device 0x1042)",
+                     pci capability (expected vendor 0x1af4, device 0x1042) — attach one \
+                     to this boot (`cargo xtask qemu <arch> pci disk`, or QEMU \
+                     `-device virtio-blk-pci,disable-legacy=on`), or check that an \
+                     attenuator composed in front of this driver allows the disk's address",
                 )
             })?;
         let address = target.address;
