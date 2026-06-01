@@ -56,6 +56,10 @@ pub enum ParseError {
     GateNeedsDollar { gate: &'static str },
     /// The two sides of a `with (…) as (…)` tuple have different lengths.
     TupleArityMismatch { providers: usize, slots: usize },
+    /// `detach` without its required `restart <policy>` clause.
+    DetachNeedsRestart,
+    /// `svc` with an unknown subcommand.
+    UnknownSvcCommand { found: String },
 }
 
 impl fmt::Display for ParseError {
@@ -84,6 +88,17 @@ impl fmt::Display for ParseError {
             ParseError::TupleArityMismatch { providers, slots } => write!(
                 f,
                 "`with` tuple arity mismatch: {providers} provider(s) but {slots} slot name(s)"
+            ),
+            ParseError::DetachNeedsRestart => write!(
+                f,
+                "`detach` needs a restart policy: `detach <name> = <program> restart <policy>` \
+                 (e.g. `restart restart.never`; the standard policies are restart.never, \
+                 restart.always, and restart.backoff)"
+            ),
+            ParseError::UnknownSvcCommand { found } => write!(
+                f,
+                "unknown `svc` subcommand `{found}`; expected `svc` (or `svc list`), \
+                 `svc log <name>`, `svc stop <name>`, or `svc clear <name>`"
             ),
         }
     }
@@ -200,6 +215,16 @@ impl Parser {
                     let expr = self.expr()?;
                     return Ok(Command::Save { name, expr });
                 }
+                "detach" => {
+                    self.next();
+                    let name = self.expect_word("a name for the service")?;
+                    self.expect_token(Token::Equals, "`=` after the service name")?;
+                    return self.detach_body(name);
+                }
+                "svc" => {
+                    self.next();
+                    return self.svc_command();
+                }
                 "help" => return self.builtin_no_args(Command::Help),
                 "env" => {
                     // Bare `env` is the session view; `env <expr>` is the capability
@@ -225,6 +250,70 @@ impl Parser {
         }
 
         Ok(Command::Run(self.expr()?))
+    }
+
+    /// The body of a `detach` command after `detach <name> =`: a program expression,
+    /// the keyword `restart`, and a restart-policy expression. The split happens at the
+    /// *last* top-level (paren-depth-0) `restart` word, so a program that itself is
+    /// named `restart` still parses (the policy clause is the last one on the line).
+    fn detach_body(&mut self, name: String) -> Result<Command, ParseError> {
+        let rest: Vec<Token> = self.tokens[self.pos..].to_vec();
+        self.pos = self.tokens.len();
+
+        let mut depth: usize = 0;
+        let mut split: Option<usize> = None;
+        for (index, token) in rest.iter().enumerate() {
+            match token {
+                Token::LParen => depth += 1,
+                Token::RParen => depth = depth.saturating_sub(1),
+                Token::Word(word) if depth == 0 && word == "restart" => split = Some(index),
+                _ => {}
+            }
+        }
+        let Some(split) = split else {
+            return Err(ParseError::DetachNeedsRestart);
+        };
+
+        let mut program = Parser::new(rest[..split].to_vec());
+        let expr = program.expr()?;
+        program.expect_end()?;
+
+        let mut policy_parser = Parser::new(rest[split + 1..].to_vec());
+        let policy = policy_parser.expr()?;
+        policy_parser.expect_end()?;
+
+        Ok(Command::Detach { name, expr, policy })
+    }
+
+    /// `svc` subcommands: bare `svc` / `svc list` (the table), and `log`/`stop`/`clear`
+    /// with a service name.
+    fn svc_command(&mut self) -> Result<Command, ParseError> {
+        let Some(token) = self.peek() else {
+            return Ok(Command::SvcList);
+        };
+        let Token::Word(word) = token else {
+            return Err(ParseError::UnexpectedToken {
+                found: token.describe(),
+                expected: "an `svc` subcommand (list, log, stop, clear)",
+            });
+        };
+        let sub = word.clone();
+        match sub.as_str() {
+            "list" => {
+                self.next();
+                Ok(Command::SvcList)
+            }
+            "log" | "stop" | "clear" => {
+                self.next();
+                let name = self.expect_word("a service name")?;
+                Ok(match sub.as_str() {
+                    "log" => Command::SvcLog(name),
+                    "stop" => Command::SvcStop(name),
+                    _ => Command::SvcClear(name),
+                })
+            }
+            _ => Err(ParseError::UnknownSvcCommand { found: sub }),
+        }
     }
 
     fn builtin_no_args(&mut self, command: Command) -> Result<Command, ParseError> {
@@ -785,6 +874,131 @@ mod tests {
             Err(ParseError::TupleArityMismatch {
                 providers: 3,
                 slots: 2
+            })
+        );
+    }
+
+    // -- detach and svc -----------------------------------------------------------
+
+    #[test]
+    fn detach_parses_program_arguments_and_policy() {
+        let command = parse_command("detach ticker = cruncher --rounds 50 restart restart.never")
+            .expect("parses");
+        assert_eq!(
+            command,
+            Command::Detach {
+                name: "ticker".to_string(),
+                expr: app(name("cruncher"), vec![flag("rounds", word("50"))]),
+                policy: name("restart.never"),
+            }
+        );
+    }
+
+    #[test]
+    fn detach_policy_can_be_configured_and_parenthesized() {
+        // The policy clause is itself a full expression: configure flags apply.
+        let command = parse_command(
+            "detach worker = cruncher restart restart.backoff --max-restarts 5 --base-delay-ms 200",
+        )
+        .expect("parses");
+        assert_eq!(
+            command,
+            Command::Detach {
+                name: "worker".to_string(),
+                expr: name("cruncher"),
+                policy: app(
+                    name("restart.backoff"),
+                    vec![
+                        flag("max-restarts", word("5")),
+                        flag("base-delay-ms", word("200"))
+                    ]
+                ),
+            }
+        );
+        // Parenthesized policy: identical meaning.
+        let parenthesized = parse_command(
+            "detach worker = cruncher restart (restart.backoff --max-restarts 5 --base-delay-ms 200)",
+        )
+        .expect("parses");
+        assert_eq!(command, parenthesized);
+    }
+
+    #[test]
+    fn detach_program_can_be_a_composition() {
+        let command =
+            parse_command("detach greeter = time.frozen $ hello --name svc restart restart.always")
+                .expect("parses");
+        assert_eq!(
+            command,
+            Command::Detach {
+                name: "greeter".to_string(),
+                expr: compose(
+                    name("time.frozen"),
+                    app(name("hello"), vec![flag("name", word("svc"))])
+                ),
+                policy: name("restart.always"),
+            }
+        );
+    }
+
+    #[test]
+    fn detach_without_a_restart_clause_is_an_error() {
+        assert_eq!(
+            parse_command("detach ticker = cruncher --rounds 50"),
+            Err(ParseError::DetachNeedsRestart)
+        );
+    }
+
+    #[test]
+    fn detach_splits_at_the_last_top_level_restart_keyword() {
+        // A program named `restart` (uncommon but legal) still parses: the *last*
+        // top-level `restart` is the clause separator.
+        let command = parse_command("detach r = restart restart restart.never").expect("parses");
+        assert_eq!(
+            command,
+            Command::Detach {
+                name: "r".to_string(),
+                expr: name("restart"),
+                policy: name("restart.never"),
+            }
+        );
+        // A `restart` inside parentheses is not a separator.
+        let command = parse_command("detach r = (restart --mode soft) restart restart.never")
+            .expect("parses");
+        assert_eq!(
+            command,
+            Command::Detach {
+                name: "r".to_string(),
+                expr: app(name("restart"), vec![flag("mode", word("soft"))]),
+                policy: name("restart.never"),
+            }
+        );
+    }
+
+    #[test]
+    fn svc_subcommands_parse() {
+        assert_eq!(parse_command("svc"), Ok(Command::SvcList));
+        assert_eq!(parse_command("svc list"), Ok(Command::SvcList));
+        assert_eq!(
+            parse_command("svc log ticker"),
+            Ok(Command::SvcLog("ticker".to_string()))
+        );
+        assert_eq!(
+            parse_command("svc stop ticker"),
+            Ok(Command::SvcStop("ticker".to_string()))
+        );
+        assert_eq!(
+            parse_command("svc clear ticker"),
+            Ok(Command::SvcClear("ticker".to_string()))
+        );
+    }
+
+    #[test]
+    fn svc_unknown_subcommand_is_an_error() {
+        assert_eq!(
+            parse_command("svc restart ticker"),
+            Err(ParseError::UnknownSvcCommand {
+                found: "restart".to_string()
             })
         );
     }

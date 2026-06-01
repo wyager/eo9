@@ -368,3 +368,18 @@ its first milestones, and to be the place where cross-area seams get found.
     new `session_sweeps_never_delete_a_live_session` regression test (4 waves × 6
     invocations, so each wave's sweeps run against the prior wave's dead sessions while its
     siblings establish) covers the collision shape in CI.
+
+### Executor v1: `--svc` and the process-bound registry (2026-06-01, area 11)
+
+* **`eo9 --svc`** (a global flag) grants the shell session both halves of `eo9:svc`, backed by a
+  `ServiceRegistry` created per invocation and bound to the process (owner ruling E: registry
+  lifetime is a root-process configuration; the CLI's choice is "dies with `eo9`"). Children
+  spawned from the shell never inherit it (owner ruling B: detach is an explicit grant).
+* **The drive loop** (`run::drive_with_services`) pumps the foreground task and the registry from
+  the same loop — fuel still has one source. When everything is parked it waits on the foreground
+  doorbell with a 10 ms ceiling so due service restarts fire promptly.
+* **Teardown**: when the shell exits with services still alive, the CLI names them, stops them, and
+  explains the lifetime rule on stderr ("services live only as long as this eo9 process").
+* The eo9 binary's embedded component set now includes the three restart-policy stubs (60 bundled
+  programs); `eo9-bundled-programs/data` is NOT refreshed on this branch (the post-merge
+  refresh-components convention from the canonical checkout applies).

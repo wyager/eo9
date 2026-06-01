@@ -12,7 +12,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::ast::{Command, Expr};
-use crate::backend::{AbnormalExit, Backend, ComponentKind, Outcome};
+use crate::backend::{AbnormalExit, Backend, ComponentKind, Outcome, ServiceInfo};
 use crate::envinfo::{self, SessionManifest};
 use crate::eval::{EvalError, Evaluator, complete_args};
 use crate::parse::parse_command;
@@ -124,6 +124,11 @@ impl<B: Backend> Session<B> {
             Command::Exit => LineResult::Exit,
             Command::Let { name, expr } => self.run_let(name, &expr).await,
             Command::Save { name, expr } => self.run_save(name, &expr).await,
+            Command::Detach { name, expr, policy } => self.run_detach(name, &expr, &policy).await,
+            Command::SvcList => self.run_svc_list(),
+            Command::SvcLog(name) => self.run_svc_log(&name),
+            Command::SvcStop(name) => self.run_svc_stop(&name),
+            Command::SvcClear(name) => self.run_svc_clear(&name),
             Command::Describe(expr) => self.run_describe(&expr, false).await,
             Command::Imports(expr) => self.run_describe(&expr, true).await,
             Command::Run(expr) => self.run_program(&expr).await,
@@ -261,6 +266,224 @@ impl<B: Backend> Session<B> {
         }
     }
 
+    /// `detach <name> = <expr> restart <policy>`: compose the program (with the same
+    /// environment rule as a foreground run), evaluate the restart policy, and hand both
+    /// to the service registry. The service then runs in the background, outliving this
+    /// command — and, on hosts whose registry outlives the shell, this shell.
+    async fn run_detach(&mut self, name: String, expr: &Expr, policy: &Expr) -> LineResult {
+        let (can_detach, _) = self.backend.svc_grants();
+        if !can_detach {
+            return self.refuse_no_svc("detach");
+        }
+
+        // The same name rules as `save` (the registry enforces them too; checking here
+        // gives the friendlier, earlier message).
+        let name_ok = !name.is_empty()
+            && !name.starts_with('.')
+            && !name.ends_with('.')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_');
+        if !name_ok {
+            let message = format!(
+                "error: `detach` refused: `{name}` is not a usable service name (letters, \
+                 digits, `-`, `_`, and interior `.` only)"
+            );
+            self.backend.print_error(&message);
+            return LineResult::Error(message);
+        }
+
+        // The program: evaluated exactly like a foreground command — applied arguments
+        // become the service's `main` arguments, the kind must be a binary, missing
+        // arguments are completed/refused against the signature, and the session's
+        // granted environment (when there is one) is composed in. A detached service
+        // runs with what *this session* could have given a foreground run, never more.
+        let mut evaluator = Evaluator::new(&mut self.backend, &self.bindings);
+        let output = match evaluator.eval(expr).await {
+            Ok(output) => output,
+            Err(err) => return self.report(err),
+        };
+        let mut component = output.component;
+        let mut args = output.args;
+
+        let info = self.backend.describe(&component);
+        if info.kind == ComponentKind::Provider {
+            return self.report(EvalError::TopLevelProvider);
+        }
+        if let Err(err) = complete_args(&mut args, &info.args) {
+            return self.report(err);
+        }
+        if let Some(environment) = &self.environment {
+            let environment = match self.backend.duplicate(environment) {
+                Ok(environment) => environment,
+                Err(err) => return self.report(EvalError::Backend(err)),
+            };
+            component = match self.backend.compose(environment, component) {
+                Ok(component) => component,
+                Err(err) => return self.report(EvalError::Backend(err)),
+            };
+        }
+
+        // The restart policy: an expression evaluating to a policy component (its
+        // configure arguments, e.g. `restart.backoff --max-restarts 5`, were applied by
+        // the evaluator as compose-time configuration).
+        let mut evaluator = Evaluator::new(&mut self.backend, &self.bindings);
+        let policy_component = match evaluator
+            .eval_plain(
+                policy,
+                "a restart policy (a policy takes no run-time arguments)",
+            )
+            .await
+        {
+            Ok(component) => component,
+            Err(err) => return self.report(err),
+        };
+
+        match self
+            .backend
+            .svc_detach(component, policy_component, &name, &args)
+        {
+            Ok(service) => {
+                self.backend.print(&format!(
+                    "detached: {service} is running in the background (`svc list` to \
+                     inspect, `svc log {service}` for its output, `svc stop {service}` \
+                     to stop it)"
+                ));
+                LineResult::Ok
+            }
+            Err(err) => {
+                let message = format!("error: `detach {name}` failed: {err}");
+                self.backend.print_error(&message);
+                LineResult::Error(message)
+            }
+        }
+    }
+
+    /// `svc` / `svc list`: the service table.
+    fn run_svc_list(&mut self) -> LineResult {
+        let (_, can_inspect) = self.backend.svc_grants();
+        if !can_inspect {
+            return self.refuse_no_svc("svc");
+        }
+        match self.backend.svc_list() {
+            Ok(services) if services.is_empty() => {
+                self.backend.print(
+                    "no services (start one with `detach <name> = <program> restart <policy>`)",
+                );
+                LineResult::Ok
+            }
+            Ok(services) => {
+                for line in render_service_table(&services) {
+                    self.backend.print(&line);
+                }
+                LineResult::Ok
+            }
+            Err(err) => {
+                let message = format!("error: `svc list` failed: {err}");
+                self.backend.print_error(&message);
+                LineResult::Error(message)
+            }
+        }
+    }
+
+    /// `svc log <name>`: the captured output.
+    fn run_svc_log(&mut self, name: &str) -> LineResult {
+        let (_, can_inspect) = self.backend.svc_grants();
+        if !can_inspect {
+            return self.refuse_no_svc("svc");
+        }
+        match self.backend.svc_log(name) {
+            Ok(Some(log)) if log.is_empty() => {
+                self.backend
+                    .print(&format!("{name}: no output captured yet"));
+                LineResult::Ok
+            }
+            Ok(Some(log)) => {
+                for line in log.lines() {
+                    self.backend.print(line);
+                }
+                LineResult::Ok
+            }
+            Ok(None) => {
+                let message = format!(
+                    "error: no captured log for `{name}` (no such service, or it was \
+                     detached with logs discarded)"
+                );
+                self.backend.print_error(&message);
+                LineResult::Error(message)
+            }
+            Err(err) => {
+                let message = format!("error: `svc log {name}` failed: {err}");
+                self.backend.print_error(&message);
+                LineResult::Error(message)
+            }
+        }
+    }
+
+    /// `svc stop <name>`.
+    fn run_svc_stop(&mut self, name: &str) -> LineResult {
+        let (_, can_inspect) = self.backend.svc_grants();
+        if !can_inspect {
+            return self.refuse_no_svc("svc");
+        }
+        match self.backend.svc_stop(name) {
+            Ok(Some(outcome)) => {
+                self.backend.print(&format!("stopped: {name} ({outcome})"));
+                LineResult::Ok
+            }
+            Ok(None) => {
+                let message =
+                    format!("error: no service named `{name}` (`svc list` shows what exists)");
+                self.backend.print_error(&message);
+                LineResult::Error(message)
+            }
+            Err(err) => {
+                let message = format!("error: `svc stop {name}` failed: {err}");
+                self.backend.print_error(&message);
+                LineResult::Error(message)
+            }
+        }
+    }
+
+    /// `svc clear <name>`.
+    fn run_svc_clear(&mut self, name: &str) -> LineResult {
+        let (_, can_inspect) = self.backend.svc_grants();
+        if !can_inspect {
+            return self.refuse_no_svc("svc");
+        }
+        match self.backend.svc_clear(name) {
+            Ok(true) => {
+                self.backend.print(&format!("cleared: {name}"));
+                LineResult::Ok
+            }
+            Ok(false) => {
+                let message = format!(
+                    "error: cannot clear `{name}`: no such service, or it is still running \
+                     (`svc stop {name}` first)"
+                );
+                self.backend.print_error(&message);
+                LineResult::Error(message)
+            }
+            Err(err) => {
+                let message = format!("error: `svc clear {name}` failed: {err}");
+                self.backend.print_error(&message);
+                LineResult::Error(message)
+            }
+        }
+    }
+
+    /// The shared refusal when a builtin needs the svc capability and the session does
+    /// not hold it.
+    fn refuse_no_svc(&mut self, what: &str) -> LineResult {
+        let message = format!(
+            "error: `{what}` needs the eo9:svc capability, which this session does not hold \
+             (services are an explicit grant — in usermode, relaunch with `eo9 --svc`, or run \
+             a service config with `eo9 init`)"
+        );
+        self.backend.print_error(&message);
+        LineResult::Error(message)
+    }
+
     /// `describe expr` / `imports expr`.
     async fn run_describe(&mut self, expr: &Expr, imports_only: bool) -> LineResult {
         let mut evaluator = Evaluator::new(&mut self.backend, &self.bindings);
@@ -356,6 +579,25 @@ impl<B: Backend> Session<B> {
     }
 }
 
+/// Render the `svc list` table: fixed-width columns, one service per line.
+fn render_service_table(services: &[ServiceInfo]) -> Vec<String> {
+    let mut lines = Vec::with_capacity(services.len() + 1);
+    lines.push(format!(
+        "{:<18} {:<16} {:>8}  {}",
+        "NAME", "STATE", "RESTARTS", "OUTCOME"
+    ));
+    for service in services {
+        lines.push(format!(
+            "{:<18} {:<16} {:>8}  {}",
+            service.name,
+            service.state,
+            service.restarts,
+            service.outcome.as_deref().unwrap_or("-"),
+        ));
+    }
+    lines
+}
+
 /// The `help` builtin's text.
 pub fn help_lines() -> &'static [&'static str] {
     &[
@@ -373,6 +615,12 @@ pub fn help_lines() -> &'static [&'static str] {
         "  with <provider> as <slot>, …  bind providers to named slots (tuples bind positionally)",
         "  let <name> = <expr>           name a component or environment value",
         "  save <name> = <expr>          persist a program or composition to /bin (where the store is writable)",
+        "  detach <name> = <expr> restart <policy>",
+        "                                run a program in the background as a named service, under a",
+        "                                  restart policy (restart.never, restart.always, or",
+        "                                  restart.backoff --max-restarts N --base-delay-ms MS);",
+        "                                  needs the svc capability (eo9 --svc)",
+        "  svc [list]                    list background services; svc log/stop/clear <name>",
         "  (…)                           grouping; the inner expression is passed as a value, not run",
         "",
         "explore the sandbox:",
@@ -382,7 +630,7 @@ pub fn help_lines() -> &'static [&'static str] {
         "  env                           what this session holds and what programs run from it receive",
         "  env <expr>                    how this session treats the expression's imports, without running it",
         "",
-        "builtins: help, env [<expr>], history, let, save, describe <expr>, imports <expr>, exit",
+        "builtins: help, env [<expr>], history, let, save, detach, svc, describe <expr>, imports <expr>, exit",
     ]
 }
 
@@ -404,6 +652,194 @@ mod tests {
 
     fn run(session: &mut Session<MockBackend>, line: &str) -> LineResult {
         block_on_ready(session.execute_line(line))
+    }
+
+    // -- detach and svc -----------------------------------------------------------
+
+    #[test]
+    fn detach_without_the_grant_is_refused_with_advice() {
+        let mut session = session_with(&[("cruncher", binary(&[("rounds", "u64")]))]);
+        // Default mock: no svc grants at all.
+        let result = run(
+            &mut session,
+            "detach worker = cruncher --rounds 5 restart restart.never",
+        );
+        assert!(matches!(result, LineResult::Error(_)));
+        let error = session.backend.err.join("\n");
+        assert!(
+            error.contains("eo9:svc") && error.contains("--svc"),
+            "the refusal names the capability and how to get it: {error}"
+        );
+        // Nothing was evaluated or detached.
+        assert!(session.backend.log.is_empty());
+    }
+
+    #[test]
+    fn svc_builtins_without_the_grant_are_refused_with_advice() {
+        let mut session = session_with(&[]);
+        for line in ["svc", "svc list", "svc log x", "svc stop x", "svc clear x"] {
+            let result = run(&mut session, line);
+            assert!(
+                matches!(result, LineResult::Error(_)),
+                "`{line}` must be refused without the services grant"
+            );
+        }
+        assert!(
+            session
+                .backend
+                .err
+                .iter()
+                .all(|line| line.contains("eo9:svc")),
+            "every refusal names the capability: {:?}",
+            session.backend.err
+        );
+    }
+
+    #[test]
+    fn detach_with_the_grant_evaluates_and_hands_off() {
+        let mut session = session_with(&[
+            ("cruncher", binary(&[("seed", "u64"), ("rounds", "u64")])),
+            ("restart.never", provider(&["eo9:svc/restart-policy"])),
+        ]);
+        session.backend.svc_grants = (true, true);
+        let result = run(
+            &mut session,
+            "detach worker = cruncher --seed 1 --rounds 5 restart restart.never",
+        );
+        assert_eq!(result, LineResult::Ok);
+        // The backend saw: resolve program, describe, resolve policy, detach.
+        assert!(
+            session
+                .backend
+                .log
+                .iter()
+                .any(|line| line.starts_with("svc_detach(") && line.contains("worker")),
+            "the handoff happened: {:?}",
+            session.backend.log
+        );
+        // The confirmation tells the user what they can do next.
+        let out = session.backend.out.join("\n");
+        assert!(
+            out.contains("detached: worker") && out.contains("svc list"),
+            "confirmation printed: {out}"
+        );
+        // The service is now visible to `svc list`.
+        let result = run(&mut session, "svc list");
+        assert_eq!(result, LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(
+            out.contains("worker") && out.contains("running"),
+            "the table shows the service: {out}"
+        );
+    }
+
+    #[test]
+    fn detach_arguments_are_completed_against_the_signature() {
+        // A required u64 argument that nothing fills is refused before the handoff.
+        let mut session = session_with(&[
+            ("cruncher", binary(&[("seed", "u64"), ("rounds", "u64")])),
+            ("restart.never", provider(&["eo9:svc/restart-policy"])),
+        ]);
+        session.backend.svc_grants = (true, true);
+        let result = run(
+            &mut session,
+            "detach worker = cruncher restart restart.never",
+        );
+        assert!(matches!(result, LineResult::Error(_)));
+        assert!(
+            !session
+                .backend
+                .log
+                .iter()
+                .any(|line| line.starts_with("svc_detach(")),
+            "an incomplete invocation never reaches the registry: {:?}",
+            session.backend.log
+        );
+    }
+
+    #[test]
+    fn detach_refuses_a_provider() {
+        let mut session = session_with(&[
+            ("time.frozen", provider(&["eo9:time/time"])),
+            ("restart.never", provider(&["eo9:svc/restart-policy"])),
+        ]);
+        session.backend.svc_grants = (true, true);
+        let result = run(&mut session, "detach t = time.frozen restart restart.never");
+        assert!(matches!(result, LineResult::Error(_)));
+    }
+
+    #[test]
+    fn detach_invalid_service_names_are_refused_early() {
+        let mut session = session_with(&[
+            ("cruncher", binary(&[])),
+            ("restart.never", provider(&["eo9:svc/restart-policy"])),
+        ]);
+        session.backend.svc_grants = (true, true);
+        let result = run(
+            &mut session,
+            "detach .hidden = cruncher restart restart.never",
+        );
+        assert!(matches!(result, LineResult::Error(_)));
+        let error = session.backend.err.join("\n");
+        assert!(
+            error.contains("not a usable service name"),
+            "the refusal explains the name rules: {error}"
+        );
+    }
+
+    #[test]
+    fn svc_stop_and_clear_lifecycle() {
+        let mut session = session_with(&[
+            ("cruncher", binary(&[])),
+            ("restart.never", provider(&["eo9:svc/restart-policy"])),
+        ]);
+        session.backend.svc_grants = (true, true);
+        run(
+            &mut session,
+            "detach worker = cruncher restart restart.never",
+        );
+
+        // Clearing a running service is refused.
+        let result = run(&mut session, "svc clear worker");
+        assert!(matches!(result, LineResult::Error(_)));
+
+        // Stop, then clear.
+        assert_eq!(run(&mut session, "svc stop worker"), LineResult::Ok);
+        assert_eq!(run(&mut session, "svc clear worker"), LineResult::Ok);
+
+        // Unknown afterwards.
+        let result = run(&mut session, "svc stop worker");
+        assert!(matches!(result, LineResult::Error(_)));
+        let error = session.backend.err.last().unwrap().clone();
+        assert!(
+            error.contains("no service named"),
+            "stop of an unknown service says so: {error}"
+        );
+    }
+
+    #[test]
+    fn svc_log_reads_captured_output() {
+        let mut session = session_with(&[
+            ("cruncher", binary(&[])),
+            ("restart.never", provider(&["eo9:svc/restart-policy"])),
+        ]);
+        session.backend.svc_grants = (true, true);
+        run(
+            &mut session,
+            "detach worker = cruncher restart restart.never",
+        );
+        assert_eq!(run(&mut session, "svc log worker"), LineResult::Ok);
+        // Unknown service: a clear error.
+        let result = run(&mut session, "svc log ghost");
+        assert!(matches!(result, LineResult::Error(_)));
+    }
+
+    #[test]
+    fn help_mentions_detach_and_svc() {
+        let lines = help_lines().join("\n");
+        assert!(lines.contains("detach <name>"));
+        assert!(lines.contains("svc"));
+        assert!(lines.contains("restart"));
     }
 
     #[test]

@@ -95,6 +95,21 @@ pub enum Command {
     /// `env <expr>` — show how this session would treat the expression's imports
     /// (satisfied, optional-and-absent, or refused at spawn).
     EnvOf(Expr),
+    /// `detach <name> = <expr> restart <policy>` — compose a program and hand it to the
+    /// service registry to run in the background under a restart policy.
+    Detach {
+        name: String,
+        expr: Expr,
+        policy: Expr,
+    },
+    /// `svc` / `svc list` — list the registry's services.
+    SvcList,
+    /// `svc log <name>` — print a service's captured output.
+    SvcLog(String),
+    /// `svc stop <name>` — stop a service.
+    SvcStop(String),
+    /// `svc clear <name>` — remove a finished service's record.
+    SvcClear(String),
     /// `history` — show the lines entered this session.
     History,
     /// `help`.

@@ -125,7 +125,10 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
                      live only as long as this eo9 process)"
                 );
                 for service in registry.list() {
-                    eprintln!("eo9:   stopped: {}", service.name);
+                    // Only the ones actually still alive; finished records just go away.
+                    if service.state != eo9_runtime::ServiceState::Finished {
+                        eprintln!("eo9:   stopped: {}", service.name);
+                    }
                 }
             }
             registry.stop_all();

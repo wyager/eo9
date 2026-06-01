@@ -1813,12 +1813,19 @@ impl From<crate::svc::ServiceInfo> for WitServiceInfo {
 
 /// Register the `eo9:svc` interfaces.
 ///
-/// The interface instances and their root-handle resources are always registered (the
-/// optional flavors reference the resource types, and any program may import an optional
-/// flavor); the operations are registered only for the halves the task was actually
-/// granted. A task granted `detach` must also hold `exec` — component handles live in
-/// the exec provider's table — which the embedder is responsible for (the shell and init
-/// always hold both).
+/// Unlike fs/disk (where the operations are registered only when granted, so a required
+/// import is refused at spawn), the svc interfaces and their operations are **always**
+/// registered: a client of svc — eosh, init — must import both the `-optional` flavor
+/// (to observe whether the capability was granted) *and* the full interface (to call it
+/// when it was), and must still instantiate in sessions, kernels, and browsers that
+/// grant no svc at all. The honest signal is the optional flavor; an operation called
+/// without the grant traps with "svc capability was not granted to this task" (a
+/// programming error a well-behaved client never makes, because it checks the optional
+/// first).
+///
+/// A task granted `detach` must also hold `exec` — component handles live in the exec
+/// provider's table — which the embedder is responsible for (the shell and init always
+/// hold both).
 fn add_svc(linker: &mut Linker<TaskState>, providers: &Providers) -> Result<()> {
     let (detach_granted, services_granted) = match &providers.svc {
         Some(grant) => (grant.detach, grant.services),
@@ -1832,7 +1839,7 @@ fn add_svc(linker: &mut Linker<TaskState>, providers: &Providers) -> Result<()> 
         ResourceType::host::<SvcDetachCap>(),
         |_, _| Ok(()),
     )?;
-    if detach_granted {
+    {
         add_default_handle::<SvcDetachCap>(&mut detach)?;
         detach.func_wrap(
             "detach",
@@ -1880,7 +1887,7 @@ fn add_svc(linker: &mut Linker<TaskState>, providers: &Providers) -> Result<()> 
         ResourceType::host::<SvcServicesCap>(),
         |_, _| Ok(()),
     )?;
-    if services_granted {
+    {
         add_default_handle::<SvcServicesCap>(&mut services)?;
         services.func_wrap(
             "list",

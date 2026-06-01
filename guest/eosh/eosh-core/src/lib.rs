@@ -50,7 +50,7 @@ mod testutil;
 pub use ast::{Arg, ArgValue, Command, Expr};
 pub use backend::{
     ArgSpec, Backend, BackendError, ComponentInfo, ComponentKind, ExportSlot, ImportNeed,
-    InterfaceRef, NamedArg, Outcome, WaveValue,
+    InterfaceRef, NamedArg, Outcome, ServiceInfo, WaveValue,
 };
 pub use envinfo::SESSION_MANIFEST_PATH;
 pub use eval::{EvalError, EvalOutput, Evaluator};
