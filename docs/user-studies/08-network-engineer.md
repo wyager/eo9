@@ -324,7 +324,148 @@ provider, no l3-over-l2 middleware, no ICMP/ping example. The layer is specified
 
 ## Round 2 — bare metal: the real NIC driver and the three-layer stack
 
-*(to be filled after the metal demos)*
+Environment: `cargo xtask qemu aarch64 pci net` — QEMU `virt`, GICv2, 512 MiB, a modern
+virtio-net PCI function backed by QEMU user-mode networking (slirp), serial on stdio,
+input scripted through an expect driver that timestamps every prompt round-trip. The `pci`
+boot token is the opt-in grant that lets compositions claim PCI devices.
+
+**Boot:** 12.5 s from `cargo xtask qemu` to the `eosh>` prompt (includes xtask's
+kernel-build check and QEMU start). The kernel banner reports a 22-component baked store —
+including `net.virtio`, `net.l4.over-l2`, `l2check`, `l4check` — and W^X heap, and that
+compositions are "fused and compiled on-target."
+
+**Metal demo 1 — `env` at the metal prompt (and a wart):**
+
+```
+eosh> env
+capabilities granted to this shell:
+  text     PL011 serial console
+  fs       the baked-in read-only store image (program names under /bin)
+  exec     spawn programs as children
+programs started from this shell receive:
+  text     PL011 serial console (shared with the shell)
+  time     generic timer + PL031 RTC
+  entropy  counter-seeded splitmix64 (a stub, not a CSPRNG)
+  fs       the same read-only store image view (programs under /bin, /session)
+  exec     spawn programs as children (the full session environment is inherited, every generation)
+  ...
+```
+
+The wart: this boot was started with the `pci` grant (the kernel command line says
+`cmdline: pci`, and the very next demo proves children can claim the NIC through it) —
+but `env` does not mention pci at all. The one capability that makes this boot different
+from a default boot is invisible in the capability report.
+
+**Metal demo 2 — the NIC driver is a wasm component in /bin:**
+
+```
+eosh> ls /bin
+… net.virtio.wasm  l2check.wasm  net.l4.over-l2.wasm  l4check.wasm …   (22 entries)
+ok: listed(22)
+
+eosh> describe net.virtio
+kind: provider
+imports:
+  required eo9:pci/pci (eo9:pci/pci@0.1.0)
+  required eo9:text/text … eo9:io/buffers … eo9:rt/diagnostics …
+exports:
+  eo9:net/l2 (eo9:net/l2@0.1.0)
+```
+
+**Metal demo 3 — the ARP round-trip through the wasm NIC driver:**
+
+```
+eosh> net.virtio $ l2check
+net.virtio: virtio-net 52:54:00:12:34:56, queues rx/tx 16/16
+l2check: interface virtio0 (52:54:00:12:34:56, mtu 1500)
+l2check: 10.0.2.2 is at 52:55:0a:00:02:02
+ok: resolved("52:55:0a:00:02:02")
+        [9.8 s prompt-to-prompt: compose + on-target Cranelift compile + run]
+```
+
+`l2check` (a program that imports only `l2` + text) broadcast an ARP request for the
+gateway and got the reply, through a virtio-net driver that is itself a wasm component
+(909 lines of no_std Rust): config space, BARs, DMA, virtqueues — all via the `eo9:pci`
+capability, compiled to native code *on the machine* by the kernel's own Cranelift.
+
+**Metal demo 4 — real DNS through three composed wasm layers:**
+
+```
+eosh> net.virtio $ net.l4.over-l2 $ l4check
+net.virtio: virtio-net 52:54:00:12:34:56, queues rx/tx 16/16
+ok: resolved("example.com is 172.66.147.243; tcp 10.0.2.2:9 -> L4Error::TimedOut")
+        [47.6 s prompt-to-prompt]
+```
+
+The whole path: `l4check` (imports only `l4`) → `net.l4.over-l2` (smoltcp, imports `l2`)
+→ `net.virtio` (imports `pci`) → a real virtio-net device → QEMU slirp → the real
+internet. The DNS answer is a real Cloudflare A record (it changed across runs:
+172.66.147.243, 104.20.23.154 — real round-robin). The TCP probe to the gateway's discard
+port surfaces as a typed `L4Error::TimedOut`, not a hang. The composition was fused and
+compiled on-target.
+
+The number that hurts: **47.6 s**, nearly all of it on-target Cranelift compilation of the
+three-layer composition. Re-running the *identical* composition in the same boot:
+**45.6 s** — the compile cache does not hit for fused compositions (re-confirming user
+study 03's finding #13). The variance across three runs was 47.6 / 61.7 / 45.6 s.
+
+**Metal demo 5 — typed denial on metal: BLOCKED (a docs overclaim found live):**
+
+```
+eosh> net.l2.deny $ net.l4.over-l2 $ l4check
+error: cannot resolve `net.l2.deny` (/bin/net.l2.deny.wasm): FsError::NotFound
+```
+
+STATUS.md says: "with `net.l2.deny` underneath the same program gets a typed denial in
+under a second" — in the bullet about *metal*. But `net.l2.deny` is not in the kernel's
+baked store (it never was; checked back to the commit that landed the metal sockets demo).
+The typed-denial-on-metal claim cannot be reproduced at the metal prompt. (It does work in
+usermode — Round 1 Demo 5 — and in the integration suite via the library API.) Also: the
+failed resolve renders as raw `FsError::NotFound` debug text.
+
+**Metal demo 6 — `only` attenuation on metal:**
+
+```
+eosh> only eo9:io,eo9:rt,eo9:text,eo9:time,eo9:entropy $ net.virtio $ net.l4.over-l2 $ l4check
+error: `only` failed: required imports outside the allow-list: eo9:pci/pci@0.1.0
+```
+
+Compose-time refusal naming exactly the residual import — the NIC driver's PCI
+requirement. (Wording inconsistency vs usermode noted: "`only` failed: required imports
+outside the allow-list: …" here vs "`only` refused: the program still requires …, which
+the allow-list does not include (allow it, compose a provider for it, or drop the
+requirement)" there.)
+
+**Metal demo 7 — configured static addressing, on metal, compiled on-target:**
+
+```
+eosh> net.virtio $ net.l4.over-l2 --address 10.0.2.15 --prefix-length 24 --gateway 10.0.2.2 $ l4check
+net.virtio: virtio-net 52:54:00:12:34:56, queues rx/tx 16/16
+ok: resolved("example.com is 172.66.147.243; tcp 10.0.2.2:9 -> L4Error::TimedOut")
+        [41.2 s prompt-to-prompt]
+```
+
+The static IPv4 addressing was passed as configure flags at the metal prompt, baked at
+compose time, compiled on-target, and the stack came up on it.
+
+**Session end:** `exit` → `eosh: session ended, outcome = ok(exited)` → PSCI SYSTEM_OFF →
+QEMU exits cleanly.
+
+**Facilitator note on the scripted console:** in the first metal session, the command sent
+right after the 47-second compile lost most of its characters (the serial echo shows
+`net` and nothing else; the shell then waited forever for the rest of the line). This is
+the documented plan/12 D49 pacing issue, but it is also a real operational papercut: the
+input that gets dropped is exactly the input typed while/right after the machine is busy
+compiling. The second session used 1-character-per-40 ms pacing and 5 s settles and hit no
+drops.
+
+### Participant reactions (round 2)
+
+*(to be filled after the participant session)*
+
+## Round 3 — verdict and structured wrap-up
+
+*(to be filled after the participant session)*
 
 ## Findings
 
