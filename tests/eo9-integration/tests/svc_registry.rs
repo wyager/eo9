@@ -548,3 +548,86 @@ fn discarded_logs_are_absent_not_empty() {
         "a discard-policy service has no log to read"
     );
 }
+
+/// The directive's crash-recovery case: a service that TRAPS (not merely fails) is
+/// brought back by restart.always — and its failure history records the trapped class.
+#[test]
+fn restart_always_brings_a_crashing_service_back() {
+    let registry = registry();
+    // `outcomes --mode trap` panics → the run ends abnormal(trapped). It imports text +
+    // rt only, so it is detachable as-is.
+    let child = load_example("outcomes");
+    let policy = load_stub("restart.always");
+
+    registry
+        .lock()
+        .unwrap()
+        .detach(
+            child,
+            policy,
+            "crasher",
+            vec![
+                NamedArg::new("mode", "\"trap\""),
+                NamedArg::new("detail", "\"requested crash\""),
+            ],
+            LogPolicy::Capture,
+        )
+        .expect("detach should succeed");
+
+    // Pump until the crash has happened and the policy has restarted it at least twice:
+    // crash → restart → crash → restart …
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        registry.lock().unwrap().pump(100_000);
+        let info = registry
+            .lock()
+            .unwrap()
+            .status("crasher")
+            .expect("the service exists");
+        if info.restarts >= 2 {
+            // The recorded outcome of completed runs is the trap.
+            let outcome = info.outcome.expect("a completed run has an outcome");
+            assert!(
+                outcome.contains("trapped"),
+                "the recorded outcome is the trap: {outcome}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "restart.always should have restarted the crashing service at least twice"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // And restart.never on the same crasher: one trap, no comeback.
+    let child = load_example("outcomes");
+    let policy = load_stub("restart.never");
+    registry
+        .lock()
+        .unwrap()
+        .detach(
+            child,
+            policy,
+            "oneshot-crasher",
+            vec![
+                NamedArg::new("mode", "\"trap\""),
+                NamedArg::new("detail", "\"requested crash\""),
+            ],
+            LogPolicy::Discard,
+        )
+        .expect("detach should succeed");
+    assert!(
+        pump_until_finished(&registry, "oneshot-crasher", Duration::from_secs(30)),
+        "the crash finishes the service for good under restart.never"
+    );
+    let info = registry.lock().unwrap().status("oneshot-crasher").unwrap();
+    assert_eq!(info.restarts, 0, "restart.never never brings a crash back");
+    assert!(
+        info.outcome.unwrap().contains("trapped"),
+        "the outcome records the trap"
+    );
+
+    // Cleanup the still-crash-looping service.
+    registry.lock().unwrap().stop("crasher");
+}

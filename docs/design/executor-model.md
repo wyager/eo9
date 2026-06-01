@@ -1,8 +1,12 @@
 # The executor model: detached programs, services, and single-owner devices
 
-Status: **APPROVED with rulings (2026-06-01); v1 (usermode) in implementation.** The owner
+Status: **APPROVED with rulings (2026-06-01); v1 (usermode) IMPLEMENTED.** The owner
 answered the open questions of §8; the rulings below amend the proposal and are what v1
-implements. The WIT lives at `wit/svc/svc.wit` (no longer proposed).
+implements. The WIT lives at `wit/svc/svc.wit`; the registry in
+`crates/eo9-runtime/src/svc.rs`; the standard policies in `guest/stubs/restart-*`; the
+shell builtins in eosh; the boot program in `guest/init` (`eo9 init`). v2 (the kernel
+registry + boot-runs-init), v3 (the virtual-NIC switch), and v4 (the post-Message-API
+supervisor) remain per the staged plan in §7.
 
 ## Owner rulings (2026-06-01)
 
