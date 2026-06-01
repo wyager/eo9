@@ -2531,3 +2531,39 @@ fn concurrent_invocations_of_one_store_do_not_corrupt_the_session() {
     assert_eq!(after.code, 0, "stderr: {}", after.stderr);
     assert!(after.stdout.contains("after"));
 }
+
+// -----------------------------------------------------------------------------------
+// version: the binary identifies itself (study 11 D1)
+// -----------------------------------------------------------------------------------
+
+#[test]
+fn version_flag_identifies_the_binary_and_never_resolves_as_a_program() {
+    // A registry-installed binary must be able to identify itself, and none of the
+    // version spellings may fall through to store-name resolution (study 11 D1: `eo9
+    // version` used to be looked up as a program called `version`).
+    let store = temp_store("version");
+    for spelling in ["--version", "-V", "version"] {
+        let run = eo9(&store, &[spelling]);
+        assert_eq!(run.code, 0, "`eo9 {spelling}` stderr: {}", run.stderr);
+        assert!(
+            run.stdout.contains(concat!("eo9 ", env!("CARGO_PKG_VERSION"))),
+            "`eo9 {spelling}` should print the crate version: {}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("bundled components"),
+            "`eo9 {spelling}` should report the bundled-component provenance: {}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("wasmtime-"),
+            "`eo9 {spelling}` should report the embedded compiler version: {}",
+            run.stdout
+        );
+        assert!(
+            !run.stderr.contains("does not resolve"),
+            "version spellings must never reach store-name resolution: {}",
+            run.stderr
+        );
+    }
+}
