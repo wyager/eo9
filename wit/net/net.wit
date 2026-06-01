@@ -306,6 +306,40 @@ interface l4-over-l2-config {
         -> result<l4-impl, string>;
 }
 
+/// A policy deciding which transport endpoints an attenuated L4 view may use — a
+/// firewall as a pure decision function ("policies are programs" — SPEC, Eo9 API
+/// design). Policy providers should import nothing.
+///
+/// The `net.l4.filtered` middleware consults the policy at every endpoint operation:
+/// TCP connect (the remote address), TCP listen (the local address), UDP bind (the
+/// local address), and UDP send-to (the remote address) — the last so that a UDP socket
+/// bound to an admitted local port still cannot reach refused remotes.
+interface connection-policy {
+    use l4.{socket-address};
+
+    /// The kind of endpoint operation being attempted.
+    enum endpoint-kind {
+        /// An outbound TCP connection; the address is the remote endpoint.
+        connect,
+        /// A listening TCP socket; the address is the local endpoint.
+        listen,
+        /// A UDP socket binding; the address is the local endpoint.
+        bind-udp,
+        /// A UDP datagram send; the address is the remote endpoint.
+        send-to,
+    }
+
+    /// Whether the operation on this endpoint is admitted.
+    admit: func(kind: endpoint-kind, endpoint: socket-address) -> bool;
+}
+
+/// Compose-time configuration entry for net.policy-ports: `configure` binds the
+/// allow-list of ports the policy admits (for any address and any operation kind).
+/// Unconfigured, the policy admits nothing (deny-all).
+interface ports-config {
+    configure: func(allow: list<u16>) -> result<_, string>;
+}
+
 // --- stub worlds (one per standard stub provider) ------------------------------
 
 /// net.l2.none — absence: exports the optional flavor answering `none`.
@@ -349,4 +383,23 @@ world l4-deny {
 world l4-loopback {
     export l4;
     export l4-loopback-config;
+}
+
+/// net.l4.filtered — attenuation over an underlying transport layer: every endpoint
+/// operation (connect, listen, bind, send-to) is submitted to an imported connection
+/// policy before it is forwarded; refused endpoints answer the layer's own `denied`.
+/// The policy is ordinary composed middleware
+/// (`net.policy-ports --allow … $ net.l4.filtered $ program`), so it is fused at
+/// compile time, shows up in the wiring tree, and cannot be bypassed by the consumer.
+world l4-filtered {
+    import l4;
+    import connection-policy;
+    export l4;
+}
+
+/// net.policy-ports — the port allow-list connection policy: admits endpoints whose
+/// port is on the configured list, for any address and operation kind.
+world ports-policy {
+    export connection-policy;
+    export ports-config;
 }

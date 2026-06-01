@@ -53,9 +53,11 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-net-l3-deny",
     "eo9-stub-net-l3-none",
     "eo9-stub-net-l4-deny",
+    "eo9-stub-net-l4-filtered",
     "eo9-stub-net-l4-loopback",
     "eo9-stub-net-l4-none",
     "eo9-stub-net-l4-over-l2",
+    "eo9-stub-net-policy-ports",
     "eo9-stub-net-virtio",
     "eo9-stub-pci-admit-address",
     "eo9-stub-pci-admit-vendor",
@@ -167,6 +169,10 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-stub-net-l4-deny", "net.l4.deny"),
     ("eo9-stub-net-l4-none", "net.l4.none"),
     ("eo9-stub-net-l4-loopback", "net.l4.loopback"),
+    // The transport firewall and its standard port policy ("policies are programs"):
+    //   net.policy-ports --allow "[7]" $ net.l4.filtered $ net.l4.loopback-backed program
+    ("eo9-stub-net-l4-filtered", "net.l4.filtered"),
+    ("eo9-stub-net-policy-ports", "net.policy-ports"),
     ("eo9-example-sockcheck", "sockcheck"),
     // Basic coreutils, so the metal shell can inspect its own (read-only) filesystem:
     // `ls /bin`, `cat /session`, `wc`, `head`, `stat`.

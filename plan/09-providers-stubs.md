@@ -419,3 +419,16 @@ Match the priority order above; (1)+(2) unblock I2.
     along with allow/deny/read-only end-to-end over fs.memfs, deny-all-when-unconfigured, and
     purity. Follow-up: a metal interactive demo and the browser /bin additions ride with the
     later milestones of this branch.
+
+28. **`net.l4.filtered` + `net.policy-ports`: the transport firewall as composed policy
+    (2026-06-01, plan/02 D26).** A firewall is now ordinary middleware:
+    `net.policy-ports --allow "[80, 443]" $ net.l4.filtered $ program` admits only endpoints
+    whose port is on the list (connect remotes, listen/bind locals, and per-datagram send-to
+    remotes), answering everything else with the layer's own `denied`. Pure, deny-all when
+    unconfigured, in GUEST_COMPONENTS and the kernel store. Test-pinned over `net.l4.loopback`
+    (tests/eo9-integration/tests/net_l4_filtered.rs): a permissive policy lets sockcheck's full
+    TCP echo + UDP round-trip succeed with every endpoint gated; a restrictive or unconfigured
+    policy surfaces as the program's own typed denial. (The end-to-end success test pins the
+    loopback's deterministic ephemeral port sequence — documented in the test.) Follow-ups:
+    a metal demo over `net.virtio $ net.l4.over-l2` (the firewall composes above the TCP/IP
+    middleware unchanged — same l4-in/l4-out shape) and the browser /bin additions.

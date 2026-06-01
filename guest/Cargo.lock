@@ -441,6 +441,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-stub-net-l4-filtered"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-stub-net-l4-loopback"
 version = "0.0.0"
 dependencies = [
@@ -462,6 +470,14 @@ version = "0.0.0"
 dependencies = [
  "eo9-guest",
  "smoltcp",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-net-policy-ports"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
  "wit-bindgen",
 ]
 

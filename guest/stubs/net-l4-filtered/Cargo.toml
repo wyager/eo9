@@ -1,0 +1,16 @@
+# The connection-policy transport firewall ("policies are programs").
+[package]
+name = "eo9-stub-net-l4-filtered"
+description = "Eo9 standard stub provider `net.l4.filtered`: attenuates an underlying eo9:net/l4 transport layer through a composed eo9:net/connection-policy component — every connect, listen, bind, and send-to is submitted to the policy and forwarded only if admitted."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

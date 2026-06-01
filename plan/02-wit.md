@@ -342,3 +342,12 @@ review pending).
     refused) before the policy sees it and forwards that same normalized path to the underlying
     fs, so the path ruled on is the path accessed; policies normalize defensively as well. The
     fs interface itself, the existing fs worlds, and every existing fs stub are untouched.
+
+26. **`eo9:net` gains `connection-policy` and the `l4-filtered`/`ports-policy` worlds (2026-06-01,
+    plan/02 D24's conventions).** `connection-policy` is the per-endpoint decision function
+    (`admit: func(kind: endpoint-kind, endpoint: socket-address) -> bool`, kind = connect |
+    listen | bind-udp | send-to); `net.l4.filtered` is the firewall middleware (`import l4;
+    import connection-policy; export l4`); `ports-config` configures the standard
+    `net.policy-ports` allow-list policy. `send-to` is gated per datagram so an admitted local
+    UDP binding does not imply every remote is reachable. The l4 interface itself, the existing
+    net worlds, and every existing net stub are untouched.

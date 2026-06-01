@@ -1,0 +1,16 @@
+# The port allow-list connection policy for net.l4.filtered ("policies are programs").
+[package]
+name = "eo9-stub-net-policy-ports"
+description = "Eo9 standard policy `net.policy-ports`: an eo9:net/connection-policy component admitting endpoints whose port is on a configured allow-list. Pure (imports nothing); composed as `net.policy-ports --allow ... $ net.l4.filtered $ program`."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }
