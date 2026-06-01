@@ -1551,6 +1551,13 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
                 Err(crate::task::SpawnError::BadArguments(msg)) => {
                     Err(WitSpawnError::BadArguments(msg))
                 }
+                Err(crate::task::SpawnError::ConfigurationRefused(msg)) => {
+                    // The exec WIT's spawn-error variant is kept stable (no dedicated
+                    // case); the typed refusal rides `internal` with its full message.
+                    Err(WitSpawnError::Internal(format!(
+                        "compose-time configuration refused: {msg}"
+                    )))
+                }
                 Err(crate::task::SpawnError::Internal(msg)) => {
                     // Embedder-supplied hints turn a raw unsatisfied-import failure into
                     // actionable advice (e.g. "relaunch with --disk <image>"). The advice

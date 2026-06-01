@@ -173,10 +173,21 @@ fn instantiate(
         "instantiation",
         linker.instantiate_async(&mut store, &component),
     )??;
-    // Executor contract (plan/03 D21): apply compose-time configuration, if the artifact
-    // carries the `eo9:rt/configured` entrypoint, before the first entry into it.
+    // Executor contract (plan/03 D23): apply compose-time configuration, if the artifact
+    // carries the `eo9:rt/configured` entrypoint, before the first entry into it. A
+    // configuration the provider rejects is `bind`'s typed error -- a pre-run refusal,
+    // never a trap.
     if let Some(bind) = bind_entrypoint(&mut store, &instance) {
-        block_on("bind()", bind.call_async(&mut store, &[], &mut []))??;
+        let mut bind_results = vec![Val::Bool(false); bind.ty(&store).results().len()];
+        block_on(
+            "bind()",
+            bind.call_async(&mut store, &[], &mut bind_results),
+        )??;
+        if let Some(refused) = configuration_refused(&bind_results) {
+            return Err(wasmtime::Error::msg(format!(
+                "compose-time configuration refused: {refused}"
+            )));
+        }
     }
     Ok((store, instance))
 }
@@ -190,6 +201,18 @@ pub(crate) fn bind_entrypoint(
     let configured = instance.get_export_index(&mut *store, None, "eo9:rt/configured@0.1.0")?;
     let bind = instance.get_export_index(&mut *store, Some(&configured), "bind")?;
     instance.get_func(&mut *store, bind)
+}
+
+/// The provider's configure-error text, if `bind`'s results carry one. Old artifacts
+/// (a result-less `bind`) produce an empty results slice and never report this way.
+pub(crate) fn configuration_refused(bind_results: &[Val]) -> Option<String> {
+    match bind_results.first() {
+        Some(Val::Result(Err(err))) => Some(match err.as_deref() {
+            Some(Val::String(msg)) => msg.clone(),
+            _ => "the provider rejected its baked configuration".to_string(),
+        }),
+        _ => None,
+    }
 }
 
 fn top_level_func(

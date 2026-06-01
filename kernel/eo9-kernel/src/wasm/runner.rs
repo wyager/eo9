@@ -18,6 +18,7 @@
 
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 
 use wasmtime::Store;
@@ -214,10 +215,21 @@ fn try_run(entry: &StoreEntry, args: &[(String, String)]) -> Result<String, wasm
         linker.instantiate_async(&mut store, &component),
     )??;
 
-    // Executor contract (plan/03 D21): apply compose-time configuration, if the
-    // artifact carries the `eo9:rt/configured` entrypoint, before the first entry.
+    // Executor contract (plan/03 D23): apply compose-time configuration, if the
+    // artifact carries the `eo9:rt/configured` entrypoint, before the first entry. A
+    // configuration the provider rejects is `bind`'s typed error -- the run is refused,
+    // never trapped.
     if let Some(bind) = super::bind_entrypoint(&instance, &mut store) {
-        super::block_on("bind()", bind.call_async(&mut store, &[], &mut []))??;
+        let mut bind_results = vec![Val::Bool(false); super::bind_result_slots(&bind, &store)];
+        super::block_on(
+            "bind()",
+            bind.call_async(&mut store, &[], &mut bind_results),
+        )??;
+        if let Some(refused) = super::configuration_refused(&bind_results) {
+            return Err(wasmtime::Error::msg(format!(
+                "compose-time configuration refused: {refused}"
+            )));
+        }
     }
 
     let main = instance

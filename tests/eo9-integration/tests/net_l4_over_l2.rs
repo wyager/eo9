@@ -11,7 +11,28 @@
 
 use eo9_component::{compose, configure};
 use eo9_integration::{guest, run};
-use eo9_runtime::{NamedArg, Outcome, Providers, SpawnLimits, Task};
+use eo9_runtime::{NamedArg, Outcome, Providers, SpawnError, SpawnLimits, Task};
+
+/// The full denied-link composition over an already-configured middleware, ready to
+/// compile and spawn.
+fn configured_stack(address: &str) -> eo9_component::Component {
+    let address_literal = format!("{address:?}");
+    let configured = configure(
+        &guest::load_stub("net.l4.over-l2"),
+        &[
+            ("address", address_literal.as_str()),
+            ("prefix-length", "24"),
+            ("gateway", "\"192.168.7.1\""),
+        ],
+    )
+    .expect("baking a syntactically-valid string succeeds; address validation is the provider's");
+    let stack = compose(&configured, &guest::load_example("l4check"))
+        .expect("configure(net.l4.over-l2, …) $ l4check");
+    let stack = compose(&guest::load_stub("net.l2.deny"), &stack).expect("net.l2.deny $ …");
+    let stack =
+        compose(&guest::load_stub("time.monotonic-stub"), &stack).expect("time.monotonic-stub $ …");
+    compose(&guest::load_stub("entropy.seeded"), &stack).expect("entropy.seeded $ …")
+}
 
 #[test]
 fn deny_at_l2_surfaces_through_the_middleware_as_the_programs_own_failure() {
@@ -142,22 +163,14 @@ fn configuring_the_middleware_bakes_and_the_configured_chain_still_runs() {
     }
 }
 
-/// User study 08, finding F1: a malformed configure address must never let the program
-/// run. The middleware's own validation is contract-correct -- its `configure` returns
-/// `result<l4-impl, string>` and a bad dotted-quad comes back as the typed error -- but
-/// the synthesized `eo9:rt/configured.bind` entrypoint cannot carry an error outward
-/// (its signature is `func()`), so today the refusal surfaces as a *bind-time trap*
-/// whose message names the failing step but discards the validation reason. plan/09
-/// Decision 22 records the complete fix (bind grows an error channel; areas 02/03 plus
-/// the three executors).
-///
-/// This test pins the safety property that does hold -- the program never spawns, the
-/// failure is attributed to compose-time configuration -- so the gap cannot silently
-/// widen into "malformed config runs with defaults". When bind gains its error channel,
-/// strengthen the message assertion to require the middleware's own reason text
-/// ("not a dotted-quad IPv4 address").
+/// A malformed configured address is a **typed pre-run refusal**, never a trap (user
+/// study 08 finding F1; plan/03 D23's error channel). Baking succeeds -- "not-an-ip" is
+/// a perfectly valid WIT string -- and the provider's own validation rejects it when the
+/// executor applies the configuration: `eo9:rt/configured.bind` returns the provider's
+/// error, the spawn is refused with `SpawnError::ConfigurationRefused`, and the program
+/// is never entered.
 #[test]
-fn a_malformed_configure_address_never_lets_the_program_run() {
+fn a_malformed_configure_address_is_a_typed_refusal_not_a_trap() {
     guest::ensure_components(&[
         "eo9-stub-entropy-seeded",
         "eo9-stub-time-monotonic-stub",
@@ -166,32 +179,70 @@ fn a_malformed_configure_address_never_lets_the_program_run() {
         "eo9-example-l4check",
     ]);
 
-    // The algebra bakes the malformed string happily: "not-an-ip" is a perfectly valid
-    // *string*. Only the middleware knows IPv4 semantics, and only at bind time.
-    let configured = configure(
+    let stack = configured_stack("not-an-ip");
+    let image = run::compile_component(&stack);
+    let err = Task::spawn(&image, &[], SpawnLimits::default(), Providers::none())
+        .expect_err("a malformed configured address must refuse the spawn");
+    match err {
+        SpawnError::ConfigurationRefused(reason) => {
+            assert!(
+                reason.contains("not a dotted-quad IPv4 address"),
+                "the refusal must carry the provider's own validation message: {reason}"
+            );
+            assert!(
+                reason.contains("not-an-ip"),
+                "the refusal must name the rejected value: {reason}"
+            );
+        }
+        other => panic!("expected ConfigurationRefused, got: {other}"),
+    }
+}
+
+/// The same malformed configuration, but reached through a **merged** bind entrypoint:
+/// the outer compose's provider (`entropy.seeded`, valid config) and the inner
+/// configured middleware (bad address) both carry `eo9:rt/configured`, so the executor
+/// calls one merged `bind` -- provider first (succeeds), then the inner one (refuses).
+/// The merger must propagate that error as its own, so the spawn is still the typed
+/// refusal, never a trap.
+#[test]
+fn a_merged_bind_propagates_the_nested_configure_refusal() {
+    guest::ensure_components(&[
+        "eo9-stub-entropy-seeded",
+        "eo9-stub-time-monotonic-stub",
+        "eo9-stub-net-l2-deny",
+        "eo9-stub-net-l4-over-l2",
+        "eo9-example-l4check",
+    ]);
+
+    // Inner: the bad-address middleware over l4check (carries the middleware's bind).
+    let bad = configure(
         &guest::load_stub("net.l4.over-l2"),
         &[
-            ("address", "\"not-an-ip\""),
+            ("address", "\"999.0.0.1\""),
             ("prefix-length", "24"),
             ("gateway", "\"192.168.7.1\""),
         ],
     )
-    .expect("configure() bakes the string; validation is the provider's job at bind time");
+    .expect("baking succeeds; validation is the provider's");
+    let inner = compose(&bad, &guest::load_example("l4check")).expect("bad-l4 $ l4check");
+    let inner = compose(&guest::load_stub("net.l2.deny"), &inner).expect("net.l2.deny $ …");
+    let inner =
+        compose(&guest::load_stub("time.monotonic-stub"), &inner).expect("time.monotonic-stub $ …");
 
-    let stack = compose(&configured, &guest::load_example("l4check"))
-        .expect("configure(net.l4.over-l2, …) $ l4check");
-    let stack = compose(&guest::load_stub("net.l2.deny"), &stack).expect("net.l2.deny $ …");
-    let stack =
-        compose(&guest::load_stub("time.monotonic-stub"), &stack).expect("time.monotonic-stub $ …");
-    let stack = compose(&guest::load_stub("entropy.seeded"), &stack).expect("entropy.seeded $ …");
+    // Outer: a *configured* entropy provider over the inner stack -- both operands carry
+    // a bind entrypoint, so this compose synthesizes the bind merger.
+    let seeded = configure(&guest::load_stub("entropy.seeded"), &[("seed", "42")])
+        .expect("configure(entropy.seeded, seed)");
+    let stack = compose(&seeded, &inner).expect("configured-entropy $ …");
 
     let image = run::compile_component(&stack);
     let err = Task::spawn(&image, &[], SpawnLimits::default(), Providers::none())
-        .map(|_| ())
-        .expect_err("a malformed configure address must be refused at bind time, before main");
-    let reason = format!("{err:?}");
-    assert!(
-        reason.contains("configuration") && reason.contains("bind"),
-        "the refusal must be attributed to compose-time configuration: {reason}"
-    );
+        .expect_err("the nested configure refusal must refuse the spawn through the merger");
+    match err {
+        SpawnError::ConfigurationRefused(reason) => assert!(
+            reason.contains("not a dotted-quad IPv4 address"),
+            "the merger must propagate the nested provider's own message: {reason}"
+        ),
+        other => panic!("expected ConfigurationRefused, got: {other}"),
+    }
 }

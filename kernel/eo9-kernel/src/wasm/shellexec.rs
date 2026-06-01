@@ -890,50 +890,61 @@ fn spawn_child(
             })?
     };
 
-    // Apply any compose-time configuration baked into the artifact (plan/03 D21): a
+    // Apply any compose-time configuration baked into the artifact (plan/03 D23): a
     // configured composition exports `eo9:rt/configured`, whose parameterless `bind`
     // runs every nested provider's `configure` with its baked constants. Executor
     // contract: once, after instantiation, before the first entry. It shares the
-    // bounded spawn budget — configuration binds constants and must not block.
+    // bounded spawn budget — configuration binds constants and must not block. A
+    // configuration the provider rejects comes back as `bind`'s typed error (never a
+    // trap) and refuses the spawn.
     if let Some(bind) = super::bind_entrypoint(&instance, &mut store) {
-        let call = bind.call_async(&mut store, &[], &mut []);
-        let mut call = core::pin::pin!(call);
-        let waker = Waker::from(Arc::new(ChildWaker {
-            rung: AtomicBool::new(false),
-        }));
-        let mut cx = Context::from_waker(&waker);
-        let mut result = None;
-        for _ in 0..4096 {
-            match call.as_mut().poll(&mut cx) {
-                Poll::Ready(r) => {
-                    result = Some(r);
-                    break;
+        let mut bind_results =
+            alloc::vec![Val::Bool(false); super::bind_result_slots(&bind, &store)];
+        {
+            let call = bind.call_async(&mut store, &[], &mut bind_results);
+            let mut call = core::pin::pin!(call);
+            let waker = Waker::from(Arc::new(ChildWaker {
+                rung: AtomicBool::new(false),
+            }));
+            let mut cx = Context::from_waker(&waker);
+            let mut result = None;
+            for _ in 0..4096 {
+                match call.as_mut().poll(&mut cx) {
+                    Poll::Ready(r) => {
+                        result = Some(r);
+                        break;
+                    }
+                    Poll::Pending => continue,
                 }
-                Poll::Pending => continue,
             }
+            result
+                .ok_or_else(|| {
+                    WitSpawnError::Internal(
+                        "compose-time configuration (`bind`) unexpectedly suspended".to_string(),
+                    )
+                })?
+                .map_err(|err| {
+                    if matches!(
+                        err.downcast_ref::<wasmtime::Trap>(),
+                        Some(wasmtime::Trap::OutOfFuel)
+                    ) {
+                        WitSpawnError::Internal(format!(
+                            "compose-time configuration exceeded the spawn fuel budget \
+                             ({SPAWN_FUEL} fuel): `configure` must bind constants, not run \
+                             unbounded code"
+                        ))
+                    } else {
+                        WitSpawnError::Internal(format!(
+                            "compose-time configuration (`bind`) failed: {err:#}"
+                        ))
+                    }
+                })?;
         }
-        result
-            .ok_or_else(|| {
-                WitSpawnError::Internal(
-                    "compose-time configuration (`bind`) unexpectedly suspended".to_string(),
-                )
-            })?
-            .map_err(|err| {
-                if matches!(
-                    err.downcast_ref::<wasmtime::Trap>(),
-                    Some(wasmtime::Trap::OutOfFuel)
-                ) {
-                    WitSpawnError::Internal(format!(
-                        "compose-time configuration exceeded the spawn fuel budget \
-                         ({SPAWN_FUEL} fuel): `configure` must bind constants, not run \
-                         unbounded code"
-                    ))
-                } else {
-                    WitSpawnError::Internal(format!(
-                        "compose-time configuration (`bind`) failed: {err:#}"
-                    ))
-                }
-            })?;
+        if let Some(refused) = super::configuration_refused(&bind_results) {
+            return Err(WitSpawnError::Internal(format!(
+                "compose-time configuration refused: {refused}"
+            )));
+        }
     }
 
     // Normal fuel regime for the child's life (usermode parity): an effectively-infinite

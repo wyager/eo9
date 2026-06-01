@@ -302,3 +302,11 @@ Toolchain findings (wasm-tools 1.250.0, wit-bindgen-cli 0.57.1):
       *before* any of the task's buffer memory is reclaimed, so a driver that never tears down
       explicitly is still memory-safe (kernel/src/wasm/pci_provider.rs, plan/12 D62). Drivers should
       still quiesce their own device (reset / bus-master off) at clean shutdown when they can.
+
+23. **`eo9:rt/configured.bind` returns `result<_, string>` (2026-06-01, plan/03 D24).** The bind
+    entrypoint's signature gains the error channel: a configuration the provider rejects is returned as
+    the provider's own error text instead of trapping. Compatibility: executors call `bind` through the
+    dynamic `Val` API and size the results from the function's actual type, so artifacts composed before
+    this change (result-less `bind`) still load and run — only the both-operands-configured merger
+    requires both operands to share a signature (recompose to refresh). The canonical WIT text in
+    wit/rt/rt.wit is the binding contract; the algebra's synthesized interfaces match it structurally.

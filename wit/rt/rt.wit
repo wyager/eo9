@@ -42,8 +42,11 @@ interface diagnostics {
 interface configured {
     /// Apply the configuration baked into this component.
     ///
-    /// Idempotent: the first call wins, later calls are no-ops. A configuration the
-    /// provider rejects (an invalid baked value) traps, so a misconfigured composition
-    /// fails before any of its observable behavior runs.
-    bind: func();
+    /// Idempotent: the first call wins, later calls are no-ops (and report success). A
+    /// configuration the provider rejects (an invalid baked value) is returned as the
+    /// provider's own error text, so a misconfigured composition fails as a typed
+    /// pre-run refusal -- never a trap -- before any of its observable behavior runs:
+    /// the executor renders the error ("compose-time configuration refused: <reason>")
+    /// and does not enter the program.
+    bind: func() -> result<_, string>;
 }
