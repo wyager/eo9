@@ -11,10 +11,11 @@
 //! there is no configure interface):
 //!
 //! * **First use mounts the disk.** If either uberblock slot carries the eofs magic the
-//!   image is mounted; a blank device (no magic in either slot) is formatted in place
-//!   with the default options (4 KiB blocks, lz4 on). A device that has the magic but
-//!   fails to mount is *never* reformatted — the error is reported instead, so corruption
-//!   can't silently become data loss.
+//!   image is mounted; a blank device (no magic, and all zero everywhere a common foreign
+//!   format would leave its mark — see [`eofs_core::probe`]) is formatted in place with
+//!   the default options (4 KiB blocks, lz4 on). A device that has the magic but fails to
+//!   mount is *never* reformatted — the error is reported instead, so corruption can't
+//!   silently become data loss; a device holding foreign data is refused outright.
 //! * **Every completed mutating operation commits; failed ones roll back.** `write`,
 //!   `create-directory`, and `remove` each end with an eofs commit (root flip), so
 //!   completed operations are durable on the disk and crash consistency is the engine's
@@ -177,8 +178,9 @@ impl BlockDevice for DiskDevice {
 /// Mount the imported disk, formatting it first if — and only if — it is blank.
 ///
 /// "Blank" means probed as [`eofs_core::ImageState::Blank`]: no eofs filesystem AND the
-/// device's leading bytes are all zero. A device holding anybody else's data (an ext4
-/// image, a tarball, a file pointed at by mistake) is refused, never formatted over —
+/// spans where any common format would leave its mark — the leading megabyte, the trailing
+/// 64 KiB, or the whole device when it is small — are all zero. A device holding anybody
+/// else's data (an ext4 image, a btrfs volume, a file pointed at by mistake) is refused, never formatted over —
 /// destroying foreign data is something only an explicit, forced `mkfs` may do (study 07,
 /// S7-2). A device with eofs remains that no longer mount is also never reformatted; its
 /// mount error is reported instead.
