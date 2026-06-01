@@ -11,7 +11,7 @@
 
 use eo9_component::{compose, configure};
 use eo9_integration::{guest, run};
-use eo9_runtime::{NamedArg, Outcome, Providers};
+use eo9_runtime::{NamedArg, Outcome, Providers, SpawnLimits, Task};
 
 #[test]
 fn deny_at_l2_surfaces_through_the_middleware_as_the_programs_own_failure() {
@@ -140,4 +140,58 @@ fn configuring_the_middleware_bakes_and_the_configured_chain_still_runs() {
         ),
         other => panic!("expected the program's own typed failure, got {other:?}"),
     }
+}
+
+/// User study 08, finding F1: a malformed configure address must never let the program
+/// run. The middleware's own validation is contract-correct -- its `configure` returns
+/// `result<l4-impl, string>` and a bad dotted-quad comes back as the typed error -- but
+/// the synthesized `eo9:rt/configured.bind` entrypoint cannot carry an error outward
+/// (its signature is `func()`), so today the refusal surfaces as a *bind-time trap*
+/// whose message names the failing step but discards the validation reason. plan/09
+/// Decision 22 records the complete fix (bind grows an error channel; areas 02/03 plus
+/// the three executors).
+///
+/// This test pins the safety property that does hold -- the program never spawns, the
+/// failure is attributed to compose-time configuration -- so the gap cannot silently
+/// widen into "malformed config runs with defaults". When bind gains its error channel,
+/// strengthen the message assertion to require the middleware's own reason text
+/// ("not a dotted-quad IPv4 address").
+#[test]
+fn a_malformed_configure_address_never_lets_the_program_run() {
+    guest::ensure_components(&[
+        "eo9-stub-entropy-seeded",
+        "eo9-stub-time-monotonic-stub",
+        "eo9-stub-net-l2-deny",
+        "eo9-stub-net-l4-over-l2",
+        "eo9-example-l4check",
+    ]);
+
+    // The algebra bakes the malformed string happily: "not-an-ip" is a perfectly valid
+    // *string*. Only the middleware knows IPv4 semantics, and only at bind time.
+    let configured = configure(
+        &guest::load_stub("net.l4.over-l2"),
+        &[
+            ("address", "\"not-an-ip\""),
+            ("prefix-length", "24"),
+            ("gateway", "\"192.168.7.1\""),
+        ],
+    )
+    .expect("configure() bakes the string; validation is the provider's job at bind time");
+
+    let stack = compose(&configured, &guest::load_example("l4check"))
+        .expect("configure(net.l4.over-l2, …) $ l4check");
+    let stack = compose(&guest::load_stub("net.l2.deny"), &stack).expect("net.l2.deny $ …");
+    let stack =
+        compose(&guest::load_stub("time.monotonic-stub"), &stack).expect("time.monotonic-stub $ …");
+    let stack = compose(&guest::load_stub("entropy.seeded"), &stack).expect("entropy.seeded $ …");
+
+    let image = run::compile_component(&stack);
+    let err = Task::spawn(&image, &[], SpawnLimits::default(), Providers::none())
+        .map(|_| ())
+        .expect_err("a malformed configure address must be refused at bind time, before main");
+    let reason = format!("{err:?}");
+    assert!(
+        reason.contains("configuration") && reason.contains("bind"),
+        "the refusal must be attributed to compose-time configuration: {reason}"
+    );
 }
