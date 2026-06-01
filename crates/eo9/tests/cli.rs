@@ -2546,7 +2546,8 @@ fn version_flag_identifies_the_binary_and_never_resolves_as_a_program() {
         let run = eo9(&store, &[spelling]);
         assert_eq!(run.code, 0, "`eo9 {spelling}` stderr: {}", run.stderr);
         assert!(
-            run.stdout.contains(concat!("eo9 ", env!("CARGO_PKG_VERSION"))),
+            run.stdout
+                .contains(concat!("eo9 ", env!("CARGO_PKG_VERSION"))),
             "`eo9 {spelling}` should print the crate version: {}",
             run.stdout
         );
