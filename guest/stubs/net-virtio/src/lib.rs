@@ -25,12 +25,16 @@
 //!   front of it (zeroed on transmit — no offloads are negotiated — and stripped on
 //!   receive). Transmit publishes one descriptor and polls the used ring for
 //!   completion; receive polls the used ring for the next delivered buffer, copies the
-//!   frame out, and immediately re-posts the buffer. The kernel's PCI provider does not
-//!   deliver interrupts yet — and virtio is fine with polling.
+//!   frame out, and immediately re-posts the buffer. (The PCI provider can deliver
+//!   INTx interrupts — `disk.virtio` waits on them — but this driver still polls;
+//!   converting receive to an interrupt wait is the recorded follow-up in plan/12 D59.)
 //!
 //! The exported `eo9:net/l2` surface is the single interface `virtio0`: `recv-frame`
-//! that finds nothing within its (bounded) poll reports a typed `io` error rather than
-//! blocking forever, a frame larger than the transmit buffer fails with
+//! that finds nothing within its short poll window reports **an empty result**
+//! (`bytes-received: 0`, the WIT's "nothing waiting right now") so the consumer owns
+//! the wait policy — a TCP/IP middleware pumps again on its own deadline, a one-shot
+//! prober retries a few times — instead of every consumer paying a multi-second spin
+//! (user study 08, finding F2). A frame larger than the transmit buffer fails with
 //! `frame-too-large`, and device weirdness is always a typed error, never a trap.
 //!
 //! Like `disk.virtio`, the driver drives its `eo9:pci` imports eagerly (they are plain
@@ -156,11 +160,16 @@ const INTERFACE_NAME: &str = "virtio0";
 /// Transmit-completion polling bound (each iteration is a host call); the device
 /// consumes a transmit descriptor in microseconds, so hitting this means it is wedged.
 const TX_POLL_LIMIT: u64 = 50_000_000;
-/// Receive polling bound: how long `recv-frame` waits for the next frame before
-/// reporting a typed `io` error (a few seconds of host calls — long enough for the
-/// reply-to-our-request flows the l2 surface is used for, short enough never to look
-/// like a hang).
-const RX_POLL_LIMIT: u64 = 2_000_000;
+/// Receive polling bound: how many host calls `recv-frame` spends checking for a frame
+/// before reporting "nothing waiting" (an empty result, not an error). Calibrated to a
+/// couple of milliseconds of host calls — long enough to catch a reply already in
+/// flight (QEMU user-net answers ARP/DNS in tens of microseconds), short enough that a
+/// consumer polling a quiet link pays milliseconds per poll, not seconds. The consumer
+/// owns the wait policy: the TCP/IP middleware pumps repeatedly under its own
+/// deadlines, and one-shot probes like l2check retry a bounded number of times.
+/// (User study 08 finding F2: this was 2,000,000 — ~1.7 s per empty poll — which
+/// stacked up to ~6.7 s ARP stalls through the middleware's pump loop.)
+const RX_POLL_LIMIT: u64 = 2_000;
 
 // ------------------------------------------------------------------------------------------
 // Eager driving of the async pci imports (same pattern and reasoning as disk.virtio).
@@ -680,16 +689,16 @@ impl Driver {
     }
 
     /// Receive the next delivered frame (header stripped), truncated to `max_len`
-    /// bytes, re-posting the receive buffer afterwards. A bounded poll that finds
-    /// nothing reports a typed `io` error rather than blocking forever.
+    /// bytes, re-posting the receive buffer afterwards. A short poll that finds nothing
+    /// returns an empty frame ("nothing waiting right now") so the consumer decides how
+    /// long to keep waiting; runts and unusable completions also come back empty (they
+    /// are wire noise, not driver failures).
     fn recv(&mut self, max_len: u64) -> Result<Vec<u8>, L2Fail> {
         let mut spins: u64 = 0;
         while self.used_index(RX_RING_BASE) == self.rx.used_index {
             spins += 1;
             if spins > RX_POLL_LIMIT {
-                return Err(L2Fail::Io(String::from(
-                    "net.virtio: no frame arrived within the receive poll bound",
-                )));
+                return Ok(Vec::new());
             }
         }
 
@@ -738,11 +747,9 @@ impl Driver {
                 .map_err(L2Fail::Io)?;
         }
 
-        if bytes.is_empty() {
-            return Err(L2Fail::Io(String::from(
-                "net.virtio: the device delivered an unusable receive completion",
-            )));
-        }
+        // An unusable completion (a slot we never posted, or a runt the virtio-net
+        // header alone fills) is wire noise: report it the same way as "nothing
+        // waiting" and let the consumer poll again.
         Ok(bytes)
     }
 }

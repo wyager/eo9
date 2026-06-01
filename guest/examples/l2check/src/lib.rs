@@ -27,8 +27,11 @@ eo9_guest::bindings!({
 const GATEWAY: [u8; 4] = [10, 0, 2, 2];
 /// The address slirp hands its guest; only used as the ARP sender protocol address.
 const OUR_IP: [u8; 4] = [10, 0, 2, 15];
-/// How many received frames to inspect before giving up on a reply.
-const RECEIVE_ATTEMPTS: u32 = 8;
+/// How many receive polls to spend waiting for the reply before giving up. The l2
+/// provider's `recv-frame` reports "nothing waiting" after a short (few-millisecond)
+/// window — the consumer owns the wait policy — so this is roughly a 100–200 ms ARP
+/// wait: generous for any real network segment, instant for QEMU user-net.
+const RECEIVE_ATTEMPTS: u32 = 64;
 
 /// The l2 API's own error, rendered into the world's failure variant.
 fn net_failure(err: l2::L2Error) -> ProgramFailure {
@@ -117,6 +120,10 @@ eo9_guest::main! {
             let (dst, received) = l2::recv_frame(&iface, dst).await;
             match received {
                 Ok(result) => {
+                    if result.bytes_received == 0 {
+                        // Nothing waiting yet; poll again (each poll is a few ms).
+                        continue;
+                    }
                     let frame = buffer::prefix_to_vec(&dst, result.bytes_received);
                     if let Some(gateway_mac) = arp_reply_from_gateway(&frame) {
                         let rendered = format_mac(&gateway_mac);
