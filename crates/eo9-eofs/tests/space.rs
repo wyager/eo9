@@ -3,7 +3,7 @@
 //! removed files' space comes back. Without reclamation, an image's append frontier
 //! reaches the end of the device after a finite number of writes and the image bricks.
 
-use eofs_core::{Eofs, FormatOptions, FsError, MemDevice};
+use eo9_eofs::{Eofs, FormatOptions, FsError, MemDevice};
 
 /// The provider's `mutate()` pattern: try, gc on NoSpace, retry once.
 fn with_gc_retry<R>(

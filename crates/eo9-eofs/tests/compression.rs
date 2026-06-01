@@ -1,7 +1,7 @@
 //! Compression behaviour: on by default, raw fallback for incompressible blocks, and
 //! logical content (and therefore Merkle hashes) independent of the codec.
 
-use eofs_core::{Eofs, FormatOptions, MemDevice};
+use eo9_eofs::{Eofs, FormatOptions, MemDevice};
 
 const DEV_SIZE: u64 = 8 * 1024 * 1024;
 

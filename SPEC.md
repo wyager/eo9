@@ -24,10 +24,34 @@ The trusted computing base is correspondingly small and explicit: the compiler (
 native code), the root scheduler, and the hardware-root capabilities held by the OS core. Everything else —
 interpreters, user-level schedulers, providers, the shell — is unprivileged by construction (see *Execution APIs*).
 
+**Hardware mitigations are insurance, never load-bearing.** The policy: use hardware-level security mitigations
+when they are approximately free, but never strictly rely on them. In an ideal world where the compiler is
+correct, Eo9 is secure even on hardware with no MMU at all — language-level safety is the security model, and
+every hardware feature is defense-in-depth against bugs in the things that *implement* that model (the compiler,
+the runtime's unsafe code). Concretely: W^X for generated code pages is kept (page-table bits, zero runtime
+cost, and it converts a compiler miscompilation from "arbitrary ring-0 code execution" into "data corruption
+that needs further chaining"); the IOMMU is adopted on hardware that has one (DMA is outside language-level
+safety entirely, so it is the one place hardware protection is the *only* protection); and the rest of the
+classical mitigation zoo — ASLR, stack canaries, CFI, guard pages, shadow stacks — is deliberately not built,
+because the language makes the attack patterns they defend against inexpressible.
+
 Spectre-class side channels are mitigated capability-style: fine-grained time is itself a capability. Untrusted
 programs are composed with noisy, adversarial, or stubbed timers (`time.fuzzy`, `time.frozen`, `time.none`) and are
 not granted shared-memory threads (thread spawning is itself a capability — see *Execution APIs*) or other primitives from which a high-resolution clock could be rebuilt —
 attenuating the attacker's clock is just provider substitution, the same mechanism as everything else.
+Two further layers exist for programs that *are* legitimately granted precise time: the compiler's speculative
+bounds-check masking, enabled where the execution mode supports it (today that is usermode; the bare-metal
+explicit-bounds-check mode cannot express the masking — upstream Cranelift work would lift this — so on metal
+the timer capability is the *only* Spectre mitigation and programs granted real time there are trusted with
+respect to side channels); and microarchitectural state (caches, branch predictors) can be flushed at
+trust boundaries. Flushing **is a granted capability** (`cache.flush`-style), not an ambient right or a free
+execution attribute — not because erasing your own traces reads or writes anything, but because a flush
+externalizes cost: the next programs to run find cold caches and run slower, so the ability to flush is the
+ability to degrade the rest of the system. The symmetric principle: *reading* microarchitectural state (via
+timing) requires the time capability; *perturbing* it (flushing) requires the cache capability; both default to
+denied. The flush's own cost is charged to the flusher's fuel, and the executor may additionally apply
+flush-on-switch as a scheduling policy at distrust boundaries — paid only where needed, never on every context
+switch.
 
 ## Virtualization
 

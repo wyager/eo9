@@ -328,15 +328,15 @@ COMMANDS:
     doctor               Check the host prerequisites (rustup, the pinned nightly, the wasm32
                          target, the wasm-tools CLI; QEMU and node are optional) and print
                          install hints for anything missing
-    refresh-components   Copy the built guest components into crates/eo9-components/data/ and
+    refresh-components   Copy the built guest components into crates/eo9-bundled-programs/data/ and
                          regenerate its index — the prebuilt set a `cargo install eo9` build
                          seeds from (run after build-guest; commit the result)
     check-components-bundle
-                         Verify crates/eo9-components/data/ matches the built guest components
+                         Verify crates/eo9-bundled-programs/data/ matches the built guest components
                          byte-for-byte (run by `package`; needs build-guest first — note that
                          fs-eofs only matches when built from the checkout that last refreshed
                          the bundle, see plan/01 D15)
-    package              Publishing pre-flight: build-guest, verify crates/eo9-components/data/
+    package              Publishing pre-flight: build-guest, verify crates/eo9-bundled-programs/data/
                          matches the freshly built components, assemble every publishable crate
                          with `cargo package`, dry-run-publish the leaf crates, and print the
                          exact `cargo publish` sequence (nothing is uploaded)
@@ -571,7 +571,7 @@ fn test(root: &Path) -> Result<(), String> {
 fn build_guest(root: &Path) -> Result<(), String> {
     let guest = root.join("guest");
     // Remapped paths make the component bytes identical from any checkout, so the
-    // eo9-components bundle (and the ci drift check over it) is checkout-independent.
+    // eo9-bundled-programs bundle (and the ci drift check over it) is checkout-independent.
     let remap = remap_rustflags(root);
     run_with_env(
         &guest,
@@ -938,7 +938,7 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
 /// `RUSTFLAGS` for reproducible wasm builds (the guest components and the wasm32 blob):
 /// remap the absolute path prefixes that would otherwise end up in panic-location strings,
 /// so the built bytes do not depend on where the repository happens to be checked out, the
-/// cargo home, or the rustup home. This is what lets the eo9-components bundle be compared
+/// cargo home, or the rustup home. This is what lets the eo9-bundled-programs bundle be compared
 /// byte-for-byte from any checkout (study 11 D9b: the ci drift check), and what keeps the
 /// blob's fingerprinted URL stable. Any RUSTFLAGS already present are preserved.
 fn remap_rustflags(root: &Path) -> OsString {
@@ -2336,8 +2336,8 @@ fn lint(root: &Path) -> Result<(), String> {
 /// build-guest runs before test so the host integration tests never see stale prebuilt
 /// components under guest/target/components.
 ///
-/// The eo9-components bundle drift check (study 11 D9b) is NOT part of this gate yet:
-/// `fs.eofs` depends on `eofs-core`, a path dependency outside the guest workspace, and
+/// The eo9-bundled-programs bundle drift check (study 11 D9b) is NOT part of this gate yet:
+/// `fs.eofs` depends on `eo9-eofs`, a path dependency outside the guest workspace, and
 /// cargo bakes that dependency's absolute manifest path into its `-C metadata` hash — so
 /// fs-eofs's bytes still differ per checkout even under `--remap-path-prefix`, and a
 /// byte-compare gate would go red in every checkout except the one that last refreshed
@@ -2500,8 +2500,8 @@ const PUBLISH_CRATES: &[&str] = &[
     "eo9-component",
     "eo9-store",
     "eo9-providers-unix",
-    "eo9-components",
-    "eofs-core",
+    "eo9-bundled-programs",
+    "eo9-eofs",
     "eo9-runtime",
     "eo9-embed",
     "eo9",
@@ -2513,8 +2513,8 @@ const PUBLISH_LEAF_CRATES: &[&str] = &[
     "eo9-component",
     "eo9-store",
     "eo9-providers-unix",
-    "eo9-components",
-    "eofs-core",
+    "eo9-bundled-programs",
+    "eo9-eofs",
 ];
 
 fn components_build_dir(root: &Path) -> PathBuf {
@@ -2522,7 +2522,9 @@ fn components_build_dir(root: &Path) -> PathBuf {
 }
 
 fn components_data_dir(root: &Path) -> PathBuf {
-    root.join("crates").join("eo9-components").join("data")
+    root.join("crates")
+        .join("eo9-bundled-programs")
+        .join("data")
 }
 
 /// The built guest components as sorted `(stem, bytes)` pairs.
@@ -2549,7 +2551,7 @@ fn built_components(root: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
 }
 
 /// `cargo xtask refresh-components`: copy the built guest components into
-/// crates/eo9-components/data/ and regenerate its index, so the bundle a published `eo9`
+/// crates/eo9-bundled-programs/data/ and regenerate its index, so the bundle a published `eo9`
 /// seeds from matches the source tree. Run after `cargo xtask build-guest`; commit the
 /// result.
 fn refresh_components(root: &Path) -> Result<(), String> {
@@ -2581,14 +2583,14 @@ fn refresh_components(root: &Path) -> Result<(), String> {
     std::fs::write(data.join("index.rs"), index)
         .map_err(|err| format!("cannot write the bundle index: {err}"))?;
     println!(
-        "xtask: refreshed crates/eo9-components/data: {} components, {} KiB",
+        "xtask: refreshed crates/eo9-bundled-programs/data: {} components, {} KiB",
         components.len(),
         total / 1024
     );
     Ok(())
 }
 
-/// Verify crates/eo9-components/data/ matches the freshly built guest components.
+/// Verify crates/eo9-bundled-programs/data/ matches the freshly built guest components.
 fn check_components_bundle(root: &Path) -> Result<(), String> {
     let built = built_components(root)?;
     let data = components_data_dir(root);
@@ -2620,13 +2622,13 @@ fn check_components_bundle(root: &Path) -> Result<(), String> {
     }
     if drifted.is_empty() {
         println!(
-            "xtask: eo9-components bundle matches the built components ({} components)",
+            "xtask: eo9-bundled-programs bundle matches the built components ({} components)",
             built.len()
         );
         Ok(())
     } else {
         Err(format!(
-            "the eo9-components bundle is stale: {}; run `cargo xtask refresh-components` and commit the result",
+            "the eo9-bundled-programs bundle is stale: {}; run `cargo xtask refresh-components` and commit the result",
             drifted.join(", ")
         ))
     }

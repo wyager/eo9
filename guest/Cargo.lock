@@ -232,6 +232,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-eofs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "lz4_flex",
+]
+
+[[package]]
 name = "eo9-example-cruncher"
 version = "0.0.0"
 dependencies = [
@@ -347,8 +355,8 @@ dependencies = [
 name = "eo9-stub-fs-eofs"
 version = "0.0.0"
 dependencies = [
+ "eo9-eofs",
  "eo9-guest",
- "eofs-core",
  "wit-bindgen",
 ]
 
@@ -591,14 +599,6 @@ version = "0.0.0"
 dependencies = [
  "eo9-guest",
  "wit-bindgen",
-]
-
-[[package]]
-name = "eofs-core"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "lz4_flex",
 ]
 
 [[package]]

@@ -121,10 +121,11 @@ pub enum ImageState {
     /// The device holds an eofs filesystem; mounting it adopts `txg`. `degraded` is the
     /// [`MountReport::fell_back_past_invalid_slot`] condition.
     Eofs { txg: u64, degraded: bool },
-    /// The device holds no eofs filesystem and its leading bytes are all zero: a blank
-    /// device, safe to format in place.
+    /// The device holds no eofs filesystem and its probed spans (the leading megabyte,
+    /// the trailing 64 KiB, or the whole device when it is small — see [`probe`]) are all
+    /// zero: a blank device, safe to format in place.
     Blank,
-    /// The device holds no eofs filesystem but its leading bytes are NOT all zero: it
+    /// The device holds no eofs filesystem but its probed spans are NOT all zero: it
     /// contains someone else's data. Formatting it would destroy that data, so nothing in
     /// Eo9 does so implicitly (study 07, S7-2) — formatting foreign data takes an
     /// explicit, forced `mkfs`.
@@ -134,10 +135,25 @@ pub enum ImageState {
     Unmountable,
 }
 
-/// How many leading bytes [`probe`] checks for zeroness when no eofs magic is present:
-/// enough to cover both uberblock slots and the superblock locations of every common
-/// foreign filesystem (ext4 at 1024, FAT/NTFS/exFAT at 0, GPT at 512...).
-const PROBE_ZERO_SPAN: u64 = 64 * 1024;
+/// How many leading bytes [`probe`] checks for zeroness when no eofs magic is present.
+///
+/// The span must clear every common foreign format's *primary* on-disk structure:
+/// FAT/NTFS/exFAT boot sectors at 0, MBR at 446, GPT at 512, ext4 at 1024, bcachefs at
+/// 4096, ZFS's first label, and — the furthest out of the lot — **btrfs at exactly
+/// 64 KiB**. One MiB covers all of them with a wide margin (the previous 64 KiB span
+/// ended exactly where btrfs begins; owner ruling on study 07, S7-2).
+const PROBE_ZERO_PREFIX: u64 = 1024 * 1024;
+
+/// How many trailing bytes [`probe`] checks for zeroness when no eofs magic is present:
+/// backup structures live at the *end* of a device — the backup GPT header/entries in the
+/// last ~17 KiB and ZFS's end-of-device uberblock arrays. A device whose start was wiped
+/// but whose backups survive is damaged foreign data, not a blank device.
+const PROBE_ZERO_SUFFIX: u64 = 64 * 1024;
+
+/// Devices smaller than this are probed in full rather than by spans: at this size the
+/// prefix and suffix windows nearly cover the device anyway, and checking everything
+/// removes any gap between them.
+const PROBE_WHOLE_DEVICE_BELOW: u64 = 2 * 1024 * 1024;
 
 /// Inspect a device without mounting (or changing) anything: is there an eofs filesystem
 /// here, a blank device, foreign data, or unmountable eofs remains?
@@ -184,17 +200,31 @@ pub fn probe<D: BlockDevice>(dev: &D) -> Result<ImageState, FsError> {
     if any_magic {
         return Ok(ImageState::Unmountable);
     }
-    // No magic anywhere: blank or foreign. Check the leading span for any non-zero byte.
-    let span = core::cmp::min(PROBE_ZERO_SPAN, device_size);
-    let mut offset = 0u64;
+    // No magic anywhere: blank or foreign. A device only counts as blank when the spans
+    // where any common foreign format would leave its mark are all zero — the leading
+    // megabyte (primary superblocks, partition tables; btrfs sits at exactly 64 KiB), the
+    // trailing 64 KiB (backup GPT, ZFS end labels), and, for small devices, simply all of
+    // it. Anything non-zero in those spans is someone else's data and is never formatted
+    // implicitly.
+    let spans: [(u64, u64); 2] = if device_size <= PROBE_WHOLE_DEVICE_BELOW {
+        [(0, device_size), (0, 0)]
+    } else {
+        [
+            (0, PROBE_ZERO_PREFIX),
+            (device_size - PROBE_ZERO_SUFFIX, device_size),
+        ]
+    };
     let mut chunk = vec![0u8; 4096];
-    while offset < span {
-        let len = core::cmp::min(4096, span - offset) as usize;
-        dev.read_at(offset, &mut chunk[..len])?;
-        if chunk[..len].iter().any(|byte| *byte != 0) {
-            return Ok(ImageState::Foreign);
+    for (start, end) in spans {
+        let mut offset = start;
+        while offset < end {
+            let len = core::cmp::min(4096, end - offset) as usize;
+            dev.read_at(offset, &mut chunk[..len])?;
+            if chunk[..len].iter().any(|byte| *byte != 0) {
+                return Ok(ImageState::Foreign);
+            }
+            offset += len as u64;
         }
-        offset += len as u64;
     }
     Ok(ImageState::Blank)
 }

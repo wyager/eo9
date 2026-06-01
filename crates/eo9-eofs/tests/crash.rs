@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eofs_core::{CutDevice, Eofs, FormatOptions, FsError, MemDevice, NodeKind};
+use eo9_eofs::{CutDevice, Eofs, FormatOptions, FsError, MemDevice, NodeKind};
 
 const DEV_SIZE: u64 = 4 * 1024 * 1024;
 const TOTAL_TXS: usize = 5;
@@ -41,7 +41,7 @@ fn content_d() -> Vec<u8> {
 
 /// The scenario: five transactions. Counts a transaction as reported-committed only when
 /// its `commit()` returns `Ok`. Stops at the first error (the power is out).
-fn scenario<D: eofs_core::BlockDevice>(
+fn scenario<D: eo9_eofs::BlockDevice>(
     fs: &mut Eofs<D>,
     reported: &mut usize,
 ) -> Result<(), FsError> {

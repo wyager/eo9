@@ -1,7 +1,7 @@
 //! Snapshots are retained roots: isolated from later writes, listable, readable, and never
 //! reclaimed by GC while they exist.
 
-use eofs_core::{Eofs, FormatOptions, FsError, MemDevice, NodeKind};
+use eo9_eofs::{Eofs, FormatOptions, FsError, MemDevice, NodeKind};
 
 const DEV_SIZE: u64 = 8 * 1024 * 1024;
 

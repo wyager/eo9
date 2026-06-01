@@ -2,7 +2,7 @@
 //! damaged uberblock slot falls back to the previous transaction (or fails the mount when
 //! both slots are gone).
 
-use eofs_core::{Eofs, FormatOptions, FsError, MemDevice};
+use eo9_eofs::{Eofs, FormatOptions, FsError, MemDevice};
 
 const DEV_SIZE: u64 = 4 * 1024 * 1024;
 const MARKER: &[u8] = b"EOFS-CORRUPTION-MARKER-";
@@ -110,7 +110,7 @@ fn a_blank_device_does_not_mount() {
 
 #[test]
 fn probe_distinguishes_eofs_blank_foreign_and_unmountable() {
-    use eofs_core::{ImageState, probe};
+    use eo9_eofs::{ImageState, probe};
 
     // A healthy image probes as Eofs at its committed transaction, not degraded.
     let image = image_with_victim();
@@ -143,6 +143,47 @@ fn probe_distinguishes_eofs_blank_foreign_and_unmountable() {
         ImageState::Foreign
     );
 
+    // A btrfs-shaped victim: zeros everywhere except a superblock at exactly 64 KiB — the
+    // boundary where the old 64 KiB probe span ended (owner ruling on study 07, S7-2).
+    // This must read as Foreign, never Blank.
+    let mut btrfs_like = vec![0u8; DEV_SIZE as usize];
+    btrfs_like[64 * 1024..64 * 1024 + 8].copy_from_slice(b"_BHRfS_M");
+    assert_eq!(
+        probe(&MemDevice::from_vec(btrfs_like)).unwrap(),
+        ImageState::Foreign
+    );
+
+    // Backup structures at the END of the device (a backup GPT header, ZFS end labels)
+    // also make it Foreign: a wiped start with surviving backups is damaged data, not a
+    // blank device.
+    let mut tail_data = vec![0u8; DEV_SIZE as usize];
+    let tail = DEV_SIZE as usize - 512;
+    tail_data[tail..tail + 8].copy_from_slice(b"EFI PART");
+    assert_eq!(
+        probe(&MemDevice::from_vec(tail_data)).unwrap(),
+        ImageState::Foreign
+    );
+
+    // Data hiding between the probed spans of a LARGE device is the accepted residual
+    // risk: beyond the leading megabyte and before the trailing 64 KiB nothing common
+    // lives, and probing entire multi-gigabyte devices on every mount is not worth it.
+    // (Devices at or under 2 MiB are probed in full, so this gap only exists above that.)
+    let mut between = vec![0u8; (3 * 1024 * 1024) as usize];
+    between[2 * 1024 * 1024] = 1;
+    assert_eq!(
+        probe(&MemDevice::from_vec(between)).unwrap(),
+        ImageState::Blank
+    );
+
+    // A small device (at or under 2 MiB) is probed in full: a non-zero byte anywhere makes
+    // it Foreign.
+    let mut small = vec![0u8; (2 * 1024 * 1024) as usize];
+    small[1024 * 1024 + 512 * 1024] = 1; // past the 1 MiB prefix, before the 64 KiB suffix
+    assert_eq!(
+        probe(&MemDevice::from_vec(small)).unwrap(),
+        ImageState::Foreign
+    );
+
     // An image whose every uberblock slot is damaged is Unmountable, not Blank or Foreign.
     let mut dead = image;
     dead[100] ^= 0xff;
@@ -155,7 +196,7 @@ fn probe_distinguishes_eofs_blank_foreign_and_unmountable() {
 
 #[test]
 fn falling_back_past_a_damaged_uberblock_is_reported() {
-    use eofs_core::{ImageState, probe};
+    use eo9_eofs::{ImageState, probe};
 
     // Two transactions: txg 1 (format, slot 1) and txg 2 (the file, slot 0).
     let mut image = image_with_victim();

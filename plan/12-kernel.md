@@ -1498,3 +1498,14 @@ preemption/hardening work.
     incremental plan in the spike doc. `wit/pci` needs no changes. The xtask `iommu` argument
     added by the spike is experimental and aarch64-only; promote it to a documented flag when
     step 1 of the incremental plan lands.
+
+64. **Spectre bounds-check mitigation audit (2026-06-01, `docs/spikes/spectre-audit.md`).** Cranelift's
+    speculative bounds-check masking is ON in usermode (defaults + guard-region sizing), but **forced
+    OFF on every bare-metal engine and cannot be enabled**: wasmtime 45 hard-errors if the Spectre
+    settings are enabled together with `signals_based_traps(false)`, because the mitigation's
+    load-from-null formulation needs fault-on-null, which explicit-bounds-check mode (and our
+    identity-mapped address 0) does not have. On metal the load-bearing Spectre defense is therefore
+    the time capability alone; the compiler-level fix is an upstream/vendored Cranelift enhancement
+    (cmov-mask formulation), a candidate for the same fork+PR path as the no_std work. The kernel's
+    wasmtime configuration is also confirmed to be exactly the no-MMU configuration (no signals, no
+    reservations, no guards) — the MMU is used only for W^X, never for memory safety.

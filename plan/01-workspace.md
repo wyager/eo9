@@ -162,3 +162,19 @@ None. Everything else depends on this.
     help entry is gone. Remaining owner decisions from the study: hosted CI, publish automation
     (tags/changelog/recovery), a local-registry rehearsal for the `eo9` crate, and crate-name
     permanence review.
+
+16. **Crate names optimized before first publish (2026-06-01, owner ruling on study 11 D24, branch
+    `area/14-blank-and-rename`).** Two renames, both done while nothing is on crates.io yet (names
+    there are permanent):
+    - `eofs-core` → **`eo9-eofs`**: the filesystem engine joins the `eo9-` namespace every other
+      published crate uses (it was the one crate outside it).
+    - `eo9-components` → **`eo9-bundled-programs`**: the prebuilt-components data crate's old name
+      was one letter away from `eo9-component` (the algebra crate) — a guaranteed source of
+      confusion on crates.io. The new name says what it is.
+    Mechanics: directory + `[package]` renames, every dependent manifest (root pin table, crates/eo9,
+    guest fs-eofs, kernel storedisk feature), every Rust use site (`eofs_core::` → `eo9_eofs::`,
+    `eo9_components::` → `eo9_bundled_programs::`), the xtask publish/refresh/check lists and paths,
+    and the two crates' READMEs. The bundle data files themselves are untouched (pure git renames).
+    Earlier decisions in this file refer to the old names; they are historical record, not current
+    state. The publish sequence is now: eo9-component, eo9-store, eo9-providers-unix,
+    eo9-bundled-programs, eo9-eofs, eo9-runtime, eo9-embed, eo9.

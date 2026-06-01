@@ -1,4 +1,4 @@
-# eo9-components
+# eo9-bundled-programs
 
 Prebuilt Eo9 guest components — the eosh shell, the example programs, the
 coreutils, and the standard stub providers — bundled as data so a `cargo install

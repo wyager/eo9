@@ -1,4 +1,4 @@
-//! eofs-core — Eo9's native filesystem, as a target-independent library.
+//! eo9-eofs — Eo9's native filesystem, as a target-independent library.
 //!
 //! This crate implements the on-disk format and the read/write engine of `eofs`
 //! (SPEC.md, "Filesystem API"): a copy-on-write, Merkle-hashed, snapshotting, block-
@@ -37,7 +37,7 @@
 //! # Example
 //!
 //! ```
-//! use eofs_core::{Eofs, FormatOptions, MemDevice};
+//! use eo9_eofs::{Eofs, FormatOptions, MemDevice};
 //!
 //! let dev = MemDevice::new(1 << 20);
 //! let mut fs = Eofs::format(dev, &FormatOptions::default()).unwrap();

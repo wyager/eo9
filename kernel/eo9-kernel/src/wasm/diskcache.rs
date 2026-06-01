@@ -37,7 +37,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use eofs_core::{BlockDevice, DeviceError, Eofs, FormatOptions};
+use eo9_eofs::{BlockDevice, DeviceError, Eofs, FormatOptions};
 
 use crate::virtio_blk::VirtioBlk;
 
@@ -126,7 +126,7 @@ fn decode_entry(tag_key: &str, bytes: &[u8], what: &str) -> Option<Vec<u8>> {
     Some(payload.to_vec())
 }
 
-/// `eofs_core::BlockDevice` over the in-kernel virtio-blk driver. The trait takes `&self`
+/// `eo9_eofs::BlockDevice` over the in-kernel virtio-blk driver. The trait takes `&self`
 /// for reads, so the driver (whose ring indices advance on every request) sits in an
 /// `UnsafeCell`; every access goes through the module-level lock below, which restores the
 /// exclusive access the cell needs.
@@ -326,7 +326,7 @@ fn write_entry(
     dir: &str,
     path: &str,
     entry: &[u8],
-) -> Result<(), eofs_core::FsError> {
+) -> Result<(), eo9_eofs::FsError> {
     if mounted.fs.stat(dir).is_err() {
         mounted.fs.mkdir(dir)?;
     }
@@ -498,7 +498,7 @@ pub fn bin_remove(name: &str) -> Result<(), String> {
             return Err(String::from("this boot has no writable store disk"));
         };
         let path = bin_path(name);
-        let result = (|| -> Result<(), eofs_core::FsError> {
+        let result = (|| -> Result<(), eo9_eofs::FsError> {
             mounted.fs.remove(&path)?;
             mounted.fs.commit()?;
             Ok(())

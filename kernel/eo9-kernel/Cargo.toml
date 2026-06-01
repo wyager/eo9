@@ -39,7 +39,7 @@ wasm-codegen = ["dep:wasmtime", "wasmtime/cranelift", "dep:eo9-component"]
 # at boot only by the bare `storedisk` command-line token; without the token the feature is
 # inert. Off by default; xtask enables it for the aarch64 full build only (the ECAM bring-up
 # in src/pci.rs is aarch64-virt specific today).
-wasm-storedisk = ["wasm-store", "dep:eofs-core", "dep:blake3"]
+wasm-storedisk = ["wasm-store", "dep:eo9-eofs", "dep:blake3"]
 
 # These dependencies are only used by the real bare-metal build; host-triple builds (unit
 # tests, `cargo check` without --target) compile the stub entry point and need neither.
@@ -60,8 +60,8 @@ eo9-component = { path = "../../crates/eo9-component", default-features = false,
 # The eofs filesystem engine (no_std + alloc; the same crate the fs.eofs guest provider and
 # the usermode mkfs use) — the on-disk format for the persistent store disk. A path
 # dependency into the host workspace, like eo9-component above.
-eofs-core = { path = "../../crates/eofs-core", optional = true }
+eo9-eofs = { path = "../../crates/eo9-eofs", optional = true }
 # Content addressing for cached compile artifacts (cache key = blake3 of the fused
 # executable bytes). Same pin as the host workspace; `no_neon` because the bare-metal
-# targets have no C toolchain for the NEON kernels (mirrors crates/eofs-core).
+# targets have no C toolchain for the NEON kernels (mirrors crates/eo9-eofs).
 blake3 = { version = "1.8.5", default-features = false, features = ["no_neon"], optional = true }

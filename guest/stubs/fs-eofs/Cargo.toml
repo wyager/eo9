@@ -12,5 +12,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 eo9-guest = { workspace = true }
-eofs-core = { workspace = true }
+eo9-eofs = { workspace = true }
 wit-bindgen = { workspace = true }

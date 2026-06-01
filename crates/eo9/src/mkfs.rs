@@ -1,7 +1,7 @@
 //! `eo9 mkfs.eofs` — create (if needed) and format a host image file with eofs, Eo9's
 //! native filesystem (plan/14-eofs.md milestone 3).
 //!
-//! The command writes the image directly through `eofs-core` on a small file-backed
+//! The command writes the image directly through `eo9-eofs` on a small file-backed
 //! [`BlockDevice`]; at run time the *guest* never sees this code — it sees the raw
 //! `eo9:disk` capability (the `--disk <image>` grant) and mounts the image by composing
 //! the `fs.eofs` provider in front of its program (`fs.eofs $ …`).
@@ -16,7 +16,7 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use eofs_core::{BlockDevice, DeviceError, Eofs, FormatOptions};
+use eo9_eofs::{BlockDevice, DeviceError, Eofs, FormatOptions};
 
 use crate::cli::{ArgStream, Config, EXIT_SUCCESS, vlog};
 
@@ -61,24 +61,24 @@ pub fn cmd_mkfs(cfg: &Config, stream: &mut ArgStream) -> Result<u8, String> {
         // What is on the device decides what formatting it would destroy (study 07, S7-2):
         // an existing eofs filesystem and foreign (non-eofs, non-blank) data are both
         // refused without --force. Only a genuinely blank device formats without ceremony.
-        match eofs_core::probe(&device)
+        match eo9_eofs::probe(&device)
             .map_err(|err| format!("cannot inspect {}: {err}", image.display()))?
         {
-            eofs_core::ImageState::Eofs { .. } | eofs_core::ImageState::Unmountable => {
+            eo9_eofs::ImageState::Eofs { .. } | eo9_eofs::ImageState::Unmountable => {
                 return Err(format!(
                     "{} already contains an eofs filesystem (or the remains of one); pass \
                      --force to reformat it and lose its contents",
                     image.display()
                 ));
             }
-            eofs_core::ImageState::Foreign => {
+            eo9_eofs::ImageState::Foreign => {
                 return Err(format!(
                     "{} holds data that is not an eofs filesystem; pass --force to format \
                      over it and lose that data",
                     image.display()
                 ));
             }
-            eofs_core::ImageState::Blank => {}
+            eo9_eofs::ImageState::Blank => {}
         }
     }
 

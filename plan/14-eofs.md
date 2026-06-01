@@ -217,3 +217,18 @@ Milestone 3 (usermode persistence: `--disk`, `mkfs.eofs`, the file-backed device
     Findings that remain open by design: S7-12 (rename/atomic-replace in WIT — owner decision),
     S7-8 (fsck/scrub/df surface), S7-9 (uberblock geometry), S7-19 (operator-side threat model
     SPEC paragraph) — all tracked in the study triage table.
+
+25. **Blank-image probe spans widened to clear every common foreign format (2026-06-01, owner ruling
+    on S7-2, branch `area/14-blank-and-rename`).** D24's "all-zero leading 64 KiB" rule had a hole:
+    btrfs puts its primary superblock at exactly 64 KiB, so a btrfs volume whose first 64 KiB is
+    legitimately zero would have been auto-formatted. `eofs_core::probe()` now judges a magic-less
+    device blank only when **(a)** its leading 1 MiB is all zero (clears MBR/GPT/ext4/bcachefs/ZFS
+    and btrfs with margin), **(b)** its trailing 64 KiB is all zero (clears backup GPT headers and
+    ZFS end-of-device labels — a wiped start with surviving backups is damaged data, not blank), and
+    **(c)** devices of 2 MiB or less are probed in full. Both auto-format paths (the fs.eofs
+    provider and un-forced `mkfs.eofs`) share `probe()`, so one change covers both. The accepted
+    residual: data hiding strictly between the spans of a large device still reads as blank —
+    nothing common lives there, and probing whole multi-gigabyte devices on every mount is not worth
+    it (test-pinned as documentation). New tests: engine-level btrfs-at-64 KiB / tail-backup /
+    between-spans / small-device cases; CLI-level `zero_prefixed_foreign_volumes_are_refused_not_formatted`
+    proves both victims are refused by provider and mkfs with bytes untouched.

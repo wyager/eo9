@@ -35,11 +35,11 @@ const SEED_RECORD_HEADER: &str = "eo9-seed 1";
 
 /// The component set this binary carries: the locally built `guest/target/components`
 /// set when the binary was built inside the repository (so dev builds always ship what
-/// the tree builds), otherwise the prebuilt set bundled by the `eo9-components` crate —
+/// the tree builds), otherwise the prebuilt set bundled by the `eo9-bundled-programs` crate —
 /// which is what a `cargo install eo9` build seeds from.
 fn carried_components() -> &'static [(&'static str, &'static [u8])] {
     if EMBEDDED_COMPONENTS.is_empty() {
-        eo9_components::bundled()
+        eo9_bundled_programs::bundled()
     } else {
         EMBEDDED_COMPONENTS
     }
@@ -56,7 +56,7 @@ pub fn embedded(stem: &str) -> Option<&'static [u8]> {
 
 /// How many components this binary carries, and where they came from — for `--version`.
 /// `true` means the locally built `guest/target/components` set (a repository build);
-/// `false` means the prebuilt `eo9-components` bundle (a registry install).
+/// `false` means the prebuilt `eo9-bundled-programs` bundle (a registry install).
 pub fn bundled_provenance() -> (usize, bool) {
     let local = !EMBEDDED_COMPONENTS.is_empty();
     (carried_components().len(), local)
