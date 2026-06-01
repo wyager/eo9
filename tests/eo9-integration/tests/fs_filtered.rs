@@ -191,3 +191,57 @@ fn the_policy_is_pure_and_the_composition_seals_it() {
         "the attenuator's underlying fs requirement must remain: {residual:?}"
     );
 }
+
+#[test]
+fn reviewer_traversal_corpus_no_false_allows_and_no_false_denies() {
+    // Reviewer-added corpus: trickier spellings in both directions — semantically-outside
+    // paths must be denied no matter how they are written, and semantically-inside paths
+    // must NOT be collateral damage of the normalization.
+    let chain = closed_chain(&subtree_policy("/docs", "read-write"));
+
+    // Semantically outside /docs — every spelling must be denied.
+    for outside in [
+        "//docs//../..",           // repeated separators + escape to root
+        "/docs/./../secret.txt",   // dot segments resolving outside
+        "/docs/..",                // exactly the parent
+        "/docsx/file.txt",         // segment-aware prefix: /docsx is not /docs
+        "/docs/../docsx/file.txt", // escape then re-enter a sibling
+        "/docs/sub/../../other",   // nested escape
+        "/../docs/../etc/passwd",  // leading escape, re-enter, escape again
+    ] {
+        let outcome = run_readwrite(&chain, outside);
+        assert_failure_contains(&outcome, "denied");
+    }
+
+    // Semantically inside /docs — normalization must not deny legitimate paths. The
+    // memfs is empty (no /docs directory), so the proof that the policy gate passed the
+    // path through is that the failure comes from the *backend* (not-found), never the
+    // gate (denied).
+    for inside in [
+        "/docs/file.txt",        // plain
+        "/docs/sub/../file.txt", // internal .. staying inside
+        "//docs///file.txt",     // repeated separators
+        "/./docs/./file.txt",    // dot segments
+        "/docs/file.txt/",       // trailing slash
+    ] {
+        let outcome = run_readwrite(&chain, inside);
+        match &outcome {
+            Outcome::Failure(failure) => assert!(
+                !failure.value.to_lowercase().contains("denied"),
+                "an inside path must not be denied by normalization: {inside:?} -> {outcome:?}"
+            ),
+            other => panic!("expected the backend's not-found for {inside:?}, got {other:?}"),
+        }
+    }
+
+    // And with a root prefix (no subdirectory needed on the empty memfs), the same
+    // tricky-but-inside spellings genuinely succeed end to end.
+    let chain = closed_chain(&subtree_policy("/", "read-write"));
+    for inside in ["/note.txt", "/sub/../note.txt", "//note.txt", "/./note.txt"] {
+        let outcome = run_readwrite(&chain, inside);
+        assert!(
+            matches!(outcome, Outcome::Success(_)),
+            "a legitimately-inside path must round-trip: {inside:?} -> {outcome:?}"
+        );
+    }
+}
