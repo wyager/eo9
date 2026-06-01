@@ -16,7 +16,6 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use eofs_core::format::{MAGIC, SLOT_OFFSETS, SLOT_SIZE};
 use eofs_core::{BlockDevice, DeviceError, Eofs, FormatOptions};
 
 use crate::cli::{ArgStream, Config, EXIT_SUCCESS, vlog};
@@ -58,12 +57,29 @@ pub fn cmd_mkfs(cfg: &Config, stream: &mut ArgStream) -> Result<u8, String> {
         .map_err(|err| format!("cannot open {}: {err}", image.display()))?;
     let device_size = device.size();
 
-    if !created && carries_eofs_magic(&device)? && !force {
-        return Err(format!(
-            "{} already contains an eofs filesystem (or the remains of one); pass --force \
-             to reformat it and lose its contents",
-            image.display()
-        ));
+    if !created && !force {
+        // What is on the device decides what formatting it would destroy (study 07, S7-2):
+        // an existing eofs filesystem and foreign (non-eofs, non-blank) data are both
+        // refused without --force. Only a genuinely blank device formats without ceremony.
+        match eofs_core::probe(&device)
+            .map_err(|err| format!("cannot inspect {}: {err}", image.display()))?
+        {
+            eofs_core::ImageState::Eofs { .. } | eofs_core::ImageState::Unmountable => {
+                return Err(format!(
+                    "{} already contains an eofs filesystem (or the remains of one); pass \
+                     --force to reformat it and lose its contents",
+                    image.display()
+                ));
+            }
+            eofs_core::ImageState::Foreign => {
+                return Err(format!(
+                    "{} holds data that is not an eofs filesystem; pass --force to format \
+                     over it and lose that data",
+                    image.display()
+                ));
+            }
+            eofs_core::ImageState::Blank => {}
+        }
     }
 
     let formatted = Eofs::format(device, &FormatOptions::default())
@@ -115,24 +131,6 @@ fn ensure_image_file(image: &Path, size: Option<u64>) -> Result<bool, String> {
         }
         Err(err) => Err(format!("cannot inspect {}: {err}", image.display())),
     }
-}
-
-/// Whether either uberblock slot of the device starts with the eofs magic — the "this was
-/// (or is) an eofs image" tell that makes a reformat require `--force`.
-fn carries_eofs_magic(device: &FileDevice) -> Result<bool, String> {
-    let mut slot = vec![0u8; MAGIC.len()];
-    for offset in SLOT_OFFSETS {
-        if offset + SLOT_SIZE > device.size() {
-            continue;
-        }
-        device
-            .read_at(offset, &mut slot)
-            .map_err(|err| format!("cannot read the image header: {err}"))?;
-        if slot == MAGIC {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// `--size` values: plain bytes, or binary-suffixed `K`/`M`/`G`.

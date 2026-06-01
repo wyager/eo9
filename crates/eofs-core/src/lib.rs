@@ -72,7 +72,8 @@ mod tree;
 
 pub use device::{BlockDevice, CutDevice, DeviceError, MemDevice};
 pub use error::FsError;
-pub use format::{Codec, NodeKind};
+pub use format::{Codec, NodeKind, SlotState};
 pub use fs::{
-    Eofs, FormatOptions, GcReport, NodeStat, SnapshotInfo, SnapshotView, SpaceReport, VerifyReport,
+    Eofs, FormatOptions, GcReport, ImageState, MountReport, NodeStat, SnapshotInfo, SnapshotView,
+    SpaceReport, VerifyReport, probe,
 };

@@ -243,3 +243,65 @@ fn no_op_commit_does_not_advance_the_transaction() {
     assert_eq!(fs.commit().unwrap(), 2);
     assert_eq!(fs.commit().unwrap(), 2);
 }
+
+// --- rollback: discarding uncommitted changes (study 07, S7-4) ---------------------------
+
+#[test]
+fn rollback_discards_uncommitted_changes() {
+    let mut fs = fresh_fs();
+    fs.create_file("/keep.txt").unwrap();
+    fs.write("/keep.txt", 0, b"the original contents").unwrap();
+    fs.commit().unwrap();
+
+    // Stage a remove + recreate (the provider's truncate) plus a write, then roll back
+    // instead of committing: the pending state vanishes, the committed state stands.
+    fs.remove("/keep.txt").unwrap();
+    fs.create_file("/keep.txt").unwrap();
+    fs.write("/keep.txt", 0, b"half").unwrap();
+    assert!(fs.is_dirty());
+    fs.rollback();
+
+    assert!(!fs.is_dirty());
+    assert_eq!(read_all(&fs, "/keep.txt"), b"the original contents");
+
+    // A remount of the underlying image agrees: nothing uncommitted ever reached disk.
+    let fs = Eofs::mount(fs.unmount()).unwrap();
+    assert_eq!(read_all(&fs, "/keep.txt"), b"the original contents");
+}
+
+#[test]
+fn rollback_after_a_failed_write_preserves_the_previous_content() {
+    // A device too small for the rewrite: the original content fits, the replacement
+    // does not. The failed rewrite (truncate staged, write fails with NoSpace) must leave
+    // the original intact after rollback — this is the engine half of the provider's
+    // atomic-rewrite discipline.
+    let mut fs = Eofs::format(MemDevice::new(64 * 1024), &FormatOptions::default()).unwrap();
+    fs.create_file("/keep.txt").unwrap();
+    fs.write("/keep.txt", 0, b"original").unwrap();
+    fs.commit().unwrap();
+
+    // Stage the truncate (remove + recreate, uncommitted), then fail the write. The
+    // replacement bytes are pseudo-random (incompressible), so lz4 cannot squeeze them
+    // into the space the device does not have.
+    fs.remove("/keep.txt").unwrap();
+    fs.create_file("/keep.txt").unwrap();
+    let mut state = 0x9E3779B97F4A7C15u64;
+    let huge: Vec<u8> = (0..256 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    assert_eq!(
+        fs.write("/keep.txt", 0, &huge).unwrap_err(),
+        FsError::NoSpace
+    );
+    fs.rollback();
+
+    // Both the live view and a fresh mount still hold the original bytes.
+    assert_eq!(read_all(&fs, "/keep.txt"), b"original");
+    let fs = Eofs::mount(fs.unmount()).unwrap();
+    assert_eq!(read_all(&fs, "/keep.txt"), b"original");
+}

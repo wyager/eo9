@@ -116,3 +116,11 @@ Each API section under Deliverables; "Execution APIs" (environments are just dat
     granted root, refusing with `Denied` otherwise; unnameable descriptors fall back to the pre-open
     decision. This narrows the canonicalize-then-open race; `openat2(RESOLVE_BENEATH)`-style resolution
     remains the real fix (GAPS).
+14. **Disk images are advisorily locked (2026-05-31, study 07 S7-7).** `DiskProvider::open`/
+    `open_with_size`/`create` take a `flock` on the backing file for the provider's lifetime —
+    exclusive for read-write devices, shared for read-only — so a second process mounting the same
+    image is refused up front ("is in use by another process") instead of corrupting the
+    copy-on-write filesystem through interleaved frontier allocation. Unit tests cover
+    writer-vs-writer exclusion, reader sharing, and reader-excludes-writer. The eo9 CLI shares one
+    locked handle per image within a process (its access is already serialized), so sequential
+    shell commands are unaffected.

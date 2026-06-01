@@ -1012,9 +1012,34 @@ fn shell_resolves_store_bound_names_and_eosh_from_the_store() {
     assert!(run.stdout.contains("Hello, store."), "{}", run.stdout);
     assert!(run.stderr.contains("ok: greeted"), "{}", run.stderr);
 
-    // The session bin view lives under the store root and holds the bound names.
-    assert!(store.join("shell/bin/greeter.wasm").is_file());
-    assert!(store.join("shell/bin/eosh.wasm").is_file());
+    // The session bin view lives under the store root (one directory per process since
+    // study 07 S7-6) and holds the bound names. The invocation above has exited, so its
+    // session directory may already have been swept by a later run; assert on whichever
+    // session directories remain, or — if a sweep already removed them all — accept that
+    // as the (correct) post-exit state and just re-run to confirm resolution still works.
+    let session_bins: Vec<std::path::PathBuf> = fs::read_dir(store.join("shell"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry.path().is_dir()
+                        && entry.file_name().to_string_lossy().starts_with("session-")
+                })
+                .map(|entry| entry.path().join("bin"))
+                .collect()
+        })
+        .unwrap_or_default();
+    for bin in &session_bins {
+        assert!(bin.join("greeter.wasm").is_file());
+        assert!(bin.join("eosh.wasm").is_file());
+    }
+    // Resolution keeps working on a fresh invocation either way.
+    let again = eo9(
+        &store,
+        &["shell", "-c", "greeter --name again --excited false"],
+    );
+    assert_eq!(again.code, 0, "stderr: {}", again.stderr);
+    assert!(again.stdout.contains("Hello, again."), "{}", again.stdout);
 }
 
 #[test]
@@ -1050,8 +1075,21 @@ fn shell_env_shows_the_session_capability_picture() {
         "{}",
         run.stdout
     );
-    // The manifest itself sits in the session directory the shell's fs is rooted at.
-    assert!(store.join("shell/session").is_file());
+    // The manifest itself sits in the (per-process) session directory the shell's fs is
+    // rooted at. The run above has exited, so its directory may have been swept; what
+    // matters is that any session directory that still exists carries a manifest.
+    if let Ok(entries) = fs::read_dir(store.join("shell")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && entry.file_name().to_string_lossy().starts_with("session-") {
+                assert!(
+                    path.join("session").is_file(),
+                    "session dir without a manifest: {}",
+                    path.display()
+                );
+            }
+        }
+    }
 
     // With --fs-root, the children's filesystem grant (and its root) shows up.
     let fs_root = store.join("data");
@@ -1988,6 +2026,18 @@ fn disk_is_not_granted_without_an_explicit_disk_flag() {
     assert!(all.contains("eo9:disk"), "output: {all}");
     assert!(all.contains("--disk"), "output: {all}");
     assert!(all.contains("mkfs.eofs"), "output: {all}");
+    // The remedy must LEAD; the raw linker text follows it (study 07, S7-13). Before this
+    // ordering, the actionable sentence was a parenthetical after four clauses of linker
+    // internals.
+    let remedy_at = all.find("--disk").expect("remedy present");
+    let jargon_at = all
+        .find("imports instance")
+        .or_else(|| all.find("implementation"))
+        .expect("raw reason still present");
+    assert!(
+        remedy_at < jargon_at,
+        "the remedy must come before the linker internals: {all}"
+    );
 }
 
 #[test]
@@ -2013,4 +2063,471 @@ fn a_damaged_disk_image_is_a_typed_error_not_a_crash() {
     let all = format!("{}{}", run.stdout, run.stderr);
     assert!(!all.contains("panicked"), "output: {all}");
     assert!(all.contains("error: fs("), "output: {all}");
+}
+
+#[test]
+fn corruption_reads_as_an_integrity_failure_not_generic_io() {
+    // Study 07 finding S7-5: corruption used to surface as FsError::Io("block checksum
+    // mismatch") — indistinguishable from a flaky cable except by string-matching debug
+    // text. The provider now prefixes every integrity failure with a fixed marker, so
+    // users (and, until the WIT gains a corruption variant, programs) can tell rot from
+    // I/O trouble.
+    let store = temp_store("eofs-integrity-error");
+    let dir = temp_store("eofs-integrity-error-images");
+    let image = dir.join("disk.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+
+    let format = eo9(&store, &["mkfs.eofs", image_arg, "--size", "4M"]);
+    assert_eq!(format.code, 0, "stderr: {}", format.stderr);
+    let write = eo9(
+        &store,
+        &[
+            "--disk",
+            image_arg,
+            "-c",
+            "fs.eofs $ readwrite /keep.txt integrity-canary-payload-x",
+        ],
+    );
+    assert_eq!(write.code, 0, "stderr: {}", write.stderr);
+
+    // Corrupt the file's data: flip bytes well past the uberblocks, in the data region.
+    let mut bytes = fs::read(&image).expect("read image");
+    let needle = b"integrity-canary-payload-x";
+    let at = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .expect("canary stored raw (incompressible short payload)");
+    bytes[at] ^= 0x40;
+    fs::write(&image, &bytes).expect("write corrupted image");
+
+    let read = eo9(
+        &store,
+        &["--disk", image_arg, "-c", "fs.eofs $ cat /keep.txt"],
+    );
+    assert_eq!(read.code, 1, "stdout: {}", read.stdout);
+    let all = format!("{}{}", read.stdout, read.stderr);
+    assert!(
+        all.contains("integrity check failed"),
+        "corruption must read as an integrity failure: {all}"
+    );
+    // And the corrupted bytes were never returned.
+    assert!(
+        !read.stdout.contains("integrity-canary"),
+        "stdout: {}",
+        read.stdout
+    );
+}
+
+#[test]
+fn a_failed_rewrite_never_destroys_the_previous_file_content() {
+    // Study 07 finding S7-4: `readwrite` (open with TRUNCATE, then write) used to commit
+    // the truncation as its own transaction, so a rewrite whose write failed (NoSpace)
+    // left a permanently empty file. The provider now stages the truncate and commits it
+    // together with the write — a rewrite is atomic. This test rewrites a small file with
+    // incompressible content on a deliberately tiny image until either a rewrite fails
+    // (pre-reclamation behaviour) or the iteration budget runs out (post-reclamation
+    // behaviour); in BOTH cases the file must hold the last successfully written content
+    // — never be empty, never hold a torn mixture.
+    let store = temp_store("eofs-atomic-rewrite");
+    let dir = temp_store("eofs-atomic-rewrite-images");
+    let image = dir.join("disk.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+
+    let format = eo9(&store, &["mkfs.eofs", image_arg, "--size", "32K"]);
+    assert_eq!(format.code, 0, "stderr: {}", format.stderr);
+
+    // Pseudo-random hex content per iteration: incompressible enough that lz4 cannot hide
+    // the space cost, unique per iteration so we can tell which write the file holds.
+    let content = |iteration: usize| -> String {
+        let mut state = 0x9E3779B97F4A7C15u64 ^ (iteration as u64).wrapping_mul(0xD1B54A32D192ED03);
+        let mut out = format!("iteration-{iteration}-");
+        for _ in 0..2048 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.push_str(&format!("{:02x}", state as u8));
+        }
+        out
+    };
+
+    let mut last_successful = String::new();
+    for iteration in 1..=12 {
+        let payload = content(iteration);
+        let command = format!("fs.eofs $ readwrite /keep.txt {payload}");
+        let run = eo9(&store, &["--disk", image_arg, "-c", &command]);
+        if run.code == 0 {
+            last_successful = payload;
+        } else {
+            // The rewrite failed (out of space). That is allowed; silently losing the
+            // previous content is not.
+            assert!(
+                !last_successful.is_empty(),
+                "the very first write failed: stderr: {}",
+                run.stderr
+            );
+            break;
+        }
+    }
+    assert!(!last_successful.is_empty());
+
+    // Whatever happened above, the file now holds the last successfully written content.
+    let read = eo9(
+        &store,
+        &["--disk", image_arg, "-c", "fs.eofs $ cat /keep.txt"],
+    );
+    assert_eq!(read.code, 0, "stderr: {}", read.stderr);
+    assert!(
+        read.stdout.contains(&last_successful),
+        "the file does not hold the last successfully written content (it holds {} bytes); \
+         a failed rewrite destroyed data",
+        read.stdout.len()
+    );
+}
+
+#[test]
+fn rm_frees_space_so_an_image_never_bricks() {
+    // Study 07 finding S7-3: an image used to have a finite write budget — once the
+    // copy-on-write frontier hit the end of the device, even an EMPTY filesystem refused
+    // every further write, forever, with reformat as the only recovery. With reclamation
+    // wired into the provider (gc on NoSpace), removing a file makes its space usable
+    // again: write big file A, remove it, write big file B — on an image that cannot hold
+    // both at once.
+    let store = temp_store("eofs-rm-frees");
+    let dir = temp_store("eofs-rm-frees-images");
+    let image = dir.join("disk.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+
+    let format = eo9(&store, &["mkfs.eofs", image_arg, "--size", "32K"]);
+    assert_eq!(format.code, 0, "stderr: {}", format.stderr);
+
+    // ~12 KiB of pseudo-random alphanumeric text per file: incompressible enough that two
+    // cannot coexist in the 32 KiB image's ~24 KiB data area, while one fits comfortably.
+    let payload = |seed: u64| -> String {
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut state = 0x9E3779B97F4A7C15u64 ^ seed.wrapping_mul(0xD1B54A32D192ED03);
+        (0..12 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                CHARS[(state % 62) as usize] as char
+            })
+            .collect()
+    };
+
+    let first = format!("fs.eofs $ readwrite /first.txt {}", payload(1));
+    let run = eo9(&store, &["--disk", image_arg, "-c", &first]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+
+    let rm = eo9(
+        &store,
+        &["--disk", image_arg, "-c", "fs.eofs $ rm /first.txt"],
+    );
+    assert_eq!(rm.code, 0, "stderr: {}", rm.stderr);
+
+    let second = format!("fs.eofs $ readwrite /second.txt {}", payload(2));
+    let run = eo9(&store, &["--disk", image_arg, "-c", &second]);
+    assert_eq!(
+        run.code, 0,
+        "after rm the space must be reusable; stderr: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_damaged_newest_uberblock_warns_instead_of_silently_rolling_back() {
+    // Study 07 finding S7-1: corrupting the newest uberblock used to make the filesystem
+    // silently serve the previous transaction — committed data vanished with exit 0 and
+    // no message anywhere. The mount still falls back (that is the correct recovery for a
+    // torn commit), but the host now WARNS, so an operator can tell "crash recovery" from
+    // "my acknowledged data just disappeared".
+    let store = temp_store("eofs-rollback-warn");
+    let dir = temp_store("eofs-rollback-warn-images");
+    let image = dir.join("disk.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+
+    let format = eo9(&store, &["mkfs.eofs", image_arg, "--size", "4M"]);
+    assert_eq!(format.code, 0, "stderr: {}", format.stderr);
+
+    // Two committed transactions (create, then write), so both uberblock slots hold valid
+    // uberblocks before the damage.
+    let write = eo9(
+        &store,
+        &[
+            "--disk",
+            image_arg,
+            "-c",
+            "fs.eofs $ readwrite /keep.txt important-data",
+        ],
+    );
+    assert_eq!(write.code, 0, "stderr: {}", write.stderr);
+
+    // Damage whichever slot holds the NEWER transaction (we don't know the parity, so
+    // find it: the newer slot is the one whose txg field is larger).
+    let mut bytes = fs::read(&image).expect("read image");
+    let txg_at = |bytes: &[u8], slot: usize| -> u64 {
+        u64::from_le_bytes(
+            bytes[slot * 4096 + 24..slot * 4096 + 32]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    let newest = if txg_at(&bytes, 0) > txg_at(&bytes, 1) {
+        0
+    } else {
+        1
+    };
+    bytes[newest * 4096 + 100] ^= 0xff;
+    fs::write(&image, &bytes).expect("write damaged image");
+
+    // The next use still works (fallback) but must warn loudly on stderr.
+    let run = eo9(&store, &["--disk", image_arg, "-c", "fs.eofs $ ls /"]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.contains("uberblock") && run.stderr.to_lowercase().contains("lost"),
+        "expected a loud rollback warning on stderr, got: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn foreign_data_is_never_silently_formatted() {
+    // Study 07 finding S7-2: "blank" used to mean "no eofs magic", so pointing --disk at
+    // ANY file that was not already an eofs image — an ext4 image, a tarball, a typo —
+    // silently reformatted it on first mount, exit 0. Blank now means all-zero: a file
+    // holding someone else's data is refused by the provider AND by mkfs without --force,
+    // and its bytes are not touched.
+    let store = temp_store("eofs-foreign");
+    let dir = temp_store("eofs-foreign-images");
+    let image = dir.join("not-eofs.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+
+    // 1 MiB of pseudo-random bytes standing in for somebody's ext4 image / tarball.
+    let mut state = 0xDEADBEEFCAFEBABEu64;
+    let foreign: Vec<u8> = (0..1024 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    fs::write(&image, &foreign).expect("write foreign image");
+
+    // Composing fs.eofs over it must refuse — and must not modify a single byte.
+    let run = eo9(&store, &["--disk", image_arg, "-c", "fs.eofs $ ls /"]);
+    assert_eq!(run.code, 1, "stdout: {} stderr: {}", run.stdout, run.stderr);
+    let all = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        all.contains("not an eofs filesystem"),
+        "the refusal must say what is wrong: {all}"
+    );
+    assert!(
+        all.contains("mkfs.eofs"),
+        "the refusal must name the explicit way out: {all}"
+    );
+    assert_eq!(
+        fs::read(&image).expect("re-read image"),
+        foreign,
+        "the foreign file's bytes must be untouched"
+    );
+
+    // mkfs without --force refuses too; with --force it formats (the explicit path).
+    let refuse = eo9(&store, &["mkfs.eofs", image_arg]);
+    assert_eq!(refuse.code, 3, "stderr: {}", refuse.stderr);
+    assert!(
+        refuse.stderr.contains("--force"),
+        "stderr: {}",
+        refuse.stderr
+    );
+    assert_eq!(
+        fs::read(&image).expect("re-read image"),
+        foreign,
+        "a refused mkfs must not modify the file"
+    );
+
+    let force = eo9(&store, &["mkfs.eofs", image_arg, "--force"]);
+    assert_eq!(force.code, 0, "stderr: {}", force.stderr);
+    let run = eo9(&store, &["--disk", image_arg, "-c", "fs.eofs $ ls /"]);
+    assert_eq!(run.code, 0, "after an explicit format: {}", run.stderr);
+}
+
+#[test]
+fn a_blank_zero_filled_file_still_auto_formats() {
+    // The convenience the all-zero rule keeps: a genuinely blank device (all zeroes, like
+    // a fresh sparse file or a zeroed partition) still formats on first use with no
+    // ceremony — no mkfs step needed.
+    let store = temp_store("eofs-blank");
+    let dir = temp_store("eofs-blank-images");
+    let image = dir.join("blank.img");
+    let image_arg = image.to_str().expect("utf-8 image path");
+
+    let file = fs::File::create(&image).expect("create blank image");
+    file.set_len(1024 * 1024).expect("size blank image");
+    drop(file);
+
+    let run = eo9(
+        &store,
+        &[
+            "--disk",
+            image_arg,
+            "-c",
+            "fs.eofs $ readwrite /auto.txt formatted-on-first-use",
+        ],
+    );
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+
+    let read = eo9(
+        &store,
+        &["--disk", image_arg, "-c", "fs.eofs $ cat /auto.txt"],
+    );
+    assert_eq!(read.code, 0, "stderr: {}", read.stderr);
+    assert!(read.stdout.contains("formatted-on-first-use"));
+}
+
+#[test]
+fn concurrent_processes_on_one_image_are_refused_not_corrupted() {
+    // Study 07 finding S7-7: there used to be no locking on --disk images, so two
+    // concurrent processes mounting the same image allocated from the same frontier and
+    // committed over each other — cross-writer checksum corruption and lost updates. The
+    // image file is now advisorily locked (exclusive) for the life of the process's disk
+    // handle: whichever process gets there second is refused up front with a clear
+    // message. This test launches two writers at once and accepts either interleaving —
+    // both succeeding (no overlap happened) or one being refused — but never corruption.
+    use std::thread;
+
+    let store_a = temp_store("eofs-lock-a");
+    let store_b = temp_store("eofs-lock-b");
+    let dir = temp_store("eofs-lock-images");
+    let image = dir.join("disk.img");
+    let image_arg = image.to_str().expect("utf-8 image path").to_string();
+
+    let format = eo9(&store_a, &["mkfs.eofs", &image_arg, "--size", "4M"]);
+    assert_eq!(format.code, 0, "stderr: {}", format.stderr);
+
+    // Pre-seed both stores so the concurrent runs don't also race on store seeding
+    // (a separate concern, covered by its own test).
+    let warm_a = eo9(&store_a, &["-c", "echo warm"]);
+    assert_eq!(warm_a.code, 0, "stderr: {}", warm_a.stderr);
+    let warm_b = eo9(&store_b, &["-c", "echo warm"]);
+    assert_eq!(warm_b.code, 0, "stderr: {}", warm_b.stderr);
+
+    let image_a = image_arg.clone();
+    let store_a2 = store_a.clone();
+    let writer_a = thread::spawn(move || {
+        eo9(
+            &store_a2,
+            &[
+                "--disk",
+                &image_a,
+                "-c",
+                "fs.eofs $ readwrite /from-a.txt written-by-process-a",
+            ],
+        )
+    });
+    let image_b = image_arg.clone();
+    let store_b2 = store_b.clone();
+    let writer_b = thread::spawn(move || {
+        eo9(
+            &store_b2,
+            &[
+                "--disk",
+                &image_b,
+                "-c",
+                "fs.eofs $ readwrite /from-b.txt written-by-process-b",
+            ],
+        )
+    });
+    let result_a = writer_a.join().expect("writer A thread");
+    let result_b = writer_b.join().expect("writer B thread");
+
+    // Each run either succeeded or was refused because the image was busy — never a
+    // checksum/corruption error.
+    for (name, result) in [("A", &result_a), ("B", &result_b)] {
+        let all = format!("{}{}", result.stdout, result.stderr);
+        assert!(
+            !all.contains("checksum"),
+            "writer {name} saw corruption: {all}"
+        );
+        if result.code != 0 {
+            assert!(
+                all.contains("in use"),
+                "writer {name} failed for a reason other than the image lock: {all}"
+            );
+        }
+    }
+    assert!(
+        result_a.code == 0 || result_b.code == 0,
+        "at least one writer must have succeeded\nA: {}\nB: {}",
+        result_a.stderr,
+        result_b.stderr
+    );
+
+    // The image is still healthy: it lists, and every file whose writer reported success
+    // is present with intact content.
+    let list = eo9(&store_a, &["--disk", &image_arg, "-c", "fs.eofs $ ls /"]);
+    assert_eq!(list.code, 0, "stderr: {}", list.stderr);
+    if result_a.code == 0 {
+        let read = eo9(
+            &store_a,
+            &["--disk", &image_arg, "-c", "fs.eofs $ cat /from-a.txt"],
+        );
+        assert!(read.stdout.contains("written-by-process-a"));
+    }
+    if result_b.code == 0 {
+        let read = eo9(
+            &store_a,
+            &["--disk", &image_arg, "-c", "fs.eofs $ cat /from-b.txt"],
+        );
+        assert!(read.stdout.contains("written-by-process-b"));
+    }
+}
+
+#[test]
+fn concurrent_invocations_of_one_store_do_not_corrupt_the_session() {
+    // Study 07 finding S7-6: every `eo9 -c` / `eo9 shell` rebuilds the session bin view,
+    // and that view used to be a single shared directory under the store — so concurrent
+    // invocations raced each other's remove/rebuild and roughly a third of them failed
+    // ("cannot place ... into the session bin view", "cannot resolve `echo`"). Sessions
+    // are now per-process: N concurrent invocations against ONE store must all succeed.
+    use std::thread;
+
+    let store = temp_store("concurrent-sessions");
+
+    // Seed once up front so the concurrent runs only exercise the session machinery, not
+    // first-run store seeding.
+    let warm = eo9(&store, &["-c", "echo warm"]);
+    assert_eq!(warm.code, 0, "stderr: {}", warm.stderr);
+
+    let runs: Vec<_> = (0..8)
+        .map(|i| {
+            let store = store.clone();
+            thread::spawn(move || {
+                let run = eo9(&store, &["-c", &format!("echo concurrent-{i}")]);
+                (i, run)
+            })
+        })
+        .collect();
+
+    let mut failures = Vec::new();
+    for handle in runs {
+        let (i, run) = handle.join().expect("runner thread");
+        if run.code != 0 || !run.stdout.contains(&format!("concurrent-{i}")) {
+            failures.push(format!(
+                "run {i}: exit {} stdout {:?} stderr {:?}",
+                run.code, run.stdout, run.stderr
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of 8 concurrent invocations failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+
+    // And a later invocation still works (the sweeps did not eat anything live).
+    let after = eo9(&store, &["-c", "echo after"]);
+    assert_eq!(after.code, 0, "stderr: {}", after.stderr);
+    assert!(after.stdout.contains("after"));
 }

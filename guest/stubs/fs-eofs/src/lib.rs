@@ -15,11 +15,16 @@
 //!   with the default options (4 KiB blocks, lz4 on). A device that has the magic but
 //!   fails to mount is *never* reformatted — the error is reported instead, so corruption
 //!   can't silently become data loss.
-//! * **Every mutating operation commits.** `open` (when it creates or truncates),
-//!   `write`, `create-directory`, and `remove` each end with an eofs commit (root flip),
-//!   so completed operations are durable on the disk and crash consistency is the
-//!   engine's by construction. This trades write amplification for simplicity — fine for
-//!   the MVP, batching is a later refinement.
+//! * **Every completed mutating operation commits; failed ones roll back.** `write`,
+//!   `create-directory`, and `remove` each end with an eofs commit (root flip), so
+//!   completed operations are durable on the disk and crash consistency is the engine's
+//!   by construction. The one deliberate exception is `open` with TRUNCATE on an existing
+//!   file: the truncation is *staged* but not committed, so it becomes durable together
+//!   with the write that follows it — a rewrite is atomic, and a failed or abandoned
+//!   rewrite leaves the file's previous contents untouched on disk (study 07, S7-4). Any
+//!   operation that fails discards every uncommitted change (`Eofs::rollback`), so
+//!   half-applied state is never published. This trades write amplification for
+//!   simplicity — fine for the MVP, batching is a later refinement.
 //! * **Paths** are `/`-separated; empty and `.` segments are ignored and `..` steps up
 //!   one level (never above the root) — the same rules `fs.memfs` documents. The root is
 //!   a directory that cannot be opened, removed, or recreated.
@@ -50,7 +55,7 @@ use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 
 use eo9_guest::provider::ProviderState;
-use eofs_core::{BlockDevice, DeviceError, Eofs, FormatOptions, format};
+use eofs_core::{BlockDevice, DeviceError, Eofs, FormatOptions};
 
 wit_bindgen::generate!({
     world: "eofs",
@@ -109,14 +114,20 @@ impl BlockDevice for DiskDevice {
         let dst = Buffer::new(len);
         let (dst, result) =
             poll_eager(disk::read(&self.handle, offset, dst)).ok_or(DeviceError::Io)?;
+        // Preserve the device's own error text (a driver's typed, labelled message) so a
+        // real hardware failure stays attributable at the console (study 09 finding 2).
         let read = result.map_err(|err| match err {
             disk::ReadError::OutOfRange => DeviceError::OutOfRange,
-            disk::ReadError::NotFound | disk::ReadError::Io(_) => DeviceError::Io,
+            disk::ReadError::Io(message) => DeviceError::IoNamed(message),
+            disk::ReadError::NotFound => DeviceError::Io,
         })?;
         if read.bytes_read < len {
             // eofs never issues reads past the end it knows about; a short read is a
             // device failure, not end-of-device.
-            return Err(DeviceError::Io);
+            return Err(DeviceError::IoNamed(alloc::format!(
+                "short read from the device ({} of {len} bytes)",
+                read.bytes_read
+            )));
         }
         buf.copy_from_slice(&dst.read(0, len));
         Ok(())
@@ -133,10 +144,16 @@ impl BlockDevice for DiskDevice {
             poll_eager(disk::write(&self.handle, offset, src)).ok_or(DeviceError::Io)?;
         let written = result.map_err(|err| match err {
             disk::WriteError::OutOfRange => DeviceError::OutOfRange,
-            disk::WriteError::ReadOnly | disk::WriteError::Io(_) => DeviceError::Io,
+            disk::WriteError::Io(message) => DeviceError::IoNamed(message),
+            disk::WriteError::ReadOnly => {
+                DeviceError::IoNamed(String::from("the device is read-only"))
+            }
         })?;
         if written.bytes_written < len {
-            return Err(DeviceError::Io);
+            return Err(DeviceError::IoNamed(alloc::format!(
+                "short write to the device ({} of {len} bytes)",
+                written.bytes_written
+            )));
         }
         Ok(())
     }
@@ -145,29 +162,52 @@ impl BlockDevice for DiskDevice {
         // The engine calls this at every commit boundary (before and after the uberblock
         // write), so durability rides on the imported disk's own flush.
         let result = poll_eager(disk::flush(&self.handle)).ok_or(DeviceError::Io)?;
-        result.map_err(|_| DeviceError::Io)
+        result.map_err(|err| match err {
+            disk::WriteError::OutOfRange => DeviceError::OutOfRange,
+            disk::WriteError::Io(message) => DeviceError::IoNamed(message),
+            disk::WriteError::ReadOnly => {
+                DeviceError::IoNamed(String::from("the device is read-only"))
+            }
+        })
     }
 }
 
 // --- state and error mapping -------------------------------------------------------------
 
-/// Mount the imported disk, formatting it first if it is blank (see the module docs).
+/// Mount the imported disk, formatting it first if — and only if — it is blank.
+///
+/// "Blank" means probed as [`eofs_core::ImageState::Blank`]: no eofs filesystem AND the
+/// device's leading bytes are all zero. A device holding anybody else's data (an ext4
+/// image, a tarball, a file pointed at by mistake) is refused, never formatted over —
+/// destroying foreign data is something only an explicit, forced `mkfs` may do (study 07,
+/// S7-2). A device with eofs remains that no longer mount is also never reformatted; its
+/// mount error is reported instead.
 fn mount_or_format() -> Result<Eofs<DiskDevice>, FsError> {
     let device = DiskDevice::new().map_err(device_error)?;
-    let mut has_magic = false;
-    let mut magic = [0u8; 8];
-    for slot in format::SLOT_OFFSETS {
-        if device.size() >= slot + magic.len() as u64 {
-            device.read_at(slot, &mut magic).map_err(device_error)?;
-            if magic == format::MAGIC {
-                has_magic = true;
-            }
-        }
+    // A device that reports size 0 is not "too small" — it is a device that could not be
+    // probed at all (the `eo9:disk` size query cannot fail, so an unreachable device has
+    // no meaningful size). Issue one read so the device reports its *real* typed error —
+    // e.g. a driver's "no virtio-blk function is visible …" — instead of burying the cause
+    // under a format-options message (study 09 finding 3).
+    if device.size() == 0 {
+        let mut probe = [0u8; 1];
+        return match device.read_at(0, &mut probe) {
+            Err(error) => Err(device_error(error)),
+            Ok(()) => Err(FsError::Io(String::from(
+                "the disk reports a size of 0 bytes",
+            ))),
+        };
     }
-    if has_magic {
-        Eofs::mount(device).map_err(map_error)
-    } else {
-        Eofs::format(device, &FormatOptions::default()).map_err(map_error)
+    match eofs_core::probe(&device).map_err(map_error)? {
+        eofs_core::ImageState::Eofs { .. } | eofs_core::ImageState::Unmountable => {
+            Eofs::mount(device).map_err(map_error)
+        }
+        eofs_core::ImageState::Blank => {
+            Eofs::format(device, &FormatOptions::default()).map_err(map_error)
+        }
+        eofs_core::ImageState::Foreign => Err(FsError::Io(String::from(
+            "the disk holds data that is not an eofs filesystem; refusing to format over it. If that data is expendable, format the device explicitly: `eo9 mkfs.eofs <image> --force`",
+        ))),
     }
 }
 
@@ -180,11 +220,69 @@ fn with_fs<R>(f: impl FnOnce(&mut Eofs<DiskDevice>) -> Result<R, FsError>) -> Re
     STATE.with(f)
 }
 
+/// Run a *mutating* operation over the mounted filesystem with rewrite atomicity and
+/// space reclamation:
+///
+/// * If the operation runs out of space, the copy-on-write garbage no root references any
+///   more — superseded copies of rewritten files, the contents of removed files — is
+///   reclaimed (`Eofs::gc`) and the operation retried once. This is what keeps an image
+///   usable forever instead of bricking once its append frontier reaches the end (study
+///   07, S7-3): `rm` frees space, rewrites reuse the space of the copies they replace.
+/// * If the operation still fails, every uncommitted change is discarded
+///   (`Eofs::rollback`), so a half-applied multi-step change — a truncation whose rewrite
+///   never landed, a partially built directory edit — can never be published by a later
+///   commit. The committed, on-disk state only ever moves from one fully-applied
+///   operation to the next.
+///
+/// The operation must be re-runnable from any pending state it may itself have
+/// half-applied (the `open` truncate path tolerates an already-removed file for this
+/// reason); see the per-operation comments.
+fn mutate<R>(
+    f: impl Fn(&mut Eofs<DiskDevice>) -> Result<R, eofs_core::FsError>,
+) -> Result<R, FsError> {
+    with_fs(|eofs| {
+        let result = match f(eofs) {
+            Err(eofs_core::FsError::NoSpace) => {
+                // Reclaim everything unreachable (the failed attempt's own orphaned
+                // blocks included — gc walks the committed and pending roots, and
+                // whatever the failure left behind is referenced by neither) and try
+                // again. The walk reads every live block, so it only runs when an
+                // allocation has actually failed, never on the fast path.
+                match eofs.gc() {
+                    Ok(_) => f(eofs),
+                    // gc itself failing (a corrupt image) is more important to report
+                    // than the space condition that triggered it.
+                    Err(error) => Err(error),
+                }
+            }
+            other => other,
+        };
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                // Discard whatever the failed operation half-applied (and, deliberately,
+                // any earlier uncommitted state it was meant to complete — e.g. the
+                // pending truncate of a rewrite whose write just failed). What was last
+                // committed is exactly what a remount sees, so old content is never lost
+                // to a failure.
+                eofs.rollback();
+                Err(map_error(error))
+            }
+        }
+    })
+}
+
 fn device_error(error: DeviceError) -> FsError {
     FsError::Io(alloc::format!("device error: {error}"))
 }
 
 /// Map the engine's error type onto the `eo9:fs` error variants.
+///
+/// Integrity failures (checksum mismatches, corrupt structures) lead with a fixed
+/// "integrity check failed:" prefix so they are distinguishable from ordinary I/O
+/// failures even though `eo9:fs` has no dedicated corruption variant yet — a flaky cable
+/// and rotting media must not read the same (study 07, S7-5). The complete fix is a WIT
+/// addition (`integrity(string)` in `fs-error`), recorded in plan/14.
 fn map_error(error: eofs_core::FsError) -> FsError {
     match error {
         eofs_core::FsError::NotFound => FsError::NotFound,
@@ -195,6 +293,13 @@ fn map_error(error: eofs_core::FsError) -> FsError {
         eofs_core::FsError::DirectoryNotEmpty => {
             FsError::Io(String::from("directory is not empty"))
         }
+        eofs_core::FsError::ChecksumMismatch => FsError::Io(String::from(
+            "integrity check failed: block checksum mismatch (the stored data does not \
+             match its recorded hash; the device is corrupted at this location)",
+        )),
+        eofs_core::FsError::Corrupt(what) => FsError::Io(alloc::format!(
+            "integrity check failed: corrupt filesystem structure ({what})"
+        )),
         other => FsError::Io(alloc::format!("{other}")),
     }
 }
@@ -245,11 +350,18 @@ struct Stub;
 /// The root-handle resource: a token referring to the mounted filesystem.
 struct EofsRoot;
 
-/// An open file: a canonical path into the mounted filesystem plus the write permission
-/// captured at open time.
+/// An open file: a canonical path into the mounted filesystem, the write permission
+/// captured at open time, and whether a TRUNCATE request is still pending.
+///
+/// Truncation is applied *lazily*: `open` only records it, and the first `write` through
+/// the handle replaces the file (remove + recreate + write + commit) as one atomic
+/// engine transaction. Until then the on-disk file is untouched, so an abandoned or
+/// failed rewrite can never lose the previous contents (study 07, S7-4). Reads through a
+/// truncate-pending handle see an empty file, matching what the truncation promised.
 struct OpenFile {
     path: String,
     writable: bool,
+    truncate_pending: core::cell::Cell<bool>,
 }
 
 /// An immutable execution handle: a snapshot of the file's contents at open-exec time.
@@ -281,35 +393,38 @@ impl fs::Guest for Stub {
         }
         let create = options.contains(OpenFlags::CREATE);
         let truncate = options.contains(OpenFlags::TRUNCATE);
-        with_fs(|eofs| {
-            let mut mutated = false;
+        let mut truncate_pending = false;
+        mutate(|eofs| {
             match eofs.stat(&path) {
                 Ok(stat) => {
                     if stat.kind == eofs_core::NodeKind::Directory {
-                        return Err(FsError::IsADirectory);
-                    }
-                    if truncate && stat.size > 0 {
-                        // eofs has no truncate primitive yet: replace the file with an
-                        // empty one (same name, fresh object).
-                        eofs.remove(&path).map_err(map_error)?;
-                        eofs.create_file(&path).map_err(map_error)?;
-                        mutated = true;
+                        return Err(eofs_core::FsError::IsADirectory);
                     }
                 }
                 Err(eofs_core::FsError::NotFound) if create => {
-                    eofs.create_file(&path).map_err(map_error)?;
-                    mutated = true;
+                    // Creating a brand-new (empty) file destroys nothing; commit it so a
+                    // bare `touch` is durable on its own.
+                    eofs.create_file(&path)?;
+                    eofs.commit()?;
                 }
-                Err(error) => return Err(map_error(error)),
-            }
-            if mutated {
-                eofs.commit().map_err(map_error)?;
+                Err(error) => return Err(error),
             }
             Ok(())
         })?;
+        // Truncation of an existing, non-empty file is recorded on the handle and applied
+        // by the first write through it — the whole rewrite (remove + recreate + write)
+        // commits as one transaction, so the previous contents survive anything short of
+        // a completed replacement (study 07, S7-4).
+        if truncate {
+            truncate_pending = with_fs(|eofs| {
+                Ok(matches!(eofs.stat(&path), Ok(stat) if stat.size > 0
+                    && stat.kind == eofs_core::NodeKind::File))
+            })?;
+        }
         Ok(fs::File::new(OpenFile {
             path,
             writable: options.contains(OpenFlags::WRITE),
+            truncate_pending: core::cell::Cell::new(truncate_pending),
         }))
     }
 
@@ -370,9 +485,9 @@ impl fs::Guest for Stub {
         if path.is_empty() {
             return Err(FsError::AlreadyExists);
         }
-        with_fs(|eofs| {
-            eofs.mkdir(&path).map_err(map_error)?;
-            eofs.commit().map_err(map_error)?;
+        mutate(|eofs| {
+            eofs.mkdir(&path)?;
+            eofs.commit()?;
             Ok(())
         })
     }
@@ -384,9 +499,9 @@ impl fs::Guest for Stub {
                 "cannot remove the root directory",
             )));
         }
-        with_fs(|eofs| {
-            eofs.remove(&path).map_err(map_error)?;
-            eofs.commit().map_err(map_error)?;
+        mutate(|eofs| {
+            eofs.remove(&path)?;
+            eofs.commit()?;
             Ok(())
         })
     }
@@ -397,6 +512,11 @@ impl fs::Guest for Stub {
         dst: Buffer,
     ) -> (Buffer, Result<ReadResult, FsError>) {
         let file = f.get::<OpenFile>();
+        // A handle whose truncation has not been written yet reads as the empty file the
+        // truncation promised; the on-disk contents are still the previous ones.
+        if file.truncate_pending.get() {
+            return (dst, Ok(ReadResult { bytes_read: 0 }));
+        }
         let wanted = usize::try_from(dst.len()).unwrap_or(usize::MAX);
         let result = with_fs(|eofs| {
             let mut bytes = vec![0u8; wanted];
@@ -433,11 +553,26 @@ impl fs::Guest for Stub {
         } else {
             src.read(0, len)
         };
-        let result = with_fs(|eofs| {
-            eofs.write(&file.path, offset, &bytes).map_err(map_error)?;
-            eofs.commit().map_err(map_error)?;
+        let path = file.path.clone();
+        let truncating = file.truncate_pending.get();
+        let result = mutate(|eofs| {
+            if truncating {
+                // The pending truncation and this write commit as one transaction: the
+                // file is replaced wholesale (eofs has no truncate primitive, so the
+                // replacement is remove + recreate). Every step is guarded so the closure
+                // can be re-run from scratch by the NoSpace retry.
+                if eofs.stat(&path).is_ok() {
+                    eofs.remove(&path)?;
+                }
+                eofs.create_file(&path)?;
+            }
+            eofs.write(&path, offset, &bytes)?;
+            eofs.commit()?;
             Ok(WriteResult { bytes_written: len })
         });
+        if result.is_ok() {
+            file.truncate_pending.set(false);
+        }
         (src, result)
     }
 

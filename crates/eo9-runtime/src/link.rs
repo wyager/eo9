@@ -1553,10 +1553,11 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
                 }
                 Err(crate::task::SpawnError::Internal(msg)) => {
                     // Embedder-supplied hints turn a raw unsatisfied-import failure into
-                    // actionable advice (e.g. "relaunch with --disk <image>"); the raw
-                    // reason stays first so nothing is hidden.
+                    // actionable advice (e.g. "relaunch with --disk <image>"). The advice
+                    // LEADS — it is what the user needs — and the raw linker reason
+                    // follows in full, so nothing is hidden behind it (study 07, S7-13).
                     let msg = match exec.policy.hint_for(&msg) {
-                        Some(hint) => format!("{msg} ({hint})"),
+                        Some(hint) => format!("{hint} [raw reason: {msg}]"),
                         None => msg,
                     };
                     Err(WitSpawnError::Internal(msg))
