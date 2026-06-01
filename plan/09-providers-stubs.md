@@ -316,3 +316,25 @@ Match the priority order above; (1)+(2) unblock I2.
     middleware's happy-path listen→accept (needs a real or hairpin l2 — only the metal
     `net.virtio` path could exercise it today), and accept-with-empty-backlog timeout semantics
     over a live link.
+
+22. **Configure validation errors are discarded by the bind entrypoint (user study 08, finding F1 —
+    2026-05-31, branch `area/09-net-fixes`).** Study 08's participant configured the TCP/IP middleware
+    with `--address not-an-ip` and got an unsymbolized wasm trap, although `l4-over-l2-config`'s own
+    WIT doc promises "a malformed address is a configure-time error, never a trap." Root cause is
+    *not* in the middleware — its `configure` validates dotted-quads and returns the typed
+    `result<l4-impl, string>` error exactly as the contract says. The error is discarded downstream,
+    in machinery this area does not own: the synthesized `eo9:rt/configured.bind` entrypoint has
+    signature `func()` (no error channel), so eo9-component's binder reads `configure`'s result
+    discriminant and lowers the error case to `unreachable` (configure.rs `bind_body`), and the
+    usermode executor renders that bind failure from the raw wasmtime error without consulting the
+    diagnostics slot (eo9-runtime task.rs). What this branch ships: an integration test
+    (net_l4_over_l2.rs `a_malformed_configure_address_never_lets_the_program_run`) pinning the safety
+    property that does hold — a malformed address never spawns the program and the refusal is
+    attributed to compose-time configuration — so the gap cannot widen into "bad config silently runs
+    with defaults." The complete fix needs, in order: (a) wit/rt — `bind: func() -> result<_, string>`;
+    (b) eo9-component configure.rs — lift `configure`'s error string through the binder and return it
+    from bind; (c) the three executors (usermode task.rs, kernel shellexec.rs/runner.rs, browser
+    execsurface.rs/store.rs) — render a bind error as "compose-time configuration refused: <reason>",
+    no trap, exit/refusal class unchanged. Until then every provider config interface shares this
+    failure mode, and per-provider workarounds (panicking with the message, falling back to defaults)
+    are all worse than the gap; none is taken.
