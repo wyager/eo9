@@ -28,7 +28,9 @@ let inputQueue = []; // command lines fed to the interactive eosh prompt via rea
 
 const imports = {
   env: {
-    host_write: (ptr, len) => lines.push(decoder.decode(new Uint8Array(memory.buffer, ptr, len))),
+    // Standard-error lines carry a leading U+0001 marker (the page styles them); strip it here.
+    host_write: (ptr, len) =>
+      lines.push(decoder.decode(new Uint8Array(memory.buffer, ptr, len)).replace(/^\u0001/, "")),
     host_now_ms: () => Date.now(),
     host_monotonic_ns: () => performance.now() * 1e6,
     host_random_fill: (ptr, len) => {
@@ -103,10 +105,19 @@ inputQueue = [
   "only eo9:text/text $ echo --text restricted",
   "only eo9:text $ echo --text shorthand",
   "only eo9:text/text $ hello --name nope --excited true",
-  // The page's bare-default forms of the same lockdowns: the pass case greets the default
-  // name, the refusal case must not add a greeting (the Hello-world count check below).
-  "only eo9:text/text,eo9:time/time $ hello",
-  "only eo9:text/text $ hello",
+  // The page's bare-default forms of the same lockdowns, in the page's exact (short-form)
+  // spelling: the pass case greets the default name, the refusal case must not add a
+  // greeting (the Hello-world count check below). Keep these literally identical to the
+  // try-it page's "Things to try" entries — they are how the page's examples stay verified.
+  "only eo9:text,eo9:time $ hello",
+  "only eo9:text $ hello",
+  // The shell's own help examples (study 10, finding 1: an example the shell refuses must
+  // never ship). The `&` example builds an environment, so bind it and use it.
+  "let helpenv = time.frozen & entropy.seeded --seed 7",
+  "helpenv $ rng --count 1",
+  // A name that is neither a binding nor a program: the refusal must teach (study 10,
+  // finding 5) and never leak filesystem enum text.
+  "frobnicate --level 11",
   // describe of a composition: the new `wiring` exec function renders the composition tree
   // (the interposed provider is visible), the same view `describe --wiring` gives natively.
   "describe entropy.seeded $ rng",
@@ -155,12 +166,48 @@ const exploreRun = (explorePart?.match(/^\d{3,}$/gm) || []).slice(0, 2);
 // greet "world" exactly once; the bare only-refusal must not add a fourth.
 const helloWorldCount = (interactive.match(/Hello, world/g) || []).length;
 
+// Every program the welcome file recommends must exist in the page's /bin (study 10,
+// finding 2: it used to recommend `wc`, which the browser store does not carry).
+const welcomeTry = (interactive.match(/^Try: (.*)$/m) || [])[1] || "";
+const welcomePrograms = [
+  ...new Set(
+    welcomeTry
+      .split(",")
+      .map((cmd) => cmd.trim().split(/\s+/)[0])
+      .filter(Boolean)
+  ),
+];
+const welcomeProgramsExist =
+  welcomePrograms.length > 0 &&
+  welcomePrograms.every((name) => new RegExp(`${name}\\.wasm`).test(interactive));
+
 const checks = [
   ["eosh instantiates (floor)", instRc === 0 && /eosh: instantiated/.test(oneShot)],
   ["eosh ran hello (greeting)", /Hello, web/.test(oneShot)],
   ["hello outcome greeted", /greeted/.test(oneShot)],
   ["eosh command rc == 0", cmdRc === 0],
   ["interactive: echo printed hi", /\bhi\b/.test(interactive)],
+  [
+    "every program the welcome file recommends exists in /bin",
+    welcomeProgramsExist,
+  ],
+  [
+    "the help text's & example evaluates, binds, and runs",
+    /helpenv: bound \(a provider of /.test(interactive) && /generated\(1\)/.test(interactive),
+  ],
+  [
+    "an unknown name gets the no-such-binding-or-program refusal (no enum leak)",
+    /no such binding or program `frobnicate`/.test(interactive) &&
+      !/FsError::/.test(interactive),
+  ],
+  [
+    "describe explains the diagnostics rider",
+    /carries no authority; always admitted by `only`/.test(interactive),
+  ],
+  [
+    "stderr renders without the [stderr] prefix or marker bytes",
+    !/\[stderr\]/.test(interactive) && !/\u0001/.test(interactive),
+  ],
   [
     "interactive: cat read two positional paths",
     /Hello from the Eo9 web VM filesystem/.test(interactive) &&
