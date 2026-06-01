@@ -340,5 +340,290 @@ Facilitator's verbal annotations on the driver:
   riscv64 PLIC), polled used-ring where it does not (x86_64 today, or any provider answering
   `unsupported`). The probe line names which mode it is in.
 
-*(Draft committed at this point. Metal demos, the participant's reactions, findings, and the triage
-table follow in subsequent commits of this branch.)*
+### Round 2 — metal demos: enumeration, the interrupt-driven storage stack, persistence, containment
+
+Everything below is real output from QEMU sessions run during the study (trimmed: boot banners and
+build noise removed; nothing else edited). The serial console was driven by a scripted harness that
+waits for the `eosh> ` prompt, paces input, and timestamps every send→next-prompt interval.
+
+#### Demo 2a — enumeration: `cargo xtask qemu aarch64 pci program=lspci`
+
+The `pci` token on the kernel command line is what grants the `eo9:pci` root capability for this
+boot; `program=lspci` runs the program headless and powers off.
+
+```
+cmdline: pci program=lspci
+store: 22 components baked in (1956 KiB components, 15442 KiB artifacts): eosh, hello, outcomes,
+cruncher, readwrite, lspci, entropy.seeded, time.frozen, disk.virtio, fs.eofs, pci.filtered,
+net.virtio, l2check, net.l4.over-l2, l4check, ls, cat, echo, wc, head, stat, rm
+runner: selected `lspci` from the kernel command line
+runner: lspci (552448 byte artifact) with kernel text/time/entropy providers
+0000:00:00.0 1b36:0008 class 06.00.00 rev 00 endpoint
+0000:00:01.0 1af4:1000 class 02.00.00 rev 00 endpoint
+0000:00:02.0 1af4:1005 class 00.ff.00 rev 00 endpoint
+runner: lspci outcome = success(devices(3))
+runner: instantiate + main took 51335 us
+[   72568 us] kernel run complete; requesting PSCI SYSTEM_OFF
+```
+
+Host bridge, QEMU's default virtio-net, virtio-rng. 51 ms instantiate+run from the precompiled
+artifact, ~73 ms boot-to-poweroff total (TCG).
+
+#### Demo 2b — the storage stack on a blank disk: `cargo xtask qemu aarch64 pci disk`, interactive
+
+`disk` attaches a blank 64 MiB raw image as a modern virtio-blk function. First boot, empty disk:
+
+```
+eosh> lspci
+0000:00:00.0 1b36:0008 class 06.00.00 rev 00 endpoint
+0000:00:01.0 1af4:1000 class 02.00.00 rev 00 endpoint
+0000:00:02.0 1af4:1005 class 00.ff.00 rev 00 endpoint
+0000:00:03.0 1af4:1042 class 01.00.00 rev 01 endpoint
+ok: devices(4)
+eosh> disk.virtio $ fs.eofs $ ls
+disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx interrupt
+pci: INTx delivery on line 3 served an interrupt wait (the cpu halted instead of polling)
+ok: listed(0)
+eosh> disk.virtio $ fs.eofs $ readwrite /hello.txt eo9-on-real-disk
+disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx interrupt
+ok: round-tripped(16)
+eosh> disk.virtio $ fs.eofs $ cat /hello.txt
+disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx interrupt
+eo9-on-real-diskok: printed(16)
+```
+
+Timings (send → next prompt, TCG, no compile cache on this boot): `ls` 38.7 s, `readwrite` 20.5 s,
+`cat` 12.3 s — dominated by on-target Cranelift compilation of each composition; `lspci` (precompiled
+artifact) 1.1 s. The `pci: INTx delivery …` line is printed by the kernel once per boot, the first
+time an interrupt delivery actually serves a driver's `wait` — it is the proof the completion path is
+interrupt-driven rather than polled. The driver's own probe line (`completion: INTx interrupt`) shows
+which mode the driver negotiated.
+
+Facilitator notes given alongside: the driver re-probes (full device reset + feature negotiation +
+queue setup) on every composition run — each command is a fresh component instance; eofs formats the
+blank device in place on first mount; `cat`'s file contents run into the outcome line (no trailing
+newline) — cosmetic but real.
+
+#### Demo 2c — power-cycle persistence (full QEMU restart, same disk image)
+
+```
+eosh> disk.virtio $ fs.eofs $ ls
+disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx interrupt
+pci: INTx delivery on line 3 served an interrupt wait (the cpu halted instead of polling)
+hello.txt
+ok: listed(1)
+eosh> disk.virtio $ fs.eofs $ cat /hello.txt
+disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx interrupt
+eo9-on-real-diskok: printed(16)
+```
+
+Real persistence: wasm driver → eofs copy-on-write commits → virtio-blk → the raw image, across a
+power cycle.
+
+#### Demo 2d — fault containment in the same boot as the driver
+
+```
+eosh> outcomes --mode trap --detail driver-study
+abnormal: trapped: guest panicked: outcomes: trapping as requested at examples/outcomes/src/lib.rs:40 — error while executing at wasm backtrace:
+    0:    0xd14 - eo9_example_outcomes.wasm!_RNvCsfDopLXnaLPZ_7___rustc17rust_begin_unwind
+    1:   0x348e - eo9_example_outcomes.wasm!_RNvNtCs9VUmvJJ0cbu_4core9panicking9panic_fmt
+    2:    0x94f - eo9_example_outcomes.wasm!main
+
+Caused by:
+    wasm trap: wasm `unreachable` instruction executed
+
+eosh> disk.virtio $ fs.eofs $ cat /rv64.txt
+disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx interrupt
+pci: INTx delivery on line 3 served an interrupt wait (the cpu halted instead of polling)
+written-on-riscv64ok: printed(18)
+```
+
+A trapping guest is reported as a typed `abnormal` outcome with the panic message and a wasm
+backtrace; the shell survives and the very next command runs the storage stack normally. (The same
+containment applies to a buggy driver: an out-of-bounds `dma-read`/`dma-write` traps the *component*,
+not the kernel.)
+
+### Round 3 — containment, attenuation, what breaks, and riscv64 parity
+
+#### Demo 3a — no grant, no devices: boot **without** the `pci` token
+
+`cargo xtask qemu aarch64 disk` — the virtio-blk hardware is attached, but the boot does not grant
+the PCI capability:
+
+```
+eosh> lspci
+error: spawn failed: the program requires PCI device access, which this boot did not grant (add the
+`pci` token to the kernel command line — `cargo xtask qemu aarch64 pci` — to provide it) (refused at
+instantiation)
+eosh> disk.virtio $ fs.eofs $ ls
+error: spawn failed: the program requires PCI device access, which this boot did not grant (add the
+`pci` token to the kernel command line — `cargo xtask qemu aarch64 pci` — to provide it) (refused at
+instantiation)
+```
+
+The hardware is physically present; nothing in this boot can touch it. The refusal names the missing
+capability and the exact remediation. Caveats the facilitator pointed out from the timing data: the
+`lspci` refusal is instant (0.09 s), but the composed `disk.virtio $ fs.eofs $ ls` refusal took
+29.5 s — the kernel compiled the whole three-component composition on-target *first* and only then
+refused at instantiation.
+
+The shell's own capability report on this boot (`env`) lists text/time/entropy/fs/exec — and, notably,
+says nothing about PCI either way (see findings).
+
+`describe` shows a driver's full authority surface at the prompt:
+
+```
+eosh> describe disk.virtio
+kind: provider
+args: (none)
+imports:
+  required eo9:pci/types (eo9:pci/types@0.1.0)
+  required eo9:pci/pci (eo9:pci/pci@0.1.0)
+  required eo9:text/types (eo9:text/types@0.1.0)
+  required eo9:text/text (eo9:text/text@0.1.0)
+  required eo9:io/buffers (eo9:io/buffers@0.1.0)
+  required eo9:rt/diagnostics (eo9:rt/diagnostics@0.1.0)
+exports:
+  eo9:disk/types (eo9:disk/types@0.1.0)
+  eo9:disk/disk (eo9:disk/disk@0.1.0)
+eosh> describe pci.filtered
+kind: provider
+args:
+  --allow: list<device-address>
+...
+```
+
+#### Demo 3b — single-device attenuation: `pci.filtered`
+
+Back on the `pci disk` boot (4 visible functions). The allow-list is a baked, compose-time list of
+records:
+
+```
+eosh> pci.filtered --allow "[{segment: 0, bus: 0, device: 1, function: 0}]" $ lspci
+0000:00:01.0 1af4:1000 class 02.00.00 rev 00 endpoint
+ok: devices(1)
+```
+
+`lspci` — the same unmodified binary that saw 4 devices — now sees exactly one. Composed attenuation,
+no kernel policy, no driver changes.
+
+#### Demo 3c — the same attenuation under the *storage* stack: **it does not work** (bug found live)
+
+The disk is at `0000:00:03.0` on this boot. Composing the filter (allowing exactly that address) in
+front of the real driver stack:
+
+```
+eosh> pci.filtered --allow "[{segment: 0, bus: 0, device: 3, function: 0}]" $ disk.virtio $ fs.eofs $ cat /hello.txt
+disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx interrupt
+error: fs("FsError::Io(\"device error: device i/o failure\")")
+```
+
+The driver *probed successfully through the filter* (the probe line is there: enumerate, open, config
+space, BARs, DMA allocation, feature negotiation, and the interrupt request all forwarded correctly) —
+and then the first actual disk read failed with an opaque error. The unfiltered
+`disk.virtio $ fs.eofs $ cat /hello.txt` works on the same boot.
+
+And with the filter pointing at the *wrong* device (the allow-list names the NIC, so the disk is
+invisible to the driver):
+
+```
+eosh> pci.filtered --allow "[{segment: 0, bus: 0, device: 1, function: 0}]" $ disk.virtio $ fs.eofs $ ls
+error: fs("FsError::Io(\"invalid format options: device too small\")")
+```
+
+— a misleading error: the driver correctly reported "no virtio-blk function is visible through the
+granted pci capability", but its `size()` contract reports 0 for an unprobeable device, `fs.eofs`
+checks the size before the first read, and the real cause never reaches the user.
+
+The facilitator also tried to show the refusal stub and could not:
+
+```
+eosh> pci.deny $ lspci
+error: cannot resolve `pci.deny` (/bin/pci.deny.wasm): FsError::NotFound
+```
+
+`pci.deny` and `pci.none` are not in the kernel's baked store (only `pci.filtered` is).
+
+#### Demo 3d — localizing the 3c failure (run live, after the participant asked what was wrong)
+
+The facilitator ran a differential on a `pci net` boot (modern virtio-net attached; note the device
+addresses shift — the NIC is at `00:02.0` on this boot config, virtio-rng at `00:01.0`):
+
+The **polled** virtio-net driver through the same filter **works end-to-end**:
+
+```
+eosh> net.virtio $ l2check
+net.virtio: virtio-net 52:54:00:12:34:56, queues rx/tx 16/16
+l2check: interface virtio0 (52:54:00:12:34:56, mtu 1500)
+l2check: 10.0.2.2 is at 52:55:0a:00:02:02
+ok: resolved("52:55:0a:00:02:02")
+eosh> pci.filtered --allow "[{segment: 0, bus: 0, device: 2, function: 0}]" $ net.virtio $ l2check
+net.virtio: virtio-net 52:54:00:12:34:56, queues rx/tx 16/16
+l2check: interface virtio0 (52:54:00:12:34:56, mtu 1500)
+l2check: 10.0.2.2 is at 52:55:0a:00:02:02
+ok: resolved("52:55:0a:00:02:02")
+```
+
+But a **double** filter (two attenuators stacked — 4 components, still fully polled, no interrupts
+anywhere) fails, and this time the error message survives because the net error path carries strings:
+
+```
+eosh> pci.filtered --allow "[… rng …, … nic …]" $ pci.filtered --allow "[… nic …]" $ net.virtio $ l2check
+error: net("L2Error::Io(\"net.virtio: enumerate: the pci provider suspended\")")
+```
+
+So the failure is about **forwarding depth in the eager-poll chain**, not interrupts: one
+guest-to-guest forwarding hop below an eagerly-polling consumer works; two hops produce "the pci
+provider suspended". The storage stack has `fs.eofs` eagerly polling `disk.virtio` above the filter
+hop — that is its second hop, which is why 3c fails while the shallower net stack works. (This matches
+a known caveat recorded in the project's gap list — "suspended-subtask path not yet exercised
+end-to-end" — which this study turned from a caveat into a reproduced, user-visible failure of the
+flagship attenuation pattern.)
+
+When the filter mis-addressed the NIC (pointing at the rng), the driver's full typed message *was*
+preserved by the net path:
+
+```
+error: net("L2Error::Io(\"net.virtio: no virtio-net function is visible through the granted pci
+capability (expected vendor 0x1af4, device 0x1041)\")")
+```
+
+— which is exactly the message the disk path swallowed into "device i/o failure" in 3c.
+
+#### Demo 3e — riscv64 parity: `cargo xtask qemu riscv64 pci disk`, same driver, same disk image
+
+The same scratch disk image (already carrying `hello.txt` written by the aarch64 boots) attached to a
+riscv64 QEMU machine, same wasm driver bytes from the riscv64 kernel's store:
+
+```
+eosh> lspci
+0000:00:00.0 1b36:0008 class 06.00.00 rev 00 endpoint
+0000:00:01.0 1af4:1005 class 00.ff.00 rev 00 endpoint
+0000:00:02.0 1af4:1042 class 01.00.00 rev 01 endpoint
+ok: devices(3)
+eosh> disk.virtio $ fs.eofs $ ls
+disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx interrupt
+hello.txt
+ok: listed(1)
+eosh> disk.virtio $ fs.eofs $ cat /hello.txt
+disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx interrupt
+eo9-on-real-diskok: printed(16)
+eosh> disk.virtio $ fs.eofs $ readwrite /rv64.txt written-on-riscv64
+disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx interrupt
+pci: INTx delivery on line 2 served an interrupt wait (the cpu halted instead of polling)
+ok: round-tripped(18)
+```
+
+- The file written on aarch64 is read back on riscv64 — same driver binary (wasm), same on-disk
+  filesystem, different ISA, no changes anywhere.
+- Interrupt delivery is through the PLIC (line 2) instead of the GIC (line 3); the driver did not
+  change — it asked the capability for an INTx vector and the per-arch routing is the provider's
+  business.
+- A later aarch64 boot listed both files (`hello.txt`, `rv64.txt`) — persistence is bidirectional
+  across architectures.
+- Note the disk sits at `00:02.0` here vs `00:03.0` on the aarch64 `disk` boot (riscv64 `virt` has no
+  default NIC) — device addresses are a function of the machine configuration, which matters for
+  address-based allow-lists.
+
+*(Demo material complete and committed. The participant phase — reactions, questions, verdict — and
+the findings/triage tables follow.)*
