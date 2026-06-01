@@ -13,7 +13,15 @@ edition = "2024"
 # everything else (placeholder, xtask, tests, not-yet-published areas) stays private.
 publish = false
 repository = "https://github.com/wyager/eo9"
+homepage = "https://github.com/wyager/eo9"
 license = "MIT"
+# The minimum Rust the published host chain builds with. Verified by
+# `cargo +stable check -p eo9` (study 11 D22: the host chain needs no nightly);
+# bump only after re-verifying against the new stable.
+rust-version = "1.94"
+# crates.io discovery metadata shared by every published crate (study 11 D11).
+keywords = ["wasm", "component-model", "capability", "sandbox", "os"]
+categories = ["wasm", "os", "virtualization"]
 
 # ---------------------------------------------------------------------------------------
 # Foundation dependency pins (PLAN.md ground rule 3). This table is the authoritative

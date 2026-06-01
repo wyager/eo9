@@ -4,6 +4,11 @@ description = "Unix-backed root providers for the Eo9 OS APIs: text, time, entro
 version.workspace = true
 edition.workspace = true
 publish = true
+readme = "README.md"
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+homepage.workspace = true
 repository.workspace = true
 license = "MIT"
 

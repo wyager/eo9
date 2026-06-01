@@ -17,6 +17,11 @@ description = "Embed a usermode Eo9 instance in a Rust program: a pluggable root
 version.workspace = true
 edition.workspace = true
 publish = true
+readme = "README.md"
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+homepage.workspace = true
 repository.workspace = true
 license = "MIT"
 

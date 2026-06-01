@@ -13,6 +13,11 @@ edition.workspace = true
 # Published: the `eo9` binary depends on it for `mkfs.eofs` (formatting disk images), so
 # it has to live on crates.io alongside the rest of the publish chain.
 publish = true
+readme = "README.md"
+rust-version.workspace = true
+keywords.workspace = true
+categories = ["filesystem", "no-std", "wasm"]
+homepage.workspace = true
 repository.workspace = true
 
 [dependencies]

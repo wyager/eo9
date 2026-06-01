@@ -378,3 +378,12 @@ Match the priority order above; (1)+(2) unblock I2.
     stays tracked as study finding F3b). STATUS's networking section is corrected to say what is
     actually in the store and what each demo reports. Process note for demo prep: the kernel store
     list — not STATUS — is the contract for what can be composed at the metal prompt.
+
+25. **`pci.deny` exists (study 09 finding 4 / plan/12 D62, 2026-06-01).** The deny world in
+    wit/pci was specified from the start but the stub crate was never created. It now follows
+    the net-l2-deny pattern: exports the full `eo9:pci/pci` surface where `enumerate`/`open`
+    answer the API's own `denied` error and every operation on opened devices/BARs/vectors/DMA
+    buffers is statically unreachable (uninhabited resource types). In GUEST_COMPONENTS, the
+    kernel store (as `pci.deny`), and the eo9-components bundle; the integration test runs
+    `text.null $ pci.deny $ lspci` against zero host providers and asserts lspci's own typed
+    `denied` failure.

@@ -12,6 +12,11 @@ description = "The usermode Eo9 binary: run, describe, and compile Eo9 programs 
 version.workspace = true
 edition.workspace = true
 publish = true
+readme = "../../README.md"
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+homepage.workspace = true
 repository.workspace = true
 license = "MIT"
 
