@@ -332,3 +332,10 @@ its first milestones, and to be the place where cross-area seams get found.
       parenthesis (this is the one change outside the usermode crate: eo9-runtime/src/link.rs,
       flagged in the merge report). The CLI test asserts the ordering.
     - **S7-14.** README gained a verified "Persistent storage (eofs)" section.
+
+25. **`eo9 version` is a real command (study 11 D1, 2026-06-01).** `--version`, `-V`, and
+    `version` print the crate version, the bundled-component count and provenance (locally
+    built vs the eo9-components bundle), and the embedded compiler/target — and are matched
+    *before* the implicit-run arm, so none of the spellings can fall through to store-name
+    resolution (the study's shadowing hazard: `eo9 version` used to be looked up as a program
+    named `version`). Help documents it; a CLI test pins all three spellings.

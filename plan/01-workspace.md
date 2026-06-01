@@ -100,14 +100,15 @@ None. Everything else depends on this.
     (ENOENT) case to "`<tool>` not found — run `make setup` (or `cargo xtask doctor`)" instead of a raw
     `os error 2`, closing the opaque-failure path from D10.
 12. **Publishing: `cargo install eo9` ships prebuilt components.** The publishable crates
-    (`eo9-component`, `eo9-store`, `eo9-providers-unix`, `eo9-components`, `eo9-runtime`,
-    `eo9-embed`, `eo9`) carry `publish = true`, version `0.1.0` (workspace-wide), MIT, and the
+    (`eo9-component`, `eo9-store`, `eo9-providers-unix`, `eo9-components`, `eofs-core`,
+    `eo9-runtime`, `eo9-embed`, `eo9` — the list `PUBLISH_CRATES` in xtask/src/main.rs is
+    authoritative) carry `publish = true`, version `0.1.0` (workspace-wide), MIT, and the
     repository URL; the intra-workspace dependency entries in the root pin table carry
     `version = "0.1.0"` alongside their paths so published manifests resolve from crates.io
     while local builds keep using the tree. `crates/eo9-components` is a data-only crate holding
-    the prebuilt guest components (raw `.wasm`, not lz4 — cargo gzips the package anyway: 1.9 MiB
-    of components → a 628 KiB crate, far under the 10 MB limit, and the simpler form keeps xtask
-    dependency-free); `cargo xtask refresh-components` regenerates `data/` from
+    the prebuilt guest components (raw `.wasm`, not lz4 — cargo gzips the package anyway; the
+    crate stays far under the 10 MB limit — `cargo xtask package` prints the current size — and
+    the simpler form keeps xtask dependency-free); `cargo xtask refresh-components` regenerates `data/` from
     `guest/target/components`, and `cargo xtask package` is the publishing pre-flight:
     build-guest → bundle drift check → `cargo publish --dry-run --registry crates-io` for the
     leaf crates (the explicit registry sidesteps local mirror replacements) → `cargo package
@@ -131,3 +132,24 @@ None. Everything else depends on this.
     here: guest component bytes still embed the absolute checkout path (panic locations), so a
     bundle refreshed from a different checkout directory shows byte drift in some components —
     the same path-dependence already documented for the web blob (plan/18 D26).
+
+15. **Release tooling hardened after the distribution-engineer study (study 11, 2026-06-01).**
+    (a) `eo9 --version`/`-V`/`version` identify the binary (crate version, bundled-component
+    count and provenance, embedded compiler/target) and are intercepted before store-name
+    resolution. (b) `cargo xtask ci` now runs `check-components-bundle` between build-guest and
+    test, so a stale eo9-components bundle can never sit unnoticed on master again (D9b — this
+    exact failure happened once); to make that byte-compare meaningful from any checkout, guest
+    builds remap the checkout root / cargo home / rustup home out of panic-location strings
+    (the same `--remap-path-prefix` flags the web blob build uses), and the bundle was refreshed
+    once to those canonical bytes. Known residual: the registry *source directory name* (e.g.
+    a crates.io vs mirror hash) still appears in dependency panic paths, so the bundle is
+    checkout-independent on one machine but not yet machine-independent across different
+    registry configurations. (c) The package pre-flight reports real `.crate` sizes (cargo moved
+    dry-run output to `target/package/tmp-crate/`; a missing file is now reported, not "0 KiB").
+    (d) `make setup` propagates a failing doctor (the `-@` ignore is gone) and pins the
+    wasm-tools install to the `~1.250` family the repo expects, as does doctor's own hint.
+    (e) Every published crate carries readme/keywords/categories/homepage/rust-version
+    (MSRV 1.94, the stable the chain is verified against). (f) The duplicate `check-web-vm`
+    help entry is gone. Remaining owner decisions from the study: hosted CI, publish automation
+    (tags/changelog/recovery), a local-registry rehearsal for the `eo9` crate, and crate-name
+    permanence review.
