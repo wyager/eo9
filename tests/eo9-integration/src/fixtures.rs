@@ -1203,3 +1203,40 @@ pub fn compound_consumer() -> Component {
 "#;
     build_component(COMPOUND_WIT, &[], "report-consumer", CORE)
 }
+
+// -----------------------------------------------------------------------------------------
+// Policy-component fixtures: an impure admit policy against the real eo9:pci package
+// -----------------------------------------------------------------------------------------
+
+/// Fixture world for an *impure* PCI admit policy: one that (illegitimately) imports
+/// entropy. Standard policies must import nothing; this fixture exists to pin the
+/// visibility property — an impure policy's needs flow outward as composition residuals
+/// and can never be hidden ("policies are programs", SPEC: Eo9 API design).
+const IMPURE_POLICY_WIT: &str = r#"
+package eo9-tests:impure@0.1.0;
+
+/// An eo9:pci/admit-policy implementation that also wants entropy.
+world impure-admit {
+    import eo9:entropy/entropy@0.1.0;
+    export eo9:pci/admit-policy@0.1.0;
+}
+"#;
+
+/// An admit policy that imports `eo9:entropy/entropy` (never used) and admits every
+/// device. Composing it into a chain must leave the entropy requirement visible.
+pub fn impure_admit_policy() -> Component {
+    const CORE: &str = r#"
+(module
+  ;; the impurity: a real (authority-bearing) entropy import
+  (import "eo9:entropy/entropy@0.1.0" "get-u64" (func $rand (param i32) (result i64)))
+  (memory (export "memory") 1)
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+  ;; admit(device-info) -> bool: device-info flattens to 11 scalars
+  ;; (segment, bus, device, function, vendor-id, device-id, class-code, subclass,
+  ;;  prog-if, revision, header); admit everything.
+  (func (export "eo9:pci/admit-policy@0.1.0#admit")
+    (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+    (i32.const 1)))
+"#;
+    build_component(IMPURE_POLICY_WIT, &["pci", "entropy"], "impure-admit", CORE)
+}

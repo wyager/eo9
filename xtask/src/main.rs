@@ -55,6 +55,8 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-net-l4-none",
     "eo9-stub-net-l4-over-l2",
     "eo9-stub-net-virtio",
+    "eo9-stub-pci-admit-address",
+    "eo9-stub-pci-admit-vendor",
     "eo9-stub-pci-deny",
     "eo9-stub-pci-filtered",
     "eo9-stub-pci-none",
@@ -126,9 +128,13 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // virtio disk (boot with the `pci` grant and the xtask `disk` flag).
     ("eo9-stub-disk-virtio", "disk.virtio"),
     ("eo9-stub-fs-eofs", "fs.eofs"),
-    // The PCI attenuator, so a metal composition can grant a driver exactly one device:
-    // `pci.filtered --allow … $ lspci` (or `$ disk.virtio $ …`).
+    // The PCI attenuator and its standard admit policies, so a metal composition can
+    // grant a driver exactly one device ("policies are programs", SPEC):
+    // `pci.admit-address --allow … $ pci.filtered $ lspci` (fixed bus address) or
+    // `pci.admit-vendor --allow … $ pci.filtered $ disk.virtio $ …` (device identity).
     ("eo9-stub-pci-filtered", "pci.filtered"),
+    ("eo9-stub-pci-admit-address", "pci.admit-address"),
+    ("eo9-stub-pci-admit-vendor", "pci.admit-vendor"),
     // The PCI absence stub, so optional-pci programs can be composed to observe "no
     // devices" on metal — and the refusal stub, so required-pci programs can be composed
     // to observe a typed `denied` (`pci.deny $ lspci`) instead of an unsatisfied import.

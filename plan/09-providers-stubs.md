@@ -387,3 +387,21 @@ Match the priority order above; (1)+(2) unblock I2.
     kernel store (as `pci.deny`), and the eo9-components bundle; the integration test runs
     `text.null $ pci.deny $ lspci` against zero host providers and asserts lspci's own typed
     `denied` failure.
+
+26. **`pci.filtered` is policy-driven; `pci.admit-address` and `pci.admit-vendor` are the standard
+    policies (2026-06-01, plan/02 D24, "policies are programs").** The attenuator imports
+    `eo9:pci/admit-policy` instead of carrying an allow-list configuration, so which devices a
+    driver may see is decided by a composed, fused, wiring-tree-visible policy component:
+    `pci.admit-address --allow "[{segment: 0, bus: 0, device: 1, function: 0}]" $ pci.filtered $ lspci`
+    (fixed bus addresses — the original behavior) or
+    `pci.admit-vendor --allow "[{vendor-id: 6900, device-id: 4096}]" $ pci.filtered $ lspci`
+    (vendor:device identity — closes study 09's address-fragility finding: the grant follows what
+    the device *is*, not where it sits). Both policies are pure (no capability imports), default
+    to deny-all when unconfigured (never-trap rule), and live in the kernel store, so both forms
+    run at the metal prompt compiled on-target (verified: 3 visible devices filter down to exactly
+    0000:00:01.0 / 1af4:1000 on QEMU aarch64). `open` on the filtered view distinguishes
+    `not-found` (no such device) from `denied` (present but refused by policy). Follow-ups:
+    (a) the kernel's missing-capability hint maps *any* `eo9:pci/*` residual — including a
+    missing admit-policy — to the "add the `pci` token" message, which is misleading when the
+    missing thing is the policy middleware (kernel message fix, area 12); (b) the browser /bin
+    does not carry the policy stubs yet (recorded, not done).
