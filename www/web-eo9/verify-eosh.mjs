@@ -88,6 +88,10 @@ inputQueue = [
   "ls /bin",
   "describe hello",
   "describe entropy.seeded",
+  // describe also explains the shell's own words (builtins and operators) — including itself.
+  "describe describe",
+  "describe $",
+  "describe only",
   // `env`: the blob seeds a session manifest at /session (the eo9-session 1 format), so
   // the builtin reports the page's actual grants instead of "no information available".
   "env",
@@ -227,6 +231,16 @@ const checks = [
   [
     "describe hello: a binary with optional typed arguments",
     /kind: binary/.test(interactive) && /--name: option<string>/.test(interactive),
+  ],
+  [
+    "describe describe: the builtin explains itself",
+    /kind: builtin/.test(interactive) && /e\.g\. describe entropy\.seeded/.test(interactive),
+  ],
+  [
+    "describe $ and describe only: operator cards",
+    /kind: operator/.test(interactive) &&
+      /right-associative/.test(interactive) &&
+      /allow-list of/.test(interactive),
   ],
   [
     "describe entropy.seeded: a provider with its configure argument",
