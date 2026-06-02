@@ -297,12 +297,33 @@ impl DriverState {
     }
 }
 
+/// Returns the driver to the slot when an operation ends — including by *cancellation*
+/// (the operation's future dropped mid-await): without this, a cancelled operation would
+/// leave the slot `Busy` forever. Before putting the driver back it resynchronizes its
+/// used-ring cursor with the device (a synchronous DMA read), so a request whose
+/// completion arrived after the cancellation is consumed here and can never be
+/// misattributed to the *next* request. On the normal path the cursor already matches
+/// and the resync is a no-op.
+struct DriverGuard {
+    driver: Option<Driver>,
+}
+
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        if let Some(mut driver) = self.driver.take() {
+            let raw = pci::dma_read(&driver.ring, USED_OFFSET + 2, 2);
+            driver.used_index = u16::from_le_bytes([raw[0], raw[1]]);
+            STATE.put(driver);
+        }
+    }
+}
+
 /// Run `f` over the brought-up driver, probing and initializing the device on first use
 /// (the documented default state — there is no configure interface).
 async fn with_driver<R>(
     f: impl AsyncFnOnce(&mut Driver) -> Result<R, DiskFail>,
 ) -> Result<R, DiskFail> {
-    let mut driver = match STATE.take()? {
+    let driver = match STATE.take()? {
         Some(driver) => driver,
         None => match Driver::bring_up().await {
             Ok(driver) => driver,
@@ -312,9 +333,11 @@ async fn with_driver<R>(
             }
         },
     };
-    let result = f(&mut driver).await;
-    STATE.put(driver);
-    result
+    let mut guard = DriverGuard {
+        driver: Some(driver),
+    };
+    f(guard.driver.as_mut().expect("guard holds the driver")).await
+    // `guard` drops here (or wherever this future is dropped), returning the driver.
 }
 
 impl Driver {

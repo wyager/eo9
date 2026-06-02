@@ -268,12 +268,32 @@ async fn mount_or_format() -> Result<AsyncEofs<DiskDevice>, FsError> {
     }
 }
 
+/// Returns the engine to the slot when an operation ends — including by *cancellation*
+/// (the operation's future dropped mid-await): without this, a cancelled operation would
+/// leave the slot `Busy` forever. Dropping also discards any uncommitted engine state
+/// (`rollback` is synchronous), so a cancelled half-applied mutation can never be
+/// published by a later commit — the same guarantee `mutate` gives failed operations. On
+/// the normal path the engine is already clean (committed or rolled back), so the
+/// rollback is a no-op.
+struct FsGuard {
+    eofs: Option<Box<AsyncEofs<DiskDevice>>>,
+}
+
+impl Drop for FsGuard {
+    fn drop(&mut self) {
+        if let Some(mut eofs) = self.eofs.take() {
+            eofs.rollback();
+            STATE.put(eofs);
+        }
+    }
+}
+
 /// Run `f` over the mounted filesystem, mounting (or formatting a blank disk) on first
 /// use — the documented default behaviour, so the unconfigured provider never traps.
 async fn with_fs<R>(
     f: impl AsyncFnOnce(&mut AsyncEofs<DiskDevice>) -> Result<R, FsError>,
 ) -> Result<R, FsError> {
-    let mut eofs = match STATE.take()? {
+    let eofs = match STATE.take()? {
         Some(eofs) => eofs,
         None => match mount_or_format().await {
             Ok(eofs) => Box::new(eofs),
@@ -283,9 +303,9 @@ async fn with_fs<R>(
             }
         },
     };
-    let result = f(&mut eofs).await;
-    STATE.put(eofs);
-    result
+    let mut guard = FsGuard { eofs: Some(eofs) };
+    f(guard.eofs.as_mut().expect("guard holds the engine")).await
+    // `guard` drops here (or wherever this future is dropped), returning the engine.
 }
 
 /// Run a *mutating* operation over the mounted filesystem with rewrite atomicity and
