@@ -92,6 +92,18 @@ component-model-async-bytes = [
 component-model-async-fiberless = [
     "component-model-async",
 ]
+# eo9 local change (kernel/vendor/README.md): opt-in "first poll" for guest callees — a
+# callback-ABI callee whose instance is enterable runs its initial activation inline on
+# the caller's stack instead of being queued to the event loop, falling back to exactly
+# the queued state when the activation suspends (`WAIT`/`YIELD` are return values under
+# the callback ABI, so there is no stack to capture). The inline/queue decision is a pure
+# function of store state (reentrance, backpressure, a fixed depth bound), so behavior
+# stays deterministic. Implements the optimization upstream contemplates in the comment
+# in `start_call` (concurrent.rs:2884-2896). Off by default; A/B'd by tests/firstpoll-ab
+# in the embedding repository.
+component-model-async-first-poll = [
+    "component-model-async",
+]
 coredump = [
     "dep:wasm-encoder",
     "runtime",

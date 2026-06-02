@@ -202,6 +202,17 @@ mod callback_code {
 /// This may be passed to the `async-start` intrinsic from a fused adapter.
 const START_FLAG_ASYNC_CALLEE: u32 = wasmtime_environ::component::START_FLAG_ASYNC_CALLEE as u32;
 
+/// eo9 local change (kernel/vendor/README.md): the maximum number of nested inline
+/// activations (`component-model-async-first-poll`).
+///
+/// Each inline entry deepens the caller's native stack by one activation, so a fixed
+/// bound keeps deep guest chains from substituting the event loop's queue with unbounded
+/// stack growth; hops beyond the bound fall back to the queued path. A constant (rather
+/// than a measurement of remaining stack) keeps the inline/queue decision a pure function
+/// of store state and therefore deterministic across hosts.
+#[cfg(feature = "component-model-async-first-poll")]
+const MAX_INLINE_DEPTH: u32 = 64;
+
 /// Provides access to either store data (via the `get` method) or the store
 /// itself (via [`AsContext`]/[`AsContextMut`]), as well as the component
 /// instance to which the current host task belongs.
@@ -644,6 +655,13 @@ enum SuspendReason {
     },
 }
 
+/// The boxed closure which runs a guest task's initial activation (the payload of
+/// `GuestCallKind::StartImplicit`).
+///
+/// If the closure returns `Ok(Some(call))`, the `call` should be run immediately using
+/// `handle_guest_call`.
+type StartImplicitFn = Box<dyn FnOnce(&mut dyn VMStore) -> Result<Option<GuestCall>> + Send + Sync>;
+
 /// Represents a pending call into guest code for a given guest task.
 enum GuestCallKind {
     /// Indicates there's an event to deliver to the task, possibly related to a
@@ -662,7 +680,7 @@ enum GuestCallKind {
     ///
     /// If the closure returns `Ok(Some(call))`, the `call` should be run
     /// immediately using `handle_guest_call`.
-    StartImplicit(Box<dyn FnOnce(&mut dyn VMStore) -> Result<Option<GuestCall>> + Send + Sync>),
+    StartImplicit(StartImplicitFn),
     StartExplicit(Box<dyn FnOnce(&mut dyn VMStore) -> Result<()> + Send + Sync>),
 }
 
@@ -2329,6 +2347,17 @@ impl Instance {
     /// Add the specified guest call to the "high priority" work item queue, to
     /// be started as soon as backpressure and/or reentrance rules allow.
     ///
+    /// eo9 local change (kernel/vendor/README.md): with the
+    /// `component-model-async-first-poll` feature, a callback-ABI callee whose instance
+    /// is enterable right now is *not* queued; instead its activation closure is returned
+    /// to `start_call`, which runs it inline on the caller's stack (the "first poll" for
+    /// guest callees that the comment in `start_call` contemplates). The legality gate
+    /// mirrors `GuestCall::is_ready` for `StartImplicit` exactly (instance reentrance and
+    /// backpressure), plus the `MAX_INLINE_DEPTH` bound; every input is store state, so
+    /// the inline/queue decision is deterministic ("always inline when legal"). When the
+    /// gate fails — or the feature is off — the call is queued exactly as before and
+    /// `Ok(None)` is returned.
+    ///
     /// SAFETY: The raw pointer arguments must be valid references to guest
     /// functions (with the appropriate signatures) when the closures queued by
     /// this function are called.
@@ -2342,7 +2371,7 @@ impl Instance {
         async_: bool,
         callback: Option<SendSyncPtr<VMFuncRef>>,
         post_return: Option<SendSyncPtr<VMFuncRef>>,
-    ) -> Result<()> {
+    ) -> Result<Option<StartImplicitFn>> {
         /// Return a closure which will call the specified function in the scope
         /// of the specified task.
         ///
@@ -2553,6 +2582,25 @@ impl Instance {
             })
         };
 
+        // eo9 local change: see the function documentation. The gate reads only store
+        // state; `do_not_enter`/`backpressure` are exactly what `GuestCall::is_ready`
+        // would check for this `StartImplicit` at dequeue time. The `Caller::Guest`
+        // check restricts inlining to the `start_call` path: host->guest calls
+        // (`queue_call0`) have no inline continuation and must always queue.
+        #[cfg(feature = "component-model-async-first-poll")]
+        if callback.is_some()
+            && store.0.concurrent_state_mut().inline_depth < MAX_INLINE_DEPTH
+            && matches!(
+                store.0.concurrent_state_mut().get_mut(guest_thread.task)?.caller,
+                Caller::Guest { .. }
+            )
+        {
+            let inst = store.0.instance_state(callee_instance).concurrent_state();
+            if !inst.do_not_enter && inst.backpressure == 0 {
+                return Ok(Some(fun));
+            }
+        }
+
         store
             .0
             .concurrent_state_mut()
@@ -2564,7 +2612,7 @@ impl Instance {
                 },
             ));
 
-        Ok(())
+        Ok(None)
     }
 
     /// Prepare (but do not start) a guest->guest call.
@@ -2855,8 +2903,10 @@ impl Instance {
         let caller = *caller;
         let caller_instance = state.get_mut(caller.task)?.instance;
 
-        // Queue the call as a "high priority" work item.
-        unsafe {
+        // Queue the call as a "high priority" work item — or, with the
+        // `component-model-async-first-poll` feature (eo9 local change, see
+        // `queue_call`), get the activation back and run it inline on this stack.
+        let _inline = unsafe {
             self.queue_call(
                 store.as_context_mut(),
                 guest_thread,
@@ -2866,8 +2916,28 @@ impl Instance {
                 (flags & START_FLAG_ASYNC_CALLEE) != 0,
                 NonNull::new(callback).map(SendSyncPtr::new),
                 NonNull::new(post_return).map(SendSyncPtr::new),
-            )?;
-        }
+            )?
+        };
+
+        // eo9 local change: run the activation inline if `queue_call` returned it.
+        // `Some(prefetched)` short-circuits the wait loop below: the callee's terminal
+        // (or `Started`) status was already observed synchronously, with the pending
+        // event consumed, so there is no event-loop round trip and no suspension.
+        // `None` with `_inline` consumed means the callee suspended under a sync-lowered
+        // caller, which falls through to the wait loop exactly as a queued call would.
+        #[cfg(feature = "component-model-async-first-poll")]
+        let prefetched = match _inline {
+            Some(fun) => self.run_inline_activation(
+                store.as_context_mut(),
+                fun,
+                guest_thread,
+                caller_instance,
+                async_caller,
+            )?,
+            None => None,
+        };
+        #[cfg(not(feature = "component-model-async-first-poll"))]
+        let prefetched: Option<(Status, Option<u32>)> = None;
 
         let state = store.0.concurrent_state_mut();
 
@@ -2895,7 +2965,14 @@ impl Instance {
         // etc.).  Again, we'd want to see a measurable performance benefit
         // before committing to such an optimization.  And again, we'd need to
         // update the spec to allow that.
-        let (status, waitable) = loop {
+        //
+        // eo9 local change: with `component-model-async-first-poll` the first
+        // alternative above is exactly what `run_inline_activation` did, in which case
+        // `prefetched` already carries the status and the loop is skipped.
+        let (status, waitable) = if let Some(prefetched) = prefetched {
+            prefetched
+        } else {
+            loop {
             store.0.suspend(SuspendReason::Waiting {
                 set,
                 thread: caller,
@@ -2943,6 +3020,7 @@ impl Instance {
                 // a sync-lowered import, so we loop and keep waiting until the
                 // callee returns.
             }
+            }
         };
 
         guest_waitable.join(store.0.concurrent_state_mut(), old_set)?;
@@ -2970,6 +3048,97 @@ impl Instance {
         }
 
         Ok(status.pack(waitable))
+    }
+
+    /// eo9 local change (kernel/vendor/README.md): run a callback-ABI callee's initial
+    /// activation inline on the caller's stack (`component-model-async-first-poll`) —
+    /// the guest-callee analogue of `first_poll` below.
+    ///
+    /// The closure is exactly the work item the queued path would have run; running it
+    /// here only moves the initial activation earlier. Under the callback ABI suspension
+    /// is a *return value* (`WAIT`/`YIELD` from the callback), so when the callee does
+    /// suspend, `handle_callback_code` has already registered it exactly as the queued
+    /// path would have and there is nothing to undo — the caller simply proceeds to the
+    /// wait loop in `start_call`.
+    ///
+    /// Because the subtask waitable has not yet joined the caller's sync-call set, every
+    /// status event the activation produces lands in the waitable's (last-write-wins)
+    /// event slot without waking anything; this function consumes that slot, which is
+    /// also what makes the fall-through to the wait loop sound (the loop's suspend
+    /// cannot race a stale `Started`).
+    ///
+    /// Returns:
+    ///
+    /// - `Some((Returned, None))` — the activation completed (`task.return` reached);
+    ///   the fast case: no event-loop round trip, no suspension, no subtask machinery
+    ///   visible to the caller.
+    /// - `Some((Started, Some(handle)))` — the callee suspended and the caller is
+    ///   async-lowered: it takes a subtask handle and proceeds, exactly as if it had
+    ///   observed `Started` from the wait loop.
+    /// - `None` — the callee suspended and the caller is sync-lowered: fall through to
+    ///   the wait loop and park until the callee returns.
+    #[cfg(feature = "component-model-async-first-poll")]
+    fn run_inline_activation<T: 'static>(
+        self,
+        store: StoreContextMut<T>,
+        fun: StartImplicitFn,
+        guest_thread: QualifiedThreadId,
+        caller_instance: RuntimeInstance,
+        async_caller: bool,
+    ) -> Result<Option<(Status, Option<u32>)>> {
+        // Mirror the queued environment: a dequeued work item runs with no current
+        // thread (the caller has not suspended, but it is not running either while the
+        // callee's activation is on the stack).
+        store.0.set_thread(CurrentThread::None)?;
+
+        store.0.concurrent_state_mut().inline_depth += 1;
+        let result = match fun(store.0) {
+            // Yield-in-non-blocking-context: the queued path runs the returned call
+            // immediately too (`handle_guest_call` loops on it).
+            Ok(Some(call)) => handle_guest_call(store.0, call),
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        };
+        store.0.concurrent_state_mut().inline_depth -= 1;
+        result?;
+
+        let state = store.0.concurrent_state_mut();
+        let event = Waitable::Guest(guest_thread.task).take_event(state)?;
+        match event {
+            Some(Event::Subtask {
+                status: Status::Returned,
+            }) => {
+                // `Returned` overwrote the `Started` that `GuestTask::lower_params`
+                // posted, within the activation — the callee never yielded.
+                Ok(Some((Status::Returned, None)))
+            }
+            Some(Event::Subtask {
+                status: Status::Started,
+            }) => {
+                if async_caller {
+                    // Same bookkeeping as the wait loop's non-terminal break.
+                    let handle = store
+                        .0
+                        .instance_state(caller_instance)
+                        .handle_table()
+                        .subtask_insert_guest(guest_thread.task.rep())?;
+                    store
+                        .0
+                        .concurrent_state_mut()
+                        .get_mut(guest_thread.task)?
+                        .common
+                        .handle = Some(handle);
+                    Ok(Some((Status::Started, Some(handle))))
+                } else {
+                    Ok(None)
+                }
+            }
+            // `ReturnCancelled` is unreachable here: cancellation requires a subtask
+            // handle, which cannot exist before this call's status is first observed.
+            // `Starting` is only posted by the not-ready dequeue path, which the inline
+            // gate excludes. An empty slot would mean `lower_params` never ran.
+            other => bail_bug!("unexpected event after inline activation: {other:?}"),
+        }
     }
 
     /// Poll the specified future once on behalf of a guest->host call using an
@@ -5055,6 +5224,13 @@ pub struct ConcurrentState {
     ///
     /// Used in the implementation of `Accessor::poll_no_interesting_tasks`.
     interesting_tasks_empty_waker: Option<Waker>,
+
+    /// eo9 local change (kernel/vendor/README.md): the number of inline guest
+    /// activations currently on the native stack (`component-model-async-first-poll`).
+    ///
+    /// See `MAX_INLINE_DEPTH` and `Instance::run_inline_activation`.
+    #[cfg(feature = "component-model-async-first-poll")]
+    inline_depth: u32,
 }
 
 impl Default for ConcurrentState {
@@ -5071,6 +5247,8 @@ impl Default for ConcurrentState {
             global_error_context_ref_counts: BTreeMap::new(),
             interesting_tasks: 0,
             interesting_tasks_empty_waker: None,
+            #[cfg(feature = "component-model-async-first-poll")]
+            inline_depth: 0,
         }
     }
 }
@@ -5609,7 +5787,7 @@ fn queue_call0<T: 'static>(
     // SAFETY: `callee`, `callback`, and `post_return` are valid pointers
     // (with signatures appropriate for this call) and will remain valid as
     // long as this instance is valid.
-    unsafe {
+    let inline = unsafe {
         instance.queue_call(
             store,
             guest_thread,
@@ -5619,6 +5797,11 @@ fn queue_call0<T: 'static>(
             is_concurrent,
             callback,
             post_return.map(SendSyncPtr::new),
-        )
-    }
+        )?
+    };
+    // eo9 local change: host->guest calls always queue (`queue_call`'s inline gate
+    // requires a guest caller); there is no inline continuation here.
+    debug_assert!(inline.is_none());
+    let _ = inline;
+    Ok(())
 }
