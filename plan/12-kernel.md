@@ -1549,3 +1549,23 @@ preemption/hardening work.
     services). Remaining for v3+: the L2 switch root provider; storedisk-persisted service configs +
     logs (a `storedisk` boot could read `/services.cfg`); per-service fuel budgets; the `blocked`
     state split; cross-reboot service compile caching.
+66. **The display stack on metal: `gpu.virtio $ draw`, the `gpu` QEMU flag, and `check-gpu`
+    (2026-06-02).** The kernel store gains the gfx family (gpu.virtio, gfx.mem, gfx.none,
+    gfx.deny, draw — 5 entries), all reachable at the metal prompt with zero kernel-source
+    changes: the driver is an ordinary wasm component over the existing eo9:pci provider. The
+    xtask `gpu` argument attaches `-device virtio-gpu-pci,xres=640,yres=480` (geometry pinned so
+    the deterministic pattern is reproducible) plus a QMP socket; `cargo xtask check-gpu` is the
+    headless verification: boots `pci gpu`, types `gpu.virtio $ draw` then `… --frames 2` at the
+    serial prompt (byte-at-a-time at 25 ms with echo verification — chunked pastes lose bytes
+    under host CPU contention, the D49 console convention taken to its conclusion), QMP
+    `screendump`s after each, and compares both PPMs pixel-for-pixel against the pattern
+    computed independently in xtask. Verified end to end, plus: Ctrl-C mid-draw → the generic
+    teardown quiesce covers the GPU (diagnostic line) and a second `gpu.virtio $ draw`
+    re-claims and re-presents; `gfx.mem $ draw` on metal = the usermode checksum = gpu.virtio's
+    readback checksum (12974149382569602461 at 640x480) — one deterministic pattern across
+    every backend and target; all three arch demos and the lspci baseline unchanged (the GPU
+    only exists behind its explicit flag). One driver-shaping lesson recorded: dropping ANY DMA
+    buffer mid-conversation kills the device — the kernel's conservative quiesce-on-buffer-free
+    clears bus mastering, and QEMU's virtio-pci clears DRIVER_OK when bus mastering drops — so
+    drivers must allocate exactly what they keep (gpu.virtio's framebuffer is an Option filled
+    once, never replaced; surfaced by the enriched poll-limit diagnostics, which stay).

@@ -6,7 +6,7 @@
 # when something installable is missing (QEMU is a system package, so it is only checked).
 
 .DEFAULT_GOAL := help
-.PHONY: help setup ensure-setup shell www www-build qemu ci
+.PHONY: help setup ensure-setup shell www www-build qemu gfx ci
 
 help:
 	@echo "Eo9 — common entry points:"
@@ -15,6 +15,7 @@ help:
 	@echo "  make www        serve the website + the in-browser shell at http://127.0.0.1:8080/"
 	@echo "  make www-build  rebuild the /vm in-browser shell assets from source, then serve"
 	@echo "  make qemu       boot the bare-metal kernel in QEMU to an eosh prompt (aarch64)"
+	@echo "  make gfx        same, plus a framebuffer window — type 'gpu.virtio \$$ draw' to paint it"
 	@echo "  make ci         run the full local gate (host + guest + kernel workspaces)"
 
 setup:
@@ -71,6 +72,18 @@ qemu: ensure-setup
 	  echo "error: qemu-system-aarch64 not found — install QEMU (e.g. 'brew install qemu'), then re-run"; exit 1; }
 	cargo xtask build-kernel aarch64
 	cargo xtask qemu aarch64
+
+# Boots with the PCI grant, a virtio-gpu device, and a framebuffer WINDOW (the serial
+# console stays in this terminal). At the eosh> prompt, paint the window with:
+#   gpu.virtio $ draw
+gfx: ensure-setup
+	@command -v qemu-system-aarch64 >/dev/null 2>&1 || { \
+	  echo "error: qemu-system-aarch64 not found — install QEMU (e.g. 'brew install qemu'), then re-run"; exit 1; }
+	cargo xtask build-kernel aarch64
+	@echo ""
+	@echo "A QEMU framebuffer window opens; at the eosh> prompt try:   gpu.virtio \$$ draw"
+	@echo ""
+	cargo xtask qemu aarch64 pci gpu display
 
 ci: ensure-setup
 	cargo xtask ci

@@ -17,6 +17,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-outcomes",
     "eo9-example-cruncher",
     "eo9-example-readwrite",
+    "eo9-example-draw",
     "eo9-example-sockcheck",
     "eo9-example-lspci",
     "eo9-example-l2check",
@@ -52,6 +53,10 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-fs-overlay",
     "eo9-stub-fs-policy-subtree",
     "eo9-stub-fs-readonly",
+    "eo9-stub-gfx-deny",
+    "eo9-stub-gfx-mem",
+    "eo9-stub-gfx-none",
+    "eo9-stub-gpu-virtio",
     "eo9-stub-net-l2-deny",
     "eo9-stub-net-l2-echo",
     "eo9-stub-net-l2-none",
@@ -208,6 +213,15 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // the shell (`save <name> = <expr>`) are removed with `rm /bin/<name>.wasm`. Baked
     // entries refuse removal (read-only), so rm on the standard names is inert.
     ("eo9-coreutil-rm", "rm"),
+    // The display stack: the virtio-gpu driver, the RAM framebuffer (the no-hardware
+    // deterministic target), the absence/refusal stubs, and the drawing demo, so the
+    // metal shell can compose `gpu.virtio $ draw` against a QEMU virtio-gpu (boot with
+    // the `pci` grant and the xtask `gpu` flag) or `gfx.mem $ draw` against nothing.
+    ("eo9-stub-gpu-virtio", "gpu.virtio"),
+    ("eo9-stub-gfx-mem", "gfx.mem"),
+    ("eo9-stub-gfx-none", "gfx.none"),
+    ("eo9-stub-gfx-deny", "gfx.deny"),
+    ("eo9-example-draw", "draw"),
 ];
 
 fn main() -> ExitCode {
@@ -261,6 +275,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         "build-kernel" => {
             build_kernel(&root, &arch_arg("build-kernel", rest)?)?;
             Ok(())
+        }
+        "check-gpu" => {
+            expect_no_args("check-gpu", rest)?;
+            check_gpu(&root)
         }
         "qemu" => {
             let Some((arch, append)) = rest.split_first() else {
@@ -344,6 +362,11 @@ COMMANDS:
                          feature-less image (boot/serial/heap/timer/interrupts so far)
     qemu <arch>          Build the kernel image and boot it under QEMU with serial on stdio
                          (aarch64 or riscv64; exits when the kernel powers off, Ctrl-A X to quit)
+    check-gpu            Boot the aarch64 kernel under QEMU with a virtio-gpu (pci gpu), drive
+                         `gpu.virtio $ draw` (one frame, then the two-frame partial-damage run)
+                         at the serial eosh prompt, screendump the scanout over QMP after each,
+                         and compare both images pixel-for-pixel against the independently
+                         computed expected pattern
     fmt [--check]        Run `cargo fmt --all` in all three workspaces
     lint                 Run `cargo clippy -D warnings` in all three workspaces
     ci                   The merge gate: fmt --check, lint, build, build-guest, test
@@ -2142,7 +2165,13 @@ fn ensure_storedisk_mac_key(root: &Path) -> Result<PathBuf, String> {
 /// hardware to claim — `cargo xtask qemu aarch64 pci disk`. A bare `net` argument is the
 /// same idea for networking: it attaches a modern virtio-net PCI function backed by QEMU
 /// user-mode networking (`-netdev user`) so the `net.virtio` driver has a NIC to claim —
-/// `cargo xtask qemu aarch64 pci net`.
+/// `cargo xtask qemu aarch64 pci net`. A bare `gpu` argument attaches a virtio-gpu PCI
+/// function pinned at 640x480 plus a QMP control socket, so the `gpu.virtio` driver has
+/// a display to claim and `check-gpu` can screendump it — `cargo xtask qemu aarch64 pci gpu`.
+/// Adding the bare `display` argument (requires `gpu`) opens QEMU's framebuffer window
+/// instead of running headless, with the serial console multiplexed on stdio, so the
+/// scanout is visible while you type at the prompt — `cargo xtask qemu aarch64 pci gpu
+/// display`, then `gpu.virtio $ draw` (this is what `make gfx` runs).
 ///
 /// A bare `storedisk` argument attaches the *persistent* store-disk image and also stays on
 /// the kernel command line: the kernel claims that virtio-blk function for its own
@@ -2217,17 +2246,29 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
             ));
         }
     };
+    // The bare `display` argument opens QEMU's default framebuffer window (cocoa on
+    // macOS, gtk/sdl elsewhere) instead of running headless, with the serial console
+    // and monitor multiplexed on stdio so the eosh prompt stays in the terminal. It
+    // only makes sense with a display device, so it requires `gpu`.
+    let want_display = append.iter().any(|argument| argument == "display");
+    if want_display && !append.iter().any(|argument| argument == "gpu") {
+        return Err(
+            "`display` opens a framebuffer window and needs the virtio-gpu device — \
+             add the `gpu` argument (e.g. `cargo xtask qemu aarch64 pci gpu display`)"
+                .into(),
+        );
+    }
+    let console: &[&str] = if want_display {
+        &["-serial", "mon:stdio"]
+    } else {
+        &["-nographic"]
+    };
     let mut args: Vec<std::ffi::OsString> = machine
         .iter()
+        .chain(["-smp", "1", "-m", KERNEL_QEMU_MEMORY].iter())
+        .chain(console.iter())
+        .chain(["-kernel"].iter())
         .copied()
-        .chain([
-            "-smp",
-            "1",
-            "-m",
-            KERNEL_QEMU_MEMORY,
-            "-nographic",
-            "-kernel",
-        ])
         .map(Into::into)
         .collect();
     args.push(image.as_os_str().to_os_string());
@@ -2242,6 +2283,7 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
     let mut cmdline: Vec<String> = Vec::new();
     let mut attach_disk = false;
     let mut attach_net = false;
+    let mut attach_gpu = false;
     let mut net_dump = false;
     let mut attach_store_disk = false;
     for argument in append {
@@ -2249,6 +2291,8 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
             attach_disk = true;
         } else if argument == "net" {
             attach_net = true;
+        } else if argument == "gpu" {
+            attach_gpu = true;
         } else if argument == "netdump" {
             // Capture the user-net link to kernel/target/eo9-net.pcap (implies `net`),
             // so link-level evidence — e.g. the virtual-NIC switch's per-port MACs in
@@ -2258,6 +2302,9 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         } else if argument == "iommu" {
             // EXPERIMENTAL: consumed above (machine-type selection); never reaches the
             // kernel command line.
+        } else if argument == "display" {
+            // Consumed above (console/window selection); never reaches the kernel
+            // command line.
         } else if argument == "storedisk" {
             attach_store_disk = true;
             cmdline.push(argument.clone());
@@ -2301,6 +2348,16 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         }
         args.push("-device".into());
         args.push("virtio-net-pci,netdev=eo9net,disable-legacy=on".into());
+    }
+    if attach_gpu {
+        // A virtio-gpu function at a pinned 640x480 (so the draw demo's pattern — and
+        // `check-gpu`'s expected image — are deterministic), plus a QMP socket so a
+        // verification driver can `screendump` the scanout while the machine runs.
+        // virtio-gpu is modern-only; there is no disable-legacy property to pin.
+        args.push("-device".into());
+        args.push(format!("virtio-gpu-pci,xres={GPU_XRES},yres={GPU_YRES}").into());
+        args.push("-qmp".into());
+        args.push(format!("unix:{},server=on,wait=off", gpu_qmp_socket(root).display()).into());
     }
     // Anything else after the architecture becomes the kernel command line, e.g.
     // `cargo xtask qemu aarch64 program=cruncher seed=9 rounds=200000`.
@@ -2768,5 +2825,381 @@ fn package(root: &Path) -> Result<(), String> {
          xtask: the dependent crates until their dependencies are live on crates.io, so\n\
          xtask: `cargo publish` performs that verification at publish time."
     );
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------------------
+// check-gpu: headless verification of the display stack (wit/gfx, gpu.virtio, draw).
+//
+// Boots the aarch64 kernel under QEMU with the `pci` grant and a virtio-gpu pinned at
+// GPU_XRES x GPU_YRES, drives the serial eosh prompt like a (paced) human, and after each
+// draw run issues a QMP `screendump` and compares the PPM pixel-for-pixel against the
+// expected pattern — computed here, independently of the guest (the third verbatim copy
+// of the pattern; see guest/examples/draw/src/lib.rs).
+// ----------------------------------------------------------------------------------------
+
+/// The geometry the `gpu` flag pins the virtio-gpu to (small enough that the on-target
+/// composition draws in a moment; the pattern scales to whatever the mode reports).
+const GPU_XRES: u32 = 640;
+const GPU_YRES: u32 = 480;
+
+/// How long to wait for the eosh prompt / a draw outcome before declaring the boot hung.
+/// On-target compilation of `gpu.virtio $ draw` dominates (tens of seconds under TCG).
+const GPU_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn gpu_qmp_socket(root: &Path) -> PathBuf {
+    root.join("kernel").join("target").join("eo9-gpu-qmp.sock")
+}
+
+/// The deterministic draw test pattern — a verbatim copy of guest/examples/draw/src/lib.rs
+/// (and of tests/eo9-integration/tests/gfx.rs); see the demo's module docs. Keep in
+/// lockstep: a drifted copy fails the image comparison this module exists to make.
+mod gfx_pattern {
+    pub fn pattern_pixel(frame: u32, width: u32, height: u32, x: u32, y: u32) -> (u8, u8, u8) {
+        let base = base_pixel(width, height, x, y);
+        if frame >= 2 && in_damage_rect(width, height, x, y) {
+            return (255 - base.0, 255 - base.1, 255 - base.2);
+        }
+        base
+    }
+
+    fn damage_rect(width: u32, height: u32) -> (u32, u32, u32, u32) {
+        (width / 4, height / 4, width / 2, height / 2)
+    }
+
+    fn in_damage_rect(width: u32, height: u32, x: u32, y: u32) -> bool {
+        let (dx, dy, dw, dh) = damage_rect(width, height);
+        x >= dx && x < dx + dw && y >= dy && y < dy + dh
+    }
+
+    fn base_pixel(width: u32, height: u32, x: u32, y: u32) -> (u8, u8, u8) {
+        if x == 0 || y == 0 || x == width - 1 || y == height - 1 {
+            return (255, 255, 255);
+        }
+        let qw = width / 4;
+        let qh = height / 4;
+        let in_quarter = |x0: u32, y0: u32| x >= x0 && x < x0 + qw && y >= y0 && y < y0 + qh;
+        if in_quarter(width / 8, height / 8) {
+            return (255, 32, 32);
+        }
+        if in_quarter(3 * width / 8, 3 * height / 8) {
+            return (32, 255, 32);
+        }
+        if in_quarter(5 * width / 8, 5 * height / 8) {
+            return (32, 32, 255);
+        }
+        (
+            ((x as u64 * 255) / u64::from(width - 1).max(1)) as u8,
+            ((y as u64 * 255) / u64::from(height - 1).max(1)) as u8,
+            ((x ^ y) & 0xff) as u8,
+        )
+    }
+}
+
+/// Boot, draw (one frame, then two frames), screendump after each, compare both.
+fn check_gpu(root: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::sync::mpsc;
+
+    let arch = "aarch64";
+    let image = build_kernel(root, arch)?;
+    let qmp_path = gpu_qmp_socket(root);
+    let _ = std::fs::remove_file(&qmp_path);
+    let dump1 = root
+        .join("kernel")
+        .join("target")
+        .join("eo9-gpu-frame1.ppm");
+    let dump2 = root
+        .join("kernel")
+        .join("target")
+        .join("eo9-gpu-frame2.ppm");
+    let _ = std::fs::remove_file(&dump1);
+    let _ = std::fs::remove_file(&dump2);
+
+    println!(
+        "xtask: check-gpu — booting {} with a {GPU_XRES}x{GPU_YRES} virtio-gpu, driving \
+         `gpu.virtio $ draw` at the eosh prompt, screendumping over QMP",
+        image.display()
+    );
+
+    // The same invocation as `qemu aarch64 pci gpu`, with stdio piped for scripting.
+    let mut command = Command::new(format!("qemu-system-{arch}"));
+    command
+        .current_dir(root)
+        .args(["-M", "virt,gic-version=2,highmem=off", "-cpu", "max"])
+        .args(["-device", "virtio-rng-pci"])
+        .args(["-smp", "1", "-m", KERNEL_QEMU_MEMORY, "-nographic"])
+        .arg("-kernel")
+        .arg(&image)
+        .args(["-append", "pci"])
+        .arg("-device")
+        .arg(format!("virtio-gpu-pci,xres={GPU_XRES},yres={GPU_YRES}"))
+        .arg("-qmp")
+        .arg(format!("unix:{},server=on,wait=off", qmp_path.display()))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("check-gpu: failed to spawn qemu-system-{arch}: {err}"))?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+
+    // Reader thread: forward serial bytes over a channel so waits can time out.
+    let (sender, receiver) = mpsc::channel::<u8>();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut stdout = stdout;
+        let mut byte = [0u8; 1];
+        while let Ok(n) = stdout.read(&mut byte) {
+            if n == 0 || sender.send(byte[0]).is_err() {
+                break;
+            }
+        }
+    });
+
+    /// Accumulate serial output until `marker` appears (echoing it through), or time out.
+    fn wait_for(receiver: &mpsc::Receiver<u8>, marker: &str, what: &str) -> Result<String, String> {
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + GPU_STEP_TIMEOUT;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| {
+                    format!(
+                        "check-gpu: timed out waiting for {what} (last output: …{})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    )
+                })?;
+            match receiver.recv_timeout(remaining) {
+                Ok(byte) => {
+                    seen.push(byte as char);
+                    if seen.contains(marker) {
+                        return Ok(seen);
+                    }
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "check-gpu: the serial stream ended or timed out waiting for {what} \
+                         (last output: …{})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Type a line the way a human would: one byte at a time, slowly. The metal console
+    /// drops bytes from fast input (plan/12 D49), and under host CPU contention even
+    /// chunked pastes lose characters — so go at genuinely human speed and let the
+    /// caller verify the echo before trusting the line went in.
+    fn type_line(stdin: &mut std::process::ChildStdin, line: &str) -> Result<(), String> {
+        for byte in line.as_bytes() {
+            stdin
+                .write_all(core::slice::from_ref(byte))
+                .map_err(|err| format!("check-gpu: writing to the console: {err}"))?;
+            stdin
+                .flush()
+                .map_err(|err| format!("check-gpu: flushing the console: {err}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        stdin
+            .write_all(b"\n")
+            .and_then(|()| stdin.flush())
+            .map_err(|err| format!("check-gpu: writing to the console: {err}"))
+    }
+
+    // Boot to the prompt, run the one-frame draw, dump; run the two-frame draw, dump.
+    // Any failure kills QEMU before returning (no orphaned VMs holding the pipe open).
+    let drive = (|| -> Result<(), String> {
+        wait_for(&receiver, "eosh>", "the eosh prompt")?;
+        type_line(&mut stdin, "gpu.virtio $ draw")?;
+        wait_for(&receiver, "gpu.virtio $ draw", "the one-frame command echo")?;
+        let output = wait_for(&receiver, "presented(", "the one-frame draw outcome")?;
+        if !output.contains("ok:") {
+            return Err(String::from(
+                "check-gpu: the one-frame draw did not report ok (see the serial output above)",
+            ));
+        }
+        wait_for(&receiver, "eosh>", "the prompt after the one-frame draw")?;
+        qmp_screendump(&qmp_path, &dump1)?;
+
+        type_line(&mut stdin, "gpu.virtio $ draw --frames 2")?;
+        wait_for(&receiver, "--frames 2", "the two-frame command echo")?;
+        wait_for(&receiver, "presented(", "the two-frame draw outcome")?;
+        wait_for(&receiver, "eosh>", "the prompt after the two-frame draw")?;
+        qmp_screendump(&qmp_path, &dump2)?;
+
+        type_line(&mut stdin, "exit")?;
+        Ok(())
+    })();
+    if let Err(err) = drive {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    let _ = child.wait();
+
+    compare_ppm(&dump1, 1)?;
+    compare_ppm(&dump2, 2)?;
+    println!(
+        "xtask: check-gpu ok — both screendumps match the expected pattern pixel-for-pixel \
+         ({GPU_XRES}x{GPU_YRES}, frame 1 and the frame-2 partial-damage composite)"
+    );
+    Ok(())
+}
+
+/// Issue a QMP `screendump` and wait for its completion response.
+fn qmp_screendump(socket: &Path, output: &Path) -> Result<(), String> {
+    use std::io::{Read as _, Write as _};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|err| format!("check-gpu: connecting to the QMP socket: {err}"))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .map_err(|err| format!("check-gpu: QMP socket timeout: {err}"))?;
+
+    /// Read until `needle` appears in the accumulated response (QMP is line-oriented
+    /// JSON; matching the substring is enough for this two-command conversation).
+    fn read_until(
+        stream: &mut std::os::unix::net::UnixStream,
+        needle: &str,
+    ) -> Result<String, String> {
+        let mut seen = String::new();
+        let mut buf = [0u8; 512];
+        loop {
+            let n = stream
+                .read(&mut buf)
+                .map_err(|err| format!("check-gpu: reading QMP: {err}"))?;
+            if n == 0 {
+                return Err(format!("check-gpu: QMP closed early (saw: {seen})"));
+            }
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+            if seen.contains(needle) {
+                return Ok(seen);
+            }
+            if seen.contains("\"error\"") {
+                return Err(format!("check-gpu: QMP reported an error: {seen}"));
+            }
+        }
+    }
+
+    // Greeting → capabilities → screendump → completion.
+    read_until(&mut stream, "QMP")?;
+    stream
+        .write_all(b"{\"execute\":\"qmp_capabilities\"}\n")
+        .map_err(|err| format!("check-gpu: writing QMP: {err}"))?;
+    read_until(&mut stream, "\"return\"")?;
+    let dump = format!(
+        "{{\"execute\":\"screendump\",\"arguments\":{{\"filename\":{:?}}}}}\n",
+        output.display().to_string()
+    );
+    stream
+        .write_all(dump.as_bytes())
+        .map_err(|err| format!("check-gpu: writing QMP: {err}"))?;
+    read_until(&mut stream, "\"return\"")?;
+    Ok(())
+}
+
+/// Compare a QEMU `screendump` PPM against the expected pattern for `frame`.
+fn compare_ppm(path: &Path, frame: u32) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|err| {
+        format!(
+            "check-gpu: reading the screendump {}: {err}",
+            path.display()
+        )
+    })?;
+
+    // P6 header: magic, width, height, maxval — whitespace/comment separated, then one
+    // single whitespace byte before the binary RGB triplets.
+    let mut cursor = 0usize;
+    let mut fields: Vec<u64> = Vec::new();
+    if !bytes.starts_with(b"P6") {
+        return Err(format!("check-gpu: {} is not a P6 PPM", path.display()));
+    }
+    cursor += 2;
+    while fields.len() < 3 {
+        // Skip whitespace and comments.
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b' ' | b'\t' | b'\r' | b'\n' => cursor += 1,
+                b'#' => {
+                    while cursor < bytes.len() && bytes[cursor] != b'\n' {
+                        cursor += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if start == cursor {
+            return Err(format!(
+                "check-gpu: malformed PPM header in {}",
+                path.display()
+            ));
+        }
+        let field = std::str::from_utf8(&bytes[start..cursor])
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| format!("check-gpu: malformed PPM header in {}", path.display()))?;
+        fields.push(field);
+    }
+    cursor += 1; // the single whitespace after maxval
+    let (width, height, maxval) = (fields[0] as u32, fields[1] as u32, fields[2]);
+    if (width, height) != (GPU_XRES, GPU_YRES) {
+        return Err(format!(
+            "check-gpu: {} is {width}x{height}, expected {GPU_XRES}x{GPU_YRES} (is the \
+             virtio-gpu xres/yres pin in place?)",
+            path.display()
+        ));
+    }
+    if maxval != 255 {
+        return Err(format!(
+            "check-gpu: {} has maxval {maxval}, expected 255",
+            path.display()
+        ));
+    }
+    let pixels = &bytes[cursor..];
+    let needed = width as usize * height as usize * 3;
+    if pixels.len() < needed {
+        return Err(format!(
+            "check-gpu: {} is truncated ({} of {needed} pixel bytes)",
+            path.display(),
+            pixels.len()
+        ));
+    }
+
+    // Pixel-for-pixel, exact: the pattern is integer-deterministic, the format is
+    // xrgb8888 → RGB888 with no scaling or blending anywhere in the path, so any
+    // tolerance would only hide bugs (the recorded comparison-tolerance decision).
+    /// First mismatching pixel: position, expected RGB, actual RGB.
+    type Mismatch = (u32, u32, (u8, u8, u8), (u8, u8, u8));
+    let mut mismatches = 0usize;
+    let mut first: Option<Mismatch> = None;
+    for y in 0..height {
+        for x in 0..width {
+            let expected = gfx_pattern::pattern_pixel(frame, width, height, x, y);
+            let at = ((y * width + x) * 3) as usize;
+            let actual = (pixels[at], pixels[at + 1], pixels[at + 2]);
+            if actual != expected {
+                mismatches += 1;
+                if first.is_none() {
+                    first = Some((x, y, expected, actual));
+                }
+            }
+        }
+    }
+    if mismatches > 0 {
+        let (x, y, expected, actual) = first.unwrap();
+        return Err(format!(
+            "check-gpu: frame {frame} screendump {} differs from the expected pattern at \
+             {mismatches} pixel(s); first at ({x},{y}): expected {expected:?}, got {actual:?}",
+            path.display()
+        ));
+    }
     Ok(())
 }
