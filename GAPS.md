@@ -152,13 +152,14 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
   `wiring` as a leaf only; eosh `envinfo` still classifies authority by the `/types`-name heuristic.
 
 ### Runtime / providers (usermode)
-- **OPEN — intermittent lost wakeup hangs `eo9 -c` coreutils runs under load** (found 2026-06-02 running
-  the hardening matrix's CI; plan/13 D19): the spawned `eo9 --fs-root … -c "cat …"` child parks forever in
-  `providers::wait_until_runnable` (crates/eo9/src/providers.rs:1167) with no in-flight provider op (the
-  blocking-pool worker idles in `recv`); two stale identically-hung processes from other checkouts (`cat`,
-  `cp`, hours old) prove it pre-dates current branches. Suspect window: the parent-resume/child-doorbell
-  handoff (`Task::resume`'s children loop + `wait_until_runnable`). Reproduces only under heavy machine
-  load; isolated runs pass. Symptom in CI: a cli `cat`/`cp` test hanging ≫60 s — kill the child, re-run.
+- **FIXED 2026-06-02 — intermittent lost wakeup hung `eo9 -c` coreutils runs under load** (found
+  2026-06-02 running the hardening matrix's CI; plan/13 D19): the `eo9:exec/task.wait` host fn discarded
+  `child.runnable()`'s `Ready` in its child-is-blocked branch, so a child completion landing in the
+  check→register window (it drained an empty waiter list — only the sticky flag recorded it) lost its
+  only wake and the parent parked forever over a runnable child. Fixed in
+  crates/eo9-runtime/src/link.rs (act on the edge: wake and re-poll); root cause, reproduction (40/40
+  hangs with the window amplified, 0 after the fix), and rejected alternatives in plan/11
+  "Lost-wakeup fix".
 - **Guest-facing `resume` unsupported (E5)**: children are fuel-sliced from the parent's donation; no
   guest-directed scheduling. (plan/04 D11/E5)
 - **Fuel-quantum resume shim** (10k granularity) until wasmtime can park a fiber at fuel exhaustion.
