@@ -40,6 +40,10 @@ pub mod fs {
     pub use crate::bindings::eo9::fs::fs;
 }
 
+pub mod gfx {
+    pub use crate::bindings::eo9::gfx::{gfx, types};
+}
+
 pub mod net {
     pub use crate::bindings::eo9::net::{l2, l3, l4};
 }

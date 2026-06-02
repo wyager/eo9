@@ -516,3 +516,20 @@ Match the priority order above; (1)+(2) unblock I2.
     is *observed* unconfigured (the deny-path tests never reached it) — its lazy documented
     default remains a follow-up for whoever next touches the time stubs; the vnic tests
     configure it explicitly.
+32. **`gfx.mem`, `gfx.none`, `gfx.deny`, and the `gpu.virtio` driver (2026-06-02).** The
+    standard gfx environment mirrors the disk family: `gfx.mem` is the deterministic RAM
+    framebuffer (configured WxH, documented default 640x480, never traps; present/read/clear
+    with full bounds checks — out-of-bounds and bad-buffer are typed); `gfx.none`/`gfx.deny`
+    are the absence/refusal pair. `gpu.virtio` is the third real device driver (sibling of
+    disk.virtio/net.virtio, same probe/bring-up/INTx-with-polled-fallback machinery): claims
+    the first virtio-gpu function (0x1af4:0x1050), negotiates VERSION_1 only, drives the 2D
+    control queue (GET_DISPLAY_INFO → RESOURCE_CREATE_2D xrgb8888 at scanout 0's geometry →
+    RESOURCE_ATTACH_BACKING over one alloc-dma framebuffer → SET_SCANOUT; per present:
+    row-copy into the backing at the resource stride, TRANSFER_TO_HOST_2D of the damage rect,
+    RESOURCE_FLUSH). `read` answers from the DMA backing — the driver's copy of what was
+    presented — so the draw demo's checksum verifies the guest-side data path while QEMU's
+    screendump (xtask `check-gpu`) verifies the host-side scanout independently; together the
+    two cover the whole pipe. v1 bound: a single-allocation backing caps the mode at the
+    provider's 4 MiB DMA limit (1024x768 fits; larger needs multi-entry attach-backing — the
+    recorded follow-up). No configure interface: claim-first-on-first-use, like the siblings;
+    device selection is `pci.filtered` composed in front.

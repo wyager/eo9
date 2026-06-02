@@ -1,0 +1,15 @@
+[package]
+name = "eo9-stub-gpu-virtio"
+description = "Eo9 device driver `gpu.virtio`: drives a virtio-gpu PCI function's 2D control queue through the eo9:pci capability (config space, BARs, DMA) and exports eo9:gfx, so drawing programs run over a real display by composition."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

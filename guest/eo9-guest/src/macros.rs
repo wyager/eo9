@@ -31,7 +31,7 @@
 /// * `world` — the world name, defined in the crate's own `wit/` directory (with the
 ///   repo-level packages it imports symlinked under `wit/deps/`).
 /// * `apis` — which eo9 APIs the world imports, as bare identifiers (`io`, `text`,
-///   `time`, `entropy`, `perf`, `disk`, `fs`, `pci`, and the net layers `net_l2`,
+///   `time`, `entropy`, `perf`, `disk`, `fs`, `gfx`, `pci`, and the net layers `net_l2`,
 ///   `net_l3`, `net_l4`). Listing an API maps its interfaces onto [`crate::api`] instead
 ///   of regenerating them; `io` must be listed exactly when the world's imports use
 ///   `eo9:io/buffers` (i.e. for `disk`, `fs`, and the net layers).
@@ -117,6 +117,16 @@ macro_rules! __bindings_with {
             with [$($acc)*
                 "eo9:disk/types@0.1.0": eo9_guest::api::disk::types,
                 "eo9:disk/disk@0.1.0": eo9_guest::api::disk::disk,
+            ]
+            $($tail)*
+        );
+    };
+    (apis [gfx $($rest:ident)*] with [$($acc:tt)*] $($tail:tt)*) => {
+        $crate::__bindings_with!(
+            apis [$($rest)*]
+            with [$($acc)*
+                "eo9:gfx/types@0.1.0": eo9_guest::api::gfx::types,
+                "eo9:gfx/gfx@0.1.0": eo9_guest::api::gfx::gfx,
             ]
             $($tail)*
         );

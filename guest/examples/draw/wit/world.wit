@@ -1,0 +1,35 @@
+// draw — the pixel-output example: queries the framebuffer mode, draws the
+// deterministic test pattern, reads it back through the same API, and reports the
+// checksum — so one program verifies any gfx provider (the RAM stub, the virtio-gpu
+// driver, a real framebuffer) end to end.
+package eo9-examples:draw@0.1.0;
+
+/// Draws the deterministic test pattern and reports its FNV-1a-64 readback checksum.
+///
+///   draw                       one frame
+///   draw --frames 2            two frames (the second presents only the damage rect)
+///   draw --check oob-rect      probe: an out-of-bounds present must answer out-of-bounds
+///   draw --check short-buffer  probe: an undersized buffer must answer bad-buffer
+world draw {
+    import eo9:gfx/gfx@0.1.0;
+
+    variant program-success {
+        /// Drew `frames` frame(s) and read the result back; carries the FNV-1a-64
+        /// checksum of the final full-frame tightly packed xrgb8888 pixels.
+        presented(u64),
+        /// A `--check` probe got exactly the typed error it expected (named).
+        probed(string),
+    }
+
+    variant program-failure {
+        /// An argument value was rejected.
+        bad-arguments(string),
+        /// A gfx operation failed, carrying the API's own error.
+        gfx(string),
+        /// A `--check` probe got the wrong answer.
+        unexpected(string),
+    }
+
+    export main: async func(frames: option<u32>, check: option<string>)
+        -> result<program-success, program-failure>;
+}
