@@ -22,6 +22,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-l2check",
     "eo9-example-l4check",
     "eo9-example-vnicheck",
+    "eo9-example-vnic4check",
     "eosh",
     // The service-boot program (executor v1, docs/design/executor-model.md).
     "init",

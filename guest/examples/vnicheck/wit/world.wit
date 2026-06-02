@@ -34,5 +34,10 @@ world vnicheck {
         io(string),
     }
 
-    export main: async func() -> result<program-success, program-failure>;
+    /// `mode`: `echo` runs the full delivery-policy suite against the `net.l2.echo`
+    /// fixture's probe behaviors; `arp` ARP-resolves the QEMU user-net gateway
+    /// (10.0.2.2) independently through both ports — the real-link sharing proof
+    /// over `net.virtio` on metal, where each reply must come back unicast to its
+    /// own port's virtual MAC.
+    export main: async func(mode: string) -> result<program-success, program-failure>;
 }

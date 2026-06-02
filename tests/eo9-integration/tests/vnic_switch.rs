@@ -16,7 +16,7 @@
 
 use eo9_component::{Component, compose, configure, rename};
 use eo9_integration::{guest, run};
-use eo9_runtime::{Outcome, Providers, SpawnError, SpawnLimits, Task};
+use eo9_runtime::{NamedArg, Outcome, Providers, SpawnError, SpawnLimits, Task};
 
 const COMPONENTS: &[&str] = &[
     "eo9-stub-net-l2-echo",
@@ -85,7 +85,11 @@ fn switching_policy_verified_over_two_ports() {
     guest::ensure_components(COMPONENTS);
     let stack = switched_stack(&guest::load_stub("net.l2.switch"));
 
-    let outcome = run::run_component(&stack, &[], Providers::none());
+    let outcome = run::run_component(
+        &stack,
+        &[NamedArg::new("mode", "\"echo\"")],
+        Providers::none(),
+    );
     match outcome {
         Outcome::Success(success) => {
             assert!(
@@ -112,7 +116,11 @@ fn a_configured_mac_base_derives_the_port_macs() {
     .expect("baking a syntactically-valid string succeeds");
     let stack = switched_stack(&configured);
 
-    let outcome = run::run_component(&stack, &[], Providers::none());
+    let outcome = run::run_component(
+        &stack,
+        &[NamedArg::new("mode", "\"echo\"")],
+        Providers::none(),
+    );
     match outcome {
         Outcome::Success(success) => {
             assert!(
@@ -140,8 +148,13 @@ fn a_bad_mac_base_is_a_typed_refusal_not_a_trap() {
             .expect("baking a syntactically-valid string succeeds");
         let stack = switched_stack(&configured);
         let image = run::compile_component(&stack);
-        let err = Task::spawn(&image, &[], SpawnLimits::default(), Providers::none())
-            .expect_err("a bad MAC base must refuse the spawn");
+        let err = Task::spawn(
+            &image,
+            &[NamedArg::new("mode", "\"echo\"")],
+            SpawnLimits::default(),
+            Providers::none(),
+        )
+        .expect_err("a bad MAC base must refuse the spawn");
         match err {
             SpawnError::ConfigurationRefused(reason) => assert!(
                 reason.contains(expected),

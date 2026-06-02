@@ -1,0 +1,41 @@
+// vnic4check — two whole TCP/IP stacks over one switched link: imports two
+// `eo9:net/l4` capabilities under the named slots `left` and `right` (each a
+// `net.l4.over-l2` middleware riding its own virtual NIC on one `net.l2.switch`)
+// and completes an independent UDP round-trip on each. Composed as
+//
+//   <upstream l2> $ rename port-a link-a $ rename port-b link-b $ net.l2.switch
+//     $ (left stack, link-a)  $ (right stack, link-b)  $ vnic4check
+//
+// with the upstream `net.l2.echo` in tests (mode `echo`) or the real NIC driver
+// `net.virtio` on metal (mode `dns`, against the QEMU user-net resolver).
+package eo9-examples:vnic4check@0.1.0;
+
+/// Completes one UDP round-trip per transport stack and reports both.
+world vnic4check {
+    import left: eo9:net/l4@0.1.0;
+    import right: eo9:net/l4@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    variant program-success {
+        /// Both stacks completed their round-trip; carries `left=<…> right=<…>`.
+        verified(string),
+    }
+
+    variant program-failure {
+        /// A transport capability refused an operation.
+        denied,
+        /// A transport operation failed, carrying the l4 API's own error.
+        net(string),
+        /// A round-trip completed but the reply was not what the mode expects.
+        check(string),
+        /// A console error.
+        io(string),
+    }
+
+    /// `peer`/`peer-port`: the UDP destination (dotted-quad). `mode`: `echo` (the
+    /// reply must carry the sent payload back — the net.l2.echo fixture) or `dns`
+    /// (send a DNS query for example.com and accept any well-formed answer — the
+    /// QEMU user-net resolver on metal).
+    export main: async func(peer: string, peer-port: u16, mode: string)
+        -> result<program-success, program-failure>;
+}

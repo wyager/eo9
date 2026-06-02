@@ -174,8 +174,43 @@ fn net_failure(slot: &str, rendered: String, _err: &impl core::fmt::Debug) -> Pr
 port_driver!(link_a, open_a, send_a, recv_a, expect_empty_a);
 port_driver!(link_b, open_b, send_b, recv_b, expect_empty_b);
 
+/// The gateway QEMU user-mode networking answers ARP for, and the per-port sender
+/// IPs the `arp` mode claims (distinct, so the two exchanges are fully independent).
+const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+const SENDER_IP_A: [u8; 4] = [10, 0, 2, 15];
+const SENDER_IP_B: [u8; 4] = [10, 0, 2, 16];
+
+/// An ARP request for the gateway, broadcast from `mac` claiming `sender_ip`.
+fn arp_request(mac: [u8; 6], sender_ip: [u8; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(42);
+    out.extend_from_slice(&[0xff; 6]); // destination: broadcast
+    out.extend_from_slice(&mac); // source
+    out.extend_from_slice(&[0x08, 0x06]); // ethertype: ARP
+    out.extend_from_slice(&[0x00, 0x01]); // htype: Ethernet
+    out.extend_from_slice(&[0x08, 0x00]); // ptype: IPv4
+    out.extend_from_slice(&[0x06, 0x04]); // hlen, plen
+    out.extend_from_slice(&[0x00, 0x01]); // oper: request
+    out.extend_from_slice(&mac); // sender hardware address
+    out.extend_from_slice(&sender_ip); // sender protocol address
+    out.extend_from_slice(&[0x00; 6]); // target hardware address: unknown
+    out.extend_from_slice(&GATEWAY_IP); // target protocol address
+    out
+}
+
+/// If `received` is an ARP reply for the gateway, the gateway's MAC.
+fn arp_reply_mac(received: &Received) -> Option<[u8; 6]> {
+    if received.ethertype != 0x0806 || received.payload.len() < 28 {
+        return None;
+    }
+    let arp = &received.payload;
+    if arp[6..8] != [0x00, 0x02] || arp[14..18] != GATEWAY_IP {
+        return None; // not a reply, or not from the gateway
+    }
+    Some(arp[8..14].try_into().expect("six bytes"))
+}
+
 eo9_guest::main! {
-    async fn main() -> Result<ProgramSuccess, ProgramFailure> {
+    async fn main(mode: String) -> Result<ProgramSuccess, ProgramFailure> {
         // --- the ports and their MACs -------------------------------------------------
         let (iface_a, info_a) = open_a().await?;
         let (iface_b, info_b) = open_b().await?;
@@ -195,6 +230,62 @@ eo9_guest::main! {
                     mac_text((mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]))
                 )));
             }
+        }
+
+        if mode == "arp" {
+            // --- the real-link sharing proof: ARP-resolve the gateway through both
+            // ports independently; each reply must come back unicast to its own
+            // port's virtual MAC (the demux at work on a real link).
+            send_a(&iface_a, &arp_request(mac_a, SENDER_IP_A)).await?;
+            let mut gw_a: Option<([u8; 6], [u8; 6])> = None;
+            for _ in 0..POLL_ATTEMPTS {
+                if let Some(received) = recv_a(&iface_a).await? {
+                    if let Some(gw) = arp_reply_mac(&received) {
+                        gw_a = Some((gw, received.dst));
+                        break;
+                    }
+                }
+            }
+            let (gw_a, dst_a) = gw_a.ok_or_else(|| {
+                ProgramFailure::Check(String::from("link-a: no ARP reply from the gateway"))
+            })?;
+            if dst_a != mac_a {
+                return Err(ProgramFailure::Check(format!(
+                    "link-a: the gateway's reply was addressed to {}, not port A's virtual MAC",
+                    mac_text((dst_a[0], dst_a[1], dst_a[2], dst_a[3], dst_a[4], dst_a[5]))
+                )));
+            }
+
+            send_b(&iface_b, &arp_request(mac_b, SENDER_IP_B)).await?;
+            let mut gw_b: Option<([u8; 6], [u8; 6])> = None;
+            for _ in 0..POLL_ATTEMPTS {
+                if let Some(received) = recv_b(&iface_b).await? {
+                    if let Some(gw) = arp_reply_mac(&received) {
+                        gw_b = Some((gw, received.dst));
+                        break;
+                    }
+                }
+            }
+            let (gw_b, dst_b) = gw_b.ok_or_else(|| {
+                ProgramFailure::Check(String::from("link-b: no ARP reply from the gateway"))
+            })?;
+            if dst_b != mac_b {
+                return Err(ProgramFailure::Check(format!(
+                    "link-b: the gateway's reply was addressed to {}, not port B's virtual MAC",
+                    mac_text((dst_b[0], dst_b[1], dst_b[2], dst_b[3], dst_b[4], dst_b[5]))
+                )));
+            }
+
+            return Ok(ProgramSuccess::Verified(format!(
+                "mac-a={} gw-a={} mac-b={} gw-b={}",
+                mac_text(info_a.mac),
+                mac_text((gw_a[0], gw_a[1], gw_a[2], gw_a[3], gw_a[4], gw_a[5])),
+                mac_text(info_b.mac),
+                mac_text((gw_b[0], gw_b[1], gw_b[2], gw_b[3], gw_b[4], gw_b[5])),
+            )));
+        }
+        if mode != "echo" {
+            return Err(ProgramFailure::Check(format!("unknown mode {mode:?}")));
         }
 
         // --- 1. unicast reflect: source rewrite + delivery to A alone ------------------
