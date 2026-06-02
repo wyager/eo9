@@ -1240,3 +1240,283 @@ pub fn impure_admit_policy() -> Component {
 "#;
     build_component(IMPURE_POLICY_WIT, &["pci", "entropy"], "impure-admit", CORE)
 }
+
+// -----------------------------------------------------------------------------------------
+// The eager-guest fixtures (docs/spikes/eager-guest-forwarding.md)
+// -----------------------------------------------------------------------------------------
+//
+// A three-component chain — guest leaf <- forwarding relay <- single-poll consumer — that
+// reproduces and then resolves the eager-guest-calls-guest suspension at the canonical-ABI
+// level, with every lift/lower combination spelled out by hand. The consumer plays the
+// role of an eager middleware-as-caller (the `eager()` single-poll convention: one
+// async-lowered call, one poll, `RETURNED` required); the relay plays the middleware-as-
+// callee (it forwards to the leaf, so its body performs a nested import call); the leaf is
+// a trivial guest `eo9:time` provider whose operations complete in their own activation.
+//
+// The consumer's outcome encodes what it observed: `code * 1000 + value`, where `code` is
+// the canonical-ABI subtask status its single poll saw (0 = STARTING, 1 = STARTED,
+// 2 = RETURNED) and `value` is the relay's reported result when (and only when) the call
+// completed eagerly. The relay's own report is the status *it* observed from the leaf, or
+// 7 for the sync-lowered (block-until-done) import flavor.
+
+/// The fixture vocabulary: one async function whose result is observable.
+const EAGER_WIT: &str = r#"
+package eo9-tests:eager@0.1.0;
+
+/// A capability with a single async operation that reports a number.
+interface probe {
+    /// What did the relay observe from its own downstream call?
+    run: async func() -> u32;
+}
+
+/// The single-poll consumer: the eager middleware-as-caller, as a binary. `main` is
+/// async-typed (the SDK convention for binaries) because the validator only permits the
+/// `async` canonical option on async-typed functions; the sync-lower consumer flavor
+/// sync-lifts this same async type (the allowed direction).
+world eager-consumer {
+    import probe;
+    export main: async func() -> result<u32, string>;
+}
+
+/// The forwarding relay: imports the real time API, exports `probe`.
+world time-relay {
+    import eo9:time/types@0.1.0;
+    import eo9:time/time@0.1.0;
+    export probe;
+}
+
+/// The guest leaf: a self-contained provider of the real time API.
+world time-leaf {
+    export eo9:time/types@0.1.0;
+    export eo9:time/time@0.1.0;
+}
+"#;
+
+/// The leaf's shared sync-surface imports (every import must precede functions in WAT).
+const LEAF_IMPORTS: &str = r#"
+  (import "[export]eo9:time/types@0.1.0" "[resource-new]time-impl" (func $new (param i32) (result i32)))
+"#;
+
+/// The leaf's shared sync surface: handle minting, the three sync time functions.
+const LEAF_SYNC_SURFACE: &str = r#"
+  (memory (export "memory") 1)
+  (func (export "eo9:time/types@0.1.0#[dtor]time-impl") (param i32))
+  (func (export "eo9:time/time@0.1.0#default") (result i32)
+    (call $new (i32.const 1)))
+  (func (export "eo9:time/time@0.1.0#now") (param i32) (result i32)
+    ;; datetime { seconds: s64 = 0, nanoseconds: u32 = 0 } at a fixed address
+    (i64.store (i32.const 32) (i64.const 0))
+    (i32.store (i32.const 40) (i32.const 0))
+    (i32.const 32))
+  (func (export "eo9:time/time@0.1.0#monotonic-now") (param i32) (result i64)
+    (i64.const 0))
+  (func (export "eo9:time/time@0.1.0#resolution") (param i32) (result i64)
+    (i64.const 1))
+"#;
+
+/// A guest `eo9:time` leaf whose `sleep` is **async-lifted** (callback ABI) with an
+/// eager body: it calls `task.return` and exits in its initial activation — the same
+/// shape every wit-bindgen-built provider stub has today.
+pub fn time_leaf_async() -> Component {
+    let core = format!(
+        r#"
+(module
+{LEAF_IMPORTS}
+  (import "[export]eo9:time/time@0.1.0" "[task-return]sleep" (func $task-return-sleep))
+{LEAF_SYNC_SURFACE}
+{BUMP_REALLOC}
+  (func (export "[async-lift]eo9:time/time@0.1.0#sleep") (param i32 i64) (result i32)
+    (call $task-return-sleep)
+    (i32.const 0)) ;; EXIT
+  (func (export "[callback][async-lift]eo9:time/time@0.1.0#sleep") (param i32 i32 i32) (result i32)
+    ;; the body exits eagerly, so the callback can never be invoked
+    unreachable))
+"#
+    );
+    build_component(EAGER_WIT, &["time"], "time-leaf", &core)
+}
+
+/// A guest `eo9:time` leaf whose `sleep` is **sync-lifted** while keeping its WIT-level
+/// `async` type — the candidate fix's callee-side declaration ("my implementation
+/// completes in its own activation").
+pub fn time_leaf_sync() -> Component {
+    let core = format!(
+        r#"
+(module
+{LEAF_IMPORTS}
+{LEAF_SYNC_SURFACE}
+{BUMP_REALLOC}
+  (func (export "eo9:time/time@0.1.0#sleep") (param i32 i64)))
+"#
+    );
+    build_component(EAGER_WIT, &["time"], "time-leaf", &core)
+}
+
+/// How the relay drives its `eo9:time/time.sleep` import.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayImport {
+    /// Async-lower + a single poll: the eager middleware convention. The relay reports
+    /// the status code its one poll observed (2 = the call completed eagerly).
+    EagerPoll,
+    /// Plain (sync) lower: block until the callee completes; reports 7.
+    SyncLower,
+}
+
+/// How the relay lifts its `probe.run` export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayExport {
+    /// Async lift with callback: today's wit-bindgen default for an `async func`.
+    AsyncLift,
+    /// Sync lift of the (still async-typed) function: the candidate fix.
+    SyncLift,
+}
+
+/// The forwarding relay: `run()` calls `default()` then `sleep(handle, 0)` through the
+/// chosen import flavor and reports what it observed (see [`RelayImport`]).
+pub fn time_relay(import: RelayImport, export: RelayExport) -> Component {
+    let import_imports = match import {
+        RelayImport::EagerPoll => {
+            r#"
+  (import "eo9:time/time@0.1.0" "[async-lower]sleep" (func $sleep-async (param i32 i64) (result i32)))
+  (import "$root" "[subtask-cancel]" (func $subtask-cancel (param i32) (result i32)))
+  (import "$root" "[subtask-drop]" (func $subtask-drop (param i32)))
+"#
+        }
+        RelayImport::SyncLower => {
+            r#"
+  (import "eo9:time/time@0.1.0" "sleep" (func $sleep-sync (param i32 i64)))
+"#
+        }
+    };
+    let import_funcs = match import {
+        RelayImport::EagerPoll => {
+            r#"
+  ;; observe(): one async-lowered call, one poll's worth of status.
+  (func $observe (result i32)
+    (local $packed i32)
+    (local $code i32)
+    (local.set $packed (call $sleep-async (call $default) (i64.const 0)))
+    (local.set $code (i32.and (local.get $packed) (i32.const 0xf)))
+    ;; if a live subtask handle came back, cancel and drop it so the task can exit
+    (if (i32.ne (i32.shr_u (local.get $packed) (i32.const 4)) (i32.const 0))
+      (then
+        (drop (call $subtask-cancel (i32.shr_u (local.get $packed) (i32.const 4))))
+        (call $subtask-drop (i32.shr_u (local.get $packed) (i32.const 4)))))
+    (local.get $code))
+"#
+        }
+        RelayImport::SyncLower => {
+            r#"
+  ;; observe(): a sync-lowered call blocks until the callee is done; report 7.
+  (func $observe (result i32)
+    (call $sleep-sync (call $default) (i64.const 0))
+    (i32.const 7))
+"#
+        }
+    };
+    let export_imports = match export {
+        RelayExport::AsyncLift => {
+            r#"
+  (import "[export]eo9-tests:eager/probe@0.1.0" "[task-return]run" (func $task-return-run (param i32)))
+"#
+        }
+        RelayExport::SyncLift => "",
+    };
+    let export_funcs = match export {
+        RelayExport::AsyncLift => {
+            r#"
+  (func (export "[async-lift]eo9-tests:eager/probe@0.1.0#run") (result i32)
+    (call $task-return-run (call $observe))
+    (i32.const 0)) ;; EXIT
+  (func (export "[callback][async-lift]eo9-tests:eager/probe@0.1.0#run") (param i32 i32 i32) (result i32)
+    unreachable))
+"#
+        }
+        RelayExport::SyncLift => {
+            r#"
+  (func (export "eo9-tests:eager/probe@0.1.0#run") (result i32)
+    (call $observe)))
+"#
+        }
+    };
+    let core = format!(
+        r#"
+(module
+  (import "eo9:time/time@0.1.0" "default" (func $default (result i32)))
+{import_imports}
+{export_imports}
+  (memory (export "memory") 1)
+{BUMP_REALLOC}
+{import_funcs}
+{export_funcs}
+"#
+    );
+    build_component(EAGER_WIT, &["time"], "time-relay", &core)
+}
+
+/// How the consumer calls `probe.run`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsumerCall {
+    /// Async-lower + a single poll (the eager middleware-as-caller). Outcome
+    /// `code * 1000 + value`; `value` is only read when `code == 2`.
+    EagerPoll,
+    /// Plain (sync) lower: block until done. Outcome `7000 + value`.
+    SyncLower,
+}
+
+/// The single-poll consumer binary (see [`ConsumerCall`]).
+pub fn eager_consumer(call: ConsumerCall) -> Component {
+    let core = match call {
+        ConsumerCall::EagerPoll => {
+            r#"
+(module
+  (import "eo9-tests:eager/probe@0.1.0" "[async-lower]run" (func $run-async (param i32) (result i32)))
+  (import "$root" "[subtask-cancel]" (func $subtask-cancel (param i32) (result i32)))
+  (import "$root" "[subtask-drop]" (func $subtask-drop (param i32)))
+  (import "[export]$root" "[task-return]main" (func $task-return-main (param i32 i32 i32)))
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 4096))
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+    (global.get $heap))
+  (func (export "[async-lift]main") (result i32)
+    (local $packed i32)
+    (local $code i32)
+    (local $outcome i32)
+    ;; one async-lowered call to run(), results written at address 64 when RETURNED
+    (local.set $packed (call $run-async (i32.const 64)))
+    (local.set $code (i32.and (local.get $packed) (i32.const 0xf)))
+    (local.set $outcome (i32.mul (local.get $code) (i32.const 1000)))
+    (if (i32.eq (local.get $code) (i32.const 2))
+      (then
+        (local.set $outcome (i32.add (local.get $outcome) (i32.load (i32.const 64)))))
+      (else
+        ;; a live subtask handle: cancel and drop it so the task can exit cleanly
+        (if (i32.ne (i32.shr_u (local.get $packed) (i32.const 4)) (i32.const 0))
+          (then
+            (drop (call $subtask-cancel (i32.shr_u (local.get $packed) (i32.const 4))))
+            (call $subtask-drop (i32.shr_u (local.get $packed) (i32.const 4)))))))
+    ;; main returns ok(outcome): result<u32, string> task-return takes (disc, a, b)
+    (call $task-return-main (i32.const 0) (local.get $outcome) (i32.const 0))
+    (i32.const 0)) ;; EXIT
+  (func (export "[callback][async-lift]main") (param i32 i32 i32) (result i32)
+    unreachable))
+"#
+        }
+        ConsumerCall::SyncLower => {
+            r#"
+(module
+  (import "eo9-tests:eager/probe@0.1.0" "run" (func $run-sync (result i32)))
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 4096))
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+    (global.get $heap))
+  (func (export "main") (result i32)
+    ;; ok(7000 + value) through the sync retptr convention
+    (i32.store8 (i32.const 96) (i32.const 0))
+    (i32.store (i32.const 100) (i32.add (i32.const 7000) (call $run-sync)))
+    (i32.const 96)))
+"#
+        }
+    };
+    build_component(EAGER_WIT, &["time"], "eager-consumer", core)
+}
