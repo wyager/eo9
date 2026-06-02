@@ -25,7 +25,7 @@ use std::string::String;
 use std::vec::Vec;
 
 use wasmtime::component::{
-    Accessor, ComponentType, Lift, Linker, LinkerInstance, Lower, Resource, ResourceType,
+    Accessor, ComponentType, Lift, Linker, LinkerInstance, Lower, Resource, ResourceType, Val,
 };
 use wasmtime::{Result, StoreContextMut};
 
@@ -228,6 +228,71 @@ pub fn add_providers(linker: &mut Linker<WebState>) -> Result<()> {
     add_text(linker)?;
     add_time(linker)?;
     add_entropy(linker)?;
+    add_svc_absent(linker)?;
+    Ok(())
+}
+
+/// Host representation of `eo9:svc/detach.detach-impl` (never minted in the browser).
+struct SvcDetachCap;
+/// Host representation of `eo9:svc/services.services-impl` (never minted in the browser).
+struct SvcServicesCap;
+
+/// `eo9:svc` — registered as **absent**: the page has no service registry (executor v1
+/// is usermode; a browser registry is a recorded follow-up — docs/design/executor-model.md).
+/// Mirrors the kernel's `add_svc_absent`: eosh imports both the `-optional` flavors (the
+/// honest am-I-granted signal it checks) and the full interfaces (to call when granted),
+/// so all four must be registered for eosh to instantiate at all. The optionals answer
+/// `none`; the operations are registered through the dynamic (`func_new`) API and refuse
+/// with a clear message if ever called — which a well-behaved client never does after
+/// seeing `none`.
+fn add_svc_absent(linker: &mut Linker<WebState>) -> Result<()> {
+    fn refuse(
+        _store: StoreContextMut<'_, WebState>,
+        _ty: wasmtime::component::types::ComponentFunc,
+        _params: &[Val],
+        _results: &mut [Val],
+    ) -> Result<()> {
+        Err(wasmtime::Error::msg(
+            "eo9:svc is not available in the browser: background services need a service \
+             registry (usermode `eo9 --svc` has one today)",
+        ))
+    }
+
+    fn answer_none(
+        _store: StoreContextMut<'_, WebState>,
+        _ty: wasmtime::component::types::ComponentFunc,
+        _params: &[Val],
+        results: &mut [Val],
+    ) -> Result<()> {
+        results[0] = Val::Option(None);
+        Ok(())
+    }
+
+    let mut detach = linker.instance("eo9:svc/detach@0.1.0")?;
+    detach.resource(
+        "detach-impl",
+        ResourceType::host::<SvcDetachCap>(),
+        |_, _| Ok(()),
+    )?;
+    detach.func_new("default", refuse)?;
+    detach.func_new("detach", refuse)?;
+
+    let mut detach_optional = linker.instance("eo9:svc/detach-optional@0.1.0")?;
+    detach_optional.func_new("default", answer_none)?;
+
+    let mut services = linker.instance("eo9:svc/services@0.1.0")?;
+    services.resource(
+        "services-impl",
+        ResourceType::host::<SvcServicesCap>(),
+        |_, _| Ok(()),
+    )?;
+    for operation in ["default", "list", "status", "log", "stop", "clear"] {
+        services.func_new(operation, refuse)?;
+    }
+
+    let mut services_optional = linker.instance("eo9:svc/services-optional@0.1.0")?;
+    services_optional.func_new("default", answer_none)?;
+
     Ok(())
 }
 
