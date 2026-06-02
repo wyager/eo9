@@ -285,6 +285,24 @@ switch lives host-side (a root provider, like the UART mux); in stage B it can b
 `l2.switchd` guest service itself, once cross-task channels exist. Programs cannot tell the
 difference — they import `l2` either way.
 
+*Status (2026-06-02, v3):* the switch shipped as ordinary **composed middleware** —
+`net.l2.switch`, two named ports (`port-a`/`port-b`, renamed onto consumers' slots), one
+upstream import, per-port locally-administered MACs, demux-by-destination isolation
+(plan/09 D30). Within one composition this is the whole (b) story with no host plumbing
+at all, verified on metal: `net.virtio $ rename port-a link-a $ rename port-b link-b $
+net.l2.switch $ vnicheck --mode arp` — one physical NIC, two virtual MACs on the wire.
+*Cross-service* sharing (two **detached services** riding one NIC) still needs stage A or
+B above, and an l4 stack riding a switch port additionally needs the nested
+guest-to-guest forwarding limit lifted (plan/09 D31 — the eager middleware sees the
+switch suspend). A boot config that shares one NIC across services would read:
+
+```text
+# /etc/init.cfg — per-service virtual NICs (needs stage A/B + plan/09 D31)
+nic    = pci.admit-vendor --allow "[{vendor-id: 6900, device-id: 4096}]" $ pci.filtered $ net.virtio $ l2.switchd
+sshd   = [vnic of nic] $ net.l4.over-l2 --address 10.0.2.15 … $ sshd
+webd   = [vnic of nic] $ net.l4.over-l2 --address 10.0.2.16 … $ webd
+```
+
 **(c) Most programs: L4 only, no link access at all.**
 
 ```text

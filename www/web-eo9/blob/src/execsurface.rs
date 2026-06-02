@@ -741,6 +741,9 @@ fn run_child_inner(
         Ok(Ok(Ok(value))) => Ok(value),
         Ok(Ok(Err(error))) | Ok(Err(error)) | Err(error) => Err(error),
     };
+    // The run is over: a final partial line (output without a trailing newline) still
+    // belongs on the page, ahead of the shell's outcome line.
+    store.data_mut().flush_partial_lines();
     match flattened {
         Ok(outcome) => Ok(val_to_outcome(&outcome)),
         Err(error) => Ok(ProgramOutcome::Abnormal(WitAbnormalExit::Trapped(
@@ -1186,6 +1189,8 @@ fn run_eosh(command: Option<String>) -> Result<()> {
             Ok(result[0].clone())
         }),
     )???;
+    // The session is over: flush any final partial line before the outcome banner.
+    store.data_mut().flush_partial_lines();
     crate::outf!("eosh: session outcome = {}", render_val(&outcome));
     Ok(())
 }

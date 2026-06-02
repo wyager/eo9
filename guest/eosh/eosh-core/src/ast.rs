@@ -87,6 +87,9 @@ pub enum Command {
     Run(Expr),
     /// `describe <expr>` — print kind, arguments, imports, and exports.
     Describe(Expr),
+    /// `describe <builtin-or-operator>` — print the shell word's own card
+    /// (`describe describe`, `describe $`, …). Carries the word as typed.
+    DescribeBuiltin(String),
     /// `imports <expr>` — print the residual imports.
     Imports(Expr),
     /// `env` — show the session's capability picture (what the shell holds, what

@@ -340,11 +340,57 @@ interface ports-config {
     configure: func(allow: list<u16>) -> result<_, string>;
 }
 
+/// Compose-time configuration entry for net.l2.switch: binds the locally-administered
+/// MAC base its virtual NICs derive from. `mac-base` is colon-separated hex
+/// (`"02:e0:09:00:00:00"`); it must have the locally-administered bit set and the
+/// multicast bit clear in its first octet, and a malformed or non-local base is a
+/// configure-time error, never a trap. Port MACs are `base + slot index + 1` in the
+/// last octet (wrapping). Unconfigured, the switch keeps its documented default base,
+/// `02:e0:09:00:00:00` — so `port-a` is `02:e0:09:00:00:01` and `port-b` is
+/// `02:e0:09:00:00:02`.
+interface l2-switch-config {
+    configure: func(mac-base: string) -> result<_, string>;
+}
+
 // --- stub worlds (one per standard stub provider) ------------------------------
 
 /// net.l2.none — absence: exports the optional flavor answering `none`.
 world l2-none {
     export l2-optional;
+}
+
+/// net.l2.switch — the virtual-NIC switch: imports ONE upstream link (`eo9:net/l2` —
+/// the physical NIC's driver, or another switch: it stacks) and exports two virtual
+/// NICs as the named ports `port-a` and `port-b`, each a full `eo9:net/l2` with its own
+/// locally-administered MAC and its own root-handle type (named exports mint per-port
+/// nominal types, so a consumer wired to one port cannot reach the other — see SPEC,
+/// "Multi-instance imports and type identity"). Frames a port sends are forwarded
+/// upstream with the port's virtual MAC as the Ethernet source; inbound frames are
+/// demuxed by destination MAC (broadcast/multicast to every port, a port's own unicast
+/// to that port alone, unknown unicast dropped — never flooded to siblings, so one
+/// consumer can never observe another's traffic). Wire it with renames:
+///
+///   net.virtio $ rename port-a link-a $ rename port-b link-b $ net.l2.switch
+///     $ (consumers whose l2 imports are named link-a / link-b)
+world l2-switch {
+    import l2;
+    export port-a: l2;
+    export port-b: l2;
+    export l2-switch-config;
+}
+
+/// net.l2.echo — the frame-reflector test fixture: a self-contained `eo9:net/l2` whose
+/// single interface answers every sent frame deterministically, so link-layer plumbing
+/// (the switch, drivers' consumers) is testable with no real network. Behaviors, by
+/// ethertype: an ARP request is answered with a proper ARP reply (the fixture owns
+/// every IP it is asked about); an IPv4/UDP datagram is echoed back with addresses and
+/// ports swapped (UDP checksum zeroed, IPv4 header checksum recomputed), so a whole
+/// TCP/IP stack above can complete a UDP round-trip; the test ethertype `0xb0b0`
+/// triggers a broadcast reply and `0xb0b1` a reply to a fixed unknown unicast MAC
+/// (delivery-policy probes); anything else is reflected with source and destination
+/// MACs swapped, the original Ethernet source echoed in the payload.
+world l2-echo {
+    export l2;
 }
 
 /// net.l2.deny — refusal: exports `l2` with every operation failing with `denied`.

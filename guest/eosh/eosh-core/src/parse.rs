@@ -240,6 +240,24 @@ impl Parser {
                 "poweroff" => return self.builtin_no_args(Command::Poweroff),
                 "describe" => {
                     self.next();
+                    // A single shell word — a builtin or an operator — gets its own card
+                    // instead of name resolution: `describe describe`, `describe $`,
+                    // `describe only`. Anything longer (or any non-shell word) is an
+                    // expression as before; parentheses force the expression path.
+                    if self.tokens.len() - self.pos == 1 {
+                        let word = match &self.tokens[self.pos] {
+                            Token::Word(word) => Some(word.clone()),
+                            Token::Dollar => Some(String::from("$")),
+                            Token::Amp => Some(String::from("&")),
+                            _ => None,
+                        };
+                        if let Some(word) = word
+                            && crate::builtins::builtin_doc(&word).is_some()
+                        {
+                            self.next();
+                            return Ok(Command::DescribeBuiltin(word));
+                        }
+                    }
                     return Ok(Command::Describe(self.expr()?));
                 }
                 "imports" => {

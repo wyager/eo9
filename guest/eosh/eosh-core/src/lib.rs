@@ -36,6 +36,7 @@ extern crate std;
 
 pub mod ast;
 pub mod backend;
+pub mod builtins;
 pub mod envinfo;
 pub mod eval;
 pub mod lex;

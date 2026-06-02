@@ -1,0 +1,15 @@
+[package]
+name = "eo9-stub-net-l2-echo"
+description = "Eo9 test-fixture provider `net.l2.echo`: a self-contained eo9:net/l2 whose single interface answers every sent frame deterministically (ARP replies, UDP echo, delivery-policy probe ethertypes), so link-layer plumbing is testable with no real network."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }
