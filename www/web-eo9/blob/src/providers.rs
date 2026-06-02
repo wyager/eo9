@@ -106,6 +106,26 @@ impl WebState {
         }
     }
 
+    /// Flush buffered *partial* lines to the page. Reading input is the terminal's flush
+    /// point — exactly C stdio's contract — because a partial line written just before a
+    /// read is a prompt: eosh writes `eosh> ` with no newline and then calls `read-line`.
+    /// Without this flush the prompt sits in the buffer accumulating one `eosh> ` per
+    /// read until the shell's next complete line drags them all out glued together
+    /// ("eosh> eosh> eosh> ok: greeted" — the prompt-accumulation regression), and the
+    /// page attaches the visitor's typing to whatever line happened to render last.
+    /// Also called when a run ends, so a program whose final output lacks a trailing
+    /// newline still gets that text onto the page.
+    pub fn flush_partial_lines(&mut self) {
+        if !self.out_line.is_empty() {
+            let line = core::mem::take(&mut self.out_line);
+            host::write_out(&line);
+        }
+        if !self.err_line.is_empty() {
+            let line = core::mem::take(&mut self.err_line);
+            host::write_out(&std::format!("\u{1}{line}"));
+        }
+    }
+
     /// Record the guest's reported panic message (write-once: the first report wins).
     pub fn report_panic(&mut self, message: String) {
         if self.panic_message.is_some() {
@@ -330,12 +350,17 @@ fn add_text(linker: &mut Linker<WebState>) -> Result<()> {
     // One line from the page terminal's input box. The JSPI `Suspending` import parks the
     // whole blob until the visitor presses Enter (or signals end-of-input), then resumes it
     // with the line — the same contract the kernel's PL011 read-line future provides.
+    // Reading flushes buffered partial output first: the partial line written just before
+    // a read is the prompt, and it must be on the page before we park on the keyboard.
     text.func_wrap_concurrent(
         "read-line",
-        |_accessor: &Accessor<WebState>,
+        |accessor: &Accessor<WebState>,
          (_cap,): (Resource<TextCap>,)|
          -> ConcurrentFuture<'_, (core::result::Result<Option<String>, WitTextError>,)> {
-            Box::pin(async move { Ok((Ok(host::read_line(MAX_READ_LINE_BYTES)),)) })
+            Box::pin(async move {
+                accessor.with(|mut access| access.data_mut().flush_partial_lines());
+                Ok((Ok(host::read_line(MAX_READ_LINE_BYTES)),))
+            })
         },
     )?;
 

@@ -819,3 +819,24 @@ eosh-side fixes (help `&` example via `let`, the no-such-binding refusal, the di
 annotation). Assets rebuilt once: blob 8,911,977 B raw / 1,747,183 B brotli; only the blob and page
 files changed (every store `.cwasm` reproduced byte-identically); check-web-vm ok at 20 assets; all
 four harnesses pass (verify-eosh now 33 checks).
+
+## Decision 38 — read-line flushes the prompt: the accumulation regression and its rendering harness (2026-06-02)
+
+Branch `area/18-prompt-explain` (owner-reported: "each line accumulates more eosh prefixes" — the
+prompt was broken *again*, differently). Root cause: D37's line buffering emits only on a complete
+line, but the prompt is deliberately not one — eosh writes `eosh> ` with no newline and then calls
+`read-line`. The partial line sat in `WebState::out_line` accumulating one `eosh> ` per read (empty
+Enters, commands whose output went through a child's separate `WebState`) until the shell's next
+complete line dragged them all out glued together (`eosh> eosh> eosh> ok: greeted`), while `vm.js`
+attached the visitor's typing to whatever line happened to render last. The fix is the terminal
+contract C stdio has always had: **reading flushes** — `read-line` drains both partial-line buffers
+(stdout, then stderr with its marker) before parking on the keyboard, so the prompt is on the page
+exactly when typing arms; and a finished run (`run_eosh`, `run_child_inner`) flushes too, so a
+program whose final output lacks a trailing newline still lands. Why no harness caught it: every
+existing harness consumes `host_write` itself and never exercises `vm.js`'s one-line-per-write
+rendering contract. New `verify-render.mjs` closes that class: it runs the *actual* `vm.js` (node
+`runInThisContext`) against the real blob with a ~60-line DOM stand-in, drives the captured keydown
+handler like a visitor (empty Enters, hello, help, an unresolvable command, rapid entry, exit), and
+asserts on the rendered transcript: no line carries more than one `eosh>`, every prompt starts its
+line, the typed command freezes on the prompt line, outcomes are not glued to prompts, exactly one
+prompt line per read, no marker bytes, stderr keeps its error styling.
