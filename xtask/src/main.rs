@@ -2168,6 +2168,10 @@ fn ensure_storedisk_mac_key(root: &Path) -> Result<PathBuf, String> {
 /// `cargo xtask qemu aarch64 pci net`. A bare `gpu` argument attaches a virtio-gpu PCI
 /// function pinned at 640x480 plus a QMP control socket, so the `gpu.virtio` driver has
 /// a display to claim and `check-gpu` can screendump it — `cargo xtask qemu aarch64 pci gpu`.
+/// Adding the bare `display` argument (requires `gpu`) opens QEMU's framebuffer window
+/// instead of running headless, with the serial console multiplexed on stdio, so the
+/// scanout is visible while you type at the prompt — `cargo xtask qemu aarch64 pci gpu
+/// display`, then `gpu.virtio $ draw` (this is what `make gfx` runs).
 ///
 /// A bare `storedisk` argument attaches the *persistent* store-disk image and also stays on
 /// the kernel command line: the kernel claims that virtio-blk function for its own
@@ -2242,17 +2246,29 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
             ));
         }
     };
+    // The bare `display` argument opens QEMU's default framebuffer window (cocoa on
+    // macOS, gtk/sdl elsewhere) instead of running headless, with the serial console
+    // and monitor multiplexed on stdio so the eosh prompt stays in the terminal. It
+    // only makes sense with a display device, so it requires `gpu`.
+    let want_display = append.iter().any(|argument| argument == "display");
+    if want_display && !append.iter().any(|argument| argument == "gpu") {
+        return Err(
+            "`display` opens a framebuffer window and needs the virtio-gpu device — \
+             add the `gpu` argument (e.g. `cargo xtask qemu aarch64 pci gpu display`)"
+                .into(),
+        );
+    }
+    let console: &[&str] = if want_display {
+        &["-serial", "mon:stdio"]
+    } else {
+        &["-nographic"]
+    };
     let mut args: Vec<std::ffi::OsString> = machine
         .iter()
+        .chain(["-smp", "1", "-m", KERNEL_QEMU_MEMORY].iter())
+        .chain(console.iter())
+        .chain(["-kernel"].iter())
         .copied()
-        .chain([
-            "-smp",
-            "1",
-            "-m",
-            KERNEL_QEMU_MEMORY,
-            "-nographic",
-            "-kernel",
-        ])
         .map(Into::into)
         .collect();
     args.push(image.as_os_str().to_os_string());
@@ -2286,6 +2302,9 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         } else if argument == "iommu" {
             // EXPERIMENTAL: consumed above (machine-type selection); never reaches the
             // kernel command line.
+        } else if argument == "display" {
+            // Consumed above (console/window selection); never reaches the kernel
+            // command line.
         } else if argument == "storedisk" {
             attach_store_disk = true;
             cmdline.push(argument.clone());
