@@ -1174,9 +1174,15 @@ mod tests {
             "describe describe renders its own card: {out}"
         );
         // Nothing was resolved, evaluated, or compiled.
-        assert!(session.backend.log.is_empty(), "log: {:?}", session.backend.log);
+        assert!(
+            session.backend.log.is_empty(),
+            "log: {:?}",
+            session.backend.log
+        );
 
-        for word in ["help", "let", "save", "detach", "svc", "env", "imports", "exit", "only"] {
+        for word in [
+            "help", "let", "save", "detach", "svc", "env", "imports", "exit", "only",
+        ] {
             session.backend.out.clear();
             assert_eq!(
                 run(&mut session, &format!("describe {word}")),

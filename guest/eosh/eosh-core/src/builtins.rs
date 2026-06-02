@@ -55,7 +55,10 @@ pub const BUILTIN_DOCS: &[BuiltinDoc] = &[
             "imports, exports, and the wiring tree of a composition. For a shell word — a builtin or an",
             "operator, including `describe` itself — a card like this one.",
         ],
-        usage: &["describe <name, expr, builtin, or operator>", "e.g. describe entropy.seeded"],
+        usage: &[
+            "describe <name, expr, builtin, or operator>",
+            "e.g. describe entropy.seeded",
+        ],
         related: "imports, env, help",
     },
     BuiltinDoc {
@@ -94,7 +97,10 @@ pub const BUILTIN_DOCS: &[BuiltinDoc] = &[
             "value and bound, not run. Use the name anywhere an expression goes. Bindings live only in",
             "this session; `save` is the persistent form.",
         ],
-        usage: &["let <name> = <expr>", "e.g. let det = time.frozen & entropy.seeded --seed 7"],
+        usage: &[
+            "let <name> = <expr>",
+            "e.g. let det = time.frozen & entropy.seeded --seed 7",
+        ],
         related: "save, describe",
     },
     BuiltinDoc {
@@ -105,7 +111,10 @@ pub const BUILTIN_DOCS: &[BuiltinDoc] = &[
             "writable (a metal boot with the storedisk grant; refused on read-only stores). The saved",
             "program keeps exactly the capabilities the expression composed in.",
         ],
-        usage: &["save <name> = <expr>", "e.g. save frozen-hello = time.frozen --now-seconds 5 --monotonic-ns 0 $ hello"],
+        usage: &[
+            "save <name> = <expr>",
+            "e.g. save frozen-hello = time.frozen --now-seconds 5 --monotonic-ns 0 $ hello",
+        ],
         related: "let, describe",
     },
     BuiltinDoc {
@@ -131,7 +140,10 @@ pub const BUILTIN_DOCS: &[BuiltinDoc] = &[
             "restarts, last outcome; `svc log <name>` prints a service's captured output; `svc stop <name>`",
             "stops one (final: a stopped service never restarts); `svc clear <name>` drops a finished record.",
         ],
-        usage: &["svc [list | log <name> | stop <name> | clear <name>]", "e.g. svc list"],
+        usage: &[
+            "svc [list | log <name> | stop <name> | clear <name>]",
+            "e.g. svc list",
+        ],
         related: "detach",
     },
     BuiltinDoc {
@@ -154,7 +166,10 @@ pub const BUILTIN_DOCS: &[BuiltinDoc] = &[
             "right-associative, the rightmost term is what runs, and the whole chain is fused and compiled",
             "before it runs.",
         ],
-        usage: &["provider $ program", "e.g. entropy.seeded --seed 7 $ rng --count 2"],
+        usage: &[
+            "provider $ program",
+            "e.g. entropy.seeded --seed 7 $ rng --count 2",
+        ],
         related: "&, only, describe",
     },
     BuiltinDoc {
@@ -165,7 +180,10 @@ pub const BUILTIN_DOCS: &[BuiltinDoc] = &[
             "layers overriding earlier ones for the same interface. An environment is composed onto a",
             "program with `$` — the action law (x & y) $ c is exactly x $ y $ c.",
         ],
-        usage: &["base & layer", "e.g. time.frozen --now-seconds 0 --monotonic-ns 0 & entropy.seeded --seed 7"],
+        usage: &[
+            "base & layer",
+            "e.g. time.frozen --now-seconds 0 --monotonic-ns 0 & entropy.seeded --seed 7",
+        ],
         related: "$, let, describe",
     },
     BuiltinDoc {
@@ -177,7 +195,10 @@ pub const BUILTIN_DOCS: &[BuiltinDoc] = &[
             "are sealed absent. An entry naming a package (eo9:text) admits all its interfaces. Attenuation",
             "only narrows: an outer `only` can never widen an inner one.",
         ],
-        usage: &["only <iface,…> $ <expr>", "e.g. only eo9:text,eo9:time $ hello"],
+        usage: &[
+            "only <iface,…> $ <expr>",
+            "e.g. only eo9:text,eo9:time $ hello",
+        ],
         related: "$, env, describe",
     },
     BuiltinDoc {
@@ -188,7 +209,10 @@ pub const BUILTIN_DOCS: &[BuiltinDoc] = &[
             "`rename <from> <to> $ expr` rewires the slot before composition. Most compositions never",
             "need it; multi-instance consumers (two disks, two filesystems) do.",
         ],
-        usage: &["rename <from> <to> $ <expr>", "e.g. rename eo9:fs/fs upper $ fs.overlay"],
+        usage: &[
+            "rename <from> <to> $ <expr>",
+            "e.g. rename eo9:fs/fs upper $ fs.overlay",
+        ],
         related: "with, $, describe",
     },
     BuiltinDoc {
@@ -209,9 +233,7 @@ pub const BUILTIN_DOCS: &[BuiltinDoc] = &[
 
 /// Look a shell word up (exact match over names and aliases).
 pub fn builtin_doc(word: &str) -> Option<&'static BuiltinDoc> {
-    BUILTIN_DOCS
-        .iter()
-        .find(|doc| doc.names.contains(&word))
+    BUILTIN_DOCS.iter().find(|doc| doc.names.contains(&word))
 }
 
 /// Render a card in `describe`'s voice.
@@ -240,15 +262,16 @@ mod tests {
     /// `parse.rs`'s command match and the expression grammar — the point of this list is
     /// that adding a word THERE without a card HERE fails the test below.
     pub const SHELL_WORDS: &[&str] = &[
-        "help", "describe", "imports", "env", "history", "let", "save", "detach", "svc",
-        "exit", "quit", "$", "&", "only", "rename", "with", "compose", "extend",
+        "help", "describe", "imports", "env", "history", "let", "save", "detach", "svc", "exit",
+        "quit", "$", "&", "only", "rename", "with", "compose", "extend",
     ];
 
     #[test]
     fn every_builtin_and_operator_has_a_card() {
         for word in SHELL_WORDS {
-            let doc = builtin_doc(word)
-                .unwrap_or_else(|| panic!("`{word}` has no describe card — add one to BUILTIN_DOCS"));
+            let doc = builtin_doc(word).unwrap_or_else(|| {
+                panic!("`{word}` has no describe card — add one to BUILTIN_DOCS")
+            });
             let lines = render_builtin_doc(doc);
             assert!(
                 lines.first().is_some_and(|l| l.starts_with("kind: ")),
@@ -280,11 +303,7 @@ mod tests {
             .find(|l| l.starts_with("builtins:"))
             .expect("help has a `builtins:` line");
         for word in line.trim_start_matches("builtins:").split(',') {
-            let word = word
-                .trim()
-                .split([' ', '['])
-                .next()
-                .unwrap_or_default();
+            let word = word.trim().split([' ', '[']).next().unwrap_or_default();
             if word.is_empty() {
                 continue;
             }
