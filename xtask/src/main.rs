@@ -125,6 +125,13 @@ const MIN_NODE_MAJOR: u32 = 25;
 /// (`eo9-example-hello` → `hello`, `eo9-stub-entropy-seeded` → `entropy.seeded`).
 const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eosh", "eosh"),
+    // The boot supervisor and the standard restart policies (executor v2): the default
+    // boot runs init (config: console = eosh), and `detach … restart <policy>` at the
+    // metal prompt needs the policy components resolvable under /bin.
+    ("init", "init"),
+    ("eo9-stub-restart-never", "restart.never"),
+    ("eo9-stub-restart-always", "restart.always"),
+    ("eo9-stub-restart-backoff", "restart.backoff"),
     ("eo9-example-hello", "hello"),
     ("eo9-example-outcomes", "outcomes"),
     ("eo9-example-cruncher", "cruncher"),

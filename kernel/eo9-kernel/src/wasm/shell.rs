@@ -59,6 +59,112 @@ pub fn boot_to_eosh(entries: &'static [StoreEntry]) {
     }
 }
 
+/// Boot the service supervisor: run `init` (an ordinary store program with no private
+/// powers) as the root program, granted the svc capability (2 generations: itself and
+/// its console). init detaches the config's services and keeps the console running in
+/// the foreground; the kernel's drive loop pumps the console's children and the
+/// detached services side by side. When init's `main` returns — console exited with no
+/// services left, `console-restart = never`, or an explicit `poweroff` — whatever still
+/// runs is stopped (the registry's lifetime is the machine) and the caller powers off.
+pub fn boot_to_init(entries: &'static [StoreEntry], config: &str) {
+    crate::kprintln!(
+        "init: starting the boot supervisor from the baked-in store ({} programs under /bin)",
+        entries.len()
+    );
+    match run_init(entries, config) {
+        Ok(outcome) => crate::kprintln!("init: ended, outcome = {outcome}"),
+        Err(error) => crate::kprintln!("init: FAILED: {error:?}"),
+    }
+    super::svc::stop_all_and_report();
+}
+
+fn run_init(entries: &'static [StoreEntry], config: &str) -> Result<String, wasmtime::Error> {
+    let Some(init) = entries.iter().find(|entry| entry.name == "init") else {
+        // A store image from before init was baked in: keep the machine usable.
+        crate::kprintln!("init: not in the baked-in store; falling back to the plain console");
+        return run_eosh(entries);
+    };
+
+    shellexec::reset_children();
+    super::svc::reset_services();
+    // The root program is the *supervisor*, not the console: its wait on the console
+    // must never consume Ctrl-C — the interrupt key belongs to the console's foreground
+    // job (and stays a no-op at the bare prompt), exactly as on a direct-eosh boot.
+    shellexec::set_root_consumes_ctrl_c(false);
+
+    let engine = super::new_engine()?;
+
+    // SAFETY: the artifact comes from the store image produced by `cargo xtask
+    // build-kernel` with the same wasmtime version and engine configuration, embedded
+    // read-only in the kernel image.
+    let component = unsafe { Component::deserialize(&engine, init.artifact)? };
+
+    let mut linker: Linker<KernelState> = Linker::new(&engine);
+    providers::add_providers(&mut linker)?;
+    shellfs::add_buffers(&mut linker)?;
+    shellfs::add_fs(&mut linker)?;
+    shellexec::add_exec(&mut linker)?;
+
+    let manifest = session_manifest(entries);
+    let mut state = KernelState::new();
+    // The boot grant (owner ruling B): init holds svc, and so does its console (so the
+    // `svc` builtins work at the serial prompt); the console's children do not.
+    state.svc_generations = 2;
+    state.shell = Some(alloc::boxed::Box::new(ShellState {
+        fs: ShellFs::new(entries, manifest),
+        buffers: BufferTable::default(),
+        exec: ShellExec::default(),
+        engine: engine.clone(),
+    }));
+    let mut store = Store::new(&engine, state);
+    store.set_fuel(u64::MAX)?;
+
+    let instance = super::block_on(
+        "init instantiation",
+        linker.instantiate_async(&mut store, &component),
+    )??;
+
+    let main = instance
+        .get_func(&mut store, "main")
+        .ok_or_else(|| wasmtime::Error::msg("init does not export `main`"))?;
+
+    // init's single argument is the config text (the baked default or the demo config).
+    let params = [Val::String(alloc::string::ToString::to_string(config))];
+    let mut results = vec![Val::Bool(false)];
+
+    {
+        let call = main.call_async(&mut store, &params, &mut results);
+        let mut call = pin!(call);
+        let waker = Waker::from(Arc::new(LoopWaker));
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            match call.as_mut().poll(&mut cx) {
+                Poll::Ready(Ok(())) => break,
+                Poll::Ready(Err(err)) => return Err(err),
+                Poll::Pending => {
+                    // The same idle discipline as the plain console session: pump every
+                    // running child (the console and its foreground jobs) and every
+                    // detached service; idle the core only when nothing is runnable.
+                    let children = shellexec::drive_children();
+                    let services = super::svc::drive_services();
+                    let any_runnable = children.any_runnable || services.any_runnable;
+                    let any_running = children.any_running || services.any_running;
+                    if !any_runnable {
+                        super::idle_wait(any_running);
+                    } else {
+                        // The loop stays hot for a runnable child/service; wake any
+                        // input-parked future (the console's read-line) each pass so
+                        // the prompt stays responsive while something spins.
+                        super::wake_idle();
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(results.first().map(wave::render).unwrap_or_default())
+}
+
 /// The session manifest eosh's `env` builtin reads from `/session` (the `eo9-session 1`
 /// format from plan/10 D9 / plan/11 D12 — keep in sync with eosh-core's `envinfo`).
 /// Children read the same manifest through their own fs view (they inherit the full
@@ -226,6 +332,11 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
                     let any_running = children.any_running || services.any_running;
                     if !any_runnable {
                         super::idle_wait(any_running);
+                    } else {
+                        // The loop stays hot for a runnable child/service; wake any
+                        // input-parked future (the console's read-line) each pass so
+                        // the prompt stays responsive while something spins.
+                        super::wake_idle();
                     }
                 }
             }

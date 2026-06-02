@@ -319,7 +319,11 @@ pub(crate) fn register_idle_waker(waker: &Waker) {
 }
 
 /// Wake (and clear) the registered idle waker, so wasmtime re-polls the parked future.
-fn wake_idle() {
+/// Also called by the session drive loops on busy passes (a runnable child or service
+/// keeps the loop hot, skipping `idle_wait`): the console's `read-line` parks on this
+/// waker, and without the wake it would never be re-polled — a spinning service must
+/// not deafen the prompt.
+pub(crate) fn wake_idle() {
     IDLE_WAKER.lock();
     // SAFETY: exclusive while `locked` is held.
     let waker = unsafe { (*IDLE_WAKER.waker.get()).take() };

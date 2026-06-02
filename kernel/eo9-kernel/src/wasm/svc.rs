@@ -301,7 +301,6 @@ impl KService {
 static SERVICES: KLock<Vec<Option<KService>>> = KLock::new(Vec::new());
 
 /// Reset the registry (called once when the boot supervisor starts).
-#[allow(dead_code)] // wired up by the boot supervisor (the next commit)
 pub fn reset_services() {
     SERVICES.with(|services| services.clear());
 }
@@ -861,22 +860,8 @@ fn respawn(index: usize) {
     });
 }
 
-/// True when any service is still alive (running or waiting on a restart).
-#[allow(dead_code)] // wired up by the boot supervisor (the next commit)
-pub fn any_alive() -> bool {
-    SERVICES.with(|services| {
-        services.iter().any(|slot| {
-            matches!(
-                slot.as_ref().map(|s| &s.run),
-                Some(SRun::Running(_) | SRun::Polling | SRun::WaitingRestart { .. })
-            )
-        })
-    })
-}
-
 /// Stop everything still running and report it (the boot supervisor exited; the
 /// registry's lifetime — the machine — is ending).
-#[allow(dead_code)] // wired up by the boot supervisor (the next commit)
 pub fn stop_all_and_report() {
     let alive: Vec<String> = SERVICES.with(|services| {
         services

@@ -782,6 +782,14 @@ pub(super) fn bind_args(
                 vals.push(Val::List(Vec::new()));
                 continue;
             }
+            // An unsupplied `option<…>` parameter binds to `none` — usermode-runtime
+            // parity (its binder and the headless runner both do this), so a spawner
+            // that passes no arguments (init starting its console) works against
+            // option-typed signatures exactly as it does in usermode.
+            [] if matches!(ty, Type::Option(_)) => {
+                vals.push(Val::Option(None));
+                continue;
+            }
             [] => return Err(format!("missing argument `{name}`")),
             [arg] => *arg,
             _ => return Err(format!("argument `{name}` supplied more than once")),
