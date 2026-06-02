@@ -4,15 +4,28 @@
 //! Everything is copy-on-write: an operation writes new blocks for whatever it changes
 //! (data blocks, the file's indirect tree, and every directory from the file up to the
 //! root) and leaves all previously written blocks untouched. The new tree only becomes the
-//! filesystem when [`Eofs::commit`] writes a new uberblock; until then a crash or a remount
-//! simply falls back to the last committed root. See `FORMAT.md`.
+//! filesystem when [`AsyncEofs::commit`] writes a new uberblock; until then a crash or a
+//! remount simply falls back to the last committed root. See `FORMAT.md`.
+//!
+//! The engine has **one implementation with two boundaries**: the core
+//! ([`AsyncEofs`]) runs over an [`AsyncBlockDevice`] and awaits every device call, which is
+//! what the guest provider needs (its `eo9:disk` import genuinely waits — see SPEC,
+//! "Boundaries are honestly async"). The synchronous embedders — the kernel's storedisk
+//! cache, `mkfs`, the test suite — use the [`Eofs`] facade at the bottom of this module: a
+//! thin sync wrapper that adapts a [`BlockDevice`] via [`SyncDevice`] and drives each core
+//! future with a single poll. Over a sync device every core future is ready on its first
+//! poll (the only awaits in the core are device calls), so the facade is behaviorally
+//! identical to the pre-async engine. No CoW, Merkle, or transaction logic exists twice.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 
-use crate::device::BlockDevice;
+use crate::device::{AsyncBlockDevice, BlockDevice, SyncDevice, SyncReadRef, poll_now};
 use crate::error::FsError;
 use crate::format::{
     BLOCK_PTR_SIZE, BlockPtr, Codec, DATA_START, DirEntry, MAX_META_OBJECT_SIZE, MAX_NAME_LEN,
@@ -21,7 +34,7 @@ use crate::format::{
 };
 use crate::space::{Allocator, Extent};
 
-/// Options for [`Eofs::format`].
+/// Options for [`AsyncEofs::format`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatOptions {
     /// Filesystem (logical) block size in bytes: a power of two between 512 bytes and 1 MiB.
@@ -43,7 +56,7 @@ impl Default for FormatOptions {
     }
 }
 
-/// What [`Eofs::stat`] reports about a node.
+/// What [`AsyncEofs::stat`] reports about a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeStat {
     pub kind: NodeKind,
@@ -55,7 +68,7 @@ pub struct NodeStat {
     pub hash: [u8; 32],
 }
 
-/// One entry of [`Eofs::snapshot_list`].
+/// One entry of [`AsyncEofs::snapshot_list`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotInfo {
     pub name: String,
@@ -65,7 +78,7 @@ pub struct SnapshotInfo {
     pub root_hash: [u8; 32],
 }
 
-/// What [`Eofs::verify`] found while walking every reachable block.
+/// What [`AsyncEofs::verify`] found while walking every reachable block.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VerifyReport {
     /// Blocks read and checked against their pointers (data + indirect).
@@ -81,7 +94,7 @@ pub struct VerifyReport {
     pub snapshots: u64,
 }
 
-/// What [`Eofs::gc`] reclaimed.
+/// What [`AsyncEofs::gc`] reclaimed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GcReport {
     /// Bytes below the allocation frontier that no retained root references; they are now
@@ -96,13 +109,13 @@ pub struct GcReport {
 pub struct SpaceReport {
     /// First never-allocated byte.
     pub frontier: u64,
-    /// Bytes on the allocator's free list (populated by [`Eofs::gc`]).
+    /// Bytes on the allocator's free list (populated by [`AsyncEofs::gc`]).
     pub free_bytes: u64,
     /// Device capacity in bytes.
     pub device_size: u64,
 }
 
-/// What [`Eofs::mount_with_report`] observed while electing the uberblock.
+/// What [`AsyncEofs::mount_with_report`] observed while electing the uberblock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MountReport {
     /// The transaction the mount adopted.
@@ -158,9 +171,8 @@ const PROBE_WHOLE_DEVICE_BELOW: u64 = 2 * 1024 * 1024;
 /// Inspect a device without mounting (or changing) anything: is there an eofs filesystem
 /// here, a blank device, foreign data, or unmountable eofs remains?
 ///
-/// This is the decision function behind every "format on first use" convenience in Eo9:
-/// only [`ImageState::Blank`] devices are ever formatted implicitly.
-pub fn probe<D: BlockDevice>(dev: &D) -> Result<ImageState, FsError> {
+/// This is the async-boundary form; synchronous embedders use [`probe`].
+pub async fn probe_async<D: AsyncBlockDevice>(dev: &D) -> Result<ImageState, FsError> {
     let device_size = dev.size();
     let mut best: Option<u64> = None;
     let mut any_invalid = false;
@@ -170,7 +182,7 @@ pub fn probe<D: BlockDevice>(dev: &D) -> Result<ImageState, FsError> {
             continue;
         }
         let mut slot = vec![0u8; SLOT_SIZE as usize];
-        dev.read_at(offset, &mut slot)?;
+        dev.read_at(offset, &mut slot).await?;
         match Uberblock::classify_slot(&slot) {
             Ok(SlotState::Valid(ub)) => {
                 any_magic = true;
@@ -219,7 +231,7 @@ pub fn probe<D: BlockDevice>(dev: &D) -> Result<ImageState, FsError> {
         let mut offset = start;
         while offset < end {
             let len = core::cmp::min(4096, end - offset) as usize;
-            dev.read_at(offset, &mut chunk[..len])?;
+            dev.read_at(offset, &mut chunk[..len]).await?;
             if chunk[..len].iter().any(|byte| *byte != 0) {
                 return Ok(ImageState::Foreign);
             }
@@ -229,8 +241,10 @@ pub fn probe<D: BlockDevice>(dev: &D) -> Result<ImageState, FsError> {
     Ok(ImageState::Blank)
 }
 
-/// A mounted eofs filesystem over a block device.
-pub struct Eofs<D: BlockDevice> {
+/// A mounted eofs filesystem over an asynchronous block device — the engine core.
+///
+/// Synchronous embedders use the [`Eofs`] facade instead.
+pub struct AsyncEofs<D: AsyncBlockDevice> {
     pub(crate) dev: D,
     pub(crate) block_size: u32,
     pub(crate) alloc_unit: u32,
@@ -249,9 +263,9 @@ pub struct Eofs<D: BlockDevice> {
     dirty: bool,
 }
 
-/// A read-only view of one snapshot.
-pub struct SnapshotView<'a, D: BlockDevice> {
-    fs: &'a Eofs<D>,
+/// A read-only view of one snapshot (async boundary).
+pub struct AsyncSnapshotView<'a, D: AsyncBlockDevice> {
+    fs: &'a AsyncEofs<D>,
     root: ObjRef,
 }
 
@@ -271,12 +285,12 @@ enum DirOp<'a> {
     },
 }
 
-impl<D: BlockDevice> Eofs<D> {
+impl<D: AsyncBlockDevice> AsyncEofs<D> {
     // --- format & mount ----------------------------------------------------------------
 
     /// Create a fresh filesystem on `dev` and mount it. The initial (empty) state is
     /// committed as transaction 1 before this returns.
-    pub fn format(dev: D, opts: &FormatOptions) -> Result<Eofs<D>, FsError> {
+    pub async fn format(dev: D, opts: &FormatOptions) -> Result<AsyncEofs<D>, FsError> {
         if !opts.block_size.is_power_of_two() || !(512..=1 << 20).contains(&opts.block_size) {
             return Err(FsError::InvalidConfig("block_size"));
         }
@@ -290,7 +304,7 @@ impl<D: BlockDevice> Eofs<D> {
         if device_size < DATA_START + 4 * opts.block_size as u64 {
             return Err(FsError::InvalidConfig("device too small"));
         }
-        let mut fs = Eofs {
+        let mut fs = AsyncEofs {
             dev,
             block_size: opts.block_size,
             alloc_unit: opts.alloc_unit,
@@ -311,22 +325,24 @@ impl<D: BlockDevice> Eofs<D> {
         };
         // Clear both uberblock slots so stale uberblocks from a previous filesystem can
         // never win the mount-time election.
-        fs.dev.write_at(0, &[0u8; (2 * SLOT_SIZE) as usize])?;
-        fs.commit()?;
+        fs.dev
+            .write_at(0, &[0u8; (2 * SLOT_SIZE) as usize])
+            .await?;
+        fs.commit().await?;
         Ok(fs)
     }
 
     /// Mount an existing filesystem: read both uberblock slots and adopt the valid one with
     /// the highest transaction number.
-    pub fn mount(dev: D) -> Result<Eofs<D>, FsError> {
-        Ok(Self::mount_with_report(dev)?.0)
+    pub async fn mount(dev: D) -> Result<AsyncEofs<D>, FsError> {
+        Ok(Self::mount_with_report(dev).await?.0)
     }
 
-    /// [`mount`](Eofs::mount), and also report what the uberblock election saw — in
+    /// [`mount`](AsyncEofs::mount), and also report what the uberblock election saw — in
     /// particular whether the mount had to fall back past a slot holding the *remains* of
     /// an uberblock, which can mean an acknowledged commit has been silently lost.
     /// Embedders that talk to a user should surface that loudly (study 07, S7-1).
-    pub fn mount_with_report(dev: D) -> Result<(Eofs<D>, MountReport), FsError> {
+    pub async fn mount_with_report(dev: D) -> Result<(AsyncEofs<D>, MountReport), FsError> {
         let device_size = dev.size();
         if device_size < DATA_START {
             return Err(FsError::Corrupt("device too small to hold an eofs image"));
@@ -336,7 +352,7 @@ impl<D: BlockDevice> Eofs<D> {
         let mut fell_back = false;
         for offset in SLOT_OFFSETS {
             let mut slot = vec![0u8; SLOT_SIZE as usize];
-            dev.read_at(offset, &mut slot)?;
+            dev.read_at(offset, &mut slot).await?;
             match Uberblock::classify_slot(&slot) {
                 Ok(SlotState::Valid(ub)) => {
                     if best.as_ref().is_none_or(|b| ub.txg > b.txg) {
@@ -371,7 +387,7 @@ impl<D: BlockDevice> Eofs<D> {
             fell_back_past_invalid_slot: fell_back,
         };
         Ok((
-            Eofs {
+            AsyncEofs {
                 dev,
                 block_size: ub.block_size,
                 alloc_unit: ub.alloc_unit,
@@ -430,12 +446,12 @@ impl<D: BlockDevice> Eofs<D> {
     /// Commit every change made since the last commit: flush the device, write the next
     /// uberblock into the slot the previous commit did *not* use, and flush again. Returns
     /// the new transaction number (or the current one if there was nothing to commit).
-    pub fn commit(&mut self) -> Result<u64, FsError> {
+    pub async fn commit(&mut self) -> Result<u64, FsError> {
         if !self.dirty {
             return Ok(self.committed_txg);
         }
         // Everything the new root references must be durable before the root flip.
-        self.dev.flush()?;
+        self.dev.flush().await?;
         let txg = self.committed_txg + 1;
         let ub = Uberblock {
             block_size: self.block_size,
@@ -448,8 +464,8 @@ impl<D: BlockDevice> Eofs<D> {
             snapshots: self.snapshots,
         };
         let slot = SLOT_OFFSETS[(txg % 2) as usize];
-        self.dev.write_at(slot, &ub.to_slot_bytes())?;
-        self.dev.flush()?;
+        self.dev.write_at(slot, &ub.to_slot_bytes()).await?;
+        self.dev.flush().await?;
         self.committed_txg = txg;
         self.committed_live_root = self.live_root;
         self.committed_snapshots = self.snapshots;
@@ -460,7 +476,7 @@ impl<D: BlockDevice> Eofs<D> {
     /// Discard every change made since the last commit: the pending state returns to the
     /// last committed transaction, exactly as a remount would see it. The blocks the
     /// discarded changes wrote are unreferenced afterwards and are reclaimed by the next
-    /// [`gc`](Eofs::gc).
+    /// [`gc`](AsyncEofs::gc).
     ///
     /// This is what lets an embedder make a multi-step change (say, a truncate followed by
     /// a write) atomic: apply the steps without committing, and if any step fails, roll
@@ -474,16 +490,16 @@ impl<D: BlockDevice> Eofs<D> {
     // --- namespace operations --------------------------------------------------------------
 
     /// Create an empty file.
-    pub fn create_file(&mut self, path: &str) -> Result<(), FsError> {
-        self.create_node(path, NodeKind::File)
+    pub async fn create_file(&mut self, path: &str) -> Result<(), FsError> {
+        self.create_node(path, NodeKind::File).await
     }
 
     /// Create an empty directory.
-    pub fn mkdir(&mut self, path: &str) -> Result<(), FsError> {
-        self.create_node(path, NodeKind::Directory)
+    pub async fn mkdir(&mut self, path: &str) -> Result<(), FsError> {
+        self.create_node(path, NodeKind::Directory).await
     }
 
-    fn create_node(&mut self, path: &str, kind: NodeKind) -> Result<(), FsError> {
+    async fn create_node(&mut self, path: &str, kind: NodeKind) -> Result<(), FsError> {
         let segments = split_path(path)?;
         let Some((name, parent)) = segments.split_last() else {
             return Err(FsError::InvalidPath);
@@ -495,61 +511,61 @@ impl<D: BlockDevice> Eofs<D> {
             kind,
             obj: ObjRef::EMPTY,
         };
-        self.live_root = self.apply_in_dir(&root, parent, &op)?;
+        self.live_root = self.apply_in_dir(&root, parent, &op).await?;
         self.dirty = true;
         Ok(())
     }
 
     /// Write `data` into a file at byte `offset`, growing it (zero-filling any gap) if the
     /// write reaches past the current end.
-    pub fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<(), FsError> {
+    pub async fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<(), FsError> {
         let segments = split_path(path)?;
         let Some((name, parent)) = segments.split_last() else {
             return Err(FsError::IsADirectory);
         };
         let name = *name;
         let root = self.live_root;
-        let (kind, obj) = self.resolve(&root, &segments)?;
+        let (kind, obj) = self.resolve(&root, &segments).await?;
         if kind != NodeKind::File {
             return Err(FsError::IsADirectory);
         }
-        let new_obj = self.write_object_range(&obj, offset, data)?;
+        let new_obj = self.write_object_range(&obj, offset, data).await?;
         let op = DirOp::Replace { name, obj: new_obj };
-        self.live_root = self.apply_in_dir(&root, parent, &op)?;
+        self.live_root = self.apply_in_dir(&root, parent, &op).await?;
         self.dirty = true;
         Ok(())
     }
 
     /// Read from a file at byte `offset` into `buf`; returns the number of bytes read
     /// (short only at end-of-file).
-    pub fn read(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        self.read_at_root(&self.live_root, path, offset, buf)
+    pub async fn read(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        self.read_at_root(&self.live_root, path, offset, buf).await
     }
 
     /// The entry names of a directory, in name order.
-    pub fn list(&self, path: &str) -> Result<Vec<String>, FsError> {
-        self.list_at_root(&self.live_root, path)
+    pub async fn list(&self, path: &str) -> Result<Vec<String>, FsError> {
+        self.list_at_root(&self.live_root, path).await
     }
 
     /// Kind, size, and Merkle root hash of a node.
-    pub fn stat(&self, path: &str) -> Result<NodeStat, FsError> {
-        self.stat_at_root(&self.live_root, path)
+    pub async fn stat(&self, path: &str) -> Result<NodeStat, FsError> {
+        self.stat_at_root(&self.live_root, path).await
     }
 
     /// Remove a file or an empty directory.
-    pub fn remove(&mut self, path: &str) -> Result<(), FsError> {
+    pub async fn remove(&mut self, path: &str) -> Result<(), FsError> {
         let segments = split_path(path)?;
         let Some((name, parent)) = segments.split_last() else {
             return Err(FsError::InvalidPath);
         };
         let name = *name;
         let root = self.live_root;
-        let (kind, obj) = self.resolve(&root, &segments)?;
+        let (kind, obj) = self.resolve(&root, &segments).await?;
         if kind == NodeKind::Directory && obj.size != 0 {
             return Err(FsError::DirectoryNotEmpty);
         }
         let op = DirOp::Remove { name };
-        self.live_root = self.apply_in_dir(&root, parent, &op)?;
+        self.live_root = self.apply_in_dir(&root, parent, &op).await?;
         self.dirty = true;
         Ok(())
     }
@@ -557,11 +573,11 @@ impl<D: BlockDevice> Eofs<D> {
     // --- snapshots -------------------------------------------------------------------------
 
     /// Retain the filesystem exactly as it is right now under `name`. Like every other
-    /// change, the snapshot becomes durable at the next [`commit`](Eofs::commit).
-    pub fn snapshot_create(&mut self, name: &str) -> Result<(), FsError> {
+    /// change, the snapshot becomes durable at the next [`commit`](AsyncEofs::commit).
+    pub async fn snapshot_create(&mut self, name: &str) -> Result<(), FsError> {
         check_name(name)?;
         let snapshots = self.snapshots;
-        let mut entries = parse_snapshots(&self.read_object(&snapshots)?)?;
+        let mut entries = parse_snapshots(&self.read_object(&snapshots).await?)?;
         if entries.iter().any(|entry| entry.name == name) {
             return Err(FsError::AlreadyExists);
         }
@@ -574,14 +590,14 @@ impl<D: BlockDevice> Eofs<D> {
         if bytes.len() as u64 > MAX_META_OBJECT_SIZE {
             return Err(FsError::NoSpace);
         }
-        self.snapshots = self.write_object(&bytes)?;
+        self.snapshots = self.write_object(&bytes).await?;
         self.dirty = true;
         Ok(())
     }
 
     /// All snapshots, in creation order.
-    pub fn snapshot_list(&self) -> Result<Vec<SnapshotInfo>, FsError> {
-        let entries = parse_snapshots(&self.read_object(&self.snapshots)?)?;
+    pub async fn snapshot_list(&self) -> Result<Vec<SnapshotInfo>, FsError> {
+        let entries = parse_snapshots(&self.read_object(&self.snapshots).await?)?;
         Ok(entries
             .into_iter()
             .map(|entry| SnapshotInfo {
@@ -593,13 +609,13 @@ impl<D: BlockDevice> Eofs<D> {
     }
 
     /// A read-only view of one snapshot.
-    pub fn snapshot(&self, name: &str) -> Result<SnapshotView<'_, D>, FsError> {
-        let entries = parse_snapshots(&self.read_object(&self.snapshots)?)?;
+    pub async fn snapshot(&self, name: &str) -> Result<AsyncSnapshotView<'_, D>, FsError> {
+        let entries = parse_snapshots(&self.read_object(&self.snapshots).await?)?;
         let entry = entries
             .into_iter()
             .find(|entry| entry.name == name)
             .ok_or(FsError::NotFound)?;
-        Ok(SnapshotView {
+        Ok(AsyncSnapshotView {
             fs: self,
             root: entry.root,
         })
@@ -609,14 +625,14 @@ impl<D: BlockDevice> Eofs<D> {
 
     /// Walk every reachable block — the live tree, the snapshot table, and every snapshot's
     /// tree — re-reading each one and checking it against the blake3 hash in its pointer.
-    pub fn verify(&self) -> Result<VerifyReport, FsError> {
+    pub async fn verify(&self) -> Result<VerifyReport, FsError> {
         let mut report = VerifyReport::default();
-        self.verify_dir_tree(&self.live_root, &mut report)?;
+        self.verify_dir_tree(&self.live_root, &mut report).await?;
         let snapshots = self.snapshots;
-        self.verify_object(&snapshots, &mut report)?;
-        for entry in parse_snapshots(&self.read_object(&snapshots)?)? {
+        self.verify_object(&snapshots, &mut report).await?;
+        for entry in parse_snapshots(&self.read_object(&snapshots).await?)? {
             report.snapshots += 1;
-            self.verify_dir_tree(&entry.root, &mut report)?;
+            self.verify_dir_tree(&entry.root, &mut report).await?;
         }
         Ok(report)
     }
@@ -625,7 +641,11 @@ impl<D: BlockDevice> Eofs<D> {
     /// image cannot exhaust the stack with a deep chain) and a visited set (so repeated or
     /// cyclic references to the same directory object terminate with an error instead of
     /// multiplying the walk).
-    fn verify_dir_tree(&self, root: &ObjRef, report: &mut VerifyReport) -> Result<(), FsError> {
+    async fn verify_dir_tree(
+        &self,
+        root: &ObjRef,
+        report: &mut VerifyReport,
+    ) -> Result<(), FsError> {
         let mut pending: Vec<ObjRef> = vec![*root];
         let mut visited: BTreeSet<u64> = BTreeSet::new();
         while let Some(dir) = pending.pop() {
@@ -633,13 +653,13 @@ impl<D: BlockDevice> Eofs<D> {
                 return Err(FsError::Corrupt("directory tree is not a tree"));
             }
             report.directories += 1;
-            self.verify_object(&dir, report)?;
-            for entry in parse_dir(&self.read_object(&dir)?)? {
+            self.verify_object(&dir, report).await?;
+            for entry in parse_dir(&self.read_object(&dir).await?)? {
                 check_name(&entry.name)?;
                 match entry.kind {
                     NodeKind::File => {
                         report.files += 1;
-                        self.verify_object(&entry.obj, report)?;
+                        self.verify_object(&entry.obj, report).await?;
                     }
                     NodeKind::Directory => pending.push(entry.obj),
                 }
@@ -648,12 +668,14 @@ impl<D: BlockDevice> Eofs<D> {
         Ok(())
     }
 
-    fn verify_object(&self, obj: &ObjRef, report: &mut VerifyReport) -> Result<(), FsError> {
+    async fn verify_object(&self, obj: &ObjRef, report: &mut VerifyReport) -> Result<(), FsError> {
         let leaf_count = self.check_object(obj)?;
         if leaf_count == 0 {
             return Ok(());
         }
-        let counted = self.verify_ptr(&obj.root, obj.level, obj.size, leaf_count, 0, report)?;
+        let counted = self
+            .verify_ptr(&obj.root, obj.level, obj.size, leaf_count, 0, report)
+            .await?;
         if counted != leaf_count {
             return Err(FsError::Corrupt("object data-block count mismatch"));
         }
@@ -664,52 +686,57 @@ impl<D: BlockDevice> Eofs<D> {
     /// number `first_leaf` of an object `obj_size` bytes long with `leaf_count` data blocks
     /// in total; returns how many data blocks it covers. The walk fails as soon as it finds
     /// more data blocks than the object's declared size allows, so an inflated tree cannot
-    /// drive unbounded work.
-    fn verify_ptr(
-        &self,
-        ptr: &BlockPtr,
+    /// drive unbounded work. (Boxed: async recursion bounded by the tree height, which
+    /// [`check_object`](Self::check_object) has already validated.)
+    fn verify_ptr<'a>(
+        &'a self,
+        ptr: &'a BlockPtr,
         level: u8,
         obj_size: u64,
         leaf_count: u64,
         first_leaf: u64,
-        report: &mut VerifyReport,
-    ) -> Result<u64, FsError> {
-        let logical = self.read_block(ptr)?;
-        report.blocks += 1;
-        report.logical_bytes += ptr.lsize as u64;
-        report.physical_bytes += self.alloc.aligned(ptr.psize as u64);
-        if ptr.codec == Codec::Lz4 {
-            report.compressed_blocks += 1;
-        }
-        if level == 0 {
-            if first_leaf >= leaf_count {
-                return Err(FsError::Corrupt(
-                    "object has more data blocks than its size",
-                ));
+        report: &'a mut VerifyReport,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, FsError>> + 'a>> {
+        Box::pin(async move {
+            let logical = self.read_block(ptr).await?;
+            report.blocks += 1;
+            report.logical_bytes += ptr.lsize as u64;
+            report.physical_bytes += self.alloc.aligned(ptr.psize as u64);
+            if ptr.codec == Codec::Lz4 {
+                report.compressed_blocks += 1;
             }
-            let bs = self.block_size as u64;
-            let expected = core::cmp::min(bs, obj_size - first_leaf * bs);
-            if ptr.lsize as u64 != expected {
-                return Err(FsError::Corrupt("data block size mismatch"));
+            if level == 0 {
+                if first_leaf >= leaf_count {
+                    return Err(FsError::Corrupt(
+                        "object has more data blocks than its size",
+                    ));
+                }
+                let bs = self.block_size as u64;
+                let expected = core::cmp::min(bs, obj_size - first_leaf * bs);
+                if ptr.lsize as u64 != expected {
+                    return Err(FsError::Corrupt("data block size mismatch"));
+                }
+                return Ok(1);
             }
-            return Ok(1);
-        }
-        if logical.is_empty() || logical.len() % BLOCK_PTR_SIZE != 0 {
-            return Err(FsError::Corrupt("malformed indirect block"));
-        }
-        let mut covered = 0u64;
-        for chunk in logical.chunks(BLOCK_PTR_SIZE) {
-            let child = BlockPtr::read_from(chunk)?;
-            covered += self.verify_ptr(
-                &child,
-                level - 1,
-                obj_size,
-                leaf_count,
-                first_leaf + covered,
-                report,
-            )?;
-        }
-        Ok(covered)
+            if logical.is_empty() || logical.len() % BLOCK_PTR_SIZE != 0 {
+                return Err(FsError::Corrupt("malformed indirect block"));
+            }
+            let mut covered = 0u64;
+            for chunk in logical.chunks(BLOCK_PTR_SIZE) {
+                let child = BlockPtr::read_from(chunk)?;
+                covered += self
+                    .verify_ptr(
+                        &child,
+                        level - 1,
+                        obj_size,
+                        leaf_count,
+                        first_leaf + covered,
+                        report,
+                    )
+                    .await?;
+            }
+            Ok(covered)
+        })
     }
 
     // --- garbage collection -----------------------------------------------------------------
@@ -718,17 +745,17 @@ impl<D: BlockDevice> Eofs<D> {
     /// root, the pending root, and every snapshot in both snapshot tables) and hand the
     /// gaps below the allocation frontier back to the allocator for reuse. The free list is
     /// not persisted; run `gc` again after a remount to rebuild it.
-    pub fn gc(&mut self) -> Result<GcReport, FsError> {
+    pub async fn gc(&mut self) -> Result<GcReport, FsError> {
         let mut marked: Vec<Extent> = Vec::new();
         let roots = [self.committed_live_root, self.live_root];
         for root in roots {
-            self.mark_dir_tree(&root, &mut marked)?;
+            self.mark_dir_tree(&root, &mut marked).await?;
         }
         let tables = [self.committed_snapshots, self.snapshots];
         for table in tables {
-            self.mark_object(&table, &mut marked)?;
-            for entry in parse_snapshots(&self.read_object(&table)?)? {
-                self.mark_dir_tree(&entry.root, &mut marked)?;
+            self.mark_object(&table, &mut marked).await?;
+            for entry in parse_snapshots(&self.read_object(&table).await?)? {
+                self.mark_dir_tree(&entry.root, &mut marked).await?;
             }
         }
         marked.sort_by_key(|extent| extent.addr);
@@ -762,17 +789,17 @@ impl<D: BlockDevice> Eofs<D> {
     /// Same walk discipline as [`verify_dir_tree`](Self::verify_dir_tree): an explicit
     /// worklist and a visited set, so GC over a corrupted image cannot recurse without
     /// bound or loop on a cyclic directory structure.
-    fn mark_dir_tree(&self, root: &ObjRef, out: &mut Vec<Extent>) -> Result<(), FsError> {
+    async fn mark_dir_tree(&self, root: &ObjRef, out: &mut Vec<Extent>) -> Result<(), FsError> {
         let mut pending: Vec<ObjRef> = vec![*root];
         let mut visited: BTreeSet<u64> = BTreeSet::new();
         while let Some(dir) = pending.pop() {
             if !dir.root.is_null() && !visited.insert(dir.root.addr) {
                 return Err(FsError::Corrupt("directory tree is not a tree"));
             }
-            self.mark_object(&dir, out)?;
-            for entry in parse_dir(&self.read_object(&dir)?)? {
+            self.mark_object(&dir, out).await?;
+            for entry in parse_dir(&self.read_object(&dir).await?)? {
                 match entry.kind {
-                    NodeKind::File => self.mark_object(&entry.obj, out)?,
+                    NodeKind::File => self.mark_object(&entry.obj, out).await?,
                     NodeKind::Directory => pending.push(entry.obj),
                 }
             }
@@ -780,58 +807,67 @@ impl<D: BlockDevice> Eofs<D> {
         Ok(())
     }
 
-    fn mark_object(&self, obj: &ObjRef, out: &mut Vec<Extent>) -> Result<(), FsError> {
+    async fn mark_object(&self, obj: &ObjRef, out: &mut Vec<Extent>) -> Result<(), FsError> {
         let leaf_count = self.check_object(obj)?;
         if leaf_count == 0 {
             return Ok(());
         }
         let mut leaves_seen = 0u64;
         self.mark_ptr(&obj.root, obj.level, leaf_count, &mut leaves_seen, out)
+            .await
     }
 
-    fn mark_ptr(
-        &self,
-        ptr: &BlockPtr,
+    /// (Boxed: async recursion bounded by the validated tree height.)
+    fn mark_ptr<'a>(
+        &'a self,
+        ptr: &'a BlockPtr,
         level: u8,
         leaf_count: u64,
-        leaves_seen: &mut u64,
-        out: &mut Vec<Extent>,
-    ) -> Result<(), FsError> {
-        out.push(Extent {
-            addr: ptr.addr,
-            len: self.alloc.aligned(ptr.psize as u64),
-        });
-        if level == 0 {
-            *leaves_seen += 1;
-            if *leaves_seen > leaf_count {
-                return Err(FsError::Corrupt(
-                    "object has more data blocks than its size",
-                ));
+        leaves_seen: &'a mut u64,
+        out: &'a mut Vec<Extent>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), FsError>> + 'a>> {
+        Box::pin(async move {
+            out.push(Extent {
+                addr: ptr.addr,
+                len: self.alloc.aligned(ptr.psize as u64),
+            });
+            if level == 0 {
+                *leaves_seen += 1;
+                if *leaves_seen > leaf_count {
+                    return Err(FsError::Corrupt(
+                        "object has more data blocks than its size",
+                    ));
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        let logical = self.read_block(ptr)?;
-        if logical.is_empty() || logical.len() % BLOCK_PTR_SIZE != 0 {
-            return Err(FsError::Corrupt("malformed indirect block"));
-        }
-        for chunk in logical.chunks(BLOCK_PTR_SIZE) {
-            let child = BlockPtr::read_from(chunk)?;
-            self.mark_ptr(&child, level - 1, leaf_count, leaves_seen, out)?;
-        }
-        Ok(())
+            let logical = self.read_block(ptr).await?;
+            if logical.is_empty() || logical.len() % BLOCK_PTR_SIZE != 0 {
+                return Err(FsError::Corrupt("malformed indirect block"));
+            }
+            for chunk in logical.chunks(BLOCK_PTR_SIZE) {
+                let child = BlockPtr::read_from(chunk)?;
+                self.mark_ptr(&child, level - 1, leaf_count, leaves_seen, out)
+                    .await?;
+            }
+            Ok(())
+        })
     }
 
     // --- shared internals ----------------------------------------------------------------
 
     /// Walk `segments` down from `root`; returns the kind and object of the final node.
-    fn resolve(&self, root: &ObjRef, segments: &[&str]) -> Result<(NodeKind, ObjRef), FsError> {
+    async fn resolve(
+        &self,
+        root: &ObjRef,
+        segments: &[&str],
+    ) -> Result<(NodeKind, ObjRef), FsError> {
         let mut kind = NodeKind::Directory;
         let mut obj = *root;
         for segment in segments {
             if kind != NodeKind::Directory {
                 return Err(FsError::NotADirectory);
             }
-            let entries = parse_dir(&self.read_object(&obj)?)?;
+            let entries = parse_dir(&self.read_object(&obj).await?)?;
             let entry = entries
                 .into_iter()
                 .find(|entry| entry.name == *segment)
@@ -844,60 +880,63 @@ impl<D: BlockDevice> Eofs<D> {
 
     /// Apply `op` inside the directory reached by walking `segments` down from `dir`, and
     /// return the new root of that walk: every directory along the path is rewritten
-    /// (copy-on-write), everything else is shared with the old tree.
-    fn apply_in_dir(
-        &mut self,
-        dir: &ObjRef,
-        segments: &[&str],
-        op: &DirOp<'_>,
-    ) -> Result<ObjRef, FsError> {
-        let mut entries = parse_dir(&self.read_object(dir)?)?;
-        if let Some((segment, rest)) = segments.split_first() {
-            let index = entries
-                .iter()
-                .position(|entry| entry.name == *segment)
-                .ok_or(FsError::NotFound)?;
-            if entries[index].kind != NodeKind::Directory {
-                return Err(FsError::NotADirectory);
-            }
-            let child = entries[index].obj;
-            entries[index].obj = self.apply_in_dir(&child, rest, op)?;
-        } else {
-            match op {
-                DirOp::Insert { name, kind, obj } => {
-                    if entries.iter().any(|entry| entry.name == *name) {
-                        return Err(FsError::AlreadyExists);
+    /// (copy-on-write), everything else is shared with the old tree. (Boxed: async
+    /// recursion bounded by the path depth.)
+    fn apply_in_dir<'a>(
+        &'a mut self,
+        dir: &'a ObjRef,
+        segments: &'a [&'a str],
+        op: &'a DirOp<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<ObjRef, FsError>> + 'a>> {
+        Box::pin(async move {
+            let mut entries = parse_dir(&self.read_object(dir).await?)?;
+            if let Some((segment, rest)) = segments.split_first() {
+                let index = entries
+                    .iter()
+                    .position(|entry| entry.name == *segment)
+                    .ok_or(FsError::NotFound)?;
+                if entries[index].kind != NodeKind::Directory {
+                    return Err(FsError::NotADirectory);
+                }
+                let child = entries[index].obj;
+                entries[index].obj = self.apply_in_dir(&child, rest, op).await?;
+            } else {
+                match op {
+                    DirOp::Insert { name, kind, obj } => {
+                        if entries.iter().any(|entry| entry.name == *name) {
+                            return Err(FsError::AlreadyExists);
+                        }
+                        entries.push(DirEntry {
+                            name: String::from(*name),
+                            kind: *kind,
+                            obj: *obj,
+                        });
                     }
-                    entries.push(DirEntry {
-                        name: String::from(*name),
-                        kind: *kind,
-                        obj: *obj,
-                    });
-                }
-                DirOp::Replace { name, obj } => {
-                    let entry = entries
-                        .iter_mut()
-                        .find(|entry| entry.name == *name)
-                        .ok_or(FsError::NotFound)?;
-                    entry.obj = *obj;
-                }
-                DirOp::Remove { name } => {
-                    let index = entries
-                        .iter()
-                        .position(|entry| entry.name == *name)
-                        .ok_or(FsError::NotFound)?;
-                    entries.remove(index);
+                    DirOp::Replace { name, obj } => {
+                        let entry = entries
+                            .iter_mut()
+                            .find(|entry| entry.name == *name)
+                            .ok_or(FsError::NotFound)?;
+                        entry.obj = *obj;
+                    }
+                    DirOp::Remove { name } => {
+                        let index = entries
+                            .iter()
+                            .position(|entry| entry.name == *name)
+                            .ok_or(FsError::NotFound)?;
+                        entries.remove(index);
+                    }
                 }
             }
-        }
-        let bytes = serialize_dir(&entries);
-        if bytes.len() as u64 > MAX_META_OBJECT_SIZE {
-            return Err(FsError::NoSpace);
-        }
-        self.write_object(&bytes)
+            let bytes = serialize_dir(&entries);
+            if bytes.len() as u64 > MAX_META_OBJECT_SIZE {
+                return Err(FsError::NoSpace);
+            }
+            self.write_object(&bytes).await
+        })
     }
 
-    fn read_at_root(
+    async fn read_at_root(
         &self,
         root: &ObjRef,
         path: &str,
@@ -905,26 +944,26 @@ impl<D: BlockDevice> Eofs<D> {
         buf: &mut [u8],
     ) -> Result<usize, FsError> {
         let segments = split_path(path)?;
-        let (kind, obj) = self.resolve(root, &segments)?;
+        let (kind, obj) = self.resolve(root, &segments).await?;
         if kind != NodeKind::File {
             return Err(FsError::IsADirectory);
         }
-        self.read_object_range(&obj, offset, buf)
+        self.read_object_range(&obj, offset, buf).await
     }
 
-    fn list_at_root(&self, root: &ObjRef, path: &str) -> Result<Vec<String>, FsError> {
+    async fn list_at_root(&self, root: &ObjRef, path: &str) -> Result<Vec<String>, FsError> {
         let segments = split_path(path)?;
-        let (kind, obj) = self.resolve(root, &segments)?;
+        let (kind, obj) = self.resolve(root, &segments).await?;
         if kind != NodeKind::Directory {
             return Err(FsError::NotADirectory);
         }
-        let entries = parse_dir(&self.read_object(&obj)?)?;
+        let entries = parse_dir(&self.read_object(&obj).await?)?;
         Ok(entries.into_iter().map(|entry| entry.name).collect())
     }
 
-    fn stat_at_root(&self, root: &ObjRef, path: &str) -> Result<NodeStat, FsError> {
+    async fn stat_at_root(&self, root: &ObjRef, path: &str) -> Result<NodeStat, FsError> {
         let segments = split_path(path)?;
-        let (kind, obj) = self.resolve(root, &segments)?;
+        let (kind, obj) = self.resolve(root, &segments).await?;
         Ok(NodeStat {
             kind,
             size: obj.size,
@@ -933,20 +972,20 @@ impl<D: BlockDevice> Eofs<D> {
     }
 }
 
-impl<D: BlockDevice> SnapshotView<'_, D> {
-    /// Read from a file in the snapshot; same contract as [`Eofs::read`].
-    pub fn read(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        self.fs.read_at_root(&self.root, path, offset, buf)
+impl<D: AsyncBlockDevice> AsyncSnapshotView<'_, D> {
+    /// Read from a file in the snapshot; same contract as [`AsyncEofs::read`].
+    pub async fn read(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        self.fs.read_at_root(&self.root, path, offset, buf).await
     }
 
     /// The entry names of a directory in the snapshot, in name order.
-    pub fn list(&self, path: &str) -> Result<Vec<String>, FsError> {
-        self.fs.list_at_root(&self.root, path)
+    pub async fn list(&self, path: &str) -> Result<Vec<String>, FsError> {
+        self.fs.list_at_root(&self.root, path).await
     }
 
     /// Kind, size, and Merkle root hash of a node in the snapshot.
-    pub fn stat(&self, path: &str) -> Result<NodeStat, FsError> {
-        self.fs.stat_at_root(&self.root, path)
+    pub async fn stat(&self, path: &str) -> Result<NodeStat, FsError> {
+        self.fs.stat_at_root(&self.root, path).await
     }
 }
 
@@ -976,4 +1015,172 @@ fn check_name(name: &str) -> Result<(), FsError> {
         return Err(FsError::InvalidPath);
     }
     Ok(())
+}
+
+// --- the synchronous facade ------------------------------------------------------------------
+//
+// One implementation, two boundaries: everything below is a thin wrapper that drives the
+// async core over a [`SyncDevice`] with single polls. Over a sync device the core's futures
+// are ready on their first poll (its only awaits are device calls), so these wrappers are
+// behaviorally identical to the engine before the async boundary existed — which is what
+// keeps the kernel's storedisk cache, `mkfs`, and the whole test suite working unchanged.
+
+/// Inspect a device without mounting (or changing) anything; the synchronous form of
+/// [`probe_async`] for sync embedders (the provider's auto-format decision, `mkfs`).
+pub fn probe<D: BlockDevice>(dev: &D) -> Result<ImageState, FsError> {
+    poll_now(probe_async(&SyncReadRef(dev)))
+}
+
+/// A mounted eofs filesystem over a synchronous block device.
+///
+/// This is the boundary the kernel's storedisk cache, `mkfs`, and the test suite use; the
+/// guest provider (whose disk genuinely waits) uses [`AsyncEofs`] directly.
+pub struct Eofs<D: BlockDevice> {
+    core: AsyncEofs<SyncDevice<D>>,
+}
+
+/// A read-only view of one snapshot (sync facade).
+pub struct SnapshotView<'a, D: BlockDevice> {
+    inner: AsyncSnapshotView<'a, SyncDevice<D>>,
+}
+
+impl<D: BlockDevice> Eofs<D> {
+    /// See [`AsyncEofs::format`].
+    pub fn format(dev: D, opts: &FormatOptions) -> Result<Eofs<D>, FsError> {
+        Ok(Eofs {
+            core: poll_now(AsyncEofs::format(SyncDevice(dev), opts))?,
+        })
+    }
+
+    /// See [`AsyncEofs::mount`].
+    pub fn mount(dev: D) -> Result<Eofs<D>, FsError> {
+        Ok(Eofs {
+            core: poll_now(AsyncEofs::mount(SyncDevice(dev)))?,
+        })
+    }
+
+    /// See [`AsyncEofs::mount_with_report`].
+    pub fn mount_with_report(dev: D) -> Result<(Eofs<D>, MountReport), FsError> {
+        let (core, report) = poll_now(AsyncEofs::mount_with_report(SyncDevice(dev)))?;
+        Ok((Eofs { core }, report))
+    }
+
+    /// See [`AsyncEofs::unmount`].
+    pub fn unmount(self) -> D {
+        self.core.unmount().into_inner()
+    }
+
+    /// See [`AsyncEofs::block_size`].
+    pub fn block_size(&self) -> u32 {
+        self.core.block_size()
+    }
+
+    /// See [`AsyncEofs::compression`].
+    pub fn compression(&self) -> bool {
+        self.core.compression()
+    }
+
+    /// See [`AsyncEofs::txg`].
+    pub fn txg(&self) -> u64 {
+        self.core.txg()
+    }
+
+    /// See [`AsyncEofs::is_dirty`].
+    pub fn is_dirty(&self) -> bool {
+        self.core.is_dirty()
+    }
+
+    /// See [`AsyncEofs::space`].
+    pub fn space(&self) -> SpaceReport {
+        self.core.space()
+    }
+
+    /// See [`AsyncEofs::commit`].
+    pub fn commit(&mut self) -> Result<u64, FsError> {
+        poll_now(self.core.commit())
+    }
+
+    /// See [`AsyncEofs::rollback`].
+    pub fn rollback(&mut self) {
+        self.core.rollback()
+    }
+
+    /// See [`AsyncEofs::create_file`].
+    pub fn create_file(&mut self, path: &str) -> Result<(), FsError> {
+        poll_now(self.core.create_file(path))
+    }
+
+    /// See [`AsyncEofs::mkdir`].
+    pub fn mkdir(&mut self, path: &str) -> Result<(), FsError> {
+        poll_now(self.core.mkdir(path))
+    }
+
+    /// See [`AsyncEofs::write`].
+    pub fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<(), FsError> {
+        poll_now(self.core.write(path, offset, data))
+    }
+
+    /// See [`AsyncEofs::read`].
+    pub fn read(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        poll_now(self.core.read(path, offset, buf))
+    }
+
+    /// See [`AsyncEofs::list`].
+    pub fn list(&self, path: &str) -> Result<Vec<String>, FsError> {
+        poll_now(self.core.list(path))
+    }
+
+    /// See [`AsyncEofs::stat`].
+    pub fn stat(&self, path: &str) -> Result<NodeStat, FsError> {
+        poll_now(self.core.stat(path))
+    }
+
+    /// See [`AsyncEofs::remove`].
+    pub fn remove(&mut self, path: &str) -> Result<(), FsError> {
+        poll_now(self.core.remove(path))
+    }
+
+    /// See [`AsyncEofs::snapshot_create`].
+    pub fn snapshot_create(&mut self, name: &str) -> Result<(), FsError> {
+        poll_now(self.core.snapshot_create(name))
+    }
+
+    /// See [`AsyncEofs::snapshot_list`].
+    pub fn snapshot_list(&self) -> Result<Vec<SnapshotInfo>, FsError> {
+        poll_now(self.core.snapshot_list())
+    }
+
+    /// See [`AsyncEofs::snapshot`].
+    pub fn snapshot(&self, name: &str) -> Result<SnapshotView<'_, D>, FsError> {
+        Ok(SnapshotView {
+            inner: poll_now(self.core.snapshot(name))?,
+        })
+    }
+
+    /// See [`AsyncEofs::verify`].
+    pub fn verify(&self) -> Result<VerifyReport, FsError> {
+        poll_now(self.core.verify())
+    }
+
+    /// See [`AsyncEofs::gc`].
+    pub fn gc(&mut self) -> Result<GcReport, FsError> {
+        poll_now(self.core.gc())
+    }
+}
+
+impl<D: BlockDevice> SnapshotView<'_, D> {
+    /// Read from a file in the snapshot; same contract as [`Eofs::read`].
+    pub fn read(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        poll_now(self.inner.read(path, offset, buf))
+    }
+
+    /// The entry names of a directory in the snapshot, in name order.
+    pub fn list(&self, path: &str) -> Result<Vec<String>, FsError> {
+        poll_now(self.inner.list(path))
+    }
+
+    /// Kind, size, and Merkle root hash of a node in the snapshot.
+    pub fn stat(&self, path: &str) -> Result<NodeStat, FsError> {
+        poll_now(self.inner.stat(path))
+    }
 }

@@ -70,10 +70,10 @@ mod fs;
 mod space;
 mod tree;
 
-pub use device::{BlockDevice, CutDevice, DeviceError, MemDevice};
+pub use device::{AsyncBlockDevice, BlockDevice, CutDevice, DeviceError, MemDevice, SyncDevice};
 pub use error::FsError;
 pub use format::{Codec, NodeKind, SlotState};
 pub use fs::{
-    Eofs, FormatOptions, GcReport, ImageState, MountReport, NodeStat, SnapshotInfo, SnapshotView,
-    SpaceReport, VerifyReport, probe,
+    AsyncEofs, AsyncSnapshotView, Eofs, FormatOptions, GcReport, ImageState, MountReport,
+    NodeStat, SnapshotInfo, SnapshotView, SpaceReport, VerifyReport, probe, probe_async,
 };
