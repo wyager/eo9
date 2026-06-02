@@ -389,3 +389,22 @@ usermode v1 is implemented:
   on its own machinery (policy compiled once at detach, instantiated per decision; the same soundness
   short-list; stop-is-final), boot runs init with the generation-counted grant, and `poweroff` flows up
   as eosh's typed `poweroff-requested` outcome — `exit` leaves the shell, `poweroff` halts the machine.
+* **The CM-async runtime paths the async-first conversion stands on are now exercised end-to-end**
+  (area/13-async-hardening; suites in tests/eo9-integration/tests/async_*.rs, findings in
+  docs/spikes/async-hardening.md). From the runtime's perspective: `Task::kill`/`kill_in_place` while a
+  guest chain is parked through N forwarding layers drops the store and every in-flight provider operation
+  cleanly (no panic, no leak, post-kill completions are quiet no-ops) — the GAPS "cancellation of an
+  in-flight forwarded call traps" caveat was binder-era and is refuted for both kill and guest
+  `subtask.cancel` (which cascades to `RETURN_CANCELLED` when callees acknowledge). The two genuine traps
+  are canonical-ABI contract violations and are pinned as such (cancel of a handle-less eager completion;
+  cancel after the terminal event was consumed: `Trap::SubtaskCancelAfterTerminal`). A callee that ignores
+  `CANCELLED` parks its canceller forever — quiet, fuel-immune; the SPEC bounded-await rule is the policy
+  answer and the conversion pass must verify generated bindings acknowledge cancellation.
+* **First-poll-inline is designed, not yet built** (docs/spikes/first-poll-inline.md): the queue decision is
+  the unconditional `push_high_priority(WorkItem::GuestCall(StartImplicit))` in vendored
+  `concurrent.rs:2557-2566`; the proposal runs callback-ABI callees inline on the caller's stack and falls
+  back to the queue when the activation returns `WAIT`/`YIELD` (suspension is a return value — no stack
+  capture), behind reentrance/backpressure/stack-depth gates, always-inline-when-legal for determinism,
+  feature-gated off-by-default and A/B'd against the hardening matrix (which must stay byte-identical) plus
+  the eager_guest suite (whose three "wall" rows flipping to RETURNED is the intended signal). Upstream's
+  own comment at concurrent.rs:2884-2896 invites exactly this with numbers.
