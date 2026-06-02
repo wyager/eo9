@@ -76,3 +76,15 @@ similar only if justified — ask).
    crate (keeps the crate and dev-deps at zero dependencies): scripted random workloads replay to identical
    traces under the deterministic policy, and fuel conservation holds under arbitrary operation sequences at
    both the ledger and scheduler level, with failed operations changing nothing.
+10. **The storage chain now parks on the executor (2026-06-02, `area/14-async-storage`; observation,
+    no scheduler-crate change).** Since the async-first conversion (SPEC "Boundaries are honestly
+    async", plan/14 D25, plan/09 D32), `fs.eofs` and `disk.virtio` genuinely await their imports, so
+    every metal storage operation through the filtered chain exercises queued guest-to-guest calls —
+    park, event delivery, resume — instead of completing inside a single activation. Two consequences
+    for this plan's territory: (a) the storage compositions are now *load* on the readiness machinery
+    (CompletionQueue/Doorbell edges and the resume-once invariant see real traffic on every disk op,
+    where before only net/vnic shapes parked); (b) waits remain bounded per layer — the driver's
+    interrupt-retry/poll-spin caps and the kernel's bounded `wait` — so a parked storage chain always
+    re-becomes runnable or fails typed; nothing parks open-endedly. The deep-chain
+    suspension/cancellation matrix (kill mid-await at depth, fan-out completion ordering) is the
+    `area/04-async-hardening` branch's charter, not this one's.
