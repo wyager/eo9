@@ -109,7 +109,7 @@ runInThisContext(readFileSync(join(here, "..", "site", "vm", "vm.js"), "utf8"), 
 // --- drive the keyboard ---------------------------------------------------------------------
 
 const transcriptLines = () => output.children.map((child) => child.textContent);
-const promptCount = () => transcriptLines().filter((line) => line.includes("eosh>")).length;
+const promptCount = () => transcriptLines().filter((line) => line.startsWith("eosh>")).length;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -204,10 +204,11 @@ check(
   `offenders: ${JSON.stringify(accumulated.slice(0, 3))}`,
 );
 
-// Prompts are their own lines: every eosh> sits at the start of its line.
+// Prompts are their own lines: every eosh> sits at the start of its line (the page's own
+// "·" status lines may mention the prompt by name).
 const misplaced = lines.filter((line) => {
   const at = line.indexOf("eosh>");
-  return at > 0;
+  return at > 0 && !line.startsWith("\u00b7 ");
 });
 check(
   "every eosh> prompt starts its line",
@@ -232,8 +233,9 @@ check(
   lines.some((line) => /Hello, world/.test(line) && !line.includes("eosh>")),
 );
 
-// One prompt per read: 1 banner prompt + 6 commands + the post-`exit` none = 7 prompt lines.
-const promptLines = lines.filter((line) => line.includes("eosh>"));
+// One prompt line per read: 7 commands were typed (2 empty, hello, help, nosuchprogram,
+// ls /bin, exit), so exactly 7 lines start with the prompt.
+const promptLines = lines.filter((line) => line.startsWith("eosh>"));
 check(
   "exactly one prompt line per command read",
   promptLines.length === 7,
