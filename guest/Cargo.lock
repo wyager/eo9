@@ -304,6 +304,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-example-vnicheck"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-guest"
 version = "0.0.0"
 dependencies = [
@@ -417,7 +425,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-stub-net-l2-echo"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-stub-net-l2-none"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-net-l2-switch"
 version = "0.0.0"
 dependencies = [
  "eo9-guest",

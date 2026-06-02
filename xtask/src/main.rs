@@ -21,6 +21,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-lspci",
     "eo9-example-l2check",
     "eo9-example-l4check",
+    "eo9-example-vnicheck",
     "eosh",
     // The service-boot program (executor v1, docs/design/executor-model.md).
     "init",
@@ -51,7 +52,9 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-fs-policy-subtree",
     "eo9-stub-fs-readonly",
     "eo9-stub-net-l2-deny",
+    "eo9-stub-net-l2-echo",
     "eo9-stub-net-l2-none",
+    "eo9-stub-net-l2-switch",
     "eo9-stub-net-l3-deny",
     "eo9-stub-net-l3-none",
     "eo9-stub-net-l4-deny",

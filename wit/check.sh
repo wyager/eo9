@@ -22,7 +22,9 @@ for pkg in $packages; do
     printf 'eo9:%s ... ' "$pkg"
     wasm-tools component wit "$pkg" > "$tmpdir/$pkg.wit"
     wasm-tools component wit "$pkg" --wasm --output "$tmpdir/$pkg.wasm"
-    wasm-tools validate --features cm-async "$tmpdir/$pkg.wasm"
+    # cm-implements: named interface exports (e.g. the l2 switch ports) encode with the
+    # implements relationship - the same feature set build-guest validates with.
+    wasm-tools validate --features cm-async,cm-implements "$tmpdir/$pkg.wasm"
     wasm-tools component wit "$tmpdir/$pkg.wasm" > "$tmpdir/$pkg.roundtrip.wit"
     printf 'ok\n'
 done
