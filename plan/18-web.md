@@ -840,3 +840,11 @@ handler like a visitor (empty Enters, hello, help, an unresolvable command, rapi
 asserts on the rendered transcript: no line carries more than one `eosh>`, every prompt starts its
 line, the typed command freezes on the prompt line, outcomes are not glued to prompts, exactly one
 prompt line per read, no marker bytes, stderr keeps its error styling.
+
+Addendum (same branch): this was the first `build-web-vm` after executor v1, so the rebuilt blob bakes
+the svc-aware eosh — which imports all four `eo9:svc` interfaces and could no longer instantiate against
+the page's linker. The blob now registers `eo9:svc` as **absent**, mirroring the kernel's
+`add_svc_absent` exactly (optionals answer `none`; operations registered via `func_new` refuse with a
+clear message naming usermode `eo9 --svc`): the `svc`/`detach` builtins refuse gracefully in the browser
+instead of failing instantiation. A real browser registry remains the recorded follow-up
+(docs/design/executor-model.md, staged plan).
