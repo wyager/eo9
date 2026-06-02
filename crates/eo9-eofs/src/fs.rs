@@ -325,9 +325,7 @@ impl<D: AsyncBlockDevice> AsyncEofs<D> {
         };
         // Clear both uberblock slots so stale uberblocks from a previous filesystem can
         // never win the mount-time election.
-        fs.dev
-            .write_at(0, &[0u8; (2 * SLOT_SIZE) as usize])
-            .await?;
+        fs.dev.write_at(0, &[0u8; (2 * SLOT_SIZE) as usize]).await?;
         fs.commit().await?;
         Ok(fs)
     }

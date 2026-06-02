@@ -74,6 +74,6 @@ pub use device::{AsyncBlockDevice, BlockDevice, CutDevice, DeviceError, MemDevic
 pub use error::FsError;
 pub use format::{Codec, NodeKind, SlotState};
 pub use fs::{
-    AsyncEofs, AsyncSnapshotView, Eofs, FormatOptions, GcReport, ImageState, MountReport,
-    NodeStat, SnapshotInfo, SnapshotView, SpaceReport, VerifyReport, probe, probe_async,
+    AsyncEofs, AsyncSnapshotView, Eofs, FormatOptions, GcReport, ImageState, MountReport, NodeStat,
+    SnapshotInfo, SnapshotView, SpaceReport, VerifyReport, probe, probe_async,
 };

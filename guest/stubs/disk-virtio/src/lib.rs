@@ -372,15 +372,18 @@ impl Driver {
         let ring = pci_call(
             "disk.virtio: alloc-dma (ring)",
             pci::alloc_dma(&device, RING_BYTES),
-        ).await?;
+        )
+        .await?;
         let request = pci_call(
             "disk.virtio: alloc-dma (request)",
             pci::alloc_dma(&device, REQ_BYTES),
-        ).await?;
+        )
+        .await?;
         let data = pci_call(
             "disk.virtio: alloc-dma (data)",
             pci::alloc_dma(&device, DATA_BYTES),
-        ).await?;
+        )
+        .await?;
 
         let mut driver = Driver {
             _device: device,
@@ -438,9 +441,14 @@ impl Driver {
     /// of bring-up, once the function is claimed and the DMA buffers exist.
     async fn start(&mut self, notify_multiplier: u32) -> Result<(), String> {
         // Reset, then ACKNOWLEDGE and DRIVER.
-        self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, 0).await?;
+        self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, 0)
+            .await?;
         let mut spins = 0u32;
-        while self.common_read(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte).await? != 0 {
+        while self
+            .common_read(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte)
+            .await?
+            != 0
+        {
             spins += 1;
             if spins > 1000 {
                 return Err(String::from("disk.virtio: device did not reset"));
@@ -450,44 +458,59 @@ impl Driver {
             COMMON_DEVICE_STATUS,
             pci::AccessWidth::Byte,
             STATUS_ACKNOWLEDGE,
-        ).await?;
+        )
+        .await?;
         self.common_write(
             COMMON_DEVICE_STATUS,
             pci::AccessWidth::Byte,
             STATUS_ACKNOWLEDGE | STATUS_DRIVER,
-        ).await?;
+        )
+        .await?;
 
         // Feature negotiation: accept exactly VIRTIO_F_VERSION_1, plus VIRTIO_BLK_F_FLUSH
         // when the device offers it (so `flush` can issue real cache flushes). The device
         // must offer VERSION_1 (it is what makes the modern register layout above valid
         // at all).
-        self.common_write(COMMON_DEVICE_FEATURE_SELECT, pci::AccessWidth::Dword, 1).await?;
-        let high_features = self.common_read(COMMON_DEVICE_FEATURE, pci::AccessWidth::Dword).await?;
+        self.common_write(COMMON_DEVICE_FEATURE_SELECT, pci::AccessWidth::Dword, 1)
+            .await?;
+        let high_features = self
+            .common_read(COMMON_DEVICE_FEATURE, pci::AccessWidth::Dword)
+            .await?;
         if high_features & FEATURE_VERSION_1_HIGH == 0 {
             return Err(String::from(
                 "disk.virtio: the device does not offer VIRTIO_F_VERSION_1 \
                  (is it a legacy-only function?)",
             ));
         }
-        self.common_write(COMMON_DEVICE_FEATURE_SELECT, pci::AccessWidth::Dword, 0).await?;
-        let low_features = self.common_read(COMMON_DEVICE_FEATURE, pci::AccessWidth::Dword).await?;
+        self.common_write(COMMON_DEVICE_FEATURE_SELECT, pci::AccessWidth::Dword, 0)
+            .await?;
+        let low_features = self
+            .common_read(COMMON_DEVICE_FEATURE, pci::AccessWidth::Dword)
+            .await?;
         self.flush_supported = low_features & FEATURE_BLK_FLUSH_LOW != 0;
         let low_accepted = low_features & FEATURE_BLK_FLUSH_LOW;
-        self.common_write(COMMON_DRIVER_FEATURE_SELECT, pci::AccessWidth::Dword, 0).await?;
-        self.common_write(COMMON_DRIVER_FEATURE, pci::AccessWidth::Dword, low_accepted).await?;
-        self.common_write(COMMON_DRIVER_FEATURE_SELECT, pci::AccessWidth::Dword, 1).await?;
+        self.common_write(COMMON_DRIVER_FEATURE_SELECT, pci::AccessWidth::Dword, 0)
+            .await?;
+        self.common_write(COMMON_DRIVER_FEATURE, pci::AccessWidth::Dword, low_accepted)
+            .await?;
+        self.common_write(COMMON_DRIVER_FEATURE_SELECT, pci::AccessWidth::Dword, 1)
+            .await?;
         self.common_write(
             COMMON_DRIVER_FEATURE,
             pci::AccessWidth::Dword,
             FEATURE_VERSION_1_HIGH,
-        ).await?;
+        )
+        .await?;
         let with_features_ok = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK;
         self.common_write(
             COMMON_DEVICE_STATUS,
             pci::AccessWidth::Byte,
             with_features_ok,
-        ).await?;
-        let status = self.common_read(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte).await?;
+        )
+        .await?;
+        let status = self
+            .common_read(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte)
+            .await?;
         if status & STATUS_FEATURES_OK == 0 {
             return Err(String::from(
                 "disk.virtio: the device rejected the negotiated feature set",
@@ -499,18 +522,24 @@ impl Driver {
         pci_call(
             "disk.virtio: set-bus-master",
             pci::set_bus_master(&self._device, true),
-        ).await?;
+        )
+        .await?;
 
         // Virtqueue 0: bound the size to QUEUE_SIZE, point the three rings at the ring
         // DMA page, remember the notify offset, and enable it.
-        let queues = self.common_read(COMMON_NUM_QUEUES, pci::AccessWidth::Word).await?;
+        let queues = self
+            .common_read(COMMON_NUM_QUEUES, pci::AccessWidth::Word)
+            .await?;
         if queues == 0 {
             return Err(String::from(
                 "disk.virtio: the device exposes no virtqueues",
             ));
         }
-        self.common_write(COMMON_QUEUE_SELECT, pci::AccessWidth::Word, 0).await?;
-        let max_size = self.common_read(COMMON_QUEUE_SIZE, pci::AccessWidth::Word).await?;
+        self.common_write(COMMON_QUEUE_SELECT, pci::AccessWidth::Word, 0)
+            .await?;
+        let max_size = self
+            .common_read(COMMON_QUEUE_SIZE, pci::AccessWidth::Word)
+            .await?;
         if max_size == 0 {
             return Err(String::from("disk.virtio: virtqueue 0 is not available"));
         }
@@ -519,25 +548,33 @@ impl Driver {
             COMMON_QUEUE_SIZE,
             pci::AccessWidth::Word,
             u64::from(queue_size),
-        ).await?;
+        )
+        .await?;
         // The driver owns ring initialization (virtio 1.0 §3.1.1): zero the descriptor
         // table and both rings so the device's first used-index write is the first
         // non-zero value the polling loop ever observes.
         pci::dma_write(&self.ring, 0, &[0u8; 1024]);
         let ring_address = pci::dma_address(&self.ring);
-        self.write_address(COMMON_QUEUE_DESC, ring_address + DESC_OFFSET).await?;
-        self.write_address(COMMON_QUEUE_DRIVER, ring_address + AVAIL_OFFSET).await?;
-        self.write_address(COMMON_QUEUE_DEVICE, ring_address + USED_OFFSET).await?;
-        let queue_notify_off = self.common_read(COMMON_QUEUE_NOTIFY_OFF, pci::AccessWidth::Word).await?;
+        self.write_address(COMMON_QUEUE_DESC, ring_address + DESC_OFFSET)
+            .await?;
+        self.write_address(COMMON_QUEUE_DRIVER, ring_address + AVAIL_OFFSET)
+            .await?;
+        self.write_address(COMMON_QUEUE_DEVICE, ring_address + USED_OFFSET)
+            .await?;
+        let queue_notify_off = self
+            .common_read(COMMON_QUEUE_NOTIFY_OFF, pci::AccessWidth::Word)
+            .await?;
         self.notify_offset = self.notify.offset + queue_notify_off * u64::from(notify_multiplier);
         // Avail ring starts empty: flags 0, idx 0 (the DMA buffer is zero-filled by the
         // provider, but make the driver's published state explicit).
         pci::dma_write(&self.ring, AVAIL_OFFSET, &[0, 0, 0, 0]);
-        self.common_write(COMMON_QUEUE_ENABLE, pci::AccessWidth::Word, 1).await?;
+        self.common_write(COMMON_QUEUE_ENABLE, pci::AccessWidth::Word, 1)
+            .await?;
 
         // Everything is in place: tell the device the driver is live.
         let live = with_features_ok | STATUS_DRIVER_OK;
-        self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, live).await?;
+        self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, live)
+            .await?;
 
         // Capacity (in 512-byte sectors) from the device configuration window. The
         // diagnostic line (probed capacity + completion mode) is printed by `bring_up` once
@@ -564,7 +601,8 @@ impl Driver {
         pci_call(
             "disk.virtio: common config read",
             pci::bar_read(bar, self.common.offset + register, width),
-        ).await
+        )
+        .await
     }
 
     async fn common_write(
@@ -577,7 +615,8 @@ impl Driver {
         pci_call(
             "disk.virtio: common config write",
             pci::bar_write(bar, self.common.offset + register, width, value),
-        ).await
+        )
+        .await
     }
 
     async fn device_read(&self, register: u64, width: pci::AccessWidth) -> Result<u64, String> {
@@ -585,12 +624,14 @@ impl Driver {
         pci_call(
             "disk.virtio: device config read",
             pci::bar_read(bar, self.device_config.offset + register, width),
-        ).await
+        )
+        .await
     }
 
     /// Write a 64-bit ring address as the two dword halves the common config expects.
     async fn write_address(&self, register: u64, address: u64) -> Result<(), String> {
-        self.common_write(register, pci::AccessWidth::Dword, address & 0xffff_ffff).await?;
+        self.common_write(register, pci::AccessWidth::Dword, address & 0xffff_ffff)
+            .await?;
         self.common_write(register + 4, pci::AccessWidth::Dword, address >> 32)
             .await
     }
@@ -600,7 +641,8 @@ impl Driver {
         pci_call(
             "disk.virtio: queue notify",
             pci::bar_write(bar, self.notify_offset, pci::AccessWidth::Word, 0),
-        ).await
+        )
+        .await
     }
 
     // --- one request ------------------------------------------------------------------------
@@ -921,7 +963,8 @@ async fn find_windows(
                     common = Some(Region { bar, offset });
                 }
                 VIRTIO_PCI_CAP_NOTIFY if notify.is_none() => {
-                    let multiplier = read(device, pointer + 16, pci::AccessWidth::Dword).await? as u32;
+                    let multiplier =
+                        read(device, pointer + 16, pci::AccessWidth::Dword).await? as u32;
                     notify = Some((Region { bar, offset }, multiplier));
                 }
                 VIRTIO_PCI_CAP_ISR if isr.is_none() => {
