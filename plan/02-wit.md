@@ -365,3 +365,22 @@ review pending).
     import both the optional flavor *and* the operations to be able to call them when granted —
     and must still instantiate everywhere when not. An operation called without the grant traps;
     the optional flavor is the honest signal clients check first.
+
+28. **The `eo9:gfx` package: pixel output as a framebuffer, not a GPU (2026-06-02).** v1 is
+    deliberately the smallest API that a *dumb pre-configured framebuffer* can implement —
+    an address plus width/height/stride/format, the shape U-Boot's simple-framebuffer hands
+    a kernel on real boards (the RK3588-class bring-up path: a future `gfx.simplefb` provider
+    reads exactly that and needs nothing else) — while still being implementable by virtio-gpu.
+    One types interface (the `gfx-impl` root), one API interface: fallible `mode` (so `gfx.deny`
+    and a provider over an unsupported firmware format answer in the API's own vocabulary —
+    `mode-info` is width/height/stride/format, xrgb8888 only), async `present`/`read` with the
+    owned-buffer round-trip, and `clear`. Operation buffers are TIGHTLY PACKED rows of the
+    operation's rectangle; the provider does the stride math — consumers never see the backing
+    layout. `read` returns the provider's own backing copy of what was presented (a screenshot
+    of the data path, not a host-side readback), which makes every gfx provider self-verifiable:
+    draw, read back, checksum — the `draw` demo does exactly that, so one program conformance-
+    tests every backend. Worlds: `none`, `deny`, `mem` (the configured RAM framebuffer, default
+    640x480). v2 candidates recorded, not built: modesetting, multiple scanouts, cursor planes,
+    and vsync — vsync deliberately last, because a vblank clock IS a timer and therefore a
+    capability question (see SPEC, Security: the timer is how Spectre-class channels are read);
+    when v2 adds it, it must ride the time-capability rules, not the gfx grant.

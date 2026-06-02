@@ -441,6 +441,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-stub-gpu-virtio"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-stub-net-l2-deny"
 version = "0.0.0"
 dependencies = [

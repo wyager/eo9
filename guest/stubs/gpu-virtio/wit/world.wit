@@ -1,0 +1,25 @@
+/// eo9:gpu-virtio — the virtio-gpu driver world (plan/09, plan/12).
+///
+/// `gpu.virtio` is the display sibling of `disk.virtio`/`net.virtio`: an ordinary wasm
+/// component that imports the PCI capability (`eo9:pci/pci`), drives a virtio-gpu PCI
+/// function's 2D control queue through configuration space, BAR registers, and DMA
+/// buffers, and exports `eo9:gfx/gfx` — so a drawing program runs over a real (virtual)
+/// display by composition: `gpu.virtio $ draw`.
+///
+/// `eo9:text/text` is imported only for one diagnostic line on first use (the probed
+/// scanout geometry and completion mode); the driver works identically without a console.
+///
+/// There is no configure interface: the documented default behaviour is to claim the
+/// first virtio-gpu function visible through the granted PCI capability on first use and
+/// scan out at the host's preferred geometry (the option-C default-configuration rule,
+/// plan/09 Decision 14). Selecting a specific device is `pci.filtered`'s job, composed
+/// in front of the driver.
+package eo9:gpu-virtio@0.1.0;
+
+world virtio {
+    import eo9:pci/pci@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    export eo9:gfx/types@0.1.0;
+    export eo9:gfx/gfx@0.1.0;
+}
