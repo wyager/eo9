@@ -81,6 +81,42 @@ wasm32-hosted wasmtime via Pulley with the exact SplitMix64 sequence the kernel/
 embeddings produce, through both the `call_async` and `run_concurrent`/`call_concurrent`
 entry points.
 
+## First-poll-inline for guest callees (docs/spikes/first-poll-inline.md)
+
+`wasmtime/` gains a second **opt-in** feature, `component-model-async-first-poll`
+(off by default; not enabled by the kernel, host, or browser builds — with it off the
+only code change is `queue_call`'s return type growing an always-`None` `Option`):
+
+- `Cargo.toml` — declares the feature (depends on `component-model-async` only).
+- `src/runtime/component/concurrent.rs` — implements the optimization upstream's own
+  comment in `start_call` contemplates ("we _could_ call the callee directly using the
+  current fiber"): when a guest->guest call targets a **callback-ABI** callee and the
+  legality gate passes, `queue_call` returns the activation closure instead of queueing
+  it, and `start_call` runs it inline on the caller's stack (`run_inline_activation`).
+  If the activation completes (`task.return` reached, callback code `EXIT`), the caller
+  consumes the terminal status directly — no event-loop round trip, no suspension, no
+  subtask machinery. If it suspends (`WAIT`/`YIELD` — return values under the callback
+  ABI, so there is no callee stack to capture), `handle_callback_code` has already
+  registered it exactly as the queued path would have; the caller falls through to the
+  existing wait loop (async-lowered callers take their subtask handle without suspending
+  at all). The gate — `Caller::Guest` only (host->guest calls via `queue_call0` always
+  queue), instance enterable now (`do_not_enter`/`backpressure`, the same checks
+  `GuestCall::is_ready` makes at dequeue time), nested-inline depth below
+  `MAX_INLINE_DEPTH` — reads only store state, so the inline/queue decision is
+  deterministic ("always inline when legal"). Sync-lifted and stackful async-lifted
+  callees keep the queued path unconditionally.
+
+Verified by `tests/firstpoll-ab` (a standalone workspace patching this vendored family,
+like `www/embed-spike`): the 21-test async-hardening matrix
+(tests/eo9-integration/tests/async_*.rs) passes with identical outcomes in both arms, and
+the seven-row eager-guest suite flips exactly its three queued-callback-callee rows from
+`STARTED` to `RETURNED` with the feature on. Known semantic deviation, inherited from the
+upstream comment's caveat: a directly-called callee that *blocks mid-frame* (a blocking
+sync-lowered import inside its initial activation) now blocks its caller's fiber for the
+duration instead of blocking only a worker fiber; Eo9 guests are callback-ABI throughout
+and express waits as `WAIT` return codes, so no shipped composition does this, and the
+spec change upstream names would be required before proposing this default-on.
+
 ## On-target codegen (in progress) — plan/12 Decisions 26 & 28
 
 The on-target-codegen rung (the kernel compiling components on the machine, behind the

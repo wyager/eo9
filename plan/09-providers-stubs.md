@@ -554,3 +554,54 @@ Match the priority order above; (1)+(2) unblock I2.
     - The l4-over-switch limit (D31) is the *net* lane's instance of the same wall and converts on
       `area/09-net-async` (the parallel branch); the storage acceptance is study 09's
       `pci.filtered $ disk.virtio $ fs.eofs $ cat` on metal.
+
+34. **Cancellation cannot misattribute virtio completions: drain-before-reuse (2026-06-02,
+    branch `area/09-cancel-guard`).** The async-storage reviewer's precision note was right:
+    `disk.virtio`'s drop-guard resync consumes only completions *already posted* at drop time, so
+    a request still in flight at the device when an operation is cancelled (its future dropped
+    mid-await — reachable through any deferring pci interposition since the honest-await
+    conversion) could complete later and be consumed by the *next* request's wait as its own; with
+    the single shared descriptor chain and bounce buffers the device could also DMA torn state
+    while the next request rewrites them. Audit verdict for `net.virtio`: the same class exists on
+    the **transmit** path (a cancel landing in `send`'s notify await leaves a published — possibly
+    unkicked — descriptor over the shared tx bounce buffer: the next `send` would put a corrupted
+    copy of its own frame on the wire under the stale descriptor and consume the stale completion
+    as its own), while the **receive** path is clean by construction (the used element is read,
+    the cursor advanced, and the slot re-published entirely with synchronous DMA accesses before
+    the only await; a cancel there can only lose a doorbell, and the published re-post stays in
+    the avail ring where the next kick re-delivers it).
+
+    The fix is **drain-before-reuse** (option B; chosen over per-request id tagging because
+    tagging alone cannot make shared-buffer reuse safe — only the device *finishing* the old
+    request does, and the used element posting is exactly that signal). Each driver keeps its
+    free-running published/consumed cursor pair (`avail_index`/`used_index`), level between
+    healthy operations; every request-submitting operation (`transfer`, `flush_device`, `send`)
+    first settles any divergence — kick once (idempotent, and the cancelled request may never
+    have been kicked), then consume the leftover completion with the normal bounded wait
+    machinery, discarding it. The drop-guards keep their fast role (consume what is already
+    posted; restore the slot; never touch the device beyond a synchronous cursor read). **The
+    invariant, under any cancellation/drop timing: when an operation begins writing
+    device-shared state, the device has posted completions for every previously published
+    request on that queue** (rx pre-posting is exempt — its consumption is await-free), so no
+    completion is ever attributed to a request other than the one that produced it. Documented
+    side effect, not fixed: a cancel landing inside the INTx `pci::wait` drops the vector with
+    the cancelled future and the driver completes later requests in polled mode — graceful
+    degradation; a fresh bring-up re-requests the vector.
+
+    Verification, honestly bounded: the drivers only run on metal (no usermode pci provider
+    exists), the guest workspace has no test runner, and the cancel window cannot be hit
+    deterministically from an SDK consumer (the cancel lands at whatever await the executor
+    processes it on; against the kernel root every pci await resolves within the call), so the
+    misattribution scenario itself is pinned by this analysis and the code audit rather than an
+    executable test. The drain's no-op-on-every-normal-path is what the regression battery
+    proves: the metal storage round-trip, the filtered chain, cross-boot persistence, ARP + DNS,
+    and the full `cargo xtask ci` gate, all green on this branch. An executable
+    cancel-mid-flight probe belongs to the async-hardening lane's matrix machinery once a
+    cancellable metal consumer exists.
+
+    **The pattern `gpu.virtio` must follow when it converts to honest awaits** (it is the last
+    eager driver): (1) take/put slot + drop-guard restoring on every exit path; (2) per-queue
+    free-running published/consumed cursors; (3) drain-before-reuse at the top of every
+    submitting operation, kicking before waiting; (4) keep used-element consumption await-free
+    so a cancel cannot land mid-consume; (5) accept interrupt-vector loss on cancellation
+    (degrade to polled) or restructure to preserve the vector across the wait.

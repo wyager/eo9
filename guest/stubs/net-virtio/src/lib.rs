@@ -265,7 +265,12 @@ struct DriverSlot {
 
 static STATE: ProviderState<DriverSlot> = ProviderState::new();
 
-/// Puts the driver back in its slot when the operation that took it finishes.
+/// Puts the driver back in its slot when the operation that took it finishes —
+/// including by *cancellation* (the operation's future dropped mid-await), so a
+/// cancelled operation can never leave the slot empty. A transmit the cancelled
+/// operation left published is settled by the next `send`'s [`Driver::drain_tx`]
+/// before any shared state is reused; the guard itself stays synchronous and free of
+/// device access (`Drop` cannot await).
 struct DriverGuard(Option<Driver>);
 
 impl Drop for DriverGuard {
@@ -747,6 +752,45 @@ impl Driver {
         }
     }
 
+    /// Settle a transmit a *cancelled* `send-frame` left published before the shared
+    /// bounce buffer and descriptor slot are reused. A cancellation (the operation's
+    /// future dropped mid-await — reachable through any pci provider that defers, e.g.
+    /// an interposed `pci.filtered`) can land in `send`'s notify await: at that point
+    /// the descriptor is published — possibly unkicked — and the device may transmit it
+    /// at the next doorbell, reading whatever the bounce buffer holds *then*. Without
+    /// this drain, the next `send` would overwrite the bounce buffer (putting a
+    /// corrupted copy of its own frame on the wire under the cancelled transmit's
+    /// descriptor) and consume the stale completion as its own, leaving the consumed
+    /// cursor permanently one behind the device. The cursor pair makes it visible:
+    /// `tx.avail_index` counts published transmits, `tx.used_index` consumed
+    /// completions, level between healthy operations. On divergence: kick (idempotent),
+    /// poll the leftover completion out with the normal transmit bound, discard it.
+    ///
+    /// The receive queue needs no analogue: its consumption path is await-free (the
+    /// used element is read, the cursor advanced, and the slot re-published entirely
+    /// with synchronous DMA accesses before the only await, the re-post doorbell), so a
+    /// cancellation there can only lose a kick — and the published re-post stays in the
+    /// avail ring, where the next doorbell re-delivers it.
+    async fn drain_tx(&mut self) -> Result<(), L2Fail> {
+        let mut spins: u64 = 0;
+        while self.tx.avail_index != self.tx.used_index {
+            self.notify_queue(1, self.tx.notify_offset)
+                .await
+                .map_err(L2Fail::Io)?;
+            while self.used_index(TX_RING_BASE) == self.tx.used_index {
+                spins += 1;
+                if spins > TX_POLL_LIMIT {
+                    return Err(L2Fail::Io(String::from(
+                        "net.virtio: the device did not complete a cancelled transmit \
+                         (poll limit)",
+                    )));
+                }
+            }
+            self.tx.used_index = self.tx.used_index.wrapping_add(1);
+        }
+        Ok(())
+    }
+
     /// Transmit one Ethernet frame: virtio-net header (zeroed — no offloads) + frame,
     /// one descriptor, kick, poll the used ring for the device to consume it.
     async fn send(&mut self, frame: &[u8]) -> Result<u64, L2Fail> {
@@ -754,6 +798,7 @@ impl Driver {
         if frame_len > MAX_FRAME {
             return Err(L2Fail::FrameTooLarge);
         }
+        self.drain_tx().await?;
         let mut packet = vec![0u8; VNET_HEADER as usize];
         packet.extend_from_slice(frame);
         pci::dma_write(&self.tx_data, 0, &packet);

@@ -1631,10 +1631,18 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
                             cx.waker().wake_by_ref();
                         } else {
                             // The child is blocked on its own I/O: wake the parent when
-                            // the child's doorbell rings.
+                            // the child's doorbell rings. If the child became runnable
+                            // between the is-runnable check above and the registration
+                            // inside this poll (its completion raced us), that doorbell
+                            // edge fired no registered waker — acting on the Ready here
+                            // is the only wake left. Discarding it parks the parent
+                            // forever while the child sits runnable with no further
+                            // event coming (the lost-wakeup hang; plan/11).
                             let runnable = child.runnable();
                             let mut runnable = std::pin::pin!(runnable);
-                            let _ = runnable.as_mut().poll(cx);
+                            if runnable.as_mut().poll(cx).is_ready() {
+                                cx.waker().wake_by_ref();
+                            }
                         }
                         std::task::Poll::Pending
                     })

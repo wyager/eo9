@@ -403,3 +403,52 @@ its first milestones, and to be the place where cross-area seams get found.
   blocks the machine.
 * Demo config: `guest/init/demo/services.cfg`. Tests: `tests/eo9-integration/tests/svc_init.rs`
   (6 subprocess tests incl. the runtime-level no-svc refusal).
+
+### Lost-wakeup fix: the wait host fn's discarded runnable edge (2026-06-02, area 11)
+
+The intermittent `eo9 -c` hang (found by area 13's CI, recorded in GAPS and plan/13 D19) is
+fixed. Root cause, with the reproduction that proves it:
+
+* **Symptom**: a `-c` coreutils run parks forever — main thread in
+  `providers::wait_until_runnable` (crates/eo9/src/providers.rs:1167) under
+  `run::drive_to_completion`, blocking pool idle, no in-flight op. Two wild specimens (a ~3 h
+  `-c cat` from the main checkout, a ~24 h `-c cp` from the svcv1 worktree) were sampled before
+  being killed: identical backtraces.
+* **Root cause** — a lost wakeup in `eo9:exec/task.wait`'s host implementation
+  (crates/eo9-runtime/src/link.rs): in the child-is-blocked branch the poll registered the
+  parent's waker via `child.runnable()` and **discarded the poll result**
+  (`let _ = runnable.as_mut().poll(cx)`). `Task::runnable`'s check/register/recheck closes the
+  register→ring race (the drained registration fires the waker — observable), but NOT the
+  check→register race: a child completion landing between the wait fn's `is_runnable()` check
+  and the registration drains an **empty** waiter list (fires nothing, sets only the sticky
+  child rung flag) and `runnable()` then returns `Ready` immediately *without registering*.
+  Discarding that `Ready` throws away the only remaining wake: the parent's drive poll returns
+  Pending with no doorbell edge → `resume` returns `Blocked` → the embedder parks on the
+  parent's doorbell, while the runnable child can never generate another event (its op already
+  completed; it only runs on parent-donated fuel). Permanent wedge. Load dependence is
+  preemption inside the few-instruction window. The sibling `runnable` host fn already handled
+  its `Ready` correctly; this was the only discard of the shape in the tree (grep
+  `let _ = .*poll(cx)`).
+* **Fix** (minimal): act on the edge — `if runnable.as_mut().poll(cx).is_ready() {
+  cx.waker().wake_by_ref(); }`, exactly the keep-awake the runnable-branch already does. The
+  woken wait future re-polls, sees the child runnable, and the parent's next resume donates
+  fuel.
+* **Reproduction/verification** (stress harness: N parallel `eo9 -c "cat /notes.txt"` runs,
+  per-run watchdog + `sample` capture, CPU hogs):
+  - Unamplified, unfixed: 0 hangs / 240 — confirms the wild rarity.
+  - Amplified (a temporary, uncommitted 500 µs sleep inside the check→register window),
+    unfixed: **40 hangs / 40 runs**, every backtrace identical to the wild specimens — the
+    window IS the bug.
+  - Amplified, fixed: **0 hangs / 160 runs** through the same widened window.
+  - Amplifier removed (verified absent from source and binary): **0 hangs, 0 failures / 320
+    runs** executed concurrently with a full `cargo xtask ci` (the original flake's load
+    profile); full CI green 3×; interleaved A/B timing of normal `-c cat` runs shows no
+    regression (−1.5 % median, within noise — the fix adds one branch on an already-computed
+    poll result, only in the child-blocked path).
+* **Evaluated and rejected**: also suppressing `Blocked` in `Task::resume` while any child
+  `is_runnable()` (defense-in-depth). Insufficient alone (the parent still parks at the
+  child's *next* I/O wait with no registration bridging the doorbells) and redundant once the
+  edge is acted on; it would only mask future bugs of this class. A deterministic in-tree
+  regression test would need fault-injection hooks in the host fn's poll (rejected: prod code
+  carrying interleaving hooks); the regression guards are the CLI suite under load and this
+  recorded experiment.

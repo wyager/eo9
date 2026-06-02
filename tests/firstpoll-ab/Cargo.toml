@@ -1,0 +1,50 @@
+# A/B harness for the first-poll-inline prototype (docs/spikes/first-poll-inline.md).
+#
+# This is a standalone workspace (like www/embed-spike): nothing here enters the OS
+# dependency tree, and `cargo xtask ci` neither builds nor needs it. Both arms of the A/B
+# build the SAME wasmtime source — the vendored copy (kernel/vendor/wasmtime), via the
+# [patch] below — so the only variable is the `first-poll-inline` feature:
+#
+#   arm A (today's queued semantics):   cargo test  (from this directory)
+#   arm B (inline first poll):          cargo test --features first-poll-inline
+#
+# The test binaries include the async-hardening matrix and the eager-guest suite from
+# tests/eo9-integration/tests by `#[path]` modules, so the pinned semantics are verified
+# verbatim, not re-transcribed. `cargo xtask firstpoll-ab` runs both arms.
+[package]
+name = "firstpoll-ab"
+description = "A/B harness: the async-hardening matrix against the vendored wasmtime, first-poll-inline off vs on."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone: keeps this package out of the host workspace (and its registry wasmtime).
+[workspace]
+
+[dependencies]
+eo9-component = { path = "../../crates/eo9-component" }
+eo9-runtime = { path = "../../crates/eo9-runtime" }
+eo9-store = { path = "../../crates/eo9-store" }
+eo9-integration = { path = "../eo9-integration" }
+# Direct dependency only to forward the feature below; the version matches the root pin
+# table and resolves to the vendored copy via [patch].
+wasmtime = { version = "45.0.0", default-features = false }
+# The vendored compile crate gates host-target inference (`cranelift-native`, std-only)
+# off because the kernel always names its target. This harness runs on the host and
+# eo9-runtime's pinned engine infers the host triple, so turn it back on here.
+wasmtime-internal-cranelift = { version = "45.0.0", default-features = false, features = [
+    "cranelift-native",
+] }
+
+[features]
+# Arm B: run callback-ABI guest callees inline on the caller's stack when legal.
+first-poll-inline = ["wasmtime/component-model-async-first-poll"]
+
+# The whole vendored wasmtime family must be used together for the types to agree (the
+# on-target-codegen fork changed shared debug surfaces) — same set as www/embed-spike.
+[patch.crates-io]
+wasmtime = { path = "../../kernel/vendor/wasmtime" }
+wasmtime-environ = { path = "../../kernel/vendor/wasmtime-environ" }
+wasmtime-internal-cranelift = { path = "../../kernel/vendor/wasmtime-cranelift" }
+cranelift-frontend = { path = "../../kernel/vendor/cranelift-frontend" }
+wasmtime-internal-unwinder = { path = "../../kernel/vendor/wasmtime-unwinder" }
