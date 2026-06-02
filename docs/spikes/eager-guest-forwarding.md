@@ -160,7 +160,7 @@ both directions. Executed so far:
   and `disk.virtio` await their imports; `pci.filtered` already did. Study 09's
   `pci.admit-address $ pci.filtered $ disk.virtio $ fs.eofs $ ls /` runs on QEMU aarch64
   metal — with INTx-interrupt completion *through* the filter, so the "interrupt-mode
-  pacing does not survive interposition" residual recorded above is gone (plan/09 D32).
+  pacing does not survive interposition" residual recorded above is gone (plan/09 D33).
 * **Net lane**: `area/09-net-async` (parallel branch), targeting the l4-over-l2 pump and
   the vnic_l4 acceptance.
 

@@ -273,3 +273,33 @@ Milestone 3 (usermode persistence: `--disk`, `mkfs.eofs`, the file-backed device
       green including a new `filtered_chain_over_a_deferring_eofs_round_trips` pin (the deepest
       awaited guest chain in usermode: readwrite → fs.filtered → fs.eofs → disk.mem, with fs.eofs
       genuinely parking on every disk call).
+
+26. **Metal acceptance: study 09's filtered-storage chain runs (2026-06-02, QEMU aarch64,
+    `pci disk` boot, fresh scratch disk).** Transcript evidence, all through the *converted*
+    awaiting stubs (paced-console driver; the modern policy-component form — `pci.filtered`'s
+    own `--allow` moved to `pci.admit-address` in the policies-are-programs swap, which is what
+    study 09's pre-swap transcript still showed):
+    - Baseline, unfiltered: `disk.virtio $ fs.eofs $ readwrite --path "/keep.txt" …` →
+      `disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx
+      interrupt` / `pci: INTx delivery on line 3 served an interrupt wait (the cpu halted
+      instead of polling)` / `ok: round-tripped(10)`.
+    - **The flagship**: `pci.admit-address --allow "[{segment: 0, bus: 0, device: 3, function:
+      0}]" $ pci.filtered $ disk.virtio $ fs.eofs $ ls /` → probe line, `keep.txt`,
+      `ok: listed(1)` — the exact composition class study 09 pinned as failing with the typed
+      suspension. The INTx line shows interrupt-paced completion *through the filter*: the
+      interposed-interrupt residual (plan/09 D31) is empirically gone, not just by-construction.
+    - Next boot (scratch disk kept): the same chain with `cat /keep.txt` served `asyncfirst` —
+      power-cycle persistence through the filtered chain — and the wrong-device variant
+      (allow-list naming the rng) failed with the driver's own actionable error ("no virtio-blk
+      function is visible through the granted pci capability … check that an attenuator composed
+      in front of this driver allows the disk's address") instead of study 09 finding 3's
+      misleading "device too small" (the size-rewake path of D25).
+    - Perf: usermode A/B of the eofs round-trip test (eager master vs awaited branch, 3 runs
+      each): ~4.0s vs ~3.3s median — no measurable queueing tax (the bar was "analyze if >2x").
+      No metal op-phase instrumentation exists to time the ms-scale run phase under the
+      minutes-scale on-target compile, so the metal evidence is qualitative: completion moved
+      from polled (the eager driver's single poll could never see the interrupt wait complete)
+      to genuine halt-until-INTx, strictly less CPU burn.
+    Residual: `gpu.virtio` (merged from `area/02-gfx` while this branch was in flight) still
+    uses the eager `pci_call` convention — the next conversion in this series, deferred to the
+    gfx lane.

@@ -78,7 +78,7 @@ similar only if justified — ask).
    both the ledger and scheduler level, with failed operations changing nothing.
 10. **The storage chain now parks on the executor (2026-06-02, `area/14-async-storage`; observation,
     no scheduler-crate change).** Since the async-first conversion (SPEC "Boundaries are honestly
-    async", plan/14 D25, plan/09 D32), `fs.eofs` and `disk.virtio` genuinely await their imports, so
+    async", plan/14 D25, plan/09 D33), `fs.eofs` and `disk.virtio` genuinely await their imports, so
     every metal storage operation through the filtered chain exercises queued guest-to-guest calls —
     park, event delivery, resume — instead of completing inside a single activation. Two consequences
     for this plan's territory: (a) the storage compositions are now *load* on the readiness machinery
