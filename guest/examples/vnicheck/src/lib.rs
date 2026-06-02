@@ -239,11 +239,11 @@ eo9_guest::main! {
             send_a(&iface_a, &arp_request(mac_a, SENDER_IP_A)).await?;
             let mut gw_a: Option<([u8; 6], [u8; 6])> = None;
             for _ in 0..POLL_ATTEMPTS {
-                if let Some(received) = recv_a(&iface_a).await? {
-                    if let Some(gw) = arp_reply_mac(&received) {
-                        gw_a = Some((gw, received.dst));
-                        break;
-                    }
+                if let Some(received) = recv_a(&iface_a).await?
+                    && let Some(gw) = arp_reply_mac(&received)
+                {
+                    gw_a = Some((gw, received.dst));
+                    break;
                 }
             }
             let (gw_a, dst_a) = gw_a.ok_or_else(|| {
@@ -259,11 +259,11 @@ eo9_guest::main! {
             send_b(&iface_b, &arp_request(mac_b, SENDER_IP_B)).await?;
             let mut gw_b: Option<([u8; 6], [u8; 6])> = None;
             for _ in 0..POLL_ATTEMPTS {
-                if let Some(received) = recv_b(&iface_b).await? {
-                    if let Some(gw) = arp_reply_mac(&received) {
-                        gw_b = Some((gw, received.dst));
-                        break;
-                    }
+                if let Some(received) = recv_b(&iface_b).await?
+                    && let Some(gw) = arp_reply_mac(&received)
+                {
+                    gw_b = Some((gw, received.dst));
+                    break;
                 }
             }
             let (gw_b, dst_b) = gw_b.ok_or_else(|| {
