@@ -50,60 +50,99 @@ exports), not about the lift options of async-typed functions.
   (`kernel/vendor/wasmtime/src/runtime/component/concurrent.rs:2698`) does not exist on
   the sync path (`concurrent.rs:2467-2545`, the `else` branch of `queue_call`).
 
-## The failure mechanism (hypothesis to be verified by the fixture)
+## The failure mechanism (verified by the fixture matrix)
 
-For an async-lowered call to an **async-lifted** guest callee, the caller parks until the
-callee's *first status event* (`concurrent.rs:2898`, the `start_call` wait loop) and — for
-an async caller — **breaks at the first event it sees**. `Status::Started` is posted the
-moment the callee's start adapter lowers the parameters, *before the callee's body runs*.
-Events live in a single last-write-wins slot (`concurrent.rs:4824`), so:
+For a queued call to a guest callee, the caller parks until the callee's *first status
+event* (`concurrent.rs:2898`, the `start_call` wait loop) and — for an async-lowered
+caller — **breaks at the first event it sees**. `Status::Started` is posted by the
+caller-side machinery the moment the callee's parameters are lowered
+(`concurrent.rs:2698`), *before the callee's body runs*, for **every** queued call,
+regardless of the callee's lift flavor. Events live in a single last-write-wins slot
+(`concurrent.rs:4824`), so what the eager caller's single poll observes is decided by a
+race between its own resumption and the callee's completion:
 
-- a callee whose body runs to completion **without yielding** overwrites `Started` with
-  `Returned` inside the same work item; the caller resumes and reads `Returned` —
-  this is why `net.l2.deny $ net.l4.over-l2` and `disk.mem $ fs.eofs` work today;
-- a callee whose body performs **its own import call** yields mid-body (guest-to-guest
-  calls suspend the worker fiber; host calls that aren't immediately ready park the
-  task), the event loop resumes the waiting caller while the slot still says `Started`,
-  and the eager caller's single poll fails — this is the wall, and it reproduces at
-  exactly the observed boundary: trivial-bodied callees work, callees with nested calls
-  don't.
+- a callee whose activation **never yields** completes inside its own work item, and
+  `Returned` overwrites `Started` before the caller resumes — the caller's single poll
+  sees `RETURNED`. This is why `net.l2.deny $ net.l4.over-l2` and `disk.mem $ fs.eofs`
+  work today: their callee bodies make no import calls.
+- a callee that makes a **queued call of its own** yields to the event loop mid-body;
+  the waiting caller resumes while the slot still says `Started`, and the eager poll
+  fails. A call is queued when it is **async-lowered (against any callee)** or
+  **sync-lowered against an async-lifted guest**. Host calls complete inline
+  (`first_poll` / `poll_and_block` poll the host future once on the caller's stack) and
+  sync-lowered calls to **sync-lifted guests** are direct fused-adapter calls — neither
+  yields.
 
-A **sync-lifted** callee never posts `Started` at all, so its caller — async-lowered or
-sync-lowered, eager or awaiting — wakes only on `Returned`, at any nesting depth.
+The empirical matrix (tests/eo9-integration/tests/eager_guest.rs, all seven pinned):
 
-## Direction chosen: (a) sync lifts and sync lowers for eager middlewares
+| leaf lift | relay import | relay export | consumer call | observed |
+|---|---|---|---|---|
+| async | async-lower poll | async | eager poll | **STARTED — the wall** |
+| async | async-lower poll | async | sync-lower (block) | completes; relay saw RETURNED |
+| async | async-lower poll | sync | eager poll | STARTED (export lift alone is irrelevant) |
+| sync | async-lower poll | sync | eager poll | STARTED (async-lower always queues) |
+| async | sync-lower | sync | eager poll | STARTED (sync-lower to async-lifted guest queues) |
+| sync | sync-lower | sync | eager poll | **RETURNED — the fix** |
+| sync | sync-lower | async | eager poll | **RETURNED — the minimal conversion shape** |
 
-An eager middleware's implementation contract is already "I complete in one activation
-and never park". Making its **exports sync-lifted** and its **imports sync-lowered**
-declares that truthfully at the canonical-ABI level:
+## Direction chosen: the all-sync convention for eager components
 
-- exports: callers (eager or awaiting) get eager completion — the wall disappears;
-- imports: a sync-lower of an eager chain never actually blocks (the chain grounds out
-  at an eager host leaf or an eager sync-lifted guest), and the bridge code in the
-  middleware becomes a plain function call — the `eager()` poll-once helper and its
-  typed failure path disappear with it;
-- the WIT surface, the component types, and every existing composition are unchanged.
+A component is **eager-callable** iff no export activation ever yields: every import
+call must be **sync-lowered**, and every guest it calls must itself be eager-callable
+and **sync-lifted** (host providers always qualify — they complete inline). The export
+lift of the component itself does not affect its callers (Returned overwrites Started
+within the activation), but a sync lift is what makes the component's *own* exports
+non-queued for the eager component above it — so middlewares that sit under other eager
+components (pci.filtered under disk.virtio, the switch under net.l4.over-l2,
+disk.virtio under fs.eofs) need sync lifts too. The WIT types stay `async func`
+throughout: the validator only forbids the async *option* on a sync *type*
+(`wasmparser-0.250.0/src/validator/component.rs:402-409` `check_asyncness`), never the
+reverse, and the toolchain already exercises the allowed direction (the text-sink
+fixture sync-lifts `read-line` today).
 
-Candidate (b) — teaching the runtime to drive an async callee's nested chain to
-completion before reporting a status — is vendored-runtime surgery in the most delicate
-code we ship and is unnecessary if (a) holds. Candidate (c) — rewriting middlewares as
-genuinely-async state machines — fights the sync cores (smoltcp's and eofs-core's traits)
-and re-fixes every middleware forever.
+What this buys, per component class:
+
+- **Pure attenuators / policy middlewares** (pci.filtered, fs.filtered, net.l4.filtered,
+  the switch): convert wholesale via wit-bindgen's `async` filter (sync bindings for
+  both directions). Their bodies become plain function calls; the `eager()` helper and
+  its typed-failure path disappear.
+- **Drivers and engine bridges** (disk.virtio, net.virtio, fs.eofs, net.l4.over-l2):
+  sync-lower their imports (the sync engine cores stop needing `eager()` entirely);
+  sync-lift their exports so eager components above them stay eager.
+- **One documented residual**: a sync-lifted task may not block, so a *parking* host
+  operation (the INTx `wait`) cannot be forwarded through a sync-lifted middleware —
+  exactly the interrupt-under-filter case. The polled fallback already covers it
+  (drivers degrade to polling when `wait` fails), and the limitation shrinks to
+  "interrupt-mode pacing does not survive interposition", recorded in plan/09.
+
+Candidate (b) — teaching the runtime to drive a callee's nested chain to completion
+before reporting status — remains the only path to "eager callers over *genuinely
+async* callees", is vendored-runtime surgery, and is not needed for any shipped
+composition. Candidate (c) — async rewrites of the middlewares — is superseded: the
+all-sync convention removes the async machinery instead of doubling it.
 
 ## Verification
 
-`tests/eo9-integration/tests/eager_guest.rs` builds the minimal chain from hand-written
-fixtures (an eager single-poll consumer → a forwarding relay → a guest leaf, over the
-real `eo9:time` package) in all four lift/lower combinations and pins:
+`tests/eo9-integration/tests/eager_guest.rs` — seven tests over hand-written
+canonical-ABI fixtures (`tests/eo9-integration/src/fixtures.rs`, the `eo9-tests:eager`
+section): the wall reproduced, every single-knob variant pinned as insufficient, and
+both fix shapes (all-sync, and sync-lowered-imports-with-async-export) completing for an
+eager caller. The fixtures also pin, as a side effect, that the encoder + validator +
+runtime accept sync lifts and sync lowers of async-typed WIT functions end to end.
 
-1. the wall, reproduced (async-lift relay with a nested call → the consumer's single
-   poll observes a non-`RETURNED` status);
-2. the fix (sync-lift relay → the consumer's single poll observes `RETURNED`);
-3. sync-lowered imports block-until-done against both lift flavors;
-4. a genuinely-parking callee still yields the typed-failure shape, never a hang.
+## Conversion plan (the follow-up pass, per stub)
 
-(Results recorded below after the fixture lands.)
+1. `pci.filtered`, `fs.filtered`, `net.l4.filtered`, `net.l2.switch`, `pci-admit-*`,
+   `fs-policy-*`, `net-policy-*`: `async: ["-all"]` in `generate!` (sync both ways),
+   bodies lose their `eager()`/await scaffolding.
+2. `disk.virtio`, `net.virtio`: sync-lower imports + sync-lift exports; keep the
+   polled-fallback for `wait` (see the residual above); verify `pci.filtered $
+   disk.virtio $ fs.eofs $ cat` and the vnic l4-over-switch acceptance on metal.
+3. `fs.eofs`, `net.l4.over-l2`: same; delete the `eager()` helpers; the
+   "provider suspended" io-error class disappears.
+4. `fs.overlay`, `fs.eofs`-adjacent stubs, `gfx.*` when it lands: same convention.
+5. Un-ignore the vnic l4-over-switch acceptance test (vnic_l4.rs) and re-run study 09's
+   filtered-storage transcript on metal.
 
-## Results
-
-See the test file; summarized in plan/03 D25 / plan/07 D14 once verified.
+The conversion is per-stub bindgen configuration plus mechanical body simplification;
+no WIT, no algebra, no vendored-runtime changes.
