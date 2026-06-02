@@ -25,7 +25,7 @@ use std::string::String;
 use std::vec::Vec;
 
 use wasmtime::component::{
-    Accessor, ComponentType, Lift, Linker, LinkerInstance, Lower, Resource, ResourceType,
+    Accessor, ComponentType, Lift, Linker, LinkerInstance, Lower, Resource, ResourceType, Val,
 };
 use wasmtime::{Result, StoreContextMut};
 
@@ -103,6 +103,26 @@ impl WebState {
             let line: String = buffer.drain(..=newline).collect();
             let line = line.trim_end_matches('\n');
             host::write_out(&std::format!("{marker}{line}"));
+        }
+    }
+
+    /// Flush buffered *partial* lines to the page. Reading input is the terminal's flush
+    /// point — exactly C stdio's contract — because a partial line written just before a
+    /// read is a prompt: eosh writes `eosh> ` with no newline and then calls `read-line`.
+    /// Without this flush the prompt sits in the buffer accumulating one `eosh> ` per
+    /// read until the shell's next complete line drags them all out glued together
+    /// ("eosh> eosh> eosh> ok: greeted" — the prompt-accumulation regression), and the
+    /// page attaches the visitor's typing to whatever line happened to render last.
+    /// Also called when a run ends, so a program whose final output lacks a trailing
+    /// newline still gets that text onto the page.
+    pub fn flush_partial_lines(&mut self) {
+        if !self.out_line.is_empty() {
+            let line = core::mem::take(&mut self.out_line);
+            host::write_out(&line);
+        }
+        if !self.err_line.is_empty() {
+            let line = core::mem::take(&mut self.err_line);
+            host::write_out(&std::format!("\u{1}{line}"));
         }
     }
 
@@ -208,6 +228,71 @@ pub fn add_providers(linker: &mut Linker<WebState>) -> Result<()> {
     add_text(linker)?;
     add_time(linker)?;
     add_entropy(linker)?;
+    add_svc_absent(linker)?;
+    Ok(())
+}
+
+/// Host representation of `eo9:svc/detach.detach-impl` (never minted in the browser).
+struct SvcDetachCap;
+/// Host representation of `eo9:svc/services.services-impl` (never minted in the browser).
+struct SvcServicesCap;
+
+/// `eo9:svc` — registered as **absent**: the page has no service registry (executor v1
+/// is usermode; a browser registry is a recorded follow-up — docs/design/executor-model.md).
+/// Mirrors the kernel's `add_svc_absent`: eosh imports both the `-optional` flavors (the
+/// honest am-I-granted signal it checks) and the full interfaces (to call when granted),
+/// so all four must be registered for eosh to instantiate at all. The optionals answer
+/// `none`; the operations are registered through the dynamic (`func_new`) API and refuse
+/// with a clear message if ever called — which a well-behaved client never does after
+/// seeing `none`.
+fn add_svc_absent(linker: &mut Linker<WebState>) -> Result<()> {
+    fn refuse(
+        _store: StoreContextMut<'_, WebState>,
+        _ty: wasmtime::component::types::ComponentFunc,
+        _params: &[Val],
+        _results: &mut [Val],
+    ) -> Result<()> {
+        Err(wasmtime::Error::msg(
+            "eo9:svc is not available in the browser: background services need a service \
+             registry (usermode `eo9 --svc` has one today)",
+        ))
+    }
+
+    fn answer_none(
+        _store: StoreContextMut<'_, WebState>,
+        _ty: wasmtime::component::types::ComponentFunc,
+        _params: &[Val],
+        results: &mut [Val],
+    ) -> Result<()> {
+        results[0] = Val::Option(None);
+        Ok(())
+    }
+
+    let mut detach = linker.instance("eo9:svc/detach@0.1.0")?;
+    detach.resource(
+        "detach-impl",
+        ResourceType::host::<SvcDetachCap>(),
+        |_, _| Ok(()),
+    )?;
+    detach.func_new("default", refuse)?;
+    detach.func_new("detach", refuse)?;
+
+    let mut detach_optional = linker.instance("eo9:svc/detach-optional@0.1.0")?;
+    detach_optional.func_new("default", answer_none)?;
+
+    let mut services = linker.instance("eo9:svc/services@0.1.0")?;
+    services.resource(
+        "services-impl",
+        ResourceType::host::<SvcServicesCap>(),
+        |_, _| Ok(()),
+    )?;
+    for operation in ["default", "list", "status", "log", "stop", "clear"] {
+        services.func_new(operation, refuse)?;
+    }
+
+    let mut services_optional = linker.instance("eo9:svc/services-optional@0.1.0")?;
+    services_optional.func_new("default", answer_none)?;
+
     Ok(())
 }
 
@@ -330,12 +415,17 @@ fn add_text(linker: &mut Linker<WebState>) -> Result<()> {
     // One line from the page terminal's input box. The JSPI `Suspending` import parks the
     // whole blob until the visitor presses Enter (or signals end-of-input), then resumes it
     // with the line — the same contract the kernel's PL011 read-line future provides.
+    // Reading flushes buffered partial output first: the partial line written just before
+    // a read is the prompt, and it must be on the page before we park on the keyboard.
     text.func_wrap_concurrent(
         "read-line",
-        |_accessor: &Accessor<WebState>,
+        |accessor: &Accessor<WebState>,
          (_cap,): (Resource<TextCap>,)|
          -> ConcurrentFuture<'_, (core::result::Result<Option<String>, WitTextError>,)> {
-            Box::pin(async move { Ok((Ok(host::read_line(MAX_READ_LINE_BYTES)),)) })
+            Box::pin(async move {
+                accessor.with(|mut access| access.data_mut().flush_partial_lines());
+                Ok((Ok(host::read_line(MAX_READ_LINE_BYTES)),))
+            })
         },
     )?;
 

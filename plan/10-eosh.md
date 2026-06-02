@@ -229,3 +229,18 @@ eosh is the first client of `eo9:svc` (executor v1, docs/design/executor-model.m
   do; the kernel's registration answers "absent" until executor v2).
 * eosh-core: 117 unit tests (16 new — parsing, grant refusals, lifecycle, soundness-at-the-shell);
   end-to-end: tests/eo9-integration/tests/svc_shell.rs (7 subprocess session tests).
+
+18. **`describe` works on the shell's own words (2026-06-02, branch `area/18-prompt-explain`).** The owner
+    asked for an `explain` builtin, then corrected: `describe` is the canonical spelling and should cover
+    builtins — including itself. `describe <word>` now renders a hand-written plain-language card when the
+    word is a builtin (`help`, `describe`, `imports`, `env`, `history`, `let`, `save`, `detach`, `svc`,
+    `exit`/`quit`) or an operator (`$`/`compose`, `&`/`extend`, `only`, `rename`, `with`): kind line,
+    one-paragraph summary, usage with a concrete example, and a `related:` pointer, all within the try-it
+    page's ~109-column budget (`eosh-core/src/builtins.rs`). Precedence is deliberately narrow: only a
+    *single* trailing word with a card takes the builtin path; anything longer — and any parenthesized
+    expression, the escape hatch — keeps the expression path (resolution, backend describe, wiring).
+    No `explain` builtin exists (nothing to alias). Coverage is test-pinned the same way the help examples
+    are: `every_builtin_and_operator_has_a_card` enumerates the parser's dispatch list (a new builtin
+    without a card fails the build), `every_builtin_the_help_text_lists_has_a_card` walks help's
+    `builtins:` line, and the cards' column budget is asserted per line. `help`'s explore section now
+    points at it (`e.g. describe describe`, which the help-examples test therefore also runs end-to-end).
