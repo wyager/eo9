@@ -299,11 +299,16 @@ impl DriverState {
 
 /// Returns the driver to the slot when an operation ends — including by *cancellation*
 /// (the operation's future dropped mid-await): without this, a cancelled operation would
-/// leave the slot `Busy` forever. Before putting the driver back it resynchronizes its
-/// used-ring cursor with the device (a synchronous DMA read), so a request whose
-/// completion arrived after the cancellation is consumed here and can never be
-/// misattributed to the *next* request. On the normal path the cursor already matches
-/// and the resync is a no-op.
+/// leave the slot `Busy` forever. Before putting the driver back it consumes any
+/// completion the device has *already posted* (a synchronous DMA read), settling the
+/// common cancellation shape — the request finished while the cancel was landing. A
+/// request the device is *still* processing cannot be settled here (`Drop` cannot
+/// await); it stays visible as `avail_index != used_index`, and the next operation's
+/// [`Driver::drain_stale`] waits it out before any shared descriptor or buffer is
+/// reused. On the normal path the cursors already match and the resync is a no-op.
+/// One side effect of cancellation landing inside the INTx `pci::wait`: the vector
+/// moved into that wait drops with the cancelled future, so later requests complete in
+/// polled mode — graceful degradation, not a failure.
 struct DriverGuard {
     driver: Option<Driver>,
 }
@@ -670,6 +675,33 @@ impl Driver {
 
     // --- one request ------------------------------------------------------------------------
 
+    /// Settle any request a *cancelled* operation left in flight before the shared
+    /// descriptors and DMA buffers are touched again. A cancellation (the operation's
+    /// future dropped mid-await — reachable through any pci provider that defers, e.g.
+    /// an interposed `pci.filtered`) can leave a request published, possibly not even
+    /// kicked if the drop landed during the notify, with the device still free to DMA
+    /// the descriptor chain, the request page, and the data buffer at any later moment.
+    /// Reusing those for a new request while the old one is live would let the device
+    /// read torn state, and its eventual completion would be consumed by the new
+    /// request's wait as if it were its own — the silent-misattribution class. The
+    /// cursor pair makes the situation visible: `avail_index` counts published
+    /// requests, `used_index` consumed completions, and they are level between healthy
+    /// operations (the [`DriverGuard`] resync keeps them level when the completion had
+    /// already posted by the time the cancel landed). On divergence: kick once
+    /// (idempotent — and the cancelled request may never have been kicked), then
+    /// consume the leftover completion with the normal bounded wait machinery,
+    /// discarding its status and data. The invariant this establishes: when an
+    /// operation begins writing device-shared state, the device has posted completions
+    /// for every previously published request, so no completion is ever attributed to a
+    /// request other than the one that produced it, under any cancellation timing.
+    async fn drain_stale(&mut self) -> Result<(), String> {
+        while self.avail_index != self.used_index {
+            self.notify_queue().await?;
+            self.wait_for_completion("a cancelled request").await?;
+        }
+        Ok(())
+    }
+
     /// Transfer `sectors` sectors starting at `sector`. For a write, `payload` is the
     /// sector-aligned data to send; for a read the function returns the sectors read.
     async fn transfer(
@@ -679,6 +711,7 @@ impl Driver {
         sectors: u32,
         payload: Option<&[u8]>,
     ) -> Result<Option<Vec<u8>>, String> {
+        self.drain_stale().await?;
         let byte_len = u64::from(sectors) * SECTOR;
         debug_assert!(byte_len <= DATA_BYTES);
 
@@ -830,6 +863,7 @@ impl Driver {
         if !self.flush_supported {
             return Ok(());
         }
+        self.drain_stale().await.map_err(DiskFail::Io)?;
         // Header: type FLUSH, reserved 0, sector 0; status preset to a non-status value.
         let mut header = [0u8; 16];
         header[0..4].copy_from_slice(&BLK_T_FLUSH.to_le_bytes());
