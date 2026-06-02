@@ -57,6 +57,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -177,8 +178,9 @@ enum Slot {
     Empty,
     /// An operation is in flight (the engine is on that operation's stack).
     Busy,
-    /// Mounted and idle.
-    Ready(AsyncEofs<DiskDevice>),
+    /// Mounted and idle. Boxed: the engine is ~400 bytes and the other variants are
+    /// empty (clippy `large_enum_variant`); take/put then moves one pointer.
+    Ready(Box<AsyncEofs<DiskDevice>>),
 }
 
 struct FsState {
@@ -198,7 +200,7 @@ impl FsState {
     /// Take the engine for one operation. `Ok(Some)` = mounted engine; `Ok(None)` = first
     /// use (the slot is now `Busy`; mount and then [`put`](Self::put) or
     /// [`clear`](Self::clear)); `Err` = another operation is in flight.
-    fn take(&self) -> Result<Option<AsyncEofs<DiskDevice>>, FsError> {
+    fn take(&self) -> Result<Option<Box<AsyncEofs<DiskDevice>>>, FsError> {
         let mut slot = self.inner.borrow_mut();
         match core::mem::replace(&mut *slot, Slot::Busy) {
             Slot::Ready(eofs) => Ok(Some(eofs)),
@@ -211,7 +213,7 @@ impl FsState {
     }
 
     /// Put the engine back after an operation.
-    fn put(&self, eofs: AsyncEofs<DiskDevice>) {
+    fn put(&self, eofs: Box<AsyncEofs<DiskDevice>>) {
         *self.inner.borrow_mut() = Slot::Ready(eofs);
     }
 
@@ -274,7 +276,7 @@ async fn with_fs<R>(
     let mut eofs = match STATE.take()? {
         Some(eofs) => eofs,
         None => match mount_or_format().await {
-            Ok(eofs) => eofs,
+            Ok(eofs) => Box::new(eofs),
             Err(error) => {
                 STATE.clear();
                 return Err(error);
