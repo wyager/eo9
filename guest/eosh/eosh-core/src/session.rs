@@ -46,6 +46,10 @@ pub enum LineResult {
     Error(String),
     /// The user asked to leave the shell.
     Exit,
+    /// The user asked to halt the machine (`poweroff`): leave the shell AND tell the
+    /// embedder — under init, plain `exit` restarts the console while services live,
+    /// so halting is its own intent, reported as the shell's own typed outcome.
+    Poweroff,
 }
 
 /// One shell session: the backend plus everything the user has built up in it.
@@ -122,6 +126,7 @@ impl<B: Backend> Session<B> {
             Command::Env => self.run_env().await,
             Command::EnvOf(expr) => self.run_env_of(&expr).await,
             Command::Exit => LineResult::Exit,
+            Command::Poweroff => LineResult::Poweroff,
             Command::Let { name, expr } => self.run_let(name, &expr).await,
             Command::Save { name, expr } => self.run_save(name, &expr).await,
             Command::Detach { name, expr, policy } => self.run_detach(name, &expr, &policy).await,
@@ -130,6 +135,15 @@ impl<B: Backend> Session<B> {
             Command::SvcStop(name) => self.run_svc_stop(&name),
             Command::SvcClear(name) => self.run_svc_clear(&name),
             Command::Describe(expr) => self.run_describe(&expr, false).await,
+            Command::DescribeBuiltin(word) => {
+                // The parser only constructs this for words with a card.
+                if let Some(doc) = crate::builtins::builtin_doc(&word) {
+                    for line in crate::builtins::render_builtin_doc(doc) {
+                        self.backend.print(&line);
+                    }
+                }
+                LineResult::Ok
+            }
             Command::Imports(expr) => self.run_describe(&expr, true).await,
             Command::Run(expr) => self.run_program(&expr).await,
         }
@@ -625,12 +639,13 @@ pub fn help_lines() -> &'static [&'static str] {
         "",
         "explore the sandbox:",
         "  ls /bin                       list what is installed (programs and providers)",
-        "  describe <name or expr>       its kind, arguments, imports, exports, and wiring",
+        "  describe <name or expr>       its kind, arguments, imports, exports, and wiring; also",
+        "                                  explains the shell's own words — e.g. describe describe",
         "  imports <expr>                just the residual imports of an expression",
         "  env                           what this session holds and what programs run from it receive",
         "  env <expr>                    how this session treats the expression's imports, without running it",
         "",
-        "builtins: help, env [<expr>], history, let, save, detach, svc, describe <expr>, imports <expr>, exit",
+        "builtins: help, env [<expr>], history, let, save, detach, svc, describe <expr>, imports <expr>, exit, poweroff (halt the machine — under init, exit only restarts the console)",
     ]
 }
 
@@ -1155,6 +1170,71 @@ mod tests {
     }
 
     #[test]
+    fn describe_works_on_builtins_including_itself() {
+        let mut session = session_with(&[]);
+        assert_eq!(run(&mut session, "describe describe"), LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(
+            out.contains("kind: builtin") && out.contains("e.g. describe entropy.seeded"),
+            "describe describe renders its own card: {out}"
+        );
+        // Nothing was resolved, evaluated, or compiled.
+        assert!(
+            session.backend.log.is_empty(),
+            "log: {:?}",
+            session.backend.log
+        );
+
+        for word in [
+            "help", "let", "save", "detach", "svc", "env", "imports", "exit", "only",
+        ] {
+            session.backend.out.clear();
+            assert_eq!(
+                run(&mut session, &format!("describe {word}")),
+                LineResult::Ok,
+                "describe {word}"
+            );
+            assert!(
+                session.backend.out.iter().any(|l| l.starts_with("kind: ")),
+                "describe {word} renders a card: {:?}",
+                session.backend.out
+            );
+        }
+    }
+
+    #[test]
+    fn describe_works_on_the_operators() {
+        let mut session = session_with(&[]);
+        for (word, expect) in [("$", "Composition"), ("&", "Environment extension")] {
+            session.backend.out.clear();
+            assert_eq!(
+                run(&mut session, &format!("describe {word}")),
+                LineResult::Ok,
+                "describe {word}"
+            );
+            let out = session.backend.out.join("\n");
+            assert!(
+                out.contains("kind: operator") && out.contains(expect),
+                "describe {word}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn describe_of_a_program_named_like_nothing_builtin_still_uses_the_backend() {
+        // `describe <single non-shell word>` keeps the expression path: resolution,
+        // backend.describe, the wiring tree.
+        let mut session = session_with(&[("memfs", provider(&["eo9:fs/fs"]))]);
+        assert_eq!(run(&mut session, "describe memfs"), LineResult::Ok);
+        assert!(session.backend.out.iter().any(|l| l == "kind: provider"));
+        // And a parenthesized shell word forces the expression path too (resolution
+        // failure, not a card) — the escape hatch if a store ever shipped such a name.
+        session.backend.out.clear();
+        let result = run(&mut session, "describe (help)");
+        assert!(matches!(result, LineResult::Error(_)), "got: {result:?}");
+    }
+
+    #[test]
     fn env_help_history_exit_and_empty_lines() {
         let mut session = session_with(&[]);
         assert_eq!(run(&mut session, ""), LineResult::Ok);
@@ -1176,6 +1256,7 @@ mod tests {
         );
         assert_eq!(run(&mut session, "exit"), LineResult::Exit);
         assert_eq!(run(&mut session, "quit"), LineResult::Exit);
+        assert_eq!(run(&mut session, "poweroff"), LineResult::Poweroff);
     }
 
     #[test]

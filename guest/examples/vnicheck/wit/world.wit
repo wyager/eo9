@@ -1,0 +1,43 @@
+// vnicheck — the virtual-NIC switch example: drive two switch ports (wired into the
+// named slots `link-a` / `link-b`) over one upstream link and verify the switching
+// policy a consumer can observe: per-port MACs, source-rewrite on send, demux by
+// destination (own unicast only), broadcast delivery to every port, and
+// unknown-unicast isolation. Composed as
+//
+//   <upstream l2> $ rename port-a link-a $ rename port-b link-b $ net.l2.switch
+//     $ vnicheck
+//
+// where the upstream is `net.l2.echo` in tests (its probe ethertypes and seen-source
+// payload convention are what the checks below read) — see that fixture's docs.
+package eo9-examples:vnicheck@0.1.0;
+
+/// Verifies the switch's per-port MACs and delivery policy over two ports.
+world vnicheck {
+    import link-a: eo9:net/l2@0.1.0;
+    import link-b: eo9:net/l2@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    variant program-success {
+        /// Every check passed; carries `mac-a=<…> mac-b=<…>` for the composer to
+        /// inspect (the derived per-port MACs).
+        verified(string),
+    }
+
+    variant program-failure {
+        /// A link-layer capability refused an operation.
+        denied,
+        /// A link-layer operation failed, carrying the l2 API's own error.
+        net(string),
+        /// A switching-policy check failed (what was expected, what happened).
+        check(string),
+        /// A console error.
+        io(string),
+    }
+
+    /// `mode`: `echo` runs the full delivery-policy suite against the `net.l2.echo`
+    /// fixture's probe behaviors; `arp` ARP-resolves the QEMU user-net gateway
+    /// (10.0.2.2) independently through both ports — the real-link sharing proof
+    /// over `net.virtio` on metal, where each reply must come back unicast to its
+    /// own port's virtual MAC.
+    export main: async func(mode: string) -> result<program-success, program-failure>;
+}

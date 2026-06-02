@@ -470,6 +470,17 @@ impl Guest for Init {
             let outcome = task::wait(&console_task).await;
             out.say(&format!("the console exited ({})", outcome_text(&outcome)));
 
+            // The poweroff intent (the console's `poweroff` builtin) flows up as a
+            // typed outcome: halt means halt — init exits regardless of running
+            // services (the embedder's teardown stops them), instead of restarting
+            // the console per ruling D.
+            if let task::ProgramOutcome::Success(value) = &outcome
+                && value.value == "poweroff-requested"
+            {
+                out.say("the console requested poweroff; init exiting");
+                return Ok(ProgramSuccess::Exited);
+            }
+
             // Scripted mode (`console-restart = never`): the console's exit is init's
             // exit. Whatever services still run die with the embedding process — the
             // process-bound lifetime of owner ruling E.

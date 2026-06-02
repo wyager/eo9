@@ -197,3 +197,18 @@ example programs used by every other area's tests.
     "cleaned backtrace" rendering is unchanged underneath. Remaining: the browser blob must register the
     import before the next `/vm` asset rebuild (plan/02 D19), and the kernel's headless `program=` runner
     still prints the raw trap text (its interactive shellexec path carries the message).
+
+14. **The all-sync bindgen convention for eager components (2026-06-02, from the area-03 eager-guest
+    spike; docs/spikes/eager-guest-forwarding.md).** Middlewares and drivers with sync cores (the
+    `eager()` single-poll convention: pci.filtered, the policy attenuators, net.l2.switch,
+    disk.virtio, net.virtio, fs.eofs, net.l4.over-l2) should generate **sync bindings in both
+    directions** via wit-bindgen's `async` filter (e.g. `async: ["-all"]` in `generate!`), keeping
+    the WIT types `async func`. Sync-lowered imports replace the `eager()` poll-once helpers with
+    plain calls (the typed "provider suspended" failure class disappears where the convention holds);
+    sync-lifted exports make the component eager-callable by the eager component above it. Two rules
+    carry the contract: (1) everything an all-sync component imports must itself be all-sync or a
+    host provider — one async-lifted guest in the chain reintroduces the yield; (2) a sync-lifted
+    task may not block, so a *parking* host op (the INTx `wait`) cannot be forwarded through an
+    all-sync middleware — drivers keep their polled fallback, and interrupt-mode pacing under
+    interposition stays a documented limitation (plan/09). Conversion is per-stub bindgen config +
+    mechanical body simplification; the seven-test matrix in eager_guest.rs is the regression net.

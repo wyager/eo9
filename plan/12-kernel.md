@@ -1510,7 +1510,46 @@ preemption/hardening work.
     wasmtime configuration is also confirmed to be exactly the no-MMU configuration (no signals, no
     reservations, no guards) — the MMU is used only for W^X, never for memory safety.
 
-65. **The display stack on metal: `gpu.virtio $ draw`, the `gpu` QEMU flag, and `check-gpu`
+65. **Executor v2 — services on metal: the kernel svc registry, boot-runs-init, and `poweroff`
+    (2026-06-02, branch `area/12-svc-v2`).** The `eo9:svc` surface moves from absent-stub to real on
+    store builds (`src/wasm/svc.rs`): a machine-lifetime registry (16 services, 256 KiB log rings,
+    64-record failure history — usermode's constants) pumped by the session drive loop beside
+    foreground children. The boot pipeline becomes kernel → init → console: `runner::boot`'s default
+    branch runs `init` from the baked store with the svc grant (a per-store generation count on
+    `KernelState`: init 2 → its console 1 → the console's children 0, never a default; `task.spawn`
+    hands children parent−1), with the baked default config `console = eosh` — out of the box, leaving
+    the shell with no services running still ends the boot, so the pre-init transcripts are preserved.
+    `program=eosh` keeps the supervisor-less direct console. The `svcdemo` token swaps in the baked
+    demo config (a cruncher worker under `restart.always`, a one-shot echo banner under
+    `restart.never`); init, restart.never/always/backoff joined `KERNEL_STORE_COMPONENTS` (38 → 42).
+    Deviations from the usermode registry, all deliberate: the policy is **compiled once at detach**
+    (on-target Cranelift is ~100 ms; usermode recompiles per decision) and only instantiated per
+    decision; service state reports running/waiting-restart/finished (no blocked split — the kernel
+    has no per-service park introspection); the service compile path skips the storedisk cache
+    (services restart from the in-memory artifact; cross-reboot caching is a follow-up); optional
+    imports outside text/rt/io fail at the spawn inside detach (the service linker registers no
+    optional flavors) rather than resolving to absent as usermode does. Capability soundness is
+    structural: the service linker carries log-capture text, the rt riders, and io buffers — no fs,
+    exec, time, entropy, pci, or svc. Three correctness fixes the work surfaced: (a) **Ctrl-C
+    ownership** — `task.wait` consumes the interrupt key only when the waiter is itself a child or the
+    root opted in (`set_root_consumes_ctrl_c`); init's wait on the console is exempt, so Ctrl-C still
+    kills the console's foreground job (and stays a no-op at the bare prompt) instead of killing the
+    console, and detached services are untouchable by it (they live outside the child table the
+    kill-cascade walks); (b) **busy-pass input wakes** — with an always-runnable service the drive loop
+    never idles, so `wake_idle` is now also called on busy passes; without it the console's parked
+    `read-line` waker was never rung and a spinning service deafened the prompt; (c) **option-default
+    parity** — `bind_args` binds an unsupplied `option<…>` parameter to `none` (the usermode binder and
+    the headless runner already did; init spawns its console with no arguments). `poweroff` rides the
+    supervision tree as a typed outcome (eosh's `program-success` gains `poweroff-requested`; init
+    exits on it regardless of running services; the kernel then stops leftovers and powers off via the
+    existing PSCI/SBI/ACPI path) — no new capability, no WIT-package change. Verified on all three
+    architectures (demos unchanged; aarch64 additionally: the svcdemo battery — list/log/stop, Ctrl-C
+    kills foreground not services, exit-restarts-console under ruling D, crash-restart under configured
+    backoff with the trapped reason in the record, storedisk + pci flows, poweroff with and without
+    services). Remaining for v3+: the L2 switch root provider; storedisk-persisted service configs +
+    logs (a `storedisk` boot could read `/services.cfg`); per-service fuel budgets; the `blocked`
+    state split; cross-reboot service compile caching.
+66. **The display stack on metal: `gpu.virtio $ draw`, the `gpu` QEMU flag, and `check-gpu`
     (2026-06-02).** The kernel store gains the gfx family (gpu.virtio, gfx.mem, gfx.none,
     gfx.deny, draw — 5 entries), all reachable at the metal prompt with zero kernel-source
     changes: the driver is an ordinary wasm component over the existing eo9:pci provider. The

@@ -385,3 +385,7 @@ usermode v1 is implemented:
 * Verified by `tests/eo9-integration/tests/svc_registry.rs` (13 tests: detach/run/log/finish, soundness
   refusals, policy validation, never/always/backoff behavior including configured backoff delays and
   budget exhaustion, stop/clear, names).
+* **v2 (metal) shipped** (2026-06-02, plan/12 D65): the kernel implements the same registry semantics
+  on its own machinery (policy compiled once at detach, instantiated per decision; the same soundness
+  short-list; stop-is-final), boot runs init with the generation-counted grant, and `poweroff` flows up
+  as eosh's typed `poweroff-requested` outcome — `exit` leaves the shell, `poweroff` halts the machine.

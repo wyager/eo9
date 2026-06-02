@@ -446,7 +446,59 @@ Match the priority order above; (1)+(2) unblock I2.
     the eo9-bundled-programs refresh happens at merge time per the established convention;
     the kernel's missing-capability hint for a missing admit-policy (D26 follow-up (a)).
 
-30. **`gfx.mem`, `gfx.none`, `gfx.deny`, and the `gpu.virtio` driver (2026-06-02).** The
+30. **`net.l2.switch` + `net.l2.echo` + `vnicheck`: the virtual-NIC switch (svc v3 — the
+    single-owner-NIC sharing story; docs/design/executor-model.md §6, 2026-06-02).** The switch
+    imports ONE upstream `eo9:net/l2` (the physical NIC's driver, or another switch — it
+    stacks) and exports two virtual NICs as the **named ports** `port-a`/`port-b` — the first
+    multi-export provider (fs.overlay's mirror image), expressible today: named interface
+    exports encode with the `implements` relationship (wit/check.sh and the kernel-store
+    precompile now handle that — the store precompiles `executable_bytes()`, the same
+    stripped form every other compile path uses). Each port is a full l2 with one interface
+    (`vnic-a`/`vnic-b`) and its own locally-administered MAC, derived deterministically from a
+    configured base (`l2-switch-config`, validated locally-administered + non-multicast;
+    documented default `02:e0:09:00:00:00`, ports = base+1/base+2 in the last octet).
+    Switching policy, deliberate: sends are forwarded upstream immediately with the port's
+    MAC overwriting the Ethernet source (no sibling/uplink spoofing at the Ethernet layer;
+    ARP-payload-level anti-spoofing is a recorded follow-up); inbound demuxes by destination
+    (broadcast/multicast to every port, own unicast only, unknown unicast **dropped, never
+    flooded** — a consumer can never observe its sibling's traffic; no hairpin); bounded
+    per-port rx queues (32 frames, drop-oldest = newest-wins), uplink drained only inside
+    `recv-frame` (consumer-pull), each drain feeding both queues. Two-slot shape: more
+    consumers stack switches (`switch $ switch $ …`); a configured port count is not
+    expressible as one component today (a world's exports are static). Wiring is renames —
+    `rename port-a link-a $ rename port-b link-b $ net.l2.switch` — and one `$` instantiates
+    the switch once, wiring that single instance to every named slot it satisfies (sharing is
+    real, not two switches). `net.l2.echo` is the deterministic frame-reflector fixture (ARP
+    replies, UDP echo with checksum recompute, broadcast/unknown-unicast probe ethertypes,
+    seen-source payload convention); `vnicheck` (named imports `link-a`/`link-b`) verifies the
+    whole observable policy in `mode echo` (tests/eo9-integration/tests/vnic_switch.rs: 4
+    tests — surface shape, policy suite, configured MAC derivation, bad-base typed refusal)
+    and ARP-resolves the QEMU gateway through both ports in `mode arp` — the metal demo over
+    `net.virtio` (one physical NIC, two virtual MACs on the wire; `cargo xtask qemu aarch64
+    pci netdump` captures the pcap: both `02:e0:09:00:00:01/02` ARP exchanges, each reply
+    unicast to its own port, the real MAC never appearing as a source). Kernel store 38 → 40
+    (switch + vnicheck; the echo fixture stays usermode-only).
+
+31. **The l4-over-switch limit, pinned (2026-06-02).** `net.l4.over-l2` riding a switch port
+    composes and compiles but cannot run: the middleware drives its l2 import eagerly
+    (single-poll, the layered-provider convention), and the switch — a guest whose exports
+    make nested guest-to-guest calls upstream — does not complete eagerly under the CM-async
+    callback ABI, so the middleware's poll sees the suspension and reports its typed `io`
+    error. Same root cause as study 09's `pci.filtered $ disk.virtio $ fs.eofs` failure
+    (GAPS: the suspended-subtask caveat); this is the second, minimal reproduction:
+    eager-poller → nested-guest-caller breaks, properly-awaiting-caller → nested-guest-caller
+    works (vnicheck), eager-poller → host-leaf-caller works (`net.l4.over-l2 $ net.virtio` on
+    metal, and depth-1 `net.l4.over-l2 $ net.l2.echo` in usermode — verified during this
+    work). tests/eo9-integration/tests/vnic_l4.rs pins the typed failure (never a trap, never
+    a hang) and carries the `#[ignore]`d acceptance test (`vnic4check`, two transport stacks
+    with distinct configured IPs over two ports) for the day the platform limit lifts — the
+    consumer is already shipped and registered. Until then, per-service virtual NICs at the
+    l4 level need the limit fixed; l2-speaking services (and everything the executor-model
+    §6(c) defers to a shared stack) are unaffected. Also surfaced: `time.monotonic-stub`
+    panics if its clock is *observed* unconfigured (the deny-path tests never reached it) —
+    its lazy documented default is a follow-up for whoever next touches the time stubs; the
+    new tests configure it explicitly.
+32. **`gfx.mem`, `gfx.none`, `gfx.deny`, and the `gpu.virtio` driver (2026-06-02).** The
     standard gfx environment mirrors the disk family: `gfx.mem` is the deterministic RAM
     framebuffer (configured WxH, documented default 640x480, never traps; present/read/clear
     with full bounds checks — out-of-bounds and bad-buffer are typed); `gfx.none`/`gfx.deny`

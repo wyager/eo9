@@ -22,6 +22,8 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-lspci",
     "eo9-example-l2check",
     "eo9-example-l4check",
+    "eo9-example-vnicheck",
+    "eo9-example-vnic4check",
     "eosh",
     // The service-boot program (executor v1, docs/design/executor-model.md).
     "init",
@@ -56,7 +58,9 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-gfx-none",
     "eo9-stub-gpu-virtio",
     "eo9-stub-net-l2-deny",
+    "eo9-stub-net-l2-echo",
     "eo9-stub-net-l2-none",
+    "eo9-stub-net-l2-switch",
     "eo9-stub-net-l3-deny",
     "eo9-stub-net-l3-none",
     "eo9-stub-net-l4-deny",
@@ -130,6 +134,13 @@ const MIN_NODE_MAJOR: u32 = 25;
 /// (`eo9-example-hello` → `hello`, `eo9-stub-entropy-seeded` → `entropy.seeded`).
 const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eosh", "eosh"),
+    // The boot supervisor and the standard restart policies (executor v2): the default
+    // boot runs init (config: console = eosh), and `detach … restart <policy>` at the
+    // metal prompt needs the policy components resolvable under /bin.
+    ("init", "init"),
+    ("eo9-stub-restart-never", "restart.never"),
+    ("eo9-stub-restart-always", "restart.always"),
+    ("eo9-stub-restart-backoff", "restart.backoff"),
     ("eo9-example-hello", "hello"),
     ("eo9-example-outcomes", "outcomes"),
     ("eo9-example-cruncher", "cruncher"),
@@ -165,6 +176,12 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // against a QEMU user-mode NIC (boot with the `pci` grant and the xtask `net` flag).
     ("eo9-stub-net-virtio", "net.virtio"),
     ("eo9-example-l2check", "l2check"),
+    // The virtual-NIC switch and its two-port check, so the single-owner-NIC sharing
+    // demo runs at the metal prompt (one physical NIC, two isolated virtual MACs):
+    //   let sw = rename port-a link-a $ rename port-b link-b $ net.l2.switch
+    //   net.virtio $ sw $ vnicheck --mode arp
+    ("eo9-stub-net-l2-switch", "net.l2.switch"),
+    ("eo9-example-vnicheck", "vnicheck"),
     ("eo9-stub-net-l4-over-l2", "net.l4.over-l2"),
     ("eo9-example-l4check", "l4check"),
     // The per-layer net stubs, the in-memory transport, and the transport conformance
@@ -1427,9 +1444,20 @@ fn build_store_image(root: &Path, target: &str) -> Result<PathBuf, String> {
         let component_path = build_guest_component(root, package)?;
         let component = std::fs::read(&component_path)
             .map_err(|err| format!("failed to read {}: {err}", component_path.display()))?;
+        // Precompile the *executable* form: components whose worlds carry named
+        // interface exports (e.g. the virtual-NIC switch's ports) encode an
+        // `implements` annotation the pinned wasmtime parser predates; stripping it is
+        // behavior-neutral and is exactly what the usermode and kernel compile paths
+        // do (eo9-component, `executable_bytes`). The store keeps the full bytes, so
+        // the algebra side stays lossless.
+        let executable = eo9_component::Component::load(component.clone())
+            .map_err(|err| {
+                format!("store component `{shell_name}` does not load as an eo9 module: {err:?}")
+            })?
+            .executable_bytes();
         let artifact_path = precompile_for_kernel(
             root,
-            &component,
+            &executable,
             package,
             &format!("store-{shell_name}.cwasm"),
             target,
@@ -2240,6 +2268,7 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
     let mut attach_disk = false;
     let mut attach_net = false;
     let mut attach_gpu = false;
+    let mut net_dump = false;
     let mut attach_store_disk = false;
     for argument in append {
         if argument == "disk" {
@@ -2248,6 +2277,12 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
             attach_net = true;
         } else if argument == "gpu" {
             attach_gpu = true;
+        } else if argument == "netdump" {
+            // Capture the user-net link to kernel/target/eo9-net.pcap (implies `net`),
+            // so link-level evidence — e.g. the virtual-NIC switch's per-port MACs in
+            // live exchanges — can be read back with tcpdump.
+            attach_net = true;
+            net_dump = true;
         } else if argument == "iommu" {
             // EXPERIMENTAL: consumed above (machine-type selection); never reaches the
             // kernel command line.
@@ -2281,6 +2316,17 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
     if attach_net {
         args.push("-netdev".into());
         args.push("user,id=eo9net".into());
+        if net_dump {
+            let pcap = root.join("kernel/target/eo9-net.pcap");
+            args.push("-object".into());
+            args.push(
+                format!(
+                    "filter-dump,id=eo9dump,netdev=eo9net,file={}",
+                    pcap.display()
+                )
+                .into(),
+            );
+        }
         args.push("-device".into());
         args.push("virtio-net-pci,netdev=eo9net,disable-legacy=on".into());
     }

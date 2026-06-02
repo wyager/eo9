@@ -385,3 +385,24 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     --address not-an-ip $ l4check` → the typed refusal on the metal console, shell survives), the
     browser harnesses (valid configs through the new construction), and byte determinism for valid
     configs unchanged.
+
+25. **The eager-guest suspension is root-caused and the fix direction is proven at the canonical-ABI
+    level (2026-06-02, branch `area/03-eager-guest`; docs/spikes/eager-guest-forwarding.md).** The
+    platform limitation behind study 09's filtered-storage failure and plan/09 D31's l4-over-switch
+    reproduction — eager single-poll middleware imports failing against guest callees — is now fully
+    mechanistic: the caller-side machinery posts `Status::Started` into a last-write-wins event slot
+    when any *queued* call's parameters are lowered, and an eager (async-lowered, single-poll) caller
+    breaks at the first event it sees; the callee's completion overwrites the slot with `Returned`
+    only if its activation never yields, and an activation yields exactly when it makes a queued call
+    of its own — async-lowered (any callee) or sync-lowered against an async-lifted guest. Host calls
+    complete inline; sync-lowered calls to sync-lifted guests are direct fused calls. Ground truth
+    established along the way: the component *type* keeps its `async` bit (composition/wiring is
+    untouched), but the validator only forbids the async canonical *option* on a sync *type*
+    (wasmparser `check_asyncness`), never a sync lift/lower of an async type — and wit-component
+    (name-prefix ABI selection) plus wit-bindgen (the `async` filter set, per-function `-import:`/
+    `-export:` spellings) already expose the allowed direction. Seven canonical-ABI fixture tests
+    (tests/eo9-integration/tests/eager_guest.rs) pin the wall, every insufficient single-knob variant,
+    and both fix shapes. **The fix is a guest-side convention, not an algebra or runtime change**: an
+    eager component sync-lowers its imports and sync-lifts its exports ("all-sync"); the chain grounds
+    out at host providers. The algebra, the WIT surface, and the vendored runtime are untouched; the
+    per-stub conversion plan lives in the spike doc and rides with area 07/09.
