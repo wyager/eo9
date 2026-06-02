@@ -141,9 +141,9 @@ struct WitInterfaceRef {
 
 #[derive(Clone, ComponentType, Lift, Lower)]
 #[component(record)]
-struct WitNamedArg {
-    name: String,
-    value: String,
+pub(super) struct WitNamedArg {
+    pub(super) name: String,
+    pub(super) value: String,
 }
 
 #[derive(Clone, ComponentType, Lift, Lower)]
@@ -317,7 +317,7 @@ fn wit_outcome(outcome: &KOutcome) -> WitProgramOutcome {
 
 /// Render a completed `main` return value into a [`KOutcome`] (the same rule as the
 /// usermode runtime's `wave::render_outcome`).
-fn render_outcome(result_ty: Option<&Type>, val: Option<&Val>) -> KOutcome {
+pub(super) fn render_outcome(result_ty: Option<&Type>, val: Option<&Val>) -> KOutcome {
     let render = |ty: Option<Type>, payload: Option<&Val>| -> (String, String) {
         match (ty, payload) {
             (Some(ty), Some(val)) => (wave::type_text(&ty), wave::render(val)),
@@ -351,9 +351,9 @@ fn render_outcome(result_ty: Option<&Type>, val: Option<&Val>) -> KOutcome {
 // -----------------------------------------------------------------------------------------
 
 /// A minimal spinlock for the single-core kernel: it exists to make the static child
-/// registry `Sync`; with one core and the lock never held across a yield it cannot
-/// actually contend.
-struct KLock<T> {
+/// registry (and the service registry in `svc.rs`) `Sync`; with one core and the lock
+/// never held across a yield it cannot actually contend.
+pub(super) struct KLock<T> {
     locked: AtomicBool,
     value: UnsafeCell<T>,
 }
@@ -362,14 +362,14 @@ struct KLock<T> {
 unsafe impl<T: Send> Sync for KLock<T> {}
 
 impl<T> KLock<T> {
-    const fn new(value: T) -> Self {
+    pub(super) const fn new(value: T) -> Self {
         KLock {
             locked: AtomicBool::new(false),
             value: UnsafeCell::new(value),
         }
     }
 
-    fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+    pub(super) fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         while self.locked.swap(true, Ordering::Acquire) {
             core::hint::spin_loop();
         }
@@ -410,6 +410,20 @@ static PARENTS: KLock<Vec<Option<u32>>> = KLock::new(Vec::new());
 /// core, set/cleared around each unlocked child poll, never nested (children do not call
 /// `drive_children`).
 static CURRENT_PARENT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Whether the *root* program's own `task.wait` consumes Ctrl-C. True when the root is
+/// the console itself (`boot_to_eosh`, headless runs — today's behavior); false when the
+/// root is the boot supervisor (`boot_to_init`), whose wait on the console must NOT eat
+/// the interrupt key — Ctrl-C belongs to the console's foreground job, exactly as it
+/// does today, and a Ctrl-C at the bare prompt stays a no-op instead of killing the
+/// console. Child waiters (the console waiting on its foreground job, a nested eosh)
+/// always consume, which `CURRENT_PARENT != MAX` identifies during their polls.
+static ROOT_CONSUMES_CTRL_C: AtomicBool = AtomicBool::new(true);
+
+/// Set whether the root program's waits consume Ctrl-C (see [`ROOT_CONSUMES_CTRL_C`]).
+pub fn set_root_consumes_ctrl_c(consumes: bool) {
+    ROOT_CONSUMES_CTRL_C.store(consumes, Ordering::Release);
+}
 
 /// Kill task `rep` and all its descendants (transitively, via [`PARENTS`]). Running/checked-out
 /// slots become `Done(Killed)` (dropping a checked-out drive future happens when its poll
@@ -650,7 +664,7 @@ fn try_preemption_demo(entries: &'static [super::store::StoreEntry]) -> Result<(
                 value: format!("{rounds}"),
             },
         ];
-        spawn_child(&engine, entries, &component, &args, None).map_err(|err| {
+        spawn_child(&engine, entries, &component, &args, None, 0).map_err(|err| {
             wasmtime::Error::msg(match err {
                 WitSpawnError::BadArguments(msg) => format!("spawn failed (bad arguments): {msg}"),
                 WitSpawnError::Internal(msg) => format!("spawn failed: {msg}"),
@@ -745,7 +759,7 @@ fn try_preemption_demo(entries: &'static [super::store::StoreEntry]) -> Result<(
 /// `parse_args` rule: every declared parameter exactly once, no unknown arguments — except
 /// that a *final* `list<…>` parameter left unsupplied defaults to the empty list, the
 /// variadic-tail convention shared with the usermode binder).
-fn bind_args(
+pub(super) fn bind_args(
     signature: &wasmtime::component::types::ComponentFunc,
     args: &[WitNamedArg],
 ) -> Result<Vec<Val>, String> {
@@ -800,6 +814,7 @@ fn spawn_child(
     component: &Component,
     args: &[WitNamedArg],
     max_memory: Option<u64>,
+    svc_generations: u32,
 ) -> Result<u32, WitSpawnError> {
     let internal = |err: wasmtime::Error| {
         let text = format!("{err:?}");
@@ -837,6 +852,10 @@ fn spawn_child(
     }
 
     let mut state = KernelState::new();
+    // The svc capability reaches exactly the configured number of generations down
+    // (owner ruling B, mirroring the usermode generation count): init holds 2, so its
+    // console holds 1, and the console's children hold 0 — never a default grant.
+    state.svc_generations = svc_generations;
     state.shell = Some(Box::new(super::shell::ShellState {
         fs: super::shellfs::ShellFs::new(entries, super::shell::session_manifest(entries)),
         buffers: super::shellfs::BufferTable::default(),
@@ -1024,9 +1043,9 @@ fn spawn_child(
 /// pristine baked-in component (which enables the host-AOT fast path in `compile` and the
 /// baked metadata in `describe`). Algebra results (`compose`/`extend`/…) carry `entry =
 /// None` and are compiled on-target.
-struct KComponent {
-    bytes: Vec<u8>,
-    entry: Option<usize>,
+pub(super) struct KComponent {
+    pub(super) bytes: Vec<u8>,
+    pub(super) entry: Option<usize>,
 }
 
 /// One compiled image: the deserialized baked-in artifact.
@@ -1079,7 +1098,7 @@ impl ShellExec {
             .ok_or_else(|| wasmtime::Error::msg(format!("unknown component handle {rep}")))
     }
 
-    fn take_component(&mut self, rep: u32) -> Result<KComponent> {
+    pub(super) fn take_component(&mut self, rep: u32) -> Result<KComponent> {
         self.components
             .get_mut(rep as usize)
             .and_then(Option::take)
@@ -1266,25 +1285,90 @@ fn fused_is_provider(bytes: &[u8]) -> bool {
 }
 
 // -----------------------------------------------------------------------------------------
+// Shared component helpers (used by the exec surface and the service registry)
+// -----------------------------------------------------------------------------------------
+
+/// Describe an open component value: baked store entries replay their precomputed
+/// metadata; algebra results are described with the eo9-component loader (on-target
+/// codegen builds only).
+pub(super) fn component_info(
+    entries: &'static [super::store::StoreEntry],
+    component: &KComponent,
+) -> Result<WitComponentInfo, String> {
+    match component.entry {
+        Some(entry) => Ok(parse_metadata(entries[entry].metadata)),
+        #[cfg(feature = "wasm-codegen")]
+        None => wit_info_from_eo9(&component.bytes).map_err(|err| format!("{err}")),
+        #[cfg(not(feature = "wasm-codegen"))]
+        None => Err("cannot describe a composed component without on-target codegen".to_string()),
+    }
+}
+
+/// The wiring view of an open component value (leaf-only on the kernel, as in the
+/// exec surface's `wiring` operation).
+pub(super) fn component_wiring(component: &KComponent) -> String {
+    #[cfg(feature = "wasm-codegen")]
+    {
+        match eo9_component::Component::load(component.bytes.clone()) {
+            Ok(loaded) => loaded.wiring_tree(),
+            Err(_) => String::from("(wiring unavailable)"),
+        }
+    }
+    #[cfg(not(feature = "wasm-codegen"))]
+    {
+        let _ = component;
+        String::from("(wiring unavailable: this kernel build has no component loader)")
+    }
+}
+
+/// Compile an open component value to a runnable artifact: the baked host-AOT artifact
+/// for pristine store entries (the fast path), on-target Cranelift for algebra results.
+/// The same rule as the exec surface's `compile`, minus the persistent disk cache —
+/// services compile exactly once at detach and restart from the in-memory artifact, so
+/// the cache would only help across reboots (recorded follow-up).
+pub(super) fn compile_component(
+    engine: &Engine,
+    entries: &'static [super::store::StoreEntry],
+    component: &KComponent,
+) -> Result<Component, String> {
+    match component.entry {
+        // SAFETY: the artifact comes from the store image produced by `cargo xtask
+        // build-kernel` with the same wasmtime version and engine configuration.
+        Some(entry) => unsafe { Component::deserialize(engine, entries[entry].artifact) }
+            .map_err(|err| format!("the baked-in artifact failed to load: {err:?}")),
+        #[cfg(feature = "wasm-codegen")]
+        None => {
+            let exec_bytes = eo9_component::Component::load(component.bytes.clone())
+                .map(|c| c.executable_bytes())
+                .unwrap_or_else(|_| component.bytes.clone());
+            Component::new(engine, &exec_bytes)
+                .map_err(|err| format!("on-target compilation failed: {err:?}"))
+        }
+        #[cfg(not(feature = "wasm-codegen"))]
+        None => Err("composed components require on-target codegen".to_string()),
+    }
+}
+
+// -----------------------------------------------------------------------------------------
 // State plumbing
 // -----------------------------------------------------------------------------------------
 
 impl KernelState {
-    fn shell_exec(&mut self) -> Result<&mut ShellExec> {
+    pub(super) fn shell_exec(&mut self) -> Result<&mut ShellExec> {
         self.shell
             .as_mut()
             .map(|shell| &mut shell.exec)
             .ok_or_else(|| wasmtime::Error::msg("the exec capability was not granted to this task"))
     }
 
-    fn shell_engine(&mut self) -> Result<Engine> {
+    pub(super) fn shell_engine(&mut self) -> Result<Engine> {
         self.shell
             .as_mut()
             .map(|shell| shell.engine.clone())
             .ok_or_else(|| wasmtime::Error::msg("the exec capability was not granted to this task"))
     }
 
-    fn shell_entries(&mut self) -> Result<&'static [super::store::StoreEntry]> {
+    pub(super) fn shell_entries(&mut self) -> Result<&'static [super::store::StoreEntry]> {
         self.shell
             .as_mut()
             .map(|shell| shell.fs.entries())
@@ -1777,12 +1861,20 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
          -> Result<(Result<Resource<ChildTaskRes>, WitSpawnError>,)> {
             let engine = store.data_mut().shell_engine()?;
             let entries = store.data_mut().shell_entries()?;
+            let child_generations = store.data().svc_generations.saturating_sub(1);
             let component = {
                 let exec = store.data_mut().shell_exec()?;
                 exec.image(image.rep())?.component.clone()
             };
             Ok((
-                match spawn_child(&engine, entries, &component, &args, limits.max_memory) {
+                match spawn_child(
+                    &engine,
+                    entries,
+                    &component,
+                    &args,
+                    limits.max_memory,
+                    child_generations,
+                ) {
                     Ok(rep) => Ok(Resource::new_own(rep)),
                     Err(err) => Err(err),
                 },
@@ -1834,8 +1926,13 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                             // so a Ctrl-C in the RX ring means "kill what I'm waiting on" and
                             // return to the prompt. Kills the awaited task and its descendants
                             // (a foreground nested eosh takes its own children down with it),
-                            // mirroring `task.kill`.
-                            if crate::uart::take_ctrl_c() {
+                            // mirroring `task.kill`. The boot supervisor's wait on the console
+                            // is exempt (ROOT_CONSUMES_CTRL_C false): the interrupt key belongs
+                            // to the console's foreground job, never to the console itself.
+                            let waiter_consumes = CURRENT_PARENT.load(Ordering::Acquire)
+                                != u32::MAX
+                                || ROOT_CONSUMES_CTRL_C.load(Ordering::Acquire);
+                            if waiter_consumes && crate::uart::take_ctrl_c() {
                                 let outcome = kill_task_tree(rep);
                                 return Poll::Ready(Ok(outcome));
                             }

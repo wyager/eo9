@@ -149,6 +149,9 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
     // Children of a previous session (there are none today, but be safe) cannot alias the
     // new session's task handles.
     shellexec::reset_children();
+    // The root program here is the console itself: its `task.wait` consumes Ctrl-C
+    // (today's behavior — the interrupt key kills the foreground job).
+    shellexec::set_root_consumes_ctrl_c(true);
 
     let engine = super::new_engine()?;
 
@@ -206,18 +209,23 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
                 Poll::Ready(Ok(())) => break,
                 Poll::Ready(Err(err)) => return Err(err),
                 Poll::Pending => {
-                    // Give every running child a turn. If any is runnable (yielded on fuel,
-                    // wants to run again now), loop straight back and re-poll without a `wfi`
-                    // so a compute-bound child runs at full speed. Only when nothing is
-                    // runnable do we idle the core in `wfi` (src/wasm/mod.rs) — until a child's
-                    // sleep deadline or a keystroke (UART RX interrupt) wakes it, which
-                    // `wake_idle` then uses to re-drive eosh's parked `read-line`. With no
-                    // children running at all (the bare prompt) that idle is a ~1 s backstop
-                    // plus the keystroke interrupt, so the core sleeps near 0% instead of
-                    // waking every 10 ms.
-                    let status = shellexec::drive_children();
-                    if !status.any_runnable {
-                        super::idle_wait(status.any_running);
+                    // Give every running child a turn — and every detached service (none can
+                    // exist on a direct-eosh boot, which holds no svc grant; the call is a
+                    // no-op on an empty registry). If any is runnable (yielded on fuel, wants
+                    // to run again now), loop straight back and re-poll without a `wfi` so a
+                    // compute-bound child runs at full speed. Only when nothing is runnable do
+                    // we idle the core in `wfi` (src/wasm/mod.rs) — until a child's sleep
+                    // deadline or a keystroke (UART RX interrupt) wakes it, which `wake_idle`
+                    // then uses to re-drive eosh's parked `read-line`. With no children
+                    // running at all (the bare prompt) that idle is a ~1 s backstop plus the
+                    // keystroke interrupt, so the core sleeps near 0% instead of waking every
+                    // 10 ms.
+                    let children = shellexec::drive_children();
+                    let services = super::svc::drive_services();
+                    let any_runnable = children.any_runnable || services.any_runnable;
+                    let any_running = children.any_running || services.any_running;
+                    if !any_runnable {
+                        super::idle_wait(any_running);
                     }
                 }
             }

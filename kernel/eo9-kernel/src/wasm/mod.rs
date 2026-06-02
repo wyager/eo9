@@ -42,6 +42,8 @@ pub mod shellfs;
 #[cfg(feature = "wasm-store")]
 pub mod store;
 #[cfg(feature = "wasm-store")]
+pub mod svc;
+#[cfg(feature = "wasm-store")]
 pub mod wave;
 
 use alloc::sync::Arc;
