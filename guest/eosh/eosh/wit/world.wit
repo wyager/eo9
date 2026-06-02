@@ -33,6 +33,12 @@ world eosh {
         /// The session ended cleanly (end of input, `exit`, or a one-shot command that
         /// completed successfully).
         exited,
+        /// The user asked to halt the machine (`poweroff`). The intent flows up the
+        /// supervision tree as a typed outcome: init exits when its console reports
+        /// it (instead of restarting the console per ruling D), and the embedder —
+        /// the kernel, or the eo9 process — then powers off / ends. A shell run
+        /// without init treats it like exit: the session ends.
+        poweroff-requested,
     }
 
     variant program-failure {
