@@ -3,7 +3,7 @@
 //! Targets the crate-local `eo9:fs-eofs/eofs` world: imports a raw block device
 //! (`eo9:disk/disk`) and exports `eo9:fs/fs` backed by the `eo9-eofs` engine — the same
 //! copy-on-write, Merkle-hashed, lz4-compressed, snapshotting filesystem the host tests
-//! and (later) the kernel use. All I/O goes through the imported disk capability, so the
+//! and the kernel use. All I/O goes through the imported disk capability, so the
 //! identical component runs over `disk.mem` in usermode today and over file-backed or
 //! virtio disks later: `disk.mem $ fs.eofs $ program`.
 //!
@@ -12,10 +12,10 @@
 //!
 //! * **First use mounts the disk.** If either uberblock slot carries the eofs magic the
 //!   image is mounted; a blank device (no magic, and all zero everywhere a common foreign
-//!   format would leave its mark — see [`eo9_eofs::probe`]) is formatted in place with
-//!   the default options (4 KiB blocks, lz4 on). A device that has the magic but fails to
-//!   mount is *never* reformatted — the error is reported instead, so corruption can't
-//!   silently become data loss; a device holding foreign data is refused outright.
+//!   format would leave its mark — see [`eo9_eofs::probe_async`]) is formatted in place
+//!   with the default options (4 KiB blocks, lz4 on). A device that has the magic but
+//!   fails to mount is *never* reformatted — the error is reported instead, so corruption
+//!   can't silently become data loss; a device holding foreign data is refused outright.
 //! * **Every completed mutating operation commits; failed ones roll back.** `write`,
 //!   `create-directory`, and `remove` each end with an eofs commit (root flip), so
 //!   completed operations are durable on the disk and crash consistency is the engine's
@@ -23,7 +23,7 @@
 //!   file: the truncation is *staged* but not committed, so it becomes durable together
 //!   with the write that follows it — a rewrite is atomic, and a failed or abandoned
 //!   rewrite leaves the file's previous contents untouched on disk (study 07, S7-4). Any
-//!   operation that fails discards every uncommitted change (`Eofs::rollback`), so
+//!   operation that fails discards every uncommitted change (`AsyncEofs::rollback`), so
 //!   half-applied state is never published. This trades write amplification for
 //!   simplicity — fine for the MVP, batching is a later refinement.
 //! * **Paths** are `/`-separated; empty and `.` segments are ignored and `..` steps up
@@ -34,12 +34,20 @@
 //!   (unlike memfs's unlink semantics). `open-exec` snapshots the contents at open time —
 //!   honest immutability by copy; pinning the Merkle object instead is a later
 //!   refinement (the hash is already content-stable).
-//! * **The disk import is driven eagerly.** The disk operations are `async func`s, but
-//!   the engine underneath is synchronous, so each call is polled to completion on the
-//!   spot; a disk that genuinely suspends makes the operation fail with an `io` error
-//!   rather than blocking. Every disk wired up today (disk.mem and other compute-only
-//!   backends) completes eagerly; the fully asynchronous bridge is a recorded follow-up
-//!   (plan/14-eofs.md).
+//! * **The disk import is genuinely awaited** (SPEC, "Boundaries are honestly async"):
+//!   the engine core runs over an [`eo9_eofs::AsyncBlockDevice`] whose operations await
+//!   the imported `eo9:disk` calls, so a disk that parks — a deferred guest chain, an
+//!   interrupt-paced driver — suspends the filesystem operation and resumes it when the
+//!   device completes, instead of failing with the old "device suspended" error. The
+//!   await's *bound* is the device layer's own (every shipped disk bounds its waits:
+//!   `disk.virtio`'s interrupt/poll limits, the host providers' eager completion), so a
+//!   filesystem operation can wait no longer than its disk is allowed to — recorded as
+//!   the deadline story in plan/14.
+//! * **Operations are serialized.** The engine is a single mutable state; while one
+//!   operation is awaiting the disk, a concurrently delivered operation fails with a
+//!   typed `io` ("the filesystem is busy") rather than corrupting state or trapping.
+//!   Every shipped consumer issues filesystem calls sequentially, so this surfaces only
+//!   under deliberately concurrent callers; a queueing upgrade is a recorded refinement.
 //! * The device size comes from the disk API's `size` query (read once per mount), and
 //!   the engine's commit-boundary flushes call straight through to the disk's `flush`,
 //!   so durability is the underlying device's (fsync for a file-backed disk, a virtio
@@ -52,11 +60,12 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::pin::pin;
-use core::task::{Context, Poll, Waker};
+use core::cell::RefCell;
 
-use eo9_eofs::{BlockDevice, DeviceError, Eofs, FormatOptions};
-use eo9_guest::provider::ProviderState;
+use eo9_eofs::{AsyncBlockDevice, AsyncEofs, DeviceError, FormatOptions};
+// Linked for its runtime contract (allocator, panic handler, diagnostics import), not
+// for any item: the provider state here is the take/put `Slot`, not `ProviderState`.
+use eo9_guest as _;
 
 wit_bindgen::generate!({
     world: "eofs",
@@ -71,23 +80,9 @@ use exports::eo9::fs::fs::{
     self, Buffer, FsError, NodeKind, NodeStat, OpenFlags, ReadResult, WriteResult,
 };
 
-/// The mounted filesystem: the eofs engine over the imported disk capability.
-static STATE: ProviderState<Eofs<DiskDevice>> = ProviderState::new();
+// --- the imported disk as an eofs async block device --------------------------------------
 
-// --- the imported disk as an eofs block device ------------------------------------------
-
-/// Drive an async disk import call that completes without suspending (see the module
-/// docs: the milestone-2 provider requires an eagerly-completing disk).
-fn poll_eager<F: Future>(future: F) -> Option<F::Output> {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    match future.as_mut().poll(&mut context) {
-        Poll::Ready(value) => Some(value),
-        Poll::Pending => None,
-    }
-}
-
-/// The imported `eo9:disk` capability seen as an eofs [`BlockDevice`].
+/// The imported `eo9:disk` capability seen as an eofs [`AsyncBlockDevice`].
 struct DiskDevice {
     handle: disk::DiskImpl,
     size: u64,
@@ -95,26 +90,25 @@ struct DiskDevice {
 
 impl DiskDevice {
     /// Take the disk's root handle and read its size from the disk API.
-    fn new() -> Result<DiskDevice, DeviceError> {
+    fn new() -> DiskDevice {
         let handle = disk::default();
         let size = disk::size(&handle);
-        Ok(DiskDevice { handle, size })
+        DiskDevice { handle, size }
     }
 }
 
-impl BlockDevice for DiskDevice {
+impl AsyncBlockDevice for DiskDevice {
     fn size(&self) -> u64 {
         self.size
     }
 
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), DeviceError> {
+    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), DeviceError> {
         if buf.is_empty() {
             return Ok(());
         }
         let len = buf.len() as u64;
         let dst = Buffer::new(len);
-        let (dst, result) =
-            poll_eager(disk::read(&self.handle, offset, dst)).ok_or(DeviceError::Io)?;
+        let (dst, result) = disk::read(&self.handle, offset, dst).await;
         // Preserve the device's own error text (a driver's typed, labelled message) so a
         // real hardware failure stays attributable at the console (study 09 finding 2).
         let read = result.map_err(|err| match err {
@@ -134,15 +128,14 @@ impl BlockDevice for DiskDevice {
         Ok(())
     }
 
-    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), DeviceError> {
+    async fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), DeviceError> {
         if data.is_empty() {
             return Ok(());
         }
         let len = data.len() as u64;
         let src = Buffer::new(len);
         src.write(0, data);
-        let (_src, result) =
-            poll_eager(disk::write(&self.handle, offset, src)).ok_or(DeviceError::Io)?;
+        let (_src, result) = disk::write(&self.handle, offset, src).await;
         let written = result.map_err(|err| match err {
             disk::WriteError::OutOfRange => DeviceError::OutOfRange,
             disk::WriteError::Io(message) => DeviceError::IoNamed(message),
@@ -159,11 +152,10 @@ impl BlockDevice for DiskDevice {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), DeviceError> {
+    async fn flush(&mut self) -> Result<(), DeviceError> {
         // The engine calls this at every commit boundary (before and after the uberblock
         // write), so durability rides on the imported disk's own flush.
-        let result = poll_eager(disk::flush(&self.handle)).ok_or(DeviceError::Io)?;
-        result.map_err(|err| match err {
+        disk::flush(&self.handle).await.map_err(|err| match err {
             disk::WriteError::OutOfRange => DeviceError::OutOfRange,
             disk::WriteError::Io(message) => DeviceError::IoNamed(message),
             disk::WriteError::ReadOnly => {
@@ -173,40 +165,101 @@ impl BlockDevice for DiskDevice {
     }
 }
 
-// --- state and error mapping -------------------------------------------------------------
+// --- state: the mounted engine, safe across awaits ----------------------------------------
+
+/// The provider's state slot. Unlike `ProviderState`, whose borrow must never be held
+/// across an await, operations here *do* await mid-operation (the disk calls), so the
+/// engine is **taken out** of the slot for the duration of an operation and put back
+/// afterwards. A second activation arriving while the slot is `Busy` gets a typed error —
+/// never a `RefCell` re-borrow trap.
+enum Slot {
+    /// Not mounted yet (first use mounts or formats).
+    Empty,
+    /// An operation is in flight (the engine is on that operation's stack).
+    Busy,
+    /// Mounted and idle.
+    Ready(AsyncEofs<DiskDevice>),
+}
+
+struct FsState {
+    inner: RefCell<Slot>,
+}
+
+// SAFETY: guest components run single-threaded (shared-memory threading is an
+// ungranted capability — see SPEC "Execution APIs"); `Sync` is only needed for the
+// `static`. Re-entrant access is handled by the `Busy` state, not by panicking.
+unsafe impl Sync for FsState {}
+
+static STATE: FsState = FsState {
+    inner: RefCell::new(Slot::Empty),
+};
+
+impl FsState {
+    /// Take the engine for one operation. `Ok(Some)` = mounted engine; `Ok(None)` = first
+    /// use (the slot is now `Busy`; mount and then [`put`](Self::put) or
+    /// [`clear`](Self::clear)); `Err` = another operation is in flight.
+    fn take(&self) -> Result<Option<AsyncEofs<DiskDevice>>, FsError> {
+        let mut slot = self.inner.borrow_mut();
+        match core::mem::replace(&mut *slot, Slot::Busy) {
+            Slot::Ready(eofs) => Ok(Some(eofs)),
+            Slot::Empty => Ok(None),
+            Slot::Busy => Err(FsError::Io(String::from(
+                "the filesystem is busy with a concurrent operation; \
+                 issue filesystem calls sequentially",
+            ))),
+        }
+    }
+
+    /// Put the engine back after an operation.
+    fn put(&self, eofs: AsyncEofs<DiskDevice>) {
+        *self.inner.borrow_mut() = Slot::Ready(eofs);
+    }
+
+    /// First-use mount failed: return the slot to `Empty` so a later call can retry.
+    fn clear(&self) {
+        *self.inner.borrow_mut() = Slot::Empty;
+    }
+}
 
 /// Mount the imported disk, formatting it first if — and only if — it is blank.
 ///
 /// "Blank" means probed as [`eo9_eofs::ImageState::Blank`]: no eofs filesystem AND the
 /// spans where any common format would leave its mark — the leading megabyte, the trailing
 /// 64 KiB, or the whole device when it is small — are all zero. A device holding anybody
-/// else's data (an ext4 image, a btrfs volume, a file pointed at by mistake) is refused, never formatted over —
-/// destroying foreign data is something only an explicit, forced `mkfs` may do (study 07,
-/// S7-2). A device with eofs remains that no longer mount is also never reformatted; its
-/// mount error is reported instead.
-fn mount_or_format() -> Result<Eofs<DiskDevice>, FsError> {
-    let device = DiskDevice::new().map_err(device_error)?;
-    // A device that reports size 0 is not "too small" — it is a device that could not be
-    // probed at all (the `eo9:disk` size query cannot fail, so an unreachable device has
-    // no meaningful size). Issue one read so the device reports its *real* typed error —
-    // e.g. a driver's "no virtio-blk function is visible …" — instead of burying the cause
-    // under a format-options message (study 09 finding 3).
-    if device.size() == 0 {
+/// else's data (an ext4 image, a btrfs volume, a file pointed at by mistake) is refused,
+/// never formatted over — destroying foreign data is something only an explicit, forced
+/// `mkfs` may do (study 07, S7-2). A device with eofs remains that no longer mount is also
+/// never reformatted; its mount error is reported instead.
+async fn mount_or_format() -> Result<AsyncEofs<DiskDevice>, FsError> {
+    let mut device = DiskDevice::new();
+    // A device that reports size 0 has not answered yet: either it cannot be probed at
+    // all, or it is a driver that brings its hardware up lazily on the first *awaited*
+    // operation (`disk.virtio` — its `size` is a synchronous query and bring-up awaits).
+    // Issue one read: a failure carries the device's *real* typed error — e.g. "no
+    // virtio-blk function is visible …" — instead of burying the cause under a
+    // format-options message (study 09 finding 3); a success means the read woke the
+    // device, so re-ask for the size and carry on mounting.
+    if device.size == 0 {
         let mut probe = [0u8; 1];
-        return match device.read_at(0, &mut probe) {
-            Err(error) => Err(device_error(error)),
-            Ok(()) => Err(FsError::Io(String::from(
-                "the disk reports a size of 0 bytes",
-            ))),
-        };
+        match device.read_at(0, &mut probe).await {
+            Err(error) => return Err(device_error(error)),
+            Ok(()) => {
+                device.size = disk::size(&device.handle);
+                if device.size == 0 {
+                    return Err(FsError::Io(String::from(
+                        "the disk reports a size of 0 bytes",
+                    )));
+                }
+            }
+        }
     }
-    match eo9_eofs::probe(&device).map_err(map_error)? {
+    match eo9_eofs::probe_async(&device).await.map_err(map_error)? {
         eo9_eofs::ImageState::Eofs { .. } | eo9_eofs::ImageState::Unmountable => {
-            Eofs::mount(device).map_err(map_error)
+            AsyncEofs::mount(device).await.map_err(map_error)
         }
-        eo9_eofs::ImageState::Blank => {
-            Eofs::format(device, &FormatOptions::default()).map_err(map_error)
-        }
+        eo9_eofs::ImageState::Blank => AsyncEofs::format(device, &FormatOptions::default())
+            .await
+            .map_err(map_error),
         eo9_eofs::ImageState::Foreign => Err(FsError::Io(String::from(
             "the disk holds data that is not an eofs filesystem; refusing to format over it. If that data is expendable, format the device explicitly: `eo9 mkfs.eofs <image> --force`",
         ))),
@@ -215,11 +268,22 @@ fn mount_or_format() -> Result<Eofs<DiskDevice>, FsError> {
 
 /// Run `f` over the mounted filesystem, mounting (or formatting a blank disk) on first
 /// use — the documented default behaviour, so the unconfigured provider never traps.
-fn with_fs<R>(f: impl FnOnce(&mut Eofs<DiskDevice>) -> Result<R, FsError>) -> Result<R, FsError> {
-    if !STATE.is_set() {
-        STATE.set(mount_or_format()?);
-    }
-    STATE.with(f)
+async fn with_fs<R>(
+    f: impl AsyncFnOnce(&mut AsyncEofs<DiskDevice>) -> Result<R, FsError>,
+) -> Result<R, FsError> {
+    let mut eofs = match STATE.take()? {
+        Some(eofs) => eofs,
+        None => match mount_or_format().await {
+            Ok(eofs) => eofs,
+            Err(error) => {
+                STATE.clear();
+                return Err(error);
+            }
+        },
+    };
+    let result = f(&mut eofs).await;
+    STATE.put(eofs);
+    result
 }
 
 /// Run a *mutating* operation over the mounted filesystem with rewrite atomicity and
@@ -227,31 +291,32 @@ fn with_fs<R>(f: impl FnOnce(&mut Eofs<DiskDevice>) -> Result<R, FsError>) -> Re
 ///
 /// * If the operation runs out of space, the copy-on-write garbage no root references any
 ///   more — superseded copies of rewritten files, the contents of removed files — is
-///   reclaimed (`Eofs::gc`) and the operation retried once. This is what keeps an image
-///   usable forever instead of bricking once its append frontier reaches the end (study
-///   07, S7-3): `rm` frees space, rewrites reuse the space of the copies they replace.
+///   reclaimed (`AsyncEofs::gc`) and the operation retried once. This is what keeps an
+///   image usable forever instead of bricking once its append frontier reaches the end
+///   (study 07, S7-3): `rm` frees space, rewrites reuse the space of the copies they
+///   replace.
 /// * If the operation still fails, every uncommitted change is discarded
-///   (`Eofs::rollback`), so a half-applied multi-step change — a truncation whose rewrite
-///   never landed, a partially built directory edit — can never be published by a later
-///   commit. The committed, on-disk state only ever moves from one fully-applied
+///   (`AsyncEofs::rollback`), so a half-applied multi-step change — a truncation whose
+///   rewrite never landed, a partially built directory edit — can never be published by a
+///   later commit. The committed, on-disk state only ever moves from one fully-applied
 ///   operation to the next.
 ///
 /// The operation must be re-runnable from any pending state it may itself have
 /// half-applied (the `open` truncate path tolerates an already-removed file for this
 /// reason); see the per-operation comments.
-fn mutate<R>(
-    f: impl Fn(&mut Eofs<DiskDevice>) -> Result<R, eo9_eofs::FsError>,
+async fn mutate<R>(
+    f: impl AsyncFn(&mut AsyncEofs<DiskDevice>) -> Result<R, eo9_eofs::FsError>,
 ) -> Result<R, FsError> {
-    with_fs(|eofs| {
-        let result = match f(eofs) {
+    with_fs(async |eofs| {
+        let result = match f(eofs).await {
             Err(eo9_eofs::FsError::NoSpace) => {
                 // Reclaim everything unreachable (the failed attempt's own orphaned
                 // blocks included — gc walks the committed and pending roots, and
                 // whatever the failure left behind is referenced by neither) and try
                 // again. The walk reads every live block, so it only runs when an
                 // allocation has actually failed, never on the fast path.
-                match eofs.gc() {
-                    Ok(_) => f(eofs),
+                match eofs.gc().await {
+                    Ok(_) => f(eofs).await,
                     // gc itself failing (a corrupt image) is more important to report
                     // than the space condition that triggered it.
                     Err(error) => Err(error),
@@ -272,6 +337,7 @@ fn mutate<R>(
             }
         }
     })
+    .await
 }
 
 fn device_error(error: DeviceError) -> FsError {
@@ -394,8 +460,8 @@ impl fs::Guest for Stub {
         let create = options.contains(OpenFlags::CREATE);
         let truncate = options.contains(OpenFlags::TRUNCATE);
         let mut truncate_pending = false;
-        mutate(|eofs| {
-            match eofs.stat(&path) {
+        mutate(async |eofs| {
+            match eofs.stat(&path).await {
                 Ok(stat) => {
                     if stat.kind == eo9_eofs::NodeKind::Directory {
                         return Err(eo9_eofs::FsError::IsADirectory);
@@ -404,22 +470,24 @@ impl fs::Guest for Stub {
                 Err(eo9_eofs::FsError::NotFound) if create => {
                     // Creating a brand-new (empty) file destroys nothing; commit it so a
                     // bare `touch` is durable on its own.
-                    eofs.create_file(&path)?;
-                    eofs.commit()?;
+                    eofs.create_file(&path).await?;
+                    eofs.commit().await?;
                 }
                 Err(error) => return Err(error),
             }
             Ok(())
-        })?;
+        })
+        .await?;
         // Truncation of an existing, non-empty file is recorded on the handle and applied
         // by the first write through it — the whole rewrite (remove + recreate + write)
         // commits as one transaction, so the previous contents survive anything short of
         // a completed replacement (study 07, S7-4).
         if truncate {
-            truncate_pending = with_fs(|eofs| {
-                Ok(matches!(eofs.stat(&path), Ok(stat) if stat.size > 0
+            truncate_pending = with_fs(async |eofs| {
+                Ok(matches!(eofs.stat(&path).await, Ok(stat) if stat.size > 0
                     && stat.kind == eo9_eofs::NodeKind::File))
-            })?;
+            })
+            .await?;
         }
         Ok(fs::File::new(OpenFile {
             path,
@@ -436,18 +504,19 @@ impl fs::Guest for Stub {
         if path.is_empty() {
             return Err(FsError::IsADirectory);
         }
-        let bytes = with_fs(|eofs| {
-            let stat = eofs.stat(&path).map_err(map_error)?;
+        let bytes = with_fs(async |eofs| {
+            let stat = eofs.stat(&path).await.map_err(map_error)?;
             if stat.kind == eo9_eofs::NodeKind::Directory {
                 return Err(FsError::IsADirectory);
             }
             let size = usize::try_from(stat.size)
                 .map_err(|_| FsError::Io(String::from("file too large for open-exec")))?;
             let mut bytes = vec![0u8; size];
-            let read = eofs.read(&path, 0, &mut bytes).map_err(map_error)?;
+            let read = eofs.read(&path, 0, &mut bytes).await.map_err(map_error)?;
             bytes.truncate(read);
             Ok(bytes)
-        })?;
+        })
+        .await?;
         // eofs is copy-on-write, so the contents behind the snapshot can never be
         // overwritten in place; copying here keeps the handle simple (pinning the Merkle
         // object instead is a recorded refinement).
@@ -459,13 +528,13 @@ impl fs::Guest for Stub {
         path: String,
     ) -> Result<Vec<String>, FsError> {
         let path = canonical(&path);
-        with_fs(|eofs| eofs.list(&path).map_err(map_error))
+        with_fs(async |eofs| eofs.list(&path).await.map_err(map_error)).await
     }
 
     async fn stat(_fs: fs::FsImplBorrow<'_>, path: String) -> Result<NodeStat, FsError> {
         let path = canonical(&path);
-        with_fs(|eofs| {
-            let stat = eofs.stat(&path).map_err(map_error)?;
+        with_fs(async |eofs| {
+            let stat = eofs.stat(&path).await.map_err(map_error)?;
             Ok(NodeStat {
                 kind: match stat.kind {
                     eo9_eofs::NodeKind::File => NodeKind::File,
@@ -478,6 +547,7 @@ impl fs::Guest for Stub {
                 },
             })
         })
+        .await
     }
 
     async fn create_directory(_fs: fs::FsImplBorrow<'_>, path: String) -> Result<(), FsError> {
@@ -485,11 +555,12 @@ impl fs::Guest for Stub {
         if path.is_empty() {
             return Err(FsError::AlreadyExists);
         }
-        mutate(|eofs| {
-            eofs.mkdir(&path)?;
-            eofs.commit()?;
+        mutate(async |eofs| {
+            eofs.mkdir(&path).await?;
+            eofs.commit().await?;
             Ok(())
         })
+        .await
     }
 
     async fn remove(_fs: fs::FsImplBorrow<'_>, path: String) -> Result<(), FsError> {
@@ -499,11 +570,12 @@ impl fs::Guest for Stub {
                 "cannot remove the root directory",
             )));
         }
-        mutate(|eofs| {
-            eofs.remove(&path)?;
-            eofs.commit()?;
+        mutate(async |eofs| {
+            eofs.remove(&path).await?;
+            eofs.commit().await?;
             Ok(())
         })
+        .await
     }
 
     async fn read(
@@ -518,10 +590,11 @@ impl fs::Guest for Stub {
             return (dst, Ok(ReadResult { bytes_read: 0 }));
         }
         let wanted = usize::try_from(dst.len()).unwrap_or(usize::MAX);
-        let result = with_fs(|eofs| {
+        let result = with_fs(async |eofs| {
             let mut bytes = vec![0u8; wanted];
             let read = eofs
                 .read(&file.path, offset, &mut bytes)
+                .await
                 .map_err(map_error)?;
             if read > 0 {
                 dst.write(0, &bytes[..read]);
@@ -529,7 +602,8 @@ impl fs::Guest for Stub {
             Ok(ReadResult {
                 bytes_read: read as u64,
             })
-        });
+        })
+        .await;
         (dst, result)
     }
 
@@ -555,21 +629,22 @@ impl fs::Guest for Stub {
         };
         let path = file.path.clone();
         let truncating = file.truncate_pending.get();
-        let result = mutate(|eofs| {
+        let result = mutate(async |eofs| {
             if truncating {
                 // The pending truncation and this write commit as one transaction: the
                 // file is replaced wholesale (eofs has no truncate primitive, so the
                 // replacement is remove + recreate). Every step is guarded so the closure
                 // can be re-run from scratch by the NoSpace retry.
-                if eofs.stat(&path).is_ok() {
-                    eofs.remove(&path)?;
+                if eofs.stat(&path).await.is_ok() {
+                    eofs.remove(&path).await?;
                 }
-                eofs.create_file(&path)?;
+                eofs.create_file(&path).await?;
             }
-            eofs.write(&path, offset, &bytes)?;
-            eofs.commit()?;
+            eofs.write(&path, offset, &bytes).await?;
+            eofs.commit().await?;
             Ok(WriteResult { bytes_written: len })
-        });
+        })
+        .await;
         if result.is_ok() {
             file.truncate_pending.set(false);
         }

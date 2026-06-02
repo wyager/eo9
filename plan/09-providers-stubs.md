@@ -498,3 +498,24 @@ Match the priority order above; (1)+(2) unblock I2.
     panics if its clock is *observed* unconfigured (the deny-path tests never reached it) —
     its lazy documented default is a follow-up for whoever next touches the time stubs; the
     new tests configure it explicitly.
+
+32. **The storage chain converts to honest awaits; the suspension wall falls for storage
+    (2026-06-02, branch `area/14-async-storage`, SPEC "Boundaries are honestly async").**
+    `disk.virtio` and `fs.eofs` no longer drive their imports with the eager single-poll: every
+    `eo9:pci` and `eo9:disk` call is genuinely awaited (the engine itself went async at the core —
+    plan/14 D25), so a downstream that defers suspends the operation instead of failing it. What
+    this changes in this plan's ledger:
+    - The "provider suspended" `io` error class is gone from `disk.virtio` and `fs.eofs`
+      (`pci.filtered`, `fs.filtered`, `fs.overlay` already awaited — verified, no change needed).
+    - **D31's interrupt-under-interposition residual is resolved by construction**: the INTx `wait`
+      is now awaited rather than single-polled, so a parking wait survives interposition — the
+      driver no longer needs its callee chain to complete eagerly. The interrupt-retry and
+      poll-spin bounds are retained, so a dead device still surfaces a typed error, never a hang.
+    - Provider state for awaiting providers is the take/put `Slot` (`Empty | Busy | Ready`) rather
+      than `ProviderState` — borrows never cross awaits, concurrent delivery gets a typed busy
+      error, never a re-borrow trap. `disk.virtio`'s synchronous `size` reports 0 until the first
+      awaited operation brings the device up; `fs.eofs` wakes it with one read and re-asks
+      (plan/14 D25).
+    - The l4-over-switch limit (D31) is the *net* lane's instance of the same wall and converts on
+      `area/09-net-async` (the parallel branch); the storage acceptance is study 09's
+      `pci.filtered $ disk.virtio $ fs.eofs $ cat` on metal.

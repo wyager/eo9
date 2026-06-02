@@ -35,13 +35,18 @@
 //! does not lie entirely within the device fails with `out-of-range` (no partial I/O),
 //! and a zero-length access at any offset up to the capacity succeeds.
 //!
-//! Like `fs.eofs`, the driver drives its imports eagerly: every `eo9:pci` operation it
-//! uses completes without suspending on the kernel (they are plain MMIO / memory
-//! operations), so the exported `read`/`write` complete in a single poll and the driver
-//! composes under consumers that poll their disk import eagerly. The documented default
-//! state (no configure interface) is "claim the first virtio-blk function on first
-//! use"; first use also prints one `disk.virtio: …` diagnostic line so a metal session
-//! shows what was probed.
+//! Like `fs.eofs`, the driver **genuinely awaits its imports** (SPEC, "Boundaries are
+//! honestly async"): every `eo9:pci` operation is awaited, so a PCI provider that defers
+//! — an attenuating guest like `pci.filtered`, an interrupt wait that parks the core —
+//! suspends the disk operation and resumes it on completion, instead of failing it. The
+//! waits stay bounded where the waiting actually happens: the interrupt path bounds its
+//! wait retries and the polled fallback bounds its spins (below), and the kernel bounds
+//! each `wait` host call, so a dead device surfaces as a typed `io` error, never a hang.
+//! The documented default state (no configure interface) is "claim the first virtio-blk
+//! function on first use"; first use also prints one `disk.virtio: …` diagnostic line so
+//! a metal session shows what was probed. One consequence of lazy bring-up: the
+//! synchronous `size` query reports 0 until the first awaited operation has brought the
+//! device up (consumers issue one read, then re-ask — see `fs.eofs`).
 //!
 //! **The DMA contract this driver relies on** (what `alloc-dma` actually guarantees on the
 //! kernel root — proposed for the WIT doc comments in plan/02 D22): allocations are
@@ -61,10 +66,11 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::pin::pin;
-use core::task::{Context, Poll, Waker};
+use core::cell::RefCell;
 
-use eo9_guest::provider::ProviderState;
+// Linked for its runtime contract (allocator, panic handler, diagnostics import); the
+// provider state here is the take/put `Slot` below, not `ProviderState`.
+use eo9_guest as _;
 
 wit_bindgen::generate!({
     world: "virtio",
@@ -174,28 +180,15 @@ const INTERRUPT_WAIT_RETRIES: u32 = 4;
 // Eager driving of the async pci imports (same pattern and reasoning as fs.eofs).
 // ------------------------------------------------------------------------------------------
 
-/// Drive an async import call that completes without suspending. Every `eo9:pci`
-/// operation the driver uses is plain MMIO / memory work in the provider, so a single
-/// poll completes it; a provider that genuinely suspends makes the operation fail with
-/// an `io` error rather than blocking the consumer's eager poll of *us*.
-fn poll_eager<F: Future>(future: F) -> Option<F::Output> {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    match future.as_mut().poll(&mut context) {
-        Poll::Ready(value) => Some(value),
-        Poll::Pending => None,
-    }
-}
-
-/// Run one PCI operation eagerly and flatten its result, labelling failures with `what`.
-fn pci_call<T>(
+/// Run one PCI operation, awaiting it (a deferring provider suspends us; our consumer
+/// awaits us in turn), and flatten its result, labelling failures with `what`.
+async fn pci_call<T>(
     what: &str,
     future: impl Future<Output = Result<T, pci::PciError>>,
 ) -> Result<T, String> {
-    match poll_eager(future) {
-        None => Err(format!("{what}: the pci provider suspended")),
-        Some(Ok(value)) => Ok(value),
-        Some(Err(error)) => Err(format!("{what}: {error:?}")),
+    match future.await {
+        Ok(value) => Ok(value),
+        Err(error) => Err(format!("{what}: {error:?}")),
     }
 }
 
@@ -248,27 +241,89 @@ enum DiskFail {
     Io(String),
 }
 
-static STATE: ProviderState<Driver> = ProviderState::new();
+/// The provider's state slot. Operations await mid-flight (the pci calls), so the driver
+/// is **taken out** of the slot for the duration of an operation and put back afterwards;
+/// a second activation arriving while the slot is `Busy` gets a typed error — never a
+/// `RefCell` re-borrow trap (the discipline `ProviderState` cannot offer across awaits).
+enum Slot {
+    /// Not brought up yet (first use probes and initializes).
+    Empty,
+    /// An operation is in flight (the driver is on that operation's stack).
+    Busy,
+    /// Brought up and idle.
+    Ready(Driver),
+}
+
+struct DriverState {
+    inner: RefCell<Slot>,
+}
+
+// SAFETY: guest components run single-threaded (shared-memory threading is an ungranted
+// capability — see SPEC "Execution APIs"); `Sync` is only needed for the `static`.
+unsafe impl Sync for DriverState {}
+
+static STATE: DriverState = DriverState {
+    inner: RefCell::new(Slot::Empty),
+};
+
+impl DriverState {
+    fn take(&self) -> Result<Option<Driver>, DiskFail> {
+        let mut slot = self.inner.borrow_mut();
+        match core::mem::replace(&mut *slot, Slot::Busy) {
+            Slot::Ready(driver) => Ok(Some(driver)),
+            Slot::Empty => Ok(None),
+            Slot::Busy => Err(DiskFail::Io(String::from(
+                "disk.virtio: the device is busy with a concurrent request; \
+                 issue disk operations sequentially",
+            ))),
+        }
+    }
+
+    fn put(&self, driver: Driver) {
+        *self.inner.borrow_mut() = Slot::Ready(driver);
+    }
+
+    fn clear(&self) {
+        *self.inner.borrow_mut() = Slot::Empty;
+    }
+
+    /// The capacity if the device is up and idle; `None` otherwise. For the synchronous
+    /// `size` query only — it cannot bring the device up (bring-up awaits).
+    fn peek_capacity(&self) -> Option<u64> {
+        match &*self.inner.borrow() {
+            Slot::Ready(driver) => Some(driver.capacity_bytes),
+            _ => None,
+        }
+    }
+}
 
 /// Run `f` over the brought-up driver, probing and initializing the device on first use
 /// (the documented default state — there is no configure interface).
-fn with_driver<R>(f: impl FnOnce(&mut Driver) -> Result<R, DiskFail>) -> Result<R, DiskFail> {
-    if !STATE.is_set() {
-        match Driver::bring_up() {
-            Ok(driver) => STATE.set(driver),
-            Err(message) => return Err(DiskFail::Io(message)),
-        }
-    }
-    STATE.with(f)
+async fn with_driver<R>(
+    f: impl AsyncFnOnce(&mut Driver) -> Result<R, DiskFail>,
+) -> Result<R, DiskFail> {
+    let mut driver = match STATE.take()? {
+        Some(driver) => driver,
+        None => match Driver::bring_up().await {
+            Ok(driver) => driver,
+            Err(message) => {
+                STATE.clear();
+                return Err(DiskFail::Io(message));
+            }
+        },
+    };
+    let result = f(&mut driver).await;
+    STATE.put(driver);
+    result
 }
 
 impl Driver {
     /// Find, claim, and bring up the first virtio-blk function visible through the
     /// granted PCI capability. Every step reports a typed, labelled error — device
     /// weirdness is an `io` failure of the disk operation, never a trap.
-    fn bring_up() -> Result<Driver, String> {
+    async fn bring_up() -> Result<Driver, String> {
         let root = pci::default();
-        let devices = pci_call("disk.virtio: enumerate", pci::enumerate(&root))?;
+        let devices = pci_call("disk.virtio: enumerate", pci::enumerate(&root)).await?;
         let target = devices
             .iter()
             .find(|d| d.vendor_id == VIRTIO_VENDOR && d.device_id == VIRTIO_BLK_MODERN)
@@ -287,10 +342,11 @@ impl Driver {
                 )
             })?;
         let address = target.address;
-        let device = pci_call("disk.virtio: open", pci::open(&root, address))?;
+        let device = pci_call("disk.virtio: open", pci::open(&root, address)).await?;
 
         // Walk the vendor-specific capabilities to find the virtio register windows.
-        let (common, notify_base, notify_multiplier, device_config, isr) = find_windows(&device)?;
+        let (common, notify_base, notify_multiplier, device_config, isr) =
+            find_windows(&device).await?;
 
         // Open each BAR the windows live in exactly once.
         let mut bar_indices: Vec<u8> = Vec::new();
@@ -306,7 +362,7 @@ impl Driver {
         }
         let mut bars: Vec<(u8, pci::Bar)> = Vec::new();
         for index in bar_indices {
-            let bar = pci_call("disk.virtio: open-bar", pci::open_bar(&device, index))?;
+            let bar = pci_call("disk.virtio: open-bar", pci::open_bar(&device, index)).await?;
             bars.push((index, bar));
         }
 
@@ -316,15 +372,15 @@ impl Driver {
         let ring = pci_call(
             "disk.virtio: alloc-dma (ring)",
             pci::alloc_dma(&device, RING_BYTES),
-        )?;
+        ).await?;
         let request = pci_call(
             "disk.virtio: alloc-dma (request)",
             pci::alloc_dma(&device, REQ_BYTES),
-        )?;
+        ).await?;
         let data = pci_call(
             "disk.virtio: alloc-dma (data)",
             pci::alloc_dma(&device, DATA_BYTES),
-        )?;
+        ).await?;
 
         let mut driver = Driver {
             _device: device,
@@ -344,7 +400,7 @@ impl Driver {
             capacity_bytes: 0,
             flush_supported: false,
         };
-        driver.start(notify_multiplier)?;
+        driver.start(notify_multiplier).await?;
 
         // Interrupt delivery: ask the provider for one INTx vector. `unsupported` (or any
         // other failure) means this platform/provider does not route PCI interrupts —
@@ -352,14 +408,11 @@ impl Driver {
         // Interrupt mode also needs the ISR window (reading it clears the device-side
         // cause), so without one the vector is not requested at all.
         if driver.isr.is_some() {
-            driver.interrupt = match poll_eager(pci::enable_interrupts(
-                &driver._device,
-                pci::InterruptKind::Intx,
-                1,
-            )) {
-                Some(Ok(mut vectors)) if !vectors.is_empty() => Some(vectors.remove(0)),
-                _ => None,
-            };
+            driver.interrupt =
+                match pci::enable_interrupts(&driver._device, pci::InterruptKind::Intx, 1).await {
+                    Ok(mut vectors) if !vectors.is_empty() => Some(vectors.remove(0)),
+                    _ => None,
+                };
         }
 
         // One best-effort diagnostic line so a metal session shows what was probed and how
@@ -383,11 +436,11 @@ impl Driver {
 
     /// Negotiate features, build the virtqueue, and read the capacity — the device side
     /// of bring-up, once the function is claimed and the DMA buffers exist.
-    fn start(&mut self, notify_multiplier: u32) -> Result<(), String> {
+    async fn start(&mut self, notify_multiplier: u32) -> Result<(), String> {
         // Reset, then ACKNOWLEDGE and DRIVER.
-        self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, 0)?;
+        self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, 0).await?;
         let mut spins = 0u32;
-        while self.common_read(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte)? != 0 {
+        while self.common_read(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte).await? != 0 {
             spins += 1;
             if spins > 1000 {
                 return Err(String::from("disk.virtio: device did not reset"));
@@ -397,44 +450,44 @@ impl Driver {
             COMMON_DEVICE_STATUS,
             pci::AccessWidth::Byte,
             STATUS_ACKNOWLEDGE,
-        )?;
+        ).await?;
         self.common_write(
             COMMON_DEVICE_STATUS,
             pci::AccessWidth::Byte,
             STATUS_ACKNOWLEDGE | STATUS_DRIVER,
-        )?;
+        ).await?;
 
         // Feature negotiation: accept exactly VIRTIO_F_VERSION_1, plus VIRTIO_BLK_F_FLUSH
         // when the device offers it (so `flush` can issue real cache flushes). The device
         // must offer VERSION_1 (it is what makes the modern register layout above valid
         // at all).
-        self.common_write(COMMON_DEVICE_FEATURE_SELECT, pci::AccessWidth::Dword, 1)?;
-        let high_features = self.common_read(COMMON_DEVICE_FEATURE, pci::AccessWidth::Dword)?;
+        self.common_write(COMMON_DEVICE_FEATURE_SELECT, pci::AccessWidth::Dword, 1).await?;
+        let high_features = self.common_read(COMMON_DEVICE_FEATURE, pci::AccessWidth::Dword).await?;
         if high_features & FEATURE_VERSION_1_HIGH == 0 {
             return Err(String::from(
                 "disk.virtio: the device does not offer VIRTIO_F_VERSION_1 \
                  (is it a legacy-only function?)",
             ));
         }
-        self.common_write(COMMON_DEVICE_FEATURE_SELECT, pci::AccessWidth::Dword, 0)?;
-        let low_features = self.common_read(COMMON_DEVICE_FEATURE, pci::AccessWidth::Dword)?;
+        self.common_write(COMMON_DEVICE_FEATURE_SELECT, pci::AccessWidth::Dword, 0).await?;
+        let low_features = self.common_read(COMMON_DEVICE_FEATURE, pci::AccessWidth::Dword).await?;
         self.flush_supported = low_features & FEATURE_BLK_FLUSH_LOW != 0;
         let low_accepted = low_features & FEATURE_BLK_FLUSH_LOW;
-        self.common_write(COMMON_DRIVER_FEATURE_SELECT, pci::AccessWidth::Dword, 0)?;
-        self.common_write(COMMON_DRIVER_FEATURE, pci::AccessWidth::Dword, low_accepted)?;
-        self.common_write(COMMON_DRIVER_FEATURE_SELECT, pci::AccessWidth::Dword, 1)?;
+        self.common_write(COMMON_DRIVER_FEATURE_SELECT, pci::AccessWidth::Dword, 0).await?;
+        self.common_write(COMMON_DRIVER_FEATURE, pci::AccessWidth::Dword, low_accepted).await?;
+        self.common_write(COMMON_DRIVER_FEATURE_SELECT, pci::AccessWidth::Dword, 1).await?;
         self.common_write(
             COMMON_DRIVER_FEATURE,
             pci::AccessWidth::Dword,
             FEATURE_VERSION_1_HIGH,
-        )?;
+        ).await?;
         let with_features_ok = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK;
         self.common_write(
             COMMON_DEVICE_STATUS,
             pci::AccessWidth::Byte,
             with_features_ok,
-        )?;
-        let status = self.common_read(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte)?;
+        ).await?;
+        let status = self.common_read(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte).await?;
         if status & STATUS_FEATURES_OK == 0 {
             return Err(String::from(
                 "disk.virtio: the device rejected the negotiated feature set",
@@ -446,18 +499,18 @@ impl Driver {
         pci_call(
             "disk.virtio: set-bus-master",
             pci::set_bus_master(&self._device, true),
-        )?;
+        ).await?;
 
         // Virtqueue 0: bound the size to QUEUE_SIZE, point the three rings at the ring
         // DMA page, remember the notify offset, and enable it.
-        let queues = self.common_read(COMMON_NUM_QUEUES, pci::AccessWidth::Word)?;
+        let queues = self.common_read(COMMON_NUM_QUEUES, pci::AccessWidth::Word).await?;
         if queues == 0 {
             return Err(String::from(
                 "disk.virtio: the device exposes no virtqueues",
             ));
         }
-        self.common_write(COMMON_QUEUE_SELECT, pci::AccessWidth::Word, 0)?;
-        let max_size = self.common_read(COMMON_QUEUE_SIZE, pci::AccessWidth::Word)?;
+        self.common_write(COMMON_QUEUE_SELECT, pci::AccessWidth::Word, 0).await?;
+        let max_size = self.common_read(COMMON_QUEUE_SIZE, pci::AccessWidth::Word).await?;
         if max_size == 0 {
             return Err(String::from("disk.virtio: virtqueue 0 is not available"));
         }
@@ -466,31 +519,31 @@ impl Driver {
             COMMON_QUEUE_SIZE,
             pci::AccessWidth::Word,
             u64::from(queue_size),
-        )?;
+        ).await?;
         // The driver owns ring initialization (virtio 1.0 §3.1.1): zero the descriptor
         // table and both rings so the device's first used-index write is the first
         // non-zero value the polling loop ever observes.
         pci::dma_write(&self.ring, 0, &[0u8; 1024]);
         let ring_address = pci::dma_address(&self.ring);
-        self.write_address(COMMON_QUEUE_DESC, ring_address + DESC_OFFSET)?;
-        self.write_address(COMMON_QUEUE_DRIVER, ring_address + AVAIL_OFFSET)?;
-        self.write_address(COMMON_QUEUE_DEVICE, ring_address + USED_OFFSET)?;
-        let queue_notify_off = self.common_read(COMMON_QUEUE_NOTIFY_OFF, pci::AccessWidth::Word)?;
+        self.write_address(COMMON_QUEUE_DESC, ring_address + DESC_OFFSET).await?;
+        self.write_address(COMMON_QUEUE_DRIVER, ring_address + AVAIL_OFFSET).await?;
+        self.write_address(COMMON_QUEUE_DEVICE, ring_address + USED_OFFSET).await?;
+        let queue_notify_off = self.common_read(COMMON_QUEUE_NOTIFY_OFF, pci::AccessWidth::Word).await?;
         self.notify_offset = self.notify.offset + queue_notify_off * u64::from(notify_multiplier);
         // Avail ring starts empty: flags 0, idx 0 (the DMA buffer is zero-filled by the
         // provider, but make the driver's published state explicit).
         pci::dma_write(&self.ring, AVAIL_OFFSET, &[0, 0, 0, 0]);
-        self.common_write(COMMON_QUEUE_ENABLE, pci::AccessWidth::Word, 1)?;
+        self.common_write(COMMON_QUEUE_ENABLE, pci::AccessWidth::Word, 1).await?;
 
         // Everything is in place: tell the device the driver is live.
         let live = with_features_ok | STATUS_DRIVER_OK;
-        self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, live)?;
+        self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, live).await?;
 
         // Capacity (in 512-byte sectors) from the device configuration window. The
         // diagnostic line (probed capacity + completion mode) is printed by `bring_up` once
         // it has also asked the provider for an interrupt vector.
-        let capacity_low = self.device_read(0, pci::AccessWidth::Dword)?;
-        let capacity_high = self.device_read(4, pci::AccessWidth::Dword)?;
+        let capacity_low = self.device_read(0, pci::AccessWidth::Dword).await?;
+        let capacity_high = self.device_read(4, pci::AccessWidth::Dword).await?;
         self.capacity_bytes = ((capacity_high << 32) | capacity_low) * SECTOR;
         self.queue_size = queue_size;
         Ok(())
@@ -506,15 +559,15 @@ impl Driver {
             .ok_or_else(|| String::from("disk.virtio: internal error: BAR not opened"))
     }
 
-    fn common_read(&self, register: u64, width: pci::AccessWidth) -> Result<u64, String> {
+    async fn common_read(&self, register: u64, width: pci::AccessWidth) -> Result<u64, String> {
         let bar = self.bar(self.common.bar)?;
         pci_call(
             "disk.virtio: common config read",
             pci::bar_read(bar, self.common.offset + register, width),
-        )
+        ).await
     }
 
-    fn common_write(
+    async fn common_write(
         &self,
         register: u64,
         width: pci::AccessWidth,
@@ -524,36 +577,37 @@ impl Driver {
         pci_call(
             "disk.virtio: common config write",
             pci::bar_write(bar, self.common.offset + register, width, value),
-        )
+        ).await
     }
 
-    fn device_read(&self, register: u64, width: pci::AccessWidth) -> Result<u64, String> {
+    async fn device_read(&self, register: u64, width: pci::AccessWidth) -> Result<u64, String> {
         let bar = self.bar(self.device_config.bar)?;
         pci_call(
             "disk.virtio: device config read",
             pci::bar_read(bar, self.device_config.offset + register, width),
-        )
+        ).await
     }
 
     /// Write a 64-bit ring address as the two dword halves the common config expects.
-    fn write_address(&self, register: u64, address: u64) -> Result<(), String> {
-        self.common_write(register, pci::AccessWidth::Dword, address & 0xffff_ffff)?;
+    async fn write_address(&self, register: u64, address: u64) -> Result<(), String> {
+        self.common_write(register, pci::AccessWidth::Dword, address & 0xffff_ffff).await?;
         self.common_write(register + 4, pci::AccessWidth::Dword, address >> 32)
+            .await
     }
 
-    fn notify_queue(&self) -> Result<(), String> {
+    async fn notify_queue(&self) -> Result<(), String> {
         let bar = self.bar(self.notify.bar)?;
         pci_call(
             "disk.virtio: queue notify",
             pci::bar_write(bar, self.notify_offset, pci::AccessWidth::Word, 0),
-        )
+        ).await
     }
 
     // --- one request ------------------------------------------------------------------------
 
     /// Transfer `sectors` sectors starting at `sector`. For a write, `payload` is the
     /// sector-aligned data to send; for a read the function returns the sectors read.
-    fn transfer(
+    async fn transfer(
         &mut self,
         write: bool,
         sector: u64,
@@ -599,8 +653,8 @@ impl Driver {
         );
 
         // Kick the device and wait (interrupt) or poll (fallback) for the completion.
-        self.notify_queue()?;
-        self.wait_for_completion("the request")?;
+        self.notify_queue().await?;
+        self.wait_for_completion("the request").await?;
 
         let status = pci::dma_read(&self.request, REQ_STATUS_OFFSET, 1)[0];
         if status != BLK_S_OK {
@@ -625,7 +679,7 @@ impl Driver {
     /// failure (bound expiry, console interrupt, no routing) falls back to the polled loop,
     /// which works everywhere and is preemptible (it burns guest fuel), so a Ctrl-C that
     /// aborted a blocked wait still kills the composition promptly.
-    fn wait_for_completion(&mut self, what: &str) -> Result<(), String> {
+    async fn wait_for_completion(&mut self, what: &str) -> Result<(), String> {
         if let Some(vector) = self.interrupt.take() {
             let mut waits = 0u32;
             let completed = loop {
@@ -636,13 +690,13 @@ impl Driver {
                     break false;
                 }
                 waits += 1;
-                match poll_eager(pci::wait(&vector)) {
+                match pci::wait(&vector).await {
                     // A delivery arrived (possibly coalesced/spurious): clear the device's
                     // ISR so the line deasserts, then re-check the used ring.
-                    Some(Ok(_deliveries)) => self.acknowledge_isr(),
-                    // Bound expiry, console interrupt, a suspending provider, or any other
-                    // failure: fall back to polling below.
-                    Some(Err(_)) | None => break false,
+                    Ok(_deliveries) => self.acknowledge_isr().await,
+                    // Bound expiry, console interrupt, or any other failure: fall back to
+                    // polling below.
+                    Err(_) => break false,
                 }
             };
             self.interrupt = Some(vector);
@@ -658,7 +712,7 @@ impl Driver {
                 if self.interrupt.is_some() {
                     // The completion may also have asserted INTx; clear it so the next
                     // interrupt wait does not see a stale delivery.
-                    self.acknowledge_isr();
+                    self.acknowledge_isr().await;
                 }
                 return Ok(());
             }
@@ -686,11 +740,11 @@ impl Driver {
 
     /// Read (and thereby clear) the device's ISR status register, deasserting its INTx
     /// line. Best-effort: a failure here only risks one spurious re-delivery.
-    fn acknowledge_isr(&self) {
+    async fn acknowledge_isr(&self) {
         if let Some(isr) = &self.isr
             && let Ok(bar) = self.bar(isr.bar)
         {
-            let _ = poll_eager(pci::bar_read(bar, isr.offset, pci::AccessWidth::Byte));
+            let _ = pci::bar_read(bar, isr.offset, pci::AccessWidth::Byte).await;
         }
     }
 
@@ -707,7 +761,7 @@ impl Driver {
     /// Issue one `VIRTIO_BLK_T_FLUSH` request, making every completed write durable.
     /// When the device did not offer `VIRTIO_BLK_F_FLUSH` it is write-through by
     /// definition and this is a successful no-op.
-    fn flush_device(&mut self) -> Result<(), DiskFail> {
+    async fn flush_device(&mut self) -> Result<(), DiskFail> {
         if !self.flush_supported {
             return Ok(());
         }
@@ -731,8 +785,9 @@ impl Driver {
             &self.avail_index.to_le_bytes(),
         );
 
-        self.notify_queue().map_err(DiskFail::Io)?;
+        self.notify_queue().await.map_err(DiskFail::Io)?;
         self.wait_for_completion("the flush")
+            .await
             .map_err(DiskFail::Io)?;
         let status = pci::dma_read(&self.request, REQ_STATUS_OFFSET, 1)[0];
         if status != BLK_S_OK {
@@ -746,7 +801,7 @@ impl Driver {
     // --- byte-addressed operations over the sector device -----------------------------------
 
     /// Read `len` bytes at byte offset `offset`.
-    fn read_bytes(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, DiskFail> {
+    async fn read_bytes(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, DiskFail> {
         self.check_range(offset, len)?;
         let mut out: Vec<u8> = Vec::with_capacity(len as usize);
         let mut cursor = offset;
@@ -761,6 +816,7 @@ impl Driver {
                 .unwrap_or(0) as u32;
             let chunk = self
                 .transfer(false, first_sector, sectors, None)
+                .await
                 .map_err(DiskFail::Io)?
                 .unwrap_or_default();
             let start = within as usize;
@@ -773,7 +829,7 @@ impl Driver {
     }
 
     /// Write `bytes` at byte offset `offset`, read–modify–writing partial edge sectors.
-    fn write_bytes(&mut self, offset: u64, bytes: &[u8]) -> Result<(), DiskFail> {
+    async fn write_bytes(&mut self, offset: u64, bytes: &[u8]) -> Result<(), DiskFail> {
         let len = bytes.len() as u64;
         self.check_range(offset, len)?;
         let mut cursor = offset;
@@ -792,6 +848,7 @@ impl Driver {
                 // Read the covering sectors, overlay the new bytes, write the span back.
                 let mut current = self
                     .transfer(false, first_sector, sectors, None)
+                    .await
                     .map_err(DiskFail::Io)?
                     .unwrap_or_default();
                 if current.len() < span as usize {
@@ -804,6 +861,7 @@ impl Driver {
                 current
             };
             self.transfer(true, first_sector, sectors, Some(&chunk))
+                .await
                 .map_err(DiskFail::Io)?;
             cursor += take;
             written += take;
@@ -828,37 +886,42 @@ impl Driver {
 
 /// Walk the configuration-space capability list and return the common, notify (plus its
 /// multiplier), device-config, and (optional) ISR windows.
-fn find_windows(
+async fn find_windows(
     device: &pci::Device,
 ) -> Result<(Region, Region, u32, Region, Option<Region>), String> {
-    let read = |offset: u32, width: pci::AccessWidth| -> Result<u64, String> {
+    async fn read(
+        device: &pci::Device,
+        offset: u32,
+        width: pci::AccessWidth,
+    ) -> Result<u64, String> {
         pci_call(
             "disk.virtio: config read",
             pci::config_read(device, offset, width),
         )
-    };
+        .await
+    }
 
     let mut common: Option<Region> = None;
     let mut notify: Option<(Region, u32)> = None;
     let mut device_config: Option<Region> = None;
     let mut isr: Option<Region> = None;
 
-    let mut pointer = (read(PCI_CAP_POINTER, pci::AccessWidth::Byte)? & 0xfc) as u32;
+    let mut pointer = (read(device, PCI_CAP_POINTER, pci::AccessWidth::Byte).await? & 0xfc) as u32;
     let mut steps = 0;
     while pointer != 0 && steps < PCI_CAP_WALK_LIMIT {
         steps += 1;
-        let id = read(pointer, pci::AccessWidth::Byte)?;
-        let next = (read(pointer + 1, pci::AccessWidth::Byte)? & 0xfc) as u32;
+        let id = read(device, pointer, pci::AccessWidth::Byte).await?;
+        let next = (read(device, pointer + 1, pci::AccessWidth::Byte).await? & 0xfc) as u32;
         if id == PCI_CAP_ID_VENDOR {
-            let cfg_type = read(pointer + 3, pci::AccessWidth::Byte)?;
-            let bar = read(pointer + 4, pci::AccessWidth::Byte)? as u8;
-            let offset = read(pointer + 8, pci::AccessWidth::Dword)?;
+            let cfg_type = read(device, pointer + 3, pci::AccessWidth::Byte).await?;
+            let bar = read(device, pointer + 4, pci::AccessWidth::Byte).await? as u8;
+            let offset = read(device, pointer + 8, pci::AccessWidth::Dword).await?;
             match cfg_type {
                 VIRTIO_PCI_CAP_COMMON if common.is_none() => {
                     common = Some(Region { bar, offset });
                 }
                 VIRTIO_PCI_CAP_NOTIFY if notify.is_none() => {
-                    let multiplier = read(pointer + 16, pci::AccessWidth::Dword)? as u32;
+                    let multiplier = read(device, pointer + 16, pci::AccessWidth::Dword).await? as u32;
                     notify = Some((Region { bar, offset }, multiplier));
                 }
                 VIRTIO_PCI_CAP_ISR if isr.is_none() => {
@@ -906,14 +969,16 @@ impl disk::Guest for Stub {
     }
 
     fn size(_dev: disk::DiskImplBorrow<'_>) -> u64 {
-        // Bring the device up if needed and report its capacity. A device that cannot be
-        // probed has no meaningful size; report 0 rather than trapping (the subsequent
-        // read/write will surface the typed `io` failure with the real reason).
-        with_driver(|driver| Ok(driver.capacity_bytes)).unwrap_or(0)
+        // `size` is a synchronous query and bring-up awaits, so it reports the capacity
+        // only once the device is up (any awaited operation brings it up). Before that —
+        // or for a device that cannot be probed at all — it reports 0 rather than
+        // trapping; consumers issue one read to wake the device (and surface its real,
+        // typed error), then ask again. `fs.eofs` does exactly this at mount.
+        STATE.peek_capacity().unwrap_or(0)
     }
 
     async fn flush(_dev: disk::DiskImplBorrow<'_>) -> Result<(), WriteError> {
-        match with_driver(|driver| driver.flush_device()) {
+        match with_driver(async |driver| driver.flush_device().await).await {
             Ok(()) => Ok(()),
             Err(DiskFail::OutOfRange) => Err(WriteError::OutOfRange),
             Err(DiskFail::Io(message)) => Err(WriteError::Io(message)),
@@ -926,7 +991,7 @@ impl disk::Guest for Stub {
         dst: Buffer,
     ) -> (Buffer, Result<ReadResult, ReadError>) {
         let len = dst.len();
-        let outcome = with_driver(|driver| driver.read_bytes(offset, len));
+        let outcome = with_driver(async |driver| driver.read_bytes(offset, len).await).await;
         match outcome {
             Ok(bytes) => {
                 if !bytes.is_empty() {
@@ -952,7 +1017,7 @@ impl disk::Guest for Stub {
         } else {
             src.read(0, len)
         };
-        let outcome = with_driver(|driver| driver.write_bytes(offset, &bytes));
+        let outcome = with_driver(async |driver| driver.write_bytes(offset, &bytes).await).await;
         match outcome {
             Ok(()) => (src, Ok(WriteResult { bytes_written: len })),
             Err(DiskFail::OutOfRange) => (src, Err(WriteError::OutOfRange)),

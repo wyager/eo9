@@ -232,3 +232,44 @@ Milestone 3 (usermode persistence: `--disk`, `mkfs.eofs`, the file-backed device
     it (test-pinned as documentation). New tests: engine-level btrfs-at-64 KiB / tail-backup /
     between-spans / small-device cases; CLI-level `zero_prefixed_foreign_volumes_are_refused_not_formatted`
     proves both victims are refused by provider and mkfs with bytes untouched.
+
+25. **The async-first conversion: one engine, two device boundaries (2026-06-02, branch
+    `area/14-async-storage`).** The D15/D22 follow-up landed, under the SPEC ruling "Boundaries are
+    honestly async" (the owner's directive that nothing stays sync because it happens to complete
+    eagerly). Shape:
+    - **`eo9-eofs` is async at its core.** The engine (CoW, Merkle, transactions, snapshots, verify,
+      gc) now runs over an `AsyncBlockDevice` (`size` sync; `read_at`/`write_at`/`flush` async) and
+      awaits every device call; recursion sites (`apply_in_dir`, `collect_level`, `verify_ptr`,
+      `mark_ptr`) box their futures, with depth still bounded by `check_object`'s validated tree
+      height. The synchronous embedders — the kernel storedisk cache, `mkfs.eofs`, the whole test
+      suite — keep the *unchanged* `BlockDevice` trait and `Eofs`/`probe`/`SnapshotView` API through a
+      facade that adapts via `SyncDevice` and drives each core future with a single poll: over a sync
+      device the core's only awaits are immediately ready, so `Pending` is unreachable by construction
+      and the facade is behaviorally identical to the pre-async engine. **No CoW/Merkle/commit logic
+      exists twice**; the kernel and `crates/eo9` compile against it without a single edit.
+    - **`fs.eofs` genuinely awaits** its disk import (`AsyncEofs<DiskDevice>` where `DiskDevice:
+      AsyncBlockDevice` awaits `eo9:disk` calls). The eager single-poll helper and its "device
+      suspended" failure class are gone. Because operations now park mid-flight, the provider state
+      moved from `ProviderState` (whose borrow must never cross an await) to a take/put slot:
+      `Empty | Busy | Ready(engine)` — an operation takes the engine out, awaits freely, puts it
+      back; a concurrently delivered operation observes `Busy` and fails with a typed `io`
+      ("filesystem is busy") rather than trapping on a re-borrow. All shipped consumers issue fs
+      calls sequentially; queueing instead of refusing is a recorded refinement.
+    - **Deadlines live where the waiting lives.** `fs.eofs` adds no clock import; its awaits are
+      bounded *transitively* by the device layer's own bounds (disk.virtio's interrupt-retry and
+      poll-spin limits, the kernel's bounded `wait`, host providers' eager completion). A disk that
+      exceeds its bounds surfaces a typed `io` error through the same await. This satisfies the
+      SPEC's "everything that parks, parks bounded" without growing the provider's import surface —
+      revisit if a genuinely unbounded device class appears.
+    - **Lazy bring-up vs the sync `size` query.** `disk.virtio` can only bring its hardware up
+      inside an awaited operation, so `size` (synchronous WIT) reports 0 until first use; the
+      `fs.eofs` mount path issues one 1-byte read on size-0 (which both wakes the device and, on
+      failure, surfaces the driver's real typed error) and then re-asks for the size.
+    - **Verification.** Engine suite (41 tests) green through the sync facade; kernel aarch64
+      full-feature build untouched and the two-boot storedisk QEMU smoke (format/miss → remount
+      txg 2/hit) green; `cargo test -p eo9 --test cli` 60/60 green pre-stub-conversion (the engine
+      facade) — the bundle refresh that re-exercises the *converted* fs.eofs in the CLI happens at
+      merge from the main checkout per the build convention; the usermode integration suite is
+      green including a new `filtered_chain_over_a_deferring_eofs_round_trips` pin (the deepest
+      awaited guest chain in usermode: readwrite → fs.filtered → fs.eofs → disk.mem, with fs.eofs
+      genuinely parking on every disk call).
