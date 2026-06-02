@@ -140,9 +140,14 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
 - **OPEN — The spec-promised "exports match nothing" warning never reaches the user**: `compose_checked`
   returns `ProviderExportsUnused`, but surfacing it in eosh/CLI is still queued. (study 05 #7)
 - Binder caveats (narrowed): depends on wasmtime 45's CM-async ABI encodings (one constants block);
-  suspended-subtask path not yet exercised end-to-end; cancellation of an in-flight forwarded call traps;
-  variant/result/flags/handle-typed configure values still refuse (with clear messages); the
-  unbakeable-shape refusal is reported under the `Internal` error variant (cosmetic tidy-up queued).
+  the suspended-subtask path **is now exercised end-to-end on the storage chain** — `fs.eofs` and
+  `disk.virtio` genuinely await, and study 09's `pci.admit-address $ pci.filtered $ disk.virtio $
+  fs.eofs` runs on metal with INTx completion through the filter (plan/14 D25/D26, plan/09 D33); the
+  net lane converts on `area/09-net-async`; cancellation of an in-flight forwarded call still traps
+  (the `area/04-async-hardening` matrix owns it — the storage providers already carry drop-guards so a
+  cancelled operation can't wedge their state slots); variant/result/flags/handle-typed configure
+  values still refuse (with clear messages); the unbakeable-shape refusal is reported under the
+  `Internal` error variant (cosmetic tidy-up queued).
 - Kernel algebra errors map to `Internal(String)` rather than the specific WIT variants; the kernel renders
   `wiring` as a leaf only; eosh `envinfo` still classifies authority by the `/types`-name heuristic.
 
