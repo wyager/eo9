@@ -1,0 +1,15 @@
+[package]
+name = "eo9-stub-gfx-mem"
+description = "Eo9 standard stub provider `gfx.mem`: exports eo9:gfx/gfx backed by a RAM framebuffer of the geometry bound by configure — the deterministic gfx environment and the readback target for tests."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

@@ -248,6 +248,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-example-draw"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-example-hello"
 version = "0.0.0"
 dependencies = [
@@ -402,6 +410,30 @@ dependencies = [
 
 [[package]]
 name = "eo9-stub-fs-readonly"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-gfx-deny"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-gfx-mem"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-gfx-none"
 version = "0.0.0"
 dependencies = [
  "eo9-guest",

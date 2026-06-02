@@ -1,0 +1,148 @@
+/// eo9:gfx — pixel output: a single framebuffer the program can query, fill, and
+/// present damage rectangles into.
+///
+/// v1 is deliberately a FRAMEBUFFER API, not a GPU API. The design constraint (plan/02
+/// Decisions): every operation must be implementable by a *dumb pre-configured
+/// framebuffer* — an address plus width/height/stride/format and nothing else, the shape
+/// U-Boot's simple-framebuffer hands a kernel on real boards — as well as by a virtio-gpu
+/// device. So there is no acceleration, no 3D, no modesetting, and no multi-display here;
+/// those are v2 candidates recorded in plan/02 (and vsync/timing is a *capability*
+/// question — a vblank clock is a timer; see SPEC, Security).
+///
+/// Pixels are `xrgb8888`: each pixel one 32-bit little-endian word `0x00RRGGBB` (byte
+/// order in memory B, G, R, X; the X byte is written as zero and ignored). Buffers
+/// passed to `present` / returned by `read` are TIGHTLY PACKED rows of the operation's
+/// rectangle — `width * 4` bytes per row, `height` rows, no padding — regardless of the
+/// framebuffer's own `stride`; the provider does the stride math. That keeps consumers
+/// independent of the backing layout (a simple-framebuffer's stride is whatever firmware
+/// chose).
+///
+/// `read` returns the last-presented pixels for the rectangle. On a memory framebuffer
+/// that is the framebuffer itself; on a device-backed provider it is the provider's own
+/// backing copy of what was presented (a screenshot of the data path, not a host-side
+/// readback). This makes every gfx provider self-verifiable: draw, read back, checksum.
+///
+/// See SPEC.md: "Eo9 API design" (async operations, owned buffers, configure shape).
+package eo9:gfx@0.1.0;
+
+/// Root-handle type, shared by the required and `-optional` flavors.
+/// (Types-only interface — see plan/02-wit.md Decisions.)
+interface types {
+    /// The gfx capability's root handle: one framebuffer.
+    resource gfx-impl;
+}
+
+interface gfx {
+    use eo9:io/buffers@0.1.0.{buffer};
+    use types.{gfx-impl};
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> gfx-impl;
+
+    /// Pixel formats. v1 supports exactly one; the field exists so a provider over a
+    /// pre-configured framebuffer can refuse honestly (via `mode`'s error) rather than
+    /// reinterpret memory if firmware picked something else.
+    enum pixel-format {
+        /// One 32-bit little-endian word per pixel, `0x00RRGGBB` (memory bytes B,G,R,X).
+        xrgb8888,
+    }
+
+    /// The framebuffer's fixed geometry, queried once and stable for the life of the
+    /// handle.
+    record mode-info {
+        /// Visible width in pixels.
+        width: u32,
+        /// Visible height in pixels.
+        height: u32,
+        /// Bytes per scanline of the *backing* framebuffer (>= width * 4). Informational
+        /// for consumers — `present`/`read` buffers are tightly packed and the provider
+        /// does the stride math — but reported so a consumer can size expectations.
+        stride: u32,
+        format: pixel-format,
+    }
+
+    /// A rectangle in framebuffer coordinates (origin top-left).
+    record rect {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    }
+
+    variant gfx-error {
+        /// Refused by policy — what `gfx.deny` answers every operation with.
+        denied,
+        /// The rectangle does not lie entirely within the mode (or overflows).
+        out-of-bounds,
+        /// The buffer does not match the rectangle (e.g. smaller than
+        /// `width * height * 4` bytes); carries the expectation.
+        bad-buffer(string),
+        io(string),
+    }
+
+    /// The framebuffer geometry. Fallible so refusing providers (`gfx.deny`) and
+    /// providers over firmware-configured framebuffers (an unsupported pixel format)
+    /// answer in the API's own vocabulary instead of inventing a fake mode.
+    mode: func(g: borrow<gfx-impl>) -> result<mode-info, gfx-error>;
+
+    /// Present pixels into `dst`: copy `src` (tightly packed rows of the rectangle)
+    /// into the framebuffer and make that damage visible. Owned buffer in, owned buffer
+    /// back out (on both success and error) — see SPEC, "Ownership and buffers".
+    /// A zero-area rectangle inside the mode succeeds and changes nothing.
+    present: async func(g: borrow<gfx-impl>, dst: rect, src: buffer)
+        -> tuple<buffer, result<_, gfx-error>>;
+
+    /// Read the last-presented pixels of `src` back as tightly packed rows (see the
+    /// package docs: the provider's backing copy, not a host-side readback). The buffer
+    /// must be at least `width * height * 4` bytes; the same owned round-trip as
+    /// `present`.
+    read: async func(g: borrow<gfx-impl>, src: rect, dst: buffer)
+        -> tuple<buffer, result<_, gfx-error>>;
+
+    /// Fill `dst` with one solid color (`0x00RRGGBB`) and make it visible. Equivalent
+    /// to presenting a constant buffer, without materializing one.
+    clear: async func(g: borrow<gfx-impl>, dst: rect, color: u32) -> result<_, gfx-error>;
+}
+
+/// Optional flavor of `gfx` (hand-written for v0; see SPEC: The capability algebra).
+interface gfx-optional {
+    use types.{gfx-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<gfx-impl>;
+}
+
+/// Compose-time configuration entry for gfx.deny: `configure` returns the root handle
+/// that the exported `gfx` serves via `default()` (see SPEC: Binary or provider, never both).
+interface deny-config {
+    use types.{gfx-impl};
+    configure: func() -> result<gfx-impl, string>;
+}
+
+/// Compose-time configuration entry for gfx.mem: `configure` binds the framebuffer
+/// geometry and returns the root handle that the exported `gfx` serves via `default()`.
+interface mem-config {
+    use types.{gfx-impl};
+    configure: func(width: u32, height: u32) -> result<gfx-impl, string>;
+}
+
+/// gfx.none — absence: exports the optional flavor answering `none`.
+world none {
+    export types;
+    export gfx-optional;
+}
+
+/// gfx.deny — refusal: exports `gfx` with every operation failing with `denied`.
+world deny {
+    export types;
+    export gfx;
+    export deny-config;
+}
+
+/// gfx.mem — a RAM-backed framebuffer of a configured size (default 640x480): the
+/// deterministic gfx environment, and the readback target for tests.
+world mem {
+    export types;
+    export gfx;
+    export mem-config;
+}
