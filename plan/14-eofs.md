@@ -232,3 +232,74 @@ Milestone 3 (usermode persistence: `--disk`, `mkfs.eofs`, the file-backed device
     it (test-pinned as documentation). New tests: engine-level btrfs-at-64 KiB / tail-backup /
     between-spans / small-device cases; CLI-level `zero_prefixed_foreign_volumes_are_refused_not_formatted`
     proves both victims are refused by provider and mkfs with bytes untouched.
+
+25. **The async-first conversion: one engine, two device boundaries (2026-06-02, branch
+    `area/14-async-storage`).** The D15/D22 follow-up landed, under the SPEC ruling "Boundaries are
+    honestly async" (the owner's directive that nothing stays sync because it happens to complete
+    eagerly). Shape:
+    - **`eo9-eofs` is async at its core.** The engine (CoW, Merkle, transactions, snapshots, verify,
+      gc) now runs over an `AsyncBlockDevice` (`size` sync; `read_at`/`write_at`/`flush` async) and
+      awaits every device call; recursion sites (`apply_in_dir`, `collect_level`, `verify_ptr`,
+      `mark_ptr`) box their futures, with depth still bounded by `check_object`'s validated tree
+      height. The synchronous embedders — the kernel storedisk cache, `mkfs.eofs`, the whole test
+      suite — keep the *unchanged* `BlockDevice` trait and `Eofs`/`probe`/`SnapshotView` API through a
+      facade that adapts via `SyncDevice` and drives each core future with a single poll: over a sync
+      device the core's only awaits are immediately ready, so `Pending` is unreachable by construction
+      and the facade is behaviorally identical to the pre-async engine. **No CoW/Merkle/commit logic
+      exists twice**; the kernel and `crates/eo9` compile against it without a single edit.
+    - **`fs.eofs` genuinely awaits** its disk import (`AsyncEofs<DiskDevice>` where `DiskDevice:
+      AsyncBlockDevice` awaits `eo9:disk` calls). The eager single-poll helper and its "device
+      suspended" failure class are gone. Because operations now park mid-flight, the provider state
+      moved from `ProviderState` (whose borrow must never cross an await) to a take/put slot:
+      `Empty | Busy | Ready(engine)` — an operation takes the engine out, awaits freely, puts it
+      back; a concurrently delivered operation observes `Busy` and fails with a typed `io`
+      ("filesystem is busy") rather than trapping on a re-borrow. All shipped consumers issue fs
+      calls sequentially; queueing instead of refusing is a recorded refinement.
+    - **Deadlines live where the waiting lives.** `fs.eofs` adds no clock import; its awaits are
+      bounded *transitively* by the device layer's own bounds (disk.virtio's interrupt-retry and
+      poll-spin limits, the kernel's bounded `wait`, host providers' eager completion). A disk that
+      exceeds its bounds surfaces a typed `io` error through the same await. This satisfies the
+      SPEC's "everything that parks, parks bounded" without growing the provider's import surface —
+      revisit if a genuinely unbounded device class appears.
+    - **Lazy bring-up vs the sync `size` query.** `disk.virtio` can only bring its hardware up
+      inside an awaited operation, so `size` (synchronous WIT) reports 0 until first use; the
+      `fs.eofs` mount path issues one 1-byte read on size-0 (which both wakes the device and, on
+      failure, surfaces the driver's real typed error) and then re-asks for the size.
+    - **Verification.** Engine suite (41 tests) green through the sync facade; kernel aarch64
+      full-feature build untouched and the two-boot storedisk QEMU smoke (format/miss → remount
+      txg 2/hit) green; `cargo test -p eo9 --test cli` 60/60 green pre-stub-conversion (the engine
+      facade) — the bundle refresh that re-exercises the *converted* fs.eofs in the CLI happens at
+      merge from the main checkout per the build convention; the usermode integration suite is
+      green including a new `filtered_chain_over_a_deferring_eofs_round_trips` pin (the deepest
+      awaited guest chain in usermode: readwrite → fs.filtered → fs.eofs → disk.mem, with fs.eofs
+      genuinely parking on every disk call).
+
+26. **Metal acceptance: study 09's filtered-storage chain runs (2026-06-02, QEMU aarch64,
+    `pci disk` boot, fresh scratch disk).** Transcript evidence, all through the *converted*
+    awaiting stubs (paced-console driver; the modern policy-component form — `pci.filtered`'s
+    own `--allow` moved to `pci.admit-address` in the policies-are-programs swap, which is what
+    study 09's pre-swap transcript still showed):
+    - Baseline, unfiltered: `disk.virtio $ fs.eofs $ readwrite --path "/keep.txt" …` →
+      `disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx
+      interrupt` / `pci: INTx delivery on line 3 served an interrupt wait (the cpu halted
+      instead of polling)` / `ok: round-tripped(10)`.
+    - **The flagship**: `pci.admit-address --allow "[{segment: 0, bus: 0, device: 3, function:
+      0}]" $ pci.filtered $ disk.virtio $ fs.eofs $ ls /` → probe line, `keep.txt`,
+      `ok: listed(1)` — the exact composition class study 09 pinned as failing with the typed
+      suspension. The INTx line shows interrupt-paced completion *through the filter*: the
+      interposed-interrupt residual (plan/09 D31) is empirically gone, not just by-construction.
+    - Next boot (scratch disk kept): the same chain with `cat /keep.txt` served `asyncfirst` —
+      power-cycle persistence through the filtered chain — and the wrong-device variant
+      (allow-list naming the rng) failed with the driver's own actionable error ("no virtio-blk
+      function is visible through the granted pci capability … check that an attenuator composed
+      in front of this driver allows the disk's address") instead of study 09 finding 3's
+      misleading "device too small" (the size-rewake path of D25).
+    - Perf: usermode A/B of the eofs round-trip test (eager master vs awaited branch, 3 runs
+      each): ~4.0s vs ~3.3s median — no measurable queueing tax (the bar was "analyze if >2x").
+      No metal op-phase instrumentation exists to time the ms-scale run phase under the
+      minutes-scale on-target compile, so the metal evidence is qualitative: completion moved
+      from polled (the eager driver's single poll could never see the interrupt wait complete)
+      to genuine halt-until-INTx, strictly less CPU burn.
+    Residual: `gpu.virtio` (merged from `area/02-gfx` while this branch was in flight) still
+    uses the eager `pci_call` convention — the next conversion in this series, deferred to the
+    gfx lane.

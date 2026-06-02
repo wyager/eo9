@@ -60,6 +60,107 @@ pub trait BlockDevice {
     fn flush(&mut self) -> Result<(), DeviceError>;
 }
 
+/// A flat, byte-addressed block device whose operations may genuinely wait.
+///
+/// This is the boundary the **async engine core** ([`AsyncEofs`](crate::AsyncEofs)) runs
+/// on: the guest provider implements it by awaiting the imported `eo9:disk` operations,
+/// so a disk that parks (an interrupt-driven driver, a deferred guest chain) suspends the
+/// filesystem operation instead of failing it. The contract is identical to
+/// [`BlockDevice`] in every other respect (ordering, flush durability, torn writes).
+///
+/// Synchronous embedders (the kernel's storedisk cache, `mkfs`, the test suite) never
+/// implement this trait; they keep [`BlockDevice`] and go through the [`Eofs`](crate::Eofs)
+/// facade, which adapts via [`SyncDevice`] — whose futures are always immediately ready,
+/// so the facade's single-poll driver never observes `Pending`.
+#[allow(async_fn_in_trait)] // single-threaded no_std: no Send bound wanted
+pub trait AsyncBlockDevice {
+    /// Device capacity in bytes.
+    fn size(&self) -> u64;
+
+    /// Read `buf.len()` bytes starting at byte `offset`.
+    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), DeviceError>;
+
+    /// Write `data` starting at byte `offset`.
+    async fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), DeviceError>;
+
+    /// Make every completed write durable.
+    async fn flush(&mut self) -> Result<(), DeviceError>;
+}
+
+/// A synchronous [`BlockDevice`] seen through the [`AsyncBlockDevice`] boundary.
+///
+/// Every future this adapter produces is ready on its first poll (the inner call has
+/// already completed by the time the future exists), which is what makes the sync
+/// [`Eofs`](crate::Eofs) facade sound: driving the async core over a `SyncDevice` can
+/// never observe `Pending`.
+pub struct SyncDevice<D: BlockDevice>(pub D);
+
+impl<D: BlockDevice> SyncDevice<D> {
+    /// Unwrap the inner device.
+    pub fn into_inner(self) -> D {
+        self.0
+    }
+}
+
+impl<D: BlockDevice> AsyncBlockDevice for SyncDevice<D> {
+    fn size(&self) -> u64 {
+        self.0.size()
+    }
+
+    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), DeviceError> {
+        self.0.read_at(offset, buf)
+    }
+
+    async fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<(), DeviceError> {
+        self.0.write_at(offset, data)
+    }
+
+    async fn flush(&mut self) -> Result<(), DeviceError> {
+        self.0.flush()
+    }
+}
+
+/// A shared reference to a synchronous device, for the read-only [`probe`](crate::probe)
+/// facade (probing only ever reads). Writing through it is a contract violation and
+/// reports [`DeviceError::Io`].
+pub(crate) struct SyncReadRef<'a, D: BlockDevice>(pub &'a D);
+
+impl<D: BlockDevice> AsyncBlockDevice for SyncReadRef<'_, D> {
+    fn size(&self) -> u64 {
+        self.0.size()
+    }
+
+    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), DeviceError> {
+        self.0.read_at(offset, buf)
+    }
+
+    async fn write_at(&mut self, _offset: u64, _data: &[u8]) -> Result<(), DeviceError> {
+        Err(DeviceError::Io)
+    }
+
+    async fn flush(&mut self) -> Result<(), DeviceError> {
+        Err(DeviceError::Io)
+    }
+}
+
+/// Drive a future from the async engine core to completion *now*.
+///
+/// Only the sync facade uses this, and only over [`SyncDevice`]/[`SyncReadRef`] — whose
+/// futures are immediately ready — so the engine core (whose only awaits are device
+/// calls) always completes on the first poll. `Pending` is unreachable by construction;
+/// reaching it would mean a sync device produced a future that parked, which no
+/// implementation in this crate can.
+pub(crate) fn poll_now<F: core::future::Future>(future: F) -> F::Output {
+    let mut future = core::pin::pin!(future);
+    let mut context = core::task::Context::from_waker(core::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        core::task::Poll::Ready(value) => value,
+        core::task::Poll::Pending => {
+            unreachable!("a synchronous device future never pends")
+        }
+    }
+}
+
 /// Checks that `offset..offset + len` lies inside a device of `size` bytes.
 fn check_range(size: u64, offset: u64, len: usize) -> Result<(), DeviceError> {
     let len = len as u64;
