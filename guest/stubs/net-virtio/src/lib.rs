@@ -27,7 +27,11 @@
 //!   completion; receive polls the used ring for the next delivered buffer, copies the
 //!   frame out, and immediately re-posts the buffer. (The PCI provider can deliver
 //!   INTx interrupts — `disk.virtio` waits on them — but this driver still polls;
-//!   converting receive to an interrupt wait is the recorded follow-up in plan/12 D59.)
+//!   converting receive to an interrupt wait is the recorded follow-up in plan/12 D59.
+//!   The used-ring polling bounds stay: every await here resolves within the call —
+//!   pci operations are plain MMIO/memory work in the provider — so the bounds are
+//!   what keep a wedged device a typed error instead of a hang, per the SPEC's
+//!   awaits-are-bounded rule.)
 //!
 //! The exported `eo9:net/l2` surface is the single interface `virtio0`: `recv-frame`
 //! that finds nothing within its short poll window reports **an empty result**
@@ -37,12 +41,13 @@
 //! (user study 08, finding F2). A frame larger than the transmit buffer fails with
 //! `frame-too-large`, and device weirdness is always a typed error, never a trap.
 //!
-//! Like `disk.virtio`, the driver drives its `eo9:pci` imports eagerly (they are plain
-//! MMIO / memory operations in the provider), so the exported operations complete in a
-//! single poll and the driver composes under consumers that poll their l2 import
-//! eagerly. The documented default state (no configure interface) is "claim the first
-//! virtio-net function on first use"; first use also prints one `net.virtio: …`
-//! diagnostic line so a metal session shows what was probed.
+//! The driver's `eo9:pci` import calls are genuine awaits (the SPEC's "boundaries are
+//! honestly async" rule): each one is plain MMIO / memory work in the provider and
+//! resolves within the call today, but nothing in this driver depends on that — a
+//! provider that suspends just parks the operation, and the consumer above absorbs the
+//! suspension by awaiting its own l2 calls. The documented default state (no configure
+//! interface) is "claim the first virtio-net function on first use"; first use also
+//! prints one `net.virtio: …` diagnostic line so a metal session shows what was probed.
 
 #![no_std]
 
@@ -52,8 +57,6 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::pin::pin;
-use core::task::{Context, Poll, Waker};
 
 use eo9_guest::provider::ProviderState;
 
@@ -172,31 +175,21 @@ const TX_POLL_LIMIT: u64 = 50_000_000;
 const RX_POLL_LIMIT: u64 = 2_000;
 
 // ------------------------------------------------------------------------------------------
-// Eager driving of the async pci imports (same pattern and reasoning as disk.virtio).
+// Awaited driving of the async pci imports.
 // ------------------------------------------------------------------------------------------
 
-/// Drive an async import call that completes without suspending. Every `eo9:pci`
-/// operation the driver uses is plain MMIO / memory work in the provider, so a single
-/// poll completes it; a provider that genuinely suspends makes the operation fail with
-/// an `io` error rather than blocking the consumer's eager poll of *us*.
-fn poll_eager<F: Future>(future: F) -> Option<F::Output> {
-    let mut future = pin!(future);
-    let mut context = Context::from_waker(Waker::noop());
-    match future.as_mut().poll(&mut context) {
-        Poll::Ready(value) => Some(value),
-        Poll::Pending => None,
-    }
-}
-
-/// Run one PCI operation eagerly and flatten its result, labelling failures with `what`.
-fn pci_call<T>(
+/// Run one PCI operation to completion and flatten its result, labelling failures with
+/// `what`. The await is genuine: a provider that completes within the call (the kernel
+/// root, `pci.deny`) resolves on the spot; one that suspends (an interposed guest
+/// middleware) parks this driver's activation, and the consumer above absorbs that by
+/// awaiting its own l2 call.
+async fn pci_call<T>(
     what: &str,
     future: impl Future<Output = Result<T, pci::PciError>>,
 ) -> Result<T, String> {
-    match poll_eager(future) {
-        None => Err(format!("{what}: the pci provider suspended")),
-        Some(Ok(value)) => Ok(value),
-        Some(Err(error)) => Err(format!("{what}: {error:?}")),
+    match future.await {
+        Ok(value) => Ok(value),
+        Err(error) => Err(format!("{what}: {error:?}")),
     }
 }
 
@@ -245,7 +238,6 @@ struct Driver {
 /// Failures of the link-layer operations, mapped to the WIT error variants by the
 /// export glue.
 enum L2Fail {
-    NoSuchInterface,
     FrameTooLarge,
     Io(String),
 }
@@ -253,34 +245,104 @@ enum L2Fail {
 impl From<L2Fail> for L2Error {
     fn from(fail: L2Fail) -> L2Error {
         match fail {
-            L2Fail::NoSuchInterface => L2Error::NoSuchInterface,
             L2Fail::FrameTooLarge => L2Error::FrameTooLarge,
             L2Fail::Io(message) => L2Error::Io(message),
         }
     }
 }
 
-static STATE: ProviderState<Driver> = ProviderState::new();
+/// The driver's home between operations. An operation takes the driver *out* of the
+/// slot for its duration (the same discipline as `net.l4.over-l2`'s link slot): a
+/// `ProviderState` borrow must never be held across an await, so the state cannot be
+/// borrowed in place while pci calls run.
+struct DriverSlot {
+    driver: Option<Driver>,
+    /// Whether bring-up has been claimed (set before the first `bring_up().await`, so a
+    /// concurrent first use cannot start a second probe; cleared again if bring-up
+    /// fails, so the next use retries).
+    brought_up: bool,
+}
 
-/// Run `f` over the brought-up driver, probing and initializing the device on first use
-/// (the documented default state — there is no configure interface).
-fn with_driver<R>(f: impl FnOnce(&mut Driver) -> Result<R, L2Fail>) -> Result<R, L2Fail> {
-    if !STATE.is_set() {
-        match Driver::bring_up() {
-            Ok(driver) => STATE.set(driver),
-            Err(message) => return Err(L2Fail::Io(message)),
+static STATE: ProviderState<DriverSlot> = ProviderState::new();
+
+/// Puts the driver back in its slot when the operation that took it finishes.
+struct DriverGuard(Option<Driver>);
+
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        if let Some(driver) = self.0.take() {
+            STATE.with(|slot| slot.driver = Some(driver));
         }
     }
-    STATE.with(f)
+}
+
+impl core::ops::Deref for DriverGuard {
+    type Target = Driver;
+    fn deref(&self) -> &Driver {
+        self.0
+            .as_ref()
+            .expect("the driver is held for the guard's lifetime")
+    }
+}
+
+impl core::ops::DerefMut for DriverGuard {
+    fn deref_mut(&mut self) -> &mut Driver {
+        self.0
+            .as_mut()
+            .expect("the driver is held for the guard's lifetime")
+    }
+}
+
+/// What `acquire_driver` found in the slot.
+enum SlotView {
+    Ready(Driver),
+    Busy,
+    NeedBringUp,
+}
+
+/// Take the driver for one operation, probing and initializing the device on first use
+/// (the documented default state — there is no configure interface). A second
+/// activation arriving while one is parked mid-operation gets a typed error, never a
+/// re-entrant borrow trap.
+async fn acquire_driver() -> Result<DriverGuard, L2Fail> {
+    if !STATE.is_set() {
+        STATE.set(DriverSlot {
+            driver: None,
+            brought_up: false,
+        });
+    }
+    let view = STATE.with(|slot| {
+        if let Some(driver) = slot.driver.take() {
+            SlotView::Ready(driver)
+        } else if slot.brought_up {
+            SlotView::Busy
+        } else {
+            slot.brought_up = true;
+            SlotView::NeedBringUp
+        }
+    });
+    match view {
+        SlotView::Ready(driver) => Ok(DriverGuard(Some(driver))),
+        SlotView::Busy => Err(L2Fail::Io(String::from(
+            "net.virtio: another operation on this device is in progress",
+        ))),
+        SlotView::NeedBringUp => match Driver::bring_up().await {
+            Ok(driver) => Ok(DriverGuard(Some(driver))),
+            Err(message) => {
+                STATE.with(|slot| slot.brought_up = false);
+                Err(L2Fail::Io(message))
+            }
+        },
+    }
 }
 
 impl Driver {
     /// Find, claim, and bring up the first virtio-net function visible through the
     /// granted PCI capability. Every step reports a typed, labelled error — device
     /// weirdness is an `io` failure of the l2 operation, never a trap.
-    fn bring_up() -> Result<Driver, String> {
+    async fn bring_up() -> Result<Driver, String> {
         let root = pci::default();
-        let devices = pci_call("net.virtio: enumerate", pci::enumerate(&root))?;
+        let devices = pci_call("net.virtio: enumerate", pci::enumerate(&root)).await?;
         let target = devices
             .iter()
             .find(|d| d.vendor_id == VIRTIO_VENDOR && d.device_id == VIRTIO_NET_MODERN)
@@ -296,10 +358,10 @@ impl Driver {
                 )
             })?;
         let address = target.address;
-        let device = pci_call("net.virtio: open", pci::open(&root, address))?;
+        let device = pci_call("net.virtio: open", pci::open(&root, address)).await?;
 
         // Walk the vendor-specific capabilities to find the virtio register windows.
-        let (common, notify_base, notify_multiplier, device_config) = find_windows(&device)?;
+        let (common, notify_base, notify_multiplier, device_config) = find_windows(&device).await?;
 
         // Open each BAR the windows live in exactly once.
         let mut bar_indices: Vec<u8> = Vec::new();
@@ -310,7 +372,7 @@ impl Driver {
         }
         let mut bars: Vec<(u8, pci::Bar)> = Vec::new();
         for index in bar_indices {
-            let bar = pci_call("net.virtio: open-bar", pci::open_bar(&device, index))?;
+            let bar = pci_call("net.virtio: open-bar", pci::open_bar(&device, index)).await?;
             bars.push((index, bar));
         }
 
@@ -321,15 +383,18 @@ impl Driver {
         let rings = pci_call(
             "net.virtio: alloc-dma (rings)",
             pci::alloc_dma(&device, RING_BYTES),
-        )?;
+        )
+        .await?;
         let rx_data = pci_call(
             "net.virtio: alloc-dma (receive buffers)",
             pci::alloc_dma(&device, RX_DATA_BYTES),
-        )?;
+        )
+        .await?;
         let tx_data = pci_call(
             "net.virtio: alloc-dma (transmit buffer)",
             pci::alloc_dma(&device, TX_DATA_BYTES),
-        )?;
+        )
+        .await?;
 
         let mut driver = Driver {
             _device: device,
@@ -354,18 +419,23 @@ impl Driver {
             },
             mac: [0; 6],
         };
-        driver.start(notify_multiplier)?;
+        driver.start(notify_multiplier).await?;
         Ok(driver)
     }
 
     /// Negotiate features, build both virtqueues, read the MAC, and pre-post the
     /// receive buffers — the device side of bring-up, once the function is claimed and
     /// the DMA buffers exist.
-    fn start(&mut self, notify_multiplier: u32) -> Result<(), String> {
+    async fn start(&mut self, notify_multiplier: u32) -> Result<(), String> {
         // Reset, then ACKNOWLEDGE and DRIVER.
-        self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, 0)?;
+        self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, 0)
+            .await?;
         let mut spins = 0u32;
-        while self.common_read(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte)? != 0 {
+        while self
+            .common_read(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte)
+            .await?
+            != 0
+        {
             spins += 1;
             if spins > 1000 {
                 return Err(String::from("net.virtio: device did not reset"));
@@ -375,20 +445,28 @@ impl Driver {
             COMMON_DEVICE_STATUS,
             pci::AccessWidth::Byte,
             STATUS_ACKNOWLEDGE,
-        )?;
+        )
+        .await?;
         self.common_write(
             COMMON_DEVICE_STATUS,
             pci::AccessWidth::Byte,
             STATUS_ACKNOWLEDGE | STATUS_DRIVER,
-        )?;
+        )
+        .await?;
 
         // Feature negotiation: VIRTIO_F_VERSION_1 is required (it is what makes the
         // modern register layout valid at all); VIRTIO_NET_F_MAC is required so the
         // device-config window carries a stable MAC address (QEMU always offers it).
-        self.common_write(COMMON_DEVICE_FEATURE_SELECT, pci::AccessWidth::Dword, 0)?;
-        let low_features = self.common_read(COMMON_DEVICE_FEATURE, pci::AccessWidth::Dword)?;
-        self.common_write(COMMON_DEVICE_FEATURE_SELECT, pci::AccessWidth::Dword, 1)?;
-        let high_features = self.common_read(COMMON_DEVICE_FEATURE, pci::AccessWidth::Dword)?;
+        self.common_write(COMMON_DEVICE_FEATURE_SELECT, pci::AccessWidth::Dword, 0)
+            .await?;
+        let low_features = self
+            .common_read(COMMON_DEVICE_FEATURE, pci::AccessWidth::Dword)
+            .await?;
+        self.common_write(COMMON_DEVICE_FEATURE_SELECT, pci::AccessWidth::Dword, 1)
+            .await?;
+        let high_features = self
+            .common_read(COMMON_DEVICE_FEATURE, pci::AccessWidth::Dword)
+            .await?;
         if high_features & FEATURE_VERSION_1_HIGH == 0 {
             return Err(String::from(
                 "net.virtio: the device does not offer VIRTIO_F_VERSION_1 \
@@ -400,25 +478,32 @@ impl Driver {
                 "net.virtio: the device does not offer VIRTIO_NET_F_MAC",
             ));
         }
-        self.common_write(COMMON_DRIVER_FEATURE_SELECT, pci::AccessWidth::Dword, 0)?;
+        self.common_write(COMMON_DRIVER_FEATURE_SELECT, pci::AccessWidth::Dword, 0)
+            .await?;
         self.common_write(
             COMMON_DRIVER_FEATURE,
             pci::AccessWidth::Dword,
             FEATURE_MAC_LOW,
-        )?;
-        self.common_write(COMMON_DRIVER_FEATURE_SELECT, pci::AccessWidth::Dword, 1)?;
+        )
+        .await?;
+        self.common_write(COMMON_DRIVER_FEATURE_SELECT, pci::AccessWidth::Dword, 1)
+            .await?;
         self.common_write(
             COMMON_DRIVER_FEATURE,
             pci::AccessWidth::Dword,
             FEATURE_VERSION_1_HIGH,
-        )?;
+        )
+        .await?;
         let with_features_ok = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK;
         self.common_write(
             COMMON_DEVICE_STATUS,
             pci::AccessWidth::Byte,
             with_features_ok,
-        )?;
-        let status = self.common_read(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte)?;
+        )
+        .await?;
+        let status = self
+            .common_read(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte)
+            .await?;
         if status & STATUS_FEATURES_OK == 0 {
             return Err(String::from(
                 "net.virtio: the device rejected the negotiated feature set",
@@ -430,33 +515,39 @@ impl Driver {
         pci_call(
             "net.virtio: set-bus-master",
             pci::set_bus_master(&self._device, true),
-        )?;
+        )
+        .await?;
 
         // Queues 0 (receive) and 1 (transmit).
-        let queues = self.common_read(COMMON_NUM_QUEUES, pci::AccessWidth::Word)?;
+        let queues = self
+            .common_read(COMMON_NUM_QUEUES, pci::AccessWidth::Word)
+            .await?;
         if queues < 2 {
             return Err(format!(
                 "net.virtio: the device exposes {queues} virtqueue(s); a net device needs \
                  a receive and a transmit queue"
             ));
         }
-        self.rx = self.setup_queue(0, RX_RING_BASE, notify_multiplier)?;
-        self.tx = self.setup_queue(1, TX_RING_BASE, notify_multiplier)?;
+        self.rx = self.setup_queue(0, RX_RING_BASE, notify_multiplier).await?;
+        self.tx = self.setup_queue(1, TX_RING_BASE, notify_multiplier).await?;
 
         // Everything is in place: tell the device the driver is live.
         let live = with_features_ok | STATUS_DRIVER_OK;
-        self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, live)?;
+        self.common_write(COMMON_DEVICE_STATUS, pci::AccessWidth::Byte, live)
+            .await?;
 
         // The MAC address from the device configuration window (valid because
         // VIRTIO_NET_F_MAC was negotiated).
         let mut mac = [0u8; 6];
         for (index, byte) in mac.iter_mut().enumerate() {
-            *byte = self.device_read(index as u64, pci::AccessWidth::Byte)? as u8;
+            *byte = self
+                .device_read(index as u64, pci::AccessWidth::Byte)
+                .await? as u8;
         }
         self.mac = mac;
 
         // Hand the device its receive buffers and open the doorbell once.
-        self.post_initial_receive_buffers()?;
+        self.post_initial_receive_buffers().await?;
 
         // One best-effort diagnostic line so a metal session shows what was probed.
         let handle = text::default();
@@ -473,7 +564,7 @@ impl Driver {
 
     /// Select queue `index`, size it, point its rings at `ring_base` within the ring
     /// page, and enable it.
-    fn setup_queue(
+    async fn setup_queue(
         &mut self,
         index: u16,
         ring_base: u64,
@@ -483,24 +574,34 @@ impl Driver {
             COMMON_QUEUE_SELECT,
             pci::AccessWidth::Word,
             u64::from(index),
-        )?;
-        let max_size = self.common_read(COMMON_QUEUE_SIZE, pci::AccessWidth::Word)?;
+        )
+        .await?;
+        let max_size = self
+            .common_read(COMMON_QUEUE_SIZE, pci::AccessWidth::Word)
+            .await?;
         if max_size == 0 {
             return Err(format!("net.virtio: virtqueue {index} is not available"));
         }
         let size = core::cmp::min(max_size, u64::from(QUEUE_SIZE)) as u16;
-        self.common_write(COMMON_QUEUE_SIZE, pci::AccessWidth::Word, u64::from(size))?;
+        self.common_write(COMMON_QUEUE_SIZE, pci::AccessWidth::Word, u64::from(size))
+            .await?;
         // The driver owns ring initialization (virtio 1.0 §3.1.1): zero the descriptor
         // table and both rings so the device's first used-index write is the first
         // non-zero value the polling loops ever observe.
         pci::dma_write(&self.rings, ring_base, &[0u8; 1024]);
         let ring_address = pci::dma_address(&self.rings) + ring_base;
-        self.write_address(COMMON_QUEUE_DESC, ring_address + DESC_OFFSET)?;
-        self.write_address(COMMON_QUEUE_DRIVER, ring_address + AVAIL_OFFSET)?;
-        self.write_address(COMMON_QUEUE_DEVICE, ring_address + USED_OFFSET)?;
-        let queue_notify_off = self.common_read(COMMON_QUEUE_NOTIFY_OFF, pci::AccessWidth::Word)?;
+        self.write_address(COMMON_QUEUE_DESC, ring_address + DESC_OFFSET)
+            .await?;
+        self.write_address(COMMON_QUEUE_DRIVER, ring_address + AVAIL_OFFSET)
+            .await?;
+        self.write_address(COMMON_QUEUE_DEVICE, ring_address + USED_OFFSET)
+            .await?;
+        let queue_notify_off = self
+            .common_read(COMMON_QUEUE_NOTIFY_OFF, pci::AccessWidth::Word)
+            .await?;
         let notify_offset = self.notify.offset + queue_notify_off * u64::from(notify_multiplier);
-        self.common_write(COMMON_QUEUE_ENABLE, pci::AccessWidth::Word, 1)?;
+        self.common_write(COMMON_QUEUE_ENABLE, pci::AccessWidth::Word, 1)
+            .await?;
         Ok(Queue {
             notify_offset,
             size,
@@ -511,7 +612,7 @@ impl Driver {
 
     /// Post every receive slot to the device: descriptor `i` covers slot `i`, the avail
     /// ring publishes them all, and one kick tells the device its buffers are there.
-    fn post_initial_receive_buffers(&mut self) -> Result<(), String> {
+    async fn post_initial_receive_buffers(&mut self) -> Result<(), String> {
         let rx_address = pci::dma_address(&self.rx_data);
         for slot in 0..RX_SLOTS {
             self.write_descriptor(
@@ -535,7 +636,7 @@ impl Driver {
             RX_RING_BASE + AVAIL_OFFSET + 2,
             &self.rx.avail_index.to_le_bytes(),
         );
-        self.notify_queue(0, self.rx.notify_offset)
+        self.notify_queue(0, self.rx.notify_offset).await
     }
 
     // --- register access helpers ----------------------------------------------------------
@@ -548,15 +649,16 @@ impl Driver {
             .ok_or_else(|| String::from("net.virtio: internal error: BAR not opened"))
     }
 
-    fn common_read(&self, register: u64, width: pci::AccessWidth) -> Result<u64, String> {
+    async fn common_read(&self, register: u64, width: pci::AccessWidth) -> Result<u64, String> {
         let bar = self.bar(self.common.bar)?;
         pci_call(
             "net.virtio: common config read",
             pci::bar_read(bar, self.common.offset + register, width),
         )
+        .await
     }
 
-    fn common_write(
+    async fn common_write(
         &self,
         register: u64,
         width: pci::AccessWidth,
@@ -567,29 +669,34 @@ impl Driver {
             "net.virtio: common config write",
             pci::bar_write(bar, self.common.offset + register, width, value),
         )
+        .await
     }
 
-    fn device_read(&self, register: u64, width: pci::AccessWidth) -> Result<u64, String> {
+    async fn device_read(&self, register: u64, width: pci::AccessWidth) -> Result<u64, String> {
         let bar = self.bar(self.device_config.bar)?;
         pci_call(
             "net.virtio: device config read",
             pci::bar_read(bar, self.device_config.offset + register, width),
         )
+        .await
     }
 
     /// Write a 64-bit ring address as the two dword halves the common config expects.
-    fn write_address(&self, register: u64, address: u64) -> Result<(), String> {
-        self.common_write(register, pci::AccessWidth::Dword, address & 0xffff_ffff)?;
+    async fn write_address(&self, register: u64, address: u64) -> Result<(), String> {
+        self.common_write(register, pci::AccessWidth::Dword, address & 0xffff_ffff)
+            .await?;
         self.common_write(register + 4, pci::AccessWidth::Dword, address >> 32)
+            .await
     }
 
     /// Ring the doorbell for queue `index` at its precomputed notify offset.
-    fn notify_queue(&self, index: u16, notify_offset: u64) -> Result<(), String> {
+    async fn notify_queue(&self, index: u16, notify_offset: u64) -> Result<(), String> {
         let bar = self.bar(self.notify.bar)?;
         pci_call(
             "net.virtio: queue notify",
             pci::bar_write(bar, notify_offset, pci::AccessWidth::Word, u64::from(index)),
         )
+        .await
     }
 
     /// Write one 16-byte split-virtqueue descriptor for the queue whose rings start at
@@ -642,7 +749,7 @@ impl Driver {
 
     /// Transmit one Ethernet frame: virtio-net header (zeroed — no offloads) + frame,
     /// one descriptor, kick, poll the used ring for the device to consume it.
-    fn send(&mut self, frame: &[u8]) -> Result<u64, L2Fail> {
+    async fn send(&mut self, frame: &[u8]) -> Result<u64, L2Fail> {
         let frame_len = frame.len() as u64;
         if frame_len > MAX_FRAME {
             return Err(L2Fail::FrameTooLarge);
@@ -673,6 +780,7 @@ impl Driver {
             &self.tx.avail_index.to_le_bytes(),
         );
         self.notify_queue(1, self.tx.notify_offset)
+            .await
             .map_err(L2Fail::Io)?;
 
         let mut spins: u64 = 0;
@@ -693,7 +801,7 @@ impl Driver {
     /// returns an empty frame ("nothing waiting right now") so the consumer decides how
     /// long to keep waiting; runts and unusable completions also come back empty (they
     /// are wire noise, not driver failures).
-    fn recv(&mut self, max_len: u64) -> Result<Vec<u8>, L2Fail> {
+    async fn recv(&mut self, max_len: u64) -> Result<Vec<u8>, L2Fail> {
         let mut spins: u64 = 0;
         while self.used_index(RX_RING_BASE) == self.rx.used_index {
             spins += 1;
@@ -744,6 +852,7 @@ impl Driver {
                 &self.rx.avail_index.to_le_bytes(),
             );
             self.notify_queue(0, self.rx.notify_offset)
+                .await
                 .map_err(L2Fail::Io)?;
         }
 
@@ -766,36 +875,44 @@ fn format_mac(mac: &[u8; 6]) -> String {
 // Capability-window discovery (the vendor-specific PCI capabilities).
 // ------------------------------------------------------------------------------------------
 
+/// One capability-list configuration-space read.
+async fn config_read(
+    device: &pci::Device,
+    offset: u32,
+    width: pci::AccessWidth,
+) -> Result<u64, String> {
+    pci_call(
+        "net.virtio: config read",
+        pci::config_read(device, offset, width),
+    )
+    .await
+}
+
 /// Walk the configuration-space capability list and return the common, notify (plus its
 /// multiplier), and device-config windows.
-fn find_windows(device: &pci::Device) -> Result<(Region, Region, u32, Region), String> {
-    let read = |offset: u32, width: pci::AccessWidth| -> Result<u64, String> {
-        pci_call(
-            "net.virtio: config read",
-            pci::config_read(device, offset, width),
-        )
-    };
-
+async fn find_windows(device: &pci::Device) -> Result<(Region, Region, u32, Region), String> {
     let mut common: Option<Region> = None;
     let mut notify: Option<(Region, u32)> = None;
     let mut device_config: Option<Region> = None;
 
-    let mut pointer = (read(PCI_CAP_POINTER, pci::AccessWidth::Byte)? & 0xfc) as u32;
+    let mut pointer =
+        (config_read(device, PCI_CAP_POINTER, pci::AccessWidth::Byte).await? & 0xfc) as u32;
     let mut steps = 0;
     while pointer != 0 && steps < PCI_CAP_WALK_LIMIT {
         steps += 1;
-        let id = read(pointer, pci::AccessWidth::Byte)?;
-        let next = (read(pointer + 1, pci::AccessWidth::Byte)? & 0xfc) as u32;
+        let id = config_read(device, pointer, pci::AccessWidth::Byte).await?;
+        let next = (config_read(device, pointer + 1, pci::AccessWidth::Byte).await? & 0xfc) as u32;
         if id == PCI_CAP_ID_VENDOR {
-            let cfg_type = read(pointer + 3, pci::AccessWidth::Byte)?;
-            let bar = read(pointer + 4, pci::AccessWidth::Byte)? as u8;
-            let offset = read(pointer + 8, pci::AccessWidth::Dword)?;
+            let cfg_type = config_read(device, pointer + 3, pci::AccessWidth::Byte).await?;
+            let bar = config_read(device, pointer + 4, pci::AccessWidth::Byte).await? as u8;
+            let offset = config_read(device, pointer + 8, pci::AccessWidth::Dword).await?;
             match cfg_type {
                 VIRTIO_PCI_CAP_COMMON if common.is_none() => {
                     common = Some(Region { bar, offset });
                 }
                 VIRTIO_PCI_CAP_NOTIFY if notify.is_none() => {
-                    let multiplier = read(pointer + 16, pci::AccessWidth::Dword)? as u32;
+                    let multiplier =
+                        config_read(device, pointer + 16, pci::AccessWidth::Dword).await? as u32;
                     notify = Some((Region { bar, offset }, multiplier));
                 }
                 VIRTIO_PCI_CAP_DEVICE if device_config.is_none() => {
@@ -843,29 +960,35 @@ impl l2::Guest for Stub {
     }
 
     async fn list_interfaces(_l2: l2::L2ImplBorrow<'_>) -> Result<Vec<InterfaceInfo>, L2Error> {
-        with_driver(|driver| Ok(alloc::vec![driver.interface_info()])).map_err(L2Error::from)
+        match acquire_driver().await {
+            Ok(driver) => Ok(alloc::vec![driver.interface_info()]),
+            Err(fail) => Err(L2Error::from(fail)),
+        }
     }
 
     async fn open_interface(
         _l2: l2::L2ImplBorrow<'_>,
         name: String,
     ) -> Result<l2::L2Interface, L2Error> {
-        with_driver(|driver| {
-            if name.is_empty() || name == INTERFACE_NAME {
-                let _ = driver;
-                Ok(())
-            } else {
-                Err(L2Fail::NoSuchInterface)
-            }
-        })
-        .map_err(L2Error::from)?;
-        Ok(l2::L2Interface::new(VirtioInterface))
+        let _driver = acquire_driver().await.map_err(L2Error::from)?;
+        if name.is_empty() || name == INTERFACE_NAME {
+            Ok(l2::L2Interface::new(VirtioInterface))
+        } else {
+            Err(L2Error::NoSuchInterface)
+        }
     }
 
     fn info(_iface: l2::L2InterfaceBorrow<'_>) -> InterfaceInfo {
-        // An opened interface implies the driver is up; if anything went sideways since,
-        // report the link down rather than trapping.
-        with_driver(|driver| Ok(driver.interface_info())).unwrap_or(InterfaceInfo {
+        // An opened interface implies the driver is up (open-interface brought it up);
+        // `info` is a sync WIT function, so it reads the resting driver from its slot
+        // and reports the link down rather than trapping if the state is unavailable
+        // (mid-operation, or something went sideways since).
+        let resting = if STATE.is_set() {
+            STATE.with(|slot| slot.driver.as_ref().map(Driver::interface_info))
+        } else {
+            None
+        };
+        resting.unwrap_or(InterfaceInfo {
             name: String::from(INTERFACE_NAME),
             mac: (0, 0, 0, 0, 0, 0),
             mtu: 0,
@@ -885,7 +1008,11 @@ impl l2::Guest for Stub {
         } else {
             frame.read(0, len)
         };
-        match with_driver(|driver| driver.send(&bytes)) {
+        let mut driver = match acquire_driver().await {
+            Ok(driver) => driver,
+            Err(fail) => return (frame, Err(L2Error::from(fail))),
+        };
+        match driver.send(&bytes).await {
             Ok(bytes_sent) => (frame, Ok(SendResult { bytes_sent })),
             Err(fail) => (frame, Err(L2Error::from(fail))),
         }
@@ -896,7 +1023,11 @@ impl l2::Guest for Stub {
         dst: Buffer,
     ) -> (Buffer, Result<RecvResult, L2Error>) {
         let capacity = dst.len();
-        match with_driver(|driver| driver.recv(capacity)) {
+        let mut driver = match acquire_driver().await {
+            Ok(driver) => driver,
+            Err(fail) => return (dst, Err(L2Error::from(fail))),
+        };
+        match driver.recv(capacity).await {
             Ok(bytes) => {
                 if !bytes.is_empty() {
                     dst.write(0, &bytes);

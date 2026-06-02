@@ -184,6 +184,15 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-example-vnicheck", "vnicheck"),
     ("eo9-stub-net-l4-over-l2", "net.l4.over-l2"),
     ("eo9-example-l4check", "l4check"),
+    // The two-stack transport check, so the full shared-link payoff runs at the metal
+    // prompt — two l4 stacks, each riding its own switch port, each resolving real DNS
+    // (one physical NIC, two virtual MACs, two IP stacks; plan/09 D31):
+    //   net.virtio $ (rename port-a link-a $ rename port-b link-b $ net.l2.switch)
+    //     $ (rename eo9:net/l4 left $ rename eo9:net/l2 link-a $ net.l4.over-l2)
+    //     $ (rename eo9:net/l4 right $ rename eo9:net/l2 link-b
+    //        $ net.l4.over-l2 --address 10.0.2.16 --prefix-length 24 --gateway 10.0.2.2)
+    //     $ vnic4check --peer 10.0.2.3 --peer-port 53 --mode dns
+    ("eo9-example-vnic4check", "vnic4check"),
     // The per-layer net stubs, the in-memory transport, and the transport conformance
     // check, so the typed-denial and mock-vs-real comparisons run at the metal prompt
     // exactly as they do in usermode (user study 08, finding F4):
