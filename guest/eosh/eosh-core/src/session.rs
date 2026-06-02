@@ -46,6 +46,10 @@ pub enum LineResult {
     Error(String),
     /// The user asked to leave the shell.
     Exit,
+    /// The user asked to halt the machine (`poweroff`): leave the shell AND tell the
+    /// embedder — under init, plain `exit` restarts the console while services live,
+    /// so halting is its own intent, reported as the shell's own typed outcome.
+    Poweroff,
 }
 
 /// One shell session: the backend plus everything the user has built up in it.
@@ -122,6 +126,7 @@ impl<B: Backend> Session<B> {
             Command::Env => self.run_env().await,
             Command::EnvOf(expr) => self.run_env_of(&expr).await,
             Command::Exit => LineResult::Exit,
+            Command::Poweroff => LineResult::Poweroff,
             Command::Let { name, expr } => self.run_let(name, &expr).await,
             Command::Save { name, expr } => self.run_save(name, &expr).await,
             Command::Detach { name, expr, policy } => self.run_detach(name, &expr, &policy).await,
@@ -640,7 +645,7 @@ pub fn help_lines() -> &'static [&'static str] {
         "  env                           what this session holds and what programs run from it receive",
         "  env <expr>                    how this session treats the expression's imports, without running it",
         "",
-        "builtins: help, env [<expr>], history, let, save, detach, svc, describe <expr>, imports <expr>, exit",
+        "builtins: help, env [<expr>], history, let, save, detach, svc, describe <expr>, imports <expr>, exit, poweroff (halt the machine — under init, exit only restarts the console)",
     ]
 }
 
@@ -1251,6 +1256,7 @@ mod tests {
         );
         assert_eq!(run(&mut session, "exit"), LineResult::Exit);
         assert_eq!(run(&mut session, "quit"), LineResult::Exit);
+        assert_eq!(run(&mut session, "poweroff"), LineResult::Poweroff);
     }
 
     #[test]

@@ -620,6 +620,7 @@ impl Guest for Eosh {
                 session.route_outcome_to_stderr();
                 match session.execute_line(&line).await {
                     LineResult::Ok | LineResult::Exit => Ok(ProgramSuccess::Exited),
+                    LineResult::Poweroff => Ok(ProgramSuccess::PoweroffRequested),
                     LineResult::ProgramFailed(class, rendered) => Err(match class {
                         CommandClass::Failed => ProgramFailure::CommandFailed(rendered),
                         CommandClass::Trapped => ProgramFailure::CommandTrapped(rendered),
@@ -646,8 +647,10 @@ impl Guest for Eosh {
                         // End of input.
                         return Ok(ProgramSuccess::Exited);
                     };
-                    if session.execute_line(&line).await == LineResult::Exit {
-                        return Ok(ProgramSuccess::Exited);
+                    match session.execute_line(&line).await {
+                        LineResult::Exit => return Ok(ProgramSuccess::Exited),
+                        LineResult::Poweroff => return Ok(ProgramSuccess::PoweroffRequested),
+                        _ => {}
                     }
                 }
             }

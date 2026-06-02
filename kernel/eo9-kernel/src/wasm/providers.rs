@@ -45,6 +45,11 @@ const MAX_ENTROPY_REQUEST_BYTES: u64 = 64 * 1024;
 pub struct KernelState {
     /// Deterministic splitmix64 stream behind `eo9:entropy/entropy`.
     entropy_state: u64,
+    /// How many generations of the `eo9:svc` capability this task holds (0 = not
+    /// granted). The boot grants init 2, so init's console holds 1 and the console's
+    /// children hold 0 — never a default grant (owner ruling B; mirrors the usermode
+    /// generation count in crates/eo9/src/providers.rs).
+    pub svc_generations: u32,
     /// The task's `eo9:rt/diagnostics` slot: the panic message the guest reported just
     /// before trapping (write-once, bounded; surfaced only in `trapped(reason)`).
     pub panic_message: Option<alloc::string::String>,
@@ -66,6 +71,7 @@ impl KernelState {
     pub fn new() -> Self {
         KernelState {
             entropy_state: crate::timer::counter() ^ 0x9e37_79b9_7f4a_7c15,
+            svc_generations: 0,
             panic_message: None,
             limits: KernelLimits::default(),
             #[cfg(feature = "wasm-store")]
@@ -168,7 +174,7 @@ struct EntropyCap;
 #[repr(u8)]
 // Constructed only by the generated `Lift` impl (values come in from the guest).
 #[allow(dead_code)]
-enum WitOutputStream {
+pub(super) enum WitOutputStream {
     #[component(name = "out")]
     Out,
     #[component(name = "err")]
@@ -179,7 +185,7 @@ enum WitOutputStream {
 #[component(variant)]
 // The error arms exist to satisfy the interface type; the serial console cannot fail.
 #[allow(dead_code)]
-enum WitTextError {
+pub(super) enum WitTextError {
     #[component(name = "closed")]
     Closed,
     #[component(name = "io")]
@@ -209,18 +215,26 @@ pub fn add_providers(linker: &mut Linker<KernelState>) -> Result<()> {
     add_text(linker)?;
     add_time(linker)?;
     add_entropy(linker)?;
+    // The eo9:svc surface: the real registry on store builds (executor v2; the grant is
+    // the store's generation count, 0 everywhere except the boot supervisor's chain),
+    // the absent stub on demo-only builds, which have no shell exec tables to detach
+    // through.
+    #[cfg(feature = "wasm-store")]
+    super::svc::add_svc(linker)?;
+    #[cfg(not(feature = "wasm-store"))]
     add_svc_absent(linker)?;
     Ok(())
 }
 
-/// Host representation of `eo9:svc/detach.detach-impl` (never minted on this kernel).
+/// Host representation of `eo9:svc/detach.detach-impl` (never minted on demo builds).
+#[cfg(not(feature = "wasm-store"))]
 struct SvcDetachCap;
-/// Host representation of `eo9:svc/services.services-impl` (never minted on this kernel).
+/// Host representation of `eo9:svc/services.services-impl` (never minted on demo builds).
+#[cfg(not(feature = "wasm-store"))]
 struct SvcServicesCap;
 
-/// `eo9:svc` — registered as **absent**: this kernel has no service registry yet
-/// (executor v1 is usermode; the kernel registry is v2 — see
-/// docs/design/executor-model.md, staged plan).
+/// `eo9:svc` — registered as **absent** on demo-only kernel builds (no store, no shell,
+/// nothing to detach). Store builds register the real registry (`super::svc`).
 ///
 /// eosh imports both the `-optional` flavors (the honest am-I-granted signal it checks)
 /// and the full interfaces (to call them when granted), so all four must be registered
@@ -228,6 +242,7 @@ struct SvcServicesCap;
 /// registered through the dynamic (`func_new`) API — their signatures come from the
 /// component's own expectations — and refuse with a clear message if ever called, which
 /// a well-behaved client never does after seeing `none`.
+#[cfg(not(feature = "wasm-store"))]
 fn add_svc_absent(linker: &mut Linker<KernelState>) -> Result<()> {
     fn refuse(
         _store: StoreContextMut<'_, KernelState>,
@@ -281,7 +296,7 @@ fn add_svc_absent(linker: &mut Linker<KernelState>) -> Result<()> {
 /// `eo9:rt/diagnostics`: the write-once panic-message sink for the trap path (mirrors the
 /// usermode runtime). Always registered; carries no authority — the message is surfaced
 /// only inside a subsequent `trapped(reason)`.
-fn add_diagnostics(linker: &mut Linker<KernelState>) -> Result<()> {
+pub(super) fn add_diagnostics(linker: &mut Linker<KernelState>) -> Result<()> {
     let mut diagnostics = linker.instance("eo9:rt/diagnostics@0.1.0")?;
     diagnostics.func_wrap(
         "report-panic",

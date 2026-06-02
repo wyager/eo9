@@ -152,10 +152,22 @@ pub const BUILTIN_DOCS: &[BuiltinDoc] = &[
         summary: &[
             "Ends the session. What that means belongs to whoever runs the shell: the usermode CLI returns",
             "to your terminal, the bare-metal console powers off (until init owns the console), the browser",
-            "page asks for a reload.",
+            "page asks for a reload. Under init, leaving the shell restarts the console while services are",
+            "still running — halting the machine is `poweroff`, its own intent.",
         ],
         usage: &["exit", "e.g. exit"],
-        related: "help",
+        related: "poweroff, help",
+    },
+    BuiltinDoc {
+        names: &["poweroff"],
+        kind: BUILTIN,
+        summary: &[
+            "Ends the session AND asks the embedder to halt: the intent flows up as the shell's own typed",
+            "outcome, so under init the machine powers off even while services are running (plain `exit`",
+            "would restart the console instead). Without init it behaves like `exit`.",
+        ],
+        usage: &["poweroff", "e.g. poweroff"],
+        related: "exit, svc",
     },
     BuiltinDoc {
         names: &["$", "compose"],
@@ -263,7 +275,7 @@ mod tests {
     /// that adding a word THERE without a card HERE fails the test below.
     pub const SHELL_WORDS: &[&str] = &[
         "help", "describe", "imports", "env", "history", "let", "save", "detach", "svc", "exit",
-        "quit", "$", "&", "only", "rename", "with", "compose", "extend",
+        "quit", "poweroff", "$", "&", "only", "rename", "with", "compose", "extend",
     ];
 
     #[test]

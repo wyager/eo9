@@ -30,6 +30,23 @@ use super::store::{StoreEntry, StoreImage};
 /// The store image assembled and injected by `cargo xtask build-kernel <arch>`.
 static STORE_IMAGE: &[u8] = include_bytes!(env!("EO9_STORE_IMAGE"));
 
+/// The default boot config: a serial console, no services. Out of the box the boot
+/// pipeline (kernel → init → eosh) behaves exactly as the direct console did: leaving
+/// the shell with no services running ends init, and the machine powers off.
+const DEFAULT_SERVICES_CONFIG: &str = "\
+# the kernel's default boot: a serial console, no services.
+console = eosh
+";
+
+/// The baked demo config (the `svcdemo` boot token): a long-running worker the
+/// registry keeps alive and a one-shot banner whose output lands in its service log.
+const DEMO_SERVICES_CONFIG: &str = "\
+# the kernel's baked service demo (the `svcdemo` boot token).
+worker = cruncher --seed 7 --rounds 900000000000 restart restart.always
+banner = echo --text hello-from-a-service restart restart.never
+console = eosh
+";
+
 /// Parse the boot arguments and run what they select. Returns `true` when the boot was
 /// handled here (a headless program or the shell ran), `false` when the caller should run
 /// the default demo sequence instead (the `demo` token, or a store image that fails to
@@ -79,8 +96,23 @@ pub fn boot(bootargs: Option<&str>) -> bool {
     }
 
     match program.as_deref() {
-        // The default boot program is the shell; `program=eosh` spells the same thing.
-        None | Some("eosh") => {
+        // The default boot runs init, the service supervisor (executor v2): it applies
+        // the baked config — services, then the serial console — and the machine powers
+        // off when init exits. The default config is just `console = eosh`, so the
+        // out-of-the-box boot behaves exactly as the direct console did; the `svcdemo`
+        // token swaps in the baked demo config (a worker under restart.always and a
+        // one-shot banner) to demonstrate the service registry.
+        None => {
+            let config = if tokenize(bootargs).iter().any(|token| token == "svcdemo") {
+                DEMO_SERVICES_CONFIG
+            } else {
+                DEFAULT_SERVICES_CONFIG
+            };
+            super::shell::boot_to_init(entries, config);
+        }
+        // `program=eosh` keeps the direct console (no supervisor, no svc grant) — the
+        // pre-init boot pipeline, still useful for byte-for-byte comparisons.
+        Some("eosh") => {
             super::shell::boot_to_eosh(entries);
         }
         Some(program) => {

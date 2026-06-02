@@ -119,6 +119,10 @@ pub enum Command {
     Help,
     /// `exit` / `quit`.
     Exit,
+    /// `poweroff` — end the session AND ask the embedder to halt: under init, leaving
+    /// the shell restarts the console while services live (ruling D), so halting the
+    /// machine is its own, explicit intent.
+    Poweroff,
 }
 
 impl Expr {

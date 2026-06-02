@@ -237,6 +237,7 @@ impl Parser {
                 }
                 "history" => return self.builtin_no_args(Command::History),
                 "exit" | "quit" => return self.builtin_no_args(Command::Exit),
+                "poweroff" => return self.builtin_no_args(Command::Poweroff),
                 "describe" => {
                     self.next();
                     // A single shell word — a builtin or an operator — gets its own card
@@ -1119,6 +1120,10 @@ mod tests {
         assert_eq!(parse_command("history").expect("parses"), Command::History);
         assert_eq!(parse_command("exit").expect("parses"), Command::Exit);
         assert_eq!(parse_command("quit").expect("parses"), Command::Exit);
+        assert_eq!(
+            parse_command("poweroff").expect("parses"),
+            Command::Poweroff
+        );
         assert_eq!(
             parse_command("describe net.none $ browser").expect("parses"),
             Command::Describe(compose(name("net.none"), name("browser")))
