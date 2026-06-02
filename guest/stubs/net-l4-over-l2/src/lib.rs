@@ -19,12 +19,18 @@
 //!   `eo9:net/l4-over-l2-config` entry binds different addressing; baking it through
 //!   `configure(…)` waits on compose-time configuration of resource-owning API
 //!   providers (plan/03 D13, plan/09 D20).
-//! * **Driving the link.** Every l2 import is driven eagerly (the same single-poll
-//!   pattern as `net.virtio` driving `eo9:pci`, and `fs.eofs` driving `eo9:disk`):
-//!   each exported l4 operation pumps the link — transmit what the stack queued,
-//!   receive what the device has, let smoltcp process it — until the operation
-//!   completes or its deadline passes, then returns a typed error. Nothing here ever
-//!   suspends mid-operation and nothing blocks forever.
+//! * **Driving the link.** Every l2 import call is a genuine await (the SPEC's
+//!   "boundaries are honestly async" rule): each exported l4 operation pumps the link
+//!   — transmit what the stack queued, receive what the device has, let smoltcp
+//!   process it — awaiting each frame exchange, until the operation completes or its
+//!   deadline passes. An l2 provider that completes within the call (a leaf driver
+//!   over the host) resolves on the spot; one that suspends (a switch port, any
+//!   forwarding middleware) parks this operation, and the consumer above absorbs that
+//!   by awaiting its own l4 call. smoltcp itself never touches the link: its device
+//!   abstraction runs over in-memory frame queues ([`QueueDevice`]), and all I/O
+//!   happens between `poll`s in the pump — so the sync stack core and the async link
+//!   never meet on one call stack. Nothing here blocks forever: every wait is bounded
+//!   by its operation deadline plus the pump-round cap.
 //! * **Bounds.** At most 16 sockets (TCP + UDP combined), 16 KiB TCP buffers per
 //!   direction, 8 × 1536 B received / 4 × 1536 B queued UDP datagrams per socket, a
 //!   32-frame receive queue, and per-operation deadlines (4 s receive, 6 s connect,
@@ -47,8 +53,6 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::Cell;
-use core::pin::pin;
-use core::task::{Context as TaskContext, Poll, Waker};
 
 use eo9_guest::provider::ProviderState;
 
@@ -169,24 +173,6 @@ const SEND_FLUSH_DEADLINE_NS: u64 = 1_500_000_000;
 /// stub) still cannot make an operation loop forever.
 const MAX_PUMPS: u32 = 4096;
 
-// ------------------------------------------------------------------------------------------
-// Eager driving of the async l2 imports (same pattern and reasoning as net.virtio's pci
-// imports and fs.eofs's disk imports).
-// ------------------------------------------------------------------------------------------
-
-/// Drive an async import call that completes without suspending. Every l2 operation the
-/// providers below us export completes in a single poll (that is the convention the
-/// drivers and stubs follow); one that genuinely suspends makes the operation fail with
-/// a typed `io` error rather than blocking the consumer's eager poll of *us*.
-fn eager<F: Future>(what: &str, future: F) -> Result<F::Output, L4Error> {
-    let mut future = pin!(future);
-    let mut context = TaskContext::from_waker(Waker::noop());
-    match future.as_mut().poll(&mut context) {
-        Poll::Ready(value) => Ok(value),
-        Poll::Pending => Err(L4Error::Io(format!("{what}: the l2 provider suspended"))),
-    }
-}
-
 /// The l2 layer's own error, in l4 vocabulary: a refusal stays a refusal, everything
 /// else is a typed `io` error naming the layer.
 fn l2_failure(err: l2::L2Error) -> L4Error {
@@ -210,7 +196,13 @@ struct Link {
     clock: time::TimeImpl,
 }
 
-struct LinkSlot(Option<Link>);
+struct LinkSlot {
+    link: Option<Link>,
+    /// Whether the link has been claimed for opening (set before the first awaited
+    /// open, so a concurrent first use cannot open a second interface; cleared again if
+    /// opening fails, so the next use retries).
+    opened: bool,
+}
 
 static LINK: ProviderState<LinkSlot> = ProviderState::new();
 
@@ -220,7 +212,7 @@ struct LinkGuard(Option<Link>);
 impl Drop for LinkGuard {
     fn drop(&mut self) {
         if let Some(link) = self.0.take() {
-            LINK.with(|slot| slot.0 = Some(link));
+            LINK.with(|slot| slot.link = Some(link));
         }
     }
 }
@@ -242,30 +234,64 @@ fn smol_instant(ns: u64) -> Instant {
     Instant::from_micros((ns / 1_000) as i64)
 }
 
+/// What `acquire` found in the link slot.
+enum LinkView {
+    Ready(Link),
+    Busy,
+    NeedOpen,
+}
+
 /// Take the link for one operation, bringing it (and the smoltcp state) up on first
 /// use: open the l2 provider's first interface, read its MAC address, seed the stack
-/// from entropy, and bind the documented default address.
-fn acquire() -> Result<LinkGuard, L4Error> {
+/// from entropy, and bind the documented default address. A second activation arriving
+/// while one is parked mid-operation gets a typed error, never a second interface.
+async fn acquire() -> Result<LinkGuard, L4Error> {
     if !LINK.is_set() {
-        LINK.set(LinkSlot(None));
+        LINK.set(LinkSlot {
+            link: None,
+            opened: false,
+        });
     }
-    if let Some(link) = LINK.with(|slot| slot.0.take()) {
-        return Ok(LinkGuard(Some(link)));
+    let view = LINK.with(|slot| {
+        if let Some(link) = slot.link.take() {
+            LinkView::Ready(link)
+        } else if slot.opened {
+            LinkView::Busy
+        } else {
+            slot.opened = true;
+            LinkView::NeedOpen
+        }
+    });
+    match view {
+        LinkView::Ready(link) => return Ok(LinkGuard(Some(link))),
+        LinkView::Busy => {
+            return Err(L4Error::Io(String::from(
+                "another l4 operation on this stack is in progress",
+            )));
+        }
+        LinkView::NeedOpen => {}
     }
 
+    let opened = open_link().await;
+    if opened.is_err() {
+        LINK.with(|slot| slot.opened = false);
+    }
+    opened
+}
+
+/// First-use bring-up: the awaited l2 opens plus the smoltcp state.
+async fn open_link() -> Result<LinkGuard, L4Error> {
     let root = l2::default();
-    let interfaces = eager("list-interfaces", l2::list_interfaces(&root))?.map_err(l2_failure)?;
+    let interfaces = l2::list_interfaces(&root).await.map_err(l2_failure)?;
     let first = interfaces
         .first()
         .ok_or_else(|| L4Error::Io(String::from("the l2 capability exposes no interfaces")))?;
     let (a, b, c, d, e, f) = first.mac;
     let mac = [a, b, c, d, e, f];
     let mtu = first.mtu.clamp(576, 9216) as usize;
-    let iface = eager(
-        "open-interface",
-        l2::open_interface(&root, first.name.clone()),
-    )?
-    .map_err(l2_failure)?;
+    let iface = l2::open_interface(&root, first.name.clone())
+        .await
+        .map_err(l2_failure)?;
 
     let clock = time::default();
     let entropy_root = entropy::default();
@@ -433,12 +459,12 @@ fn poll_stack(link: &Link) {
 }
 
 /// Hand everything the stack queued to the l2 provider.
-fn flush_tx(link: &Link) -> Result<(), L4Error> {
+async fn flush_tx(link: &Link) -> Result<(), L4Error> {
     let frames: Vec<Vec<u8>> = with_net(|n| n.dev.tx.drain(..).collect());
     for frame in frames {
         let buffer = Buffer::new(frame.len() as u64);
         buffer.write(0, &frame);
-        let (_buffer, sent) = eager("send-frame", l2::send_frame(&link.iface, buffer))?;
+        let (_buffer, sent) = l2::send_frame(&link.iface, buffer).await;
         match sent {
             Ok(_) => {}
             Err(l2::L2Error::Denied) => return Err(L4Error::Denied),
@@ -452,14 +478,14 @@ fn flush_tx(link: &Link) -> Result<(), L4Error> {
 
 /// One pump round: let the stack emit what is due, hand it to the link, pull a few
 /// frames the other way, and let the stack process them.
-fn pump(link: &Link) -> Result<(), L4Error> {
+async fn pump(link: &Link) -> Result<(), L4Error> {
     poll_stack(link);
-    flush_tx(link)?;
+    flush_tx(link).await?;
 
     let mut received_any = false;
     for _ in 0..RX_BATCH {
         let dst = Buffer::new(RX_BUFFER_BYTES);
-        let (dst, received) = eager("recv-frame", l2::recv_frame(&link.iface, dst))?;
+        let (dst, received) = l2::recv_frame(&link.iface, dst).await;
         match received {
             Ok(result) if result.bytes_received > 0 => {
                 let frame = dst.read(0, result.bytes_received.min(RX_BUFFER_BYTES));
@@ -481,7 +507,7 @@ fn pump(link: &Link) -> Result<(), L4Error> {
     }
     if received_any {
         poll_stack(link);
-        flush_tx(link)?;
+        flush_tx(link).await?;
     }
     Ok(())
 }
@@ -489,7 +515,7 @@ fn pump(link: &Link) -> Result<(), L4Error> {
 /// Pump the link until `check` reports a result, the deadline passes, or the pump-round
 /// cap is hit. `check` runs before the first pump, so already-satisfiable operations
 /// never touch the link.
-fn wait_until<T>(
+async fn wait_until<T>(
     link: &Link,
     deadline_ns: u64,
     mut check: impl FnMut() -> Option<Result<T, L4Error>>,
@@ -509,13 +535,13 @@ fn wait_until<T>(
             // the outcome rather than the deadline. A connect whose SYN was answered
             // with an RST must report `connection-refused`, never `timed-out`, no
             // matter how late the answer is processed.
-            pump(link)?;
+            pump(link).await?;
             if let Some(result) = check() {
                 return result;
             }
             return Err(L4Error::TimedOut);
         }
-        pump(link)?;
+        pump(link).await?;
         rounds += 1;
     }
 }
@@ -719,7 +745,7 @@ impl l4::Guest for Stub {
         remote: SocketAddress,
     ) -> Result<l4::TcpConnection, L4Error> {
         let destination = destination_v4(&remote.address)?;
-        let link = acquire()?;
+        let link = acquire().await?;
 
         let handle = with_net(|n| -> Result<SocketHandle, L4Error> {
             n.sweep();
@@ -745,7 +771,8 @@ impl l4::Guest for Stub {
                 tcp::State::Closed => Some(Err(L4Error::ConnectionRefused)),
                 _ => None,
             })
-        });
+        })
+        .await;
 
         match outcome {
             Ok(()) => Ok(l4::TcpConnection::new(Conn {
@@ -770,7 +797,7 @@ impl l4::Guest for Stub {
         if !bindable(&local.address) {
             return Err(L4Error::AddressUnavailable);
         }
-        let _link = acquire()?;
+        let _link = acquire().await?;
         with_net(|n| {
             n.sweep();
             if n.live >= MAX_SOCKETS {
@@ -805,7 +832,7 @@ impl l4::Guest for Stub {
         l: l4::TcpListenerBorrow<'_>,
     ) -> Result<(l4::TcpConnection, SocketAddress), L4Error> {
         let listener = l.get::<Listener>();
-        let link = acquire()?;
+        let link = acquire().await?;
 
         let peer_endpoint = wait_until(&link, RECV_DEADLINE_NS, || {
             with_net(|n| {
@@ -816,7 +843,8 @@ impl l4::Guest for Stub {
                     _ => None,
                 }
             })
-        })?;
+        })
+        .await?;
 
         // The socket that just went Established becomes the connection; a fresh socket
         // takes over listening on the same port. After the swap there are two live
@@ -860,7 +888,7 @@ impl l4::Guest for Stub {
     ) -> (Buffer, Result<SendResult, L4Error>) {
         let connection = c.get::<Conn>();
         let bytes = src.read(0, src.len());
-        let link = match acquire() {
+        let link = match acquire().await {
             Ok(link) => link,
             Err(err) => return (src, Err(err)),
         };
@@ -888,10 +916,11 @@ impl l4::Guest for Stub {
                     Err(err) => Some(Err(L4Error::Io(format!("send: {err:?}")))),
                 }
             })
-        });
+        })
+        .await;
         // Give what was queued a chance to leave the stack.
         if !matches!(outcome, Err(L4Error::Denied)) {
-            let _ = pump(&link);
+            let _ = pump(&link).await;
         }
 
         match outcome {
@@ -917,7 +946,7 @@ impl l4::Guest for Stub {
     ) -> (Buffer, Result<RecvResult, L4Error>) {
         let connection = c.get::<Conn>();
         let capacity = dst.len();
-        let link = match acquire() {
+        let link = match acquire().await {
             Ok(link) => link,
             Err(err) => return (dst, Err(err)),
         };
@@ -941,7 +970,8 @@ impl l4::Guest for Stub {
                 }
                 None
             })
-        });
+        })
+        .await;
 
         match outcome {
             Ok(chunk) => {
@@ -966,7 +996,7 @@ impl l4::Guest for Stub {
         if !bindable(&local.address) {
             return Err(L4Error::AddressUnavailable);
         }
-        let _link = acquire()?;
+        let _link = acquire().await?;
         with_net(|n| {
             n.sweep();
             if n.live >= MAX_SOCKETS {
@@ -1015,7 +1045,7 @@ impl l4::Guest for Stub {
         if payload.len() > UDP_PACKET_BYTES {
             return (src, Err(L4Error::MessageTooLarge));
         }
-        let link = match acquire() {
+        let link = match acquire().await {
             Ok(link) => link,
             Err(err) => return (src, Err(err)),
         };
@@ -1037,7 +1067,7 @@ impl l4::Guest for Stub {
         // A few pump rounds give the datagram (and the ARP exchange it may need) a
         // chance to leave; a recv that follows keeps pumping anyway.
         for _ in 0..6 {
-            if let Err(L4Error::Denied) = pump(&link) {
+            if let Err(L4Error::Denied) = pump(&link).await {
                 return (src, Err(L4Error::Denied));
             }
             let drained = with_net(|n| {
@@ -1066,7 +1096,7 @@ impl l4::Guest for Stub {
     ) -> (Buffer, Result<(RecvResult, SocketAddress), L4Error>) {
         let socket_state = s.get::<Udp>();
         let capacity = dst.len();
-        let link = match acquire() {
+        let link = match acquire().await {
             Ok(link) => link,
             Err(err) => return (dst, Err(err)),
         };
@@ -1085,7 +1115,8 @@ impl l4::Guest for Stub {
                     Err(err) => Some(Err(L4Error::Io(format!("recv-from: {err:?}")))),
                 }
             })
-        });
+        })
+        .await;
 
         match outcome {
             Ok((payload, from)) => {

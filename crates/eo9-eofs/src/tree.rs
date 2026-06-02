@@ -1,27 +1,30 @@
 //! Block I/O and byte-object trees.
 //!
-//! Everything stored on disk is written through [`Eofs::write_block`] (hash, compress,
-//! allocate, write) and read back through [`Eofs::read_block`] (read, decompress, check the
-//! hash). On top of single blocks sit *byte objects* — arbitrary-length byte strings stored
-//! as a tree of data blocks under indirect blocks of block pointers. Files, serialized
-//! directories, and the snapshot table are all byte objects; see `FORMAT.md`.
+//! Everything stored on disk is written through [`AsyncEofs::write_block`] (hash, compress,
+//! allocate, write) and read back through [`AsyncEofs::read_block`] (read, decompress, check
+//! the hash). On top of single blocks sit *byte objects* — arbitrary-length byte strings
+//! stored as a tree of data blocks under indirect blocks of block pointers. Files,
+//! serialized directories, and the snapshot table are all byte objects; see `FORMAT.md`.
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 
-use crate::device::BlockDevice;
+use crate::device::AsyncBlockDevice;
 use crate::error::FsError;
 use crate::format::{BLOCK_PTR_SIZE, BlockPtr, Codec, DATA_START, MAX_META_OBJECT_SIZE, ObjRef};
-use crate::fs::Eofs;
+use crate::fs::AsyncEofs;
 
-impl<D: BlockDevice> Eofs<D> {
+impl<D: AsyncBlockDevice> AsyncEofs<D> {
     /// Pointers per indirect block.
     pub(crate) fn fanout(&self) -> usize {
         self.block_size as usize / BLOCK_PTR_SIZE
     }
 
     /// Hash, (maybe) compress, allocate, and write one logical block. Returns the pointer.
-    pub(crate) fn write_block(&mut self, logical: &[u8]) -> Result<BlockPtr, FsError> {
+    pub(crate) async fn write_block(&mut self, logical: &[u8]) -> Result<BlockPtr, FsError> {
         debug_assert!(!logical.is_empty() && logical.len() <= self.block_size as usize);
         let hash = blake3::hash(logical);
         let compressed;
@@ -37,7 +40,7 @@ impl<D: BlockDevice> Eofs<D> {
             (Codec::Raw, logical)
         };
         let addr = self.alloc.allocate(payload.len() as u64)?;
-        self.dev.write_at(addr, payload)?;
+        self.dev.write_at(addr, payload).await?;
         Ok(BlockPtr {
             addr,
             lsize: logical.len() as u32,
@@ -50,7 +53,7 @@ impl<D: BlockDevice> Eofs<D> {
     /// Read one block: fetch the stored bytes, decompress if needed, and check the blake3
     /// hash against the pointer. Every read path in the filesystem goes through this, so a
     /// corrupted block can never be returned as data.
-    pub(crate) fn read_block(&self, ptr: &BlockPtr) -> Result<Vec<u8>, FsError> {
+    pub(crate) async fn read_block(&self, ptr: &BlockPtr) -> Result<Vec<u8>, FsError> {
         if ptr.is_null() {
             return Err(FsError::Corrupt("read through a null block pointer"));
         }
@@ -71,7 +74,7 @@ impl<D: BlockDevice> Eofs<D> {
             return Err(FsError::Corrupt("block pointer outside the data region"));
         }
         let mut payload = vec![0u8; ptr.psize as usize];
-        self.dev.read_at(ptr.addr, &mut payload)?;
+        self.dev.read_at(ptr.addr, &mut payload).await?;
         let logical = match ptr.codec {
             Codec::Raw => {
                 if ptr.psize != ptr.lsize {
@@ -133,48 +136,59 @@ impl<D: BlockDevice> Eofs<D> {
 
     /// The ordered data-block pointers of an object (reads and checks every indirect block
     /// on the way down).
-    pub(crate) fn collect_leaves(&self, obj: &ObjRef) -> Result<Vec<BlockPtr>, FsError> {
+    pub(crate) async fn collect_leaves(&self, obj: &ObjRef) -> Result<Vec<BlockPtr>, FsError> {
         let leaf_count = self.check_object(obj)?;
         if leaf_count == 0 {
             return Ok(Vec::new());
         }
         let mut leaves = Vec::new();
-        self.collect_level(&obj.root, obj.level, leaf_count, &mut leaves)?;
+        self.collect_level(&obj.root, obj.level, leaf_count, &mut leaves)
+            .await?;
         if leaves.len() as u64 != leaf_count {
             return Err(FsError::Corrupt("object data-block count mismatch"));
         }
         Ok(leaves)
     }
 
-    fn collect_level(
-        &self,
-        ptr: &BlockPtr,
+    /// Recursive descent over the indirect tree. Boxed because async recursion needs an
+    /// indirection; the depth is the tree height, which [`check_object`](Self::check_object)
+    /// has already bounded to the canonical height for the object's size.
+    fn collect_level<'a>(
+        &'a self,
+        ptr: &'a BlockPtr,
         level: u8,
         leaf_count: u64,
-        out: &mut Vec<BlockPtr>,
-    ) -> Result<(), FsError> {
-        if level == 0 {
-            if out.len() as u64 >= leaf_count {
-                return Err(FsError::Corrupt(
-                    "object has more data blocks than its size",
-                ));
+        out: &'a mut Vec<BlockPtr>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), FsError>> + 'a>> {
+        Box::pin(async move {
+            if level == 0 {
+                if out.len() as u64 >= leaf_count {
+                    return Err(FsError::Corrupt(
+                        "object has more data blocks than its size",
+                    ));
+                }
+                out.push(*ptr);
+                return Ok(());
             }
-            out.push(*ptr);
-            return Ok(());
-        }
-        let block = self.read_block(ptr)?;
-        if block.is_empty() || block.len() % BLOCK_PTR_SIZE != 0 {
-            return Err(FsError::Corrupt("malformed indirect block"));
-        }
-        for chunk in block.chunks(BLOCK_PTR_SIZE) {
-            let child = BlockPtr::read_from(chunk)?;
-            self.collect_level(&child, level - 1, leaf_count, out)?;
-        }
-        Ok(())
+            let block = self.read_block(ptr).await?;
+            if block.is_empty() || block.len() % BLOCK_PTR_SIZE != 0 {
+                return Err(FsError::Corrupt("malformed indirect block"));
+            }
+            for chunk in block.chunks(BLOCK_PTR_SIZE) {
+                let child = BlockPtr::read_from(chunk)?;
+                self.collect_level(&child, level - 1, leaf_count, out)
+                    .await?;
+            }
+            Ok(())
+        })
     }
 
     /// Build the indirect-block tree over `leaves` and return the object reference.
-    pub(crate) fn build_tree(&mut self, leaves: &[BlockPtr], size: u64) -> Result<ObjRef, FsError> {
+    pub(crate) async fn build_tree(
+        &mut self,
+        leaves: &[BlockPtr],
+        size: u64,
+    ) -> Result<ObjRef, FsError> {
         if leaves.is_empty() {
             debug_assert_eq!(size, 0);
             return Ok(ObjRef::EMPTY);
@@ -189,7 +203,7 @@ impl<D: BlockDevice> Eofs<D> {
                 for (i, ptr) in group.iter().enumerate() {
                     ptr.write_to(&mut bytes[i * BLOCK_PTR_SIZE..(i + 1) * BLOCK_PTR_SIZE]);
                 }
-                next.push(self.write_block(&bytes)?);
+                next.push(self.write_block(&bytes).await?);
             }
             current = next;
             level += 1;
@@ -202,28 +216,28 @@ impl<D: BlockDevice> Eofs<D> {
     }
 
     /// Store `data` as a fresh byte object.
-    pub(crate) fn write_object(&mut self, data: &[u8]) -> Result<ObjRef, FsError> {
-        self.write_object_range(&ObjRef::EMPTY, 0, data)
+    pub(crate) async fn write_object(&mut self, data: &[u8]) -> Result<ObjRef, FsError> {
+        self.write_object_range(&ObjRef::EMPTY, 0, data).await
     }
 
     /// Read a whole byte object into memory. This is the *metadata* read path (serialized
     /// directories and the snapshot table), so the object's declared size is capped at
     /// [`MAX_META_OBJECT_SIZE`] before anything is allocated; file contents go through
     /// [`read_object_range`](Self::read_object_range) into caller-provided buffers instead.
-    pub(crate) fn read_object(&self, obj: &ObjRef) -> Result<Vec<u8>, FsError> {
+    pub(crate) async fn read_object(&self, obj: &ObjRef) -> Result<Vec<u8>, FsError> {
         if obj.size > MAX_META_OBJECT_SIZE {
             return Err(FsError::Corrupt("metadata object impossibly large"));
         }
         self.check_object(obj)?;
         let mut buf = vec![0u8; obj.size as usize];
-        let got = self.read_object_range(obj, 0, &mut buf)?;
+        let got = self.read_object_range(obj, 0, &mut buf).await?;
         debug_assert_eq!(got as u64, obj.size);
         Ok(buf)
     }
 
     /// Read up to `buf.len()` bytes of an object starting at `offset`; returns how many
     /// bytes were read (short only at end-of-object).
-    pub(crate) fn read_object_range(
+    pub(crate) async fn read_object_range(
         &self,
         obj: &ObjRef,
         offset: u64,
@@ -234,13 +248,13 @@ impl<D: BlockDevice> Eofs<D> {
         }
         let want = core::cmp::min(buf.len() as u64, obj.size - offset) as usize;
         let bs = self.block_size as u64;
-        let leaves = self.collect_leaves(obj)?;
+        let leaves = self.collect_leaves(obj).await?;
         let mut done = 0usize;
         while done < want {
             let at = offset + done as u64;
             let block_index = (at / bs) as usize;
             let within = (at % bs) as usize;
-            let logical = self.read_block(&leaves[block_index])?;
+            let logical = self.read_block(&leaves[block_index]).await?;
             let take = core::cmp::min(want - done, logical.len() - within);
             buf[done..done + take].copy_from_slice(&logical[within..within + take]);
             done += take;
@@ -252,7 +266,7 @@ impl<D: BlockDevice> Eofs<D> {
     /// spliced in at `offset` (growing it, zero-filling any gap, if the write reaches past
     /// the old end). Untouched data blocks are reused by pointer; the indirect tree is
     /// rebuilt.
-    pub(crate) fn write_object_range(
+    pub(crate) async fn write_object_range(
         &mut self,
         obj: &ObjRef,
         offset: u64,
@@ -266,7 +280,7 @@ impl<D: BlockDevice> Eofs<D> {
             .ok_or(FsError::NoSpace)?;
         let new_size = core::cmp::max(obj.size, write_end);
         let bs = self.block_size as u64;
-        let old_leaves = self.collect_leaves(obj)?;
+        let old_leaves = self.collect_leaves(obj).await?;
         let block_count = new_size.div_ceil(bs);
         let mut new_leaves = Vec::with_capacity(block_count as usize);
         for b in 0..block_count {
@@ -286,7 +300,7 @@ impl<D: BlockDevice> Eofs<D> {
             }
             let mut content = vec![0u8; new_len];
             if old_len > 0 {
-                let old = self.read_block(&old_leaves[b as usize])?;
+                let old = self.read_block(&old_leaves[b as usize]).await?;
                 if old.len() != old_len {
                     return Err(FsError::Corrupt("data block size mismatch"));
                 }
@@ -298,8 +312,8 @@ impl<D: BlockDevice> Eofs<D> {
                     (overlap_start - block_start) as usize..(overlap_end - block_start) as usize;
                 content[dst].copy_from_slice(&data[src]);
             }
-            new_leaves.push(self.write_block(&content)?);
+            new_leaves.push(self.write_block(&content).await?);
         }
-        self.build_tree(&new_leaves, new_size)
+        self.build_tree(&new_leaves, new_size).await
     }
 }

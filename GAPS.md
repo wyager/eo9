@@ -140,6 +140,10 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
 - **OPEN — The spec-promised "exports match nothing" warning never reaches the user**: `compose_checked`
   returns `ProviderExportsUnused`, but surfacing it in eosh/CLI is still queued. (study 05 #7)
 - Binder caveats (narrowed): depends on wasmtime 45's CM-async ABI encodings (one constants block);
+  the suspended-subtask path **is now exercised end-to-end on the storage chain** — `fs.eofs` and
+  `disk.virtio` genuinely await, and study 09's `pci.admit-address $ pci.filtered $ disk.virtio $
+  fs.eofs` runs on metal with INTx completion through the filter (plan/14 D25/D26, plan/09 D33); the
+  net lane landed on `area/09-async-net` (per-port l4 stacks over the switch);
   variant/result/flags/handle-typed configure values still refuse (with clear messages); the
   unbakeable-shape refusal is reported under the `Internal` error variant (cosmetic tidy-up queued).
   **RESOLVED — the suspended-subtask and cancellation caveats**: the async hardening matrix
@@ -147,7 +151,8 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
   chains end-to-end at depths 0-3 — host kill mid-park leaks nothing, acknowledged `subtask.cancel`
   cascades to `RETURN_CANCELLED`; the only traps are canonical-ABI contract violations, pinned. A callee
   that ignores `CANCELLED` parks its canceller forever (the SPEC bounded-await rule's concrete shape);
-  the conversion pass must verify generated bindings acknowledge cancellation.
+  the conversion pass must verify generated bindings acknowledge cancellation — the storage providers
+  already carry drop-guards so a cancelled operation can't wedge their state slots.
 - Kernel algebra errors map to `Internal(String)` rather than the specific WIT variants; the kernel renders
   `wiring` as a leaf only; eosh `envinfo` still classifies authority by the `/types`-name heuristic.
 

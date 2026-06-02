@@ -12,18 +12,14 @@
 //!   $ vnic4check
 //! ```
 //!
-//! **Platform limit, pinned below:** this composition is well-typed, composes, and
-//! compiles, but cannot *run* today. The middleware drives its l2 import eagerly
-//! (single-poll, the layered-provider convention), and the switch — itself a guest
-//! whose exports make nested guest-to-guest calls to the upstream — does not complete
-//! eagerly under the CM-async callback ABI: the middleware's poll sees the suspension
-//! and reports its typed `io` error. This is the same nested-forwarding limit user
-//! study 09 reproduced with `pci.filtered $ disk.virtio $ fs.eofs` (GAPS, the
-//! suspended-subtask caveat) — a second, minimal reproduction. Guest middleware over
-//! the switch works the moment that platform limit lifts; the `#[ignore]`d test below
-//! is the acceptance run for that day. What works *today* over the switch: consumers
-//! that import `l2` directly and await properly (`vnicheck` — see vnic_switch.rs, and
-//! the metal `arp` mode), because a properly-awaiting caller absorbs the suspension.
+//! This composition was blocked from running until the middleware's l2 driving became
+//! genuine awaits (plan/09 D31 recorded the limit; the old eager single-poll saw the
+//! switch — a guest whose exports make nested guest-to-guest calls — suspend, and
+//! reported a typed `io` error). With honest awaits the suspension parks the operation
+//! and the awaiting consumer above absorbs it, so the chain completes at any depth.
+//! The bounded-failure side stays covered: a denied or absent link is still a typed
+//! refusal within the operation deadlines, never a hang (see net_l4_over_l2.rs, the
+//! `deny`/listen-path tests).
 
 use eo9_component::{Component, compose, configure, rename};
 use eo9_integration::{guest, run};
@@ -94,35 +90,9 @@ fn run_two_stacks() -> Outcome {
     )
 }
 
-/// The composition composes and compiles, and the platform limit surfaces as the
-/// middleware's *typed* error — never a trap, never a hang. (Replace this test with
-/// the `#[ignore]`d one below when the nested-forwarding limit lifts.)
+/// The shared-link payoff: both transport stacks complete independent UDP round-trips
+/// through one switched link, each on its own virtual NIC.
 #[test]
-fn guest_middleware_over_the_switch_hits_the_nested_forwarding_limit_typed() {
-    guest::ensure_components(COMPONENTS);
-    match run_two_stacks() {
-        Outcome::Failure(failure) => {
-            assert!(
-                failure.value.contains("suspended"),
-                "expected the middleware's typed suspended-provider error: {}",
-                failure.value
-            );
-        }
-        Outcome::Success(success) => panic!(
-            "the nested-forwarding limit appears to have lifted (success: {}) — \
-             un-ignore `two_transport_stacks_share_one_link_through_the_switch` and \
-             delete this pin",
-            success.value
-        ),
-        other => panic!("expected the middleware's typed failure, got {other:?}"),
-    }
-}
-
-/// The acceptance run for the day the platform's nested guest-to-guest forwarding
-/// limit lifts (GAPS, suspended-subtask): both transport stacks complete independent
-/// UDP round-trips through one switched link.
-#[test]
-#[ignore = "blocked on the nested guest-to-guest forwarding limit (GAPS: suspended-subtask; study 09)"]
 fn two_transport_stacks_share_one_link_through_the_switch() {
     guest::ensure_components(COMPONENTS);
     match run_two_stacks() {

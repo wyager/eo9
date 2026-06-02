@@ -9,7 +9,7 @@
 //! (an unconfigured `disk.mem` self-binds its 16 MiB device, and `fs.eofs` formats the
 //! blank disk on first use), so the whole chain runs without any `configure`.
 
-use eo9_component::{Component, compose};
+use eo9_component::{Component, compose, configure};
 use eo9_integration::{guest, run};
 use eo9_runtime::{NamedArg, Outcome, Providers};
 
@@ -157,5 +157,58 @@ fn eofs_round_trip_is_deterministic() {
         run::success_value(&first),
         run::success_value(&second),
         "the eofs chain must be deterministic across runs"
+    );
+}
+
+/// The deepest awaited guest chain in usermode — the study-09 filtered-storage *shape*
+/// over in-memory providers: `(disk.mem $ fs.eofs) $ fs.policy-subtree $ fs.filtered $
+/// readwrite`. Since the async-first conversion (SPEC, "Boundaries are honestly async"),
+/// `fs.eofs` genuinely awaits its disk import, so against the `disk.mem` *guest* every
+/// engine disk call is a queued call and the middle of the chain parks and resumes —
+/// exactly what the old eager convention could not do (the eager-guest spike,
+/// docs/spikes/eager-guest-forwarding.md). `fs.filtered` above it must tolerate that
+/// deferral. This pins the storage lane's await-through-middleware behavior in usermode;
+/// the metal acceptance is study 09's `pci.filtered $ disk.virtio $ fs.eofs $ cat`.
+#[test]
+fn filtered_chain_over_a_deferring_eofs_round_trips() {
+    guest::ensure_components(&[
+        "eo9-stub-disk-mem",
+        "eo9-stub-fs-eofs",
+        "eo9-stub-fs-filtered",
+        "eo9-stub-fs-policy-subtree",
+        "eo9-example-readwrite",
+    ]);
+    let storage =
+        compose(&guest::load_stub("disk.mem"), &eofs()).expect("disk.mem $ fs.eofs must compose");
+    let policy = configure(
+        &guest::load_stub("fs.policy-subtree"),
+        &[("prefix", "\"/\""), ("access", "read-write")],
+    )
+    .expect("configure(fs.policy-subtree) must bake");
+    let filtered = compose(
+        &guest::load_stub("fs.filtered"),
+        &guest::load_component("eo9-example-readwrite"),
+    )
+    .expect("fs.filtered $ readwrite must compose");
+    let chain = compose(&policy, &filtered).expect("policy $ fs.filtered $ readwrite");
+    let program = compose(&storage, &chain)
+        .expect("(disk.mem $ fs.eofs) $ policy $ fs.filtered $ readwrite must compose");
+
+    let outcome = run::run_component(
+        &program,
+        &[
+            NamedArg::new("path", "\"boot.log\""),
+            NamedArg::new("contents", "\"through the deferring chain\""),
+        ],
+        Providers::none(),
+    );
+    match &outcome {
+        Outcome::Success(_) => {}
+        other => panic!("expected a round-trip through the filtered eofs chain, got {other:?}"),
+    }
+    assert!(
+        run::success_value(&outcome).starts_with("round-tripped("),
+        "unexpected success value: {}",
+        run::success_value(&outcome)
     );
 }

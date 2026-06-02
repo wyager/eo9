@@ -479,25 +479,43 @@ Match the priority order above; (1)+(2) unblock I2.
     unicast to its own port, the real MAC never appearing as a source). Kernel store 38 → 40
     (switch + vnicheck; the echo fixture stays usermode-only).
 
-31. **The l4-over-switch limit, pinned (2026-06-02).** `net.l4.over-l2` riding a switch port
-    composes and compiles but cannot run: the middleware drives its l2 import eagerly
-    (single-poll, the layered-provider convention), and the switch — a guest whose exports
-    make nested guest-to-guest calls upstream — does not complete eagerly under the CM-async
-    callback ABI, so the middleware's poll sees the suspension and reports its typed `io`
-    error. Same root cause as study 09's `pci.filtered $ disk.virtio $ fs.eofs` failure
-    (GAPS: the suspended-subtask caveat); this is the second, minimal reproduction:
-    eager-poller → nested-guest-caller breaks, properly-awaiting-caller → nested-guest-caller
-    works (vnicheck), eager-poller → host-leaf-caller works (`net.l4.over-l2 $ net.virtio` on
-    metal, and depth-1 `net.l4.over-l2 $ net.l2.echo` in usermode — verified during this
-    work). tests/eo9-integration/tests/vnic_l4.rs pins the typed failure (never a trap, never
-    a hang) and carries the `#[ignore]`d acceptance test (`vnic4check`, two transport stacks
-    with distinct configured IPs over two ports) for the day the platform limit lifts — the
-    consumer is already shipped and registered. Until then, per-service virtual NICs at the
-    l4 level need the limit fixed; l2-speaking services (and everything the executor-model
-    §6(c) defers to a shared stack) are unaffected. Also surfaced: `time.monotonic-stub`
-    panics if its clock is *observed* unconfigured (the deny-path tests never reached it) —
-    its lazy documented default is a follow-up for whoever next touches the time stubs; the
-    new tests configure it explicitly.
+31. **The l4-over-switch limit, pinned (2026-06-02) — and lifted by honest awaits
+    (2026-06-02).** As pinned: `net.l4.over-l2` riding a switch port composed and compiled
+    but could not run — the middleware drove its l2 import eagerly (single-poll), and the
+    switch, a guest whose exports make nested guest-to-guest calls upstream, does not
+    complete eagerly under the CM-async callback ABI, so the middleware's poll saw the
+    suspension and reported its typed `io` error. Same root cause as study 09's
+    `pci.filtered $ disk.virtio $ fs.eofs` failure (GAPS: the suspended-subtask caveat).
+    The matrix, updated after the async-first conversion (SPEC, "Boundaries are honestly
+    async"; docs/spikes/eager-guest-forwarding.md has the mechanism):
+    eager-poller → nested-guest-caller *was* the broken row — **fixed by converting the
+    pollers to genuine awaits**, not by making callees eager; awaiting-caller →
+    nested-guest-caller worked all along (vnicheck); awaiting-caller → host-leaf-caller
+    costs nothing (the await resolves within the call — `net.virtio`'s pci awaits, measured
+    identical on metal). `net.virtio` and `net.l4.over-l2` now await their imports
+    (`eager()` deleted; both keep every operation deadline and pump/poll bound, and both
+    take their state out of its `ProviderState` slot for the duration of an operation so no
+    borrow is held across an await — a concurrent activation gets a typed busy error).
+    The acceptance test is live (vnic_l4.rs, the typed-failure pin replaced by its own
+    acceptance: two transport stacks with distinct IPs complete UDP round-trips over two
+    switch ports), and the full payoff ran on metal — kernel store gains `vnic4check`
+    (44 → 45) and the demo line is recorded next to its store entry (xtask):
+    `net.virtio $ (rename port-a link-a $ rename port-b link-b $ net.l2.switch) $ (rename
+    eo9:net/l4 left $ rename eo9:net/l2 link-a $ net.l4.over-l2) $ (rename eo9:net/l4 right
+    $ rename eo9:net/l2 link-b $ net.l4.over-l2 --address 10.0.2.16 …) $ vnic4check --peer
+    10.0.2.3 --peer-port 53 --mode dns` →
+    `ok: verified("left=dns answered (61 bytes) right=dns answered (61 bytes)")` — one
+    physical NIC, two virtual MACs, two IP stacks, real DNS on each. Timing on the
+    `net.virtio $ net.l4.over-l2 $ l4check` metal demo, eager vs awaited builds, identical
+    scripted sessions: operation phase 1.10 s → 1.09 s (no measurable runtime cost; the
+    awaits resolve on completion events that arrived anyway), compile phase 29.9 s → 37.6 s
+    (the async pump's larger generated state machine costs on-target cranelift time —
+    single-sample, TCG-noisy, recorded for honesty not alarm). Per-service virtual NICs at
+    the l4 level are unblocked at the composition level; cross-service sharing still waits
+    on executor-model §6 stage A/B. Still true: `time.monotonic-stub` panics if its clock
+    is *observed* unconfigured (the deny-path tests never reached it) — its lazy documented
+    default remains a follow-up for whoever next touches the time stubs; the vnic tests
+    configure it explicitly.
 32. **`gfx.mem`, `gfx.none`, `gfx.deny`, and the `gpu.virtio` driver (2026-06-02).** The
     standard gfx environment mirrors the disk family: `gfx.mem` is the deterministic RAM
     framebuffer (configured WxH, documented default 640x480, never traps; present/read/clear
@@ -515,3 +533,24 @@ Match the priority order above; (1)+(2) unblock I2.
     provider's 4 MiB DMA limit (1024x768 fits; larger needs multi-entry attach-backing — the
     recorded follow-up). No configure interface: claim-first-on-first-use, like the siblings;
     device selection is `pci.filtered` composed in front.
+
+33. **The storage chain converts to honest awaits; the suspension wall falls for storage
+    (2026-06-02, branch `area/14-async-storage`, SPEC "Boundaries are honestly async").**
+    `disk.virtio` and `fs.eofs` no longer drive their imports with the eager single-poll: every
+    `eo9:pci` and `eo9:disk` call is genuinely awaited (the engine itself went async at the core —
+    plan/14 D25), so a downstream that defers suspends the operation instead of failing it. What
+    this changes in this plan's ledger:
+    - The "provider suspended" `io` error class is gone from `disk.virtio` and `fs.eofs`
+      (`pci.filtered`, `fs.filtered`, `fs.overlay` already awaited — verified, no change needed).
+    - **D31's interrupt-under-interposition residual is resolved by construction**: the INTx `wait`
+      is now awaited rather than single-polled, so a parking wait survives interposition — the
+      driver no longer needs its callee chain to complete eagerly. The interrupt-retry and
+      poll-spin bounds are retained, so a dead device still surfaces a typed error, never a hang.
+    - Provider state for awaiting providers is the take/put `Slot` (`Empty | Busy | Ready`) rather
+      than `ProviderState` — borrows never cross awaits, concurrent delivery gets a typed busy
+      error, never a re-borrow trap. `disk.virtio`'s synchronous `size` reports 0 until the first
+      awaited operation brings the device up; `fs.eofs` wakes it with one read and re-asks
+      (plan/14 D25).
+    - The l4-over-switch limit (D31) is the *net* lane's instance of the same wall and converts on
+      `area/09-net-async` (the parallel branch); the storage acceptance is study 09's
+      `pci.filtered $ disk.virtio $ fs.eofs $ cat` on metal.

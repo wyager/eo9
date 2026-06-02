@@ -146,3 +146,24 @@ runtime accept sync lifts and sync lowers of async-typed WIT functions end to en
 
 The conversion is per-stub bindgen configuration plus mechanical body simplification;
 no WIT, no algebra, no vendored-runtime changes.
+
+## Status addendum (2026-06-02): superseded by the async-first ruling
+
+The owner's SPEC ruling ("Boundaries are honestly async; the runtime makes the fast case
+fast", commit 06c30e4) supersedes the all-sync conversion plan above: components whose
+operations can wait in practice are converted to **genuine awaits**, not to sync ABI
+bindings — the all-sync convention survives only as a *measured optimization* for
+provably-never-waiting layers, and the fixture matrix above remains the ground truth for
+both directions. Executed so far:
+
+* **Storage lane** (`area/14-async-storage`): `fs.eofs` (async engine core, plan/14 D25)
+  and `disk.virtio` await their imports; `pci.filtered` already did. Study 09's
+  `pci.admit-address $ pci.filtered $ disk.virtio $ fs.eofs $ ls /` runs on QEMU aarch64
+  metal — with INTx-interrupt completion *through* the filter, so the "interrupt-mode
+  pacing does not survive interposition" residual recorded above is gone (plan/09 D33).
+* **Net lane**: `area/09-net-async` (parallel branch), targeting the l4-over-l2 pump and
+  the vnic_l4 acceptance.
+
+Candidate (b) — first-poll of guest callees in the vendored runtime — is now the planned
+*optimization* so honest asyncness does not tax eagerly-completing compositions; its
+design note is the `area/04-async-hardening` branch's deliverable.
