@@ -184,3 +184,33 @@ Everything; starts alongside Phase 1 (law tests) and grows with each milestone.
       component whose `describe` reports that empty surface is `≡ empty`. It is the identity of `&`
       (`empty & e ≡ e ≡ e & empty`) and a dead layer under `$` (`empty $ c ≡ c`: it satisfies nothing, and
       the wiring tree marks it as such)."
+18. **The async suspension/cancellation hardening matrix shipped (area/13-async-hardening; SPEC "Boundaries
+    are honestly async").** New fixture vocabulary `eo9-tests:hard`/`eo9-tests:bindhard`
+    (tests/eo9-integration/src/fixtures.rs): hand-written canonical-ABI components that *genuinely await* —
+    async-lowered calls joined to waitable sets, `WAIT` callback codes, `task.return` from the callback, and
+    a cancellation arm (`CANCELLED` → cancel downstream → `task.cancel`) — plus `park.rs`'s `ParkBed`, a
+    controllable host clock whose sleeps the test completes (or never completes) one by one, with
+    started/dropped lifecycle observation. Five suites: `async_chains.rs` (awaiting consumer → N relays →
+    parking leaf, N = 0..3: one host op per chain, results intact, deterministic, prompt completion; eager
+    leaf never parks), `async_kill.rs` (host kill mid-forwarded-park leaks nothing at every depth; guest
+    `subtask.cancel` cascades to `RETURN_CANCELLED` through layers; the unacknowledged-cancel quiet-park
+    liveness pin; both cancel-after-terminal traps pinned), `async_fanout.rs` (K = 3 joint await on one set,
+    completion order tracks the host schedule, deterministic, cancel-one-of-K), `async_trap.rs` (a sibling
+    traps while another is parked: trap surfaces with the callee's reason, parked op released with the
+    store), `async_bind.rs` (bind runs at spawn before a chain that parks immediately; a refused
+    configuration is the typed pre-run error and the program is never entered). Findings and the GAPS-caveat
+    refutation: docs/spikes/async-hardening.md; the runtime follow-on design: docs/spikes/first-poll-inline.md.
+19. **Open defect (master, found while running this matrix's CI): intermittent lost wakeup hangs `eo9 -c`
+    coreutils invocations.** `crates/eo9` cli suite, `shell_children_see_bin_programs_and_fs_root_data_at_once`:
+    the spawned `eo9 --fs-root … -c "cat /notes.txt"` child hung forever — main thread parked in
+    `providers::wait_until_runnable` (crates/eo9/src/providers.rs:1167) under `run::drive_to_completion`
+    (run.rs:199), blocking-pool worker idle in `recv` (no in-flight provider op), wasmtime trap-handler
+    thread idle. Two stale, identically-shaped hung processes from *other* checkouts were found alive on the
+    machine (`-c cat --paths /notes.txt` ~2 h old from the main checkout; `-c cp --src … --dst …` ~23 h old
+    from the svcv1 worktree) — so this is a pre-existing master defect in the parent/child drive path (the
+    shell parks on its doorbell while the child's progress signal is lost), not introduced by any current
+    branch. It reproduces only under heavy machine load (3/3 isolated runs pass in ~10-18 s); the suspect
+    window is the parent-resume/child-doorbell handoff in `Task::resume`'s children loop +
+    `wait_until_runnable`. Not fixed here (crates/eo9 is outside this area's lanes); needs its own
+    investigation. Until then it is a rare CI flake: a `cat`/`cp` cli test hanging ≫60 s under load is this
+    defect — kill the child and re-run.

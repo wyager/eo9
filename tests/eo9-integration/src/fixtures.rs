@@ -1520,3 +1520,599 @@ pub fn eager_consumer(call: ConsumerCall) -> Component {
     };
     build_component(EAGER_WIT, &["time"], "eager-consumer", core)
 }
+
+// -----------------------------------------------------------------------------------------
+// The async-hardening fixtures (eo9-tests:hard / eo9-tests:bindhard)
+// -----------------------------------------------------------------------------------------
+//
+// The suspension/cancellation matrix (plan/13, SPEC "Boundaries are honestly async") needs
+// guests that *genuinely await*: async-lowered calls that, on `STARTED`, join the subtask
+// into a waitable set, return the callback-ABI `WAIT` code, resume in their `[callback]`
+// export, and only then `task.return`. That is the honest-async counterpart of the eager
+// fixtures above — the machinery every wit-bindgen async build uses, hand-written so the
+// matrix controls every knob.
+//
+// Cast:
+//   * `awaiting_parker` — the bottom of a chain: a `step` provider over the real (host)
+//     `eo9:time` clock. `run(x)` with `x >= PARK_THRESHOLD` async-lowers the host `sleep`
+//     and parks until the test's controllable provider completes it; smaller `x` completes
+//     eagerly. Result: `x + 100`. Per-task state lives in context-local slot 0, so
+//     concurrent activations (the fan-out suite) do not clobber each other.
+//   * `awaiting_relay` — a forwarding layer: `step` over `step`, awaiting, adding 10.
+//     Cancellation behaviour is selectable: cascade (cancel downstream, then
+//     `task.cancel`) or ignore (keep waiting — the unacknowledged-cancel pin).
+//   * `awaiting_consumer` / `canceller_consumer` / `fanout_consumer` — binaries driving
+//     the chain: one awaited call; cancel-after-issue; K concurrent calls awaited jointly.
+//   * `step_trapper` — a `step` provider that traps, for the trap-while-parked suite.
+//   * `gate_provider` / `gate_parker` — the bind-interplay pair: a configurable provider
+//     (`configure(level)`, refusing level 13) composed under a consumer that parks before
+//     reading the gate.
+
+/// `run(x)` parks iff `x >= PARK_THRESHOLD` (see [`awaiting_parker`]).
+pub const PARK_THRESHOLD: u32 = 50;
+
+/// The hardening vocabulary: one async operation whose result is observable per layer.
+const HARD_WIT: &str = r#"
+package eo9-tests:hard@0.1.0;
+
+/// A capability with a single async operation that reports a number.
+interface step {
+    run: async func(x: u32) -> u32;
+}
+
+/// An awaiting binary over `step`.
+world step-consumer {
+    import step;
+    export main: async func() -> result<u32, string>;
+}
+
+/// A forwarding layer: `step` over `step`.
+world step-relay {
+    import step;
+    export step;
+}
+
+/// The bottom of a chain: a provider of `step` over the real (host) clock.
+world step-parker {
+    import eo9:time/types@0.1.0;
+    import eo9:time/time@0.1.0;
+    export step;
+}
+
+/// A provider of `step` that traps.
+world step-trapper {
+    export step;
+}
+
+/// Two named `step` slots under one consumer: the trap-while-parked shape.
+world mixed-consumer {
+    import park: step;
+    import trap: step;
+    export main: async func() -> result<u32, string>;
+}
+"#;
+
+/// The `$root` intrinsic imports shared by every awaiting fixture.
+const AWAIT_INTRINSICS: &str = r#"
+  (import "$root" "[waitable-set-new]" (func $set-new (result i32)))
+  (import "$root" "[waitable-join]" (func $join (param i32 i32)))
+  (import "$root" "[waitable-set-drop]" (func $set-drop (param i32)))
+  (import "$root" "[subtask-drop]" (func $subtask-drop (param i32)))
+"#;
+
+/// The bottom of the chain: a `step` provider whose `run(x)` awaits the host clock's
+/// `sleep` when `x >=` [`PARK_THRESHOLD`] (and completes eagerly otherwise), returning
+/// `x + 100`. On a delivered `CANCELLED` event it cancels its in-flight host sleep,
+/// acknowledges with `task.cancel`, and exits.
+pub fn awaiting_parker() -> Component {
+    let core = format!(
+        r#"
+(module
+  (import "eo9:time/time@0.1.0" "default" (func $default (result i32)))
+  (import "eo9:time/time@0.1.0" "[async-lower]sleep" (func $sleep-async (param i32 i64) (result i32)))
+{AWAIT_INTRINSICS}
+  (import "$root" "[subtask-cancel]" (func $subtask-cancel (param i32) (result i32)))
+  (import "$root" "[context-set-i32-0]" (func $ctx-set (param i32)))
+  (import "$root" "[context-get-i32-0]" (func $ctx-get (result i32)))
+  (import "[export]eo9-tests:hard/step@0.1.0" "[task-return]run" (func $task-return-run (param i32)))
+  (import "[export]eo9-tests:hard/step@0.1.0" "[task-cancel]" (func $task-cancel))
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 4096))
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+  ;; per-task state block: [x @0, host-subtask @4, set @8]
+  (func (export "[async-lift]eo9-tests:hard/step@0.1.0#run") (param $x i32) (result i32)
+    (local $packed i32) (local $state i32) (local $set i32)
+    (if (i32.lt_u (local.get $x) (i32.const {threshold}))
+      (then
+        (call $task-return-run (i32.add (local.get $x) (i32.const 100)))
+        (return (i32.const 0))))
+    ;; park on the host clock; the duration is nominal — the test's provider decides
+    (local.set $packed (call $sleep-async (call $default) (i64.const 1000000)))
+    (if (i32.eq (i32.and (local.get $packed) (i32.const 0xf)) (i32.const 2))
+      (then
+        ;; the host completed inline after all (an immediate-completion provider)
+        (call $task-return-run (i32.add (local.get $x) (i32.const 100)))
+        (return (i32.const 0))))
+    (local.set $state (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (i32.const 16)))
+    (local.set $set (call $set-new))
+    (i32.store (local.get $state) (local.get $x))
+    (i32.store offset=4 (local.get $state) (i32.shr_u (local.get $packed) (i32.const 4)))
+    (i32.store offset=8 (local.get $state) (local.get $set))
+    (call $ctx-set (local.get $state))
+    (call $join (i32.shr_u (local.get $packed) (i32.const 4)) (local.get $set))
+    (i32.or (i32.shl (local.get $set) (i32.const 4)) (i32.const 2)))
+  (func (export "[callback][async-lift]eo9-tests:hard/step@0.1.0#run") (param $event i32) (param $waitable i32) (param $payload i32) (result i32)
+    (local $state i32)
+    (local.set $state (call $ctx-get))
+    ;; the awaited host sleep completed: report and exit
+    (if (i32.and (i32.eq (local.get $event) (i32.const 1)) (i32.eq (local.get $payload) (i32.const 2)))
+      (then
+        (call $subtask-drop (i32.load offset=4 (local.get $state)))
+        (call $set-drop (i32.load offset=8 (local.get $state)))
+        (call $task-return-run (i32.add (i32.load (local.get $state)) (i32.const 100)))
+        (return (i32.const 0))))
+    ;; cancelled by the caller: cancel the in-flight host sleep, acknowledge, exit
+    (if (i32.eq (local.get $event) (i32.const 6))
+      (then
+        (drop (call $subtask-cancel (i32.load offset=4 (local.get $state))))
+        (call $subtask-drop (i32.load offset=4 (local.get $state)))
+        (call $set-drop (i32.load offset=8 (local.get $state)))
+        (call $task-cancel)
+        (return (i32.const 0))))
+    ;; anything else: keep waiting
+    (i32.or (i32.shl (i32.load offset=8 (local.get $state)) (i32.const 4)) (i32.const 2))))
+"#,
+        threshold = PARK_THRESHOLD,
+    );
+    build_component(HARD_WIT, &["time"], "step-parker", &core)
+}
+
+/// How an [`awaiting_relay`] reacts to a delivered `CANCELLED` event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayCancel {
+    /// Cascade: cancel the downstream subtask (blocking until its terminal status),
+    /// release it, acknowledge with `task.cancel`, exit. The well-behaved middleware.
+    Cascade,
+    /// Ignore the event and keep waiting — the unacknowledged-cancellation pin.
+    Ignore,
+}
+
+/// A forwarding layer: `run(x)` forwards downstream, awaits the completion, and reports
+/// `downstream + 10`. At most one call is in flight per relay instance (chain suites),
+/// so its state lives in globals.
+pub fn awaiting_relay(cancel: RelayCancel) -> Component {
+    let cancel_arm = match cancel {
+        RelayCancel::Cascade => {
+            r#"
+    (if (i32.eq (local.get $event) (i32.const 6))
+      (then
+        (drop (call $subtask-cancel (global.get $subtask)))
+        (call $subtask-drop (global.get $subtask))
+        (call $set-drop (global.get $set))
+        (call $task-cancel)
+        (return (i32.const 0))))
+"#
+        }
+        RelayCancel::Ignore => "",
+    };
+    let core = format!(
+        r#"
+(module
+  (import "eo9-tests:hard/step@0.1.0" "[async-lower]run" (func $run-async (param i32 i32) (result i32)))
+{AWAIT_INTRINSICS}
+  (import "$root" "[subtask-cancel]" (func $subtask-cancel (param i32) (result i32)))
+  (import "[export]eo9-tests:hard/step@0.1.0" "[task-return]run" (func $task-return-run (param i32)))
+  (import "[export]eo9-tests:hard/step@0.1.0" "[task-cancel]" (func $task-cancel))
+  (memory (export "memory") 1)
+  (global $subtask (mut i32) (i32.const 0))
+  (global $set (mut i32) (i32.const 0))
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+  (func (export "[async-lift]eo9-tests:hard/step@0.1.0#run") (param $x i32) (result i32)
+    (local $packed i32)
+    ;; the downstream result lands at 64 when the call completes
+    (local.set $packed (call $run-async (local.get $x) (i32.const 64)))
+    (if (i32.eq (i32.and (local.get $packed) (i32.const 0xf)) (i32.const 2))
+      (then
+        (call $task-return-run (i32.add (i32.load (i32.const 64)) (i32.const 10)))
+        (return (i32.const 0))))
+    (global.set $subtask (i32.shr_u (local.get $packed) (i32.const 4)))
+    (global.set $set (call $set-new))
+    (call $join (global.get $subtask) (global.get $set))
+    (i32.or (i32.shl (global.get $set) (i32.const 4)) (i32.const 2)))
+  (func (export "[callback][async-lift]eo9-tests:hard/step@0.1.0#run") (param $event i32) (param $waitable i32) (param $payload i32) (result i32)
+    (if (i32.and (i32.eq (local.get $event) (i32.const 1)) (i32.eq (local.get $payload) (i32.const 2)))
+      (then
+        (call $subtask-drop (global.get $subtask))
+        (call $set-drop (global.get $set))
+        (call $task-return-run (i32.add (i32.load (i32.const 64)) (i32.const 10)))
+        (return (i32.const 0))))
+{cancel_arm}
+    (i32.or (i32.shl (global.get $set) (i32.const 4)) (i32.const 2))))
+"#
+    );
+    build_component(HARD_WIT, &["time"], "step-relay", &core)
+}
+
+/// An awaiting binary: one async-lowered `run(x)`, awaited through the callback ABI;
+/// `main` returns `ok(value)`.
+pub fn awaiting_consumer(x: u32) -> Component {
+    let core = format!(
+        r#"
+(module
+  (import "eo9-tests:hard/step@0.1.0" "[async-lower]run" (func $run-async (param i32 i32) (result i32)))
+{AWAIT_INTRINSICS}
+  (import "[export]$root" "[task-return]main" (func $task-return-main (param i32 i32 i32)))
+  (memory (export "memory") 1)
+  (global $subtask (mut i32) (i32.const 0))
+  (global $set (mut i32) (i32.const 0))
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+  (func (export "[async-lift]main") (result i32)
+    (local $packed i32)
+    (local.set $packed (call $run-async (i32.const {x}) (i32.const 64)))
+    (if (i32.eq (i32.and (local.get $packed) (i32.const 0xf)) (i32.const 2))
+      (then
+        (call $task-return-main (i32.const 0) (i32.load (i32.const 64)) (i32.const 0))
+        (return (i32.const 0))))
+    (global.set $subtask (i32.shr_u (local.get $packed) (i32.const 4)))
+    (global.set $set (call $set-new))
+    (call $join (global.get $subtask) (global.get $set))
+    (i32.or (i32.shl (global.get $set) (i32.const 4)) (i32.const 2)))
+  (func (export "[callback][async-lift]main") (param $event i32) (param $waitable i32) (param $payload i32) (result i32)
+    (if (i32.and (i32.eq (local.get $event) (i32.const 1)) (i32.eq (local.get $payload) (i32.const 2)))
+      (then
+        (call $subtask-drop (global.get $subtask))
+        (call $set-drop (global.get $set))
+        (call $task-return-main (i32.const 0) (i32.load (i32.const 64)) (i32.const 0))
+        (return (i32.const 0))))
+    (i32.or (i32.shl (global.get $set) (i32.const 4)) (i32.const 2))))
+"#
+    );
+    build_component(HARD_WIT, &["time"], "step-consumer", &core)
+}
+
+/// A binary that issues `run(x)` and then cancels the in-flight call (the sync
+/// `subtask.cancel`, which blocks until the callee's terminal status); `main` returns
+/// `ok(status)` — the canonical-ABI status the cancel resolved to (4 = RETURN_CANCELLED).
+/// If the call completed eagerly there is nothing in flight; `main` returns
+/// `ok(1000 + value)` instead.
+pub fn canceller_consumer(x: u32) -> Component {
+    let core = format!(
+        r#"
+(module
+  (import "eo9-tests:hard/step@0.1.0" "[async-lower]run" (func $run-async (param i32 i32) (result i32)))
+  (import "$root" "[subtask-cancel]" (func $subtask-cancel (param i32) (result i32)))
+  (import "$root" "[subtask-drop]" (func $subtask-drop (param i32)))
+  (import "[export]$root" "[task-return]main" (func $task-return-main (param i32 i32 i32)))
+  (memory (export "memory") 1)
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+  (func (export "[async-lift]main") (result i32)
+    (local $packed i32) (local $status i32)
+    (local.set $packed (call $run-async (i32.const {x}) (i32.const 64)))
+    (if (i32.eq (i32.and (local.get $packed) (i32.const 0xf)) (i32.const 2))
+      (then
+        (call $task-return-main (i32.const 0) (i32.add (i32.const 1000) (i32.load (i32.const 64))) (i32.const 0))
+        (return (i32.const 0))))
+    ;; cancel the in-flight call; the sync flavor blocks until the terminal status
+    (local.set $status (call $subtask-cancel (i32.shr_u (local.get $packed) (i32.const 4))))
+    (call $subtask-drop (i32.shr_u (local.get $packed) (i32.const 4)))
+    (call $task-return-main (i32.const 0) (local.get $status) (i32.const 0))
+    (i32.const 0))
+  (func (export "[callback][async-lift]main") (param i32 i32 i32) (result i32)
+    unreachable))
+"#
+    );
+    build_component(HARD_WIT, &["time"], "step-consumer", &core)
+}
+
+/// A binary like [`awaiting_consumer`] whose callback, on the awaited completion,
+/// cancels the (now terminal) subtask instead of dropping it — pinning the runtime's
+/// behaviour for cancel-after-terminal (a trap, per the canonical ABI).
+pub fn cancel_after_event_consumer() -> Component {
+    const CORE: &str = r#"
+(module
+  (import "eo9-tests:hard/step@0.1.0" "[async-lower]run" (func $run-async (param i32 i32) (result i32)))
+  (import "$root" "[waitable-set-new]" (func $set-new (result i32)))
+  (import "$root" "[waitable-join]" (func $join (param i32 i32)))
+  (import "$root" "[subtask-cancel]" (func $subtask-cancel (param i32) (result i32)))
+  (import "[export]$root" "[task-return]main" (func $task-return-main (param i32 i32 i32)))
+  (memory (export "memory") 1)
+  (global $subtask (mut i32) (i32.const 0))
+  (global $set (mut i32) (i32.const 0))
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+  (func (export "[async-lift]main") (result i32)
+    (local $packed i32)
+    (local.set $packed (call $run-async (i32.const 57) (i32.const 64)))
+    (if (i32.eq (i32.and (local.get $packed) (i32.const 0xf)) (i32.const 2))
+      (then unreachable))
+    (global.set $subtask (i32.shr_u (local.get $packed) (i32.const 4)))
+    (global.set $set (call $set-new))
+    (call $join (global.get $subtask) (global.get $set))
+    (i32.or (i32.shl (global.get $set) (i32.const 4)) (i32.const 2)))
+  (func (export "[callback][async-lift]main") (param $event i32) (param $waitable i32) (param $payload i32) (result i32)
+    (if (i32.and (i32.eq (local.get $event) (i32.const 1)) (i32.eq (local.get $payload) (i32.const 2)))
+      (then
+        ;; the call is terminal and its completion event was just consumed: cancel it
+        (drop (call $subtask-cancel (global.get $subtask)))
+        (call $task-return-main (i32.const 0) (i32.const 0) (i32.const 0))
+        (return (i32.const 0))))
+    (i32.or (i32.shl (global.get $set) (i32.const 4)) (i32.const 2))))
+"#;
+    build_component(HARD_WIT, &["time"], "step-consumer", CORE)
+}
+
+/// A binary that cancels after an **eager** completion: a call that returns at issue
+/// never mints a subtask handle (the canonical ABI packs no waitable with `RETURNED`),
+/// so there is nothing to cancel — pinning that the attempt traps on the handle.
+pub fn cancel_after_done_consumer() -> Component {
+    const CORE: &str = r#"
+(module
+  (import "eo9-tests:hard/step@0.1.0" "[async-lower]run" (func $run-async (param i32 i32) (result i32)))
+  (import "$root" "[subtask-cancel]" (func $subtask-cancel (param i32) (result i32)))
+  (import "[export]$root" "[task-return]main" (func $task-return-main (param i32 i32 i32)))
+  (memory (export "memory") 1)
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+  (func (export "[async-lift]main") (result i32)
+    (local $packed i32)
+    ;; an eager call (x = 7 below the threshold): completes at issue
+    (local.set $packed (call $run-async (i32.const 7) (i32.const 64)))
+    ;; cancel it anyway: the subtask is already terminal
+    (drop (call $subtask-cancel (i32.shr_u (local.get $packed) (i32.const 4))))
+    (call $task-return-main (i32.const 0) (i32.const 0) (i32.const 0))
+    (i32.const 0))
+  (func (export "[callback][async-lift]main") (param i32 i32 i32) (result i32)
+    unreachable))
+"#;
+    build_component(HARD_WIT, &["time"], "step-consumer", CORE)
+}
+
+/// A `step` provider that traps in its initial activation.
+pub fn step_trapper() -> Component {
+    const CORE: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+  (func (export "eo9-tests:hard/step@0.1.0#run") (param i32) (result i32)
+    unreachable))
+"#;
+    build_component(HARD_WIT, &["time"], "step-trapper", CORE)
+}
+
+/// A binary with two named `step` slots — `park` and `trap` — that issues one call to
+/// each and awaits them jointly: the trap-while-parked shape (section 4 of the
+/// hardening matrix). Wire with `rename(parker, "eo9-tests:hard/step", "park")` and
+/// `rename(trapper, "eo9-tests:hard/step", "trap")`.
+pub fn mixed_consumer() -> Component {
+    const CORE: &str = r#"
+(module
+  (import "park" "[async-lower]run" (func $park-run (param i32 i32) (result i32)))
+  (import "trap" "[async-lower]run" (func $trap-run (param i32 i32) (result i32)))
+  (import "$root" "[waitable-set-new]" (func $set-new (result i32)))
+  (import "$root" "[waitable-join]" (func $join (param i32 i32)))
+  (import "[export]$root" "[task-return]main" (func $task-return-main (param i32 i32 i32)))
+  (memory (export "memory") 1)
+  (global $set (mut i32) (i32.const 0))
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+  (func (export "[async-lift]main") (result i32)
+    (local $packed1 i32) (local $packed2 i32)
+    ;; call 1: the parker (x = 57 parks); result at 64
+    (local.set $packed1 (call $park-run (i32.const 57) (i32.const 64)))
+    ;; call 2: the trapper; result at 80. The queued activation traps, so control
+    ;; never returns here with a completed call — but handle every shape anyway.
+    (local.set $packed2 (call $trap-run (i32.const 7) (i32.const 80)))
+    (global.set $set (call $set-new))
+    (if (i32.ne (i32.shr_u (local.get $packed1) (i32.const 4)) (i32.const 0))
+      (then (call $join (i32.shr_u (local.get $packed1) (i32.const 4)) (global.get $set))))
+    (if (i32.ne (i32.shr_u (local.get $packed2) (i32.const 4)) (i32.const 0))
+      (then (call $join (i32.shr_u (local.get $packed2) (i32.const 4)) (global.get $set))))
+    (i32.or (i32.shl (global.get $set) (i32.const 4)) (i32.const 2)))
+  (func (export "[callback][async-lift]main") (param $event i32) (param $waitable i32) (param $payload i32) (result i32)
+    ;; never legitimately reached: the trapper poisons the program first
+    (i32.or (i32.shl (global.get $set) (i32.const 4)) (i32.const 2))))
+"#;
+    build_component(HARD_WIT, &["time"], "mixed-consumer", CORE)
+}
+
+/// A binary that starts three concurrent `run` calls — `run(60)` (parks), `run(1)`
+/// (eager), `run(70)` (parks) — and awaits them jointly on one waitable set. With
+/// `cancel_third`, the third call is cancelled after issue (sync `subtask.cancel`).
+///
+/// `main` returns `ok(order * 100000 + sum)`:
+/// * `order` — completion-order digits (call index 1..3 as observed; `9` marks the
+///   cancellation step), most significant first;
+/// * `sum` — the completed calls' results, plus `7 * status` for a cancelled call
+///   (status 4 = RETURN_CANCELLED).
+pub fn fanout_consumer(cancel_third: bool) -> Component {
+    let cancel_block = if cancel_third {
+        r#"
+    ;; cancel the third call if it is in flight
+    (if (i32.ne (i32.load (i32.const 8)) (i32.const 0))
+      (then
+        (local.set $status (call $subtask-cancel (i32.load (i32.const 8))))
+        (call $subtask-drop (i32.load (i32.const 8)))
+        (i32.store (i32.const 8) (i32.const 0))
+        (global.set $pending (i32.sub (global.get $pending) (i32.const 1)))
+        (global.set $order (i32.add (i32.mul (global.get $order) (i32.const 10)) (i32.const 9)))
+        (global.set $sum (i32.add (global.get $sum) (i32.mul (local.get $status) (i32.const 7))))))
+"#
+    } else {
+        ""
+    };
+    let core = format!(
+        r#"
+(module
+  (import "eo9-tests:hard/step@0.1.0" "[async-lower]run" (func $run-async (param i32 i32) (result i32)))
+{AWAIT_INTRINSICS}
+  (import "$root" "[subtask-cancel]" (func $subtask-cancel (param i32) (result i32)))
+  (import "[export]$root" "[task-return]main" (func $task-return-main (param i32 i32 i32)))
+  (memory (export "memory") 1)
+  (global $order (mut i32) (i32.const 0))
+  (global $sum (mut i32) (i32.const 0))
+  (global $pending (mut i32) (i32.const 0))
+  (global $set (mut i32) (i32.const 0))
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+  ;; sub handles live at (idx-1)*4; retptrs at 96 + (idx-1)*16
+  (func $issue (param $x i32) (param $idx i32)
+    (local $packed i32) (local $ret i32)
+    (local.set $ret (i32.add (i32.const 96) (i32.mul (i32.sub (local.get $idx) (i32.const 1)) (i32.const 16))))
+    (local.set $packed (call $run-async (local.get $x) (local.get $ret)))
+    (if (i32.eq (i32.and (local.get $packed) (i32.const 0xf)) (i32.const 2))
+      (then
+        (global.set $order (i32.add (i32.mul (global.get $order) (i32.const 10)) (local.get $idx)))
+        (global.set $sum (i32.add (global.get $sum) (i32.load (local.get $ret)))))
+      (else
+        (i32.store (i32.mul (i32.sub (local.get $idx) (i32.const 1)) (i32.const 4))
+                   (i32.shr_u (local.get $packed) (i32.const 4)))
+        (global.set $pending (i32.add (global.get $pending) (i32.const 1))))))
+  (func $resolve (param $idx i32)
+    (local $slot i32) (local $ret i32)
+    (local.set $slot (i32.mul (i32.sub (local.get $idx) (i32.const 1)) (i32.const 4)))
+    (local.set $ret (i32.add (i32.const 96) (i32.mul (i32.sub (local.get $idx) (i32.const 1)) (i32.const 16))))
+    (global.set $order (i32.add (i32.mul (global.get $order) (i32.const 10)) (local.get $idx)))
+    (global.set $sum (i32.add (global.get $sum) (i32.load (local.get $ret))))
+    (call $subtask-drop (i32.load (local.get $slot)))
+    (i32.store (local.get $slot) (i32.const 0))
+    (global.set $pending (i32.sub (global.get $pending) (i32.const 1))))
+  (func $finish
+    (call $task-return-main (i32.const 0)
+      (i32.add (i32.mul (global.get $order) (i32.const 100000)) (global.get $sum))
+      (i32.const 0)))
+  (func (export "[async-lift]main") (result i32)
+    (local $status i32)
+    (call $issue (i32.const 60) (i32.const 1))
+    (call $issue (i32.const 1) (i32.const 2))
+    (call $issue (i32.const 70) (i32.const 3))
+{cancel_block}
+    (if (i32.eqz (global.get $pending))
+      (then
+        (call $finish)
+        (return (i32.const 0))))
+    (global.set $set (call $set-new))
+    (if (i32.ne (i32.load (i32.const 0)) (i32.const 0))
+      (then (call $join (i32.load (i32.const 0)) (global.get $set))))
+    (if (i32.ne (i32.load (i32.const 4)) (i32.const 0))
+      (then (call $join (i32.load (i32.const 4)) (global.get $set))))
+    (if (i32.ne (i32.load (i32.const 8)) (i32.const 0))
+      (then (call $join (i32.load (i32.const 8)) (global.get $set))))
+    (i32.or (i32.shl (global.get $set) (i32.const 4)) (i32.const 2)))
+  (func (export "[callback][async-lift]main") (param $event i32) (param $waitable i32) (param $payload i32) (result i32)
+    (if (i32.and (i32.eq (local.get $event) (i32.const 1)) (i32.eq (local.get $payload) (i32.const 2)))
+      (then
+        (if (i32.and (i32.ne (i32.load (i32.const 0)) (i32.const 0))
+                     (i32.eq (local.get $waitable) (i32.load (i32.const 0))))
+          (then (call $resolve (i32.const 1))))
+        (if (i32.and (i32.ne (i32.load (i32.const 4)) (i32.const 0))
+                     (i32.eq (local.get $waitable) (i32.load (i32.const 4))))
+          (then (call $resolve (i32.const 2))))
+        (if (i32.and (i32.ne (i32.load (i32.const 8)) (i32.const 0))
+                     (i32.eq (local.get $waitable) (i32.load (i32.const 8))))
+          (then (call $resolve (i32.const 3))))
+        (if (i32.eqz (global.get $pending))
+          (then
+            (call $set-drop (global.get $set))
+            (call $finish)
+            (return (i32.const 0))))))
+    (i32.or (i32.shl (global.get $set) (i32.const 4)) (i32.const 2))))
+"#
+    );
+    build_component(HARD_WIT, &["time"], "step-consumer", &core)
+}
+
+/// The bind-interplay vocabulary: a configurable provider and a consumer that parks
+/// before reading it.
+const BINDHARD_WIT: &str = r#"
+package eo9-tests:bindhard@0.1.0;
+
+/// A capability that reports one configured value.
+interface gate {
+    pass: func() -> u32;
+}
+
+/// Compose-time configuration for the gate; level 13 is refused.
+interface gate-config {
+    configure: func(level: u32) -> result<_, string>;
+}
+
+/// The configurable provider.
+world gate-provider {
+    export gate;
+    export gate-config;
+}
+
+/// A binary that parks on the (host) clock and then reads the gate.
+world gate-parker {
+    import eo9:time/types@0.1.0;
+    import eo9:time/time@0.1.0;
+    import gate;
+    export main: async func() -> result<u32, string>;
+}
+"#;
+
+/// The error text [`gate_provider`]'s `configure` refuses level 13 with.
+pub const GATE_REFUSAL: &str = "the gate refuses its configuration";
+
+/// A configurable provider: `configure(level)` bakes `level` (refusing 13 with
+/// [`GATE_REFUSAL`]); `gate.pass()` reports `level * 7`.
+pub fn gate_provider() -> Component {
+    const CORE: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (global $level (mut i32) (i32.const 0))
+  (data (i32.const 8) "the gate refuses its configuration")
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+  (func (export "eo9-tests:bindhard/gate-config@0.1.0#configure") (param $level i32) (result i32)
+    (if (result i32) (i32.eq (local.get $level) (i32.const 13))
+      (then
+        ;; err("the gate refuses its configuration") at 64
+        (i32.store8 (i32.const 64) (i32.const 1))
+        (i32.store (i32.const 68) (i32.const 8))
+        (i32.store (i32.const 72) (i32.const 34))
+        (i32.const 64))
+      (else
+        (global.set $level (local.get $level))
+        (i32.store8 (i32.const 64) (i32.const 0))
+        (i32.const 64))))
+  (func (export "eo9-tests:bindhard/gate@0.1.0#pass") (result i32)
+    (i32.mul (global.get $level) (i32.const 7))))
+"#;
+    build_component(BINDHARD_WIT, &["time"], "gate-provider", CORE)
+}
+
+/// A binary that awaits one host `sleep` and then reads the gate: pins that a baked
+/// configuration is bound at spawn (before `main` ever runs) and survives the park.
+pub fn gate_parker() -> Component {
+    let core = format!(
+        r#"
+(module
+  (import "eo9:time/time@0.1.0" "default" (func $default (result i32)))
+  (import "eo9:time/time@0.1.0" "[async-lower]sleep" (func $sleep-async (param i32 i64) (result i32)))
+  (import "eo9-tests:bindhard/gate@0.1.0" "pass" (func $pass (result i32)))
+{AWAIT_INTRINSICS}
+  (import "[export]$root" "[task-return]main" (func $task-return-main (param i32 i32 i32)))
+  (memory (export "memory") 1)
+  (global $subtask (mut i32) (i32.const 0))
+  (global $set (mut i32) (i32.const 0))
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 1024))
+  (func (export "[async-lift]main") (result i32)
+    (local $packed i32)
+    (local.set $packed (call $sleep-async (call $default) (i64.const 1000000)))
+    (if (i32.eq (i32.and (local.get $packed) (i32.const 0xf)) (i32.const 2))
+      (then
+        (call $task-return-main (i32.const 0) (call $pass) (i32.const 0))
+        (return (i32.const 0))))
+    (global.set $subtask (i32.shr_u (local.get $packed) (i32.const 4)))
+    (global.set $set (call $set-new))
+    (call $join (global.get $subtask) (global.get $set))
+    (i32.or (i32.shl (global.get $set) (i32.const 4)) (i32.const 2)))
+  (func (export "[callback][async-lift]main") (param $event i32) (param $waitable i32) (param $payload i32) (result i32)
+    (if (i32.and (i32.eq (local.get $event) (i32.const 1)) (i32.eq (local.get $payload) (i32.const 2)))
+      (then
+        (call $subtask-drop (global.get $subtask))
+        (call $set-drop (global.get $set))
+        (call $task-return-main (i32.const 0) (call $pass) (i32.const 0))
+        (return (i32.const 0))))
+    (i32.or (i32.shl (global.get $set) (i32.const 4)) (i32.const 2))))
+"#
+    );
+    build_component(BINDHARD_WIT, &["time"], "gate-parker", &core)
+}
