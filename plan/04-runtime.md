@@ -400,11 +400,21 @@ usermode v1 is implemented:
   cancel after the terminal event was consumed: `Trap::SubtaskCancelAfterTerminal`). A callee that ignores
   `CANCELLED` parks its canceller forever — quiet, fuel-immune; the SPEC bounded-await rule is the policy
   answer and the conversion pass must verify generated bindings acknowledge cancellation.
-* **First-poll-inline is designed, not yet built** (docs/spikes/first-poll-inline.md): the queue decision is
-  the unconditional `push_high_priority(WorkItem::GuestCall(StartImplicit))` in vendored
-  `concurrent.rs:2557-2566`; the proposal runs callback-ABI callees inline on the caller's stack and falls
-  back to the queue when the activation returns `WAIT`/`YIELD` (suspension is a return value — no stack
-  capture), behind reentrance/backpressure/stack-depth gates, always-inline-when-legal for determinism,
-  feature-gated off-by-default and A/B'd against the hardening matrix (which must stay byte-identical) plus
-  the eager_guest suite (whose three "wall" rows flipping to RETURNED is the intended signal). Upstream's
-  own comment at concurrent.rs:2884-2896 invites exactly this with numbers.
+* **First-poll-inline is built and A/B-verified, off by default** (area/04-first-poll;
+  docs/spikes/first-poll-inline.md "Prototype results"; kernel/vendor/README.md). The vendored wasmtime's
+  `component-model-async-first-poll` feature makes `queue_call` hand the activation closure back to
+  `start_call`, which runs callback-ABI callees inline on the caller's stack and falls back to the queue
+  exactly when the activation returns `WAIT`/`YIELD` (suspension is a return value — nothing to undo). Gate:
+  guest callers only (host->guest `queue_call0` always queues), the same `do_not_enter`/`backpressure`
+  checks `is_ready` makes, nested depth < 64 — all store state, so always-inline-when-legal stays
+  deterministic. A/B'd in `tests/firstpoll-ab` (standalone workspace, embed-spike pattern, both arms on the
+  vendored copy): the 21-test hardening matrix identical in both arms, eager_guest's three
+  callback-callee wall rows flip to RETURNED (the sync-lifted row pinned still queued), the real-chain
+  suites 33/33 in both arms, and a feature-on kernel boots QEMU and runs an on-target-composed
+  `net.l4.loopback $ sockcheck` chain. Eager forwarding chains run ~28-38% faster per spawn+run at depths
+  1-4; the parked chain's descent gets ~19% with the completion cascade unchanged by design. Known
+  deviation, documented in the README and the spike note: a callee that blocks *mid-frame* (blocking
+  sync-lowered import in its initial activation) now blocks its caller's fiber — no Eo9 guest does this
+  (callback ABI throughout), and the spec change upstream's comment names is required before default-on.
+  Remaining for default-on: where the embedder opts in, the local A/B gate spelling (xtask subcommand),
+  per-hop numbers on a quiet machine, metal measurement.

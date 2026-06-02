@@ -1,7 +1,11 @@
 # Design note: first-poll-inline for guest callees
 
-**Status**: design only — no runtime change yet. The follow-on prototype is gated on the
-async-hardening matrix (tests/eo9-integration/tests/async_*.rs) staying green unchanged.
+**Status**: prototype built and A/B-verified (area/04-first-poll). The vendored wasmtime
+gains the off-by-default `component-model-async-first-poll` feature
+(kernel/vendor/README.md); `tests/firstpoll-ab` is the standalone A/B workspace (both
+arms build the *same* vendored copy, the feature the only variable). Results in
+"Prototype results" at the end of this note. Default builds everywhere keep the queued
+path.
 
 **Context** (docs/spikes/eager-guest-forwarding.md, SPEC "Boundaries are honestly
 async"): under the async-first doctrine every boundary that can wait is declared and
@@ -135,3 +139,72 @@ just same pass/fail):
 4. Only after A/B is stable: flip the default in the Eo9 engine options, keep the
    feature flag for one release as the escape hatch, and propose upstream with the
    numbers (the upstream comment invites exactly this).
+
+## Prototype results (area/04-first-poll)
+
+**Where it landed.** Feature `component-model-async-first-poll` in the vendored
+wasmtime, exactly two change sites plus a helper: `queue_call` returns the activation
+closure instead of pushing it when the gate passes (callback-ABI callee, `Caller::Guest`
+only — the host->guest `queue_call0` path always queues — instance enterable per the
+same `do_not_enter`/`backpressure` checks `is_ready` makes, nested depth <
+`MAX_INLINE_DEPTH` = 64), and `start_call` runs it inline (`run_inline_activation`)
+before its wait loop. `EXIT` → the terminal status is consumed directly, no event-loop
+round trip, no suspension; `WAIT`/`YIELD` → fall through (async-lowered callers take
+their handle without suspending at all; sync-lowered callers park as today, with the
+pending `Started` consumed first so the wait cannot miss a wakeup). One subtlety the
+design sketch glossed: the inline run happens *before* the caller joins the subtask
+waitable to its sync-call set, so events land in the (last-write-wins) slot without
+waking anything — consuming the slot afterwards is both the result delivery and the
+lost-wakeup guard.
+
+**A/B harness**: `tests/firstpoll-ab`, a standalone workspace (embed-spike pattern) that
+patches the whole vendored wasmtime family for *both* arms, so the feature is the only
+variable. It includes the original suites by `#[path]` — pins verified verbatim, not
+re-transcribed.
+
+- The 21-test async-hardening matrix (`async_{chains,kill,fanout,trap,bind}`): green
+  with identical outcomes in both arms, including completion-order encodings,
+  cancellation cascades, and the two contract traps.
+- `eager_guest`: the seven pins hold with the feature off; with it on, exactly the
+  three rows whose STARTED came from a queued call to a *callback-ABI* callee flip to
+  RETURNED (the wall row to `2002`, the sync-lifted-relay row to `2002`, the
+  sync-lower-to-async-lifted row to `2007`), and the async-lower-to-*sync-lifted* row is
+  pinned still STARTED — inlining is scoped to callback callees by construction.
+- The real-chain suites (eofs, pci_filtered, net_l4_over_l2, vnic_switch,
+  interposition, compound_config, algebra_properties, soundness_corpus): 33/33 in both
+  arms.
+- Kernel: an aarch64 build with the feature on (kernel feature `first-poll-inline`,
+  appended manually to the build_kernel feature list) boots under QEMU, composes
+  `net.l4.loopback $ sockcheck` on-target, runs it (`ok: echoed(52)`), and powers off.
+
+**Numbers** (release, eager forwarding chain `time_leaf_async $ relay^N $
+consumer(sync-lower)`, one async-lowered callback-ABI boundary per hop, all completing
+eagerly; medians of four interleaved runs, 200 iterations each, spawn+run per
+iteration; machine moderately loaded, treat as ~±15%):
+
+| shape | queued (off) | inline (on) | delta |
+|---|---|---|---|
+| eager chain depth 1 | ~132 µs/run | ~82 µs/run | −38% |
+| eager chain depth 2 | ~137 µs/run | ~90 µs/run | −34% |
+| eager chain depth 4 | ~156 µs/run | ~112 µs/run | −28% |
+| parked chain depth 3 (park+complete cycle) | ~167 µs | ~135 µs | −19% |
+
+Every paired run at every depth was faster with the feature on; the parked-chain win is
+the descent (the initial activations down to the host park run inline; the completion
+cascade is event-loop-driven in both arms, as designed). Run-to-run noise still
+dominates per-hop accounting — instantiation is most of each iteration — so these
+numbers support "measurable benefit", not a per-boundary cost model.
+
+**Known semantic deviation** (inherited from the upstream comment's caveat): a
+directly-called callee that *blocks mid-frame* — a blocking sync-lowered import inside
+its initial activation — now blocks its caller's fiber for the duration, where the
+queued path blocked only a worker fiber and let an async-lowered caller proceed after
+`Started`. Eo9 guests are callback-ABI throughout and express waits as `WAIT` codes, so
+no shipped composition does this (the matrix and chain suites confirm), but the spec
+change upstream names is required before default-on or an upstream proposal.
+
+**Remaining for default-on** (rollout step 4): decide where the embedder opts in (an
+Eo9 engine option vs. the cargo feature), wire the host workspace A/B into the local
+gate (`cargo test` twice in tests/firstpoll-ab; an xtask subcommand would be the
+ergonomic spelling), quantify per-hop costs on a quiet machine with work-item counters,
+and a metal (not QEMU) measurement once a board is in hand.

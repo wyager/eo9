@@ -406,3 +406,18 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     eager component sync-lowers its imports and sync-lifts its exports ("all-sync"); the chain grounds
     out at host providers. The algebra, the WIT surface, and the vendored runtime are untouched; the
     per-stub conversion plan lives in the spike doc and rides with area 07/09.
+
+26. **The runtime half of async-first landed: first-poll-inline for guest callees (2026-06-02, branch
+    `area/04-first-poll`; docs/spikes/first-poll-inline.md "Prototype results").** D25's wall is now
+    closed from the runtime side too: with the vendored `component-model-async-first-poll` feature
+    (off by default), a queued call to a *callback-ABI* callee whose instance is enterable runs its
+    initial activation inline on the caller's stack, so an activation that never waits completes
+    `RETURNED` with no event-loop round trip — the eager-guest matrix's three callback-callee STARTED
+    rows flip, pinned by `tests/firstpoll-ab/tests/eager_guest_on.rs`, while the
+    async-lower-to-*sync-lifted* row is pinned still queued (inlining is scoped to callback callees by
+    construction). Algebra-side consequences: none — the decision is store-state-only
+    (reentrance/backpressure/depth), so composition, `describe`, and the determinism suites are
+    untouched (algebra_properties + soundness_corpus pass identically in both arms), and the all-sync
+    convention from D25 remains a valid (now optional) guest-side pattern whose rows behave
+    identically under the feature. The 21-test hardening matrix is outcome-identical in both arms;
+    the per-suite expectations and measured numbers live in the spike note.
