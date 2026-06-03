@@ -1713,3 +1713,30 @@ preemption/hardening work.
     ARP, check-gpu pixel-exact, svcdemo) and `cargo xtask ci` green. The serial-driving
     convention "pace input ~20 ms/char" is now obsolete for correctness (harnesses may keep
     it for echo-interleaving readability only).
+
+71. **Interrupt-edge audit + the PLIC claim becomes a linear token (2026-06-03, branch
+    `spike/12-irq-ownership`).** Owner-commissioned after entry 70's sequencing bug: audit
+    every interrupt-edge site for order-dependent code the compiler cannot see, and
+    investigate whether ownership/typestate can enforce such sequencing structurally.
+    **Audit** (`docs/spikes/irq-audit.md`, site-by-site with invariants, current order,
+    rescue, verdict): 0 live bugs; 4 SOUND-BUT-FRAGILE clusters — PL011 ack-then-drain
+    (severe history, scavenger-mitigated), GIC service-before-EOI, GIC IAR→EOIR pairing
+    (no rescue), PLIC claim→complete pairing (no rescue); everything else SOUND via three
+    named structural families (masked-halt brackets, sticky counters + guaranteed re-polls,
+    bounded fallbacks) that make ordering non-load-bearing. **Prototype**
+    (`src/arch/riscv64/plic.rs` + `traps.rs`): `claim()` returns a `#[must_use]`
+    `Claim(NonZeroU32)` token consumed by value in `complete()` — complete-without-claim
+    impossible, double-complete a compile error, an abandoned claim (the
+    permanently-stranded-source bug) a lint plus a debug-build panic naming the source.
+    Zero-cost verified: `Option<Claim>` const-asserted to the size of the raw register read
+    (the `NonZeroU32` niche reuses the hardware's 0-sentinel), no `Drop` impl in release,
+    clean A/B builds show `ktrap` byte-size identical (686 = 686; the +56-byte total `.text`
+    delta is CGU repartitioning noise that also moves unrelated symbols). **Verdict**
+    (`docs/spikes/irq-ownership.md`, honest): adopt the token shape for the two no-rescue
+    must-consume protocols only — PLIC (done) and the GIC IAR/EOIR pair (same shape, queued
+    follow-up); do NOT retrofit typestate generally — Rust's affine (not linear) types make
+    the dangerous direction (forgetting to complete) a lint + debug panic rather than a
+    compile error, the type system enforces the order you encode rather than discovering
+    the correct order, and the audit's SOUND majority is sound for structural reasons
+    tokens cannot express. The audit's invariant inventory is judged worth more than the
+    types.
