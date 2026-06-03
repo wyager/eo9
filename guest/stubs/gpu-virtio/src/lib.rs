@@ -176,6 +176,13 @@ fn poll_eager<F: Future>(future: F) -> Option<F::Output> {
     }
 }
 
+/// One diagnostic line on the console (best-effort; used for rare degraded-mode notices).
+fn diag(line: &str) {
+    let handle = text::default();
+    let _ = text::write(&handle, text::OutputStream::Out, line);
+    let _ = text::write(&handle, text::OutputStream::Out, "\n");
+}
+
 /// Run one PCI operation eagerly and flatten its result, labelling failures with `what`.
 fn pci_call<T>(
     what: &str,
@@ -226,6 +233,8 @@ struct Driver {
     used_index: u16,
     width: u32,
     height: u32,
+    /// Whether the once-per-conversation polled-fallback notice was already printed.
+    reported_polled_fallback: bool,
 }
 
 static STATE: ProviderState<Driver> = ProviderState::new();
@@ -313,6 +322,7 @@ impl Driver {
             used_index: 0,
             width: 0,
             height: 0,
+            reported_polled_fallback: false,
         };
         driver.start(notify_multiplier)?;
 
@@ -642,7 +652,26 @@ impl Driver {
             };
             self.interrupt = Some(vector);
             if completed {
+                // Acknowledge unconditionally, not just on the wait branch: a completion
+                // that was already in the used ring before (or between) waits never had
+                // its ISR read, and an unread ISR keeps the level-sensitive INTx asserted
+                // — the controller then records a delivery the moment the next `wait`
+                // unmasks the line, and that stale delivery makes the wait return without
+                // the completion it was called for (a spurious retry, and in the worst
+                // case a permanent drift into the polled fallback). Read-to-clear is
+                // idempotent, so acknowledging twice on the wait branch is harmless.
+                self.acknowledge_isr();
                 return Ok(());
+            }
+            // The interrupt path gave up (retries exhausted or the wait failed): say so
+            // once per device conversation, because the polled fallback below can spin
+            // for many seconds with the console blocked — silence here reads as a hang.
+            if !self.reported_polled_fallback {
+                self.reported_polled_fallback = true;
+                diag(&format!(
+                    "gpu.virtio: interrupt waits for {what} were not served; falling back \
+                     to polling the used ring (this is slower but bounded)"
+                ));
             }
         }
 

@@ -1569,3 +1569,44 @@ preemption/hardening work.
     clears bus mastering, and QEMU's virtio-pci clears DRIVER_OK when bus mastering drops — so
     drivers must allocate exactly what they keep (gpu.virtio's framebuffer is an Option filled
     once, never replaced; surfaced by the enriched poll-limit diagnostics, which stay).
+67. **The "gfx freeze" was the silent per-spawn recompile: a session compile cache and a codegen
+    indicator (2026-06-02, branch area/12-gpu-freeze).** Owner report: the first `gpu.virtio $ draw`
+    in a `make gfx` window took ~20 s before drawing, and the console stopped responding around the
+    third command. Reproduction across ~50 scripted draw rounds (headless, VNC- and cocoa-display,
+    with host CPU hogs, type-ahead, and per-keystroke echo verification) produced **no input freeze**
+    — the at-prompt input path is healthy under host load up to ~29 — but phase-timing the rounds
+    found the real lesion: **without a store disk the kernel had no compile cache at all**, so every
+    spawn of a composed command line re-ran Cranelift on-target (~4 s quiet, 15–60 s observed under
+    a loaded host — the owner's session ran concurrently with a stress harness pinning four cores),
+    and the synchronous compile blocks the entire drive loop: no echo, no Ctrl-C, no quiesce, total
+    silence. Each repeat draw paid it again. That is indistinguishable from a frozen shell. (The
+    transcript's "missing" INTx-wait and quiesce lines on draw #2 were red herrings: both
+    diagnostics are once-per-boot by design.) Fixes: (a) the exec `compile` path keeps a small
+    per-session FIFO (8 entries, hash + full-bytes equality on the fused executable bytes) of
+    compiled `Component`s — a repeat composition now spawns in ~0.3 s instead of ~4 s, codegen runs
+    once per session per pipeline; the storedisk cache is unchanged and a disk hit also seeds the
+    session cache; (b) **codegen announces itself** — `codegen: compiling the composed component
+    on-target (N KiB) …` before the stall and `codegen: compiled in N ms` after, on both the exec
+    and the svc-detach compile paths, so the one remaining stall is never silent (the seed of the
+    interactive-compile-feedback design recorded here rather than in plan/10: the kernel knows when
+    codegen starts; richer progress would need wasmtime-side hooks). Two adjacent defects fixed
+    while disproving freeze hypotheses: (c) `wake_idle`'s single last-write-wins waker slot would
+    silently drop the console's parked `read-line` waker the moment any other host future
+    (`time.sleep`) parked after it in the same pass — unreachable with today's baked programs (no
+    service sleeps; verified: svcdemo console responsive across 20 prompt probes before and after)
+    but a standing console-deafness hazard, now a drain-all list (`will_wake`-deduplicated, emptied
+    on every wake, so it cannot grow); cross-checked against the usermode discarded-Ready lost-wakeup
+    (crates/eo9, fixed on master): the kernel's `task.wait` is self-ringing and does **not** repeat
+    that shape; (d) gpu.virtio now reads the ISR on completions consumed *without* a wait — the
+    interrupt-mode path could return with the ISR unread, leaving level-sensitive INTx asserted, so
+    the controller recorded a delivery the instant the next `wait` unmasked and that stale delivery
+    made the wait return spuriously (instrumented runs showed the interrupt path never actually
+    degrading to the polled fallback, so this is hardening, not the lesion); the polled fallback also
+    announces itself once per device conversation now (a silent 50M-host-call spin reads as a hang).
+    The same already-completed-no-ack shape exists in disk.virtio/net.virtio — left for the storage/
+    net lanes (an active branch owns those files). Verified: draw rounds with per-keystroke echo
+    probes (6 headless + 5 cocoa, repeat draws 4.5 s → ~1.1 s end-to-end), Ctrl-C during compile
+    (kills the job at the first wait after codegen, `abnormal: killed`), Ctrl-C mid-draw + re-claim,
+    `check-gpu` pixel-exact, `disk.virtio $ fs.eofs $ readwrite/ls` and `net.virtio $
+    net.l4.over-l2 $ l4check` on metal (the chains share the INTx and exec machinery), svcdemo
+    battery prompt-responsiveness, all three arch demos, full `cargo xtask ci`.

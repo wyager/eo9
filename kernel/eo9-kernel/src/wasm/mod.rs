@@ -48,6 +48,7 @@ pub mod wave;
 
 use alloc::sync::Arc;
 use alloc::task::Wake;
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::pin;
@@ -282,13 +283,20 @@ pub(crate) fn request_timer_wake(deadline_ns: u64) {
     NEXT_TIMER_WAKE_NS.fetch_min(deadline_ns, Ordering::AcqRel);
 }
 
-/// Where a parked host-import future ([`providers`]' `read-line`/`time.sleep`) leaves the
-/// waker it wants woken. [`block_on`] takes and wakes it after each `wfi`, so wasmtime
-/// re-polls the future on the next loop. Single-core: the lock is uncontended (the IRQ
-/// handler never touches it), but kept explicit so the access is sound.
+/// Where parked host-import futures ([`providers`]' `read-line`/`time.sleep`) leave the
+/// wakers they want woken. [`wake_idle`] drains and wakes **all** of them after each
+/// `wfi`, so wasmtime re-polls every parked future on the next loop. This must hold
+/// every parked future, not just the most recent one: the console's `read-line` and a
+/// service's `time.sleep` can be parked at the same time, and a single last-write-wins
+/// slot would silently drop one of the two wakers — the dropped future is never
+/// re-polled again (wasmtime only re-polls rung sub-futures), which for `read-line`
+/// means a console that echoes nothing forever. The list stays tiny (one entry per
+/// concurrently parked host future) and is drained on every wake, so it cannot grow.
+/// Single-core: the lock is uncontended (the IRQ handler never touches it), but kept
+/// explicit so the access is sound.
 struct IdleWaker {
     locked: AtomicBool,
-    waker: UnsafeCell<Option<Waker>>,
+    wakers: UnsafeCell<Vec<Waker>>,
 }
 
 // SAFETY: all access goes through the `locked` flag below, on the kernel's single core.
@@ -296,7 +304,7 @@ unsafe impl Sync for IdleWaker {}
 
 static IDLE_WAKER: IdleWaker = IdleWaker {
     locked: AtomicBool::new(false),
-    waker: UnsafeCell::new(None),
+    wakers: UnsafeCell::new(Vec::new()),
 };
 
 impl IdleWaker {
@@ -310,25 +318,30 @@ impl IdleWaker {
     }
 }
 
-/// Register the waker to re-drive after the next `wfi` (called by a parked host future).
+/// Register a waker to re-drive after the next `wfi` (called by a parked host future).
+/// A waker that would re-poll the same future as one already registered is skipped
+/// (`will_wake`), so a future re-registering across passes does not accumulate clones.
 pub(crate) fn register_idle_waker(waker: &Waker) {
     IDLE_WAKER.lock();
     // SAFETY: exclusive while `locked` is held.
-    unsafe { *IDLE_WAKER.waker.get() = Some(waker.clone()) };
+    let wakers = unsafe { &mut *IDLE_WAKER.wakers.get() };
+    if !wakers.iter().any(|known| known.will_wake(waker)) {
+        wakers.push(waker.clone());
+    }
     IDLE_WAKER.unlock();
 }
 
-/// Wake (and clear) the registered idle waker, so wasmtime re-polls the parked future.
+/// Wake (and clear) every registered idle waker, so wasmtime re-polls the parked futures.
 /// Also called by the session drive loops on busy passes (a runnable child or service
-/// keeps the loop hot, skipping `idle_wait`): the console's `read-line` parks on this
-/// waker, and without the wake it would never be re-polled — a spinning service must
+/// keeps the loop hot, skipping `idle_wait`): the console's `read-line` parks on these
+/// wakers, and without the wake it would never be re-polled — a spinning service must
 /// not deafen the prompt.
 pub(crate) fn wake_idle() {
     IDLE_WAKER.lock();
     // SAFETY: exclusive while `locked` is held.
-    let waker = unsafe { (*IDLE_WAKER.waker.get()).take() };
+    let wakers = core::mem::take(unsafe { &mut *IDLE_WAKER.wakers.get() });
     IDLE_WAKER.unlock();
-    if let Some(waker) = waker {
+    for waker in wakers {
         waker.wake();
     }
 }

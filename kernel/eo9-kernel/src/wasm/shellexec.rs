@@ -1061,11 +1061,40 @@ struct KImage {
     component: Component,
 }
 
+/// Most fused compositions a session keeps compiled at once. Each cached artifact holds
+/// its published JIT code pages, so the cache is small and FIFO-evicted; eight covers an
+/// interactive session's working set (the same handful of pipelines re-run repeatedly)
+/// at a bounded memory cost.
+#[cfg(feature = "wasm-codegen")]
+const COMPILE_CACHE_ENTRIES: usize = 8;
+
+/// FNV-1a over the executable bytes: the compile cache's search key. Collisions are
+/// harmless — a hit is confirmed by full-bytes equality before it is served.
+#[cfg(feature = "wasm-codegen")]
+fn compile_cache_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// The shell session's exec state.
 #[derive(Default)]
 pub struct ShellExec {
     components: Vec<Option<KComponent>>,
     images: Vec<Option<KImage>>,
+    /// In-RAM compile cache for fused (algebra-result) components, keyed by a hash of the
+    /// executable bytes with a full-bytes equality check on hit. Re-running the same
+    /// composition (`gpu.virtio $ draw`, twice) costs Cranelift exactly once per session
+    /// instead of once per spawn — on-target codegen takes seconds (tens of seconds on a
+    /// loaded host) and blocks the whole console while it runs, so re-paying it for every
+    /// repeat of an identical command line read as the shell freezing (plan/12, the gfx
+    /// freeze investigation). The persistent `storedisk` cache is unchanged: it serves
+    /// across boots; this serves within a session and needs no disk.
+    #[cfg(feature = "wasm-codegen")]
+    compiled: Vec<(u64, Vec<u8>, Component)>,
 }
 
 impl ShellExec {
@@ -1111,6 +1140,31 @@ impl ShellExec {
             .get_mut(rep as usize)
             .and_then(Option::take)
             .ok_or_else(|| wasmtime::Error::msg(format!("unknown component handle {rep}")))
+    }
+
+    /// Look up a fused composition's compiled artifact in the session cache. A hit is
+    /// verified by full-bytes equality (the hash only narrows the search) and refreshed
+    /// to the back of the FIFO.
+    #[cfg(feature = "wasm-codegen")]
+    fn cached_compile(&mut self, hash: u64, exec_bytes: &[u8]) -> Option<Component> {
+        let index = self
+            .compiled
+            .iter()
+            .position(|(h, bytes, _)| *h == hash && bytes == exec_bytes)?;
+        let entry = self.compiled.remove(index);
+        let component = entry.2.clone();
+        self.compiled.push(entry);
+        Some(component)
+    }
+
+    /// Insert a freshly compiled fused composition, evicting the oldest entry beyond the
+    /// cache bound.
+    #[cfg(feature = "wasm-codegen")]
+    fn cache_compile(&mut self, hash: u64, exec_bytes: Vec<u8>, component: Component) {
+        self.compiled.push((hash, exec_bytes, component));
+        while self.compiled.len() > COMPILE_CACHE_ENTRIES {
+            self.compiled.remove(0);
+        }
     }
 
     fn free_component(&mut self, rep: u32) {
@@ -1349,8 +1403,22 @@ pub(super) fn compile_component(
             let exec_bytes = eo9_component::Component::load(component.bytes.clone())
                 .map(|c| c.executable_bytes())
                 .unwrap_or_else(|_| component.bytes.clone());
-            Component::new(engine, &exec_bytes)
-                .map_err(|err| format!("on-target compilation failed: {err:?}"))
+            // Codegen blocks the console; announce it so a long compile (a detach of a
+            // large composition) never reads as a frozen shell.
+            crate::kprintln!(
+                "codegen: compiling the composed component on-target ({} KiB) …",
+                exec_bytes.len() / 1024
+            );
+            let started = crate::timer::uptime_us();
+            let compiled = Component::new(engine, &exec_bytes)
+                .map_err(|err| format!("on-target compilation failed: {err:?}"));
+            if compiled.is_ok() {
+                crate::kprintln!(
+                    "codegen: compiled in {} ms",
+                    (crate::timer::uptime_us() - started) / 1000
+                );
+            }
+            compiled
         }
         #[cfg(not(feature = "wasm-codegen"))]
         None => Err("composed components require on-target codegen".to_string()),
@@ -1748,6 +1816,22 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                         .map(|c| c.executable_bytes())
                         .unwrap_or_else(|_| component.bytes.clone());
 
+                    // The session's in-RAM cache first: an identical composition spawned
+                    // earlier this session re-uses its artifact and skips Cranelift (and
+                    // the seconds-long console stall codegen means) entirely.
+                    let cache_hash = compile_cache_hash(&exec_bytes);
+                    if let Some(component) = store
+                        .data_mut()
+                        .shell_exec()?
+                        .cached_compile(cache_hash, &exec_bytes)
+                    {
+                        let rep = store
+                            .data_mut()
+                            .shell_exec()?
+                            .insert_image(KImage { component });
+                        return Ok((Ok(Resource::new_own(rep)),));
+                    }
+
                     // The persistent store disk, when this boot has one, caches compile
                     // results by the blake3 of exactly these bytes: a hit deserializes the
                     // artifact compiled on an earlier boot instead of re-running Cranelift;
@@ -1790,24 +1874,32 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                     #[cfg(not(feature = "wasm-storedisk"))]
                     let cached: Option<wasmtime::component::Component> = None;
 
-                    match cached {
+                    let image = match cached {
                         Some(component) => Ok(component),
                         None => {
+                            // The console is single-threaded and codegen blocks it for
+                            // seconds (much longer on a loaded host): say so *before* the
+                            // silence, so a long compile never reads as a frozen shell
+                            // (plan/12, the gfx freeze investigation).
+                            crate::kprintln!(
+                                "codegen: compiling the composed component on-target \
+                                 ({} KiB) …",
+                                exec_bytes.len() / 1024
+                            );
                             let compile_started = crate::timer::uptime_us();
                             let compiled = Component::new(&engine, &exec_bytes).map_err(|err| {
                                 WitCompileError::Codegen(format!(
                                     "on-target compilation failed: {err:?}"
                                 ))
                             });
+                            if compiled.is_ok() {
+                                let elapsed_ms =
+                                    (crate::timer::uptime_us() - compile_started) / 1000;
+                                crate::kprintln!("codegen: compiled in {elapsed_ms} ms");
+                            }
                             #[cfg(feature = "wasm-storedisk")]
                             if let Ok(component) = &compiled {
                                 if super::diskcache::enabled() {
-                                    let elapsed_ms =
-                                        (crate::timer::uptime_us() - compile_started) / 1000;
-                                    crate::kprintln!(
-                                        "storedisk: compile cache miss (compiled on-target \
-                                         in {elapsed_ms} ms)"
-                                    );
                                     match component.serialize() {
                                         Ok(artifact) => {
                                             let key = super::diskcache::key(&exec_bytes);
@@ -1820,11 +1912,20 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                                     }
                                 }
                             }
-                            #[cfg(not(feature = "wasm-storedisk"))]
-                            let _ = compile_started;
                             compiled
                         }
+                    };
+                    // Either way the artifact came to exist (compiled now, or loaded from
+                    // the store disk), remember it in the session cache so re-running the
+                    // same composition skips this whole arm.
+                    if let Ok(component) = &image {
+                        store.data_mut().shell_exec()?.cache_compile(
+                            cache_hash,
+                            exec_bytes,
+                            component.clone(),
+                        );
                     }
+                    image
                 }
                 #[cfg(not(feature = "wasm-codegen"))]
                 None => Err(WitCompileError::Codegen(
