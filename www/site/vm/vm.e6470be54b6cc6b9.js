@@ -178,6 +178,31 @@ document.addEventListener("paste", (event) => {
   }
 });
 
+// The page's framebuffer: presented pixels are blitted onto the canvas under the terminal,
+// which stays hidden until something actually draws. Pixels arrive as tightly packed
+// xrgb8888 rows (memory bytes B,G,R,X) of the rectangle at (x,y); the canvas is sized from
+// the framebuffer dimensions the blit carries, so the blob is the single source of truth.
+// Display-only: readback is answered from the blob's own backing copy, so a host with no
+// canvas (the node harnesses) can ignore these calls entirely.
+function hostGfxPresent(ptr, len, fbW, fbH, x, y, w, h) {
+  const canvas = document.getElementById("vm-display");
+  if (!canvas || typeof canvas.getContext !== "function" || w === 0 || h === 0) return;
+  if (canvas.width !== fbW) canvas.width = fbW;
+  if (canvas.height !== fbH) canvas.height = fbH;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  canvas.classList.add("vm-display-on");
+  const src = new Uint8Array(memory.buffer, ptr, len);
+  const img = ctx.createImageData(w, h);
+  for (let i = 0, n = w * h; i < n; i++) {
+    img.data[i * 4] = src[i * 4 + 2]; // R (xrgb8888 memory order is B,G,R,X)
+    img.data[i * 4 + 1] = src[i * 4 + 1]; // G
+    img.data[i * 4 + 2] = src[i * 4]; // B
+    img.data[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, x, y);
+}
+
 async function hostSleepMs(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -263,6 +288,7 @@ async function main() {
       host_monotonic_ns: hostMonotonicNs,
       host_random_fill: hostRandomFill,
       host_fetch_copy: hostFetchCopy,
+      host_gfx_present: hostGfxPresent,
       host_sleep_ms: hasJSPI ? new WebAssembly.Suspending(hostSleepMs) : unavailableSleep,
       host_read_line: hasJSPI ? new WebAssembly.Suspending(hostReadLine) : unavailableReadLine,
       host_fetch_len: hasJSPI ? new WebAssembly.Suspending(hostFetchLen) : unavailableFetchLen,

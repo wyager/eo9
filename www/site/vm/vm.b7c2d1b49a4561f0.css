@@ -72,3 +72,19 @@
 .vm-note {
   color: var(--muted);
 }
+
+/* The page framebuffer (eo9:gfx): hidden until a program actually presents pixels, then a
+   pixel-doubled canvas centered under the terminal. */
+
+#vm-display {
+  display: none;
+  image-rendering: pixelated;
+  width: min(640px, 100%);
+  margin: 0.75rem auto 0;
+  background: #111;
+  border-radius: 6px;
+}
+
+#vm-display.vm-display-on {
+  display: block;
+}

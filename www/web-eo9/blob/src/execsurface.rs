@@ -619,6 +619,9 @@ fn is_root_provided(interface: &str) -> bool {
             | "eo9:entropy/entropy"
             | "eo9:fs/fs"
             | "eo9:io/buffers"
+            // The page-canvas framebuffer (providers::add_gfx): a bare `draw` at the
+            // browser prompt paints onto the page.
+            | "eo9:gfx/gfx"
             // The write-once panic-report sink every SDK-built component imports; the
             // executor itself serves it (see providers::add_diagnostics), so it is never an
             // unmet import.

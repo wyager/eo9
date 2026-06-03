@@ -25,6 +25,17 @@ const encoder = new TextEncoder();
 let memory = null;
 const lines = [];
 let inputQueue = []; // command lines fed to the interactive eosh prompt via read-line
+let gfxLastFullFrame = null; // the last full-frame canvas blit (see host_gfx_present)
+
+// FNV-1a-64 — the same checksum `draw` reports for its read-back.
+function fnv1a64(bytes) {
+  let h = 0xcbf29ce484222325n;
+  for (const b of bytes) {
+    h ^= BigInt(b);
+    h = (h * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return h;
+}
 
 const imports = {
   env: {
@@ -38,6 +49,15 @@ const imports = {
       for (let i = 0; i < len; i++) view[i] = (Math.random() * 256) | 0;
     },
     host_fetch_copy: () => {},
+    // The page-canvas blit (display-only; readback is answered from the blob's backing
+    // copy). Record the last full-frame present so the harness can verify the data path
+    // to the page is pixel-exact: its FNV-1a-64 must equal the checksum `draw` reports
+    // from its own read-back.
+    host_gfx_present: (ptr, len, fbW, fbH, x, y, w, h) => {
+      if (x === 0 && y === 0 && w === fbW && h === fbH) {
+        gfxLastFullFrame = new Uint8Array(memory.buffer, ptr, len).slice();
+      }
+    },
     host_sleep_ms: new WebAssembly.Suspending((ms) => new Promise((r) => setTimeout(r, ms))),
     host_read_line: new WebAssembly.Suspending(async (ptr, cap) => {
       if (inputQueue.length === 0) return -1; // end of input
@@ -171,6 +191,11 @@ inputQueue = [
   // A degraded clock is just another provider: time.fuzzy composes over the browser
   // clock and the program runs unchanged (--name avoids the Hello-world count check).
   "time.fuzzy $ hello --name fuzzy --excited false",
+  // The page's own framebuffer: a BARE `draw` (no gfx provider composed) runs against
+  // the canvas root provider — on the page it actually draws; here the harness records
+  // the blitted pixels and cross-checks them against draw's own read-back checksum.
+  "echo --text CANVASMARK",
+  "draw",
   "exit",
 ];
 lines.length = 0;
@@ -196,8 +221,16 @@ const exploreRun = (explorePart?.match(/^\d{3,}$/gm) || []).slice(0, 2);
 const gfxPart = (interactive.split("GFXMARK")[1] || "").split("SOCKMARK")[0] || "";
 const sockPart = (interactive.split("SOCKMARK")[1] || "").split("FSMARK")[0] || "";
 const fsPart = (interactive.split("FSMARK")[1] || "").split("SWMARK")[0] || "";
-const swPart = interactive.split("SWMARK")[1] || "";
+const swPart = (interactive.split("SWMARK")[1] || "").split("CANVASMARK")[0] || "";
+const canvasPart = interactive.split("CANVASMARK")[1] || "";
 const drawChecksums = gfxPart.match(/presented\((\d+)\)/g) || [];
+// The bare `draw` against the page-canvas provider: the checksum it reports from its own
+// read-back must equal the FNV-1a-64 of the pixels the canvas actually received.
+const canvasReported = (canvasPart.match(/presented\((\d+)\)/) || [])[1];
+const canvasMatches =
+  canvasReported !== undefined &&
+  gfxLastFullFrame !== null &&
+  fnv1a64(gfxLastFullFrame) === BigInt(canvasReported);
 // Bare `hello` (default name), the bare only-pass form, and the bare frozen-clock form each
 // greet "world" exactly once; the bare only-refusal must not add a fourth.
 const helloWorldCount = (interactive.match(/Hello, world/g) || []).length;
@@ -345,6 +378,10 @@ const checks = [
     /mac-a=02:e0:09:00:00:01 mac-b=02:e0:09:00:00:02/.test(swPart),
   ],
   ["time.fuzzy composes over the browser clock and hello runs", /Hello, fuzzy/.test(swPart)],
+  [
+    "canvas: a bare draw paints the page framebuffer pixel-exactly (blit FNV == read-back checksum)",
+    canvasMatches,
+  ],
   ["interactive: session exited", bootRc === 0 && /success\(exited\)/.test(interactive)],
 ];
 let ok = true;

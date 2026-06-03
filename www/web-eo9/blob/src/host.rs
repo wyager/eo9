@@ -33,6 +33,22 @@ unsafe extern "C" {
     fn host_fetch_len(name_ptr: *const u8, name_len: usize) -> i32;
     /// Copy the most recently fetched artifact (see [`host_fetch_len`]) into `dest`.
     fn host_fetch_copy(dest_ptr: *mut u8, len: usize);
+    /// Blit presented pixels onto the page's canvas: `len` bytes at `ptr` are tightly
+    /// packed xrgb8888 rows of the `w`x`h` rectangle at (`x`,`y`) in a `fb_w`x`fb_h`
+    /// framebuffer (the page sizes the canvas from the framebuffer dimensions and
+    /// reveals it on the first blit). Display-only: the provider's backing copy in the
+    /// blob is the read-back source of truth, so a host with no canvas (the node
+    /// harnesses) simply ignores these.
+    fn host_gfx_present(
+        ptr: *const u8,
+        len: usize,
+        fb_w: u32,
+        fb_h: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    );
 }
 
 pub fn write_out(message: &str) {
@@ -70,6 +86,13 @@ pub fn read_line(cap: usize) -> Option<String> {
     }
     buffer.truncate(written as usize);
     Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// Blit one presented rectangle (tightly packed xrgb8888 rows) onto the page canvas.
+pub fn gfx_present(bytes: &[u8], fb: (u32, u32), rect: (u32, u32, u32, u32)) {
+    let (fb_w, fb_h) = fb;
+    let (x, y, w, h) = rect;
+    unsafe { host_gfx_present(bytes.as_ptr(), bytes.len(), fb_w, fb_h, x, y, w, h) }
 }
 
 /// Fetch a pre-AOT'd pulley32 artifact from the page's HTTP store (`/vm/store/<name>.cwasm`).

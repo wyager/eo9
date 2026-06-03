@@ -906,3 +906,37 @@ its own transcript section (a denied fs operation later legitimately prints the 
 The try-it page's size copy and examples follow in the next change. One note recorded, not fixed
 (guest sources are out of this branch's lanes): cat renders a denied read as `fs("FsError::Denied")`
 — a debug-format leak in the coreutil's failure text, same on every target.
+
+## Decision 40 — the page canvas: a real gfx provider in the browser (2026-06-02)
+
+Branch `area/18-browser-catchup` (the D39 stretch goal). The page now serves `eo9:gfx` as a browser
+ROOT provider: a 320x200 xrgb8888 framebuffer whose `present`/`clear` blit onto a real `<canvas>`
+under the terminal — so a BARE `draw` at the browser prompt visibly paints the page, then reads its
+pattern back through the same API and reports the checksum. `gfx.mem $ draw` still composes and
+seals gfx (substitution: same program, invisible RAM target).
+
+Shape, all per the WIT contract (wit/gfx):
+
+- **Backing copy in the blob** (`WebState.gfx`, lazily allocated): `read` answers from the
+  provider's own copy of what was presented — a screenshot of the data path, never a host-side
+  canvas readback. The canvas blit is display-only; a host with no canvas (the node harnesses, the
+  selftest page) ignores it and everything still round-trips.
+- **One new JS import** `host_gfx_present(ptr, len, fb_w, fb_h, x, y, w, h)`: tightly packed rows
+  of the damage rectangle; the page sizes the canvas from the dimensions the blit carries (the
+  blob's `GFX_WIDTH`/`GFX_HEIGHT` are the single source of truth) and converts B,G,R,X → RGBA. The
+  canvas stays hidden until the first real blit (`vm-display-on`).
+- **Owned-buffer round-trip** through the same `BufferTable` the fs/io surface uses; rect/buffer
+  validation mirrors gfx.mem's semantics (out-of-bounds, bad-buffer with the expectation text,
+  zero-area success).
+- Registration: `add_gfx` in both `add_providers` and `add_providers_for` (family
+  `eo9:gfx/gfx`, so `only` gates it like any capability); `is_root_provided` admits
+  `eo9:gfx/gfx`; the session manifest gains the child gfx line.
+
+Verification: verify-eosh runs a bare `draw`, records the last full-frame blit through its own
+`host_gfx_present`, and asserts its FNV-1a-64 equals the checksum draw reports from read-back —
+the data path to the page is pixel-exact by construction. A headless-Chrome CDP smoke (real key
+events at the served /vm/ page) confirmed: boots to the prompt, canvas hidden before drawing,
+`draw` → `presented(…)`, canvas revealed at 320x200 with the white-border canary at (0,0) and
+~51k distinct colors (the gradient pattern). All five node/JSPI harnesses pass; check-web-vm ok;
+full ci green. The try-it page gains the `draw` example ("pixels are a capability") and the
+canvas element. Blob: 12,827,862 B raw / 2,344,934 B brotli (+6 KB compressed over D39).

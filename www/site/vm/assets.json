@@ -1,8 +1,8 @@
 {
-  "blob": "/vm/web-eo9.79b9ffc24c430e02.wasm",
+  "blob": "/vm/web-eo9.ed4442688076a811.wasm",
   "page": {
-    "vm.js": "/vm/vm.894778b3eade9abb.js",
-    "vm.css": "/vm/vm.2a6a37de057ae53d.css"
+    "vm.js": "/vm/vm.e6470be54b6cc6b9.js",
+    "vm.css": "/vm/vm.b7c2d1b49a4561f0.css"
   },
   "store": {
     "cat": "/vm/store/cat.2a90e2377ce37653.cwasm",
