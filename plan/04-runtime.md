@@ -418,3 +418,16 @@ usermode v1 is implemented:
   (callback ABI throughout), and the spec change upstream's comment names is required before default-on.
   Remaining for default-on: where the embedder opts in, the local A/B gate spelling (xtask subcommand),
   per-hop numbers on a quiet machine, metal measurement.
+* **Default-on evaluation complete** (area/04-firstpoll-eval, 2026-06-02; docs/spikes/first-poll-inline.md
+  "Default-on evaluation"). `cargo xtask firstpoll-ab [--rounds N | --gate-only]` is the standing A/B gate:
+  both arms of tests/firstpoll-ab (matrix + eager pins + chain suites) for the semantic-identity verdict,
+  then interleaved timing rounds with medians, spread, and the host load context. Kernel measurement
+  builds via `EO9_KERNEL_FEATURES_EXTRA` (default builds verified byte-identical with it unset). Results:
+  usermode eager chains −33..−34% and parked −16% (quiet machine, non-overlapping spreads; the loaded-machine
+  run agreed in direction), metal
+  (QEMU TCG) op-phase parity on the storage and net chains (device pacing dominates), and the full
+  feature-on battery green — flagship filtered storage chain + power-cycle persistence, DNS + switch ARP,
+  pixel-exact check-gpu, the svcdemo registry, and boot-through-init demos on all three arches.
+  Recommendation in the spike note: GO for default-on in Eo9's vendored builds (one line per kernel
+  feature list), escape hatch retained; usermode (registry wasmtime) and real-board timing explicitly out
+  of scope. The flip itself is the owner's call.
