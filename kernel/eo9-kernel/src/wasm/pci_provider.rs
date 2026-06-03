@@ -19,19 +19,22 @@
 //! **Interrupt delivery (INTx).** `enable-interrupts` routes a function's legacy interrupt
 //! pin through the platform interrupt controller (the gpex lines: GIC SPIs 35-38 on aarch64
 //! `virt`, PLIC sources 0x20-0x23 on riscv64 `virt`; the standard `(slot + pin - 1) mod 4`
-//! swizzle picks the line), and `wait` blocks until a delivery arrives. The protocol with
+//! swizzle picks the line), and `wait` resolves when a delivery arrives. The protocol with
 //! the IRQ handler: a fired line is masked at the controller (it is level-sensitive — the
 //! device keeps asserting until the driver clears the cause) and counted; `wait` re-arms
 //! (unmasks) the line when called, consumes the count when it fires, and returns with the
-//! line masked again. **`wait` blocks host-side** — on the same masked-`wfi` + timer
-//! primitives the executor's idle path uses, so the CPU sleeps rather than spinning, and a
-//! console Ctrl-C or a bound expiry aborts it — instead of suspending the calling task.
-//! That is deliberate: every existing driver chain (`fs.eofs $ disk.virtio`,
-//! `net.l4.over-l2 $ net.virtio`) drives its imports eagerly (single-poll, plan/09 D16/D18),
-//! so a `wait` that returned `Pending` would be unusable by exactly the drivers it exists
-//! for. A properly task-suspending wait (parking on the drive loop the way `time.sleep`
-//! does) becomes possible when the async disk/net bridge lands; the controller-side
-//! machinery here stays the same either way. MSI/MSI-X remain `unsupported`.
+//! line masked again. **`wait` parks the calling task** — the same discipline as
+//! `time.sleep` ([`IntxWait`] registers with the executor's idle wakers and asks for a
+//! timer wake at its bound), so every other task — the console's `read-line`, detached
+//! services, sibling drivers — keeps running between a driver's request publish and its
+//! interrupt. The interrupt itself wakes the executor's `wfi` and the next wake pass
+//! re-polls the parked wait; the bound expiry stays a typed `io` error; a kill or cancel
+//! mid-wait drops the future, whose `Drop` masks the line and drains any delivery that
+//! raced the teardown (no leaked unmask, no stale count). The wait blocked host-side in
+//! the eager-poller era (plan/09 D16/D18, when a `Pending` host import was unusable by the
+//! drivers); the drivers await honestly since D33/D35, and the parking wait is the
+//! async-first doctrine applied to this host API (plan/09 D39). MSI/MSI-X remain
+//! `unsupported`.
 //!
 //! **Teardown (quiesce before free).** When a driver task ends — normal completion, a
 //! trap, or a kill — every device it armed is quiesced *before* any of its DMA buffers
@@ -54,6 +57,7 @@ use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::Poll;
 
 use wasmtime::component::{Accessor, ComponentType, Lift, Linker, Lower, Resource, ResourceType};
 use wasmtime::{Result, StoreContextMut};
@@ -74,15 +78,13 @@ const MAX_DMA_BUFFERS: usize = 64;
 /// future IOMMU mapping path.
 const DMA_ALIGN: usize = 4096;
 
-/// How long a single `wait` call blocks for a delivery before giving up with a typed `io`
+/// How long a single `wait` call waits for a delivery before giving up with a typed `io`
 /// error. Generous for any healthy device (QEMU completes block requests in well under a
 /// millisecond); a hung device falls back to the driver's polled path, which has its own
-/// bound. Bounded so a dead device cannot wedge the machine.
+/// bound. Bounded so a dead device cannot wedge the calling task open-endedly (the
+/// SPEC's awaits-are-bounded rule); the executor's own wake backstops bound how stale
+/// the expiry check can get if a wake is missed.
 const INTX_WAIT_BOUND_NS: u64 = 2_000_000_000;
-/// Timer backstop between `wfi` halts inside a blocked `wait`. The PCI interrupt itself (and
-/// any keystroke) wakes the halt immediately — this only bounds how stale the Ctrl-C / bound
-/// checks can get if a wake is missed.
-const INTX_WAIT_SLICE_NS: u64 = 10_000_000;
 
 // -----------------------------------------------------------------------------------------
 // Boot-time grant
@@ -894,7 +896,17 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
                         .interrupt(interrupt.rep())
                         .map(|vector| vector.line)
                 });
-                let result = line.and_then(wait_for_intx);
+                let result = match line {
+                    Ok(line) => {
+                        IntxWait {
+                            line,
+                            deadline: crate::timer::uptime_ns().saturating_add(INTX_WAIT_BOUND_NS),
+                            armed: false,
+                        }
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
                 Ok((result,))
             })
         },
@@ -974,57 +986,91 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
     Ok(())
 }
 
-/// Block until the gpex line `line` delivers an interrupt, the console interrupts the wait
-/// (Ctrl-C), or the wait bound expires. Returns the number of deliveries consumed (>= 1).
+/// Future that resolves when the gpex line `line` delivers an interrupt (with the number
+/// of deliveries consumed, >= 1) or the wait bound expires (typed `io` error) — parking
+/// the calling task between polls, exactly the `time.sleep` discipline, so every other
+/// task keeps running while a driver waits out its device.
 ///
-/// Protocol with the IRQ handler (the arch `kirq`/`ktrap`): the line is unmasked here, so a
-/// pending or future level-triggered assert is forwarded; when it fires, the handler masks
-/// the line (the device keeps asserting until the driver clears its cause) and bumps the
-/// delivery counter; this loop consumes the counter and returns with the line still masked.
-/// The next `wait` — after the driver has cleared the cause (e.g. read virtio's ISR
-/// register) — unmasks again.
+/// Protocol with the IRQ handler (the arch `kirq`/`ktrap`): the arming (first) poll
+/// unmasks the line, so a pending or future level-triggered assert is forwarded; when it
+/// fires, the handler masks the line (the device keeps asserting until the driver clears
+/// its cause) and bumps the delivery counter; a later poll consumes the counter and
+/// resolves with the line still masked. The next `wait` — after the driver has cleared
+/// the cause (e.g. read virtio's ISR register) — unmasks again.
 ///
-/// The block happens *host-side*, halting the core in the same masked-`wfi` + timer step the
-/// executor's idle path uses (`timer::wait_for_interrupt`), so the CPU sleeps instead of
-/// spinning host calls. The PCI interrupt, a keystroke (UART RX), and the timer slice all
-/// wake the halt; each wake re-checks the counter, the console, and the bound. See the
-/// module docs for why this blocks rather than suspending the calling task.
-fn wait_for_intx(line: usize) -> Result<u64, WitPciError> {
-    crate::arch::pci_intx::unmask(line);
-    let deadline = crate::timer::uptime_ns().saturating_add(INTX_WAIT_BOUND_NS);
-    loop {
-        let deliveries = crate::pci::intx_take(line);
+/// Wake plumbing: the interrupt wakes the executor's `wfi` (it is a plain GIC/PLIC
+/// delivery), and the next wake pass re-polls every idle-parked future, this one
+/// included; `request_timer_wake` arms the bound so the typed expiry is checked on time
+/// even if the device never fires. There is no Ctrl-C arm here: a console interrupt
+/// kills the waiting task through the ordinary kill cascade, which drops this future —
+/// and `Drop` masks an armed line and drains any delivery that raced the teardown, so a
+/// cancelled wait can neither leak an unmasked line nor leave a stale count for the next
+/// wait on the line.
+struct IntxWait {
+    line: usize,
+    /// Absolute uptime (ns) at which the wait gives up with the typed bound error.
+    deadline: u64,
+    /// Whether this future currently holds the line unmasked (armed and not yet
+    /// resolved). Drives the `Drop` cleanup.
+    armed: bool,
+}
+
+impl Future for IntxWait {
+    type Output = Result<u64, WitPciError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if !this.armed {
+            // Arm: unmask so a pending or future level assert is delivered. A delivery
+            // can land between this unmask and the take below (the handler masks and
+            // counts it) — the take consumes it and the wait resolves on its first poll.
+            crate::arch::pci_intx::unmask(this.line);
+            this.armed = true;
+        }
+        let deliveries = crate::pci::intx_take(this.line);
         if deliveries > 0 {
-            // One diagnostic line per boot, the first time a wait is actually served by an
-            // interrupt delivery: evidence in every metal transcript that completions are
-            // interrupt-driven (not satisfied by the driver's pre-wait ring check).
+            // The IRQ handler masked the line when it fired; leave it masked until the
+            // next wait, after the driver has cleared the device-side cause.
+            this.armed = false;
+            // One diagnostic line per boot, the first time a wait is actually served by
+            // an interrupt delivery: evidence in every metal transcript that completions
+            // are interrupt-driven (not satisfied by the driver's pre-wait ring check).
             static FIRST_SERVED: AtomicBool = AtomicBool::new(false);
             if !FIRST_SERVED.swap(true, Ordering::Relaxed) {
+                let line = this.line;
                 crate::kprintln!(
                     "pci: INTx delivery on line {line} served an interrupt wait \
-                     (the cpu halted instead of polling)"
+                     (the task parked instead of polling)"
                 );
             }
-            // The IRQ handler masked the line when it fired; leave it masked until the next
-            // wait, after the driver has cleared the device-side cause.
-            return Ok(deliveries);
+            return Poll::Ready(Ok(deliveries));
         }
-        if crate::uart::ctrl_c_pending() {
-            crate::arch::pci_intx::mask(line);
-            return Err(WitPciError::Io(String::from(
-                "the interrupt wait was interrupted from the console",
-            )));
-        }
-        if crate::timer::uptime_ns() > deadline {
-            crate::arch::pci_intx::mask(line);
-            return Err(WitPciError::Io(String::from(
+        if crate::timer::uptime_ns() > this.deadline {
+            crate::arch::pci_intx::mask(this.line);
+            this.armed = false;
+            return Poll::Ready(Err(WitPciError::Io(String::from(
                 "no interrupt delivery within the wait bound",
-            )));
+            ))));
         }
-        // Halt until an interrupt is pending: the PCI line itself, a keystroke, or the timer
-        // backstop. Masked-`wfi` semantics (a pending-but-masked IRQ still wakes the halt)
-        // close the lost-wakeup window between the checks above and the halt.
-        crate::timer::wait_for_interrupt(INTX_WAIT_SLICE_NS);
+        // Park: the interrupt wakes the executor's `wfi` and the wake pass re-polls every
+        // registered idle waker; the timer wake bounds the expiry check. Re-armed every
+        // poll (the executor consumes both), like `SleepUntil`.
+        super::request_timer_wake(this.deadline);
+        super::register_idle_waker(cx.waker());
+        Poll::Pending
+    }
+}
+
+impl Drop for IntxWait {
+    fn drop(&mut self) {
+        if self.armed {
+            // Dropped mid-wait (task kill, subtask cancel): mask the line, then drain any
+            // delivery that fired before the mask, so the next wait on this line starts
+            // from a clean counter instead of resolving on a stale count.
+            crate::arch::pci_intx::mask(self.line);
+            let _ = crate::pci::intx_take(self.line);
+            self.armed = false;
+        }
     }
 }
 
