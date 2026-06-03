@@ -272,11 +272,35 @@ async fn acquire() -> Result<LinkGuard, L4Error> {
         LinkView::NeedOpen => {}
     }
 
-    let opened = open_link().await;
-    if opened.is_err() {
-        LINK.with(|slot| slot.opened = false);
+    // `opened` is set from the `with` above: arm the restore before the first await
+    // of bring-up, so an error return *or a future dropped mid-open* clears the claim
+    // and the next use retries (instead of wedging the stack behind the typed busy
+    // answer).
+    let claim = BringUpClaim { armed: true };
+    let opened = open_link().await?;
+    claim.defuse();
+    Ok(opened)
+}
+
+/// Releases the bring-up claim (`opened`) if the first-use open never completes; armed
+/// from the instant the claim exists, defused on success when the [`LinkGuard`] takes
+/// over (a successful open keeps `opened = true` for the instance's lifetime).
+struct BringUpClaim {
+    armed: bool,
+}
+
+impl BringUpClaim {
+    fn defuse(mut self) {
+        self.armed = false;
     }
-    opened
+}
+
+impl Drop for BringUpClaim {
+    fn drop(&mut self) {
+        if self.armed {
+            LINK.with(|slot| slot.opened = false);
+        }
+    }
 }
 
 /// First-use bring-up: the awaited l2 opens plus the smoltcp state.
