@@ -1610,3 +1610,18 @@ preemption/hardening work.
     `check-gpu` pixel-exact, `disk.virtio $ fs.eofs $ readwrite/ls` and `net.virtio $
     net.l4.over-l2 $ l4check` on metal (the chains share the INTx and exec machinery), svcdemo
     battery prompt-responsiveness, all three arch demos, full `cargo xtask ci`.
+
+68. **The svc-detach compile path consults the session compile cache (2026-06-02, branch
+    `area/09-async-gpu`; closes D67's carried follow-up).** `shellexec::compile_component`
+    (the detach path's compiler) announced codegen but never consulted the in-RAM session
+    cache, so detaching a fused composition the session had already compiled — at the
+    prompt, or under another service name — re-paid Cranelift. It now takes the session's
+    `&mut ShellExec` and runs the same discipline as the exec surface's `compile`: hash
+    narrows, full-bytes equality confirms, hit skips Cranelift, miss compiles + announces +
+    caches. The persistent disk cache stays out of this path (unchanged recorded follow-up:
+    it would only help across reboots). Both `host_detach` call sites (child + policy) pass
+    the exec state; baked store entries (every `restart.*` policy) still take the
+    deserialize fast path and never touch the cache. Verified on metal: `detach a = gfx.mem
+    $ draw restart restart.never` compiles once (`codegen: compiling …` announced), `detach
+    b =` the identical composition detaches with **no second announce** — one codegen
+    across both; full `cargo xtask ci` green.
