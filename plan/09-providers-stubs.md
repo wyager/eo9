@@ -640,3 +640,13 @@ Match the priority order above; (1)+(2) unblock I2.
     reverse mapping for rewritten sources, or a learn-don't-rewrite stance toward a
     downlink that is itself a switch — which is an owner-facing design question, not
     plumbing.
+
+36. **`time.monotonic-stub` joins the option-C default-configuration rule (2026-06-02,
+    closing D31's recorded follow-up).** Observing the stub's clock unconfigured used to
+    panic (`ProviderState::with` on an unbound state — a never-trap convention violation,
+    reachable by plain `time.monotonic-stub $ program`). It now self-binds its documented
+    default on first use, exactly the `time.frozen` pattern: start 0 ns, step 1 ms per
+    observation (`DEFAULT_START_NS`/`DEFAULT_STEP_NS` in the stub); `configure` (or the
+    shell's `--start-ns`/`--step-ns`) still overrides. Tests in
+    `default_configuration.rs` (+2: the unconfigured origin via `hello`, the configured
+    override). With this, every configurable stub in the store follows the rule.

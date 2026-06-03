@@ -116,3 +116,62 @@ fn unconfigured_fs_memfs_defaults_to_an_empty_filesystem() {
         "unconfigured fs.memfs must not trap: {outcome:?}"
     );
 }
+
+/// `time.monotonic-stub $ hello` with no configuration anywhere: hello runs (no trap —
+/// the stub used to panic when its clock was observed unconfigured) and prints the
+/// documented default origin, 0 ns.
+#[test]
+fn unconfigured_time_monotonic_stub_defaults_to_the_documented_origin() {
+    guest::ensure_components(&["eo9-stub-time-monotonic-stub", "eo9-example-hello"]);
+    let program = compose(
+        &guest::load_stub("time.monotonic-stub"),
+        &guest::load_example("hello"),
+    )
+    .expect("time.monotonic-stub $ hello");
+
+    let (outcome, stdout) = run_with_capture(
+        &program,
+        &[
+            NamedArg::new("name", "some(\"default\")"),
+            NamedArg::new("excited", "some(true)"),
+        ],
+    );
+    assert!(
+        matches!(outcome, Outcome::Success(_)),
+        "unconfigured time.monotonic-stub must not trap: {outcome:?}"
+    );
+    assert!(
+        stdout.contains("[0.000000000] Hello, default"),
+        "expected the documented default origin in {stdout:?}"
+    );
+}
+
+/// The configured counterpart: `configure` still overrides the monotonic stub's
+/// documented default (the second half of the option-C rule).
+#[test]
+fn a_configured_monotonic_stub_overrides_the_default() {
+    guest::ensure_components(&["eo9-stub-time-monotonic-stub", "eo9-example-hello"]);
+    let configured = eo9_component::configure(
+        &guest::load_stub("time.monotonic-stub"),
+        &[("start-ns", "5000000000"), ("step-ns", "1000000")],
+    )
+    .expect("baking the start and step succeeds");
+    let program = compose(&configured, &guest::load_example("hello"))
+        .expect("configured time.monotonic-stub $ hello");
+
+    let (outcome, stdout) = run_with_capture(
+        &program,
+        &[
+            NamedArg::new("name", "some(\"default\")"),
+            NamedArg::new("excited", "some(true)"),
+        ],
+    );
+    assert!(
+        matches!(outcome, Outcome::Success(_)),
+        "the configured stub must run: {outcome:?}"
+    );
+    assert!(
+        stdout.contains("[5.000000000] Hello, default"),
+        "expected the configured start in {stdout:?}"
+    );
+}
