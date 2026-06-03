@@ -1,5 +1,5 @@
 //! Switch-over-switch stacking (plan/09 D30: "more consumers stack switches
-//! (`switch $ switch $ …`)") — the retest after the async-first conversion.
+//! (`switch $ switch $ …`)") — green since the switch's own async-first conversion.
 //!
 //! The wiring: the inner switch's `port-a` renamed onto the default `eo9:net/l2`
 //! slot becomes the outer switch's uplink; the echo fixture seals the inner uplink:
@@ -9,22 +9,19 @@
 //!   $ rename port-a link-a $ rename port-b link-b $ net.l2.switch $ vnicheck
 //! ```
 //!
-//! Status, pinned (2026-06-02): the stack composes, compiles, spawns, and **runs to a
-//! typed program outcome** — one layer further than the pre-conversion pin (the
-//! middleware's typed `io` failure happened at the *vnicheck-over-switch* edge before
-//! honest awaits; that edge now awaits and works). The residual wall is the switch's
-//! OWN `eager()` single-poll of its uplink (the D31 conversion covered `net.virtio`
-//! and `net.l4.over-l2`, not `net.l2.switch`): over a leaf upstream (echo, a driver)
-//! the eager poll completes, which is why `vnic_switch.rs` passes — but an inner
-//! *switch* is a nested-guest-caller whose exports suspend, so the outer switch's
-//! single-poll of `list-interfaces` reports its typed suspension error. The fix is
-//! the established pattern (delete `eager()`, await the uplink); recorded in plan/09.
+//! What works through a two-layer stack (the point-to-point story, `--mode through`):
+//! a port-A exchange end to end — the reflect probe goes up through BOTH source
+//! rewrites, the reply demuxes back down through both layers (the deterministic MAC
+//! derivation makes layer N's port-a MAC equal layer N+1's, so the return path
+//! composes), sibling isolation holds through the stack, broadcast fans out to both
+//! outer ports, and unknown unicast reaches neither.
 //!
-//! Note for whoever does that conversion: awaits alone will not make THIS test's
-//! full vnicheck echo suite pass. The switch's unconditional source rewrite collapses
-//! both outer ports onto the inner port's single MAC on the way up (a MAC-NAT with no
-//! reverse mapping), so the echo's replies can demux back to at most one outer port —
-//! the stacked fan-out story needs a policy decision, not just async plumbing.
+//! What does NOT work, pinned typed below: port B's own exchange (`--mode echo`).
+//! The switch's unconditional source rewrite collapses both outer ports onto the
+//! inner port's single MAC on the way up — a MAC-NAT with no reverse mapping — so
+//! replies can demux back to at most one outer port. Whether the switch grows a
+//! per-flow reverse mapping or stacking stays point-to-point is the owner's open
+//! policy question (plan/09 D37); this pin flips when it's answered.
 
 use eo9_component::{Component, compose, rename};
 use eo9_integration::{guest, run};
@@ -69,14 +66,42 @@ fn a_switch_port_satisfies_another_switchs_uplink() {
     );
 }
 
-/// The behavioral pin: the stacked composition RUNS — no spawn refusal, no trap —
-/// and fails in the program's own typed vocabulary with the outer switch's
-/// suspension report from its first uplink operation. This is the residual wall
-/// (the switch's own `eager()` poll), not the pre-conversion middleware wall;
-/// when `net.l2.switch` awaits its uplink honestly, this test's expectation is
-/// the part to revisit (see the module docs for the MAC-rewrite caveat).
+/// The point-to-point payoff: a full port-A exchange RUNS through two stacked
+/// switches — both layers' source rewrites on the way up (the upstream-seen source
+/// is the inner layer's port-a MAC, which the deterministic derivation makes equal
+/// to the outer port-a MAC the program checks), demux back down through both layers,
+/// sibling isolation through the stack, broadcast to both outer ports, unknown
+/// unicast to neither.
 #[test]
-fn stacked_switches_run_to_the_switchs_own_typed_suspension_error() {
+fn a_port_a_exchange_runs_through_two_stacked_switches() {
+    guest::ensure_components(COMPONENTS);
+    let stack = stacked_stack();
+
+    let outcome = run::run_component(
+        &stack,
+        &[NamedArg::new("mode", "\"through\"")],
+        Providers::none(),
+    );
+    match outcome {
+        Outcome::Success(success) => {
+            assert!(
+                success.value.contains("mac-a=02:e0:09:00:00:01")
+                    && success.value.contains("mac-b=02:e0:09:00:00:02"),
+                "the outer ports derive base+1/+2 from the default base: {}",
+                success.value
+            );
+        }
+        other => panic!("expected the stacked point-to-point suite to pass, got {other:?}"),
+    }
+}
+
+/// The fan-out limitation, pinned typed (never a trap): port B's own exchange cannot
+/// return through the stack — the source rewrite collapsed it onto the inner port's
+/// MAC, which demuxes back to port A's derivation, so B's reply never arrives. This
+/// is the MAC-NAT/reverse-mapping policy question (plan/09 D37); flip this pin when
+/// the owner answers it.
+#[test]
+fn the_stacked_fan_out_limitation_is_a_typed_check_failure() {
     guest::ensure_components(COMPONENTS);
     let stack = stacked_stack();
 
@@ -90,14 +115,14 @@ fn stacked_switches_run_to_the_switchs_own_typed_suspension_error() {
             assert!(
                 failure
                     .value
-                    .contains("list-interfaces: the upstream l2 provider suspended"),
-                "expected the outer switch's eager-poll suspension report in the \
-                 program's own typed failure: {}",
+                    .contains("link-b: the reflected unicast never arrived"),
+                "expected port B's missing return path in the program's own typed \
+                 failure: {}",
                 failure.value
             );
         }
         other => panic!(
-            "expected the program's own typed failure (the residual eager() wall), \
+            "expected the program's own typed failure (the MAC-NAT fan-out limit), \
              got {other:?}"
         ),
     }
