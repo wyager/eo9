@@ -423,7 +423,8 @@ usermode v1 is implemented:
   both arms of tests/firstpoll-ab (matrix + eager pins + chain suites) for the semantic-identity verdict,
   then interleaved timing rounds with medians, spread, and the host load context. Kernel measurement
   builds via `EO9_KERNEL_FEATURES_EXTRA` (default builds verified byte-identical with it unset). Results:
-  usermode eager chains −6..−42% (loaded machine; inline median won every shape every round), metal
+  usermode eager chains −33..−34% and parked −16% (quiet machine, non-overlapping spreads; the loaded-machine
+  run agreed in direction), metal
   (QEMU TCG) op-phase parity on the storage and net chains (device pacing dominates), and the full
   feature-on battery green — flagship filtered storage chain + power-cycle persistence, DNS + switch ARP,
   pixel-exact check-gpu, the svcdemo registry, and boot-through-init demos on all three arches.

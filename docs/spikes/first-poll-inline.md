@@ -225,21 +225,22 @@ machinery goes through this command. For kernel measurement builds,
 kernel feature lists (all three arches); nothing in the repo sets it, and a rebuild
 with it unset was verified byte-identical to the pristine feature-off image.
 
-**Usermode numbers** (5 interleaved rounds, host load average 34-41 throughout — other
-agents were building on the machine; treat the medians as robust, the spreads as
-honest, and re-run `cargo xtask firstpoll-ab` on a quiet machine for publishable
-figures):
+**Usermode numbers** — quiet machine (load average ~5.6, 5 interleaved rounds; spreads
+are tight and the arms do not overlap on any shape):
 
 | shape | off: median (min..max) | on: median (min..max) | delta |
 |---|---|---|---|
-| eager chain depth 1 | 181.9µs (121.3..212.7) | 105.0µs (69.2..268.7) | −42% |
-| eager chain depth 2 | 160.4µs (122.7..401.9) | 136.1µs (90.6..383.4) | −15% |
-| eager chain depth 4 | 205.5µs (136.8..487.8) | 192.6µs (89.6..229.3) | −6% |
-| parked chain depth 3 | 203.8µs (143.0..219.0) | 200.5µs (116.7..625.2) | −2% |
+| eager chain depth 1 | 97.7µs (95.1..99.6) | 64.3µs (60.1..65.0) | −34% |
+| eager chain depth 2 | 101.1µs (99.7..104.1) | 67.7µs (63.8..69.2) | −33% |
+| eager chain depth 4 | 117.8µs (114.5..121.3) | 79.3µs (78.4..82.6) | −33% |
+| parked chain depth 3 | 118.4µs (114.5..129.2) | 99.9µs (96.2..101.6) | −16% |
 
-Direction and rough magnitude match the prototype's quieter-machine round (−28..38%
-eager, −19% parked); under load the variance is large but the inline arm's median won
-every shape in every round.
+A heavily loaded run earlier the same day (load average 34-41, agents building
+concurrently) showed the same direction with wide spreads (−6..−42% eager, parked
+within noise) — the inline arm's median won every shape in every round under both
+conditions. The parked-chain win is the descent inlining (the initial activations down
+to the host park), as designed; the completion cascade is event-loop-driven in both
+arms.
 
 **Metal op-phase A/B** (QEMU TCG aarch64 — still emulation, not silicon; the real-board
 datapoint waits for hardware). Method: boot each arm's kernel image, run the
