@@ -900,8 +900,7 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
                     Ok(line) => {
                         IntxWait {
                             line,
-                            deadline: crate::timer::uptime_ns()
-                                .saturating_add(INTX_WAIT_BOUND_NS),
+                            deadline: crate::timer::uptime_ns().saturating_add(INTX_WAIT_BOUND_NS),
                             armed: false,
                         }
                         .await
