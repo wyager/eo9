@@ -37,6 +37,8 @@ use crate::lex::{Token, tokenize};
 pub enum ParseError {
     /// A quoted string was not closed before the end of the line.
     UnterminatedString,
+    /// A compound literal (`[…]`/`{…}`) was not closed before the end of the line.
+    UnterminatedCompound,
     /// An unknown escape sequence inside a quoted string.
     UnknownEscape(char),
     /// `--` with no flag name after it.
@@ -66,6 +68,9 @@ impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ParseError::UnterminatedString => write!(f, "unterminated string literal"),
+            ParseError::UnterminatedCompound => {
+                write!(f, "unterminated `[…]`/`{{…}}` literal")
+            }
             ParseError::UnknownEscape(c) => write!(f, "unknown escape `\\{c}` in string literal"),
             ParseError::EmptyFlagName => write!(f, "`--` must be followed by a flag name"),
             ParseError::UnexpectedEnd { expected } => {
@@ -616,6 +621,30 @@ mod tests {
 
     fn word(v: &str) -> ArgValue {
         ArgValue::Word(v.to_string())
+    }
+
+    // -- compound literal argument values -----------------------------------------
+
+    #[test]
+    fn unquoted_compound_literals_are_single_argument_values() {
+        // plan/03 D23's recorded follow-up: the pci.admit form needs no quotes.
+        let parsed = parse_expr(
+            "pci.admit-address --allow [{segment: 0, bus: 0, device: 1, function: 0}] $ lspci",
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed,
+            compose(
+                app(
+                    name("pci.admit-address"),
+                    vec![flag(
+                        "allow",
+                        word("[{segment: 0, bus: 0, device: 1, function: 0}]"),
+                    )],
+                ),
+                name("lspci"),
+            )
+        );
     }
 
     // -- precedence and associativity --------------------------------------------

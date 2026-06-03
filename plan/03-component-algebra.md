@@ -421,3 +421,20 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     convention from D25 remains a valid (now optional) guest-side pattern whose rows behave
     identically under the feature. The 21-test hardening matrix is outcome-identical in both arms;
     the per-suite expectations and measured numbers live in the spike note.
+
+27. **The eosh tokenizer accepts unquoted compound literals (2026-06-02, closing D23's
+    consequence (d)).** A token beginning with `[` or `{` now lexes as one compound-literal
+    word, taken verbatim until its brackets and braces balance — commas, whitespace, and the
+    structural characters inside it no longer split it, and embedded quoted strings are
+    opaque (their brackets and escaped quotes don't count toward the balance). So
+    `pci.admit-address --allow [{segment: 0, bus: 0, device: 1, function: 0}] $ …` works at
+    the prompt with no quoting (verified live in usermode: the literal bakes into
+    `configure(allow=[{…}])` and `describe` shows it), and the quoted form keeps working
+    unchanged. Scope, deliberate: the lexer only *balances* — bracket-kind mismatches and
+    well-formedness stay with the type-directed value parser, which reports against the
+    parameter's declared type; an unbalanced literal at end-of-line is the new
+    `UnterminatedCompound` parse error; top-level commas (the `only` list shorthand) stay
+    structural; mid-word brackets (`foo[1]`) keep their old lexing — only a token-initial
+    `[`/`{` enters compound mode. Tests: 6 new lexer cases (the pci.admit form, nesting,
+    opaque strings, quoted form, top-level commas, both unterminated errors) and a parser
+    case pinning the literal as a single flag value.

@@ -685,3 +685,85 @@ Match the priority order above; (1)+(2) unblock I2.
     file back (cross-boot persistence, INTx). INTx waits genuinely served in both boots
     (the kernel's once-per-boot delivery line), zero polled fallbacks. Full `cargo xtask
     ci` green.
+
+37. **Switch-over-switch stacking, retested after the conversions — runs, and pins the
+    residual wall (2026-06-02).** The two-layer stack (`net.l2.echo $ rename port-a
+    eo9:net/l2 $ net.l2.switch $ rename port-a link-a $ rename port-b link-b $
+    net.l2.switch $ vnicheck`) composes (a port export renamed onto the default slot
+    satisfies another switch's uplink; the unused sibling port drops), compiles, spawns,
+    and **runs to a typed program outcome** — one layer further than the pre-conversion
+    state, where the *middleware's* eager poll failed at the consumer-over-switch edge
+    (D31's lifted wall stays lifted). The residual: `net.l2.switch` itself still drives
+    its uplink with the `eager()` single-poll (its header even cites the now-deleted
+    middleware pattern as precedent). Over a leaf upstream (echo, `net.virtio`) the
+    eager poll completes — every existing switch test and the metal demos are
+    unaffected — but an inner *switch* is a nested-guest-caller whose exports suspend,
+    so the outer switch's first uplink operation reports its typed
+    `io("list-interfaces: the upstream l2 provider suspended")` through vnicheck's
+    failure channel. Pinned behaviorally in
+    `tests/eo9-integration/tests/vnic_stacked.rs` (2 tests: the algebra-level seal, the
+    typed run outcome). The fix is the established D31/D33 pattern — delete `eager()`,
+    await the uplink, keep operations deadline-bound — owned by whoever next touches the
+    switch (not taken here: the switch is in the kernel store and the browser /bin
+    catch-up is concurrently rebuilding www assets; a byte change mid-flight doubles the
+    refresh coordination for a fix that deserves its own focused pass).
+
+    Recorded for that pass, so nobody expects the full vnicheck echo suite to go green
+    on awaits alone: the switch's unconditional source rewrite collapses both outer
+    ports onto the inner port's single MAC on the way upstream (a MAC-NAT with no
+    reverse mapping). Echo's replies address that inner-port MAC, so the outer switch
+    can demux them to at most one port — under default bases they all land on `port-a`
+    (whose MAC coincidentally equals the inner `port-a`'s); under distinct bases they
+    are unknown unicast at the outer layer and are dropped. Honest awaits make stacked
+    switches *run*; stacked *fan-out* (distinct consumers behind a stacked port both
+    completing request/reply flows) additionally needs a policy decision — e.g. a
+    reverse mapping for rewritten sources, or a learn-don't-rewrite stance toward a
+    downlink that is itself a switch — which is an owner-facing design question, not
+    plumbing.
+
+38. **`time.monotonic-stub` joins the option-C default-configuration rule (2026-06-02,
+    closing D31's recorded follow-up).** Observing the stub's clock unconfigured used to
+    panic (`ProviderState::with` on an unbound state — a never-trap convention violation,
+    reachable by plain `time.monotonic-stub $ program`). It now self-binds its documented
+    default on first use, exactly the `time.frozen` pattern: start 0 ns, step 1 ms per
+    observation (`DEFAULT_START_NS`/`DEFAULT_STEP_NS` in the stub); `configure` (or the
+    shell's `--start-ns`/`--step-ns`) still overrides. Tests in
+    `default_configuration.rs` (+2: the unconfigured origin via `hello`, the configured
+    override). With this, every configurable stub in the store follows the rule.
+
+39. **The cancel-mid-flight probe is executable — and it root-causes why the window is
+    closed on metal today (2026-06-02, D34's recorded follow-up).** `cancelcheck`
+    (guest/examples; kernel store 50 → 51) is the consumer D34 said did not exist. Per
+    attempt it starts a 1 MiB read, races a small concurrent read against it, and
+    classifies precisely: the driver's take/put slot makes the concurrent read's typed
+    busy error a *proof* the first read is mid-flight at that instant, and the cancel —
+    the SDK's cancel-on-drop, a real `subtask.cancel`, the bindings' EVENT_CANCEL →
+    destructors → `task.cancel` acknowledgment — lands without an intervening yield, so
+    a busy-classified attempt cannot race shut. After every attempt both seeded regions
+    are re-read and compared byte-for-byte: any leftover completion credited to a later
+    read (the misattribution D34's drain-before-reuse forbids) is a typed `corruption`
+    failure carrying the offset. Usermode pins the machinery
+    (tests/eo9-integration/tests/cancel_probe.rs over `disk.mem`: no traps, no hangs,
+    honest all-miss classification); on metal the full chain ran end-to-end —
+    `disk.virtio $ cancelcheck --attempts 25` at the eosh prompt, on-target compile,
+    real virtio-blk → `ok: probed("attempts=25 hits=0 eager=25 data-miss=0")`, zero
+    corruption across all 50 verification sweeps.
+
+    `hits=0` is itself the finding. Two layers close the window, and we eliminated one
+    to expose the other: QEMU single-threaded TCG completes virtio-blk requests
+    synchronously under the queue-notify write, so the `disk` flag now gives the scratch
+    disk its own iothread (xtask; completions post asynchronously, like hardware) — and
+    the hit rate stayed zero, because the kernel's `eo9:pci/pci.wait` **blocks
+    host-side** (masked-`wfi` inside the host call, pci_provider.rs — documented as
+    deliberate when every driver was an eager poller, D16/D18, with the suspending wait
+    deferred "until the async disk/net bridge lands"). That rationale is now stale: the
+    drivers await honestly (D33), and the host-side block halts *every* task between a
+    driver's request publish and its interrupt, so no canceller can be scheduled
+    mid-flight — the window is structurally unconstructible on metal regardless of
+    consumer or device timing. The runtime support that opens it is exactly the doc
+    comment's own deferred plan, now unblocked: a task-suspending `pci.wait` that parks
+    on the drive loop the way `time.sleep` does (the async-first doctrine applied to the
+    kernel host APIs — owner-visible, kernel-lane work, not taken in this tail batch).
+    The probe is already in the store with its verification sweeps waiting; when the
+    wait parks, `cancelcheck` starts hitting with no further changes, on QEMU and on the
+    Orange Pi alike.

@@ -13,6 +13,12 @@
 //! (so wall time advances in lockstep from the configured start). `resolution()` reports
 //! the configured step and does not advance the counter. The counter saturates instead
 //! of wrapping, keeping the clock monotonic even at the extreme.
+//!
+//! Composed without `configure`, the clock self-binds its documented default — a start
+//! of 0 ns ([`DEFAULT_START_NS`]) advancing 1 ms per observation ([`DEFAULT_STEP_NS`]) —
+//! on first use, so plain `time.monotonic-stub $ program` works and never traps;
+//! `configure` (or the shell's `--start-ns`/`--step-ns` flags) overrides it (plan/09
+//! Decision 14, the option-C default-configuration rule).
 
 #![no_std]
 
@@ -50,6 +56,24 @@ impl Clock {
 
 static STATE: ProviderState<Clock> = ProviderState::new();
 
+/// The documented default start: the monotonic origin (and the Unix epoch, for `now`).
+pub const DEFAULT_START_NS: u64 = 0;
+
+/// The documented default step: 1 ms per observation.
+pub const DEFAULT_STEP_NS: u64 = 1_000_000;
+
+/// Run `f` over the clock, binding the documented default first if `configure` never
+/// ran (the option-C default-configuration rule, plan/09 Decision 14).
+fn with_clock<R>(f: impl FnOnce(&mut Clock) -> R) -> R {
+    if !STATE.is_set() {
+        STATE.set(Clock {
+            counter_ns: DEFAULT_START_NS,
+            step_ns: DEFAULT_STEP_NS,
+        });
+    }
+    STATE.with(f)
+}
+
 /// The `time.monotonic-stub` provider.
 struct Stub;
 
@@ -78,7 +102,7 @@ impl time::Guest for Stub {
     }
 
     fn now(_t: time::TimeImplBorrow<'_>) -> Datetime {
-        let observed = STATE.with(Clock::observe);
+        let observed = with_clock(Clock::observe);
         Datetime {
             seconds: (observed / NANOS_PER_SECOND) as i64,
             nanoseconds: (observed % NANOS_PER_SECOND) as u32,
@@ -87,18 +111,18 @@ impl time::Guest for Stub {
 
     fn monotonic_now(_t: time::TimeImplBorrow<'_>) -> Instant {
         Instant {
-            nanoseconds: STATE.with(Clock::observe),
+            nanoseconds: with_clock(Clock::observe),
         }
     }
 
     fn resolution(_t: time::TimeImplBorrow<'_>) -> u64 {
-        STATE.with(|clock| clock.step_ns)
+        with_clock(|clock| clock.step_ns)
     }
 
     /// Advance the counter by the requested duration and return: on the stand-in clock,
     /// sleeping *is* what makes time pass.
     async fn sleep(_t: time::TimeImplBorrow<'_>, duration_ns: u64) {
-        STATE.with(|clock| {
+        with_clock(|clock| {
             clock.counter_ns = clock.counter_ns.saturating_add(duration_ns);
         });
     }
