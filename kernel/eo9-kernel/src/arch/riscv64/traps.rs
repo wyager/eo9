@@ -62,23 +62,26 @@ extern "C" fn ktrap(scause: u64, sepc: u64, stval: u64) {
             // the PLIC — the device keeps asserting them until a driver clears the cause —
             // and recorded for the wasm provider's `wait` (wasm-store builds only; the
             // sources are never enabled otherwise).
-            IRQ_S_EXTERNAL => loop {
-                let source = super::plic::claim();
-                if source == 0 {
-                    break;
+            //
+            // The claim is a linear token (src/arch/riscv64/plic.rs): `complete` consumes
+            // it, so an early exit that abandons a claimed source — which would strand that
+            // source forever at the gateway — is a `must_use` lint plus a debug-build panic
+            // instead of a silent deafness bug (docs/spikes/irq-audit.md, B1).
+            IRQ_S_EXTERNAL => {
+                while let Some(claim) = super::plic::claim() {
+                    if claim.source() == super::plic::UART0_SOURCE {
+                        super::uart::drain_rx();
+                    }
+                    #[cfg(feature = "wasm-store")]
+                    if let Some(line) = claim.source().checked_sub(super::pci_intx::BASE_SOURCE)
+                        && (line as usize) < crate::pci::INTX_LINES
+                    {
+                        super::plic::disable_source(claim.source());
+                        crate::pci::intx_record(line as usize);
+                    }
+                    super::plic::complete(claim);
                 }
-                if source == super::plic::UART0_SOURCE {
-                    super::uart::drain_rx();
-                }
-                #[cfg(feature = "wasm-store")]
-                if let Some(line) = source.checked_sub(super::pci_intx::BASE_SOURCE)
-                    && (line as usize) < crate::pci::INTX_LINES
-                {
-                    super::plic::disable_source(source);
-                    crate::pci::intx_record(line as usize);
-                }
-                super::plic::complete(source);
-            },
+            }
             // Anything else (e.g. a software interrupt) is unexpected but harmless: it is
             // not enabled in `sie`, so simply ignore it — matching the aarch64 handler's
             // treatment of unexpected INTIDs.
