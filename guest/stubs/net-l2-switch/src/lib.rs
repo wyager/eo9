@@ -29,6 +29,16 @@
 //!   `recv-frame` (consumer-pull, the same convention as the TCP/IP middleware), and a
 //!   drain demuxes into BOTH queues, so a busy consumer keeps its idle sibling's queue
 //!   warm rather than stealing its frames.
+//! * **Honest awaits, one uplink, two ports.** Every uplink call is a genuine await
+//!   (the SPEC's "boundaries are honestly async" rule), so the upstream may park us —
+//!   and the uplink can be stacked (another switch, itself awaiting). The uplink lives
+//!   in a take/put slot with a claim flag; while one port is parked mid-await holding
+//!   it, the sibling is never wedged: its `recv-frame` serves its own queue (filled by
+//!   whichever port pumps) and reports "nothing waiting" when the queue is empty — the
+//!   consumer owns the retry, per the l2 contract — while `send-frame` (and the
+//!   bring-up operations) report a typed busy error rather than opening a second
+//!   upstream interface. `info` (sync, no error channel) reads link parameters cached
+//!   at bring-up and never touches the uplink.
 //!
 //! Virtual MACs derive deterministically from a configured base (`l2-switch-config`,
 //! colon-separated hex, locally-administered required): `port-a` = base+1, `port-b` =
@@ -44,8 +54,6 @@ use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::pin::pin;
-use core::task::{Context as TaskContext, Poll, Waker};
 
 use eo9_guest::provider::ProviderState;
 
@@ -118,8 +126,9 @@ impl Slot {
 }
 
 // ------------------------------------------------------------------------------------------
-// Eager driving of the async uplink imports (same pattern and reasoning as the TCP/IP
-// middleware's l2 imports: every l2 operation below us completes in a single poll).
+// Errors. Every uplink import call below is a genuine await (the async-first doctrine);
+// the only switch-introduced failure beyond the uplink's own is the typed busy error a
+// non-recv operation gets while the sibling port holds the uplink mid-await.
 // ------------------------------------------------------------------------------------------
 
 /// A switch-internal failure, mapped into each port module's own (structurally
@@ -132,15 +141,11 @@ enum SwitchError {
     Io(String),
 }
 
-fn eager<F: Future>(what: &str, future: F) -> Result<F::Output, SwitchError> {
-    let mut future = pin!(future);
-    let mut context = TaskContext::from_waker(Waker::noop());
-    match future.as_mut().poll(&mut context) {
-        Poll::Ready(value) => Ok(value),
-        Poll::Pending => Err(SwitchError::Io(format!(
-            "{what}: the upstream l2 provider suspended"
-        ))),
-    }
+/// The typed busy error: the sibling port holds the uplink, parked mid-await upstream.
+fn busy(what: &str) -> SwitchError {
+    SwitchError::Io(format!(
+        "{what}: the uplink is busy with the sibling port's operation"
+    ))
 }
 
 /// The uplink's own error, preserved in kind where the kinds align.
@@ -164,9 +169,16 @@ struct Uplink {
 }
 
 struct SwitchState {
-    /// `Some` once the upstream interface is open. Taken out of the slot for the
-    /// duration of any uplink call (no `ProviderState` borrow is ever held across one).
+    /// `Some` once the upstream interface is open. Taken out of the slot (with
+    /// `claimed` set) for the duration of any uplink call — no `ProviderState` borrow
+    /// is ever held across an await, and the operation may genuinely park.
     uplink: Option<Uplink>,
+    /// True while the uplink is taken out of the slot or being opened: a second
+    /// activation arriving meanwhile must never open a second upstream interface.
+    claimed: bool,
+    /// Link parameters cached at bring-up, so the sync `info` (no error channel)
+    /// never has to touch the uplink.
+    params: Option<(u32, bool)>,
     /// Per-port receive queues (index = `Slot::index`).
     rx: [VecDeque<Vec<u8>>; 2],
 }
@@ -177,19 +189,25 @@ fn with_state<R>(f: impl FnOnce(&mut SwitchState) -> R) -> R {
     if !STATE.is_set() {
         STATE.set(SwitchState {
             uplink: None,
+            claimed: false,
+            params: None,
             rx: [VecDeque::new(), VecDeque::new()],
         });
     }
     STATE.with(f)
 }
 
-/// Puts the uplink back in its slot when the operation that took it finishes.
+/// Puts the uplink back in its slot (and releases the claim) when the operation that
+/// took it finishes — on every exit path, including a future dropped mid-await.
 struct UplinkGuard(Option<Uplink>);
 
 impl Drop for UplinkGuard {
     fn drop(&mut self) {
         if let Some(uplink) = self.0.take() {
-            with_state(|state| state.uplink = Some(uplink));
+            with_state(|state| {
+                state.uplink = Some(uplink);
+                state.claimed = false;
+            });
         }
     }
 }
@@ -203,24 +221,60 @@ impl core::ops::Deref for UplinkGuard {
     }
 }
 
-/// Take the uplink for one operation, opening it on first use: list the upstream
-/// provider's interfaces, take the first, open it, and remember its link parameters.
-fn acquire_uplink() -> Result<UplinkGuard, SwitchError> {
-    if let Some(uplink) = with_state(|state| state.uplink.take()) {
-        return Ok(UplinkGuard(Some(uplink)));
-    }
+/// What taking the uplink slot found.
+enum UplinkView {
+    Ready(Uplink),
+    Busy,
+    NeedOpen,
+}
 
+fn take_uplink() -> UplinkView {
+    with_state(|state| {
+        if let Some(uplink) = state.uplink.take() {
+            state.claimed = true;
+            UplinkView::Ready(uplink)
+        } else if state.claimed {
+            UplinkView::Busy
+        } else {
+            state.claimed = true;
+            UplinkView::NeedOpen
+        }
+    })
+}
+
+/// Take the uplink for one operation, opening it on first use. `Ok(None)` means the
+/// sibling port holds it right now (parked mid-await upstream); the caller picks the
+/// policy — `recv` answers "nothing waiting" (the sibling's drain fills both queues),
+/// everything else answers the typed busy error. Never opens a second interface.
+async fn acquire_uplink() -> Result<Option<UplinkGuard>, SwitchError> {
+    match take_uplink() {
+        UplinkView::Ready(uplink) => Ok(Some(UplinkGuard(Some(uplink)))),
+        UplinkView::Busy => Ok(None),
+        UplinkView::NeedOpen => {
+            let opened = open_uplink().await;
+            if opened.is_err() {
+                // Release the claim so the next use retries the bring-up.
+                with_state(|state| state.claimed = false);
+            }
+            opened.map(Some)
+        }
+    }
+}
+
+/// First-use bring-up: list the upstream provider's interfaces, take the first, open
+/// it, and cache its link parameters for the sync `info`.
+async fn open_uplink() -> Result<UplinkGuard, SwitchError> {
     let root = uplink_l2::default();
-    let interfaces =
-        eager("list-interfaces", uplink_l2::list_interfaces(&root))?.map_err(uplink_failure)?;
+    let interfaces = uplink_l2::list_interfaces(&root)
+        .await
+        .map_err(uplink_failure)?;
     let first = interfaces
         .first()
         .ok_or_else(|| SwitchError::Io(String::from("the upstream l2 exposes no interfaces")))?;
-    let iface = eager(
-        "open-interface",
-        uplink_l2::open_interface(&root, first.name.clone()),
-    )?
-    .map_err(uplink_failure)?;
+    let iface = uplink_l2::open_interface(&root, first.name.clone())
+        .await
+        .map_err(uplink_failure)?;
+    with_state(|state| state.params = Some((first.mtu, first.up)));
     Ok(UplinkGuard(Some(Uplink {
         iface,
         mtu: first.mtu,
@@ -263,10 +317,13 @@ fn enqueue(slot: Slot, frame: Vec<u8>) {
 }
 
 /// Pull whatever the uplink has waiting (bounded) and demux it into the port queues.
-fn drain_uplink(uplink: &Uplink) -> Result<(), SwitchError> {
+/// Each `recv-frame` await is bounded by the upstream's own contract (an idle link
+/// answers `bytes-received: 0` rather than waiting for traffic), and `DRAIN_BATCH`
+/// caps the awaits per drain.
+async fn drain_uplink(uplink: &Uplink) -> Result<(), SwitchError> {
     for _ in 0..DRAIN_BATCH {
         let dst = uplink_l2::Buffer::new(MAX_FRAME_BYTES);
-        let (dst, received) = eager("recv-frame", uplink_l2::recv_frame(&uplink.iface, dst))?;
+        let (dst, received) = uplink_l2::recv_frame(&uplink.iface, dst).await;
         match received {
             Ok(result) if result.bytes_received > 0 => {
                 let frame = dst.read(0, result.bytes_received.min(MAX_FRAME_BYTES));
@@ -282,8 +339,10 @@ fn drain_uplink(uplink: &Uplink) -> Result<(), SwitchError> {
 
 /// `list-interfaces` for one port: exactly one virtual NIC, with the uplink's link
 /// parameters and the port's own MAC.
-fn port_list(slot: Slot) -> Result<(String, [u8; 6], u32, bool), SwitchError> {
-    let uplink = acquire_uplink()?;
+async fn port_list(slot: Slot) -> Result<(String, [u8; 6], u32, bool), SwitchError> {
+    let uplink = acquire_uplink()
+        .await?
+        .ok_or_else(|| busy("list-interfaces"))?;
     Ok((
         String::from(slot.interface_name()),
         slot.mac(),
@@ -293,8 +352,10 @@ fn port_list(slot: Slot) -> Result<(String, [u8; 6], u32, bool), SwitchError> {
 }
 
 /// `open-interface` for one port: the port's single interface name, strictly.
-fn port_open(slot: Slot, name: &str) -> Result<(), SwitchError> {
-    let _uplink = acquire_uplink()?;
+async fn port_open(slot: Slot, name: &str) -> Result<(), SwitchError> {
+    let _uplink = acquire_uplink()
+        .await?
+        .ok_or_else(|| busy("open-interface"))?;
     if name == slot.interface_name() {
         Ok(())
     } else {
@@ -304,7 +365,7 @@ fn port_open(slot: Slot, name: &str) -> Result<(), SwitchError> {
 
 /// `send-frame` for one port: overwrite the Ethernet source with the port's virtual
 /// MAC and forward upstream. Returns the byte count accepted.
-fn port_send(slot: Slot, frame_bytes: Vec<u8>) -> Result<u64, SwitchError> {
+async fn port_send(slot: Slot, frame_bytes: Vec<u8>) -> Result<u64, SwitchError> {
     if frame_bytes.len() < 14 {
         return Err(SwitchError::Io(format!(
             "frame too short to be Ethernet ({} bytes)",
@@ -317,24 +378,28 @@ fn port_send(slot: Slot, frame_bytes: Vec<u8>) -> Result<u64, SwitchError> {
     let mut frame = frame_bytes;
     frame[6..12].copy_from_slice(&slot.mac());
 
-    let uplink = acquire_uplink()?;
+    let uplink = acquire_uplink().await?.ok_or_else(|| busy("send-frame"))?;
     let buffer = uplink_l2::Buffer::new(frame.len() as u64);
     buffer.write(0, &frame);
-    let (_buffer, sent) = eager("send-frame", uplink_l2::send_frame(&uplink.iface, buffer))?;
+    let (_buffer, sent) = uplink_l2::send_frame(&uplink.iface, buffer).await;
     let result = sent.map_err(uplink_failure)?;
     Ok(result.bytes_sent)
 }
 
 /// `recv-frame` for one port: serve the port's queue, draining the uplink (and
 /// demuxing for both ports) when the queue is empty. An empty result (`bytes-received:
-/// 0`) means nothing is waiting — the consumer owns the wait policy.
-fn port_recv(slot: Slot) -> Result<Option<Vec<u8>>, SwitchError> {
+/// 0`) means nothing is waiting — the consumer owns the wait policy. That includes the
+/// sibling-holds-the-uplink case: the sibling's drain demuxes into BOTH queues, so
+/// "nothing waiting yet, retry" is the honest answer, never a wedge.
+async fn port_recv(slot: Slot) -> Result<Option<Vec<u8>>, SwitchError> {
     let queued = with_state(|state| state.rx[slot.index()].pop_front());
     if let Some(frame) = queued {
         return Ok(Some(frame));
     }
-    let uplink = acquire_uplink()?;
-    drain_uplink(&uplink)?;
+    let Some(uplink) = acquire_uplink().await? else {
+        return Ok(None);
+    };
+    drain_uplink(&uplink).await?;
     drop(uplink);
     Ok(with_state(|state| state.rx[slot.index()].pop_front()))
 }
@@ -380,7 +445,7 @@ macro_rules! port_binding {
             async fn list_interfaces(
                 _l2: exports::$module::L2ImplBorrow<'_>,
             ) -> Result<Vec<exports::$module::InterfaceInfo>, exports::$module::L2Error> {
-                let (name, mac, mtu, up) = port_list($slot).map_err($error)?;
+                let (name, mac, mtu, up) = port_list($slot).await.map_err($error)?;
                 Ok(alloc::vec![exports::$module::InterfaceInfo {
                     name,
                     mac: (mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]),
@@ -393,18 +458,18 @@ macro_rules! port_binding {
                 _l2: exports::$module::L2ImplBorrow<'_>,
                 name: String,
             ) -> Result<exports::$module::L2Interface, exports::$module::L2Error> {
-                port_open($slot, &name).map_err($error)?;
+                port_open($slot, &name).await.map_err($error)?;
                 Ok(exports::$module::L2Interface::new($iface_name))
             }
 
             fn info(
                 _iface: exports::$module::L2InterfaceBorrow<'_>,
             ) -> exports::$module::InterfaceInfo {
-                // Best-effort link parameters: `info` has no error channel in the WIT.
-                let (mtu, up) = match acquire_uplink() {
-                    Ok(uplink) => (uplink.mtu, uplink.up),
-                    Err(_) => (0, false),
-                };
+                // Best-effort link parameters: `info` is sync with no error channel,
+                // so it reads what bring-up cached and never touches the uplink
+                // (`(0, false)` before the first successful open — the disk
+                // size-reports-0 shape).
+                let (mtu, up) = with_state(|state| state.params).unwrap_or((0, false));
                 let mac = $slot.mac();
                 exports::$module::InterfaceInfo {
                     name: String::from($slot.interface_name()),
@@ -424,6 +489,7 @@ macro_rules! port_binding {
                 let len = frame.len();
                 let bytes = frame.read(0, len);
                 let outcome = port_send($slot, bytes)
+                    .await
                     .map(|bytes_sent| exports::$module::SendResult { bytes_sent })
                     .map_err($error);
                 (frame, outcome)
@@ -436,7 +502,7 @@ macro_rules! port_binding {
                 exports::$module::Buffer,
                 Result<exports::$module::RecvResult, exports::$module::L2Error>,
             ) {
-                match port_recv($slot) {
+                match port_recv($slot).await {
                     Ok(Some(frame)) => {
                         let take = (frame.len() as u64).min(dst.len());
                         dst.write(0, &frame[..take as usize]);

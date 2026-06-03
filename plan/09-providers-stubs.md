@@ -767,3 +767,32 @@ Match the priority order above; (1)+(2) unblock I2.
     The probe is already in the store with its verification sweeps waiting; when the
     wait parks, `cancelcheck` starts hitting with no further changes, on QEMU and on the
     Orange Pi alike.
+
+40. **`net.l2.switch` awaits honestly — stacking runs point-to-point (2026-06-02, branch
+    `area/09-switch-convert`).** The last `eager()` component converted per the async-first
+    doctrine: every uplink call is a genuine await. The one-uplink/two-ports shape gets the
+    sibling-no-wedge design: the uplink lives in a take/put slot with a claim flag (the
+    l4 middleware's `opened` pattern — a concurrent first use can never open a second
+    upstream interface, and the guard restores slot + claim on every exit path including a
+    future dropped mid-await); while one port holds it parked, the sibling's `recv-frame`
+    serves its own queue (whichever port pumps demuxes into BOTH queues) and answers
+    "nothing waiting" when empty — the consumer owns the retry, per the l2 contract — while
+    `send-frame`/`list-interfaces`/`open-interface` answer a typed busy error; the sync
+    `info` (no error channel) reads link parameters cached at bring-up and never touches
+    the uplink (the disk size-reports-0 shape). Deadline audit: every await is one upstream
+    l2 op, bounded by the upstream's own contract (an idle link answers `bytes-received: 0`
+    rather than waiting for traffic), with `DRAIN_BATCH` (16) capping awaits per drain — the
+    switch never waits for a frame to arrive. Verified: vnic_switch 4/4 unchanged;
+    vnic_stacked flipped from the D37 suspension pin to THREE tests — the algebra seal, the
+    point-to-point SUCCESS (`vnicheck --mode through`: a full port-A exchange through two
+    stacked switches — both source rewrites up, demux back down through both layers via the
+    deterministic MAC derivation (layer N's port-a equals layer N+1's), sibling isolation
+    through the stack, broadcast to both outer ports, unknown unicast to neither), and the
+    fan-out limitation pinned typed (`--mode echo`: port B's reply collapses onto the inner
+    port-a MAC and demuxes to A — the D37 MAC-NAT/reverse-mapping owner question, untouched
+    here by directive). vnicheck gained the point-to-point modes `through` and `arp-a` (the
+    A-half of `arp`) for stacked verification. Metal: the single-switch `--mode arp` payoff
+    byte-for-behavior (both MACs, gateway resolved), and the NEW two-switch smoke —
+    `net.virtio $ inner $ outer $ vnicheck --mode arp-a` → `verified("mac-a=02:e0:09:00:00:01
+    gw-a=52:55:0a:00:02:02")` — ARP through a stacked pair to the real gateway, clean
+    poweroff. Full `cargo xtask ci` green.
