@@ -40,10 +40,11 @@
 
   <h2>What Eo9 is</h2>
   <p>
-    Eo9 is an operating system built on language-theoretic principles for security, performance, and
-    composability. Programs are distributed as WebAssembly Component Model components rather than
+    Eo9 is an operating system where a program's capabilities are exactly its typed imports —
+    nothing more. Programs are distributed as WebAssembly Component Model components rather than
     native binaries, and the OS itself is, at its core, a set of typed APIs plus a compiler for
-    programs that use them.
+    programs that use them. Programs are written in Rust today; anything that compiles to a
+    WebAssembly component will work.
   </p>
   <p>
     A WebAssembly component's only channel to the outside world is its imports — there are no
