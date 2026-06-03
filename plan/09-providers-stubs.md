@@ -650,3 +650,38 @@ Match the priority order above; (1)+(2) unblock I2.
     over INTx; full `cargo xtask ci` green. Same honesty bound as D34: the cancel-mid-
     flight misattribution window itself is pinned by the pattern and audit, not an
     executable test, until the hardening lane grows a cancellable metal consumer.
+
+36. **ISR-ack alignment across the virtio drivers (2026-06-02, branch `area/09-async-gpu`).**
+    The gpu-freeze branch's unconditional read-to-clear acknowledgement, examined for the
+    siblings:
+    - **`disk.virtio` — ported.** Its `wait_for_completion` acked only on the wait branch and
+      in the polled loop; a completion already posted before (or between) interrupt waits
+      returned without an ISR read, leaving the level-sensitive INTx asserted — the next wait
+      then sees a stale delivery and retries spuriously (worst case: permanent drift into the
+      polled fallback). The ack now runs unconditionally on the completed branch. Safe at
+      this driver's queue depth of one: by the time the branch runs, every published
+      request's completion has been consumed, so a pending assertion can only belong to the
+      completion just consumed — there is no other in-flight request whose interrupt the
+      read-to-clear could swallow; double-acking on the wait branch is idempotent.
+    - **`net.virtio` — nothing to ack; the inverse fix instead.** The driver is purely polled
+      (no `enable-interrupts`, no ISR window — interrupt receive is the plan/12 D59
+      follow-up), so the stale-delivery shape cannot occur *in* it. But it carried the no-ack
+      shape's mirror image: avail flags 0 invited the device to assert its level-triggered
+      INTx on every rx/tx completion with nobody ever reading the ISR — a permanently wedged
+      line, harmless to net.virtio itself but hostile to any device sharing the swizzled
+      INTx (an interrupt-mode sibling would see endless stale deliveries and drift into its
+      polled fallback). Both queues now publish `VIRTQ_AVAIL_F_NO_INTERRUPT` (virtio 1.0
+      §2.6.7) at setup — the spec's polled-driver discipline; a hint, so a device that
+      interrupts anyway costs nothing. The rx path needs no per-completion reasoning beyond
+      this: its used-element consumption is await-free and flag state is set once at queue
+      init, before any buffer is posted. When D59 converts receive to interrupt waits, the
+      rx flag goes back to 0 and the converted driver acks like the siblings.
+    Verification (the full battery, one boot with all three functions on one bus — the
+    line-sharing scenario the net suppression exists for): disk round-trip
+    (`ok: round-tripped(15)`, completion: INTx), the filtered chain (`pci.admit-vendor $
+    pci.filtered $ disk.virtio $ fs.eofs $ cat` — INTx through the filter), net ARP + DNS
+    (`l2check` resolved the gateway MAC; `l4check` resolved example.com), `gpu.virtio $
+    draw` with the correct checksum on the shared bus; then a power-cycle boot reading the
+    file back (cross-boot persistence, INTx). INTx waits genuinely served in both boots
+    (the kernel's once-per-boot delivery line), zero polled fallbacks. Full `cargo xtask
+    ci` green.
