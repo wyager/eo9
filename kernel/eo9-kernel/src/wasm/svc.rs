@@ -1203,12 +1203,26 @@ fn host_detach(
         )));
     }
 
-    // --- compile both, once (restarts and decisions reuse the artifacts) -------------
+    // --- compile both, once (restarts and decisions reuse the artifacts; the session
+    // compile cache is consulted, so re-detaching a composition the session already
+    // compiled skips Cranelift) ---------------------------------------------------------
     let wiring = shellexec::component_wiring(&child_kc);
-    let component = shellexec::compile_component(&engine, entries, &child_kc)
-        .map_err(|err| internal(format!("compiling the service failed: {err}")))?;
-    let policy = shellexec::compile_component(&engine, entries, &policy_kc)
-        .map_err(|err| internal(format!("compiling the policy failed: {err}")))?;
+    let component = {
+        let exec = store
+            .data_mut()
+            .shell_exec()
+            .map_err(|err| internal(format!("{err}")))?;
+        shellexec::compile_component(&engine, entries, &child_kc, exec)
+            .map_err(|err| internal(format!("compiling the service failed: {err}")))?
+    };
+    let policy = {
+        let exec = store
+            .data_mut()
+            .shell_exec()
+            .map_err(|err| internal(format!("{err}")))?;
+        shellexec::compile_component(&engine, entries, &policy_kc, exec)
+            .map_err(|err| internal(format!("compiling the policy failed: {err}")))?
+    };
 
     // --- spawn the first run ----------------------------------------------------------
     let capture = matches!(logs, WitLogPolicy::Capture);

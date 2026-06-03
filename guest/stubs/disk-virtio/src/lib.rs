@@ -799,6 +799,20 @@ impl Driver {
             };
             self.interrupt = Some(vector);
             if completed {
+                // Acknowledge unconditionally, not just on the wait branch (the same fix
+                // as gpu.virtio's): a completion that was already in the used ring before
+                // (or between) waits never had its ISR read, and an unread ISR keeps the
+                // level-sensitive INTx asserted — the controller then records a delivery
+                // the moment the next `wait` unmasks the line, and that stale delivery
+                // makes the wait return without the completion it was called for (a
+                // spurious retry, and in the worst case a permanent drift into the polled
+                // fallback). Safe at this driver's queue depth of one: every published
+                // request's completion has been consumed by the time this runs, so a
+                // pending assertion can only belong to the completion just consumed —
+                // there is no other in-flight request whose interrupt the read-to-clear
+                // could swallow. Acknowledging twice on the wait branch is harmless
+                // (read-to-clear is idempotent).
+                self.acknowledge_isr().await;
                 return Ok(());
             }
         }

@@ -1387,12 +1387,18 @@ pub(super) fn component_wiring(component: &KComponent) -> String {
 /// for pristine store entries (the fast path), on-target Cranelift for algebra results.
 /// The same rule as the exec surface's `compile`, minus the persistent disk cache —
 /// services compile exactly once at detach and restart from the in-memory artifact, so
-/// the cache would only help across reboots (recorded follow-up).
+/// the disk cache would only help across reboots (recorded follow-up). The *session*
+/// compile cache is consulted, though: a detach of a composition the session already
+/// compiled (spawned at the prompt, or detached under another name) reuses the artifact
+/// and skips Cranelift, exactly like a re-spawn would.
 pub(super) fn compile_component(
     engine: &Engine,
     entries: &'static [super::store::StoreEntry],
     component: &KComponent,
+    exec: &mut ShellExec,
 ) -> Result<Component, String> {
+    #[cfg(not(feature = "wasm-codegen"))]
+    let _ = exec;
     match component.entry {
         // SAFETY: the artifact comes from the store image produced by `cargo xtask
         // build-kernel` with the same wasmtime version and engine configuration.
@@ -1403,6 +1409,12 @@ pub(super) fn compile_component(
             let exec_bytes = eo9_component::Component::load(component.bytes.clone())
                 .map(|c| c.executable_bytes())
                 .unwrap_or_else(|_| component.bytes.clone());
+            // The session's in-RAM cache first (hash narrows, full-bytes equality
+            // confirms — the same discipline as the exec surface's `compile`).
+            let cache_hash = compile_cache_hash(&exec_bytes);
+            if let Some(component) = exec.cached_compile(cache_hash, &exec_bytes) {
+                return Ok(component);
+            }
             // Codegen blocks the console; announce it so a long compile (a detach of a
             // large composition) never reads as a frozen shell.
             crate::kprintln!(
@@ -1412,11 +1424,12 @@ pub(super) fn compile_component(
             let started = crate::timer::uptime_us();
             let compiled = Component::new(engine, &exec_bytes)
                 .map_err(|err| format!("on-target compilation failed: {err:?}"));
-            if compiled.is_ok() {
+            if let Ok(component) = &compiled {
                 crate::kprintln!(
                     "codegen: compiled in {} ms",
                     (crate::timer::uptime_us() - started) / 1000
                 );
+                exec.cache_compile(cache_hash, exec_bytes, component.clone());
             }
             compiled
         }

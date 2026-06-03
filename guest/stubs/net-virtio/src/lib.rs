@@ -127,6 +127,20 @@ const FEATURE_MAC_LOW: u64 = 1 << 5;
 /// Split-virtqueue descriptor flags.
 const DESC_F_WRITE: u16 = 2;
 
+/// `VIRTQ_AVAIL_F_NO_INTERRUPT` (virtio 1.0 §2.6.7): tell the device this driver does
+/// not want used-buffer interrupts. This driver is purely polled (no `enable-interrupts`,
+/// no ISR window — converting receive to an interrupt wait is the plan/12 D59 follow-up),
+/// so without the suppression the device would assert its level-triggered INTx on every
+/// completion and *nobody would ever read the ISR to deassert it*: harmless to this
+/// driver, but a permanently wedged line for any device sharing the swizzled INTx — its
+/// interrupt-mode sibling (disk.virtio, gpu.virtio) would then see endless stale
+/// deliveries and drift into its polled fallback. The flag is the spec's hint, not a
+/// guarantee, which is exactly right: a device that interrupts anyway costs nothing here,
+/// suppression just stops the routine wedging. When D59 converts receive to interrupt
+/// waits, the rx ring's flag goes back to 0 (and the converted driver acks its ISR like
+/// the siblings).
+const AVAIL_F_NO_INTERRUPT: u16 = 1;
+
 /// Queue size the driver uses for both queues (the device's maximum is reduced to this).
 const QUEUE_SIZE: u16 = 16;
 /// Per-queue ring layout inside the shared ring DMA page: the receive queue's rings live
@@ -594,6 +608,14 @@ impl Driver {
         // table and both rings so the device's first used-index write is the first
         // non-zero value the polling loops ever observe.
         pci::dma_write(&self.rings, ring_base, &[0u8; 1024]);
+        // Suppress used-buffer interrupts on this queue: the driver polls and never
+        // reads an ISR, so an interrupt it provoked would stay asserted forever (see
+        // AVAIL_F_NO_INTERRUPT).
+        pci::dma_write(
+            &self.rings,
+            ring_base + AVAIL_OFFSET,
+            &AVAIL_F_NO_INTERRUPT.to_le_bytes(),
+        );
         let ring_address = pci::dma_address(&self.rings) + ring_base;
         self.write_address(COMMON_QUEUE_DESC, ring_address + DESC_OFFSET)
             .await?;

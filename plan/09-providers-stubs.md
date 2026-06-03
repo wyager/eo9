@@ -605,3 +605,83 @@ Match the priority order above; (1)+(2) unblock I2.
     submitting operation, kicking before waiting; (4) keep used-element consumption await-free
     so a cancel cannot land mid-consume; (5) accept interrupt-vector loss on cancellation
     (degrade to polled) or restructure to preserve the vector across the wait.
+
+35. **`gpu.virtio` converts to honest awaits — the last eager driver falls (2026-06-02,
+    branch `area/09-async-gpu`).** The conversion follows D34's pattern exactly, point by
+    point: (1) the `ProviderState` closure state became the take/put `Slot`
+    (`Empty | Busy | Ready`) with a `DriverGuard` that restores the driver — framebuffer
+    allocation included, preserving the never-drop-DMA rule — on every exit path,
+    cancellation included, resyncing the consumed cursor against completions already
+    posted (a synchronous DMA read; `Drop` cannot await); (2) the control queue keeps its
+    free-running `avail_index`/`used_index` pair; (3) `drain_stale` runs at the top of
+    `command()` — the single submitting operation every gfx op funnels through — kicking
+    once (idempotent; the cancelled command may never have been kicked) before consuming
+    the leftover completion with the normal bounded wait, so the D34 invariant holds: when
+    a command begins writing the shared descriptor chain and command/response page, the
+    device has posted completions for everything previously published; (4) used-element
+    consumption stays await-free; (5) a cancel landing inside the INTx `pci::wait` drops
+    the vector with the future — later commands complete polled, graceful degradation. The
+    eager `poll_eager`/"provider suspended" machinery is deleted; the unconditional
+    ISR-ack-on-completion and the once-per-conversation polled-fallback notice (the gpu-
+    freeze branch's fixes) are retained verbatim.
+
+    **Deadline audit** (every parking await bounded, sibling table style): interrupt wait —
+    `INTERRUPT_WAIT_RETRIES` (4) per command, each `pci::wait` kernel-bounded, fallback to
+    polled; polled loop — `POLL_LIMIT` (50M host calls) → typed `io` error with device
+    status; reset spin — 1000 iterations; `drain_stale` — reuses the wait machinery's
+    bounds, one iteration per leftover command (≤1: queue depth is one); all other pci
+    awaits — host calls the kernel bounds, resolving within the call against the root and
+    bounded by the interposer's own deadlines under interposition.
+
+    **The sync-`mode` consequence**: bring-up awaits, so the synchronous `mode` export can
+    no longer probe on first use — before bring-up it answers a typed `io` error explaining
+    the wake-up dance (the exact shape of `disk.virtio`'s `size` reporting 0, plan/14 D25).
+    The draw example wakes device-backed providers with one awaited zero-area `clear`
+    before asking for the mode (harmless on gfx.mem; against gfx.deny the wake-up itself
+    answers the same typed `denied` the old first-`mode` did — the gfx.deny integration
+    test passes unchanged, comment updated).
+
+    Verification: `cargo xtask check-gpu` pixel-exact on both frames; scripted metal
+    session — cold draw 13 s with exactly one `codegen: compiling` announce, repeat draw
+    2 s with a session-cache hit and no second announce (timing unchanged from the gpu-
+    freeze baseline), Ctrl-C landing after `codegen: compiled` (the driver run phase, an
+    INTx wait in flight) → `pci: quiesced 1 device(s) at task teardown` + `abnormal:
+    killed` → the next `gpu.virtio $ draw` re-claims and presents the correct checksum
+    over INTx; full `cargo xtask ci` green. Same honesty bound as D34: the cancel-mid-
+    flight misattribution window itself is pinned by the pattern and audit, not an
+    executable test, until the hardening lane grows a cancellable metal consumer.
+
+36. **ISR-ack alignment across the virtio drivers (2026-06-02, branch `area/09-async-gpu`).**
+    The gpu-freeze branch's unconditional read-to-clear acknowledgement, examined for the
+    siblings:
+    - **`disk.virtio` — ported.** Its `wait_for_completion` acked only on the wait branch and
+      in the polled loop; a completion already posted before (or between) interrupt waits
+      returned without an ISR read, leaving the level-sensitive INTx asserted — the next wait
+      then sees a stale delivery and retries spuriously (worst case: permanent drift into the
+      polled fallback). The ack now runs unconditionally on the completed branch. Safe at
+      this driver's queue depth of one: by the time the branch runs, every published
+      request's completion has been consumed, so a pending assertion can only belong to the
+      completion just consumed — there is no other in-flight request whose interrupt the
+      read-to-clear could swallow; double-acking on the wait branch is idempotent.
+    - **`net.virtio` — nothing to ack; the inverse fix instead.** The driver is purely polled
+      (no `enable-interrupts`, no ISR window — interrupt receive is the plan/12 D59
+      follow-up), so the stale-delivery shape cannot occur *in* it. But it carried the no-ack
+      shape's mirror image: avail flags 0 invited the device to assert its level-triggered
+      INTx on every rx/tx completion with nobody ever reading the ISR — a permanently wedged
+      line, harmless to net.virtio itself but hostile to any device sharing the swizzled
+      INTx (an interrupt-mode sibling would see endless stale deliveries and drift into its
+      polled fallback). Both queues now publish `VIRTQ_AVAIL_F_NO_INTERRUPT` (virtio 1.0
+      §2.6.7) at setup — the spec's polled-driver discipline; a hint, so a device that
+      interrupts anyway costs nothing. The rx path needs no per-completion reasoning beyond
+      this: its used-element consumption is await-free and flag state is set once at queue
+      init, before any buffer is posted. When D59 converts receive to interrupt waits, the
+      rx flag goes back to 0 and the converted driver acks like the siblings.
+    Verification (the full battery, one boot with all three functions on one bus — the
+    line-sharing scenario the net suppression exists for): disk round-trip
+    (`ok: round-tripped(15)`, completion: INTx), the filtered chain (`pci.admit-vendor $
+    pci.filtered $ disk.virtio $ fs.eofs $ cat` — INTx through the filter), net ARP + DNS
+    (`l2check` resolved the gateway MAC; `l4check` resolved example.com), `gpu.virtio $
+    draw` with the correct checksum on the shared bus; then a power-cycle boot reading the
+    file back (cross-boot persistence, INTx). INTx waits genuinely served in both boots
+    (the kernel's once-per-boot delivery line), zero polled fallbacks. Full `cargo xtask
+    ci` green.
