@@ -13,6 +13,7 @@ static BUNDLED_COMPONENTS: &[(&str, &[u8])] = &[
     ("eo9-coreutil-stat", include_bytes!("eo9-coreutil-stat.wasm") as &[u8]),
     ("eo9-coreutil-touch", include_bytes!("eo9-coreutil-touch.wasm") as &[u8]),
     ("eo9-coreutil-wc", include_bytes!("eo9-coreutil-wc.wasm") as &[u8]),
+    ("eo9-example-cancelcheck", include_bytes!("eo9-example-cancelcheck.wasm") as &[u8]),
     ("eo9-example-cruncher", include_bytes!("eo9-example-cruncher.wasm") as &[u8]),
     ("eo9-example-draw", include_bytes!("eo9-example-draw.wasm") as &[u8]),
     ("eo9-example-hello", include_bytes!("eo9-example-hello.wasm") as &[u8]),
