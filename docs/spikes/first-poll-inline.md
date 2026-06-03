@@ -1,11 +1,14 @@
 # Design note: first-poll-inline for guest callees
 
-**Status**: prototype built and A/B-verified (area/04-first-poll). The vendored wasmtime
-gains the off-by-default `component-model-async-first-poll` feature
-(kernel/vendor/README.md); `tests/firstpoll-ab` is the standalone A/B workspace (both
-arms build the *same* vendored copy, the feature the only variable). Results in
-"Prototype results" at the end of this note. Default builds everywhere keep the queued
-path.
+**Status**: prototype built and A/B-verified (area/04-first-poll); default-on
+evaluation complete (area/04-firstpoll-eval) — see "Default-on evaluation" at the end
+of this note for the standing gate (`cargo xtask firstpoll-ab`), the usermode and metal
+numbers, the feature-on three-arch battery, and the GO recommendation awaiting the
+owner's call. The vendored wasmtime gains the off-by-default
+`component-model-async-first-poll` feature (kernel/vendor/README.md);
+`tests/firstpoll-ab` is the standalone A/B workspace (both arms build the *same*
+vendored copy, the feature the only variable). Default builds everywhere keep the
+queued path.
 
 **Context** (docs/spikes/eager-guest-forwarding.md, SPEC "Boundaries are honestly
 async"): under the async-first doctrine every boundary that can wait is declared and
@@ -208,3 +211,97 @@ Eo9 engine option vs. the cargo feature), wire the host workspace A/B into the l
 gate (`cargo test` twice in tests/firstpoll-ab; an xtask subcommand would be the
 ergonomic spelling), quantify per-hop costs on a quiet machine with work-item counters,
 and a metal (not QEMU) measurement once a board is in hand.
+
+## Default-on evaluation (area/04-firstpoll-eval, 2026-06-02)
+
+**The standing gate now exists**: `cargo xtask firstpoll-ab` refreshes the guest
+components, runs the whole A/B workspace in both arms (the 21-test hardening matrix and
+the real-chain suites must be identical; the eager-guest pins are arm-specific by
+construction), and then runs `--rounds N` (default 5) interleaved A/B timing rounds
+reported as per-shape medians with min..max spread and the host load context.
+`--gate-only` is the fast regression spelling. Any future change to the vendored async
+machinery goes through this command. For kernel measurement builds,
+`EO9_KERNEL_FEATURES_EXTRA=first-poll-inline` appends the feature to the standard
+kernel feature lists (all three arches); nothing in the repo sets it, and a rebuild
+with it unset was verified byte-identical to the pristine feature-off image.
+
+**Usermode numbers** (5 interleaved rounds, host load average 34-41 throughout — other
+agents were building on the machine; treat the medians as robust, the spreads as
+honest, and re-run `cargo xtask firstpoll-ab` on a quiet machine for publishable
+figures):
+
+| shape | off: median (min..max) | on: median (min..max) | delta |
+|---|---|---|---|
+| eager chain depth 1 | 181.9µs (121.3..212.7) | 105.0µs (69.2..268.7) | −42% |
+| eager chain depth 2 | 160.4µs (122.7..401.9) | 136.1µs (90.6..383.4) | −15% |
+| eager chain depth 4 | 205.5µs (136.8..487.8) | 192.6µs (89.6..229.3) | −6% |
+| parked chain depth 3 | 203.8µs (143.0..219.0) | 200.5µs (116.7..625.2) | −2% |
+
+Direction and rough magnitude match the prototype's quieter-machine round (−28..38%
+eager, −19% parked); under load the variance is large but the inline arm's median won
+every shape in every round.
+
+**Metal op-phase A/B** (QEMU TCG aarch64 — still emulation, not silicon; the real-board
+datapoint waits for hardware). Method: boot each arm's kernel image, run the
+composition five times in one boot; repetition 1 pays the on-target compile, the
+session compile cache makes repetitions 2+ pure operation phase, timed from the typed
+newline to the outcome marker on the serial stream (25 ms/char paced input, echo
+verified — the check-gpu console conventions). Two boots per arm, interleaved:
+
+| chain | off: median (spread) | on: median (spread) |
+|---|---|---|
+| `disk.virtio $ fs.eofs $ readwrite` (7 timed reps/arm) | 1.13s (1.10..1.16) | 1.13s (1.10..1.17) |
+| `net.virtio $ net.l4.over-l2 $ l4check` (7 timed reps/arm) | 2.18s (2.18..2.20) | 2.21s (2.20..4.43) |
+
+Storage is parity: the arms swapped order between rounds (off faster in round 2, on
+faster in round 1), so boot-to-boot variance dominates any per-boundary effect. Net's
+quiet-window medians are 2.18 vs 2.21 (+1%, within the day-to-day spread of a chain
+whose op phase is real DNS over slirp plus interrupt-paced pumping); the on-arm's
+4.43s outlier coincided with a logged host load spike to ~24. Conclusion unchanged
+from the conversion-time A/B: when callees complete promptly, honest awaits — queued
+or inlined — cost nothing visible at metal op scale; the inline win is µs-per-boundary
+and lives below interrupt pacing and device latency.
+
+**Feature-on metal battery** (semantic confidence; all on the feature-on kernels):
+
+- aarch64 storage: baseline `disk.virtio $ fs.eofs $ readwrite` with INTx-paced
+  completion (`ok: round-tripped(10)`, the interrupt-wait diagnostic present); the
+  flagship filtered chain `pci.admit-address --allow "[{segment: 0, bus: 0, device: 3,
+  function: 0}]" $ pci.filtered $ disk.virtio $ fs.eofs $ ls /` → `keep.txt`,
+  `ok: listed(1)`, INTx served through the filter; next boot, the same filtered chain
+  with `cat /keep.txt` served the contents — power-cycle persistence intact.
+- aarch64 net: `l4check` resolved real DNS every rep; the switch demo
+  `net.virtio $ (rename port-a link-a $ rename port-b link-b $ net.l2.switch) $
+  vnicheck --mode arp` verified both per-port MACs against the gateway.
+- aarch64 gfx: `EO9_KERNEL_FEATURES_EXTRA=first-poll-inline cargo xtask check-gpu` —
+  both screendumps pixel-for-pixel exact.
+- aarch64 services: the `svcdemo` boot — `svc list` (worker running, banner finished),
+  `svc log banner`, `svc stop worker`, `exit` ends the boot once nothing runs.
+- riscv64 and x86_64: feature-on images boot through init to the console; `hello` and
+  `cruncher --seed 9 --rounds 200000` (`ok: digest(14341732361190694547)`) — the
+  on-target codegen and run paths under the inlined first poll on all three arches.
+
+**What remains true of the deviation**: a directly-called callee that blocks mid-frame
+(a blocking sync-lowered import inside its initial activation) blocks its caller's
+fiber. No Eo9 guest can express this — every Eo9 guest is callback-ABI and waits by
+returning `WAIT` — and the gate pins that scope (the sync-lifted eager row stays
+queued). The deviation is therefore unobservable in any shipped Eo9 composition, but it
+is still a deviation from the written CM spec, which matters exactly when proposing the
+optimization upstream. The upstream comment in `start_call` invites the change with
+numbers; the spec conversation should accompany that proposal, not gate Eo9's own
+default.
+
+**Recommendation: GO for default-on in Eo9's own builds** — concretely, append
+`first-poll-inline` to the three standard kernel feature lists in xtask (and the
+vendored-stack web embedding when its lane picks it up), keeping the cargo feature as
+the escape hatch for one release. Reasoning: semantics are pinned identical everywhere
+we can observe them (the matrix, the chains, the eager pins, and the full metal battery
+across three architectures, including the pixel-exact display path and the service
+registry); performance is strictly better in usermode (−6..−42% on eager chains, parked
+chains unaffected) and parity on metal where device pacing dominates; the determinism
+policy (always-inline-when-legal, store-state-only gate) was designed for default-on
+from the start; and the one semantic deviation is unreachable from Eo9 guests by
+construction. NOT covered by this evaluation, deliberately: usermode `eo9` (registry
+wasmtime — parity arrives only via the upstream proposal) and real-silicon timing
+(Orange Pi, when it lands). Flipping the default is the owner's call; the change is
+one line per feature list plus updating this note.
