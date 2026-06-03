@@ -288,6 +288,31 @@ impl Drop for FsGuard {
     }
 }
 
+/// Releases the first-use claim (the `Busy` slot) if the mount never completes: an
+/// error return *or a future dropped mid-mount* restores `Empty` so the next call
+/// retries, instead of wedging the filesystem behind a permanent typed-busy answer.
+/// The mount path is the deepest awaiter in this provider (it reads uberblocks and
+/// walks the tree over the disk import), so this window matters the moment a disk op
+/// can park. Armed from the instant the claim exists; defused on success, when the
+/// [`FsGuard`] takes over the restore duty.
+struct BringUpClaim {
+    armed: bool,
+}
+
+impl BringUpClaim {
+    fn defuse(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BringUpClaim {
+    fn drop(&mut self) {
+        if self.armed {
+            STATE.clear();
+        }
+    }
+}
+
 /// Run `f` over the mounted filesystem, mounting (or formatting a blank disk) on first
 /// use — the documented default behaviour, so the unconfigured provider never traps.
 async fn with_fs<R>(
@@ -295,13 +320,14 @@ async fn with_fs<R>(
 ) -> Result<R, FsError> {
     let eofs = match STATE.take()? {
         Some(eofs) => eofs,
-        None => match mount_or_format().await {
-            Ok(eofs) => Box::new(eofs),
-            Err(error) => {
-                STATE.clear();
-                return Err(error);
-            }
-        },
+        None => {
+            // The slot is `Busy` from the `take` above: arm the restore before the
+            // first await of the mount.
+            let claim = BringUpClaim { armed: true };
+            let eofs = Box::new(mount_or_format().await?);
+            claim.defuse();
+            eofs
+        }
     };
     let mut guard = FsGuard { eofs: Some(eofs) };
     f(guard.eofs.as_mut().expect("guard holds the engine")).await
