@@ -3,46 +3,30 @@
 Tracked by the planner so nothing gets lost. Each item notes where it is recorded and what unblocks it.
 Items are removed when closed; design questions move to SPEC.md when resolved.
 
-_Last updated: 2026-06-01 (master at acb6c5e, after the round-3 user studies and their fix wave: five
-personas — storage, network, driver, returning novice, distribution — produced 96 findings; 37 are fixed
-and merged, 41 are tracked below, 18 await owner decisions. The wave also closed the bind-entrypoint
-decision (resource-owning providers are configurable), shipped PCI INTx interrupt delivery, the writable
-MAC-verified /bin on metal, and the typed configure-error channel.)_
+_Last updated: 2026-06-02 (master at a1f0c10, after the executor, video, and async-first waves: the
+round-3 owner decisions are ruled and implemented, eo9:svc v1–v3 landed (services, boot-runs-init, the
+virtual-NIC switch), eo9:gfx + gpu.virtio shipped video, and the async conversion took the suspension wall
+down — both flagship study failures now run on metal. The waves also flushed out and fixed a usermode lost
+wakeup, a virtio cancellation-misattribution window, and the silent-on-target-compile "freeze".)_
 
 ## Decisions pending with the owner
 
-The round-3 studies produced a batch of genuine design questions (the per-study triage tables in
-docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
+Most round-3 questions were ruled 2026-06-01/02 (recorded under settled directions below). Still genuinely
+open:
 
 **Storage (study 07):**
-- **Rollback policy** (S7-1): when the newest uberblock is bad, mount now *warns* and falls back — should
-  it instead refuse and demand explicit operator recovery? (Warn-and-mount vs operator-gated rewind.)
-- **Auto-format existence** (S7-2): foreign images are now refused, but a genuinely all-zero device still
-  auto-formats on first mount. The participant's stronger ask: remove auto-format entirely; formatting is
-  always explicit (`mkfs.eofs`).
 - **Uberblock geometry** (S7-9): 2 adjacent slots in the first 8 KiB — one torn 8 KiB write kills the
   volume. Format change; decide before any format-stability promise.
 - **`rename`/atomic-replace in `eo9:fs`** (S7-12): "on a CoW filesystem, atomic replace should be the easy
   path." WIT addition.
-- **Operator-side safety in the threat model** (S7-19): the capability model protects programs from each
-  other; nothing frames what protects the operator's *data* from the operator's own grants. SPEC paragraph.
 
 **Networking (study 08):**
-- **Wait policy / deadlines in the l4 WIT** (F8): caller-supplied deadlines vs provider constants — the
-  participant urges deciding "now, while each interface has exactly one implementation."
-- **Multi-program networking** (F9): when two networked programs share one NIC — per-program network
-  identity (own MAC/IP per program) vs a shared-stack provider. Must be designed before multi-programming.
+- **Wait policy / deadlines in the l4 WIT** (F8): the SPEC bounded-await rule and per-op provider deadlines
+  now exist (the l4 stack ships recv/connect/send-flush bounds); whether deadlines become *caller-supplied*
+  in the WIT is still the open call.
 - **`io(string)` catch-alls** (F15): keep as the pragmatic escape hatch vs enumerate further typed cases.
 
-**Drivers (study 09):**
-- **IOMMU** (#7): adopt the participant's QEMU `virt,iommu=smmuv3` + per-device DMA domains plan, or defer
-  to real-board work — and soften the SPEC/README containment wording until one of those happens.
-- **Device matching for `pci.filtered`** (C2): allow-lists are address-keyed and fragile across boot
-  configs; should filtering also/instead match vendor:device?
-- **Long-running drivers** (C3): where does a daemon-like driver live? Tied to the Message API /
-  supervision design.
-
-**Website voice (study 10):**
+**Website voice (study 10) — context was given 2026-06-01; the owner's wording is still owed:**
 - **Authoring statement** (#15): one paragraph on the front page ("programs are Rust today; the format is
   language-neutral") — the owner's prose and roadmap commitment.
 - **Front-page jargon** (#16): "language-theoretic principles" is still the round-1 filter sentence; the
@@ -52,13 +36,9 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
   session overlay include shell-store writes, or reword `save`'s message. Touches the session design.
 
 **Release/distribution (study 11):**
-- **Hosted CI** (D17): the participant's #1 ship blocker — a GitHub Actions (or equivalent) decision, plus
-  Linux evidence (today only macOS is demonstrated).
 - **Publish automation** (D18): the 8-step manual sequence vs an `xtask publish` with tags/changelog.
 - **Publish rehearsal** (D19): the `eo9` crate cannot be end-to-end tested before the real publish — run a
   local-registry rehearsal or accept the risk.
-- **Crate naming permanence** (D24): `eofs-core` sits outside the `eo9-` namespace; names are the one
-  irreversible decision. Review before publishing.
 - **Publishing the guest SDK** (part of D13): registry users can run programs but cannot author them; is
   the guest SDK (`eo9-guest`, wit/) a published crate or repo-only?
 - **Doctor's compile cost** (D2): `cargo xtask doctor` needs ~200 crates compiled before it can check
@@ -76,6 +56,41 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
 
 ## Settled directions (recorded so they're not re-litigated)
 
+- **Boundaries are honestly async (owner ruling 2026-06-02, SPEC `06c30e4`) — implemented:** everything
+  that can wait is declared and bound async; nothing is sync because it "happens to work"; sync glue is a
+  measured, runtime-enforced optimization for provably-never-waiting layers; **awaits are bounded** (an
+  unbounded await across a trust boundary is a liveness bug). The net and storage chains are converted;
+  the eofs engine is async-core with a sync facade; first-poll-inline is the runtime direction for making
+  the fast case fast (merged off-by-default). The earlier all-sync convention is superseded
+  (docs/spikes/eager-guest-forwarding.md carries the addendum).
+- **Round-3 owner rulings (2026-06-01) — all implemented:** (A) uberblock rollback stays warn-and-fall-back
+  (S7-1 closed). (B) auto-format stays, with "blank" hardened to a sufficiently large zero span — leading
+  1 MiB + trailing 64 KiB + whole small devices (`a9e088a`; S7-2 closed). (C) **NICs are single-owner**;
+  sharing is a virtual-NIC provider — `net.l2.switch` shipped (F9 closed). (D) IOMMU: spike now, build at
+  real-board prep — done (`3f4f882`, docs/spikes/iommu.md; SMMUv3 bypass-by-default means no flag day;
+  study-09 #7 closed). (E) long-running programs live under the **executor model** — `eo9:svc`/init
+  shipped v1–v3 (C3 closed). (G) **no hosted CI** — "fragile and annoying"; test locally (D17 closed;
+  Linux evidence rides on local runs). (H) crate renames done before publish: `eo9-eofs`,
+  `eo9-bundled-programs` (D24 closed). (I) adversarial modification of the host machine is **out of
+  scope** — tamper-evidence (the storedisk MAC) yes, host-adversary protection no (S7-19's threat-model
+  framing rides on this). Vendor:device matching (C2) shipped as `pci.admit-vendor`.
+- **Executor-model rulings (2026-06-01, docs/design/executor-model.md §8) — implemented:** `eo9:svc` +
+  `init` naming; detach is an explicit grant (never in default child sets — "outliving your creator is
+  authority"); restart policy is **required in v1 and is a pure component**, not a config enum ("prefer
+  functions over complex configs"); console exit restarts the console, `poweroff` is an explicit typed
+  intent honored only from init's console child; registry lifetime is root-process config (CLI: bound to
+  the shell's life).
+- **Policies are programs (SPEC `fdfa244`, design doc 2026-06-01):** decision parameters are pure
+  components (provably import nothing), bound by ordinary composition. Shipped: pci admit policies, fs
+  path policies, net port policies, svc restart policies. Runtime-passed policies stay instantiated (not
+  fused); fusion is compose-time only.
+- **Hardware mitigations are insurance, never load-bearing (owner ruling 2026-06-01, SPEC `d01f559`):**
+  Eo9 must be secure on MMU-less hardware given a correct compiler; W^X stays as defense-in-depth; no
+  mitigation zoo. **Cache flushing is a granted capability** (`69f09fd`) because it externalizes cost —
+  the symmetric principle: reading microarchitectural state needs the time capability, perturbing it
+  needs the cache capability. The Spectre audit (`a7d9d4b`, docs/spikes/spectre-audit.md) is pinned by
+  config tests; on metal, masking is forced off (wasmtime couples it to signals-based traps), so the
+  timer capability is the only metal Spectre mitigation (`762ac0e`).
 - **The bind entrypoint (owner ruling 2026-05-30, plan/03 D21→D23) — implemented and hardened:** a
   configured provider re-exports its provider's API via direct aliases plus one `eo9:rt/configured.bind`
   export; executors call `bind` once after instantiation. Resource-owning providers are now configurable
@@ -93,7 +108,8 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
   (3) `describe` composition tree — DONE on the CLI and at the eosh prompt; provider `describe` also shows
   configure args. (4) Entropy stays in the default child set — no-op by decision. (5) Roadmap order depth →
   breadth → real hardware: **both depth and breadth are complete** (three architectures at parity,
-  CI-gated); real-board bring-up happens when the owner has hardware.
+  CI-gated); hardware is on the way (an Orange Pi 5 Plus, ordered 2026-06-02 — prep list under
+  "Bare metal" below).
 - **Owner feedback 2026-05-29 (try-it page + shell) — all implemented:** type straight into the terminal
   (`72368b4`, polished `fbc5f38`); bare-default examples via optional `hello` args; the explore-the-sandbox
   section + a `help` that teaches operators with examples (`b49e952`); accurate `&` operand errors
@@ -140,19 +156,25 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
 - **OPEN — The spec-promised "exports match nothing" warning never reaches the user**: `compose_checked`
   returns `ProviderExportsUnused`, but surfacing it in eosh/CLI is still queued. (study 05 #7)
 - Binder caveats (narrowed): depends on wasmtime 45's CM-async ABI encodings (one constants block);
-  the suspended-subtask path **is now exercised end-to-end on the storage chain** — `fs.eofs` and
-  `disk.virtio` genuinely await, and study 09's `pci.admit-address $ pci.filtered $ disk.virtio $
-  fs.eofs` runs on metal with INTx completion through the filter (plan/14 D25/D26, plan/09 D33); the
-  net lane landed on `area/09-async-net` (per-port l4 stacks over the switch);
   variant/result/flags/handle-typed configure values still refuse (with clear messages); the
   unbakeable-shape refusal is reported under the `Internal` error variant (cosmetic tidy-up queued).
   **RESOLVED — the suspended-subtask and cancellation caveats**: the async hardening matrix
   (tests/eo9-integration/tests/async_*.rs; docs/spikes/async-hardening.md) exercises parked forwarded
   chains end-to-end at depths 0-3 — host kill mid-park leaks nothing, acknowledged `subtask.cancel`
-  cascades to `RETURN_CANCELLED`; the only traps are canonical-ABI contract violations, pinned. A callee
-  that ignores `CANCELLED` parks its canceller forever (the SPEC bounded-await rule's concrete shape);
-  the conversion pass must verify generated bindings acknowledge cancellation — the storage providers
-  already carry drop-guards so a cancelled operation can't wedge their state slots.
+  cascades to `RETURN_CANCELLED`; the only traps are canonical-ABI contract violations, pinned. The
+  suspended path runs in production on master: the storage chain (`pci.admit-address $ pci.filtered $
+  disk.virtio $ fs.eofs` on metal, INTx through the filter) and the net chain (per-port l4 stacks over
+  the switch) both genuinely await (plan/14 D25/D26, plan/09 D33). A callee that ignores `CANCELLED`
+  parks its canceller forever (the SPEC bounded-await rule's concrete shape); the converted providers
+  carry drop-guards + drain-before-reuse so a cancelled operation can't wedge state or misattribute
+  completions.
+- **First-poll-inline is off by default** (kernel/vendor feature `component-model-async-first-poll`,
+  docs/spikes/first-poll-inline.md): default-on awaits quiet-machine + metal A/B numbers, an
+  `xtask firstpoll-ab` gate, and an upstream conversation about the one semantic deviation (a callee
+  that computes a long time before its first await now blocks the caller's frame inline).
+- **The cancel-mid-flight metal probe is analysis-pinned, not executable**: the virtio drain-before-reuse
+  invariant (plan/09 D34) is argued + unit-covered; an end-to-end cancel-during-DMA probe needs a
+  cancellable metal consumer (queued with the hardening lane).
 - Kernel algebra errors map to `Internal(String)` rather than the specific WIT variants; the kernel renders
   `wiring` as a leaf only; eosh `envinfo` still classifies authority by the `/types`-name heuristic.
 
@@ -175,9 +197,12 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
   export; address overrides now bake (bind entrypoint). From the network study: no mock-fidelity
   conformance test (the same binary against loopback and metal), no background pump (the stack is frozen
   between l4 calls — document the semantics until the scheduler exists), socket/buffer constants are
-  hard-coded rather than configurable, no throughput/pps instrumentation, and identical fused compositions
-  never hit the metal compile cache (bumped: this blocks all metal networking iteration). Capture-based
-  (pcap-level) test assertions are a recorded area-13 item. (study 08 F3b/F6/F7/F10–F14/F17)
+  hard-coded rather than configurable, and no throughput/pps instrumentation. **FIXED — the metal
+  compile-cache misses**: identical fused compositions now hit the per-session compile cache (`1f7a800`;
+  repeat compositions ~0.3s), and `storedisk` persists across boots; the svc-detach `compile_component`
+  path announces codegen but does not yet consult the session cache (queued). Capture-based (pcap-level)
+  test assertions landed for the switch (the v3 pcap demo); generalizing them is a recorded area-13 item.
+  (study 08 F3b/F6/F7/F10–F14/F17)
 - **Codegen determinism not verified bit-for-bit**; cache keys carry `compiler_deterministic = false`.
   (plan/04 D3)
 - **fs path containment is canonicalize-then-operate** with post-open fd re-verification as the shipped
@@ -189,14 +214,17 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
 
 ### Bare metal
 - **PCI/drivers**: the `eo9:pci` provider runs on aarch64 and riscv64; **x86_64's PCI map is documented but
-  its QEMU arm doesn't wire the `pci` grant yet**. INTx interrupt delivery is live on both GIC and PLIC and
-  `disk.virtio` waits on interrupts (`9d048e5`); **`net.virtio` is still polled** (same conversion recipe,
-  recorded). Devices are quiesced before DMA free on every teardown path (`02460f9`). Still open from the
-  driver study: machine-global device claiming (the `storedisk` vs `pci`/`disk` don't-combine rule stands),
-  the **nested-forwarding bug** (`pci.filtered $ disk.virtio $ fs.eofs $ …` fails at first I/O — promoted
-  from caveat to reproduced bug, study 09 demo 3c is the regression test), grant checks only after a 30 s
-  compile, MSI/MSI-X / FLR / hot-plug / AER unimplemented, no fault-injection surface (a `pci.fault`
-  middleware idea is recorded), and the async-API-vs-eager-reality queue-depth-1 limitation.
+  its QEMU arm doesn't wire the `pci` grant yet**. INTx interrupt delivery is live on both GIC and PLIC;
+  `disk.virtio` and `net.virtio` wait on interrupts through genuine awaits — **the nested-forwarding bug
+  is FIXED** (study 09 demo 3c, the flagship `pci.filtered $ disk.virtio $ fs.eofs` chain, runs on metal
+  with INTx pacing surviving the filter). Devices are quiesced before DMA free on every teardown path
+  (`02460f9`); cancelled requests are drained before descriptor/buffer reuse (`ca6d0c5`). Still open:
+  **gpu.virtio is the last eager-style driver** (conversion in flight, plan/09 D34 pattern; the
+  disk/net no-wait ISR-ack alignment rides with it), machine-global device claiming (the `storedisk` vs
+  `pci`/`disk` don't-combine rule stands), grant checks only after the compile (softened by the codegen
+  announcements but not reordered), MSI/MSI-X / FLR / hot-plug / AER unimplemented, no fault-injection
+  surface (a `pci.fault` middleware idea is recorded), and ops are still serialized at queue depth 1 per
+  driver (the take/put slot — concurrent submission is recorded as a typed-busy vs queueing refinement).
 - **Storage**: the `storedisk` compile cache and the **writable MAC-verified /bin** (`00d1eb2`: `save` at
   the metal prompt survives power cycles) are both live; cache eviction/space management,
   VIRTIO_BLK_F_FLUSH-on-commit, riscv64/x86_64 storedisk enablement, and disk-vs-baked provenance in
@@ -205,8 +233,12 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
   images), no fuzzing of the on-disk parser, the mount banner counts artifacts without verifying them, and
   metal `env` omits the pci/disk grants. (study 07 S7-8/10/15/20/21/22)
 - **Kernel hardening residuals**: kernel-image-internal W^X (`.text`/`.rodata`/`.data` split) and guard
-  regions; exceptions other than IRQs are fatal; the idle waker is single-slot; nested shells share the one
-  serial console.
+  regions; exceptions other than IRQs are fatal; nested shells share the one serial console. (The
+  single-slot idle waker is FIXED — `wake_idle` keeps a drain-all list, `1f7a800`.)
+- **Graphics residuals**: gpu.virtio renders to a RAM framebuffer presented via virtio-gpu 2D (no
+  acceleration — deliberate); `gfx.simplefb` (the U-Boot simple-framebuffer provider for real boards) is
+  recorded for real-board prep; the DMA framebuffer must be allocated exactly once (freeing a DMA buffer
+  quiesces the device — pinned by a comment + the allocate-once pattern).
 - **Diagnostics/runner gaps**: the headless `program=` runner ignores `program=eosh` and does not carry the
   guest panic message (the interactive path does); on-target codegen determinism is not bit-compared;
   no instrumentation for peak compile heap / phase timings / cache-hit reasons. (plan/12)
@@ -215,8 +247,11 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
   the UART model — pace scripted input. (plan/12 D49)
 - **Wasmtime version bumps are not free**: re-verify the binder/executor ABI-constant blocks and re-AOT all
   artifacts on any bump off 45.
-- Real-board bring-up is unscheduled (waiting on hardware); the QEMU test tier is still scripted/manual
-  rather than part of `cargo xtask ci`.
+- **Real-board prep is now scheduled** (an Orange Pi 5 Plus is ordered, 2026-06-02): GICv3 support (the
+  kernel is GICv2-only), a DesignWare-PCIe config-access shim behind the existing `PciAccess` seam, a
+  U-Boot boot recipe, and `gfx.simplefb`; the SMMUv3/IOMMU driver waits for board #2 (the RK3588's PCIe
+  is not behind a usable SMMU — docs/spikes/iommu.md). The QEMU test tier is still scripted/manual rather
+  than part of `cargo xtask ci` (per the owner's no-hosted-CI ruling, local runs are the gate).
 
 ### Website / in-browser demo
 - **Blob reproducibility**: same-path rebuilds are byte-identical, but a build from a *different* checkout
@@ -226,8 +261,11 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
   per such merge); if repository weight becomes a problem, move the committed web assets out of git.
 - **Performance honesty**: browser programs are Pulley-interpreted — noticeably slower than native/metal
   for compute-heavy runs (the page says so).
+- **Browser `/bin` is behind the kernel store**: the gfx family (`gfx.mem`/`draw`), the per-layer net
+  stubs, the switch, and `vnic4check` are not in the browser blob yet — queued so the browser sandbox can
+  demo the same compositions as metal. `eo9:svc` is registered absent (svc/detach refuse gracefully).
 - **Remaining polish**: a click-through on the live deployed site (after the owner's next redeploy);
-  lazy-fetching `/bin` pairs to trim the ~8.85 MiB raw blob; hash-named vm.js/vm.css (optional — they are
+  lazy-fetching `/bin` pairs to trim the ~9.0 MiB raw blob; hash-named vm.js/vm.css (optional — they are
   `no-cache`-revalidated correctly today); COEP/Permissions-Policy headers; JSPI support outside Chromium
   re-check; the explore-the-sandbox copy could add an `env` line now that browser `env` works (plan/18
   D32's deliberate one-line follow-up).
@@ -251,18 +289,19 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
 - Performance/instrumentation: compose/compile/run timing split, cache-hit reasons, peak compile heap;
   on-target vs host-AOT parity; the zero-cost-layer claim needs a benchmark or softer wording.
 - **Round 3 (sessions 07–11, 2026-05-31): complete.** 96 findings — 37 fixed (the merges are listed in the
-  synthesis), 41 tracked (folded into the sections above and below), 18 owner decisions (listed at the
-  top of this file). The fix wave's own reviews surfaced two more items, both handled: a session-lock
-  ordering race (fix in flight) and the fs-eofs checkout-dependence that keeps the bundle drift check out
-  of `cargo xtask ci` (plan/01 D15).
+  synthesis), 41 tracked (folded into the sections above and below), 18 owner decisions (now ruled — see
+  settled directions; the website-voice wording is the one piece still owed). The fix wave's own reviews
+  surfaced two more items, both handled: a session-lock ordering race (fixed, `db2f756`) and the fs-eofs
+  checkout-dependence that keeps the bundle drift check out of `cargo xtask ci` (plan/01 D15).
 
 ### Round-3 distribution/release residuals (study 11)
 
 - **The bundle drift check is not in CI** (D9b): it went in (`be91552`) and came back out (`23699a9`)
-  because fs-eofs builds are not checkout-independent — cargo bakes the out-of-workspace `eofs-core` path
+  because fs-eofs builds are not checkout-independent — cargo bakes the out-of-workspace `eo9-eofs` path
   dep's manifest path into `-C metadata` symbol hashes, which `--remap-path-prefix` cannot fix. Candidate
-  fixes in plan/01 D15 (guest-workspace membership for eofs-core / comparison normalization / pinned
-  metadata). The check remains in `cargo xtask package`.
+  fixes in plan/01 D15 (guest-workspace membership for eo9-eofs / comparison normalization / pinned
+  metadata). The check remains in `cargo xtask package`. (Bundle refreshes are therefore done from the
+  main checkout — a worktree rebuild of fs-eofs produces a different hash.)
 - No platform statement / non-unix compile gate (D12): README "Supported platforms" + `compile_error!` on
   non-unix in eo9/eo9-providers-unix.
 - Registry users can't author programs and nothing says so (D13 documentation half).
@@ -287,4 +326,10 @@ docs/user-studies/00-synthesis.md cite the evidence). Grouped by theme:
   section (wit-parser, wac-*, wit-component, wasm-wave) — documented only in plan/12 D30–35.
 - The net-l4-over-l2 crate's local world.wit header still mentions an "optional DNS server" its config
   deliberately doesn't take (cosmetic; fix on next touch).
+- `time.monotonic-stub` panics when used unconfigured instead of refusing typed (contra the
+  never-trap-unconfigured rule; recorded on the conversion wave).
+- The eosh tokenizer requires quoting compound configure literals (unquoted commas split arguments) —
+  recorded follow-up, plan/03 D23.
+- Switch-over-switch stacking should be re-tested now that the chain genuinely awaits (the pre-conversion
+  attempt hit the suspension wall; expected to just work).
 - The owner pushes master to GitHub (github.com:wyager/eo9); planner-side agents never push.
