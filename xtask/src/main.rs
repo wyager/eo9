@@ -3452,14 +3452,17 @@ where
 
 /// Extract `(shape, per-iteration nanoseconds)` pairs from the bench output lines, which
 /// look like `[first-poll-inline OFF] eager chain depth 1: 200 runs in 26.4ms
-/// (132.27µs/run)` (the per-iteration figure is the parenthesized one).
+/// (132.27µs/run)` (the per-iteration figure is the parenthesized one). Under
+/// `--nocapture` the libtest harness prints `test name ... ` onto the same line before
+/// the bench's own println, so the marker is matched anywhere in the line, not at the
+/// start.
 fn parse_bench_lines(output: &str) -> Vec<(String, f64)> {
     let mut parsed = Vec::new();
     for line in output.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("[first-poll-inline") else {
+        let Some(at) = line.find("[first-poll-inline") else {
             continue;
         };
+        let rest = &line[at + "[first-poll-inline".len()..];
         let Some((_arm, rest)) = rest.split_once("] ") else {
             continue;
         };

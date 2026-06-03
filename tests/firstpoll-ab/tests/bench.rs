@@ -19,7 +19,6 @@
 //! parks on the host clock, so inlining only moves the initial activations earlier; the
 //! completion cascade is event-loop-driven in both arms and the totals should match.
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use eo9_component::{Component, compose};
