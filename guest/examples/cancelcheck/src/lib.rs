@@ -22,14 +22,14 @@
 //!    mismatch is exactly the misattribution/torn-read corruption the invariant
 //!    forbids, reported with offset and differing byte.
 //!
-//! `hits=0` is an honest report of the window never opening, and two layers can close
-//! it: a backend that completes requests synchronously (usermode `disk.mem`; QEMU TCG
-//! virtio-blk without an iothread completes under the queue-notify write), and — the
-//! one that holds on metal today — the kernel's `eo9:pci/pci.wait` blocking *host-side*
-//! (masked-`wfi` inside the host call; see kernel pci_provider.rs), which halts every
-//! task until the interrupt, so nothing can be scheduled between publish and
-//! completion. The probe starts hitting the moment that wait suspends the calling task
-//! instead (plan/09 D39) — the verification machinery is already in place for that day.
+//! `hits=0` is an honest report of the window never opening: a backend that completes
+//! requests synchronously (usermode `disk.mem`; QEMU TCG virtio-blk without an
+//! iothread completes under the queue-notify write) leaves no in-flight instant to
+//! observe. On metal the window is open since the kernel's `eo9:pci/pci.wait` parks
+//! the calling task (plan/09 D39, the parking `IntxWait` in kernel pci_provider.rs):
+//! a driver suspended on its interrupt wait leaves the executor free to schedule this
+//! probe's poll, so busy-classified attempts — and therefore real mid-flight cancels —
+//! actually occur, and the verification sweeps check the drain invariant under them.
 
 #![no_std]
 
@@ -146,6 +146,13 @@ eo9_guest::main! {
                     // here and `read_a`'s drop below — the cancel lands mid-flight.
                     (None, Err(disk::ReadError::Io(message))) if message.contains("busy") => {
                         Attempt::Hit
+                    }
+                    // A's completion arrived in the same wake round that delivered B's
+                    // busy error: the busy was honest when the driver issued it, but A
+                    // is no longer mid-flight by the time we classify, so no cancel can
+                    // land — an eager resolution, not a failure.
+                    (Some(Ok(_)), Err(disk::ReadError::Io(message))) if message.contains("busy") => {
+                        Attempt::Eager
                     }
                     // Some other disk error on B is a real failure, not a probe
                     // classification.

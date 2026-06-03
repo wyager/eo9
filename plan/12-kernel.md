@@ -1625,3 +1625,48 @@ preemption/hardening work.
     $ draw restart restart.never` compiles once (`codegen: compiling …` announced), `detach
     b =` the identical composition detaches with **no second announce** — one codegen
     across both; full `cargo xtask ci` green.
+
+69. **`pci.wait` parks the calling task (2026-06-02, branch area/12-pciwait-park; plan/09
+    D39's unblocking work — the async-first doctrine applied to the kernel's own host
+    APIs).** The INTx wait host fn no longer blocks host-side (the eager-era masked-`wfi`
+    loop inside the host call, which halted *every* task — the console, detached services,
+    sibling drivers — between a driver's request publish and its interrupt, and made the
+    cancel window structurally unconstructible). It is now `IntxWait`, a future with
+    exactly the `time.sleep` parking discipline: the arming poll unmasks the line, each
+    poll consumes the IRQ handler's delivery count (handler masks-on-fire, unchanged) or
+    resolves the typed bound expiry, and a pending poll registers with the executor's
+    idle wakers plus `request_timer_wake(deadline)` — the interrupt wakes the `wfi`, the
+    wake pass re-polls, services keep running meanwhile. There is no Ctrl-C arm anymore:
+    a console interrupt kills the waiting task through the ordinary kill cascade, and
+    `IntxWait::Drop` masks an armed line and drains any delivery that raced the teardown
+    (no leaked unmask, no stale count for the next wait; the old typed
+    "interrupted from the console" error is gone — Ctrl-C now lands as the same
+    `abnormal(killed)` every other parked op produces). The once-per-boot diagnostic keeps
+    its grep-stable prefix with a truthful parenthetical ("the task parked instead of
+    polling"); `INTX_WAIT_SLICE_NS` is gone (the executor's own backstops bound staleness);
+    the bound stays `INTX_WAIT_BOUND_NS` = 2 s with the same typed expiry text. Module docs
+    rewritten (the "blocks host-side is deliberate" rationale was stale since D33/D35).
+
+    The companion cancelcheck fix closes the same-wake-round flake the tail-2 review
+    predicted: `(Some(Ok), Err(busy))` — A's completion delivered in the same round as
+    B's busy — now classifies as an honest `Eager` instead of a loud typed failure.
+
+    **Verified on QEMU aarch64** (`pci disk` boots): the probe now hits — `cancelcheck
+    --attempts 25/100/50/3` → hits 1/1/1/1 with `eager` the rest, `data-miss=0`
+    throughout, and **zero corruption across every verification sweep** — i.e. the D34
+    drain-before-reuse invariant now holds under *real* mid-flight cancels (a hit is a
+    genuine `subtask.cancel` landing while the driver is parked mid-INTx-wait), upgrading
+    the invariant from analysis-pinned to executable-and-passing (master same probe:
+    hits=0, structurally). A hit is also the direct scheduling proof of the liveness
+    payoff: a peer task ran during an in-flight interrupt wait. Throughput control: a
+    `restart.always` echo tick service across an identical disk-heavy foreground
+    workload — 46,430 ticks (parked) vs 46,657 (master, host-blocking): QEMU's sub-ms
+    virtio waits make the throughput delta noise on this device; the payoff here is
+    latency/structure (and ms-scale real hardware). Ctrl-C mid-attempts → `abnormal:
+    killed`, teardown quiesce fired, and a same-boot re-claim ran 3 more attempts over
+    live INTx (hit 1) — no line-registration leak. Regression sweep all green: storage
+    round-trip + admit-address-filtered chain + power-cycle persistence (INTx-served,
+    zero polled fallbacks), net ARP + DNS + typed ConnectionRefused, check-gpu
+    pixel-exact both frames, svcdemo battery (list/log/stop), storedisk two-boot
+    (format → save → 664 KiB cached → power-cycle → 2.4 ms hit), three arch demos, full
+    `cargo xtask ci`.
