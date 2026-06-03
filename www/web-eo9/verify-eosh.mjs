@@ -265,9 +265,10 @@ const checks = [
     /helpenv: bound \(a provider of /.test(interactive) && /generated\(1\)/.test(interactive),
   ],
   [
-    // Scoped to the transcript before the policy sections: a *denied* fs operation later
-    // on legitimately reports the typed fs error (`fs("FsError::Denied")` from cat); the
-    // rule here is only that the RESOLVER's refusal never leaks filesystem enum text.
+    // Scoped to the transcript before the policy sections out of caution (a denied fs
+    // operation later renders as `fs("<path>: denied")` since the coreutil text fix);
+    // the rule here is that the RESOLVER's refusal never leaks filesystem enum text —
+    // and since that fix, `FsError::` should appear nowhere at all.
     "an unknown name gets the no-such-binding-or-program refusal (no enum leak)",
     /cannot resolve `frobnicate`: no such binding or program/.test(interactive) &&
       !/FsError::/.test(beforeAmp),

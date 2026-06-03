@@ -767,3 +767,56 @@ Match the priority order above; (1)+(2) unblock I2.
     The probe is already in the store with its verification sweeps waiting; when the
     wait parks, `cancelcheck` starts hitting with no further changes, on QEMU and on the
     Orange Pi alike.
+
+40. **`net.l2.switch` awaits honestly — stacking runs point-to-point (2026-06-02, branch
+    `area/09-switch-convert`).** The last `eager()` component converted per the async-first
+    doctrine: every uplink call is a genuine await. The one-uplink/two-ports shape gets the
+    sibling-no-wedge design: the uplink lives in a take/put slot with a claim flag (the
+    l4 middleware's `opened` pattern — a concurrent first use can never open a second
+    upstream interface, and the guard restores slot + claim on every exit path including a
+    future dropped mid-await); while one port holds it parked, the sibling's `recv-frame`
+    serves its own queue (whichever port pumps demuxes into BOTH queues) and answers
+    "nothing waiting" when empty — the consumer owns the retry, per the l2 contract — while
+    `send-frame`/`list-interfaces`/`open-interface` answer a typed busy error; the sync
+    `info` (no error channel) reads link parameters cached at bring-up and never touches
+    the uplink (the disk size-reports-0 shape). Deadline audit: every await is one upstream
+    l2 op, bounded by the upstream's own contract (an idle link answers `bytes-received: 0`
+    rather than waiting for traffic), with `DRAIN_BATCH` (16) capping awaits per drain — the
+    switch never waits for a frame to arrive. Verified: vnic_switch 4/4 unchanged;
+    vnic_stacked flipped from the D37 suspension pin to THREE tests — the algebra seal, the
+    point-to-point SUCCESS (`vnicheck --mode through`: a full port-A exchange through two
+    stacked switches — both source rewrites up, demux back down through both layers via the
+    deterministic MAC derivation (layer N's port-a equals layer N+1's), sibling isolation
+    through the stack, broadcast to both outer ports, unknown unicast to neither), and the
+    fan-out limitation pinned typed (`--mode echo`: port B's reply collapses onto the inner
+    port-a MAC and demuxes to A — the D37 MAC-NAT/reverse-mapping owner question, untouched
+    here by directive). vnicheck gained the point-to-point modes `through` and `arp-a` (the
+    A-half of `arp`) for stacked verification. Metal: the single-switch `--mode arp` payoff
+    byte-for-behavior (both MACs, gateway resolved), and the NEW two-switch smoke —
+    `net.virtio $ inner $ outer $ vnicheck --mode arp-a` → `verified("mac-a=02:e0:09:00:00:01
+    gw-a=52:55:0a:00:02:02")` — ARP through a stacked pair to the real gateway, clean
+    poweroff. Full `cargo xtask ci` green.
+
+41. **Bring-up claims are guarded from the instant they exist (2026-06-02, branch
+    `area/09-bringup-guards`).** The switch-convert review noted the residual: every
+    converted provider set its bring-up claim (`Slot::Busy` in disk.virtio/gpu.virtio/
+    fs.eofs, `brought_up` in net.virtio, `opened` in net.l4.over-l2, `claimed` in
+    net.l2.switch) *before* the first await of bring-up, but armed its restore guard only
+    *after* bring-up completed — so a future dropped mid-bring-up leaked the claim and
+    wedged the instance behind the typed busy answer forever (error returns restored;
+    cancellation did not). Unreachable today (no shipped path cancels mid-bring-up), but
+    live the day a bring-up step parks — and D39's `pci.wait` parking makes exactly that
+    reachable: `cancelcheck`'s first-attempt cancel can land inside bring-up's INTx wait,
+    which without this fix would wedge every subsequent attempt. The sweep covers SIX
+    stubs (the review's five plus fs.eofs, whose mount is the deepest awaiter of all):
+    each gains a `BringUpClaim` guard armed immediately after the claim transition and
+    defused on success when the operation guard takes over; the explicit error-path
+    clears collapse into the same mechanism (one restore for error-return and
+    future-drop alike). Drop-ordering note: defuse runs in the same synchronous poll
+    segment as bring-up's final await, so no drop window exists in the handoff. A
+    drop-mid-bring-up is not constructible from the usermode harness (host providers
+    complete eagerly; kill destroys the whole instance), so the pin is the audit plus
+    the full suites; the executable probe arrives with D39 (cancelcheck over a parked
+    bring-up). Verified: vnic_switch/vnic_stacked/vnic_l4/net_l4_over_l2/eofs/
+    pci_filtered/gfx suites green (the deny suites exercise the error-path restore
+    repeatedly), metal smokes per family, full `cargo xtask ci` green.

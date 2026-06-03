@@ -14,6 +14,11 @@
 //! 3. a broadcast reply from the upstream is delivered to BOTH ports;
 //! 4. a reply addressed to a MAC no port owns is delivered to NEITHER port (unknown
 //!    unicast is dropped, never flooded).
+//!
+//! Modes: `echo` (the full two-port suite over the echo fixture), `through` (the
+//! point-to-point form for stacked switches — everything except port B's own
+//! exchange), `arp` (both ports ARP a real gateway), `arp-a` (port A alone — the
+//! stacked point-to-point form on a real link).
 
 #![no_std]
 
@@ -232,10 +237,13 @@ eo9_guest::main! {
             }
         }
 
-        if mode == "arp" {
+        if mode == "arp" || mode == "arp-a" {
             // --- the real-link sharing proof: ARP-resolve the gateway through both
             // ports independently; each reply must come back unicast to its own
-            // port's virtual MAC (the demux at work on a real link).
+            // port's virtual MAC (the demux at work on a real link). `arp-a` runs the
+            // port-A half alone — the point-to-point form for STACKED switches, where
+            // the sibling's return path is the open fan-out question (the switch's
+            // source rewrite has no reverse mapping; plan/09 D37).
             send_a(&iface_a, &arp_request(mac_a, SENDER_IP_A)).await?;
             let mut gw_a: Option<([u8; 6], [u8; 6])> = None;
             for _ in 0..POLL_ATTEMPTS {
@@ -253,6 +261,14 @@ eo9_guest::main! {
                 return Err(ProgramFailure::Check(format!(
                     "link-a: the gateway's reply was addressed to {}, not port A's virtual MAC",
                     mac_text((dst_a[0], dst_a[1], dst_a[2], dst_a[3], dst_a[4], dst_a[5]))
+                )));
+            }
+
+            if mode == "arp-a" {
+                return Ok(ProgramSuccess::Verified(format!(
+                    "mac-a={} gw-a={}",
+                    mac_text(info_a.mac),
+                    mac_text((gw_a[0], gw_a[1], gw_a[2], gw_a[3], gw_a[4], gw_a[5])),
                 )));
             }
 
@@ -284,9 +300,14 @@ eo9_guest::main! {
                 mac_text((gw_b[0], gw_b[1], gw_b[2], gw_b[3], gw_b[4], gw_b[5])),
             )));
         }
-        if mode != "echo" {
+        if mode != "echo" && mode != "through" {
             return Err(ProgramFailure::Check(format!("unknown mode {mode:?}")));
         }
+        // `through` is the point-to-point form of `echo` for STACKED switches: the full
+        // port-A suite (reflect + source-rewrite proof + sibling isolation), broadcast
+        // fan-out to both ports, and unknown-unicast to neither — everything except
+        // port B's own exchange, whose return path through a stack is the open
+        // fan-out/reverse-mapping question (plan/09 D37).
 
         // --- 1. unicast reflect: source rewrite + delivery to A alone ------------------
         let marker = b"vnic-unicast";
@@ -320,20 +341,24 @@ eo9_guest::main! {
         // Port B saw none of that exchange.
         expect_empty_b(&iface_b, "A's unicast must not reach B").await?;
 
-        // The mirror image: B's own exchange works and stays invisible to A.
-        let marker_b = b"vnic-unicast-b";
-        send_b(&iface_b, &frame([0x02, 0, 0, 0, 0, 0x99], mac_b, PROBE_REFLECT, marker_b)).await?;
-        let reply_b = recv_b(&iface_b)
-            .await?
-            .ok_or_else(|| ProgramFailure::Check(String::from(
-                "link-b: the reflected unicast never arrived",
-            )))?;
-        if reply_b.dst != mac_b || reply_b.payload[0..6] != mac_b {
-            return Err(ProgramFailure::Check(String::from(
-                "link-b: the reflected frame does not carry port B's virtual MAC",
-            )));
+        // The mirror image: B's own exchange works and stays invisible to A. (Skipped
+        // in `through` mode — through a stack, B's replies come back addressed to the
+        // inner layer's port MAC, which only port A's derivation matches.)
+        if mode == "echo" {
+            let marker_b = b"vnic-unicast-b";
+            send_b(&iface_b, &frame([0x02, 0, 0, 0, 0, 0x99], mac_b, PROBE_REFLECT, marker_b)).await?;
+            let reply_b = recv_b(&iface_b)
+                .await?
+                .ok_or_else(|| ProgramFailure::Check(String::from(
+                    "link-b: the reflected unicast never arrived",
+                )))?;
+            if reply_b.dst != mac_b || reply_b.payload[0..6] != mac_b {
+                return Err(ProgramFailure::Check(String::from(
+                    "link-b: the reflected frame does not carry port B's virtual MAC",
+                )));
+            }
+            expect_empty_a(&iface_a, "B's unicast must not reach A").await?;
         }
-        expect_empty_a(&iface_a, "B's unicast must not reach A").await?;
 
         // --- 2. broadcast: delivered to both ports -------------------------------------
         send_a(&iface_a, &frame([0x02, 0, 0, 0, 0, 0x99], mac_a, PROBE_BROADCAST, b"vnic-broadcast")).await?;
