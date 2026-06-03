@@ -5,6 +5,13 @@
 //! them and stand alone — so values that contain them (URLs with query strings, text
 //! with ampersands) must be quoted. `"…"` is a quoted string with the escapes `\"`,
 //! `\\`, `\n`, `\t`, and `\r`; `#` starts a comment that runs to the end of the line.
+//! A token *beginning* with `[` or `{` is a compound literal (a WAVE list or record
+//! value, e.g. `--allow [{segment: 0, bus: 0, device: 1, function: 0}]`): it runs,
+//! verbatim, to the position where its brackets and braces balance — commas,
+//! whitespace, and the structural characters inside it do not split it, and embedded
+//! quoted strings are opaque (their brackets do not count). The lexer only balances;
+//! whether the text is a well-formed value of the parameter's declared type is the
+//! type-directed argument machinery's call, with its own typed error.
 //! A word beginning with `--` is a flag name (`--url` → flag `url`). Everything else —
 //! dotted names, interface references like `eo9:fs/fs@0.1.0`, bare literal values —
 //! is a plain word; which of those it is gets decided by the parser and, for argument
@@ -73,6 +80,8 @@ pub fn tokenize(line: &str) -> Result<Vec<Token>, ParseError> {
         } else if c == '"' {
             chars.next();
             tokens.push(Token::Quoted(lex_quoted(&mut chars)?));
+        } else if c == '[' || c == '{' {
+            tokens.push(Token::Word(lex_compound(&mut chars)?));
         } else {
             let mut word = String::new();
             while let Some(&c) = chars.peek() {
@@ -99,6 +108,57 @@ fn word_token(word: String) -> Result<Token, ParseError> {
     } else {
         Ok(Token::Word(word))
     }
+}
+
+/// Lex a compound literal: `chars` is positioned at the opening `[` or `{`. The text is
+/// taken verbatim — commas, whitespace, and structural characters included — until the
+/// brackets and braces balance. Embedded quoted strings are opaque: their contents are
+/// copied through (escape pairs skipped, so `\"` does not end the string) and never
+/// counted toward the balance. Only balance is checked here; bracket *kind* mismatches
+/// (`[}`) and everything else about well-formedness fall to the type-directed value
+/// parser, which reports in terms of the parameter's declared type.
+fn lex_compound(
+    chars: &mut core::iter::Peekable<core::str::Chars<'_>>,
+) -> Result<String, ParseError> {
+    let mut out = String::new();
+    let mut depth = 0usize;
+    while let Some(c) = chars.next() {
+        match c {
+            '[' | '{' => {
+                depth += 1;
+                out.push(c);
+            }
+            ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                out.push(c);
+                if depth == 0 {
+                    return Ok(out);
+                }
+            }
+            '"' => {
+                out.push('"');
+                loop {
+                    match chars.next() {
+                        None => return Err(ParseError::UnterminatedString),
+                        Some('"') => {
+                            out.push('"');
+                            break;
+                        }
+                        Some('\\') => {
+                            out.push('\\');
+                            match chars.next() {
+                                None => return Err(ParseError::UnterminatedString),
+                                Some(escaped) => out.push(escaped),
+                            }
+                        }
+                        Some(other) => out.push(other),
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Err(ParseError::UnterminatedCompound)
 }
 
 /// Lex the body of a quoted string; the opening `"` has already been consumed.
@@ -247,6 +307,96 @@ mod tests {
                 word("eo9:fs/fs@0.1.0"),
                 word("virtualfs.create"),
             ]
+        );
+    }
+
+    #[test]
+    fn compound_literals_lex_as_single_words() {
+        // The pci.admit form, unquoted: commas and whitespace inside `[…]`/`{…}` do
+        // not split the value (plan/03 D23's recorded tokenizer follow-up).
+        let tokens = tokenize(
+            "pci.admit-address --allow [{segment: 0, bus: 0, device: 1, function: 0}] $ lspci",
+        )
+        .expect("lexes");
+        assert_eq!(
+            tokens,
+            vec![
+                word("pci.admit-address"),
+                Token::Flag("allow".to_string()),
+                word("[{segment: 0, bus: 0, device: 1, function: 0}]"),
+                Token::Dollar,
+                word("lspci"),
+            ]
+        );
+    }
+
+    #[test]
+    fn compound_literals_nest_and_keep_structural_characters() {
+        let tokens =
+            tokenize("--pairs [[1, 2], [3, 4]] --opts {a: some(1), b: (5)}").expect("lexes");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Flag("pairs".to_string()),
+                word("[[1, 2], [3, 4]]"),
+                Token::Flag("opts".to_string()),
+                word("{a: some(1), b: (5)}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn strings_inside_compound_literals_are_opaque() {
+        // Brackets, commas, and escaped quotes inside an embedded string neither
+        // split the literal nor count toward the balance.
+        let tokens = tokenize(r#"--names ["a]b", "c,{d", "e\"]f"]"#).expect("lexes");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Flag("names".to_string()),
+                word(r#"["a]b", "c,{d", "e\"]f"]"#),
+            ]
+        );
+    }
+
+    #[test]
+    fn quoted_compound_literals_still_lex_as_strings() {
+        let tokens = tokenize(r#"--allow "[{segment: 0, bus: 0}]""#).expect("lexes");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Flag("allow".to_string()),
+                Token::Quoted("[{segment: 0, bus: 0}]".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn top_level_commas_stay_structural() {
+        // The `only` list shorthand is unchanged: commas outside brackets still split.
+        let tokens = tokenize("only eo9:time,eo9:fs $ cruncher").expect("lexes");
+        assert_eq!(
+            tokens,
+            vec![
+                word("only"),
+                word("eo9:time"),
+                Token::Comma,
+                word("eo9:fs"),
+                Token::Dollar,
+                word("cruncher"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unterminated_compound_literals_are_errors() {
+        assert_eq!(
+            tokenize("--allow [{segment: 0"),
+            Err(ParseError::UnterminatedCompound)
+        );
+        assert_eq!(
+            tokenize(r#"--names ["unclosed"#),
+            Err(ParseError::UnterminatedString)
         );
     }
 
