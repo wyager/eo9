@@ -20,6 +20,20 @@ const UARTFR: usize = 0x018;
 const UARTIMSC: usize = 0x038;
 /// Interrupt clear register (write 1 to a bit to clear that pending interrupt source).
 const UARTICR: usize = 0x044;
+/// Line control register: word length, FIFO enable.
+const UARTLCR_H: usize = 0x02C;
+/// Control register: UART/TX/RX enables.
+const UARTCR: usize = 0x030;
+/// Interrupt FIFO level select register.
+const UARTIFLS: usize = 0x034;
+/// Line control: enable the 16-byte FIFOs.
+const UARTLCR_H_FEN: u32 = 1 << 4;
+/// Line control: 8-bit words.
+const UARTLCR_H_WLEN8: u32 = 0b11 << 5;
+/// Control: UART enable / transmit enable / receive enable.
+const UARTCR_UARTEN: u32 = 1 << 0;
+const UARTCR_TXE: u32 = 1 << 8;
+const UARTCR_RXE: u32 = 1 << 9;
 /// Flag register: transmit FIFO full.
 const UARTFR_TXFF: u32 = 1 << 5;
 /// Flag register: receive FIFO empty.
@@ -80,7 +94,10 @@ pub fn try_get_byte() -> Option<u8> {
 // RX interrupt from re-firing — the handler empties the FIFO before returning.
 
 /// RX ring capacity (power of two; one slot is left empty to distinguish full from empty).
-const RX_RING_CAP: usize = 256;
+/// Sized to hold the longest line the shell accepts (`MAX_READ_LINE_BYTES`, 4096) so a
+/// pasted command line of any accepted length survives even if the consumer is slow to
+/// drain — paste robustness, plan/12.
+const RX_RING_CAP: usize = 4096;
 
 /// Single-producer (IRQ) / single-consumer (boot core) byte ring for received input.
 struct RxRing {
@@ -103,30 +120,120 @@ static RX_RING: RxRing = RxRing {
 
 /// Enable the PL011 receive (and receive-timeout) interrupt so an arriving byte asserts the
 /// UART's GIC line. Call once during boot after the GIC forwards UART SPI 33 (src/main.rs).
+///
+/// Also programs the line for interactive use: 8-bit words with the 16-byte FIFOs enabled.
+/// The FIFO matters for paste robustness — QEMU paces its character feed by the device's
+/// free FIFO space (`pl011_can_receive` returns `depth - read_count`), and with FIFOs off
+/// the depth is 1, so *every byte* stalls the host-side feed until the guest completes a
+/// full interrupt + drain + data-register-read round-trip. Under host load those per-byte
+/// pause/resume cycles are where the chardev flow has been observed to wedge permanently
+/// (the paste-freeze bug, plan/12); with a 16-deep FIFO the feed pauses at most once per
+/// 16 bytes. On real hardware the FIFO is equally desirable (fewer interrupts per burst).
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
 pub fn enable_rx_interrupt() {
+    // 8n1, FIFOs on. Written before the enables per the PL011 programming sequence.
+    mmio_write(UARTLCR_H, UARTLCR_H_WLEN8 | UARTLCR_H_FEN);
+    // Earliest RX trigger (1/8 full) so real hardware interrupts promptly; QEMU's model
+    // raises the receive interrupt on the first byte regardless.
+    mmio_write(UARTIFLS, 0);
+    // QEMU works without touching UARTCR (its reset state already moves data), but the
+    // TRM-correct enables cost nothing and matter on real silicon.
+    mmio_write(UARTCR, UARTCR_UARTEN | UARTCR_TXE | UARTCR_RXE);
+    // Start from a clean slate, then unmask receive + receive-timeout.
+    mmio_write(UARTICR, 0x7FF);
     mmio_write(UARTIMSC, UART_INT_RX | UART_INT_RT);
 }
 
-/// Interrupt handler body: drain every waiting RX byte into [`RX_RING`], then clear the
-/// UART's RX/RT interrupt sources. Called from the GIC IRQ dispatch (src/exceptions.rs)
-/// when UART SPI 33 fires. Draining fully deasserts the level-sensitive line.
-#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
-pub fn drain_rx() {
+/// Move every byte waiting in the RX FIFO into [`RX_RING`]; returns how many moved.
+/// Bytes beyond the ring's capacity are dropped (paste overflow loses characters; the
+/// console never goes deaf). Caller must be the sole producer at the time of the call:
+/// either the IRQ handler, or thread context with IRQs masked ([`scavenge_rx`]).
+fn fifo_to_ring() -> usize {
+    let mut moved = 0;
     while mmio_read(UARTFR) & UARTFR_RXFE == 0 {
         let byte = (mmio_read(UARTDR) & 0xff) as u8;
+        moved += 1;
         let head = RX_RING.head.load(Ordering::Relaxed);
         let next = (head + 1) % RX_RING_CAP;
         // Drop the byte if the ring is full rather than overwrite unread input.
         if next != RX_RING.tail.load(Ordering::Acquire) {
-            // SAFETY: the IRQ context is the sole producer; this slot is not being read
+            // SAFETY: the caller is the sole producer; this slot is not being read
             // (it is at/after `head`, ahead of the consumer's `tail`).
             unsafe { (*RX_RING.buf.get())[head] = byte };
             RX_RING.head.store(next, Ordering::Release);
         }
     }
-    // Clear the RX and RX-timeout interrupt sources at the UART.
+    moved
+}
+
+/// Interrupt handler body: clear the UART's RX/RT interrupt sources, then drain every
+/// waiting byte into [`RX_RING`]. Called from the GIC IRQ dispatch (src/exceptions.rs)
+/// when UART SPI 33 fires.
+///
+/// The order is acknowledge-then-drain, and it is load-bearing on QEMU: its PL011 model
+/// latches the receive interrupt on the empty-to-occupied FIFO transition and `UARTICR`
+/// clears the latch. Draining first and clearing after races a byte that lands between the
+/// final empty check and the `UARTICR` write — the clear then wipes the just-latched
+/// interrupt while the byte sits in the FIFO, the FIFO never re-crosses the trigger
+/// transition, and (with no receive-timeout timer in the model) no UART interrupt ever
+/// fires again: the console goes permanently deaf. Clearing first means a byte that
+/// arrives after the final drain check re-latches the interrupt and is delivered normally.
+#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
+pub fn drain_rx() {
     mmio_write(UARTICR, UART_INT_RX | UART_INT_RT);
+    fifo_to_ring();
+}
+
+/// Idle-path receive scavenger: rescue anything the interrupt path missed, and nudge a
+/// wedged host character feed. Called from the executor's idle wakes (src/wasm/mod.rs
+/// `idle_wait`, at least about once a second via the backstop), in thread context.
+///
+/// Two distinct recoveries, both belt-and-braces behind [`drain_rx`]'s ordering fix:
+///
+/// * **Stranded FIFO bytes** — any data sitting in the FIFO with the interrupt latch dead
+///   is moved into the ring (and the interrupt path resumes with the next clean byte).
+/// * **Wedged host feed** — under host load, QEMU's per-chunk pause/resume of the
+///   character feed (`can_receive == 0` → wait for `accept_input`) has been observed to
+///   stop delivering input permanently while the FIFO sits *empty* (the paste-freeze bug):
+///   the guest cannot see the undelivered bytes at all. QEMU calls `accept_input`
+///   unconditionally on every `UARTDR` read — even with an empty FIFO — so after one
+///   second of total input silence, one harmless data-register read kicks the feed back
+///   to life. Trade-off, documented: if a byte lands in the few-instruction window between
+///   the final empty check and that dummy read, it is consumed here and lost (one
+///   keystroke, only ever during an already-silent second); permanent deafness is traded
+///   for that vanishingly rare single-character loss.
+#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
+pub fn scavenge_rx(now_ns: u64) {
+    use core::sync::atomic::AtomicU64;
+    /// Uptime of the last observed receive activity (ring movement or FIFO data).
+    static LAST_ACTIVITY_NS: AtomicU64 = AtomicU64::new(0);
+    /// Uptime of the last feed kick, so a fully idle console kicks at most once a second.
+    static LAST_KICK_NS: AtomicU64 = AtomicU64::new(0);
+    const QUIET_BEFORE_KICK_NS: u64 = 1_000_000_000;
+
+    // Mask IRQs so this thread is the ring's only producer for the duration (the IRQ
+    // handler is the producer otherwise; single core, so masking excludes it entirely).
+    // SAFETY: mask/unmask of DAIF.I around a few MMIO reads, no stack or register effects.
+    unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags)) };
+    let moved = fifo_to_ring();
+    let ring_busy = RX_RING.head.load(Ordering::Relaxed) != RX_RING.tail.load(Ordering::Relaxed);
+    if moved > 0 || ring_busy {
+        LAST_ACTIVITY_NS.store(now_ns, Ordering::Relaxed);
+    } else {
+        let quiet_since = LAST_ACTIVITY_NS.load(Ordering::Relaxed);
+        let last_kick = LAST_KICK_NS.load(Ordering::Relaxed);
+        if now_ns.saturating_sub(quiet_since) >= QUIET_BEFORE_KICK_NS
+            && now_ns.saturating_sub(last_kick) >= QUIET_BEFORE_KICK_NS
+        {
+            LAST_KICK_NS.store(now_ns, Ordering::Relaxed);
+            // The FIFO is empty (checked under the mask just above): this read returns
+            // stale data and exists purely for QEMU's unconditional `accept_input` side
+            // effect, which resumes a wedged character feed.
+            let _ = mmio_read(UARTDR);
+        }
+    }
+    // SAFETY: restore IRQ delivery.
+    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags)) };
 }
 
 /// Consume one received byte from the interrupt-filled ring, or `None` if none is waiting.
