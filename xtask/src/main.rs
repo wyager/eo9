@@ -289,6 +289,35 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("check-gpu", rest)?;
             check_gpu(&root)
         }
+        "firstpoll-ab" => {
+            let mut rounds: u32 = 5;
+            let mut gate_only = false;
+            let mut arguments = rest.iter();
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--gate-only" => gate_only = true,
+                    "--rounds" => {
+                        let value = arguments.next().ok_or_else(|| {
+                            "firstpoll-ab: `--rounds` needs a number (e.g. `--rounds 5`)"
+                                .to_string()
+                        })?;
+                        rounds = value.parse().map_err(|_| {
+                            format!("firstpoll-ab: `--rounds {value}` is not a number")
+                        })?;
+                        if rounds == 0 {
+                            return Err("firstpoll-ab: `--rounds` must be at least 1".into());
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "firstpoll-ab: unknown argument `{other}` (accepted: --rounds N, \
+                             --gate-only)"
+                        ));
+                    }
+                }
+            }
+            firstpoll_ab(&root, rounds, gate_only)
+        }
         "qemu" => {
             let Some((arch, append)) = rest.split_first() else {
                 return Err(
@@ -376,6 +405,14 @@ COMMANDS:
                          at the serial eosh prompt, screendump the scanout over QMP after each,
                          and compare both images pixel-for-pixel against the independently
                          computed expected pattern
+    firstpoll-ab [--rounds N] [--gate-only]
+                         A/B gate for the vendored `first-poll-inline` feature
+                         (docs/spikes/first-poll-inline.md): run the async-hardening matrix,
+                         the eager-guest pins, and the real-chain suites in BOTH arms of
+                         tests/firstpoll-ab (feature off, then on) for a semantic-identity
+                         verdict, then N interleaved A/B timing rounds (default 5) reported
+                         as medians with spread; --gate-only skips the timing rounds. The
+                         standing regression gate for any vendored-async change
     fmt [--check]        Run `cargo fmt --all` in all three workspaces
     lint                 Run `cargo clippy -D warnings` in all three workspaces
     ci                   The merge gate: fmt --check, lint, build, build-guest, test
@@ -1585,6 +1622,29 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// The kernel feature list, with `EO9_KERNEL_FEATURES_EXTRA` appended when set.
+///
+/// MEASUREMENT BUILDS ONLY: this hook exists so an A/B evaluation can build the kernel
+/// with an off-by-default vendored feature (e.g. `first-poll-inline`, see
+/// docs/spikes/first-poll-inline.md) without any change to the standard feature lists.
+/// Default builds never set it, so `make qemu`, `check-gpu`, and CI are byte-for-byte
+/// unaffected; nothing in the repo sets it either — it is typed by hand for a
+/// measurement run, e.g. `EO9_KERNEL_FEATURES_EXTRA=first-poll-inline cargo xtask qemu
+/// aarch64 pci disk`.
+fn kernel_features(base: &str) -> String {
+    match std::env::var("EO9_KERNEL_FEATURES_EXTRA") {
+        Ok(extra) if !extra.trim().is_empty() => {
+            let extra = extra.trim();
+            println!(
+                "xtask: MEASUREMENT BUILD — appending kernel feature(s) `{extra}` \
+                 (EO9_KERNEL_FEATURES_EXTRA)"
+            );
+            format!("{base},{extra}")
+        }
+        _ => base.to_string(),
+    }
+}
+
 /// x86_64 (QEMU `q35`, PVH direct boot): the same host-AOT precompile pipeline as the other
 /// ports — the seed canary, the real hello program, the async pair, and the read-only store
 /// image — targeted at `x86_64-unknown-none`, then a kernel build with the wasm feature set
@@ -1704,7 +1764,7 @@ fn build_kernel_x86_64(root: &Path) -> Result<PathBuf, String> {
             "--target",
             KERNEL_X86_64_TARGET,
             "--features",
-            "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen",
+            kernel_features("wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen").as_str(),
         ],
         &[
             ("EO9_SEED_CWASM", seed.as_os_str()),
@@ -1846,7 +1906,7 @@ fn build_kernel_riscv64(root: &Path) -> Result<PathBuf, String> {
             "--target",
             KERNEL_RISCV64_TARGET,
             "--features",
-            "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen",
+            kernel_features("wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen").as_str(),
         ],
         &[
             ("EO9_SEED_CWASM", seed.as_os_str()),
@@ -1957,7 +2017,10 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
             // `wasm-storedisk` (the persistent compile cache behind the `storedisk` boot
             // token) is aarch64-only for now: the kernel's ECAM bring-up is aarch64-virt
             // specific, so the other targets build without it.
-            "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen,wasm-storedisk",
+            kernel_features(
+                "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen,wasm-storedisk",
+            )
+            .as_str(),
         ],
         &[
             ("EO9_SEED_CWASM", seed.as_os_str()),
@@ -3211,4 +3274,264 @@ fn compare_ppm(path: &Path, frame: u32) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// firstpoll-ab: the A/B gate for the vendored first-poll-inline feature
+// ---------------------------------------------------------------------------
+
+/// `cargo xtask firstpoll-ab [--rounds N] [--gate-only]` — the standing regression gate
+/// for the vendored `component-model-async-first-poll` feature and for any future change
+/// to the vendored async machinery (docs/spikes/first-poll-inline.md).
+///
+/// Phase 1, the gate: build and run the standalone A/B workspace (tests/firstpoll-ab) in
+/// both arms. The suites themselves encode the semantic-identity contract — the
+/// async-hardening matrix and the real-chain suites are included by `#[path]` and must
+/// pass with identical outcomes in both arms, while the eager-guest pins are arm-specific
+/// (`eager_guest_off.rs` pins today's queued semantics, `eager_guest_on.rs` pins exactly
+/// the three intended wall-row flips). Both arms green = semantic identity PASS.
+///
+/// Phase 2, timing (skipped by `--gate-only`): run the bench measurements `--rounds`
+/// times per arm, interleaved A/B/A/B so slow drift in host load lands on both arms
+/// alike, and report per-shape medians with min..max spread plus the host load context
+/// (`uptime`) sampled around the rounds. Cargo caches both arms' artifacts side by side
+/// (the feature set is part of the unit hash), so only the first round pays a build.
+fn firstpoll_ab(root: &Path, rounds: u32, gate_only: bool) -> Result<(), String> {
+    use std::collections::BTreeMap;
+
+    let dir = root.join("tests").join("firstpoll-ab");
+    // The chain suites compose the real guest stubs; refresh the artifacts first
+    // (running against stale components has bitten before — see plan/01 Decisions).
+    build_guest(root)?;
+
+    println!(
+        "xtask: firstpoll-ab — arm A (first-poll-inline OFF): the hardening matrix, the \
+         eager-guest pins, the real-chain suites"
+    );
+    run(&dir, "cargo", ["test", "--release"])?;
+    println!(
+        "xtask: firstpoll-ab — arm B (first-poll-inline ON): the same suites; the three \
+         wall rows asserted RETURNED"
+    );
+    run(
+        &dir,
+        "cargo",
+        ["test", "--release", "--features", "first-poll-inline"],
+    )?;
+    println!(
+        "xtask: firstpoll-ab: semantic identity PASS — both arms green (matrix and chain \
+         suites identical, eager-guest pins per arm)"
+    );
+    if gate_only {
+        return Ok(());
+    }
+
+    // Timing rounds. Keyed by (shape, arm-on); each bench invocation contributes one
+    // per-iteration sample per shape (the bench's own loop already amortizes spawn+run
+    // over its iterations).
+    let load_before = host_load();
+    let mut samples: BTreeMap<(String, bool), Vec<f64>> = BTreeMap::new();
+    for round in 1..=rounds {
+        for arm_on in [false, true] {
+            let mut args = vec!["test", "--release", "--test", "bench"];
+            if arm_on {
+                args.extend(["--features", "first-poll-inline"]);
+            }
+            args.extend(["--", "--ignored", "--nocapture", "--test-threads=1"]);
+            let output = run_capture(&dir, "cargo", &args)?;
+            let parsed = parse_bench_lines(&output);
+            if parsed.is_empty() {
+                return Err(format!(
+                    "firstpoll-ab: the bench run printed no parsable timing lines \
+                     (round {round}, feature {}); raw output:\n{output}",
+                    if arm_on { "on" } else { "off" }
+                ));
+            }
+            for (shape, nanoseconds) in parsed {
+                samples
+                    .entry((shape, arm_on))
+                    .or_default()
+                    .push(nanoseconds);
+            }
+        }
+        println!("xtask: firstpoll-ab: timing round {round}/{rounds} done");
+    }
+    let load_after = host_load();
+
+    // The table: per shape, median (min..max) per arm and the median-to-median delta.
+    let shapes: Vec<String> = samples
+        .keys()
+        .map(|(shape, _)| shape.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    println!();
+    println!(
+        "xtask: firstpoll-ab timing — {rounds} interleaved round(s) per arm, per-iteration \
+         medians (min..max):"
+    );
+    println!("  load before: {load_before}");
+    println!("  load after:  {load_after}");
+    println!();
+    println!(
+        "  {:<28} | {:>26} | {:>26} | {:>7}",
+        "shape", "off: median (min..max)", "on: median (min..max)", "delta"
+    );
+    for shape in &shapes {
+        let off = samples.get(&(shape.clone(), false));
+        let on = samples.get(&(shape.clone(), true));
+        let (Some(off), Some(on)) = (off, on) else {
+            println!("  {shape:<28} | (missing one arm — bench output incomplete)");
+            continue;
+        };
+        let (off_median, off_min, off_max) = stats(off);
+        let (on_median, on_min, on_max) = stats(on);
+        let delta = (on_median - off_median) / off_median * 100.0;
+        println!(
+            "  {:<28} | {:>26} | {:>26} | {:>+6.1}%",
+            shape,
+            format!(
+                "{} ({}..{})",
+                format_nanoseconds(off_median),
+                format_nanoseconds(off_min),
+                format_nanoseconds(off_max)
+            ),
+            format!(
+                "{} ({}..{})",
+                format_nanoseconds(on_median),
+                format_nanoseconds(on_min),
+                format_nanoseconds(on_max)
+            ),
+            delta,
+        );
+    }
+    println!();
+    println!(
+        "xtask: firstpoll-ab done — gate PASS, timing above (negative delta = the inline \
+         arm is faster; treat single-digit deltas as noise unless the spreads separate)"
+    );
+    Ok(())
+}
+
+/// Like [`run`], but capture stdout for parsing while stderr (cargo's build progress)
+/// streams through to the terminal. Fails on a non-zero exit status with the captured
+/// stdout included, so test failures stay readable.
+fn run_capture<I, S>(dir: &Path, program: &str, args: I) -> Result<String, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .collect();
+    let shown: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let shown = shown.join(" ");
+    println!("xtask: [{}] {program} {shown}", dir.display());
+    let output = Command::new(program)
+        .args(&args)
+        .current_dir(dir)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|err| format!("failed to run `{program} {shown}`: {err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        Err(format!(
+            "`{program} {shown}` failed with {} in {}; stdout:\n{stdout}",
+            output.status,
+            dir.display()
+        ))
+    }
+}
+
+/// Extract `(shape, per-iteration nanoseconds)` pairs from the bench output lines, which
+/// look like `[first-poll-inline OFF] eager chain depth 1: 200 runs in 26.4ms
+/// (132.27µs/run)` (the per-iteration figure is the parenthesized one). Under
+/// `--nocapture` the libtest harness prints `test name ... ` onto the same line before
+/// the bench's own println, so the marker is matched anywhere in the line, not at the
+/// start.
+fn parse_bench_lines(output: &str) -> Vec<(String, f64)> {
+    let mut parsed = Vec::new();
+    for line in output.lines() {
+        let Some(at) = line.find("[first-poll-inline") else {
+            continue;
+        };
+        let rest = &line[at + "[first-poll-inline".len()..];
+        let Some((_arm, rest)) = rest.split_once("] ") else {
+            continue;
+        };
+        let Some((shape, rest)) = rest.split_once(':') else {
+            continue;
+        };
+        let Some(open) = rest.rfind('(') else {
+            continue;
+        };
+        let Some(slash) = rest[open + 1..].find('/') else {
+            continue;
+        };
+        if let Some(nanoseconds) = parse_duration_nanoseconds(&rest[open + 1..open + 1 + slash]) {
+            parsed.push((shape.trim().to_string(), nanoseconds));
+        }
+    }
+    parsed
+}
+
+/// Parse a `Duration`'s `Debug` rendering ("980ns", "132.27µs", "1.35ms", "4.2s") into
+/// nanoseconds. Suffix order matters: "ns"/"µs"/"ms" before the bare "s".
+fn parse_duration_nanoseconds(text: &str) -> Option<f64> {
+    let text = text.trim();
+    for (suffix, scale) in [
+        ("ns", 1.0),
+        ("µs", 1e3),
+        ("us", 1e3),
+        ("ms", 1e6),
+        ("s", 1e9),
+    ] {
+        if let Some(number) = text.strip_suffix(suffix) {
+            return number.trim().parse::<f64>().ok().map(|value| value * scale);
+        }
+    }
+    None
+}
+
+/// Median, min, max of a non-empty sample set (nanoseconds).
+fn stats(samples: &[f64]) -> (f64, f64, f64) {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let median = if sorted.len() % 2 == 1 {
+        sorted[sorted.len() / 2]
+    } else {
+        (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+    };
+    (median, sorted[0], sorted[sorted.len() - 1])
+}
+
+/// Render nanoseconds in the most readable unit (one decimal).
+fn format_nanoseconds(nanoseconds: f64) -> String {
+    if nanoseconds >= 1e9 {
+        format!("{:.2}s", nanoseconds / 1e9)
+    } else if nanoseconds >= 1e6 {
+        format!("{:.2}ms", nanoseconds / 1e6)
+    } else if nanoseconds >= 1e3 {
+        format!("{:.1}µs", nanoseconds / 1e3)
+    } else {
+        format!("{nanoseconds:.0}ns")
+    }
+}
+
+/// The host load context for measurement output: `uptime`'s one-liner (load averages),
+/// best-effort — measurements on a shared machine are only as honest as their caveats.
+fn host_load() -> String {
+    Command::new("uptime")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_else(|| "(load unavailable)".to_string())
 }
