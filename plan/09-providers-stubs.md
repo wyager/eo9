@@ -650,3 +650,40 @@ Match the priority order above; (1)+(2) unblock I2.
     shell's `--start-ns`/`--step-ns`) still overrides. Tests in
     `default_configuration.rs` (+2: the unconfigured origin via `hello`, the configured
     override). With this, every configurable stub in the store follows the rule.
+
+37. **The cancel-mid-flight probe is executable — and it root-causes why the window is
+    closed on metal today (2026-06-02, D34's recorded follow-up).** `cancelcheck`
+    (guest/examples; kernel store 50 → 51) is the consumer D34 said did not exist. Per
+    attempt it starts a 1 MiB read, races a small concurrent read against it, and
+    classifies precisely: the driver's take/put slot makes the concurrent read's typed
+    busy error a *proof* the first read is mid-flight at that instant, and the cancel —
+    the SDK's cancel-on-drop, a real `subtask.cancel`, the bindings' EVENT_CANCEL →
+    destructors → `task.cancel` acknowledgment — lands without an intervening yield, so
+    a busy-classified attempt cannot race shut. After every attempt both seeded regions
+    are re-read and compared byte-for-byte: any leftover completion credited to a later
+    read (the misattribution D34's drain-before-reuse forbids) is a typed `corruption`
+    failure carrying the offset. Usermode pins the machinery
+    (tests/eo9-integration/tests/cancel_probe.rs over `disk.mem`: no traps, no hangs,
+    honest all-miss classification); on metal the full chain ran end-to-end —
+    `disk.virtio $ cancelcheck --attempts 25` at the eosh prompt, on-target compile,
+    real virtio-blk → `ok: probed("attempts=25 hits=0 eager=25 data-miss=0")`, zero
+    corruption across all 50 verification sweeps.
+
+    `hits=0` is itself the finding. Two layers close the window, and we eliminated one
+    to expose the other: QEMU single-threaded TCG completes virtio-blk requests
+    synchronously under the queue-notify write, so the `disk` flag now gives the scratch
+    disk its own iothread (xtask; completions post asynchronously, like hardware) — and
+    the hit rate stayed zero, because the kernel's `eo9:pci/pci.wait` **blocks
+    host-side** (masked-`wfi` inside the host call, pci_provider.rs — documented as
+    deliberate when every driver was an eager poller, D16/D18, with the suspending wait
+    deferred "until the async disk/net bridge lands"). That rationale is now stale: the
+    drivers await honestly (D33), and the host-side block halts *every* task between a
+    driver's request publish and its interrupt, so no canceller can be scheduled
+    mid-flight — the window is structurally unconstructible on metal regardless of
+    consumer or device timing. The runtime support that opens it is exactly the doc
+    comment's own deferred plan, now unblocked: a task-suspending `pci.wait` that parks
+    on the drive loop the way `time.sleep` does (the async-first doctrine applied to the
+    kernel host APIs — owner-visible, kernel-lane work, not taken in this tail batch).
+    The probe is already in the store with its verification sweeps waiting; when the
+    wait parks, `cancelcheck` starts hitting with no further changes, on QEMU and on the
+    Orange Pi alike.

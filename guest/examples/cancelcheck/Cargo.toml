@@ -1,0 +1,15 @@
+[package]
+name = "eo9-example-cancelcheck"
+description = "Eo9 example program: the cancel-mid-flight disk probe — issues a large read, detects it holding the device mid-flight via a concurrent read's typed busy error, cancels it by dropping the future, and verifies every subsequent read's bytes (the virtio drain-before-reuse invariant, executable; targets the eo9-examples:cancelcheck/cancelcheck world)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

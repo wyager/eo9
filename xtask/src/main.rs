@@ -24,6 +24,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-l4check",
     "eo9-example-vnicheck",
     "eo9-example-vnic4check",
+    "eo9-example-cancelcheck",
     "eosh",
     // The service-boot program (executor v1, docs/design/executor-model.md).
     "init",
@@ -193,6 +194,12 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     //        $ net.l4.over-l2 --address 10.0.2.16 --prefix-length 24 --gateway 10.0.2.2)
     //     $ vnic4check --peer 10.0.2.3 --peer-port 53 --mode dns
     ("eo9-example-vnic4check", "vnic4check"),
+    // The cancel-mid-flight disk probe (plan/09 D34's executable follow-up): cancels an
+    // in-flight disk.virtio read detected via the driver's typed busy error, then
+    // verifies later reads byte-for-byte (the drain-before-reuse invariant, live):
+    //   pci.admit-address --allow [{segment: 0, bus: 0, device: 1, function: 0}]
+    //     $ pci.filtered $ disk.virtio $ cancelcheck --attempts 25
+    ("eo9-example-cancelcheck", "cancelcheck"),
     // The per-layer net stubs, the in-memory transport, and the transport conformance
     // check, so the typed-denial and mock-vs-real comparisons run at the metal prompt
     // exactly as they do in usermode (user study 08, finding F4):
@@ -2338,8 +2345,17 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         let scratch = ensure_scratch_disk(root)?;
         args.push("-drive".into());
         args.push(format!("if=none,format=raw,id=eo9disk,file={}", scratch.display()).into());
+        // The scratch disk gets its own iothread: without one, single-threaded TCG
+        // processes the whole request synchronously under the queue-notify write, so a
+        // request is never in flight from the guest's point of view — unlike any real
+        // device. With it, completions post asynchronously and the interrupt wait
+        // genuinely waits, which is what makes `cancelcheck`'s mid-flight window
+        // observable under QEMU once the kernel's `pci.wait` suspends the calling task
+        // instead of blocking host-side (plan/09 D37).
+        args.push("-object".into());
+        args.push("iothread,id=eo9diskio".into());
         args.push("-device".into());
-        args.push("virtio-blk-pci,drive=eo9disk,disable-legacy=on".into());
+        args.push("virtio-blk-pci,drive=eo9disk,iothread=eo9diskio,disable-legacy=on".into());
     }
     if attach_net {
         args.push("-netdev".into());

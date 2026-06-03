@@ -1,0 +1,50 @@
+// cancelcheck — the executable cancel-mid-flight probe (plan/09 D34's recorded
+// follow-up: the virtio drain-before-reuse invariant, exercised rather than analyzed).
+//
+// Each attempt issues a large disk read, watches for the driver's typed busy error on
+// a concurrent small read (the proof the first read holds the device slot mid-flight),
+// and then drops the in-flight read — the SDK's cancel-on-drop issues `subtask.cancel`,
+// the driver's CANCELLED handling runs its drop-guard, and the *next* operation's
+// drain-before-reuse must keep every later read's bytes correct. After every attempt,
+// both seeded regions are re-read and verified byte-for-byte; any mismatch is the
+// misattribution/torn-read corruption the invariant forbids.
+//
+// The window may never open — synchronous backends complete under the kick, and the
+// kernel's host-side-blocking `pci.wait` halts every task until the interrupt (plan/09
+// D37) — and then hits=0 with all attempts classified eager is an honest result, not a
+// failure: the probe reports its own hit rate.
+//
+//   pci.admit-address --allow [{segment: 0, bus: 0, device: 1, function: 0}]
+//     $ pci.filtered $ disk.virtio $ cancelcheck --attempts 25       (metal)
+//   disk.mem --size 2097152 $ cancelcheck --attempts 8               (usermode)
+package eo9-examples:cancelcheck@0.1.0;
+
+/// Probes cancellation of in-flight disk reads and verifies no later read is corrupted.
+world cancelcheck {
+    import eo9:disk/disk@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    variant program-success {
+        /// Every verification read matched; carries the attempt classification:
+        /// `attempts=<n> hits=<cancelled mid-flight> eager=<completed before the
+        /// concurrent read ran> data-miss=<concurrent read returned data>`.
+        probed(string),
+    }
+
+    variant program-failure {
+        /// An argument value was rejected (e.g. zero attempts).
+        bad-arguments(string),
+        /// The disk capability is too small for the probe regions.
+        too-small(string),
+        /// A disk operation failed with an unexpected error (not the busy probe).
+        disk(string),
+        /// A verification read returned wrong bytes — the invariant violation this
+        /// probe exists to catch (carries offset and the first differing byte).
+        corruption(string),
+        /// A console error.
+        io(string),
+    }
+
+    /// `attempts`: how many cancel attempts to run (each is probe + cancel + verify).
+    export main: async func(attempts: u32) -> result<program-success, program-failure>;
+}
