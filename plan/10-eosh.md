@@ -244,3 +244,19 @@ eosh is the first client of `eo9:svc` (executor v1, docs/design/executor-model.m
     without a card fails the build), `every_builtin_the_help_text_lists_has_a_card` walks help's
     `builtins:` line, and the cards' column budget is asserted per line. `help`'s explore section now
     points at it (`e.g. describe describe`, which the help-examples test therefore also runs end-to-end).
+
+19. **Coreutil failure text speaks the typed vocabulary (2026-06-02, branch
+    `area/09-switch-convert`).** The browser-catchup review caught `cat` rendering a denied
+    read as `fs("FsError::Denied")` — Rust debug formatting in failure text, the recurring
+    R2-18 enum-leak class, this time in the programs rather than the shell. Every coreutil
+    (cat, cp, find, head, ls, mkdir, rm, stat, touch, wc; echo and rng for output errors)
+    now maps `FsError`/`TextError` through a human-vocabulary helper with the path in
+    front: `fs("/inside.txt: denied")`, `fs("/no-such-file.txt: not found")`,
+    `io("output closed")` — never the enum's debug form. Verified live at a usermode
+    prompt (the subtree-policy denial and the not-found case), CLI suite 60/60,
+    fs_filtered/capabilities/overlay suites green, full `cargo xtask ci` green. The
+    harness pins were already case-insensitive (`/denied/i`), so only a stale comment in
+    verify-eosh.mjs needed updating; the assets themselves are the merger's rebuild, per
+    convention. Remaining instance of the class, deliberately untouched (example, not a
+    coreutil, and pinned by cli.rs's "Denied" assertion): `readwrite`'s `{err:?}` mapper —
+    a one-line follow-up for whoever next touches guest/examples.
