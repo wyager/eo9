@@ -14,6 +14,31 @@ eo9_guest::bindings!({
     apis: [io, fs, text],
 });
 
+/// Human text for an fs failure at `path` — the typed vocabulary, never Rust debug
+/// formatting (the R2-18 enum-leak class).
+fn fs_fail(path: &str, e: fs::FsError) -> ProgramFailure {
+    let what = match e {
+        fs::FsError::NotFound => String::from("not found"),
+        fs::FsError::AlreadyExists => String::from("already exists"),
+        fs::FsError::NotADirectory => String::from("not a directory"),
+        fs::FsError::IsADirectory => String::from("is a directory"),
+        fs::FsError::Denied => String::from("denied"),
+        fs::FsError::ReadOnly => String::from("read-only"),
+        fs::FsError::NoSpace => String::from("no space"),
+        fs::FsError::NotImmutable => String::from("not immutable"),
+        fs::FsError::Io(m) => format!("io: {m}"),
+    };
+    ProgramFailure::Fs(format!("{path}: {what}"))
+}
+
+/// Human text for an output failure, same rule.
+fn io_fail(e: text::TextError) -> ProgramFailure {
+    ProgramFailure::Io(match e {
+        text::TextError::Closed => String::from("output closed"),
+        text::TextError::Io(m) => format!("io: {m}"),
+    })
+}
+
 eo9_guest::main! {
     /// `head --lines <n> <path>…` — print the first `lines` lines of each file (with a
     /// `==> path <==` header when more than one is given).
@@ -21,9 +46,6 @@ eo9_guest::main! {
         if paths.is_empty() {
             return Err(ProgramFailure::BadArguments(String::from("at least one path is required")));
         }
-        let fs_err = |e: fs::FsError| ProgramFailure::Fs(format!("{e:?}"));
-        let io_err = |e: text::TextError| ProgramFailure::Io(format!("{e:?}"));
-
         let many = paths.len() > 1;
         let root = fs::default();
         let mut printed = 0u32;
@@ -33,19 +55,21 @@ eo9_guest::main! {
             }
             if many {
                 if index > 0 {
-                    text::write_out_line("").map_err(io_err)?;
+                    text::write_out_line("").map_err(io_fail)?;
                 }
-                text::write_out_line(&format!("==> {path} <==")).map_err(io_err)?;
+                text::write_out_line(&format!("==> {path} <==")).map_err(io_fail)?;
             }
-            let st = fs::stat(&root, path.clone()).await.map_err(fs_err)?;
-            let file = fs::open(&root, path, fs::OpenFlags::READ).await.map_err(fs_err)?;
+            let st = fs::stat(&root, path.clone()).await.map_err(|e| fs_fail(&path, e))?;
+            let file = fs::open(&root, path.clone(), fs::OpenFlags::READ)
+                .await
+                .map_err(|e| fs_fail(&path, e))?;
             let dst = buffer::with_capacity(st.size);
             let (dst, read_result) = fs::read(&file, 0, dst).await;
-            let read = read_result.map_err(fs_err)?;
+            let read = read_result.map_err(|e| fs_fail(&path, e))?;
             let bytes = buffer::prefix_to_vec(&dst, read.bytes_read);
             let contents = String::from_utf8_lossy(&bytes);
             for line in contents.lines().take(lines as usize) {
-                text::write_out_line(line).map_err(io_err)?;
+                text::write_out_line(line).map_err(io_fail)?;
                 printed += 1;
             }
         }
