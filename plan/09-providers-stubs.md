@@ -605,3 +605,38 @@ Match the priority order above; (1)+(2) unblock I2.
     submitting operation, kicking before waiting; (4) keep used-element consumption await-free
     so a cancel cannot land mid-consume; (5) accept interrupt-vector loss on cancellation
     (degrade to polled) or restructure to preserve the vector across the wait.
+
+35. **Switch-over-switch stacking, retested after the conversions — runs, and pins the
+    residual wall (2026-06-02).** The two-layer stack (`net.l2.echo $ rename port-a
+    eo9:net/l2 $ net.l2.switch $ rename port-a link-a $ rename port-b link-b $
+    net.l2.switch $ vnicheck`) composes (a port export renamed onto the default slot
+    satisfies another switch's uplink; the unused sibling port drops), compiles, spawns,
+    and **runs to a typed program outcome** — one layer further than the pre-conversion
+    state, where the *middleware's* eager poll failed at the consumer-over-switch edge
+    (D31's lifted wall stays lifted). The residual: `net.l2.switch` itself still drives
+    its uplink with the `eager()` single-poll (its header even cites the now-deleted
+    middleware pattern as precedent). Over a leaf upstream (echo, `net.virtio`) the
+    eager poll completes — every existing switch test and the metal demos are
+    unaffected — but an inner *switch* is a nested-guest-caller whose exports suspend,
+    so the outer switch's first uplink operation reports its typed
+    `io("list-interfaces: the upstream l2 provider suspended")` through vnicheck's
+    failure channel. Pinned behaviorally in
+    `tests/eo9-integration/tests/vnic_stacked.rs` (2 tests: the algebra-level seal, the
+    typed run outcome). The fix is the established D31/D33 pattern — delete `eager()`,
+    await the uplink, keep operations deadline-bound — owned by whoever next touches the
+    switch (not taken here: the switch is in the kernel store and the browser /bin
+    catch-up is concurrently rebuilding www assets; a byte change mid-flight doubles the
+    refresh coordination for a fix that deserves its own focused pass).
+
+    Recorded for that pass, so nobody expects the full vnicheck echo suite to go green
+    on awaits alone: the switch's unconditional source rewrite collapses both outer
+    ports onto the inner port's single MAC on the way upstream (a MAC-NAT with no
+    reverse mapping). Echo's replies address that inner-port MAC, so the outer switch
+    can demux them to at most one port — under default bases they all land on `port-a`
+    (whose MAC coincidentally equals the inner `port-a`'s); under distinct bases they
+    are unknown unicast at the outer layer and are dropped. Honest awaits make stacked
+    switches *run*; stacked *fan-out* (distinct consumers behind a stacked port both
+    completing request/reply flows) additionally needs a policy decision — e.g. a
+    reverse mapping for rewritten sources, or a learn-don't-rewrite stance toward a
+    downlink that is itself a switch — which is an owner-facing design question, not
+    plumbing.
