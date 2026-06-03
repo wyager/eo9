@@ -58,7 +58,8 @@ pool (`eo9-providers-unix/pool.rs`) in usermode, QEMU TCG for metal. Verdicts:
 A prior decision (plan/11, lost-wakeup entry) rejected "prod code carrying interleaving
 hooks" for a deterministic regression test. The chaos layer respects the spirit of that
 ruling: the hooks exist only under a non-default cargo feature, compile to empty inline
-functions otherwise (verified: identical release binary, §4), and live only in the
+functions otherwise (verified: zero chaos symbols or strings in the feature-off binary,
+§4.1), and live only in the
 synchronization primitives — not scattered through provider logic.
 
 ## 3. The codified targeted-amplifier method
