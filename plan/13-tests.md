@@ -214,3 +214,25 @@ Everything; starts alongside Phase 1 (law tests) and grows with each milestone.
     `wait_until_runnable`. Not fixed here (crates/eo9 is outside this area's lanes); needs its own
     investigation. Until then it is a rare CI flake: a `cat`/`cp` cli test hanging ≫60 s under load is this
     defect — kill the child and re-run.
+
+20. **Timing-bug strategy spike: hogs retired, seeded chaos adopted (spike/13-timing-strategies;
+    docs/spikes/timing-strategies.md).** Owner question: why did `yes`-hog load help find timing bugs,
+    and what replaces it? Ground truth: all three timing bugs (lost wakeup, paste freeze, session-lock)
+    lived in host layers below the deterministic guest scheduler; hogs blindly stretched race windows
+    via OS preemption and jittered cross-thread arrivals — effective only as entropy, irreproducible,
+    and twice the source of leaked-process incidents (workaround ledger). Replacements, per the spike's
+    escalation ladder: (a) the codified targeted-amplifier method (hypothesis → in-window 500 µs sleep →
+    A/B → remove, the lost-wakeup fix's own technique); (b) the new `chaos` cargo feature in
+    `eo9-runtime` (off by default, compiled out — honoring this plan's earlier ruling against prod
+    interleaving hooks): seeded SplitMix64 perturbation (`EO9_CHAOS_SEED`, printed; `EO9_CHAOS_SLEEP_PCT`)
+    at four sync-primitive boundaries — `Doorbell::ring`, `Doorbell::register`, `Task::runnable` poll
+    entry, embedder pre-park — plus `tests/chaos-harness/run.sh`. **Acid test** (the lost-wakeup fix
+    locally reverted, zero hogs, idle machine): first hang at iteration 2/2/1/3/2 across five seeds,
+    ~34 % sustained hit rate, hang backtraces identical to the wild specimens; replaying a hanging seed
+    re-hung 10/10; pre-fix with the feature OFF: 0/300 (the layer finds it, not the harness); fixed code
+    under chaos: 0/400. The harness's own unguarded priming run hung on first use — fixed with the same
+    watchdog (timing bugs do not respect scaffolding). Loom is recommended narrowly (a model of the
+    ~40-line Doorbell primitive) when that primitive next changes; QEMU `-icount` input-offset sweeps are
+    the metal-side analog (follow-up); the DST-for-the-embedding endgame (completion delivery as a
+    test-owned schedule, generalizing ParkBed through the BlockingPool's single completion choke point)
+    is sketched with a ~3-session estimate. CPU hogs appear nowhere on the ladder.

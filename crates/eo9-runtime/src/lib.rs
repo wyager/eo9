@@ -13,6 +13,7 @@
 //!
 //! See `plan/04-runtime.md` (scope, milestones, decisions) and SPEC.md "Execution APIs".
 
+pub mod chaos;
 pub mod engine;
 pub mod exec;
 pub mod image;

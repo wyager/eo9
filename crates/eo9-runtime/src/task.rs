@@ -144,6 +144,7 @@ pub(crate) struct Doorbell {
 
 impl Doorbell {
     fn ring(&self) {
+        crate::chaos::point("doorbell.ring");
         self.rung.store(true, Ordering::SeqCst);
         let waiters = std::mem::take(&mut *self.waiters.lock().unwrap());
         for waker in waiters {
@@ -161,6 +162,7 @@ impl Doorbell {
     }
 
     fn register(&self, waker: &Waker) {
+        crate::chaos::point("doorbell.register");
         self.waiters.lock().unwrap().push(waker.clone());
     }
 }
@@ -729,6 +731,7 @@ impl Task {
     /// should check [`Task::outcome`] first).
     pub fn runnable(&self) -> impl Future<Output = ()> + '_ {
         std::future::poll_fn(move |cx| {
+            crate::chaos::point("task.runnable.poll");
             if self.is_runnable() {
                 Poll::Ready(())
             } else {

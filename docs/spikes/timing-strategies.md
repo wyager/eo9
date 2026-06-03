@@ -123,10 +123,28 @@ with `--features chaos`, run the committed harness (`tests/chaos-harness/run.sh`
 iterations of `eo9 -c "cat /notes.txt"`, per-run watchdog, seed = base+iteration, **zero
 hogs, otherwise idle machine**), then restore the fix and sweep long.
 
-Results: **PENDING at this commit** — the next commits add the chaos layer + harness and
-then replace this block with the measured numbers (pre-fix+chaos iterations-to-hang per
-seed; pre-fix+feature-off control; fixed+chaos sweep; feature-off cost check). If the acid
-test fails to reproduce, that analysis lands here instead — a negative result is a finding.
+Results (measured on this machine, otherwise idle, **zero hogs**; full logs in the
+plan/13 entry):
+
+- **Pre-fix + chaos:** first hang at iteration **2, 2, 1, 3, 2** across five base seeds
+  (1000..5000); sustained hit rate 24/60 + 6/15 + 3/15 + 3/15 + 5/15 ≈ **34%% of
+  iterations hang**. Every sampled hang's backtrace matches the wild specimens
+  (`run::drive_to_completion` → `providers::wait_until_runnable` → `thread::park`,
+  blocking pool idle).
+- **Replay fidelity:** re-running one hanging seed (1002) re-hung **10/10** — the
+  statistical-replay caveat above turned out conservative for this bug (the injected
+  register-window sleep dominates).
+- **Pre-fix, chaos feature off, no hogs (control):** **0 hangs / 300 iterations** — the chaos layer is
+  what finds it, not the harness or ambient load.
+- **Fixed + chaos:** **0 hangs / 400 iterations** (two seeds x 200) — and the full CLI suite is green
+  with the feature on.
+- **Feature off = compiled out:** the feature-off binary contains zero chaos
+  symbols/strings (the seed banner string is absent); call sites are empty inlined stubs.
+  Byte-identity across builds is not claimed (incremental codegen layout varies); the
+  behavioral gate is the unchanged suite results.
+- **An unplanned sixth reproduction:** the harness's own unguarded *priming* invocation
+  hung on its first run — the acid test caught its own scaffolding (the priming run now
+  has the same watchdog as iterations). Timing bugs do not respect test/prod boundaries.
 
 The 500 µs targeted amplifier remains the *fastest* reproducer (40/40) — chaos needs a few
 iterations because it spreads its budget over four sites. That is the expected trade:
