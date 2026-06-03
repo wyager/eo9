@@ -28,3 +28,6 @@ license = "MIT"
 wasmtime = { workspace = true, features = ["wave"] }
 eo9-component = { workspace = true }
 
+[features]
+# Seeded scheduling perturbation in the sync primitives (test-only; see src/chaos.rs).
+chaos = []

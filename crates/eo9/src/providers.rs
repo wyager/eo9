@@ -1164,6 +1164,7 @@ pub fn wait_until_runnable(task: &Task) {
     let runnable = task.runnable();
     let mut runnable = std::pin::pin!(runnable);
     while runnable.as_mut().poll(&mut context).is_pending() {
+        eo9_runtime::chaos::point("embedder.park");
         std::thread::park();
     }
 }
@@ -1178,6 +1179,7 @@ pub fn wait_until_runnable_with_timeout(task: &Task, timeout: std::time::Duratio
     let mut runnable = std::pin::pin!(runnable);
     let deadline = std::time::Instant::now() + timeout;
     while runnable.as_mut().poll(&mut context).is_pending() {
+        eo9_runtime::chaos::point("embedder.park");
         let now = std::time::Instant::now();
         if now >= deadline {
             break;

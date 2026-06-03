@@ -38,3 +38,7 @@ libc = "0.2"
 [[bin]]
 name = "eo9"
 path = "src/main.rs"
+
+[features]
+# Forwards eo9-runtime chaos injection (test-only).
+chaos = ["eo9-runtime/chaos"]
