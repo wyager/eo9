@@ -340,6 +340,30 @@ impl Drop for DriverGuard {
     }
 }
 
+/// Releases the bring-up claim (the `Busy` slot) if bring-up never completes: an error
+/// return *or a future dropped mid-bring-up* restores `Empty` so the next use retries,
+/// instead of wedging the instance behind a permanent typed-busy answer (and behind
+/// `mode`'s "another operation is in progress" forever). Armed from the instant the
+/// claim exists (before bring-up's first await); defused on success, when the
+/// [`DriverGuard`] takes over the restore duty.
+struct BringUpClaim {
+    armed: bool,
+}
+
+impl BringUpClaim {
+    fn defuse(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BringUpClaim {
+    fn drop(&mut self) {
+        if self.armed {
+            STATE.clear();
+        }
+    }
+}
+
 /// Run `f` over the brought-up driver, probing and initializing the device on first use
 /// (the documented default state — there is no configure interface).
 async fn with_driver<R>(
@@ -347,13 +371,14 @@ async fn with_driver<R>(
 ) -> Result<R, GfxError> {
     let driver = match STATE.take()? {
         Some(driver) => driver,
-        None => match Driver::bring_up().await {
-            Ok(driver) => driver,
-            Err(message) => {
-                STATE.clear();
-                return Err(GfxError::Io(message));
-            }
-        },
+        None => {
+            // The slot is `Busy` from the `take` above: arm the restore before the
+            // first await of bring-up.
+            let claim = BringUpClaim { armed: true };
+            let driver = Driver::bring_up().await.map_err(GfxError::Io)?;
+            claim.defuse();
+            driver
+        }
     };
     let mut guard = DriverGuard {
         driver: Some(driver),

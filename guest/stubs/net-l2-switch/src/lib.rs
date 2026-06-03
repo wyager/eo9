@@ -251,12 +251,35 @@ async fn acquire_uplink() -> Result<Option<UplinkGuard>, SwitchError> {
         UplinkView::Ready(uplink) => Ok(Some(UplinkGuard(Some(uplink)))),
         UplinkView::Busy => Ok(None),
         UplinkView::NeedOpen => {
-            let opened = open_uplink().await;
-            if opened.is_err() {
-                // Release the claim so the next use retries the bring-up.
-                with_state(|state| state.claimed = false);
-            }
-            opened.map(Some)
+            // `claimed` is set from `take_uplink` above: arm the restore before the
+            // first await of bring-up, so an error return *or a future dropped
+            // mid-open* releases the claim and the next use retries (instead of
+            // wedging both ports behind the busy answer).
+            let claim = BringUpClaim { armed: true };
+            let opened = open_uplink().await?;
+            claim.defuse();
+            Ok(Some(opened))
+        }
+    }
+}
+
+/// Releases the bring-up claim (`claimed`) if the first-use open never completes;
+/// armed from the instant the claim exists, defused on success when the
+/// [`UplinkGuard`] takes over the claim's lifecycle.
+struct BringUpClaim {
+    armed: bool,
+}
+
+impl BringUpClaim {
+    fn defuse(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BringUpClaim {
+    fn drop(&mut self) {
+        if self.armed {
+            with_state(|state| state.claimed = false);
         }
     }
 }

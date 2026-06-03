@@ -345,13 +345,37 @@ async fn acquire_driver() -> Result<DriverGuard, L2Fail> {
         SlotView::Busy => Err(L2Fail::Io(String::from(
             "net.virtio: another operation on this device is in progress",
         ))),
-        SlotView::NeedBringUp => match Driver::bring_up().await {
-            Ok(driver) => Ok(DriverGuard(Some(driver))),
-            Err(message) => {
-                STATE.with(|slot| slot.brought_up = false);
-                Err(L2Fail::Io(message))
-            }
-        },
+        SlotView::NeedBringUp => {
+            // `brought_up` is set from the `with` above: arm the restore before
+            // the first await of bring-up, so an error return *or a future dropped
+            // mid-bring-up* clears the claim and the next use retries (instead of
+            // wedging the instance behind the typed busy answer).
+            let claim = BringUpClaim { armed: true };
+            let driver = Driver::bring_up().await.map_err(L2Fail::Io)?;
+            claim.defuse();
+            Ok(DriverGuard(Some(driver)))
+        }
+    }
+}
+
+/// Releases the bring-up claim (`brought_up`) if bring-up never completes; armed from
+/// the instant the claim exists, defused on success when the [`DriverGuard`] takes
+/// over (a successful bring-up keeps `brought_up = true` for the instance's lifetime).
+struct BringUpClaim {
+    armed: bool,
+}
+
+impl BringUpClaim {
+    fn defuse(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BringUpClaim {
+    fn drop(&mut self) {
+        if self.armed {
+            STATE.with(|slot| slot.brought_up = false);
+        }
     }
 }
 
