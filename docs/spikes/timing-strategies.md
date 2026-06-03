@@ -128,7 +128,7 @@ Results (measured on this machine, otherwise idle, **zero hogs**; full logs in t
 plan/13 entry):
 
 - **Pre-fix + chaos:** first hang at iteration **2, 2, 1, 3, 2** across five base seeds
-  (1000..5000); sustained hit rate 24/60 + 6/15 + 3/15 + 3/15 + 5/15 ≈ **34%% of
+  (1000..5000); sustained hit rate 24/60 + 6/15 + 3/15 + 3/15 + 5/15 ≈ **34 % of
   iterations hang**. Every sampled hang's backtrace matches the wild specimens
   (`run::drive_to_completion` → `providers::wait_until_runnable` → `thread::park`,
   blocking pool idle).
