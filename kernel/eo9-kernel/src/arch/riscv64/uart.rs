@@ -25,6 +25,10 @@ const LSR_DR: u8 = 1 << 0;
 const LSR_THRE: u8 = 1 << 5;
 /// Interrupt enable: received data available.
 const IER_ERBFI: u8 = 1 << 0;
+/// FIFO control register (write).
+const FCR: usize = 2;
+/// FIFO control: enable both FIFOs and clear them.
+const FCR_ENABLE_CLEAR: u8 = 0x07;
 
 fn mmio_read(offset: usize) -> u8 {
     // SAFETY: `UART_BASE + offset` is a valid NS16550A register on the `virt` machine, and
@@ -66,7 +70,10 @@ pub fn try_get_byte() -> Option<u8> {
 // completed.
 
 /// RX ring capacity (power of two; one slot is left empty to distinguish full from empty).
-const RX_RING_CAP: usize = 256;
+/// Sized to hold the longest line the shell accepts (`MAX_READ_LINE_BYTES`, 4096) so a
+/// pasted command line of any accepted length survives even if the consumer is slow to
+/// drain — paste robustness, plan/12.
+const RX_RING_CAP: usize = 4096;
 
 /// Single-producer (trap handler) / single-consumer (boot hart) byte ring for received input.
 struct RxRing {
@@ -91,6 +98,12 @@ static RX_RING: RxRing = RxRing {
 /// during boot after the PLIC forwards source 10 (src/arch/riscv64/mod.rs).
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
 pub fn enable_rx_interrupt() {
+    // Enable the 16-byte FIFOs first: QEMU paces its character feed by the receive buffer's
+    // free space, and with the FIFO off that space is a single byte, so every received byte
+    // stalls the host-side feed until the guest finishes a full interrupt round-trip — the
+    // per-byte pause/resume churn behind the paste-freeze bug (plan/12; the aarch64 driver
+    // documents the mechanism). With the FIFO on, the feed pauses at most once per chunk.
+    mmio_write(FCR, FCR_ENABLE_CLEAR);
     mmio_write(IER, IER_ERBFI);
 }
 
@@ -98,19 +111,65 @@ pub fn enable_rx_interrupt() {
 /// external-interrupt trap path (src/arch/riscv64/traps.rs) when PLIC source 10 fires;
 /// emptying the receive buffer deasserts the UART's interrupt line.
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
-pub fn drain_rx() {
+/// Move every byte waiting in the receive FIFO into [`RX_RING`]; returns how many moved.
+/// Caller must be the sole producer: the trap handler, or thread context with interrupts
+/// masked ([`scavenge_rx`]).
+fn fifo_to_ring() -> usize {
+    let mut moved = 0;
     while mmio_read(LSR) & LSR_DR != 0 {
         let byte = mmio_read(RBR_THR);
+        moved += 1;
         let head = RX_RING.head.load(Ordering::Relaxed);
         let next = (head + 1) % RX_RING_CAP;
         // Drop the byte if the ring is full rather than overwrite unread input.
         if next != RX_RING.tail.load(Ordering::Acquire) {
-            // SAFETY: the trap handler is the sole producer; this slot is not being read
+            // SAFETY: the caller is the sole producer; this slot is not being read
             // (it is at/after `head`, ahead of the consumer's `tail`).
             unsafe { (*RX_RING.buf.get())[head] = byte };
             RX_RING.head.store(next, Ordering::Release);
         }
     }
+    moved
+}
+
+#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
+pub fn drain_rx() {
+    fifo_to_ring();
+}
+
+/// Idle-path receive scavenger: rescue FIFO leftovers and nudge a wedged host character
+/// feed. Same design and trade-offs as the aarch64 driver's `scavenge_rx` (see
+/// src/arch/aarch64/uart.rs): QEMU's 16550 model also calls `accept_input` unconditionally
+/// on every receive-buffer read, so after a second of total input silence one harmless
+/// read of an empty receive buffer resumes a wedged feed.
+#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
+pub fn scavenge_rx(now_ns: u64) {
+    use core::sync::atomic::AtomicU64;
+    static LAST_ACTIVITY_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_KICK_NS: AtomicU64 = AtomicU64::new(0);
+    const QUIET_BEFORE_KICK_NS: u64 = 1_000_000_000;
+
+    // SAFETY: mask supervisor interrupts so this thread is the ring's only producer for
+    // the duration; mask/unmask of sstatus.SIE has no stack or register effects.
+    unsafe { core::arch::asm!("csrci sstatus, 2", options(nomem, nostack, preserves_flags)) };
+    let moved = fifo_to_ring();
+    let ring_busy = RX_RING.head.load(Ordering::Relaxed) != RX_RING.tail.load(Ordering::Relaxed);
+    if moved > 0 || ring_busy {
+        LAST_ACTIVITY_NS.store(now_ns, Ordering::Relaxed);
+    } else {
+        let quiet_since = LAST_ACTIVITY_NS.load(Ordering::Relaxed);
+        let last_kick = LAST_KICK_NS.load(Ordering::Relaxed);
+        if now_ns.saturating_sub(quiet_since) >= QUIET_BEFORE_KICK_NS
+            && now_ns.saturating_sub(last_kick) >= QUIET_BEFORE_KICK_NS
+        {
+            LAST_KICK_NS.store(now_ns, Ordering::Relaxed);
+            // Receive buffer is empty (checked under the mask): this read exists purely
+            // for QEMU's unconditional `accept_input` side effect.
+            let _ = mmio_read(RBR_THR);
+        }
+    }
+    // SAFETY: restore supervisor interrupt delivery.
+    unsafe { core::arch::asm!("csrsi sstatus, 2", options(nomem, nostack, preserves_flags)) };
 }
 
 /// Consume one received byte from the interrupt-filled ring, or `None` if none is waiting.

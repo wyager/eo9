@@ -381,6 +381,11 @@ pub(crate) fn idle_wait(child_running: bool) {
     // which is also the compiler-level memory barrier that makes whatever the interrupt
     // handler wrote (the UART input ring) visible to the re-poll below.
     crate::timer::wait_for_interrupt(delay);
+    // Idle-path UART scavenge (plan/12, the paste-freeze fix): rescue any receive bytes
+    // the interrupt path missed and, after a second of total input silence, nudge QEMU's
+    // character feed (which has been observed to wedge under host load) back to life.
+    // Runs on every idle wake — at least about once a second via the backstop above.
+    crate::uart::scavenge_rx(crate::timer::uptime_ns());
     wake_idle();
 }
 

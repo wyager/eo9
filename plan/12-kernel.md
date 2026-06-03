@@ -1670,3 +1670,46 @@ preemption/hardening work.
     pixel-exact both frames, svcdemo battery (list/log/stop), storedisk two-boot
     (format → save → 664 KiB cached → power-cycle → 2.4 ms hit), three arch demos, full
     `cargo xtask ci`.
+
+70. **Paste robustness: the console survives arbitrary-rate input on all three arches
+    (2026-06-02, branch `area/12-paste-freeze`; entry 69 is taken by the concurrent
+    `area/12-pciwait-park` branch).** Owner report: pasting a ~53-char line at the aarch64
+    `make qemu` prompt froze the console mid-echo (~34 chars), permanently deaf to Enter and
+    Ctrl-C — the bug every QEMU-driving harness in this project has been masking with the
+    "pace input ~20 ms/char" convention. Reproduced with unpaced single-write bursts under
+    host load (8 CPU hogs): master froze within 1–2 bursts; QEMU sat near-idle (~20% CPU,
+    no IRQ storm, no executor wedge — instrumented), the FIFO and input ring both empty: the
+    *host-side* character feed had stopped delivering. Mechanism (QEMU pl011.c, read
+    directly): QEMU paces its feed by `pl011_can_receive = fifo_depth − read_count`, and the
+    kernel never enabled the FIFOs (depth 1), so *every byte* paused the feed until the
+    guest completed an interrupt + drain + DR-read round-trip; under load those per-byte
+    pause/resume cycles wedge permanently. Two further latent deafness modes found while
+    root-causing: (a) QEMU latches the receive interrupt only on the FIFO's
+    empty→occupied transition and `UARTICR` clears the latch — the old drain-then-clear
+    order could wipe the latch with a byte already in the FIFO (no receive-timeout timer in
+    the model: dead forever); (b) the 256-byte input ring silently dropped long pastes
+    (the project's own demo compositions exceed 300 chars). Fix, three layers plus the ring:
+    **acknowledge-then-drain** in the PL011 handler (a byte landing after the final empty
+    check re-latches and re-delivers); **FIFOs enabled** (PL011 `LCR_H.FEN` + TRM-correct
+    `CR` enables + earliest `IFLS`; 16550 `FCR` on riscv64, x86_64 already had it) so the
+    feed pauses at most once per 16 bytes; an **idle-path scavenger** (`scavenge_rx`, called
+    from `idle_wait`'s existing wakes) that rescues any FIFO leftovers into the ring and,
+    after one second of total input silence, issues one harmless data-register read — both
+    QEMU UART models call `qemu_chr_fe_accept_input` unconditionally on every data-register
+    read, even with an empty FIFO, so the read revives a wedged feed within ~1 s (documented
+    trade: a byte landing in the few-instruction check-to-read window during an
+    already-silent second is consumed and lost — one keystroke versus permanent deafness);
+    and the **ring sized to `MAX_READ_LINE_BYTES`** (4096) so any line the shell accepts
+    survives a paste. Drop policy: bytes beyond ring capacity are dropped, the console never
+    goes deaf. Verified: A/B with a corrected harness (the original harness over-read past
+    its needle and reported phantom "prompt lost" freezes — timestamped logs proved those
+    rounds healthy; the harness now carries over surplus bytes) — master froze at cycles
+    1–2 under load, the fixed kernel survived 600/600 + 200/200 loaded bursts; the owner's
+    exact paste runs to `ok: greeted` loaded and quiet; burst matrix 16–512 chars lossless
+    on all three arches; paste during an on-target compile is buffered and runs after;
+    riscv64/x86_64 loaded hammers 100/100 each (riscv64 master baseline did not reproduce
+    the wedge in 100 bursts — the PL011 path is where it bites; the 16550 changes are
+    hardening of the same class); full battery (three arch demos, storage round-trip, net
+    ARP, check-gpu pixel-exact, svcdemo) and `cargo xtask ci` green. The serial-driving
+    convention "pace input ~20 ms/char" is now obsolete for correctness (harnesses may keep
+    it for echo-interleaving readability only).

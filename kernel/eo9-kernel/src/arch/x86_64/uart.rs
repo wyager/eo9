@@ -78,7 +78,10 @@ pub fn try_get_byte() -> Option<u8> {
 // the receive FIFO is fully drained before the interrupt is acknowledged.
 
 /// RX ring capacity (power of two; one slot is left empty to distinguish full from empty).
-const RX_RING_CAP: usize = 256;
+/// Sized to hold the longest line the shell accepts (`MAX_READ_LINE_BYTES`, 4096) so a
+/// pasted command line of any accepted length survives even if the consumer is slow to
+/// drain — paste robustness, plan/12.
+const RX_RING_CAP: usize = 4096;
 
 /// Single-producer (trap handler) / single-consumer (boot CPU) byte ring for received input.
 struct RxRing {
@@ -110,23 +113,68 @@ pub fn enable_rx_interrupt() {
     reg_write(IER, IER_ERBFI);
 }
 
-/// Interrupt handler body: drain every waiting RX byte into [`RX_RING`]. Called from the
-/// trap dispatcher (src/arch/x86_64/traps.rs) when IRQ 4 fires; emptying the receive FIFO
-/// deasserts the UART's interrupt line.
-#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
-pub fn drain_rx() {
+/// Move every byte waiting in the receive FIFO into [`RX_RING`]; returns how many moved.
+/// Caller must be the sole producer: the trap handler, or thread context with interrupts
+/// masked ([`scavenge_rx`]).
+fn fifo_to_ring() -> usize {
+    let mut moved = 0;
     while reg_read(LSR) & LSR_DR != 0 {
         let byte = reg_read(RBR_THR);
+        moved += 1;
         let head = RX_RING.head.load(Ordering::Relaxed);
         let next = (head + 1) % RX_RING_CAP;
         // Drop the byte if the ring is full rather than overwrite unread input.
         if next != RX_RING.tail.load(Ordering::Acquire) {
-            // SAFETY: the trap handler is the sole producer; this slot is not being read
+            // SAFETY: the caller is the sole producer; this slot is not being read
             // (it is at/after `head`, ahead of the consumer's `tail`).
             unsafe { (*RX_RING.buf.get())[head] = byte };
             RX_RING.head.store(next, Ordering::Release);
         }
     }
+    moved
+}
+
+/// Interrupt handler body: drain every waiting RX byte into [`RX_RING`]. Called from the
+/// trap dispatcher (src/arch/x86_64/traps.rs) when IRQ 4 fires; emptying the receive FIFO
+/// deasserts the UART's interrupt line.
+#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
+pub fn drain_rx() {
+    fifo_to_ring();
+}
+
+/// Idle-path receive scavenger: rescue FIFO leftovers and nudge a wedged host character
+/// feed. Same design and trade-offs as the aarch64 driver's `scavenge_rx` (see
+/// src/arch/aarch64/uart.rs): QEMU's 16550 model calls `accept_input` unconditionally on
+/// every receive-buffer read, so after a second of total input silence one harmless read
+/// of an empty receive buffer resumes a wedged feed.
+#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
+pub fn scavenge_rx(now_ns: u64) {
+    use core::sync::atomic::AtomicU64;
+    static LAST_ACTIVITY_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST_KICK_NS: AtomicU64 = AtomicU64::new(0);
+    const QUIET_BEFORE_KICK_NS: u64 = 1_000_000_000;
+
+    // SAFETY: mask interrupt delivery so this thread is the ring's only producer for the
+    // duration; cli/sti have no stack or register effects.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+    let moved = fifo_to_ring();
+    let ring_busy = RX_RING.head.load(Ordering::Relaxed) != RX_RING.tail.load(Ordering::Relaxed);
+    if moved > 0 || ring_busy {
+        LAST_ACTIVITY_NS.store(now_ns, Ordering::Relaxed);
+    } else {
+        let quiet_since = LAST_ACTIVITY_NS.load(Ordering::Relaxed);
+        let last_kick = LAST_KICK_NS.load(Ordering::Relaxed);
+        if now_ns.saturating_sub(quiet_since) >= QUIET_BEFORE_KICK_NS
+            && now_ns.saturating_sub(last_kick) >= QUIET_BEFORE_KICK_NS
+        {
+            LAST_KICK_NS.store(now_ns, Ordering::Relaxed);
+            // Receive buffer is empty (checked under the mask): this read exists purely
+            // for QEMU's unconditional `accept_input` side effect.
+            let _ = reg_read(RBR_THR);
+        }
+    }
+    // SAFETY: restore interrupt delivery.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
 }
 
 /// Consume one received byte from the interrupt-filled ring, or `None` if none is waiting.
