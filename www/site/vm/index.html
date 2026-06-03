@@ -8,7 +8,7 @@
         content="The full Eo9 operating system — runtime, capability algebra, compiler, and the eosh shell — compiled to WebAssembly and running entirely in this page.">
   <link rel="icon" type="image/svg+xml" href="/logo.svg">
   <link rel="stylesheet" href="/style.css">
-  <link rel="stylesheet" href="/vm/vm.2a6a37de057ae53d.css">
+  <link rel="stylesheet" href="/vm/vm.b7c2d1b49a4561f0.css">
 </head>
 <body>
 
@@ -27,7 +27,8 @@
 
 <main>
 
-  <pre id="vm-output">fetching the Eo9 OS (about 1.8&nbsp;MB compressed)…</pre>
+  <pre id="vm-output">fetching the Eo9 OS (about 2.3&nbsp;MB compressed)…</pre>
+  <canvas id="vm-display" width="320" height="200"></canvas>
   <p class="vm-note"><code>exit</code> ends the session; reload the page for a fresh one.</p>
 
   <h2>Explore the sandbox</h2>
@@ -93,6 +94,26 @@
       <span>real coreutils (also Eo9 components) against an in-memory filesystem provided by the OS —
         the same programs run unchanged on native Eo9 and on the bare-metal kernel.</span>
     </li>
+    <li>
+      <code>draw</code>
+      <span>pixels are a capability: the page provides a small framebuffer — the canvas that appears
+        under the terminal — and <code>draw</code> paints its test pattern there, reads it back
+        through the same API, and reports the checksum. Compose <code>gfx.mem $ draw</code> instead
+        and the same program draws into invisible RAM — substitution again.</span>
+    </li>
+    <li>
+      <code>net.l4.loopback $ sockcheck --payload "ping pong"</code>
+      <span>a network stack as a capability: <code>sockcheck</code> exercises real TCP/UDP semantics
+        (listen, refused connections, backlog, echo) and the loopback provider satisfies them
+        entirely inside this page — nothing touches your network.</span>
+    </li>
+    <li>
+      <code>let sw = rename port-a link-a $ rename port-b link-b $ net.l2.switch</code><br>
+      <code>net.l2.echo $ sw $ vnicheck --mode echo</code>
+      <span>one link, two isolated virtual NICs: the switch owns the upstream and gives each port its
+        own MAC; <code>vnicheck</code> verifies the whole switching policy (isolation, broadcast,
+        unknown-unicast dropped). The same composition shares a real NIC on the bare-metal kernel.</span>
+    </li>
   </ul>
 
   <h2>What this is actually doing</h2>
@@ -109,7 +130,8 @@
     instead of as native machine code, because there is no wasm→wasm code generator to hand the
     browser — so it is slower. On real hardware, Eo9 compiles programs and compositions to native
     code on the machine itself. Also not here: persistence (the filesystem is in-memory and resets on
-    reload) and networking. Genuinely blocking operations (the prompt's <code>read-line</code>,
+    reload) and real networking — the network stacks above (loopback, the switch) are themselves
+    in-page providers; nothing reaches your network. Genuinely blocking operations (the prompt's <code>read-line</code>,
     <code>time.sleep</code>) suspend the whole VM with JavaScript Promise Integration, so this page
     needs a JSPI-capable browser — current Chrome or Edge.
   </p>
@@ -122,6 +144,6 @@
      <a href="https://github.com/wyager/eo9/blob/master/SPEC.md">Spec</a></p>
 </footer>
 
-<script type="module" src="/vm/vm.894778b3eade9abb.js"></script>
+<script type="module" src="/vm/vm.e6470be54b6cc6b9.js"></script>
 </body>
 </html>

@@ -33,6 +33,16 @@ wasmtime = { version = "45.0.0", default-features = false, features = [
     "async",
     "component-model-async",
     "component-model-async-fiberless",
+    # First-poll-inline for guest callees (the vendored eager-chain feature). On this host
+    # it is not an optimization but a requirement for guest-to-guest async: the queued-call
+    # path briefly suspends the caller while the callee goes starting -> started
+    # (concurrent.rs `suspend`, "non-blocking … despite requiring a suspend"), and wasm32
+    # has no fiber backend — so a composition like `gfx.mem $ draw` or `net.l4.loopback $
+    # sockcheck` panics in BlockingContext::with. With first-poll the eager callee runs
+    # inline on the caller's stack (callback-ABI gate) and no suspend happens; a callee
+    # that genuinely waits is by then already STARTED, so the caller never blocks on the
+    # transition either.
+    "component-model-async-first-poll",
 ] }
 # The component algebra (the `eo9:exec` surface eosh imports). `default-features = false`
 # = the no_std build, exactly as the bare-metal kernel links it; its closure is patched to

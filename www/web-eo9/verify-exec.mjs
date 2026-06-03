@@ -27,6 +27,8 @@ const imports = {
       for (let i = 0; i < len; i++) view[i] = (Math.random() * 256) | 0;
     },
     host_fetch_copy: () => {},
+    // The page-canvas blit: display-only (readback comes from the blob backing); no-op here.
+    host_gfx_present: () => {},
     host_sleep_ms: new WebAssembly.Suspending((ms) => new Promise((r) => setTimeout(r, ms))),
     host_read_line: new WebAssembly.Suspending(async () => -1),
     host_fetch_len: new WebAssembly.Suspending(async () => -1),

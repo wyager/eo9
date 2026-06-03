@@ -874,6 +874,32 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
         // (e.g. `entropy.seeded $ rng`, `time.frozen ... $ hello`), compiled in-blob (plan/18 D22).
         ("entropy.seeded", "eo9-stub-entropy-seeded"),
         ("time.frozen", "eo9-stub-time-frozen"),
+        ("time.fuzzy", "eo9-stub-time-fuzzy"),
+        // The browser-runnable spread of the kernel store (plan/18 D39): pixels, sockets,
+        // the policy attenuators, and the virtual-NIC switch — every chain below is
+        // all-guest (or roots in the page's own providers), so the full composition runs
+        // client-side, fused and compiled in-blob exactly like `entropy.seeded $ rng`.
+        // Pixels: `gfx.mem $ draw` round-trips the deterministic pattern and reports its
+        // checksum (and the page's own canvas provider serves a bare `draw` — see
+        // providers.rs).
+        ("gfx.mem", "eo9-stub-gfx-mem"),
+        ("draw", "eo9-example-draw"),
+        // Sockets: `net.l4.loopback $ sockcheck` exercises real TCP/UDP semantics on a
+        // loopback transport, entirely in the page.
+        ("net.l4.loopback", "eo9-stub-net-l4-loopback"),
+        ("sockcheck", "eo9-example-sockcheck"),
+        // The policy attenuators ("policies are programs", SPEC): per-path fs grants and
+        // the transport firewall, composed at the browser prompt like the metal one.
+        ("fs.filtered", "eo9-stub-fs-filtered"),
+        ("fs.policy-subtree", "eo9-stub-fs-policy-subtree"),
+        ("net.l4.filtered", "eo9-stub-net-l4-filtered"),
+        ("net.policy-ports", "eo9-stub-net-policy-ports"),
+        // The virtual-NIC switch over the echo fixture: one upstream link, two isolated
+        // virtual MACs, the whole switching policy verified by vnicheck — pure-guest
+        // networking through the switch, in the browser.
+        ("net.l2.switch", "eo9-stub-net-l2-switch"),
+        ("net.l2.echo", "eo9-stub-net-l2-echo"),
+        ("vnicheck", "eo9-example-vnicheck"),
     ] {
         let raw = std::fs::read(
             root.join("guest")
@@ -885,9 +911,20 @@ fn build_web_vm(root: &Path) -> Result<(), String> {
         std::fs::write(artifacts.join(format!("bin-{name}.wasm")), &raw).map_err(|err| {
             format!("failed to write the raw {name} component to artifacts: {err}")
         })?;
+        // Precompile the *executable* form: components whose worlds carry named interface
+        // exports (the virtual-NIC switch's ports) encode an `implements` annotation the
+        // pinned wasmtime parser predates; stripping it is behavior-neutral and is exactly
+        // what the kernel-store and in-blob compile paths do (eo9-component,
+        // `executable_bytes`). The raw bytes above keep the full encoding, so the algebra
+        // side stays lossless.
+        let executable = eo9_component::Component::load(raw.clone())
+            .map_err(|err| {
+                format!("/bin component `{name}` does not load as an eo9 module: {err:?}")
+            })?
+            .executable_bytes();
         preaot_for_web(
             &artifacts,
-            &raw,
+            &executable,
             &format!("/bin {name}"),
             &format!("bin-{name}.cwasm"),
             false,

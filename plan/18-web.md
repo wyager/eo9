@@ -848,3 +848,95 @@ the page's linker. The blob now registers `eo9:svc` as **absent**, mirroring the
 clear message naming usermode `eo9 --svc`): the `svc`/`detach` builtins refuse gracefully in the browser
 instead of failing instantiation. A real browser registry remains the recorded follow-up
 (docs/design/executor-model.md, staged plan).
+
+## Decision 39 — the /bin catch-up: pixels, sockets, policies, and the switch in the browser (2026-06-02)
+
+Branch `area/18-browser-catchup`. The browser's 7-program `/bin` had fallen far behind the kernel's
+store; this brings the browser-meaningful spread over (now 19 entries), each as raw + pre-AOT'd
+pulley32 forms embedded in the blob, and proves every family at the prompt with verify-eosh checks:
+
+- **Pixels**: `gfx.mem` + `draw` — `gfx.mem --width 64 --height 64 $ draw` round-trips the
+  deterministic pattern through the RAM framebuffer and reports its checksum (run twice in the
+  harness: identical).
+- **Sockets**: `net.l4.loopback` + `sockcheck` — the full TCP/UDP semantics suite (listen,
+  duplicate-bind refusal, connection-refused, backlog, echo, UDP round-trip) entirely in the page.
+- **Policies** ("policies are programs"): `fs.filtered` + `fs.policy-subtree` (in-prefix cat
+  succeeds, out-of-prefix cat is denied — typed, never a trap) and `net.l4.filtered` +
+  `net.policy-ports` (the unconfigured policy denies sockcheck's first listen).
+- **The switch**: `net.l2.switch` + `net.l2.echo` + `vnicheck` — `let sw = rename port-a link-a $
+  rename port-b link-b $ net.l2.switch`, then `net.l2.echo $ sw $ vnicheck --mode echo` verifies
+  the whole switching policy (per-port MACs, source rewrite, sibling isolation, broadcast,
+  unknown-unicast dropped) over two virtual NICs on one upstream link, in the browser.
+- **Clocks**: `time.fuzzy` joins `time.frozen` (the side-channel-mitigation attenuator composes
+  over the browser clock).
+
+Skipped, deliberately: the pci family (`pci.admit-*`/`pci.filtered` compose to a not-closed
+refusal naming `eo9:pci/pci`, which teaches nothing without a pci root; `pci.none $ lspci` would
+run and show "no devices" but is out of this batch — a candidate for a later pass) and the svc
+family (`init`, `restart.*` — the browser has no registry; the refusal already exists and the
+components add no value without it).
+
+Two findings along the way, both fixed here:
+
+1. **/bin pre-AOT now compiles the executable form.** The switch's named port exports carry the
+   `implements` annotation the pinned wasmtime parser predates; `build-web-vm` now strips it via
+   `eo9_component::executable_bytes()` before precompiling — exactly what the kernel-store and
+   in-blob compile paths already did. The raw `/bin/<name>.wasm` bytes keep the full encoding, so
+   the algebra side stays lossless.
+2. **Guest-to-guest async needs first-poll on the fiberless host.** Every new chain trapped the
+   blob with a bare `RuntimeError: unreachable`: the queued-call path briefly suspends the caller
+   while its subtask goes starting → started ("non-blocking … despite requiring a suspend",
+   concurrent.rs), and wasm32 has no fiber backend — `BlockingContext::with` panics. The browser's
+   7-program store had simply never composed a guest over an async *guest* callee before (host
+   callees were always first-polled inline). The blob now enables the vendored
+   `component-model-async-first-poll` feature: not an optimization here but a requirement — the
+   eager callee runs inline on the caller's stack, and a callee that genuinely waits is by then
+   STARTED, so the caller never blocks on the transition. (This is a *blob-only* opt-in; the
+   kernel/usermode default remains the owner's call, tracked by the first-poll evaluation.)
+   And so the next such failure explains itself: `boot()` now installs a panic hook that reports
+   the blob's own panic message and location to the terminal as an error line before the abort —
+   this is what turned the bare `unreachable` into the one-line diagnosis above.
+
+Harness: verify-eosh grows 7 checks (gfx determinism, sockcheck pass, firewall deny, subtree
+allow + deny, vnicheck MACs, fuzzy-clock run), and the resolver's enum-leak check is scoped to
+its own transcript section (a denied fs operation later legitimately prints the typed
+`fs("FsError::Denied")`). All five node/JSPI harnesses pass; check-web-vm ok (20 assets — the
+/bin programs are embedded in the blob, not store files). Asset cost: blob 8,911,977 →
+12,790,338 B raw, 1,747,183 → 2,338,515 B brotli (+0.6 MB compressed for 12 new components).
+The try-it page's size copy and examples follow in the next change. One note recorded, not fixed
+(guest sources are out of this branch's lanes): cat renders a denied read as `fs("FsError::Denied")`
+— a debug-format leak in the coreutil's failure text, same on every target.
+
+## Decision 40 — the page canvas: a real gfx provider in the browser (2026-06-02)
+
+Branch `area/18-browser-catchup` (the D39 stretch goal). The page now serves `eo9:gfx` as a browser
+ROOT provider: a 320x200 xrgb8888 framebuffer whose `present`/`clear` blit onto a real `<canvas>`
+under the terminal — so a BARE `draw` at the browser prompt visibly paints the page, then reads its
+pattern back through the same API and reports the checksum. `gfx.mem $ draw` still composes and
+seals gfx (substitution: same program, invisible RAM target).
+
+Shape, all per the WIT contract (wit/gfx):
+
+- **Backing copy in the blob** (`WebState.gfx`, lazily allocated): `read` answers from the
+  provider's own copy of what was presented — a screenshot of the data path, never a host-side
+  canvas readback. The canvas blit is display-only; a host with no canvas (the node harnesses, the
+  selftest page) ignores it and everything still round-trips.
+- **One new JS import** `host_gfx_present(ptr, len, fb_w, fb_h, x, y, w, h)`: tightly packed rows
+  of the damage rectangle; the page sizes the canvas from the dimensions the blit carries (the
+  blob's `GFX_WIDTH`/`GFX_HEIGHT` are the single source of truth) and converts B,G,R,X → RGBA. The
+  canvas stays hidden until the first real blit (`vm-display-on`).
+- **Owned-buffer round-trip** through the same `BufferTable` the fs/io surface uses; rect/buffer
+  validation mirrors gfx.mem's semantics (out-of-bounds, bad-buffer with the expectation text,
+  zero-area success).
+- Registration: `add_gfx` in both `add_providers` and `add_providers_for` (family
+  `eo9:gfx/gfx`, so `only` gates it like any capability); `is_root_provided` admits
+  `eo9:gfx/gfx`; the session manifest gains the child gfx line.
+
+Verification: verify-eosh runs a bare `draw`, records the last full-frame blit through its own
+`host_gfx_present`, and asserts its FNV-1a-64 equals the checksum draw reports from read-back —
+the data path to the page is pixel-exact by construction. A headless-Chrome CDP smoke (real key
+events at the served /vm/ page) confirmed: boots to the prompt, canvas hidden before drawing,
+`draw` → `presented(…)`, canvas revealed at 320x200 with the white-border canary at (0,0) and
+~51k distinct colors (the gradient pattern). All five node/JSPI harnesses pass; check-web-vm ok;
+full ci green. The try-it page gains the `draw` example ("pixels are a capability") and the
+canvas element. Blob: 12,827,862 B raw / 2,344,934 B brotli (+6 KB compressed over D39).

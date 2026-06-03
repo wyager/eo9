@@ -160,6 +160,13 @@ fn report(name: &str, result: wasmtime::Result<()>) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn boot() -> i32 {
+    // A panic in the blob itself can only abort (panic = "abort", no unwinder), which
+    // surfaces in the page as a bare `RuntimeError: unreachable` with no explanation.
+    // The hook still runs before the abort, so report the message and location to the
+    // terminal first — as an error line (the U+0001 marker), like any other diagnostics.
+    std::panic::set_hook(std::boxed::Box::new(|info| {
+        outf!("\u{1}the Eo9 blob itself panicked (a bug — please report it): {info}");
+    }));
     report(
         "boot",
         || -> wasmtime::Result<()> {

@@ -79,6 +79,8 @@ const imports = {
       new Uint8Array(memory.buffer, destPtr, len).set(fetchedArtifact.subarray(0, len));
       fetchedArtifact = null;
     },
+    // The page-canvas blit: display-only; the self-test has no canvas, so ignore it.
+    host_gfx_present: () => {},
     host_sleep_ms: hasJSPI
       ? new WebAssembly.Suspending(async (ms) => {
           await new Promise((resolve) => setTimeout(resolve, ms));

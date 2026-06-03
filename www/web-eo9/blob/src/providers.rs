@@ -47,6 +47,11 @@ pub struct WebState {
     pub fs: crate::fs::MemFs,
     pub buffers: crate::fs::BufferTable,
     pub exec: crate::execsurface::ExecTables,
+    /// The page-canvas framebuffer's backing copy (`eo9:gfx`): tightly packed xrgb8888,
+    /// `GFX_WIDTH * GFX_HEIGHT * 4` bytes, allocated on the first gfx operation. `read`
+    /// answers from here (the provider's own copy of what was presented, per the WIT
+    /// contract); the canvas blit is display-only.
+    gfx: Option<Vec<u8>>,
     /// The store's `eo9:rt/diagnostics` slot: the panic message the guest reported just
     /// before trapping, if any (write-once, bounded — see [`WebState::report_panic`]).
     /// Read host-side when a trap is rendered into a `trapped(reason)`; never guest-readable.
@@ -79,10 +84,17 @@ impl WebState {
             fs,
             buffers: crate::fs::BufferTable::default(),
             exec: crate::execsurface::ExecTables::default(),
+            gfx: None,
             panic_message: None,
             out_line: String::new(),
             err_line: String::new(),
         }
+    }
+
+    /// The gfx backing framebuffer, allocated (black) on first use.
+    fn gfx_backing(&mut self) -> &mut Vec<u8> {
+        self.gfx
+            .get_or_insert_with(|| std::vec![0u8; (GFX_WIDTH * GFX_HEIGHT * 4) as usize])
     }
 
     /// Append terminal output, emitting one host write per *complete* line. Standard-error
@@ -160,6 +172,7 @@ fn session_manifest() -> &'static str {
      child time the browser clock\n\
      child entropy the browser's crypto random generator\n\
      child fs a fresh in-memory filesystem per run; writes do not persist between commands\n\
+     child gfx a 320x200 framebuffer rendered onto this page (try `draw`)\n\
      note everything runs inside this page; nothing reaches the network or your machine\n\
      note programs run from this shell do not receive exec (no nested spawning in the browser)\n\
      note restrict any command with `only` (e.g. `only eo9:text,eo9:time $ hello`)\n"
@@ -221,13 +234,14 @@ struct WitInstant {
 
 // --- Registration --------------------------------------------------------------------------
 
-/// Register all browser root providers (text, time, entropy — each with its `types`
+/// Register all browser root providers (text, time, entropy, gfx — each with its `types`
 /// resource). Used for an unrestricted run.
 pub fn add_providers(linker: &mut Linker<WebState>) -> Result<()> {
     add_diagnostics(linker)?;
     add_text(linker)?;
     add_time(linker)?;
     add_entropy(linker)?;
+    add_gfx(linker)?;
     add_svc_absent(linker)?;
     Ok(())
 }
@@ -335,6 +349,9 @@ pub fn add_providers_for(linker: &mut Linker<WebState>, allow: Option<&[String]>
     }
     if family_admitted(allow, "eo9:entropy/entropy") {
         add_entropy(linker)?;
+    }
+    if family_admitted(allow, "eo9:gfx/gfx") {
+        add_gfx(linker)?;
     }
     Ok(())
 }
@@ -521,6 +538,240 @@ fn add_entropy(linker: &mut Linker<WebState>) -> Result<()> {
             let mut bytes = [0u8; 8];
             host::random_fill(&mut bytes);
             Ok((u64::from_le_bytes(bytes),))
+        },
+    )?;
+
+    Ok(())
+}
+
+// --- eo9:gfx — the page canvas --------------------------------------------------------------
+
+/// The page framebuffer's fixed geometry: small enough that a Pulley-interpreted guest
+/// fills it quickly, large enough to be a real picture. The page sizes its canvas from
+/// the dimensions the blit carries, so this constant is the single source of truth.
+const GFX_WIDTH: u32 = 320;
+const GFX_HEIGHT: u32 = 200;
+
+struct GfxCap;
+
+#[derive(Clone, Copy, ComponentType, Lift, Lower)]
+#[component(enum)]
+#[repr(u8)]
+#[allow(dead_code)] // constructed only by the generated `Lift` impl
+enum WitPixelFormat {
+    #[component(name = "xrgb8888")]
+    Xrgb8888,
+}
+
+#[derive(Clone, Copy, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitModeInfo {
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: WitPixelFormat,
+}
+
+#[derive(Clone, Copy, ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, ComponentType, Lift, Lower)]
+#[component(variant)]
+#[allow(dead_code)] // the canvas never refuses or fails I/O; the arms satisfy the type
+enum WitGfxError {
+    #[component(name = "denied")]
+    Denied,
+    #[component(name = "out-of-bounds")]
+    OutOfBounds,
+    #[component(name = "bad-buffer")]
+    BadBuffer(String),
+    #[component(name = "io")]
+    Io(String),
+}
+
+/// The rectangle's byte size (tightly packed rows) if it lies entirely within the mode;
+/// `out-of-bounds` otherwise. Zero-area rectangles inside the mode are valid (and their
+/// size is 0 — the operations treat them as successful no-ops, per the WIT contract).
+fn gfx_rect_len(rect: &WitRect) -> core::result::Result<usize, WitGfxError> {
+    let right = u64::from(rect.x) + u64::from(rect.width);
+    let bottom = u64::from(rect.y) + u64::from(rect.height);
+    if right > u64::from(GFX_WIDTH) || bottom > u64::from(GFX_HEIGHT) {
+        return Err(WitGfxError::OutOfBounds);
+    }
+    Ok(rect.width as usize * rect.height as usize * 4)
+}
+
+type GfxBufferReturn = (
+    Resource<crate::fs::BufferRes>,
+    core::result::Result<(), WitGfxError>,
+);
+
+/// `eo9:gfx/gfx`: a real framebuffer rendered onto the page — `present` blits onto a
+/// canvas under the terminal (revealed on first use), `read` answers from the provider's
+/// backing copy (the WIT contract: a screenshot of the data path, not a host readback),
+/// so `draw` at the browser prompt both paints the page and verifies its own checksum.
+fn add_gfx(linker: &mut Linker<WebState>) -> Result<()> {
+    linker.instance("eo9:gfx/types@0.1.0")?.resource(
+        "gfx-impl",
+        ResourceType::host::<GfxCap>(),
+        |_, _| Ok(()),
+    )?;
+    let mut gfx = linker.instance("eo9:gfx/gfx@0.1.0")?;
+    add_default_handle::<GfxCap>(&mut gfx)?;
+
+    gfx.func_wrap(
+        "mode",
+        |_store: StoreContextMut<'_, WebState>,
+         (_cap,): (Resource<GfxCap>,)|
+         -> Result<(core::result::Result<WitModeInfo, WitGfxError>,)> {
+            Ok((Ok(WitModeInfo {
+                width: GFX_WIDTH,
+                height: GFX_HEIGHT,
+                stride: GFX_WIDTH * 4,
+                format: WitPixelFormat::Xrgb8888,
+            }),))
+        },
+    )?;
+
+    gfx.func_wrap_concurrent(
+        "present",
+        |accessor: &Accessor<WebState>,
+         (_cap, dst, src): (Resource<GfxCap>, WitRect, Resource<crate::fs::BufferRes>)|
+         -> ConcurrentFuture<'_, (GfxBufferReturn,)> {
+            Box::pin(async move {
+                let buffer_rep = src.rep();
+                let result = accessor.with(|mut access| -> Result<_> {
+                    let state = access.data_mut();
+                    let needed = match gfx_rect_len(&dst) {
+                        Ok(len) => len,
+                        Err(err) => return Ok(Err(err)),
+                    };
+                    if needed == 0 {
+                        return Ok(Ok(()));
+                    }
+                    let bytes = state.buffers.bytes(buffer_rep)?;
+                    if bytes.len() < needed {
+                        return Ok(Err(WitGfxError::BadBuffer(std::format!(
+                            "present needs {needed} bytes for {}x{}, got {}",
+                            dst.width,
+                            dst.height,
+                            bytes.len()
+                        ))));
+                    }
+                    let pixels = bytes[..needed].to_vec();
+                    let backing = state.gfx_backing();
+                    let row_bytes = dst.width as usize * 4;
+                    for row in 0..dst.height as usize {
+                        let to = ((dst.y as usize + row) * GFX_WIDTH as usize + dst.x as usize) * 4;
+                        backing[to..to + row_bytes]
+                            .copy_from_slice(&pixels[row * row_bytes..][..row_bytes]);
+                    }
+                    host::gfx_present(
+                        &pixels,
+                        (GFX_WIDTH, GFX_HEIGHT),
+                        (dst.x, dst.y, dst.width, dst.height),
+                    );
+                    Ok(Ok(()))
+                })?;
+                Ok(((Resource::new_own(buffer_rep), result),))
+            })
+        },
+    )?;
+
+    gfx.func_wrap_concurrent(
+        "read",
+        |accessor: &Accessor<WebState>,
+         (_cap, src, dst): (Resource<GfxCap>, WitRect, Resource<crate::fs::BufferRes>)|
+         -> ConcurrentFuture<'_, (GfxBufferReturn,)> {
+            Box::pin(async move {
+                let buffer_rep = dst.rep();
+                let result = accessor.with(|mut access| -> Result<_> {
+                    let state = access.data_mut();
+                    let needed = match gfx_rect_len(&src) {
+                        Ok(len) => len,
+                        Err(err) => return Ok(Err(err)),
+                    };
+                    if needed == 0 {
+                        return Ok(Ok(()));
+                    }
+                    // Copy the rows out of the backing first (split the borrows by going
+                    // through a temporary, the same pattern as the fs read handler).
+                    let mut packed = std::vec![0u8; needed];
+                    let row_bytes = src.width as usize * 4;
+                    {
+                        let backing = state.gfx_backing();
+                        for row in 0..src.height as usize {
+                            let from =
+                                ((src.y as usize + row) * GFX_WIDTH as usize + src.x as usize) * 4;
+                            packed[row * row_bytes..][..row_bytes]
+                                .copy_from_slice(&backing[from..from + row_bytes]);
+                        }
+                    }
+                    let bytes = state.buffers.bytes(buffer_rep)?;
+                    if bytes.len() < needed {
+                        return Ok(Err(WitGfxError::BadBuffer(std::format!(
+                            "read needs at least {needed} bytes for {}x{}, got {}",
+                            src.width,
+                            src.height,
+                            bytes.len()
+                        ))));
+                    }
+                    bytes[..needed].copy_from_slice(&packed);
+                    Ok(Ok(()))
+                })?;
+                Ok(((Resource::new_own(buffer_rep), result),))
+            })
+        },
+    )?;
+
+    gfx.func_wrap_concurrent(
+        "clear",
+        |accessor: &Accessor<WebState>,
+         (_cap, dst, color): (Resource<GfxCap>, WitRect, u32)|
+         -> ConcurrentFuture<'_, (core::result::Result<(), WitGfxError>,)> {
+            Box::pin(async move {
+                let result = accessor.with(|mut access| -> Result<_> {
+                    let state = access.data_mut();
+                    let needed = match gfx_rect_len(&dst) {
+                        Ok(len) => len,
+                        Err(err) => return Ok(Err(err)),
+                    };
+                    if needed == 0 {
+                        return Ok(Ok(()));
+                    }
+                    // `0x00RRGGBB` → memory bytes B, G, R, X (little-endian word).
+                    let pixel = [
+                        (color & 0xff) as u8,
+                        ((color >> 8) & 0xff) as u8,
+                        ((color >> 16) & 0xff) as u8,
+                        0,
+                    ];
+                    let mut packed = Vec::with_capacity(needed);
+                    for _ in 0..(needed / 4) {
+                        packed.extend_from_slice(&pixel);
+                    }
+                    let backing = state.gfx_backing();
+                    let row_bytes = dst.width as usize * 4;
+                    for row in 0..dst.height as usize {
+                        let to = ((dst.y as usize + row) * GFX_WIDTH as usize + dst.x as usize) * 4;
+                        backing[to..to + row_bytes]
+                            .copy_from_slice(&packed[row * row_bytes..][..row_bytes]);
+                    }
+                    host::gfx_present(
+                        &packed,
+                        (GFX_WIDTH, GFX_HEIGHT),
+                        (dst.x, dst.y, dst.width, dst.height),
+                    );
+                    Ok(Ok(()))
+                })?;
+                Ok((result,))
+            })
         },
     )?;
 

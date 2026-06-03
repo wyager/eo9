@@ -159,7 +159,9 @@ impl BufferTable {
         u32::try_from(index).map_err(|_| wasmtime::Error::msg("buffer table full"))
     }
 
-    fn bytes(&mut self, rep: u32) -> Result<&mut Vec<u8>> {
+    /// Crate-visible: the page's gfx provider (providers.rs) round-trips owned buffers
+    /// through the same table the fs/io surface uses.
+    pub(crate) fn bytes(&mut self, rep: u32) -> Result<&mut Vec<u8>> {
         self.slots
             .get_mut(rep as usize)
             .and_then(Option::as_mut)
