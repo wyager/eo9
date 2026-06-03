@@ -145,6 +145,32 @@ inputQueue = [
   // The explore section's "compose what you learned" example.
   "echo --text EXPLOREMARK",
   "entropy.seeded --seed 7 $ rng --count 2",
+  // --- the /bin catch-up (plan/18 D39): pixels, sockets, policies, the switch. Every
+  // chain below is fused by the algebra and compiled in-blob; markers scope the checks.
+  // Pixels: gfx.mem $ draw round-trips the deterministic pattern through a RAM
+  // framebuffer — run twice, the reported checksum must be identical.
+  "echo --text GFXMARK",
+  "gfx.mem --width 64 --height 64 $ draw",
+  "gfx.mem --width 64 --height 64 $ draw",
+  // Sockets: real TCP/UDP semantics over the loopback transport, entirely in the page;
+  // then the transport firewall — an unconfigured net.policy-ports denies everything
+  // (never traps), surfaced as sockcheck's own typed failure.
+  "echo --text SOCKMARK",
+  'net.l4.loopback $ sockcheck --payload "ping pong"',
+  "net.l4.loopback $ net.policy-ports $ net.l4.filtered $ sockcheck --payload blocked",
+  // Per-path grants: the subtree policy admits /docs read-only, so the in-prefix cat
+  // succeeds and the out-of-prefix cat is denied by the gate (typed, never a trap).
+  "echo --text FSMARK",
+  "fs.policy-subtree --prefix /docs --access read-only $ fs.filtered $ cat /docs/about.txt",
+  "fs.policy-subtree --prefix /docs --access read-only $ fs.filtered $ cat /welcome.txt",
+  // The virtual-NIC switch over the echo fixture: two isolated virtual MACs on one
+  // upstream link; vnicheck verifies the whole switching policy and reports the MACs.
+  "echo --text SWMARK",
+  "let sw = rename port-a link-a $ rename port-b link-b $ net.l2.switch",
+  "net.l2.echo $ sw $ vnicheck --mode echo",
+  // A degraded clock is just another provider: time.fuzzy composes over the browser
+  // clock and the program runs unchanged (--name avoids the Hello-world count check).
+  "time.fuzzy $ hello --name fuzzy --excited false",
   "exit",
 ];
 lines.length = 0;
@@ -166,6 +192,12 @@ const deterministic =
 const [ampOnly, explorePart] = (ampPart || "").split("EXPLOREMARK");
 const ampRun = (ampOnly?.match(/^\d{3,}$/gm) || []).slice(0, 2);
 const exploreRun = (explorePart?.match(/^\d{3,}$/gm) || []).slice(0, 2);
+// The /bin catch-up sections (plan/18 D39), scoped by their markers.
+const gfxPart = (interactive.split("GFXMARK")[1] || "").split("SOCKMARK")[0] || "";
+const sockPart = (interactive.split("SOCKMARK")[1] || "").split("FSMARK")[0] || "";
+const fsPart = (interactive.split("FSMARK")[1] || "").split("SWMARK")[0] || "";
+const swPart = interactive.split("SWMARK")[1] || "";
+const drawChecksums = gfxPart.match(/presented\((\d+)\)/g) || [];
 // Bare `hello` (default name), the bare only-pass form, and the bare frozen-clock form each
 // greet "world" exactly once; the bare only-refusal must not add a fourth.
 const helloWorldCount = (interactive.match(/Hello, world/g) || []).length;
@@ -200,9 +232,12 @@ const checks = [
     /helpenv: bound \(a provider of /.test(interactive) && /generated\(1\)/.test(interactive),
   ],
   [
+    // Scoped to the transcript before the policy sections: a *denied* fs operation later
+    // on legitimately reports the typed fs error (`fs("FsError::Denied")` from cat); the
+    // rule here is only that the RESOLVER's refusal never leaks filesystem enum text.
     "an unknown name gets the no-such-binding-or-program refusal (no enum leak)",
     /cannot resolve `frobnicate`: no such binding or program/.test(interactive) &&
-      !/FsError::/.test(interactive),
+      !/FsError::/.test(beforeAmp),
   ],
   [
     "describe explains the diagnostics rider",
@@ -284,6 +319,32 @@ const checks = [
     "& is right-biased: the --seed 7 layer shadows the default-seeded one",
     ampRun.length === 2 && run1.length === 3 && ampRun[0] !== run1[0],
   ],
+  // --- the /bin catch-up (plan/18 D39) ---
+  [
+    "gfx: gfx.mem $ draw round-trips the pattern, deterministically (twice, same checksum)",
+    drawChecksums.length === 2 && drawChecksums[0] === drawChecksums[1],
+  ],
+  [
+    "net: loopback $ sockcheck passes the full TCP/UDP suite in-page",
+    /echoed\(/.test(sockPart),
+  ],
+  [
+    "net: the unconfigured ports policy denies sockcheck (typed failure, no trap)",
+    /denied/i.test(sockPart) && !/trapped/.test(sockPart),
+  ],
+  [
+    "fs: the subtree policy admits the in-prefix read through fs.filtered",
+    /capability-secure OS/.test(fsPart) && /printed\(/.test(fsPart),
+  ],
+  [
+    "fs: the out-of-prefix read is denied by the gate (typed failure, no trap)",
+    /denied/i.test(fsPart) && !/trapped/.test(fsPart),
+  ],
+  [
+    "switch: vnicheck verifies the switching policy over net.l2.echo (both MACs)",
+    /mac-a=02:e0:09:00:00:01 mac-b=02:e0:09:00:00:02/.test(swPart),
+  ],
+  ["time.fuzzy composes over the browser clock and hello runs", /Hello, fuzzy/.test(swPart)],
   ["interactive: session exited", bootRc === 0 && /success\(exited\)/.test(interactive)],
 ];
 let ok = true;

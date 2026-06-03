@@ -59,6 +59,27 @@ static BIN: &[BinProgram] = &[
     // (a virtualized clock).
     bin!("entropy.seeded"),
     bin!("time.frozen"),
+    bin!("time.fuzzy"),
+    // The browser-runnable spread of the kernel store (plan/18 D39). Every chain is
+    // all-guest or roots in the page's own providers, so the fused composition compiles
+    // and runs entirely client-side:
+    //   gfx.mem --width 64 --height 64 $ draw          (deterministic pixels + checksum)
+    //   net.l4.loopback $ sockcheck --payload "hi"     (real TCP/UDP semantics, in-page)
+    //   fs.policy-subtree --prefix /docs --access read-only $ fs.filtered $ cat …
+    //   net.l4.loopback $ net.policy-ports … $ net.l4.filtered $ sockcheck …
+    //   let sw = rename port-a link-a $ rename port-b link-b $ net.l2.switch
+    //   net.l2.echo $ sw $ vnicheck --mode echo        (two virtual NICs over one link)
+    bin!("gfx.mem"),
+    bin!("draw"),
+    bin!("net.l4.loopback"),
+    bin!("sockcheck"),
+    bin!("fs.filtered"),
+    bin!("fs.policy-subtree"),
+    bin!("net.l4.filtered"),
+    bin!("net.policy-ports"),
+    bin!("net.l2.switch"),
+    bin!("net.l2.echo"),
+    bin!("vnicheck"),
 ];
 
 /// Seed `/bin/<name>.wasm` with each program's raw component bytes so eosh's `resolve`
