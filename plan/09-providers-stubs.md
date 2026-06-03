@@ -605,3 +605,48 @@ Match the priority order above; (1)+(2) unblock I2.
     submitting operation, kicking before waiting; (4) keep used-element consumption await-free
     so a cancel cannot land mid-consume; (5) accept interrupt-vector loss on cancellation
     (degrade to polled) or restructure to preserve the vector across the wait.
+
+35. **`gpu.virtio` converts to honest awaits — the last eager driver falls (2026-06-02,
+    branch `area/09-async-gpu`).** The conversion follows D34's pattern exactly, point by
+    point: (1) the `ProviderState` closure state became the take/put `Slot`
+    (`Empty | Busy | Ready`) with a `DriverGuard` that restores the driver — framebuffer
+    allocation included, preserving the never-drop-DMA rule — on every exit path,
+    cancellation included, resyncing the consumed cursor against completions already
+    posted (a synchronous DMA read; `Drop` cannot await); (2) the control queue keeps its
+    free-running `avail_index`/`used_index` pair; (3) `drain_stale` runs at the top of
+    `command()` — the single submitting operation every gfx op funnels through — kicking
+    once (idempotent; the cancelled command may never have been kicked) before consuming
+    the leftover completion with the normal bounded wait, so the D34 invariant holds: when
+    a command begins writing the shared descriptor chain and command/response page, the
+    device has posted completions for everything previously published; (4) used-element
+    consumption stays await-free; (5) a cancel landing inside the INTx `pci::wait` drops
+    the vector with the future — later commands complete polled, graceful degradation. The
+    eager `poll_eager`/"provider suspended" machinery is deleted; the unconditional
+    ISR-ack-on-completion and the once-per-conversation polled-fallback notice (the gpu-
+    freeze branch's fixes) are retained verbatim.
+
+    **Deadline audit** (every parking await bounded, sibling table style): interrupt wait —
+    `INTERRUPT_WAIT_RETRIES` (4) per command, each `pci::wait` kernel-bounded, fallback to
+    polled; polled loop — `POLL_LIMIT` (50M host calls) → typed `io` error with device
+    status; reset spin — 1000 iterations; `drain_stale` — reuses the wait machinery's
+    bounds, one iteration per leftover command (≤1: queue depth is one); all other pci
+    awaits — host calls the kernel bounds, resolving within the call against the root and
+    bounded by the interposer's own deadlines under interposition.
+
+    **The sync-`mode` consequence**: bring-up awaits, so the synchronous `mode` export can
+    no longer probe on first use — before bring-up it answers a typed `io` error explaining
+    the wake-up dance (the exact shape of `disk.virtio`'s `size` reporting 0, plan/14 D25).
+    The draw example wakes device-backed providers with one awaited zero-area `clear`
+    before asking for the mode (harmless on gfx.mem; against gfx.deny the wake-up itself
+    answers the same typed `denied` the old first-`mode` did — the gfx.deny integration
+    test passes unchanged, comment updated).
+
+    Verification: `cargo xtask check-gpu` pixel-exact on both frames; scripted metal
+    session — cold draw 13 s with exactly one `codegen: compiling` announce, repeat draw
+    2 s with a session-cache hit and no second announce (timing unchanged from the gpu-
+    freeze baseline), Ctrl-C landing after `codegen: compiled` (the driver run phase, an
+    INTx wait in flight) → `pci: quiesced 1 device(s) at task teardown` + `abnormal:
+    killed` → the next `gpu.virtio $ draw` re-claims and presents the correct checksum
+    over INTx; full `cargo xtask ci` green. Same honesty bound as D34: the cancel-mid-
+    flight misattribution window itself is pinned by the pattern and audit, not an
+    executable test, until the hardening lane grows a cancellable metal consumer.

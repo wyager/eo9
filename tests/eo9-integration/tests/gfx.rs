@@ -195,9 +195,10 @@ fn gfx_deny_seals_the_import_and_the_program_reports_denied() {
         "gfx.deny must seal the gfx import (no residual gfx requirement): {residual:?}"
     );
 
-    // `draw`'s very first gfx call is `mode`, which gfx.deny answers with the API's own
-    // `denied` — the program reports it in its own vocabulary; never a trap, never a
-    // loader error.
+    // `draw`'s very first gfx call is its wake-up `clear` (see the example: device-backed
+    // providers bring up on the first awaited operation), which gfx.deny answers with the
+    // API's own `denied` — the program reports it in its own vocabulary; never a trap,
+    // never a loader error.
     let outcome = run_draw(&sealed, &[]);
     match outcome {
         Outcome::Failure(failure) => assert!(

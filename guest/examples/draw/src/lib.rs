@@ -113,6 +113,25 @@ eo9_guest::main! {
         let gfx_failure = |err: gfx::GfxError| ProgramFailure::Gfx(format!("{err:?}"));
 
         let g = gfx::default();
+        // Device-backed providers bring their device up on the first *awaited* operation
+        // — `mode` is synchronous and cannot (gpu.virtio answers a typed `io` error
+        // before bring-up; the disk family's `size` has the same shape, and fs.eofs
+        // wakes its disk with one read). A zero-area clear is the cheapest awaited
+        // no-op: on gfx.mem and an already-up device it changes nothing, and a failing
+        // provider surfaces its real, typed bring-up error here — richer than the
+        // "not brought up" answer `mode` would give.
+        gfx::clear(
+            &g,
+            gfx::Rect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
+            0,
+        )
+        .await
+        .map_err(gfx_failure)?;
         let mode = gfx::mode(&g).map_err(gfx_failure)?;
         if mode.width < 8 || mode.height < 8 {
             return Err(ProgramFailure::BadArguments(format!(
