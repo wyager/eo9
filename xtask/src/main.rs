@@ -1823,8 +1823,10 @@ fn build_kernel_x86_64(root: &Path) -> Result<PathBuf, String> {
             "--target",
             KERNEL_X86_64_TARGET,
             "--features",
-            kernel_features("wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen,first-poll-inline")
-                .as_str(),
+            kernel_features(
+                "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen,first-poll-inline",
+            )
+            .as_str(),
         ],
         &[
             ("EO9_SEED_CWASM", seed.as_os_str()),
@@ -1966,8 +1968,10 @@ fn build_kernel_riscv64(root: &Path) -> Result<PathBuf, String> {
             "--target",
             KERNEL_RISCV64_TARGET,
             "--features",
-            kernel_features("wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen,first-poll-inline")
-                .as_str(),
+            kernel_features(
+                "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen,first-poll-inline",
+            )
+            .as_str(),
         ],
         &[
             ("EO9_SEED_CWASM", seed.as_os_str()),
