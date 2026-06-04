@@ -47,6 +47,10 @@ wasm-storedisk = ["wasm-store", "dep:eo9-eofs", "dep:blake3"]
 # A/B or bisection build is `EO9_KERNEL_FEATURES_REMOVE=first-poll-inline` (see xtask's
 # kernel_features). The weak reference keeps host-triple (stub) builds inert.
 first-poll-inline = ["wasmtime?/component-model-async-first-poll"]
+# Temporary spawn-path phase tracing (docs/spikes/spawn-latency.md): per-phase micros
+# accumulated across the algebra/compile/spawn host calls, one summary line per spawn.
+# Measurement-only; enable with EO9_KERNEL_FEATURES_EXTRA=spawn-trace. Never default.
+spawn-trace = []
 
 # These dependencies are only used by the real bare-metal build; host-triple builds (unit
 # tests, `cargo check` without --target) compile the stub entry point and need neither.

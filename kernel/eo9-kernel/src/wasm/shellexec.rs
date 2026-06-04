@@ -847,6 +847,8 @@ fn spawn_child(
         )));
     }
 
+    #[cfg(feature = "spawn-trace")]
+    let __trace_linker = crate::timer::uptime_us();
     let mut linker: Linker<KernelState> = Linker::new(engine);
     providers::add_providers(&mut linker).map_err(internal)?;
     super::shellfs::add_buffers(&mut linker).map_err(internal)?;
@@ -858,7 +860,11 @@ fn spawn_child(
     if super::pci_provider::granted() {
         super::pci_provider::add_pci(&mut linker).map_err(internal)?;
     }
+    #[cfg(feature = "spawn-trace")]
+    spawn_trace::add_since(spawn_trace::LINKER, __trace_linker);
 
+    #[cfg(feature = "spawn-trace")]
+    let __trace_state = crate::timer::uptime_us();
     let mut state = KernelState::new();
     // The svc capability reaches exactly the configured number of generations down
     // (owner ruling B, mirroring the usermode generation count): init holds 2, so its
@@ -870,17 +876,25 @@ fn spawn_child(
         exec: ShellExec::default(),
         engine: engine.clone(),
     }));
+    #[cfg(feature = "spawn-trace")]
+    spawn_trace::add_since(spawn_trace::STATE, __trace_state);
+    #[cfg(feature = "spawn-trace")]
+    let __trace_store = crate::timer::uptime_us();
     let mut store = Store::new(engine, state);
     if let Some(max_memory) = max_memory {
         store.data_mut().set_max_memory(max_memory);
         store.limiter(|state| state.limiter());
     }
+    #[cfg(feature = "spawn-trace")]
+    spawn_trace::add_since(spawn_trace::STORE, __trace_store);
 
     // Instantiation runs on a small bounded fuel budget paid by the spawner (usermode
     // `SPAWN_FUEL` parity): any start-time code either finishes within it or the spawn
     // fails — never an unbounded burn. It must also not depend on external completions;
     // drive it with a bounded poll loop, as usermode `spawn` does.
     store.set_fuel(SPAWN_FUEL).map_err(internal)?;
+    #[cfg(feature = "spawn-trace")]
+    let __trace_inst = crate::timer::uptime_us();
     let instance = {
         let instantiate = linker.instantiate_async(&mut store, component);
         let mut instantiate = core::pin::pin!(instantiate);
@@ -916,6 +930,8 @@ fn spawn_child(
                 }
             })?
     };
+    #[cfg(feature = "spawn-trace")]
+    spawn_trace::add_since(spawn_trace::INSTANTIATE, __trace_inst);
 
     // Apply any compose-time configuration baked into the artifact (plan/03 D23): a
     // configured composition exports `eo9:rt/configured`, whose parameterless `bind`
@@ -924,6 +940,8 @@ fn spawn_child(
     // bounded spawn budget — configuration binds constants and must not block. A
     // configuration the provider rejects comes back as `bind`'s typed error (never a
     // trap) and refuses the spawn.
+    #[cfg(feature = "spawn-trace")]
+    let __trace_bind = crate::timer::uptime_us();
     if let Some(bind) = super::bind_entrypoint(&instance, &mut store) {
         let mut bind_results =
             alloc::vec![Val::Bool(false); super::bind_result_slots(&bind, &store)];
@@ -973,6 +991,8 @@ fn spawn_child(
             )));
         }
     }
+    #[cfg(feature = "spawn-trace")]
+    spawn_trace::add_since(spawn_trace::BIND, __trace_bind);
 
     // Normal fuel regime for the child's life (usermode parity): an effectively-infinite
     // pool sliced by the fixed yield quantum, so every poll of the child runs at most
@@ -983,6 +1003,8 @@ fn spawn_child(
         .fuel_async_yield_interval(Some(FUEL_QUANTUM))
         .map_err(internal)?;
 
+    #[cfg(feature = "spawn-trace")]
+    let __trace_args = crate::timer::uptime_us();
     let main = instance
         .get_func(&mut store, "main")
         .ok_or_else(|| WitSpawnError::Internal("component does not export `main`".to_string()))?;
@@ -1040,6 +1062,11 @@ fn spawn_child(
         }
         parents[rep] = parent;
     });
+    #[cfg(feature = "spawn-trace")]
+    {
+        spawn_trace::add_since(spawn_trace::ARGS, __trace_args);
+        spawn_trace::dump_and_reset();
+    }
     Ok(rep as u32)
 }
 
@@ -1071,6 +1098,66 @@ const COMPILE_CACHE_ENTRIES: usize = 8;
 /// FNV-1a over the executable bytes: the compile cache's search key. Collisions are
 /// harmless — a hit is confirmed by full-bytes equality before it is served.
 #[cfg(feature = "wasm-codegen")]
+/// Spawn-path phase tracing (measurement-only; `spawn-trace` feature). Accumulates
+/// per-phase microseconds across the host calls a single prompt-line spawn makes, and
+/// prints one summary line when the spawn completes. Phases overlap nothing: each is a
+/// disjoint slice of kernel-side work; the residual vs. the externally measured
+/// echo-to-first-line total is guest-side (eosh parse/resolve) plus fs reads.
+#[cfg(feature = "spawn-trace")]
+pub(super) mod spawn_trace {
+    use super::KLock;
+
+    pub const FS_READ: usize = 0;
+    pub const ALG_LOAD: usize = 1;
+    pub const ALG_OP: usize = 2;
+    pub const EXEC_BYTES: usize = 3;
+    pub const HASH_LOOKUP: usize = 4;
+    pub const LINKER: usize = 5;
+    pub const STATE: usize = 6;
+    pub const STORE: usize = 7;
+    pub const INSTANTIATE: usize = 8;
+    pub const BIND: usize = 9;
+    pub const ARGS: usize = 10;
+    pub const N: usize = 11;
+    const NAMES: [&str; N] = [
+        "fs-read",
+        "alg-load",
+        "alg-op",
+        "exec-bytes",
+        "hash-lookup",
+        "linker",
+        "state",
+        "store",
+        "instantiate",
+        "bind",
+        "args",
+    ];
+
+    static PHASES: KLock<[u64; N]> = KLock::new([0; N]);
+    static COUNTS: KLock<[u64; N]> = KLock::new([0; N]);
+
+    pub fn add_since(idx: usize, started_us: u64) {
+        let elapsed = crate::timer::uptime_us().saturating_sub(started_us);
+        PHASES.with(|p| p[idx] += elapsed);
+        COUNTS.with(|c| c[idx] += 1);
+    }
+
+    pub fn dump_and_reset() {
+        let phases = PHASES.with(|p| core::mem::take(p));
+        let counts = COUNTS.with(|c| core::mem::take(c));
+        let mut line = alloc::string::String::from("spawn-trace:");
+        let mut total = 0u64;
+        for i in 0..N {
+            if counts[i] > 0 {
+                line.push_str(&alloc::format!(" {}={}us/{}", NAMES[i], phases[i], counts[i]));
+                total += phases[i];
+            }
+        }
+        line.push_str(&alloc::format!(" kernel-total={}us", total));
+        crate::kprintln!("{}", line);
+    }
+}
+
 fn compile_cache_hash(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
@@ -1278,6 +1365,8 @@ fn alg_binary_op(
         &eo9_component::Component,
     ) -> core::result::Result<eo9_component::Component, eo9_component::ComposeError>,
 ) -> core::result::Result<Resource<AlgComponentRes>, WitComposeError> {
+    #[cfg(feature = "spawn-trace")]
+    let __trace_op = crate::timer::uptime_us();
     let load = |bytes| {
         eo9_component::Component::load(bytes)
             .map_err(|err| WitComposeError::Internal(format!("operand is not a component: {err}")))
@@ -1285,6 +1374,8 @@ fn alg_binary_op(
     let a = load(a)?;
     let b = load(b)?;
     let fused = op(&a, &b).map_err(|err| WitComposeError::Internal(format!("{err}")))?;
+    #[cfg(feature = "spawn-trace")]
+    spawn_trace::add_since(spawn_trace::ALG_OP, __trace_op);
     let rep = store
         .data_mut()
         .shell_exec()
@@ -1489,10 +1580,14 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
         |mut store: StoreContextMut<'_, KernelState>,
          (bytes,): (Vec<u8>,)|
          -> Result<(Result<Resource<AlgComponentRes>, WitLoadError>,)> {
+            #[cfg(feature = "spawn-trace")]
+            let __trace_load = crate::timer::uptime_us();
             let entries = store.data_mut().shell_entries()?;
             let entry = entries
                 .iter()
                 .position(|entry| entry.component == bytes.as_slice());
+            #[cfg(feature = "spawn-trace")]
+            spawn_trace::add_since(spawn_trace::ALG_LOAD, __trace_load);
             Ok((match entry {
                 Some(entry) => {
                     let rep = store.data_mut().shell_exec()?.insert_component(KComponent {
@@ -1825,19 +1920,27 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                     // parser predates, so compiling the stored (annotated) bytes would fail
                     // with an opaque parse error. Identical to the stored bytes when there is
                     // no annotation; `describe`/the algebra keep the full form (`kc.bytes`).
+                    #[cfg(feature = "spawn-trace")]
+                    let __trace_eb = crate::timer::uptime_us();
                     let exec_bytes = eo9_component::Component::load(component.bytes.clone())
                         .map(|c| c.executable_bytes())
                         .unwrap_or_else(|_| component.bytes.clone());
+                    #[cfg(feature = "spawn-trace")]
+                    spawn_trace::add_since(spawn_trace::EXEC_BYTES, __trace_eb);
 
                     // The session's in-RAM cache first: an identical composition spawned
                     // earlier this session re-uses its artifact and skips Cranelift (and
                     // the seconds-long console stall codegen means) entirely.
+                    #[cfg(feature = "spawn-trace")]
+                    let __trace_hl = crate::timer::uptime_us();
                     let cache_hash = compile_cache_hash(&exec_bytes);
-                    if let Some(component) = store
+                    let session_hit = store
                         .data_mut()
                         .shell_exec()?
-                        .cached_compile(cache_hash, &exec_bytes)
-                    {
+                        .cached_compile(cache_hash, &exec_bytes);
+                    #[cfg(feature = "spawn-trace")]
+                    spawn_trace::add_since(spawn_trace::HASH_LOOKUP, __trace_hl);
+                    if let Some(component) = session_hit {
                         let rep = store
                             .data_mut()
                             .shell_exec()?
