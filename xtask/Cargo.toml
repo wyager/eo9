@@ -12,6 +12,7 @@ publish.workspace = true
 # aarch64-unknown-none target — and `eo9-component` (a workspace crate) to describe each
 # store component so the kernel's read-only store image carries its metadata.
 [dependencies]
+blake3 = { workspace = true }
 eo9-component = { path = "../crates/eo9-component" }
 wasmtime = { workspace = true, features = ["cranelift", "component-model"] }
 wat = { workspace = true }
