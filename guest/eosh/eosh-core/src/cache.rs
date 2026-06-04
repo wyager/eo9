@@ -45,8 +45,11 @@ use crate::backend::NamedArg;
 const BYTES_MAX_ENTRIES: usize = 16;
 const BYTES_MAX_TOTAL: usize = 4 * 1024 * 1024;
 
-/// Image-cache bound (mirrors the kernel session caches' LRU-8).
-const IMAGES_MAX_ENTRIES: usize = 8;
+/// Image-cache bound. Deliberately small: a cached entry retains a live image handle
+/// in the embedder's exec provider, and that table is a bounded shared resource
+/// (usermode `MAX_IMAGES` is 16, shared with detached services' respawn churn).
+/// 4 keeps the repeated-prompt-line win while leaving the table mostly free.
+const IMAGES_MAX_ENTRIES: usize = 4;
 
 /// The bytes half: name → component bytes, LRU, eagerly invalidated.
 pub struct BytesCache {
