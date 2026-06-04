@@ -1,14 +1,14 @@
 {
-  "blob": "/vm/web-eo9.87dfaf6978176eee.wasm",
+  "blob": "/vm/web-eo9.bec5a2613011d744.wasm",
   "page": {
-    "vm.js": "/vm/vm.e6470be54b6cc6b9.js",
+    "vm.js": "/vm/vm.3363de7463cd0276.js",
     "vm.css": "/vm/vm.b7c2d1b49a4561f0.css"
   },
   "store": {
     "cat": "/vm/store/cat.90cc4eb3e3b00076.cwasm",
     "cp": "/vm/store/cp.68dc5be75f8e55e0.cwasm",
     "cruncher": "/vm/store/cruncher.1a5334df8e3a469a.cwasm",
-    "echo": "/vm/store/echo.94f87c58e63a06e8.cwasm",
+    "echo": "/vm/store/echo.8e3c595d2f29b60a.cwasm",
     "find": "/vm/store/find.0e1435e620cd1080.cwasm",
     "head": "/vm/store/head.8949b89a00decf83.cwasm",
     "hello": "/vm/store/hello.988d3eb7dc6e8e27.cwasm",

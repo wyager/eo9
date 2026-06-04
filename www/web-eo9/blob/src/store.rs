@@ -31,7 +31,7 @@ const PROGRAMS: &[(&str, &[ArgKind])] = &[
     // CLI's positional/variadic argument binding; an empty list means "the default".
     ("cat", &[ArgKind::TextList]),
     ("ls", &[ArgKind::TextList]),
-    ("echo", &[ArgKind::Text]),
+    ("echo", &[ArgKind::TextList]),
     ("rng", &[ArgKind::Number]),
     ("wc", &[ArgKind::TextList]),
     ("head", &[ArgKind::Number, ArgKind::TextList]),

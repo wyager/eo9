@@ -1864,3 +1864,10 @@ the default and the verified configuration.
     svcdemo, gicv3 demo + disk smoke, 10/10 unpaced paste bursts, check-gpu
     pixel-exact (TCG); boot + lspci + disk round-trip + l4check DNS + draw cold/warm
     (session-cache hit) + 3 paste bursts + the PL031 wall-clock read (HVF); full ci.
+
+## Entry 76 — console read-line gains arrow-key recall (2026-06-04)
+
+See plan/10 D24: the ReadLine future in `wasm/providers.rs` now parses ESC/CSI
+sequences (consumed, never leaked into the line) and serves ↑/↓ recall from a
+32-entry per-boot KLock ring. Shared across all three arches; paste-rate input and
+Ctrl-C semantics unchanged (12/12 aarch64 battery + riscv64/x86_64 smokes).
