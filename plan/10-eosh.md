@@ -329,6 +329,14 @@ session dir (the session is its only writer); metal storedisk's only writers are
 console's `save` and fs-granted programs (both intercepted); the browser store is
 read-only. External writers inside a session don't exist today on any target.
 
+Measured (QEMU aarch64 TCG, this branch vs master, back-to-back same-load A/B; the
+machine carried a concurrent agent's QEMU both sides): warm repeats of
+`time.frozen … $ hello` 25 ms -> **2-3 ms**; `gpu.virtio $ draw` ~165 ms of guest+algebra
+overhead -> ~1 ms (the residual 150-220 ms is the draw program itself running under
+TCG); bare `hello` was already ~1 ms (the kernel session compile cache covers
+single-leaf lines) and stays there. Live probes on metal: `save greet2 = hello` then
+`greet2` runs the saved bytes; the old name still runs; both sub-2 ms.
+
 Deliberate v1 limits, recorded: argument values are part of the key (`hello --name a`
 vs `--name b` rebuilds — argument-stripped image sharing via cached arg-specs is the
 follow-up); fs-importing programs invalidate even when composed behind a read-only
