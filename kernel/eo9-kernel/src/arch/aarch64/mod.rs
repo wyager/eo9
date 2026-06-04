@@ -71,7 +71,8 @@ pub(crate) fn banner() {
     );
 }
 
-/// Interrupt delivery: bring up the GICv2 and forward the EL1 physical timer PPI (INTID 30)
+/// Interrupt delivery: bring up the GIC and forward the EL1 virtual timer PPI (INTID 27 —
+/// the timer the kernel drives; the whole generic-timer PPI family 26/27/29/30 is enabled)
 /// plus the PL011 UART (SPI 33 on `virt`) so the executor can `wfi`-idle and be woken either
 /// by the timer (a sleep deadline) or by a keystroke arriving on the console — instead of
 /// busy-polling. The IRQ vector (boot.rs `__irq_entry` → `kirq`) acknowledges and EOIs them
