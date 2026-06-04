@@ -895,3 +895,21 @@ Match the priority order above; (1)+(2) unblock I2.
     verified, 74.1 s compile, clean poweroff. Kernel store 51→52
     (`net.l2.bridge`); `bridgecheck` is usermode-only (GUEST_COMPONENTS, not the
     kernel store). Full `cargo xtask ci` green per milestone.
+
+43. **`gpu.virtio $ draw` latency benchmarked — the graphics pipeline is not the cost
+    (2026-06-04, branch area/09-draw-bench).** Owner TODO. Phase-marked runs on QEMU
+    aarch64 (docs/spikes/draw-latency.md has the full tables): cold = 12.0 s of which
+    11.4 s is the announced on-target codegen of the 244 KiB composition (session- and
+    storedisk-cached; 2.1 s for the 136 KiB gfx.mem composition — tracks size); warm =
+    389 ms of which 339 ms (87%) is spawn/instantiate machinery before the program's
+    first instruction, scaling near-proportionally with fused-component size; the
+    entire device conversation (full-frame clear + 1.2 MB present with per-row DMA +
+    TRANSFER/FLUSH + INTx + 1.2 MB readback) totals ~13 ms warm, so the per-row-DMA
+    batching idea is measured irrelevant at 640x480 and `present` already transfers
+    only the damage rect. A cocoa `display` window changes nothing. Native baseline:
+    the identical workload is 130 ms warm / 590 ms cold in release usermode — TCG is
+    a 3x (warm) to 23x (compile) multiplier, so on real hardware warm draw is sub-100 ms
+    and cold is ~half a second. Recommendation recorded (not implemented, kernel lane):
+    profile the 339 ms spawn path — hash-equality memcmp, pre-instantiation validation,
+    per-spawn linker construction — if warm spawn latency ever matters beyond TCG demos.
+    No gpu.virtio or draw changes warranted.
