@@ -31,3 +31,14 @@ eo9-component = { workspace = true }
 [features]
 # Seeded scheduling perturbation in the sync primitives (test-only; see src/chaos.rs).
 chaos = []
+
+[lints.rust]
+# `--cfg loom` swaps the Doorbell's sync primitives for loom's model-checked versions
+# (src/loom_tests.rs; docs/spikes/timing-strategies.md). Declare it so the custom cfg
+# doesn't trip `unexpected_cfgs` in normal builds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+# Loom is compiled only under `--cfg loom` (never in default builds — the cfg is false on
+# every real target, so the dependency is not built, linked, or shipped).
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"

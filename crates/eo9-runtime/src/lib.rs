@@ -18,6 +18,8 @@ pub mod engine;
 pub mod exec;
 pub mod image;
 mod link;
+#[cfg(all(loom, test))]
+mod loom_tests;
 pub mod outcome;
 pub mod providers;
 pub mod svc;
