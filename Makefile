@@ -67,11 +67,13 @@ www-build: ensure-setup
 	cargo xtask build-web-vm
 	$(MAKE) www
 
+# `cargo xtask qemu` builds the kernel itself (with content-keyed freshness: a warm
+# repeat skips the componentize/precompile work entirely), so there is no separate
+# build step here. `FORCE=1 make qemu` rebuilds everything from the guest sources up.
 qemu: ensure-setup
 	@command -v qemu-system-aarch64 >/dev/null 2>&1 || { \
 	  echo "error: qemu-system-aarch64 not found — install QEMU (e.g. 'brew install qemu'), then re-run"; exit 1; }
-	cargo xtask build-kernel aarch64
-	cargo xtask qemu aarch64
+	EO9_FORCE_REBUILD=$(FORCE) cargo xtask qemu aarch64
 
 # Boots with the PCI grant, a virtio-gpu device, and a framebuffer WINDOW (the serial
 # console stays in this terminal). At the eosh> prompt, paint the window with:
@@ -79,11 +81,10 @@ qemu: ensure-setup
 gfx: ensure-setup
 	@command -v qemu-system-aarch64 >/dev/null 2>&1 || { \
 	  echo "error: qemu-system-aarch64 not found — install QEMU (e.g. 'brew install qemu'), then re-run"; exit 1; }
-	cargo xtask build-kernel aarch64
 	@echo ""
 	@echo "A QEMU framebuffer window opens; at the eosh> prompt try:   gpu.virtio \$$ draw"
 	@echo ""
-	cargo xtask qemu aarch64 pci gpu display
+	EO9_FORCE_REBUILD=$(FORCE) cargo xtask qemu aarch64 pci gpu display
 
 ci: ensure-setup
 	cargo xtask ci

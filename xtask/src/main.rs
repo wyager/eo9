@@ -675,7 +675,94 @@ fn test(root: &Path) -> Result<(), String> {
     run(&root.join("www"), "cargo", ["test", "--workspace"])
 }
 
+/// Validate feature set for componentized guests. Part of every componentize stamp
+/// AND the `wasm-tools validate` invocation: one constant, so the stamp cannot drift
+/// from the flags actually passed.
+const COMPONENT_VALIDATE_FEATURES: &str = "cm-async,cm-implements";
+
+/// One guest-workspace build per xtask invocation (see [`ensure_guest_workspace_built`]).
+static GUEST_WORKSPACE_BUILT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `EO9_FORCE_REBUILD=1` (any non-empty value other than `0`) disables every freshness
+/// skip below (componentize, kernel precompile); `make gfx FORCE=1` exports it. Outputs
+/// are still written through [`write_if_different`], so a forced run that reproduces
+/// identical bytes does not trigger a kernel relink.
+fn force_rebuild() -> bool {
+    std::env::var("EO9_FORCE_REBUILD")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false)
+}
+
+/// Content fingerprint for freshness stamps (blake3, hex).
+fn fingerprint_bytes(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+/// A step is fresh when its output exists and its stamp records exactly the expected
+/// input fingerprint. Stamps record *inputs only* (the cargo contract): a hand-corrupted
+/// output is not detected, exactly as with any cargo target dir.
+fn stamp_fresh(out: &Path, stamp: &Path, fingerprint: &str) -> bool {
+    !force_rebuild()
+        && out.is_file()
+        && std::fs::read_to_string(stamp)
+            .map(|recorded| recorded == fingerprint)
+            .unwrap_or(false)
+}
+
+fn write_stamp(stamp: &Path, fingerprint: &str) -> Result<(), String> {
+    std::fs::write(stamp, fingerprint)
+        .map_err(|err| format!("failed to write {}: {err}", stamp.display()))
+}
+
+/// Write only when the content differs, returning whether a write happened. Keeping
+/// mtimes stable on unchanged outputs is what lets the kernel's build.rs
+/// (`cargo:rerun-if-changed` on every embedded artifact path) skip the rebuild+relink
+/// on warm runs.
+fn write_if_different(path: &Path, bytes: &[u8]) -> Result<bool, String> {
+    if std::fs::read(path).map(|old| old == bytes).unwrap_or(false) {
+        return Ok(false);
+    }
+    std::fs::write(path, bytes)
+        .map(|()| true)
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))
+}
+
+/// `wasm-tools --version`, cached for the process (it is part of every componentize
+/// stamp: a wasm-tools upgrade must invalidate componentized outputs).
+fn wasm_tools_version() -> Result<String, String> {
+    static VERSION: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            let output = Command::new("wasm-tools")
+                .arg("--version")
+                .output()
+                .map_err(|err| format!("failed to run wasm-tools --version: {err}"))?;
+            if !output.status.success() {
+                return Err("wasm-tools --version failed".to_string());
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        })
+        .clone()
+}
+
 fn build_guest(root: &Path) -> Result<(), String> {
+    ensure_guest_workspace_built(root)?;
+    for package in GUEST_COMPONENTS {
+        componentize_guest_package(root, package)?;
+    }
+    Ok(())
+}
+
+/// Build the whole guest workspace for wasm32, once per xtask invocation. Every
+/// componentize/precompile consumer funnels through this single `cargo build
+/// --workspace` (cargo's own freshness makes the warm case one fast no-op check),
+/// replacing the old one-cargo-spawn-per-package pattern that dominated warm
+/// `build-kernel` runs.
+fn ensure_guest_workspace_built(root: &Path) -> Result<(), String> {
+    if GUEST_WORKSPACE_BUILT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
     let guest = root.join("guest");
     // Remapped paths make the component bytes identical from any checkout, so the
     // eo9-bundled-programs bundle (and the ci drift check over it) is checkout-independent.
@@ -691,12 +778,7 @@ fn build_guest(root: &Path) -> Result<(), String> {
             GUEST_TARGET,
         ],
         &[("RUSTFLAGS", remap.as_os_str())],
-    )?;
-
-    for package in GUEST_COMPONENTS {
-        componentize_guest_package(root, package)?;
-    }
-    Ok(())
+    )
 }
 
 /// Turn one already-built guest crate into a validated component under
@@ -713,6 +795,20 @@ fn componentize_guest_package(root: &Path, package: &str) -> Result<PathBuf, Str
         .join("release")
         .join(format!("{}.wasm", package.replace('-', "_")));
     let component = components_dir.join(format!("{package}.wasm"));
+    // Freshness: the componentized output is a pure function of the core module bytes,
+    // the wasm-tools binary, and the validate feature set. Skip the two wasm-tools
+    // subprocesses when none of those changed since the recorded stamp.
+    let module_bytes = std::fs::read(&module)
+        .map_err(|err| format!("failed to read {}: {err}", module.display()))?;
+    let stamp = components_dir.join(format!("{package}.wasm.stamp"));
+    let fingerprint = format!(
+        "module={} {} features={COMPONENT_VALIDATE_FEATURES}",
+        fingerprint_bytes(&module_bytes),
+        wasm_tools_version()?,
+    );
+    if stamp_fresh(&component, &stamp, &fingerprint) {
+        return Ok(component);
+    }
     run(
         &guest,
         "wasm-tools",
@@ -735,10 +831,11 @@ fn componentize_guest_package(root: &Path, package: &str) -> Result<PathBuf, Str
         [
             OsStr::new("validate"),
             OsStr::new("--features"),
-            OsStr::new("cm-async,cm-implements"),
+            OsStr::new(COMPONENT_VALIDATE_FEATURES),
             component.as_os_str(),
         ],
     )?;
+    write_stamp(&stamp, &fingerprint)?;
     println!("xtask: built component {}", component.display());
     Ok(component)
 }
@@ -746,21 +843,7 @@ fn componentize_guest_package(root: &Path, package: &str) -> Result<PathBuf, Str
 /// Build one guest crate and componentize it (the targeted version of [`build_guest`],
 /// used by `build-kernel` to refresh just the program it embeds).
 fn build_guest_component(root: &Path, package: &str) -> Result<PathBuf, String> {
-    let guest = root.join("guest");
-    let remap = remap_rustflags(root);
-    run_with_env(
-        &guest,
-        "cargo",
-        [
-            "build",
-            "-p",
-            package,
-            "--release",
-            "--target",
-            GUEST_TARGET,
-        ],
-        &[("RUSTFLAGS", remap.as_os_str())],
-    )?;
+    ensure_guest_workspace_built(root)?;
     componentize_guest_package(root, package)
 }
 
@@ -1581,13 +1664,13 @@ fn build_store_image(root: &Path, target: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&out_dir)
         .map_err(|err| format!("failed to create {}: {err}", out_dir.display()))?;
     let out_path = out_dir.join("store.img");
-    std::fs::write(&out_path, &image)
-        .map_err(|err| format!("failed to write {}: {err}", out_path.display()))?;
+    let wrote = write_if_different(&out_path, &image)?;
     println!(
-        "xtask: assembled store image {} ({} bytes, {} components, target {target})",
+        "xtask: assembled store image {} ({} bytes, {} components, target {target}{})",
         out_path.display(),
         image.len(),
-        KERNEL_STORE_COMPONENTS.len()
+        KERNEL_STORE_COMPONENTS.len(),
+        if wrote { "" } else { ", unchanged" }
     );
     Ok(out_path)
 }
@@ -1818,8 +1901,7 @@ fn build_kernel_x86_64(root: &Path) -> Result<PathBuf, String> {
     let seed_wasm_path = kernel_precompiled_dir(root, KERNEL_X86_64_TARGET).join("seed.wasm");
     std::fs::create_dir_all(seed_wasm_path.parent().unwrap())
         .map_err(|err| format!("failed to create precompiled dir: {err}"))?;
-    std::fs::write(&seed_wasm_path, &seed_wasm)
-        .map_err(|err| format!("failed to write {}: {err}", seed_wasm_path.display()))?;
+    write_if_different(&seed_wasm_path, &seed_wasm)?;
 
     run_with_env(
         &kernel_dir,
@@ -1963,8 +2045,7 @@ fn build_kernel_riscv64(root: &Path) -> Result<PathBuf, String> {
     let seed_wasm_path = kernel_precompiled_dir(root, KERNEL_RISCV64_TARGET).join("seed.wasm");
     std::fs::create_dir_all(seed_wasm_path.parent().unwrap())
         .map_err(|err| format!("failed to create precompiled dir: {err}"))?;
-    std::fs::write(&seed_wasm_path, &seed_wasm)
-        .map_err(|err| format!("failed to write {}: {err}", seed_wasm_path.display()))?;
+    write_if_different(&seed_wasm_path, &seed_wasm)?;
 
     run_with_env(
         &kernel_dir,
@@ -2025,8 +2106,7 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
         .join("seed.wasm");
     std::fs::create_dir_all(seed_wasm_path.parent().unwrap())
         .map_err(|err| format!("failed to create precompiled dir: {err}"))?;
-    std::fs::write(&seed_wasm_path, &seed_wasm)
-        .map_err(|err| format!("failed to write {}: {err}", seed_wasm_path.display()))?;
+    write_if_different(&seed_wasm_path, &seed_wasm)?;
 
     // The async canary (awaits time.sleep against the kernel timer), assembled from WAT.
     let sleepy_wat = root.join("kernel").join("seed").join("sleepy.wat");
@@ -2135,6 +2215,17 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
 /// (kernel/eo9-kernel/src/wasm/mod.rs) so deserialization accepts the artifact. Non-host
 /// targets (riscv64) additionally need the `kernel-cross-aot` xtask feature, which links
 /// every Cranelift backend.
+/// Bump whenever anything compile-relevant changes in [`precompile_for_kernel`]'s
+/// engine configuration (flag changes, or a wasmtime upgrade through the workspace
+/// pin): the freshness stamps key on it. Partial safety net for a missed bump:
+/// wasmtime embeds its engine version and compatibility-relevant settings (trap
+/// model, memory layout, target features) in every artifact and the kernel refuses
+/// a mismatch loudly at boot — but settings that only change codegen quality
+/// (e.g. opt level) are NOT refused, so a missed bump there silently keeps the old
+/// (semantically equivalent) artifacts. The bump discipline is load-bearing for
+/// that class; when in doubt, bump.
+const PRECOMPILE_CONFIG_REV: u32 = 1;
+
 fn precompile_for_kernel(
     root: &Path,
     component: &[u8],
@@ -2142,6 +2233,20 @@ fn precompile_for_kernel(
     file_name: &str,
     target: &str,
 ) -> Result<PathBuf, String> {
+    let out_dir = kernel_precompiled_dir(root, target);
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|err| format!("failed to create {}: {err}", out_dir.display()))?;
+    let out_path = out_dir.join(file_name);
+    // Freshness: the artifact is a pure function of the input component bytes, the
+    // compilation target, and the engine configuration (keyed by PRECOMPILE_CONFIG_REV).
+    let stamp = out_dir.join(format!("{file_name}.stamp"));
+    let fingerprint = format!(
+        "input={} target={target} config-rev={PRECOMPILE_CONFIG_REV}",
+        fingerprint_bytes(component),
+    );
+    if stamp_fresh(&out_path, &stamp, &fingerprint) {
+        return Ok(out_path);
+    }
     let mut config = wasmtime::Config::new();
     config
         .target(target)
@@ -2191,12 +2296,8 @@ fn precompile_for_kernel(
         .precompile_component(component)
         .map_err(|err| format!("failed to precompile {what}: {err:#}"))?;
 
-    let out_dir = kernel_precompiled_dir(root, target);
-    std::fs::create_dir_all(&out_dir)
-        .map_err(|err| format!("failed to create {}: {err}", out_dir.display()))?;
-    let out_path = out_dir.join(file_name);
-    std::fs::write(&out_path, &artifact)
-        .map_err(|err| format!("failed to write {}: {err}", out_path.display()))?;
+    write_if_different(&out_path, &artifact)?;
+    write_stamp(&stamp, &fingerprint)?;
     println!(
         "xtask: precompiled {what} -> {} ({} bytes, target {target})",
         out_path.display(),
