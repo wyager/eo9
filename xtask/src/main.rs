@@ -1675,27 +1675,42 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// The kernel feature list, with `EO9_KERNEL_FEATURES_EXTRA` appended when set.
+/// The kernel feature list, with `EO9_KERNEL_FEATURES_EXTRA` appended and
+/// `EO9_KERNEL_FEATURES_REMOVE` stripped when set.
 ///
-/// MEASUREMENT BUILDS ONLY: this hook exists so an A/B evaluation can build the kernel
-/// with an off-by-default vendored feature (e.g. `first-poll-inline`, see
-/// docs/spikes/first-poll-inline.md) without any change to the standard feature lists.
-/// Default builds never set it, so `make qemu`, `check-gpu`, and CI are byte-for-byte
-/// unaffected; nothing in the repo sets it either — it is typed by hand for a
-/// measurement run, e.g. `EO9_KERNEL_FEATURES_EXTRA=first-poll-inline cargo xtask qemu
-/// aarch64 pci disk`.
+/// MEASUREMENT BUILDS ONLY: these hooks exist so an A/B evaluation can build the kernel
+/// with a vendored feature added or removed without any change to the standard feature
+/// lists. Default builds set neither, so `make qemu`, `check-gpu`, and CI are
+/// unaffected; nothing in the repo sets them either — they are typed by hand for a
+/// measurement run:
+///   - append: `EO9_KERNEL_FEATURES_EXTRA=some-feature cargo xtask qemu aarch64`
+///   - remove (the `first-poll-inline` escape hatch — the feature is default-on since
+///     the GO ruling, docs/spikes/first-poll-inline.md "Default-on"):
+///     `EO9_KERNEL_FEATURES_REMOVE=first-poll-inline cargo xtask qemu aarch64 pci disk`
 fn kernel_features(base: &str) -> String {
-    match std::env::var("EO9_KERNEL_FEATURES_EXTRA") {
-        Ok(extra) if !extra.trim().is_empty() => {
-            let extra = extra.trim();
-            println!(
-                "xtask: MEASUREMENT BUILD — appending kernel feature(s) `{extra}` \
-                 (EO9_KERNEL_FEATURES_EXTRA)"
-            );
-            format!("{base},{extra}")
-        }
-        _ => base.to_string(),
+    let mut features: Vec<String> = base.split(',').map(str::to_string).collect();
+    if let Ok(extra) = std::env::var("EO9_KERNEL_FEATURES_EXTRA")
+        && !extra.trim().is_empty()
+    {
+        let extra = extra.trim();
+        println!(
+            "xtask: MEASUREMENT BUILD — appending kernel feature(s) `{extra}` \
+             (EO9_KERNEL_FEATURES_EXTRA)"
+        );
+        features.extend(extra.split(',').map(|f| f.trim().to_string()));
     }
+    if let Ok(remove) = std::env::var("EO9_KERNEL_FEATURES_REMOVE")
+        && !remove.trim().is_empty()
+    {
+        let names: Vec<&str> = remove.split(',').map(str::trim).collect();
+        println!(
+            "xtask: MEASUREMENT BUILD — removing kernel feature(s) `{}` \
+             (EO9_KERNEL_FEATURES_REMOVE)",
+            names.join(",")
+        );
+        features.retain(|f| !names.contains(&f.as_str()));
+    }
+    features.join(",")
 }
 
 /// x86_64 (QEMU `q35`, PVH direct boot): the same host-AOT precompile pipeline as the other
@@ -1817,7 +1832,10 @@ fn build_kernel_x86_64(root: &Path) -> Result<PathBuf, String> {
             "--target",
             KERNEL_X86_64_TARGET,
             "--features",
-            kernel_features("wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen").as_str(),
+            kernel_features(
+                "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen,first-poll-inline",
+            )
+            .as_str(),
         ],
         &[
             ("EO9_SEED_CWASM", seed.as_os_str()),
@@ -1959,7 +1977,10 @@ fn build_kernel_riscv64(root: &Path) -> Result<PathBuf, String> {
             "--target",
             KERNEL_RISCV64_TARGET,
             "--features",
-            kernel_features("wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen").as_str(),
+            kernel_features(
+                "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen,first-poll-inline",
+            )
+            .as_str(),
         ],
         &[
             ("EO9_SEED_CWASM", seed.as_os_str()),
@@ -2071,7 +2092,7 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
             // token) is aarch64-only for now: the kernel's ECAM bring-up is aarch64-virt
             // specific, so the other targets build without it.
             kernel_features(
-                "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen,wasm-storedisk",
+                "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen,wasm-storedisk,first-poll-inline",
             )
             .as_str(),
         ],
