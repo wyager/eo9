@@ -1,8 +1,8 @@
 //! The ARM generic timer (polled).
 //!
-//! Spike step 2 of the ladder: prove the counter is readable and that the EL1 physical
+//! Spike step 2 of the ladder: prove the counter is readable and that the EL1 virtual
 //! timer's compare condition fires. Interrupt delivery (GIC bring-up) is deliberately left
-//! for the scheduler milestone — the spike polls `CNTP_CTL_EL0.ISTATUS` instead, which
+//! for the scheduler milestone — the spike polls `CNTV_CTL_EL0.ISTATUS` instead, which
 //! exercises the same timer hardware without needing the interrupt controller.
 
 use crate::ticks::{ticks_to_ns, ticks_to_us};
@@ -15,12 +15,16 @@ pub fn frequency() -> u64 {
     frequency
 }
 
-/// Current physical counter value (CNTPCT_EL0), with an ISB so the read is not hoisted.
+/// Current virtual counter value (CNTVCT_EL0), with an ISB so the read is not hoisted.
+/// The virtual counter is the physical counter minus CNTVOFF, which is zero on QEMU
+/// `virt` (TCG boots with no offset) — and the virtual timer is the only generic timer
+/// Apple's Hypervisor.framework exposes to guests, so driving CNTV is what lets the
+/// same kernel run under both TCG and HVF (docs/spikes/spawn-latency.md).
 pub fn counter() -> u64 {
     let count: u64;
-    // SAFETY: an ISB plus a read of CNTPCT_EL0 has no side effects.
+    // SAFETY: an ISB plus a read of CNTVCT_EL0 has no side effects.
     unsafe {
-        core::arch::asm!("isb", "mrs {}, cntpct_el0", out(reg) count, options(nomem, nostack));
+        core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) count, options(nomem, nostack));
     }
     count
 }
@@ -44,14 +48,14 @@ pub fn subsecond_ns() -> u32 {
     ticks_to_ns(counter() % frequency, frequency) as u32
 }
 
-/// Disable the EL1 physical timer (clear ENABLE), deasserting its interrupt. The IRQ handler
+/// Disable the EL1 virtual timer (clear ENABLE), deasserting its interrupt. The IRQ handler
 /// calls this so the level-sensitive timer line drops before the EOI; the executor re-arms it
 /// with [`arm_wake`] before the next `wfi`.
 #[cfg(target_os = "none")]
 pub fn disable() {
-    // SAFETY: writing the EL1 physical timer control register at EL1 only affects that timer.
+    // SAFETY: writing the EL1 virtual timer control register at EL1 only affects that timer.
     unsafe {
-        core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 0_u64, options(nomem, nostack));
+        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 0_u64, options(nomem, nostack));
     }
 }
 
@@ -64,7 +68,7 @@ pub fn resolution_ns() -> u64 {
     u64::max(1, 1_000_000_000 / frequency)
 }
 
-/// Arm the EL1 physical timer to assert its interrupt `delay_ns` from now, *unmasked* so it
+/// Arm the EL1 virtual timer to assert its interrupt `delay_ns` from now, *unmasked* so it
 /// reaches the GIC and can wake a `wfi`. The kernel executor's idle path arms a wake, runs
 /// `wfi` with IRQ masked (so a pending timer/UART interrupt still wakes it — no lost-wakeup
 /// race), then unmasks: the pending timer IRQ is taken as an exception and serviced by `kirq`
@@ -83,11 +87,11 @@ pub fn arm_wake(delay_ns: u64) {
     let ticks = (u128::from(delay_ns) * u128::from(frequency) / 1_000_000_000) as u64;
     let tval = u64::from(u32::try_from(ticks.max(1)).unwrap_or(u32::MAX));
     // ENABLE = 1, IMASK = 0 (assert to the GIC).
-    // SAFETY: programming the EL1 physical timer at EL1 only affects that timer.
+    // SAFETY: programming the EL1 virtual timer at EL1 only affects that timer.
     unsafe {
         core::arch::asm!(
-            "msr cntp_tval_el0, {tval}",
-            "msr cntp_ctl_el0, {ctl}",
+            "msr cntv_tval_el0, {tval}",
+            "msr cntv_ctl_el0, {ctl}",
             tval = in(reg) tval,
             ctl = in(reg) 0b01_u64,
             options(nomem, nostack),
@@ -130,16 +134,16 @@ pub fn self_test() {
         ticks_to_us(second, frequency)
     );
 
-    // Program the EL1 physical timer 10 ms ahead with its interrupt masked, then poll the
+    // Program the EL1 virtual timer 10 ms ahead with its interrupt masked, then poll the
     // ISTATUS bit. ENABLE = 1, IMASK = 1.
     let programmed_ticks = frequency / 100;
     let start = counter();
-    // SAFETY: writing the EL1 physical timer's compare/control registers at EL1 is
+    // SAFETY: writing the EL1 virtual timer's compare/control registers at EL1 is
     // architecturally permitted and only affects the (masked) timer.
     unsafe {
         core::arch::asm!(
-            "msr cntp_tval_el0, {ticks}",
-            "msr cntp_ctl_el0, {ctl}",
+            "msr cntv_tval_el0, {ticks}",
+            "msr cntv_ctl_el0, {ctl}",
             ticks = in(reg) programmed_ticks,
             ctl = in(reg) 0b11_u64,
             options(nomem, nostack),
@@ -149,7 +153,7 @@ pub fn self_test() {
         let control: u64;
         // SAFETY: reading the timer control register has no side effects.
         unsafe {
-            core::arch::asm!("mrs {}, cntp_ctl_el0", out(reg) control, options(nomem, nostack));
+            core::arch::asm!("mrs {}, cntv_ctl_el0", out(reg) control, options(nomem, nostack));
         }
         if control & (1 << 2) != 0 {
             break;
@@ -159,7 +163,7 @@ pub fn self_test() {
     let elapsed = counter() - start;
     // SAFETY: disabling the timer again.
     unsafe {
-        core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 0_u64, options(nomem, nostack));
+        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 0_u64, options(nomem, nostack));
     }
     crate::kprintln!(
         "generic timer: 10 ms timer condition asserted after {} us (polled ISTATUS)",

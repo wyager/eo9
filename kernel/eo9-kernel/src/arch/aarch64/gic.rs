@@ -3,8 +3,8 @@
 //! The kernel's executor used to busy-poll on `Poll::Pending` (a guest awaiting
 //! `time.sleep`, or eosh awaiting `read-line` at the prompt), pinning a host CPU at 100%.
 //! The fix is to `wfi` instead, which only wakes on an interrupt that reaches the PE — so we
-//! bring up the GIC distributor + CPU interface and *forward* the EL1 physical timer PPI
-//! (INTID 30) and the PL011 UART SPI (INTID 33) to this core.
+//! bring up the GIC distributor + CPU interface and *forward* the EL1 virtual timer PPI
+//! (INTID 27) and the PL011 UART SPI (INTID 33) to this core.
 //!
 //! Interrupts are taken as exceptions: IRQs are unmasked (PSTATE.I = 0) once the GIC is up,
 //! the EL1 IRQ vector dispatches to `exceptions::kirq`, which reads the IAR, services the
@@ -321,7 +321,7 @@ pub fn configure_intid(intid: u32) {
     unsafe { core::ptr::write_volatile((base + prio_reg) as *mut u8, 0x80) };
 }
 
-/// Enable forwarding of a single interrupt ID (e.g. INTID 30, the EL1 physical timer PPI).
+/// Enable forwarding of a single interrupt ID (e.g. INTID 27, the EL1 virtual timer PPI).
 /// On GICv3, SGI/PPI enables live in the redistributor, and enabled SPIs are additionally
 /// routed to this PE (affinity 0.0.0.0) via `GICD_IROUTER<n>`.
 pub fn enable_intid(intid: u32) {
