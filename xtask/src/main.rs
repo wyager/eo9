@@ -2451,6 +2451,18 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
     if want_gicv3 && arch != "aarch64" {
         return Err("the `gicv3` argument is aarch64-only".to_string());
     }
+    // A bare `hvf` argument runs the aarch64 machine under Apple's Hypervisor.framework
+    // instead of TCG (docs/spikes/spawn-latency.md): native-speed guest execution on an
+    // Apple Silicon host. Opt-in only — TCG stays the default (deterministic timing
+    // characteristics, works on every host, and the long-verified configuration); HVF
+    // requires `-cpu host` (the guest sees the host CPU) and is rejected elsewhere by
+    // QEMU itself. Consumed by xtask; never reaches the kernel command line.
+    let want_hvf = append.iter().any(|argument| argument == "hvf");
+    if want_hvf && arch != "aarch64" {
+        return Err(
+            "the `hvf` argument is aarch64-only (Apple Silicon Hypervisor.framework)".to_string(),
+        );
+    }
     let aarch64_machine = format!(
         "virt,gic-version={},highmem=off{}",
         if want_gicv3 { "3" } else { "2" },
@@ -2474,7 +2486,7 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
             "-M",
             aarch64_machine.as_str(),
             "-cpu",
-            "max",
+            if want_hvf { "host" } else { "max" },
             "-device",
             "virtio-rng-pci",
         ],
@@ -2524,6 +2536,10 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         .copied()
         .map(Into::into)
         .collect();
+    if want_hvf {
+        args.insert(0, "-accel".into());
+        args.insert(1, "hvf".into());
+    }
     args.push(image.as_os_str().to_os_string());
     // The bare `disk` and `net` arguments are xtask's: attach the scratch virtio-blk disk
     // / a user-mode virtio-net NIC and keep the tokens off the kernel command line.
@@ -2554,6 +2570,9 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
             net_dump = true;
         } else if argument == "iommu" || argument == "gicv3" {
             // Consumed above (machine-type selection); never reaches the kernel command
+            // line.
+        } else if argument == "hvf" {
+            // Consumed above (accelerator selection); never reaches the kernel command
             // line.
         } else if argument == "display" {
             // Consumed above (console/window selection); never reaches the kernel
