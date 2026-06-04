@@ -38,8 +38,13 @@ const GICR_BASE: usize = 0x080A_0000;
 /// PE 0's SGI/PPI frame (the redistributor's second 64 KiB frame).
 const GICR_SGI_BASE: usize = GICR_BASE + 0x1_0000;
 
-/// `GICD_PIDR2` — architectural peripheral ID register; bits [7:4] are the GIC
-/// architecture revision (2 = GICv2, 3 = GICv3).
+/// GICv2 `ICPIDR2` — identification register **inside the 4 KiB v2 distributor frame**;
+/// bits [7:4] are the architecture revision. Read FIRST: on a GICv3 distributor this
+/// offset is reserved (RAZ), while the v3 register below sits outside a v2 frame entirely
+/// (QEMU maps only the 4 KiB the v2 device has — reading 0xFFE8 there is a data abort).
+const GICV2_ICPIDR2: usize = 0xFE8;
+/// GICv3 `GICD_PIDR2` — same field, at the 64 KiB v3 frame's identification block. Only
+/// probed once the v2 register read says "not v2".
 const GICD_PIDR2: usize = 0xFFE8;
 /// `GICD_IGROUPR<n>` base — one bit per INTID; 1 = group 1.
 const GICD_IGROUPR: usize = 0x080;
@@ -222,7 +227,16 @@ fn gicc_write(offset: usize, value: u32) {
 /// (the GIC sits in the device-mapped low gigabyte). Detects the GIC architecture revision
 /// from `GICD_PIDR2` and brings up whichever interface the machine exposes.
 pub fn init() {
-    let arch_rev = (gicd_read(GICD_PIDR2) >> 4) & 0xf;
+    // Two-step version probe, v2-frame-safe: the v2 ICPIDR2 (inside the 4 KiB frame every
+    // distributor maps) answers 2 on a v2 part and reads as reserved-zero on a v3 part;
+    // only when it is not a v2 do we touch the v3-frame PIDR2 (which a v2 device does not
+    // map at all — QEMU data-aborts there).
+    let v2_rev = (gicd_read(GICV2_ICPIDR2) >> 4) & 0xf;
+    let arch_rev = if v2_rev == 2 {
+        2
+    } else {
+        (gicd_read(GICD_PIDR2) >> 4) & 0xf
+    };
     if arch_rev >= 3 {
         VERSION.store(3, core::sync::atomic::Ordering::Relaxed);
         init_v3();
