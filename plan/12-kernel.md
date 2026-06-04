@@ -1740,3 +1740,32 @@ preemption/hardening work.
     the correct order, and the audit's SOUND majority is sound for structural reasons
     tokens cannot express. The audit's invariant inventory is judged worth more than the
     types.
+
+72. **GICv2 ack token, GICv3 support, and the Orange Pi 5 Plus prep pack (2026-06-03,
+    branch `area/12-board-prep`).** The three preparable halves of real-board bring-up,
+    landed before the board arrives:
+    * **The IAR→EOIR linear token** (entry 71's one queued follow-up): `gic::acknowledge()`
+      now returns `Option<Ack>` (`None` = spurious 1020–1023, no EOI obligation) and
+      `end_of_interrupt(Ack)` consumes it by value — EOI-without-ack unconstructible,
+      double-EOI a compile error, abandoned ack `#[must_use]`-linted + debug-drop panic.
+      Representation is the raw IAR **plus one** in a `NonZeroU32` (IAR 0 is a legal INTID
+      — SGI 0 — so the raw value has no spare zero; +1 cannot wrap at ≤ 24 significant
+      bits). Zero-cost verified: `Option<Ack>` const-asserted at 4 bytes and the release
+      `kirq` symbol byte-identical to master (0x118 = 0x118).
+    * **GICv3** behind boot-time detection: `GICD_PIDR2.ArchRev` selects v2 (today's
+      MMIO GICC path, byte-for-byte unchanged, no new boot output) or v3 (distributor
+      ARE+group-1, blanket group-1 IGROUPR — group 0 would signal FIQ, which this kernel
+      treats as fatal — redistributor wake + SGI-frame group/enable/priority for PPIs,
+      `GICD_IROUTER<n> = 0` affinity routing for SPIs, ICC_* sysreg CPU interface with
+      EOImode = 0 so the handler's ack→service→EOI flow is identical on both versions).
+      Detection is PIDR2 rather than DTB because the kernel has no DTB parser yet
+      (docs/board/gfx-simplefb.md scopes the first one); QEMU keeps GICD at the same base
+      for both versions, and a real board moves the bases into a board profile
+      (docs/board/orange-pi-5-plus.md item 5). The same `Ack` token spans both.
+      `cargo xtask qemu aarch64 gicv3 …` boots `-M virt,gic-version=3`.
+    * **The board docs**: docs/board/rk3588-pcie.md (the DesignWare config-access shim —
+      `ConfigAccess` trait with ECAM + DW implementations, the iATU CFG window mechanics,
+      the ECAM-refactor half that is implementable blind), docs/board/orange-pi-5-plus.md
+      (U-Boot recipe, SD layout, the eight known kernel changes with sizes, the day-one
+      smoke ladder), docs/board/gfx-simplefb.md (the dumb-framebuffer provider + the
+      minimal FDT reader as its blind-implementable core).

@@ -35,12 +35,12 @@ const VECTOR_NAMES: [&str; 16] = [
 /// the executor's `wfi` idle path — the timer for sleep deadlines, the UART for input.
 #[unsafe(no_mangle)]
 extern "C" fn kirq() {
-    let iar = super::gic::acknowledge();
-    let intid = iar & 0x3ff;
-    // 1020-1023 are spurious / special and must not be EOI'd.
-    if intid >= 1020 {
+    // A spurious read (`None`) carries no EOI obligation; everything else hands us a linear
+    // token that must reach `end_of_interrupt` below (dropping it is a debug-build panic).
+    let Some(ack) = super::gic::acknowledge() else {
         return;
-    }
+    };
+    let intid = ack.intid();
     // Generic-timer PPIs (26/27/29/30): drop the level-sensitive line before the EOI.
     if matches!(intid, 26 | 27 | 29 | 30) {
         crate::timer::disable();
@@ -62,7 +62,7 @@ extern "C" fn kirq() {
         super::gic::disable_intid(intid);
         crate::pci::intx_record(line as usize);
     }
-    super::gic::end_of_interrupt(iar);
+    super::gic::end_of_interrupt(ack);
 }
 
 /// Called from every exception vector (src/boot.rs) with the vector index and the

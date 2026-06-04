@@ -2340,12 +2340,26 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
     if attach_iommu && arch != "aarch64" {
         return Err("the experimental `iommu` argument is aarch64-only (SMMUv3)".to_string());
     }
+    // A bare `gicv3` argument boots the aarch64 machine with a GICv3 (system-register CPU
+    // interface + per-PE redistributor) instead of the default GICv2. The kernel detects
+    // the version at boot from GICD_PIDR2 and drives whichever it finds
+    // (src/arch/aarch64/gic.rs) — this is the QEMU stand-in for real GICv3 hardware like
+    // the RK3588's GIC-600 (docs/board/orange-pi-5-plus.md). Consumed by xtask; never
+    // reaches the kernel command line.
+    let want_gicv3 = append.iter().any(|argument| argument == "gicv3");
+    if want_gicv3 && arch != "aarch64" {
+        return Err("the `gicv3` argument is aarch64-only".to_string());
+    }
+    let aarch64_machine = format!(
+        "virt,gic-version={},highmem=off{}",
+        if want_gicv3 { "3" } else { "2" },
+        if attach_iommu { ",iommu=smmuv3" } else { "" },
+    );
     let machine: &[&str] = match arch {
-        // Pin GICv2: the kernel brings up the GIC distributor + CPU interface over MMIO
-        // (src/arch/aarch64/gic.rs) to forward the generic-timer interrupt so the executor
-        // can wfi-idle. With `-cpu max` QEMU would otherwise default to GICv3 (a
-        // system-register CPU interface with per-PE redistributors), which that minimal
-        // MMIO bring-up does not drive.
+        // GICv2 stays the pinned default (the long-verified configuration); the bare
+        // `gicv3` argument switches to the v3 machine, which the kernel's boot-time
+        // PIDR2 detection drives with the system-register CPU interface instead
+        // (src/arch/aarch64/gic.rs).
         //
         // `highmem=off` keeps the PCIe ECAM at its low address (0x3f00_0000, inside the
         // kernel's identity-mapped device gigabyte — see kernel src/pci.rs); with the
@@ -2355,17 +2369,9 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         // The `virtio-rng-pci` device is a PCIe function with no host-side configuration,
         // so the eo9:pci capability has something real to enumerate next to the host
         // bridge (the `lspci` demo; the kernel never touches it otherwise).
-        "aarch64" if attach_iommu => &[
-            "-M",
-            "virt,gic-version=2,highmem=off,iommu=smmuv3",
-            "-cpu",
-            "max",
-            "-device",
-            "virtio-rng-pci",
-        ],
         "aarch64" => &[
             "-M",
-            "virt,gic-version=2,highmem=off",
+            aarch64_machine.as_str(),
             "-cpu",
             "max",
             "-device",
@@ -2445,9 +2451,9 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
             // live exchanges — can be read back with tcpdump.
             attach_net = true;
             net_dump = true;
-        } else if argument == "iommu" {
-            // EXPERIMENTAL: consumed above (machine-type selection); never reaches the
-            // kernel command line.
+        } else if argument == "iommu" || argument == "gicv3" {
+            // Consumed above (machine-type selection); never reaches the kernel command
+            // line.
         } else if argument == "display" {
             // Consumed above (console/window selection); never reaches the kernel
             // command line.
