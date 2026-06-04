@@ -145,7 +145,7 @@ pub fn drain_rx() {
 /// on every receive-buffer read, so after a second of total input silence one harmless
 /// read of an empty receive buffer resumes a wedged feed.
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
-pub fn scavenge_rx(now_ns: u64) {
+pub fn scavenge_rx(now_ns: u64) -> usize {
     use core::sync::atomic::AtomicU64;
     static LAST_ACTIVITY_NS: AtomicU64 = AtomicU64::new(0);
     static LAST_KICK_NS: AtomicU64 = AtomicU64::new(0);
@@ -172,6 +172,7 @@ pub fn scavenge_rx(now_ns: u64) {
     }
     // SAFETY: restore supervisor interrupt delivery.
     unsafe { core::arch::asm!("csrsi sstatus, 2", options(nomem, nostack, preserves_flags)) };
+    moved
 }
 
 /// Consume one received byte from the interrupt-filled ring, or `None` if none is waiting.
