@@ -11,6 +11,11 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[build-dependencies]
+# The compiler fingerprint (build.rs): blake3 over kernel/vendor/** + engine-config
+# sources, emitted into every persistent compile-cache key.
+blake3 = { version = "1.8.5", default-features = false }
+
 [features]
 # Embed the host-precompiled seed wasm component (built by `cargo xtask build-kernel
 # aarch64`, passed in via the EO9_SEED_CWASM environment variable) and run it at boot.
@@ -33,7 +38,7 @@ wasm-store = ["dep:wasmtime"]
 # kernel/vendor). Off by default so `cargo xtask ci` (featureless kernel) stays lean.
 # Also links the no_std component algebra (eo9-component) so the shell can compose ($/&/
 # only/configure) and compile the fused result on-target (plan/12 Decisions 30–35).
-wasm-codegen = ["dep:wasmtime", "wasmtime/cranelift", "dep:eo9-component"]
+wasm-codegen = ["dep:wasmtime", "wasmtime/cranelift", "dep:eo9-component", "dep:blake3"]
 # The persistent store disk (plan/12: store-on-eofs): an in-kernel polled virtio-blk driver
 # plus the eofs engine, used as a disk-backed cache for on-target compile results. Activated
 # at boot only by the bare `storedisk` command-line token; without the token the feature is
@@ -51,6 +56,9 @@ first-poll-inline = ["wasmtime?/component-model-async-first-poll"]
 # accumulated across the algebra/compile/spawn host calls, one summary line per spawn.
 # Measurement-only; enable with EO9_KERNEL_FEATURES_EXTRA=spawn-trace. Never default.
 spawn-trace = []
+# Re-run every fusion the graph cache serves from memory and assert byte equality
+# (the encoder-determinism check, owner design). Verification batteries only.
+graph-verify = []
 
 # These dependencies are only used by the real bare-metal build; host-triple builds (unit
 # tests, `cargo check` without --target) compile the stub entry point and need neither.

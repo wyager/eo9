@@ -287,9 +287,20 @@ pub fn init() {
     STORE.with(|slot| *slot = Some(Mounted { fs }));
 }
 
-/// The cache key for a fused composition: blake3 of the exact bytes handed to the compiler.
+/// The cache key for a fused composition: blake3 over the **compiler fingerprint** (the
+/// build-time hash of kernel/vendor/** plus the engine-config sources — see build.rs and
+/// plan/12 entry 73) followed by the exact bytes handed to the compiler. The fingerprint
+/// lives in the key (owner ruling): a vendored compiler or engine-config change makes
+/// every old entry an unreachable clean miss — never a verification failure — and the
+/// keyed MAC stays reserved for genuine integrity failures (tamper/corruption). Old
+/// entries linger as unreferenced files until evicted (see the eviction notes in
+/// docs/spikes/spawn-latency.md).
 pub fn key(executable_bytes: &[u8]) -> String {
-    blake3::hash(executable_bytes).to_hex().as_str().into()
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"eo9-compile-cache-v2\0");
+    hasher.update(env!("EO9_COMPILER_FINGERPRINT").as_bytes());
+    hasher.update(executable_bytes);
+    hasher.finalize().to_hex().as_str().into()
 }
 
 /// Read and verify one entry file. Shared by the cache and `/bin` paths; the size cap and

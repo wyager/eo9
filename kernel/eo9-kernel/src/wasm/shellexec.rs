@@ -816,6 +816,40 @@ pub(super) fn bind_args(
 /// honest: a child only links the interfaces its (possibly `only`-restricted) component
 /// imports, so granting the full set is inert for programs that never asked for it, and a
 /// nested `eosh` is a full peer that can resolve `/bin`, spawn, and compose.
+/// The one spawn `Linker`, built lazily on first use and reused for every spawn (the
+/// host-function set is boot-constant: the only conditional registration is `eo9:pci`,
+/// gated by the boot command line's `pci` token, which never changes after boot). The
+/// stored bool is that grant bit — re-checked on every reuse as the grant-shape guard
+/// (security review of the spawn-cache design): a linker built under one grant shape can
+/// never serve a spawn under another. Per-spawn capability state (svc generations, the
+/// session fs, buffer tables) lives in the per-spawn `Store`, not the linker, so reuse
+/// shares no authority between spawns.
+static SPAWN_LINKER: KLock<Option<(bool, Arc<Linker<KernelState>>)>> = KLock::new(None);
+
+fn spawn_linker(engine: &Engine) -> Result<Arc<Linker<KernelState>>, wasmtime::Error> {
+    let granted = super::pci_provider::granted();
+    if let Some(linker) = SPAWN_LINKER.with(|slot| match slot {
+        Some((shape, linker)) if *shape == granted => Some(linker.clone()),
+        _ => None,
+    }) {
+        return Ok(linker);
+    }
+    let mut linker: Linker<KernelState> = Linker::new(engine);
+    providers::add_providers(&mut linker)?;
+    super::shellfs::add_buffers(&mut linker)?;
+    super::shellfs::add_fs(&mut linker)?;
+    add_exec(&mut linker)?;
+    // PCI is never granted by default (bus mastering means DMA): only when the boot's
+    // command line carried the `pci` token — and even then the loader rule applies, so
+    // only a child that imports `eo9:pci/pci` actually links it.
+    if granted {
+        super::pci_provider::add_pci(&mut linker)?;
+    }
+    let linker = Arc::new(linker);
+    SPAWN_LINKER.with(|slot| *slot = Some((granted, linker.clone())));
+    Ok(linker)
+}
+
 fn spawn_child(
     engine: &Engine,
     entries: &'static [super::store::StoreEntry],
@@ -849,17 +883,7 @@ fn spawn_child(
 
     #[cfg(feature = "spawn-trace")]
     let __trace_linker = crate::timer::uptime_us();
-    let mut linker: Linker<KernelState> = Linker::new(engine);
-    providers::add_providers(&mut linker).map_err(internal)?;
-    super::shellfs::add_buffers(&mut linker).map_err(internal)?;
-    super::shellfs::add_fs(&mut linker).map_err(internal)?;
-    add_exec(&mut linker).map_err(internal)?;
-    // PCI is never granted by default (bus mastering means DMA): only when the boot's
-    // command line carried the `pci` token — and even then the loader rule applies, so only
-    // a child that imports `eo9:pci/pci` actually links it.
-    if super::pci_provider::granted() {
-        super::pci_provider::add_pci(&mut linker).map_err(internal)?;
-    }
+    let linker = spawn_linker(engine).map_err(internal)?;
     #[cfg(feature = "spawn-trace")]
     spawn_trace::add_since(spawn_trace::LINKER, __trace_linker);
 
@@ -1081,6 +1105,13 @@ fn spawn_child(
 pub(super) struct KComponent {
     pub(super) bytes: Vec<u8>,
     pub(super) entry: Option<usize>,
+    /// The component's *semantic identity*: blake3 over its fusion graph (owner design,
+    /// plan/12 entry 73). A leaf (loaded component) hashes its bytes; an interior node
+    /// hashes (op tag ‖ ordered child hashes ‖ canonicalized args). Two prompt lines that
+    /// fuse the same graph — regardless of spelling, whitespace, or binding names — get
+    /// the same hash, and the fused-bytes and compiled-artifact session caches key on it,
+    /// so a repeat skips re-fusion, re-extraction, and recompilation entirely.
+    pub(super) graph_hash: [u8; 32],
 }
 
 /// One compiled image: the deserialized baked-in artifact.
@@ -1095,9 +1126,6 @@ struct KImage {
 #[cfg(feature = "wasm-codegen")]
 const COMPILE_CACHE_ENTRIES: usize = 8;
 
-/// FNV-1a over the executable bytes: the compile cache's search key. Collisions are
-/// harmless — a hit is confirmed by full-bytes equality before it is served.
-#[cfg(feature = "wasm-codegen")]
 /// Spawn-path phase tracing (measurement-only; `spawn-trace` feature). Accumulates
 /// per-phase microseconds across the host calls a single prompt-line spawn makes, and
 /// prints one summary line when the spawn completes. Phases overlap nothing: each is a
@@ -1158,30 +1186,89 @@ pub(super) mod spawn_trace {
     }
 }
 
-fn compile_cache_hash(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// Domain-separated blake3 over one fusion-graph node (owner design: the graph hash).
+/// `children` are the operands' graph hashes in operand order; `args` are the operation's
+/// canonicalized arguments (length-prefixed, in the order the operation received them —
+/// argument order is part of the operation's meaning, so a reordering is a different node
+/// and merely misses the cache).
+#[cfg(feature = "wasm-codegen")]
+fn graph_node_hash(tag: &str, children: &[[u8; 32]], args: &[&str]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"eo9-fusion-graph-v1\0");
+    hasher.update(&(tag.len() as u64).to_le_bytes());
+    hasher.update(tag.as_bytes());
+    hasher.update(&(children.len() as u64).to_le_bytes());
+    for child in children {
+        hasher.update(child);
     }
+    hasher.update(&(args.len() as u64).to_le_bytes());
+    for arg in args {
+        hasher.update(&(arg.len() as u64).to_le_bytes());
+        hasher.update(arg.as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// A leaf's graph hash: blake3 of the component bytes themselves.
+#[cfg(feature = "wasm-codegen")]
+fn graph_leaf_hash(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"eo9-fusion-leaf-v1\0");
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
+/// Per-store-entry leaf hashes, computed once on first use (the store is immutable for
+/// the boot's lifetime, so the hash of entry *i* never changes).
+#[cfg(feature = "wasm-codegen")]
+static ENTRY_LEAF_HASHES: KLock<Vec<Option<[u8; 32]>>> = KLock::new(Vec::new());
+
+#[cfg(feature = "wasm-codegen")]
+fn entry_leaf_hash(entries: &'static [super::store::StoreEntry], index: usize) -> [u8; 32] {
+    if let Some(hash) = ENTRY_LEAF_HASHES.with(|hashes| hashes.get(index).copied().flatten()) {
+        return hash;
+    }
+    let hash = graph_leaf_hash(entries[index].component);
+    ENTRY_LEAF_HASHES.with(|hashes| {
+        if hashes.len() <= index {
+            hashes.resize(index + 1, None);
+        }
+        hashes[index] = Some(hash);
+    });
     hash
 }
+
+/// The compiler fingerprint: a build-time blake3 over the vendored compiler sources
+/// (kernel/vendor/**) plus the engine-config sources (wasm/mod.rs, wasm/codegen.rs),
+/// emitted by build.rs. It joins every *persistent* compiled-artifact cache key (the
+/// storedisk compile cache), so a vendored cranelift/wasmtime change — including a
+/// miscompile fix — makes every old entry an unreachable clean MISS (owner ruling: the
+/// fingerprint lives in the lookup key; no verification-failure path exists for
+/// staleness; the keyed MAC stays reserved for genuine integrity failures, and the
+/// in-RAM session cache needs no fingerprint because one boot has one engine).
+#[cfg(feature = "wasm-codegen")]
+pub(super) const COMPILER_FINGERPRINT: &str = env!("EO9_COMPILER_FINGERPRINT");
 
 /// The shell session's exec state.
 #[derive(Default)]
 pub struct ShellExec {
     components: Vec<Option<KComponent>>,
     images: Vec<Option<KImage>>,
-    /// In-RAM compile cache for fused (algebra-result) components, keyed by a hash of the
-    /// executable bytes with a full-bytes equality check on hit. Re-running the same
-    /// composition (`gpu.virtio $ draw`, twice) costs Cranelift exactly once per session
-    /// instead of once per spawn — on-target codegen takes seconds (tens of seconds on a
-    /// loaded host) and blocks the whole console while it runs, so re-paying it for every
-    /// repeat of an identical command line read as the shell freezing (plan/12, the gfx
-    /// freeze investigation). The persistent `storedisk` cache is unchanged: it serves
-    /// across boots; this serves within a session and needs no disk.
+    /// In-RAM compiled-artifact cache, keyed by the **graph hash** (semantic identity —
+    /// see `KComponent::graph_hash`): covers fused algebra results *and* pristine store
+    /// entries (whose per-spawn deserialization is also nontrivial under TCG). LRU over
+    /// `COMPILE_CACHE_ENTRIES`. The blake3 key is collision-resistant, so no byte-equality
+    /// confirmation is needed (and on a hit there are no fused bytes to compare — the
+    /// whole point is that re-fusion was skipped). The persistent `storedisk` cache is
+    /// unchanged in role: it serves across boots; this serves within a session.
     #[cfg(feature = "wasm-codegen")]
-    compiled: Vec<(u64, Vec<u8>, Component)>,
+    compiled: Vec<([u8; 32], Component)>,
+    /// In-RAM fused-bytes cache, keyed by the graph hash: a repeat of an identical
+    /// fusion skips `eo9_component::compose`/`extend`/… entirely (the dominant warm
+    /// spawn cost — see docs/spikes/spawn-latency.md). Same LRU bound; ~250 KiB per
+    /// entry worst case.
+    #[cfg(feature = "wasm-codegen")]
+    fused: Vec<([u8; 32], Vec<u8>)>,
 }
 
 impl ShellExec {
@@ -1229,28 +1316,46 @@ impl ShellExec {
             .ok_or_else(|| wasmtime::Error::msg(format!("unknown component handle {rep}")))
     }
 
-    /// Look up a fused composition's compiled artifact in the session cache. A hit is
-    /// verified by full-bytes equality (the hash only narrows the search) and refreshed
-    /// to the back of the FIFO.
+    /// Look up a compiled artifact by graph hash (semantic identity); a hit refreshes the
+    /// entry to the back of the list (LRU).
     #[cfg(feature = "wasm-codegen")]
-    fn cached_compile(&mut self, hash: u64, exec_bytes: &[u8]) -> Option<Component> {
-        let index = self
-            .compiled
-            .iter()
-            .position(|(h, bytes, _)| *h == hash && bytes == exec_bytes)?;
+    fn cached_compile(&mut self, graph_hash: &[u8; 32]) -> Option<Component> {
+        let index = self.compiled.iter().position(|(h, _)| h == graph_hash)?;
         let entry = self.compiled.remove(index);
-        let component = entry.2.clone();
+        let component = entry.1.clone();
         self.compiled.push(entry);
         Some(component)
     }
 
-    /// Insert a freshly compiled fused composition, evicting the oldest entry beyond the
-    /// cache bound.
+    /// Insert a freshly compiled (or deserialized) artifact, evicting the
+    /// least-recently-used entry beyond the cache bound.
     #[cfg(feature = "wasm-codegen")]
-    fn cache_compile(&mut self, hash: u64, exec_bytes: Vec<u8>, component: Component) {
-        self.compiled.push((hash, exec_bytes, component));
+    fn cache_compile(&mut self, graph_hash: [u8; 32], component: Component) {
+        self.compiled.retain(|(h, _)| h != &graph_hash);
+        self.compiled.push((graph_hash, component));
         while self.compiled.len() > COMPILE_CACHE_ENTRIES {
             self.compiled.remove(0);
+        }
+    }
+
+    /// Look up fused bytes by graph hash; a hit refreshes to the back (LRU) and clones
+    /// the bytes (a bounded memcpy, far cheaper than re-running the fusion).
+    #[cfg(feature = "wasm-codegen")]
+    fn cached_fused(&mut self, graph_hash: &[u8; 32]) -> Option<Vec<u8>> {
+        let index = self.fused.iter().position(|(h, _)| h == graph_hash)?;
+        let entry = self.fused.remove(index);
+        let bytes = entry.1.clone();
+        self.fused.push(entry);
+        Some(bytes)
+    }
+
+    /// Remember a fusion result, evicting the least-recently-used entry beyond the bound.
+    #[cfg(feature = "wasm-codegen")]
+    fn cache_fused(&mut self, graph_hash: [u8; 32], bytes: Vec<u8>) {
+        self.fused.retain(|(h, _)| h != &graph_hash);
+        self.fused.push((graph_hash, bytes));
+        while self.fused.len() > COMPILE_CACHE_ENTRIES {
+            self.fused.remove(0);
         }
     }
 
@@ -1358,8 +1463,9 @@ fn unsupported(operation: &str) -> String {
 #[cfg(feature = "wasm-codegen")]
 fn alg_binary_op(
     store: &mut StoreContextMut<'_, KernelState>,
-    a: Vec<u8>,
-    b: Vec<u8>,
+    tag: &str,
+    a: KComponent,
+    b: KComponent,
     op: impl Fn(
         &eo9_component::Component,
         &eo9_component::Component,
@@ -1367,13 +1473,53 @@ fn alg_binary_op(
 ) -> core::result::Result<Resource<AlgComponentRes>, WitComposeError> {
     #[cfg(feature = "spawn-trace")]
     let __trace_op = crate::timer::uptime_us();
-    let load = |bytes| {
-        eo9_component::Component::load(bytes)
-            .map_err(|err| WitComposeError::Internal(format!("operand is not a component: {err}")))
+    let node_hash = graph_node_hash(tag, &[a.graph_hash, b.graph_hash], &[]);
+    // The fused-bytes session cache: an identical fusion graph re-fuses to identical
+    // bytes (the encoder is deterministic — BTreeMap-ordered, no randomness; the
+    // `graph-verify` feature re-runs the op on every hit and asserts equality, which the
+    // verification battery exercises), so a hit skips the fusion entirely.
+    let cached = store
+        .data_mut()
+        .shell_exec()
+        .ok()
+        .and_then(|exec| exec.cached_fused(&node_hash));
+    let fused_bytes = match cached {
+        Some(bytes) => {
+            #[cfg(feature = "graph-verify")]
+            {
+                let av = eo9_component::Component::load(a.bytes.clone()).map_err(|err| {
+                    WitComposeError::Internal(format!("operand is not a component: {err}"))
+                })?;
+                let bv = eo9_component::Component::load(b.bytes.clone()).map_err(|err| {
+                    WitComposeError::Internal(format!("operand is not a component: {err}"))
+                })?;
+                let refused = op(&av, &bv)
+                    .map_err(|err| WitComposeError::Internal(format!("{err}")))?
+                    .into_bytes();
+                assert!(
+                    refused == bytes,
+                    "graph-verify: fusion cache hit disagrees with re-encoding                      (the encoder is not deterministic, or the node hash is wrong)"
+                );
+                crate::kprintln!("graph-verify: fusion hit re-encoded identically");
+            }
+            bytes
+        }
+        None => {
+            let load = |bytes| {
+                eo9_component::Component::load(bytes).map_err(|err| {
+                    WitComposeError::Internal(format!("operand is not a component: {err}"))
+                })
+            };
+            let av = load(a.bytes)?;
+            let bv = load(b.bytes)?;
+            let fused = op(&av, &bv).map_err(|err| WitComposeError::Internal(format!("{err}")))?;
+            let bytes = fused.into_bytes();
+            if let Ok(exec) = store.data_mut().shell_exec() {
+                exec.cache_fused(node_hash, bytes.clone());
+            }
+            bytes
+        }
     };
-    let a = load(a)?;
-    let b = load(b)?;
-    let fused = op(&a, &b).map_err(|err| WitComposeError::Internal(format!("{err}")))?;
     #[cfg(feature = "spawn-trace")]
     spawn_trace::add_since(spawn_trace::ALG_OP, __trace_op);
     let rep = store
@@ -1381,7 +1527,8 @@ fn alg_binary_op(
         .shell_exec()
         .map_err(|err| WitComposeError::Internal(format!("{err}")))?
         .insert_component(KComponent {
-            bytes: fused.into_bytes(),
+            bytes: fused_bytes,
+            graph_hash: node_hash,
             entry: None,
         });
     Ok(Resource::new_own(rep))
@@ -1490,22 +1637,30 @@ pub(super) fn compile_component(
 ) -> Result<Component, String> {
     #[cfg(not(feature = "wasm-codegen"))]
     let _ = exec;
+    // The session cache first, keyed by the graph hash — the same discipline as the
+    // exec surface's `compile` (semantic identity; no byte equality needed).
+    #[cfg(feature = "wasm-codegen")]
+    if let Some(component) = exec.cached_compile(&component.graph_hash) {
+        return Ok(component);
+    }
     match component.entry {
         // SAFETY: the artifact comes from the store image produced by `cargo xtask
         // build-kernel` with the same wasmtime version and engine configuration.
-        Some(entry) => unsafe { Component::deserialize(engine, entries[entry].artifact) }
-            .map_err(|err| format!("the baked-in artifact failed to load: {err:?}")),
+        Some(entry) => {
+            let deserialized =
+                unsafe { Component::deserialize(engine, entries[entry].artifact) }
+                    .map_err(|err| format!("the baked-in artifact failed to load: {err:?}"));
+            #[cfg(feature = "wasm-codegen")]
+            if let Ok(image) = &deserialized {
+                exec.cache_compile(component.graph_hash, image.clone());
+            }
+            deserialized
+        }
         #[cfg(feature = "wasm-codegen")]
         None => {
             let exec_bytes = eo9_component::Component::load(component.bytes.clone())
                 .map(|c| c.executable_bytes())
                 .unwrap_or_else(|_| component.bytes.clone());
-            // The session's in-RAM cache first (hash narrows, full-bytes equality
-            // confirms — the same discipline as the exec surface's `compile`).
-            let cache_hash = compile_cache_hash(&exec_bytes);
-            if let Some(component) = exec.cached_compile(cache_hash, &exec_bytes) {
-                return Ok(component);
-            }
             // Codegen blocks the console; announce it so a long compile (a detach of a
             // large composition) never reads as a frozen shell.
             crate::kprintln!(
@@ -1515,12 +1670,12 @@ pub(super) fn compile_component(
             let started = crate::timer::uptime_us();
             let compiled = Component::new(engine, &exec_bytes)
                 .map_err(|err| format!("on-target compilation failed: {err:?}"));
-            if let Ok(component) = &compiled {
+            if let Ok(image) = &compiled {
                 crate::kprintln!(
                     "codegen: compiled in {} ms",
                     (crate::timer::uptime_us() - started) / 1000
                 );
-                exec.cache_compile(cache_hash, exec_bytes, component.clone());
+                exec.cache_compile(component.graph_hash, image.clone());
             }
             compiled
         }
@@ -1590,9 +1745,14 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
             spawn_trace::add_since(spawn_trace::ALG_LOAD, __trace_load);
             Ok((match entry {
                 Some(entry) => {
+                    #[cfg(feature = "wasm-codegen")]
+                    let graph_hash = entry_leaf_hash(entries, entry);
+                    #[cfg(not(feature = "wasm-codegen"))]
+                    let graph_hash = [0u8; 32];
                     let rep = store.data_mut().shell_exec()?.insert_component(KComponent {
                         bytes: entries[entry].component.to_vec(),
                         entry: Some(entry),
+                        graph_hash,
                     });
                     Ok(Resource::new_own(rep))
                 }
@@ -1602,9 +1762,12 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                 #[cfg(feature = "wasm-codegen")]
                 None => match eo9_component::Component::load(bytes) {
                     Ok(component) => {
+                        let bytes = component.into_bytes();
+                        let graph_hash = graph_leaf_hash(&bytes);
                         let rep = store.data_mut().shell_exec()?.insert_component(KComponent {
-                            bytes: component.into_bytes(),
+                            bytes,
                             entry: None,
+                            graph_hash,
                         });
                         Ok(Resource::new_own(rep))
                     }
@@ -1697,13 +1860,13 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
             let (pb, cb) = {
                 let exec = store.data_mut().shell_exec()?;
                 (
-                    exec.take_component(provider.rep())?.bytes,
-                    exec.take_component(consumer.rep())?.bytes,
+                    exec.take_component(provider.rep())?,
+                    exec.take_component(consumer.rep())?,
                 )
             };
             #[cfg(feature = "wasm-codegen")]
             {
-                Ok((alg_binary_op(&mut store, pb, cb, eo9_component::compose),))
+                Ok((alg_binary_op(&mut store, "compose", pb, cb, eo9_component::compose),))
             }
             #[cfg(not(feature = "wasm-codegen"))]
             {
@@ -1721,13 +1884,13 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
             let (bb, lb) = {
                 let exec = store.data_mut().shell_exec()?;
                 (
-                    exec.take_component(base.rep())?.bytes,
-                    exec.take_component(layer.rep())?.bytes,
+                    exec.take_component(base.rep())?,
+                    exec.take_component(layer.rep())?,
                 )
             };
             #[cfg(feature = "wasm-codegen")]
             {
-                Ok((alg_binary_op(&mut store, bb, lb, eo9_component::extend),))
+                Ok((alg_binary_op(&mut store, "extend", bb, lb, eo9_component::extend),))
             }
             #[cfg(not(feature = "wasm-codegen"))]
             {
@@ -1742,11 +1905,10 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
         |mut store: StoreContextMut<'_, KernelState>,
          (component, allow): (Resource<AlgComponentRes>, Vec<WitInterfaceRef>)|
          -> Result<(Result<Resource<AlgComponentRes>, WitRestrictError>,)> {
-            let bytes = store
+            let kc = store
                 .data_mut()
                 .shell_exec()?
-                .take_component(component.rep())?
-                .bytes;
+                .take_component(component.rep())?;
             #[cfg(feature = "wasm-codegen")]
             {
                 let allow: Vec<eo9_component::InterfaceRef> = allow
@@ -1756,18 +1918,43 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                         version: r.version,
                     })
                     .collect();
+                let arg_strings: Vec<String> = allow
+                    .iter()
+                    .map(|r| match &r.version {
+                        Some(version) => format!("{}@{}", r.interface, version),
+                        None => r.interface.clone(),
+                    })
+                    .collect();
+                let args_ref: Vec<&str> = arg_strings.iter().map(String::as_str).collect();
+                let node_hash = graph_node_hash("restrict", &[kc.graph_hash], &args_ref);
                 let result =
                     (|| -> core::result::Result<Resource<AlgComponentRes>, WitRestrictError> {
-                        let c = eo9_component::Component::load(bytes)
-                            .map_err(|e| WitRestrictError::Internal(format!("{e}")))?;
-                        let restricted = eo9_component::restrict(&c, &allow)
-                            .map_err(|e| WitRestrictError::Internal(format!("{e}")))?;
+                        let cached = store
+                            .data_mut()
+                            .shell_exec()
+                            .ok()
+                            .and_then(|exec| exec.cached_fused(&node_hash));
+                        let bytes = match cached {
+                            Some(bytes) => bytes,
+                            None => {
+                                let c = eo9_component::Component::load(kc.bytes)
+                                    .map_err(|e| WitRestrictError::Internal(format!("{e}")))?;
+                                let restricted = eo9_component::restrict(&c, &allow)
+                                    .map_err(|e| WitRestrictError::Internal(format!("{e}")))?;
+                                let bytes = restricted.into_bytes();
+                                if let Ok(exec) = store.data_mut().shell_exec() {
+                                    exec.cache_fused(node_hash, bytes.clone());
+                                }
+                                bytes
+                            }
+                        };
                         let rep = store
                             .data_mut()
                             .shell_exec()
                             .map_err(|e| WitRestrictError::Internal(format!("{e}")))?
                             .insert_component(KComponent {
-                                bytes: restricted.into_bytes(),
+                                bytes,
+                                graph_hash: node_hash,
                                 entry: None,
                             });
                         Ok(Resource::new_own(rep))
@@ -1776,7 +1963,7 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
             }
             #[cfg(not(feature = "wasm-codegen"))]
             {
-                let _ = (bytes, allow);
+                let _ = (kc, allow);
                 Ok((Err(WitRestrictError::Internal(unsupported(
                     "only (restrict)",
                 ))),))
@@ -1789,25 +1976,41 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
         |mut store: StoreContextMut<'_, KernelState>,
          (component, old, new): (Resource<AlgComponentRes>, String, String)|
          -> Result<(Result<Resource<AlgComponentRes>, WitRenameError>,)> {
-            let bytes = store
+            let kc = store
                 .data_mut()
                 .shell_exec()?
-                .take_component(component.rep())?
-                .bytes;
+                .take_component(component.rep())?;
             #[cfg(feature = "wasm-codegen")]
             {
+                let node_hash = graph_node_hash("rename", &[kc.graph_hash], &[&old, &new]);
                 let result =
                     (|| -> core::result::Result<Resource<AlgComponentRes>, WitRenameError> {
-                        let c = eo9_component::Component::load(bytes)
-                            .map_err(|e| WitRenameError::Internal(format!("{e}")))?;
-                        let renamed = eo9_component::rename(&c, &old, &new)
-                            .map_err(|e| WitRenameError::Internal(format!("{e}")))?;
+                        let cached = store
+                            .data_mut()
+                            .shell_exec()
+                            .ok()
+                            .and_then(|exec| exec.cached_fused(&node_hash));
+                        let bytes = match cached {
+                            Some(bytes) => bytes,
+                            None => {
+                                let c = eo9_component::Component::load(kc.bytes)
+                                    .map_err(|e| WitRenameError::Internal(format!("{e}")))?;
+                                let renamed = eo9_component::rename(&c, &old, &new)
+                                    .map_err(|e| WitRenameError::Internal(format!("{e}")))?;
+                                let bytes = renamed.into_bytes();
+                                if let Ok(exec) = store.data_mut().shell_exec() {
+                                    exec.cache_fused(node_hash, bytes.clone());
+                                }
+                                bytes
+                            }
+                        };
                         let rep = store
                             .data_mut()
                             .shell_exec()
                             .map_err(|e| WitRenameError::Internal(format!("{e}")))?
                             .insert_component(KComponent {
-                                bytes: renamed.into_bytes(),
+                                bytes,
+                                graph_hash: node_hash,
                                 entry: None,
                             });
                         Ok(Resource::new_own(rep))
@@ -1816,7 +2019,7 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
             }
             #[cfg(not(feature = "wasm-codegen"))]
             {
-                let _ = (bytes, old, new);
+                let _ = (kc, old, new);
                 Ok((Err(WitRenameError::Internal(unsupported("rename"))),))
             }
         },
@@ -1827,27 +2030,48 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
         |mut store: StoreContextMut<'_, KernelState>,
          (component, args): (Resource<AlgComponentRes>, Vec<WitNamedArg>)|
          -> Result<(Result<Resource<AlgComponentRes>, WitConfigureError>,)> {
-            let bytes = store
+            let kc = store
                 .data_mut()
                 .shell_exec()?
-                .take_component(component.rep())?
-                .bytes;
+                .take_component(component.rep())?;
             #[cfg(feature = "wasm-codegen")]
             {
                 let pairs: Vec<(String, String)> =
                     args.into_iter().map(|a| (a.name, a.value)).collect();
+                let arg_strings: Vec<String> = pairs
+                    .iter()
+                    .map(|(name, value)| format!("{name}\u{0}{value}"))
+                    .collect();
+                let args_ref: Vec<&str> = arg_strings.iter().map(String::as_str).collect();
+                let node_hash = graph_node_hash("configure", &[kc.graph_hash], &args_ref);
                 let result =
                     (|| -> core::result::Result<Resource<AlgComponentRes>, WitConfigureError> {
-                        let c = eo9_component::Component::load(bytes)
-                            .map_err(|e| WitConfigureError::Internal(format!("{e}")))?;
-                        let configured = eo9_component::configure(&c, &pairs)
-                            .map_err(|e| WitConfigureError::Internal(format!("{e}")))?;
+                        let cached = store
+                            .data_mut()
+                            .shell_exec()
+                            .ok()
+                            .and_then(|exec| exec.cached_fused(&node_hash));
+                        let bytes = match cached {
+                            Some(bytes) => bytes,
+                            None => {
+                                let c = eo9_component::Component::load(kc.bytes)
+                                    .map_err(|e| WitConfigureError::Internal(format!("{e}")))?;
+                                let configured = eo9_component::configure(&c, &pairs)
+                                    .map_err(|e| WitConfigureError::Internal(format!("{e}")))?;
+                                let bytes = configured.into_bytes();
+                                if let Ok(exec) = store.data_mut().shell_exec() {
+                                    exec.cache_fused(node_hash, bytes.clone());
+                                }
+                                bytes
+                            }
+                        };
                         let rep = store
                             .data_mut()
                             .shell_exec()
                             .map_err(|e| WitConfigureError::Internal(format!("{e}")))?
                             .insert_component(KComponent {
-                                bytes: configured.into_bytes(),
+                                bytes,
+                                graph_hash: node_hash,
                                 entry: None,
                             });
                         Ok(Resource::new_own(rep))
@@ -1856,7 +2080,7 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
             }
             #[cfg(not(feature = "wasm-codegen"))]
             {
-                let _ = (bytes, args);
+                let _ = (kc, args);
                 Ok((Err(WitConfigureError::Internal(unsupported("configure"))),))
             }
         },
@@ -1891,6 +2115,30 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                 .data_mut()
                 .shell_exec()?
                 .take_component(component.rep())?;
+
+            // The session cache first, keyed by the graph hash (semantic identity): a hit
+            // covers fused results *and* pristine entries, and skips exec-bytes
+            // extraction, deserialization, and codegen alike. Providers can never be
+            // cached (their first compile attempt is refused below), so cache-first
+            // cannot bypass the NotABinary refusals.
+            #[cfg(feature = "wasm-codegen")]
+            {
+                #[cfg(feature = "spawn-trace")]
+                let __trace_hl = crate::timer::uptime_us();
+                let hit = store
+                    .data_mut()
+                    .shell_exec()?
+                    .cached_compile(&component.graph_hash);
+                #[cfg(feature = "spawn-trace")]
+                spawn_trace::add_since(spawn_trace::HASH_LOOKUP, __trace_hl);
+                if let Some(component_hit) = hit {
+                    let rep = store
+                        .data_mut()
+                        .shell_exec()?
+                        .insert_image(KImage { component: component_hit });
+                    return Ok((Ok(Resource::new_own(rep)),));
+                }
+            }
 
             let image = match component.entry {
                 // Pristine store entry: deserialize the baked-in host-AOT artifact (the
@@ -1927,26 +2175,6 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                         .unwrap_or_else(|_| component.bytes.clone());
                     #[cfg(feature = "spawn-trace")]
                     spawn_trace::add_since(spawn_trace::EXEC_BYTES, __trace_eb);
-
-                    // The session's in-RAM cache first: an identical composition spawned
-                    // earlier this session re-uses its artifact and skips Cranelift (and
-                    // the seconds-long console stall codegen means) entirely.
-                    #[cfg(feature = "spawn-trace")]
-                    let __trace_hl = crate::timer::uptime_us();
-                    let cache_hash = compile_cache_hash(&exec_bytes);
-                    let session_hit = store
-                        .data_mut()
-                        .shell_exec()?
-                        .cached_compile(cache_hash, &exec_bytes);
-                    #[cfg(feature = "spawn-trace")]
-                    spawn_trace::add_since(spawn_trace::HASH_LOOKUP, __trace_hl);
-                    if let Some(component) = session_hit {
-                        let rep = store
-                            .data_mut()
-                            .shell_exec()?
-                            .insert_image(KImage { component });
-                        return Ok((Ok(Resource::new_own(rep)),));
-                    }
 
                     // The persistent store disk, when this boot has one, caches compile
                     // results by the blake3 of exactly these bytes: a hit deserializes the
@@ -2031,16 +2259,6 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                             compiled
                         }
                     };
-                    // Either way the artifact came to exist (compiled now, or loaded from
-                    // the store disk), remember it in the session cache so re-running the
-                    // same composition skips this whole arm.
-                    if let Ok(component) = &image {
-                        store.data_mut().shell_exec()?.cache_compile(
-                            cache_hash,
-                            exec_bytes,
-                            component.clone(),
-                        );
-                    }
                     image
                 }
                 #[cfg(not(feature = "wasm-codegen"))]
@@ -2049,6 +2267,16 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                 )),
             };
 
+            // Either way the artifact came to exist (deserialized, loaded from the store
+            // disk, or compiled), remember it in the session cache under the graph hash so
+            // the next spawn of the same semantic composition skips this whole function.
+            #[cfg(feature = "wasm-codegen")]
+            if let Ok(image) = &image {
+                store
+                    .data_mut()
+                    .shell_exec()?
+                    .cache_compile(component.graph_hash, image.clone());
+            }
             Ok((match image {
                 Ok(image) => {
                     let rep = store
