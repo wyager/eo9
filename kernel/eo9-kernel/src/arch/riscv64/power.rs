@@ -18,6 +18,8 @@ pub fn system_off() -> ! {
     super::sbi::system_reset_shutdown();
     // SAFETY: the test device's finisher register is a valid MMIO word on the `virt`
     // machine; writing it powers the machine off (or does nothing on other platforms).
+    // Plain volatile is fine here: ISV syndrome decoding is an aarch64-hypervisor
+    // concern (see crate::mmio) — riscv64 runs under TCG only.
     unsafe { core::ptr::write_volatile(TEST_DEVICE as *mut u32, FINISHER_PASS) };
     park()
 }

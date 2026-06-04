@@ -80,8 +80,9 @@ const GICC_IAR: usize = 0x00c;
 const GICC_EOIR: usize = 0x010;
 
 fn gicc_read(offset: usize) -> u32 {
-    // SAFETY: `GICC_BASE + offset` is a valid GICv2 CPU-interface register on `virt`.
-    unsafe { core::ptr::read_volatile((GICC_BASE + offset) as *const u32) }
+    // SAFETY: `GICC_BASE + offset` is a valid GICv2 CPU-interface register on `virt`;
+    // `crate::mmio` pins the access to a syndrome-valid GPR form (see that module).
+    unsafe { crate::mmio::read_u32(GICC_BASE + offset) }
 }
 
 /// An acknowledged-but-not-yet-completed GIC interrupt: the linear token the hardware hands
@@ -191,33 +192,34 @@ pub fn end_of_interrupt(ack: Ack) {
 
 fn gicr_read(offset: usize) -> u32 {
     // SAFETY: `GICR_BASE + offset` is a valid GICv3 redistributor register on `virt`
-    // (only reached when init detected a v3 distributor).
-    unsafe { core::ptr::read_volatile((GICR_BASE + offset) as *const u32) }
+    // (only reached when init detected a v3 distributor); syndrome-valid GPR form.
+    unsafe { crate::mmio::read_u32(GICR_BASE + offset) }
 }
 
 fn gicr_write(offset: usize, value: u32) {
     // SAFETY: as above, for writes (RD frame).
-    unsafe { core::ptr::write_volatile((GICR_BASE + offset) as *mut u32, value) }
+    unsafe { crate::mmio::write_u32(GICR_BASE + offset, value) }
 }
 
 fn gicr_sgi_write(offset: usize, value: u32) {
     // SAFETY: as above, for the redistributor's SGI/PPI frame.
-    unsafe { core::ptr::write_volatile((GICR_SGI_BASE + offset) as *mut u32, value) }
+    unsafe { crate::mmio::write_u32(GICR_SGI_BASE + offset, value) }
 }
 
 fn gicd_read(offset: usize) -> u32 {
-    // SAFETY: `GICD_BASE + offset` is a valid distributor register on `virt`.
-    unsafe { core::ptr::read_volatile((GICD_BASE + offset) as *const u32) }
+    // SAFETY: `GICD_BASE + offset` is a valid distributor register on `virt`;
+    // syndrome-valid GPR form via `crate::mmio`.
+    unsafe { crate::mmio::read_u32(GICD_BASE + offset) }
 }
 
 fn gicd_write(offset: usize, value: u32) {
     // SAFETY: `GICD_BASE + offset` is a valid GICv2 distributor register on `virt`.
-    unsafe { core::ptr::write_volatile((GICD_BASE + offset) as *mut u32, value) }
+    unsafe { crate::mmio::write_u32(GICD_BASE + offset, value) }
 }
 
 fn gicc_write(offset: usize, value: u32) {
     // SAFETY: `GICC_BASE + offset` is a valid GICv2 CPU-interface register on `virt`.
-    unsafe { core::ptr::write_volatile((GICC_BASE + offset) as *mut u32, value) }
+    unsafe { crate::mmio::write_u32(GICC_BASE + offset, value) }
 }
 
 /// Enable the distributor and this core's CPU interface so forwarded interrupts can reach
@@ -317,8 +319,9 @@ pub fn configure_intid(intid: u32) {
     };
     // Priority register: one byte per INTID.
     let prio_reg = 0x400 + (intid as usize);
-    // SAFETY: GICD_/GICR_IPRIORITYR byte accessible at the selected base.
-    unsafe { core::ptr::write_volatile((base + prio_reg) as *mut u8, 0x80) };
+    // SAFETY: GICD_/GICR_IPRIORITYR byte accessible at the selected base;
+    // syndrome-valid GPR form via `crate::mmio`.
+    unsafe { crate::mmio::write_u8(base + prio_reg, 0x80) };
 }
 
 /// Enable forwarding of a single interrupt ID (e.g. INTID 27, the EL1 virtual timer PPI).

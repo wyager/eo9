@@ -1845,3 +1845,22 @@ the default and the verified configuration.
       values byte-identical to TCG; TCG regression (demo, disk, check-gpu pixel-exact,
       svcdemo backoff pacing, 10/10 unpaced paste bursts, riscv64/x86_64 demos)
       unchanged. Speedups: ~10× on-target codegen, 9.4× cold draw, 14× demo session.
+75. **The device-memory volatile sweep (`area/12-mmio-sweep`, 2026-06-04).** Closes
+    entry 74's residual: the syndrome-valid accessors moved from `pci::mmio` to the
+    crate-level `src/mmio.rs` (gated `any(aarch64, wasm-store)` — aarch64 drivers use
+    it unconditionally, other arches only via the `wasm-store`-gated pci module, so
+    feature-less builds stay lean), and every aarch64 device-memory volatile swept onto
+    them: the PL011 UART read/write helpers (the paste-fix FIFO/scavenger paths ride
+    them), all seven GIC MMIO helpers (GICC/GICD/GICR/SGI-frame) plus the byte-wide
+    `IPRIORITYR` write in `configure_intid`, and the PL031 RTC data-register read.
+    Inventory discipline: device memory = swept; RAM volatiles (virtio `DmaRegion`,
+    the DTB scan in fdt.rs, the PVH `start_info` reads) stay plain volatile with the
+    classification documented at each site; non-aarch64 device volatiles stay plain
+    with a one-line why-aarch64-differs comment (riscv64 16550/PLIC/Goldfish-RTC/test
+    device). Disassembly check: `kirq` and the UART write path carry zero SIMD/FP
+    memory operations (before the sweep they were GPR **by luck**; now by construction
+    — and the executable proof is the HVF battery, where any SIMD/FP device access
+    aborts QEMU outright). Verified: three arch demos canonical, disk INTx round-trip,
+    svcdemo, gicv3 demo + disk smoke, 10/10 unpaced paste bursts, check-gpu
+    pixel-exact (TCG); boot + lspci + disk round-trip + l4check DNS + draw cold/warm
+    (session-cache hit) + 3 paste bursts + the PL031 wall-clock read (HVF); full ci.

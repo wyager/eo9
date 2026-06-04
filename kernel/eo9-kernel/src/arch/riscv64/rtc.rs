@@ -16,6 +16,8 @@ const TIME_HIGH: usize = 0x04;
 fn mmio_read(offset: usize) -> u32 {
     // SAFETY: `RTC_BASE + offset` is a valid Goldfish RTC register on the `virt` machine; a
     // volatile MMIO read has no other side conditions.
+    // Plain volatile is fine here: ISV syndrome decoding is an aarch64-hypervisor
+    // concern (see crate::mmio) — riscv64 runs under TCG only.
     unsafe { core::ptr::read_volatile((RTC_BASE + offset) as *const u32) }
 }
 

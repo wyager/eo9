@@ -193,6 +193,7 @@ fn pvh_cmdline(start_info: *const u8) -> *const u8 {
     }
     // SAFETY: the PVH boot protocol passes a pointer to a readable hvm_start_info structure
     // in identity-mapped low RAM; the magic check below guards against anything else.
+    // (RAM reads — syndrome validity, an aarch64 device-MMIO concern, does not apply.)
     let magic = unsafe { core::ptr::read_volatile(start_info as *const u32) };
     if magic != HVM_START_INFO_MAGIC {
         return core::ptr::null();
