@@ -1169,23 +1169,46 @@ pub fn wait_until_runnable(task: &Task) {
     }
 }
 
-/// Like [`wait_until_runnable`], but parks at most `timeout` so the caller can also
-/// service other work that becomes due on a clock (a service registry's pending
-/// restarts, for example) rather than sleeping until this task's own doorbell rings.
-pub fn wait_until_runnable_with_timeout(task: &Task, timeout: std::time::Duration) {
+/// Park the drive loop until *anything* it is responsible for can progress: the
+/// foreground task's doorbell, any parked service's doorbell, a due (or soon-due)
+/// service restart, or the backstop timeout — whichever comes first.
+///
+/// The wake-set registration follows the observe->register->re-observe edge protocol on
+/// every doorbell (via [`Task::poll_runnable_with`] /
+/// `ServiceRegistry::park_ready`), so a completion landing between the readiness checks
+/// and the park is never lost. The backstop stays unconditional: a wake source this
+/// function does not know about costs at most `backstop` of latency, exactly as before.
+pub fn park_until_progress(
+    task: &Task,
+    registry: &eo9_runtime::SharedRegistry,
+    backstop: std::time::Duration,
+) {
     let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
     let mut context = Context::from_waker(&waker);
+
+    // Foreground readiness (and registration) first: poll_edge semantics.
     let runnable = task.runnable();
-    let mut runnable = std::pin::pin!(runnable);
-    let deadline = std::time::Instant::now() + timeout;
-    while runnable.as_mut().poll(&mut context).is_pending() {
-        eo9_runtime::chaos::point("embedder.park");
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            break;
-        }
-        std::thread::park_timeout(deadline - now);
+    let runnable = std::pin::pin!(runnable);
+    if runnable.poll(&mut context).is_ready() {
+        return;
     }
+
+    // Service readiness + registration, and the restart-deadline bound, under one lock.
+    let timeout = {
+        let registry = registry.lock().unwrap();
+        if registry.park_ready(&waker) {
+            return;
+        }
+        match registry.next_restart_due() {
+            Some(due) => due
+                .saturating_duration_since(std::time::Instant::now())
+                .min(backstop),
+            None => backstop,
+        }
+    };
+
+    eo9_runtime::chaos::point("embedder.park");
+    std::thread::park_timeout(timeout);
 }
 
 #[cfg(test)]
