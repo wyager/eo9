@@ -9,12 +9,26 @@
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 
 /// Ask the platform to power off; parks the core if the call somehow returns.
+///
+/// Conduit: QEMU `virt` (no EL3) serves PSCI over **HVC**; on the Orange Pi 5 Plus the
+/// call goes to TF-A BL31 at EL3 over **SMC** (the board DTB's `psci.method`), selected by
+/// the `board-opi5plus` profile.
 pub fn system_off() -> ! {
-    // SAFETY: a PSCI call via HVC with a valid function id either does not return
-    // (SYSTEM_OFF) or returns an error in x0; it clobbers only x0-x3 per SMCCC.
+    // SAFETY: a PSCI call via the platform's conduit with a valid function id either does
+    // not return (SYSTEM_OFF) or returns an error in x0; it clobbers only x0-x3 per SMCCC.
     unsafe {
+        #[cfg(not(feature = "board-opi5plus"))]
         core::arch::asm!(
             "hvc #0",
+            inout("x0") PSCI_SYSTEM_OFF => _,
+            lateout("x1") _,
+            lateout("x2") _,
+            lateout("x3") _,
+            options(nomem, nostack),
+        );
+        #[cfg(feature = "board-opi5plus")]
+        core::arch::asm!(
+            "smc #0",
             inout("x0") PSCI_SYSTEM_OFF => _,
             lateout("x1") _,
             lateout("x2") _,

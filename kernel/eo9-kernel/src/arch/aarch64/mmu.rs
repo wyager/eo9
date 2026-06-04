@@ -42,9 +42,31 @@ static mut LEVEL2_TABLE: TranslationTable = TranslationTable([0; 512]);
 static mut LEVEL3_TABLES: [TranslationTable; DRAM_L2_ENTRIES] =
     [const { TranslationTable([0; 512]) }; DRAM_L2_ENTRIES];
 
+/// DRAM window the kernel uses (image + heap). QEMU `virt`: RAM at 1 GiB, the 512 MiB
+/// xtask provides. Orange Pi 5 Plus: the first DRAM bank starts at 0x0020_0000 (verified
+/// on the board), the image links at 0x0020_0000, and the kernel uses the first 528 MiB
+/// (0x0..0x2100_0000) — comfortably below U-Boot's runtime relocation (~0xEDC5_1000), the
+/// control FDT (~0xEB9F_6C38) and TF-A's high region (0xFF10_0000).
+#[cfg(not(feature = "board-opi5plus"))]
 const RAM_BASE: usize = 0x4000_0000;
+#[cfg(feature = "board-opi5plus")]
+const RAM_BASE: usize = 0;
+#[cfg(not(feature = "board-opi5plus"))]
 const RAM_SIZE: usize = 512 * 1024 * 1024;
+#[cfg(feature = "board-opi5plus")]
+const RAM_SIZE: usize = 528 * 1024 * 1024;
 const RAM_END: usize = RAM_BASE + RAM_SIZE;
+/// Level-1 entry covering the DRAM window (1 GiB per entry; the window fits in one).
+const RAM_L1_INDEX: usize = RAM_BASE >> 30;
+/// Level-1 entries mapped as 1 GiB Device-nGnRnE blocks. QEMU `virt`: the low gigabyte
+/// (UART/RTC/GIC/ECAM). Orange Pi 5 Plus: the fourth gigabyte (0xC000_0000..), which holds
+/// every RK3588 peripheral the kernel touches (UART2 0xfeb5_0000, GIC 0xfe6x_xxxx) plus
+/// U-Boot's relocated remains and control FDT (read-only data reads through a Device
+/// mapping are fine; nothing is ever executed there).
+#[cfg(not(feature = "board-opi5plus"))]
+const DEVICE_L1: &[usize] = &[0];
+#[cfg(feature = "board-opi5plus")]
+const DEVICE_L1: &[usize] = &[3];
 /// First byte past the heap (src/heap.rs): the top of DRAM on this machine.
 pub(crate) const HEAP_END: usize = RAM_END;
 /// Number of 2 MiB level-2 entries needed to cover DRAM (= number of level-3 tables).
@@ -146,9 +168,14 @@ pub fn init() {
             l2i += 1;
         }
 
-        // Level-1: [0] MMIO device block (output 0, never executed); [1] → the level-2 table.
-        (*l1).0[0] = BLOCK | ATTR_INDEX_DEVICE | ACCESS_FLAG | PXN | UXN;
-        (*l1).0[1] = ((&raw const *l2).addr() as u64) | TABLE;
+        // Level-1: 1 GiB Device blocks per the profile's DEVICE_L1 (identity output
+        // address, never executed), and the DRAM window's entry pointing at the level-2
+        // table.
+        for &index in DEVICE_L1 {
+            (*l1).0[index] =
+                ((index as u64) << 30) | BLOCK | ATTR_INDEX_DEVICE | ACCESS_FLAG | PXN | UXN;
+        }
+        (*l1).0[RAM_L1_INDEX] = ((&raw const *l2).addr() as u64) | TABLE;
 
         let table_address = (&raw const *l1).addr() as u64;
         asm!(
@@ -173,8 +200,11 @@ pub fn init() {
         );
     }
     crate::kprintln!(
-        "mmu: identity map enabled (device 0..1 GiB, DRAM 1..1.5 GiB at 4 KiB pages, \
-         heap W^X, caches on)"
+        "mmu: identity map enabled (device {} GiB block(s), DRAM {:#x}..{:#x} at 4 KiB \
+         pages, heap W^X, caches on)",
+        DEVICE_L1.len(),
+        RAM_BASE,
+        RAM_END,
     );
 }
 

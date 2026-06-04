@@ -28,13 +28,27 @@
 //!
 //! Either way, acknowledge/EOI hand the handler a linear [`Ack`] token (see below).
 
-/// GIC distributor base on the QEMU `virt` machine (same for GICv2 and GICv3).
+/// GIC distributor base: QEMU `virt` (same address for GICv2 and GICv3), or the RK3588's
+/// GIC-600 on the `board-opi5plus` profile (GICD_PIDR2 read 0x3b on the board — v3,
+/// verified live at the U-Boot prompt).
+#[cfg(not(feature = "board-opi5plus"))]
 const GICD_BASE: usize = 0x0800_0000;
-/// GIC CPU interface base on the QEMU `virt` machine (GICv2 only).
+#[cfg(feature = "board-opi5plus")]
+const GICD_BASE: usize = 0xfe60_0000;
+/// GIC CPU interface base (GICv2 only; unused on a v3-only board, where the version probe
+/// always selects the system-register interface).
+#[cfg(not(feature = "board-opi5plus"))]
 const GICC_BASE: usize = 0x0801_0000;
-/// Redistributor base on the QEMU `virt` machine (GICv3; PE 0's RD frame — this kernel is
-/// single-core, `-smp 1`).
+#[cfg(feature = "board-opi5plus")]
+#[allow(dead_code)] // the RK3588 is GICv3-only; the v2 dispatch arms are never taken
+const GICC_BASE: usize = 0xfe61_0000;
+/// Redistributor base (GICv3; frame 0 — this kernel is single-core and boots on the
+/// board's cpu-hwid-0, whose redistributor is frame 0 in the GIC-600 layout; the 8-PE
+/// stride of 0x20000 only matters for secondaries we park).
+#[cfg(not(feature = "board-opi5plus"))]
 const GICR_BASE: usize = 0x080A_0000;
+#[cfg(feature = "board-opi5plus")]
+const GICR_BASE: usize = 0xfe68_0000;
 /// PE 0's SGI/PPI frame (the redistributor's second 64 KiB frame).
 const GICR_SGI_BASE: usize = GICR_BASE + 0x1_0000;
 

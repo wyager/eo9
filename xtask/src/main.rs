@@ -298,7 +298,22 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             fingerprint_web_vm(&root)
         }
         "build-kernel" => {
-            build_kernel(&root, &arch_arg("build-kernel", rest)?)?;
+            // `build-kernel aarch64 opi5plus [minimal]` builds the Orange Pi 5 Plus board
+            // profile and flattens it into the `booti`-bootable Image; everything else is
+            // the standard QEMU kernel build.
+            match rest {
+                [arch, board] if arch == "aarch64" && board == "opi5plus" => {
+                    build_kernel_opi5plus(&root, false)?;
+                }
+                [arch, board, minimal]
+                    if arch == "aarch64" && board == "opi5plus" && minimal == "minimal" =>
+                {
+                    build_kernel_opi5plus(&root, true)?;
+                }
+                _ => {
+                    build_kernel(&root, &arch_arg("build-kernel", rest)?)?;
+                }
+            }
             Ok(())
         }
         "check-gpu" => {
@@ -1615,14 +1630,22 @@ const KERNEL_QEMU_MEMORY: &str = "512M";
 /// host-AOT precompiled for the bare-metal target, then packed as
 /// `name + component bytes + artifact bytes + metadata text`.
 fn build_store_image(root: &Path, target: &str) -> Result<PathBuf, String> {
+    build_store_image_filtered(root, target, KERNEL_STORE_COMPONENTS, "store.img")
+}
+
+/// Assemble a store image from an explicit component list. The full QEMU kernels bake
+/// [`KERNEL_STORE_COMPONENTS`]; the Orange Pi 5 Plus *minimal* image (first-light fast
+/// iteration over `fatload`) bakes just enough to run `program=hello`.
+fn build_store_image_filtered(
+    root: &Path,
+    target: &str,
+    components: &[(&str, &str)],
+    file_name: &str,
+) -> Result<PathBuf, String> {
     let mut image: Vec<u8> = Vec::new();
     image.extend_from_slice(b"EO9STOR2");
-    image.extend_from_slice(
-        &u32::try_from(KERNEL_STORE_COMPONENTS.len())
-            .unwrap()
-            .to_le_bytes(),
-    );
-    for (package, shell_name) in KERNEL_STORE_COMPONENTS {
+    image.extend_from_slice(&u32::try_from(components.len()).unwrap().to_le_bytes());
+    for (package, shell_name) in components {
         let component_path = build_guest_component(root, package)?;
         let component = std::fs::read(&component_path)
             .map_err(|err| format!("failed to read {}: {err}", component_path.display()))?;
@@ -1663,13 +1686,13 @@ fn build_store_image(root: &Path, target: &str) -> Result<PathBuf, String> {
     let out_dir = kernel_precompiled_dir(root, target);
     std::fs::create_dir_all(&out_dir)
         .map_err(|err| format!("failed to create {}: {err}", out_dir.display()))?;
-    let out_path = out_dir.join("store.img");
+    let out_path = out_dir.join(file_name);
     let wrote = write_if_different(&out_path, &image)?;
     println!(
         "xtask: assembled store image {} ({} bytes, {} components, target {target}{})",
         out_path.display(),
         image.len(),
-        KERNEL_STORE_COMPONENTS.len(),
+        components.len(),
         if wrote { "" } else { ", unchanged" }
     );
     Ok(out_path)
@@ -1937,6 +1960,187 @@ fn build_kernel_x86_64(root: &Path) -> Result<PathBuf, String> {
     }
     println!("xtask: built kernel image {}", image.display());
     Ok(image)
+}
+
+/// Build the Orange Pi 5 Plus (RK3588) board-profile kernel and flatten it into the
+/// `booti`-bootable arm64 `Image` (docs/board/orange-pi-5-plus.md). `minimal` bakes a
+/// hello-only store for fast first-light iteration over `fatload`; the full variant bakes
+/// the standard [`KERNEL_STORE_COMPONENTS`].
+fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> {
+    // The same host-precompiled artifacts as the QEMU aarch64 build (identical wasm
+    // engine/target config — the board feature changes hardware constants, not codegen).
+    let seed_wat = root.join("kernel").join("seed").join("hello.wat");
+    let seed_wasm = wat::parse_file(&seed_wat)
+        .map_err(|err| format!("failed to assemble {}: {err}", seed_wat.display()))?;
+    let seed = precompile_for_kernel(
+        root,
+        &seed_wasm,
+        "seed component",
+        "seed.cwasm",
+        KERNEL_CHECK_TARGET,
+    )?;
+    let seed_wasm_path = root
+        .join("kernel")
+        .join("target")
+        .join("precompiled")
+        .join("seed.wasm");
+    std::fs::create_dir_all(seed_wasm_path.parent().unwrap())
+        .map_err(|err| format!("failed to create precompiled dir: {err}"))?;
+    write_if_different(&seed_wasm_path, &seed_wasm)?;
+
+    let sleepy_wat = root.join("kernel").join("seed").join("sleepy.wat");
+    let sleepy_wasm = wat::parse_file(&sleepy_wat)
+        .map_err(|err| format!("failed to assemble {}: {err}", sleepy_wat.display()))?;
+    let sleepy = precompile_for_kernel(
+        root,
+        &sleepy_wasm,
+        "sleepy canary",
+        "sleepy.cwasm",
+        KERNEL_CHECK_TARGET,
+    )?;
+
+    let hello_component = build_guest_component(root, "eo9-example-hello")?;
+    let hello_wasm = std::fs::read(&hello_component)
+        .map_err(|err| format!("failed to read {}: {err}", hello_component.display()))?;
+    let hello = precompile_for_kernel(
+        root,
+        &hello_wasm,
+        "eo9-example-hello",
+        "hello.cwasm",
+        KERNEL_CHECK_TARGET,
+    )?;
+
+    let entropy_component = build_guest_component(root, "eo9-stub-entropy-seeded")?;
+    let entropy_wasm = std::fs::read(&entropy_component)
+        .map_err(|err| format!("failed to read {}: {err}", entropy_component.display()))?;
+    let entropy = precompile_for_kernel(
+        root,
+        &entropy_wasm,
+        "eo9-stub-entropy-seeded",
+        "entropy-seeded.cwasm",
+        KERNEL_CHECK_TARGET,
+    )?;
+
+    let store_image = if minimal {
+        build_store_image_filtered(
+            root,
+            KERNEL_CHECK_TARGET,
+            &[("eo9-example-hello", "hello")],
+            "store-opi5plus-min.img",
+        )?
+    } else {
+        build_store_image(root, KERNEL_CHECK_TARGET)?
+    };
+    let mac_key = ensure_storedisk_mac_key(root)?;
+
+    let kernel_dir = root.join("kernel");
+    run_with_env(
+        &kernel_dir,
+        "cargo",
+        [
+            "build",
+            "-p",
+            "eo9-kernel",
+            "--release",
+            "--target",
+            KERNEL_CHECK_TARGET,
+            "--features",
+            kernel_features(
+                "wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen,first-poll-inline,\
+                 board-opi5plus",
+            )
+            .as_str(),
+        ],
+        &[
+            ("EO9_SEED_CWASM", seed.as_os_str()),
+            ("EO9_SEED_WASM", seed_wasm_path.as_os_str()),
+            ("EO9_HELLO_CWASM", hello.as_os_str()),
+            ("EO9_SLEEPY_CWASM", sleepy.as_os_str()),
+            ("EO9_ENTROPY_SEEDED_CWASM", entropy.as_os_str()),
+            ("EO9_STORE_IMAGE", store_image.as_os_str()),
+            ("EO9_STOREDISK_MAC_KEY", mac_key.as_os_str()),
+        ],
+    )?;
+
+    let elf = kernel_dir
+        .join("target")
+        .join(KERNEL_CHECK_TARGET)
+        .join("release")
+        .join("eo9-kernel");
+    let elf_bytes = std::fs::read(&elf)
+        .map_err(|err| format!("failed to read kernel ELF {}: {err}", elf.display()))?;
+    let flat = flatten_kernel_elf(&elf_bytes)?;
+    // The arm64 Linux Image header booti checks: magic "ARM\x64" at byte 56.
+    if flat.len() < 64 || &flat[56..60] != b"ARM\x64" {
+        return Err(
+            "flattened board image is missing the arm64 Image header (expected the \
+             `.text.header` section first — check linker-aarch64-opi5plus.ld)"
+                .into(),
+        );
+    }
+    let out = kernel_dir.join("target").join(if minimal {
+        "eo9-opi5plus-min.img"
+    } else {
+        "eo9-opi5plus.img"
+    });
+    write_if_different(&out, &flat)?;
+    println!(
+        "xtask: built Orange Pi 5 Plus Image {} ({:.1} MiB)",
+        out.display(),
+        flat.len() as f64 / (1024.0 * 1024.0)
+    );
+    println!("xtask: boot it from the U-Boot prompt (1.5 Mbaud serial):");
+    println!("         usb start");
+    println!("         setenv bootargs program=hello   (minimal image: required)");
+    println!("         fatload usb 0:1 0x00200000 <file on the stick>");
+    println!("         booti 0x00200000 - ${{fdtcontroladdr}}");
+    Ok(out)
+}
+
+/// Flatten a kernel ELF into the raw binary `booti` expects: every PT_LOAD segment with
+/// file contents, laid out at its physical address relative to the lowest one. (.bss and
+/// the boot stack carry no file bytes; the Image header's `image_size` reserves them.)
+fn flatten_kernel_elf(elf: &[u8]) -> Result<Vec<u8>, String> {
+    if elf.len() < 64 || &elf[0..4] != b"\x7fELF" {
+        return Err("kernel image is not an ELF".into());
+    }
+    let read_u64 = |at: usize| u64::from_le_bytes(elf[at..at + 8].try_into().unwrap());
+    let read_u32 = |at: usize| u32::from_le_bytes(elf[at..at + 4].try_into().unwrap());
+    let read_u16 = |at: usize| u16::from_le_bytes(elf[at..at + 2].try_into().unwrap());
+    let phoff = read_u64(32) as usize;
+    let phentsize = read_u16(54) as usize;
+    let phnum = read_u16(56) as usize;
+    let mut segments: Vec<(u64, usize, usize)> = Vec::new(); // (paddr, file offset, len)
+    for index in 0..phnum {
+        let at = phoff + index * phentsize;
+        if elf.len() < at + 56 {
+            return Err("kernel ELF program header out of bounds".into());
+        }
+        if read_u32(at) != 1 {
+            continue; // not PT_LOAD
+        }
+        let p_offset = read_u64(at + 8) as usize;
+        let p_paddr = read_u64(at + 24);
+        let p_filesz = read_u64(at + 32) as usize;
+        if p_filesz == 0 {
+            continue;
+        }
+        if elf.len() < p_offset + p_filesz {
+            return Err("kernel ELF segment out of bounds".into());
+        }
+        segments.push((p_paddr, p_offset, p_filesz));
+    }
+    if segments.is_empty() {
+        return Err("kernel ELF has no loadable segments".into());
+    }
+    let base = segments.iter().map(|s| s.0).min().unwrap();
+    let end = segments.iter().map(|s| s.0 + s.2 as u64).max().unwrap();
+    let mut flat = vec![0u8; (end - base) as usize];
+    for (paddr, offset, len) in segments {
+        let dst = (paddr - base) as usize;
+        flat[dst..dst + len].copy_from_slice(&elf[offset..offset + len]);
+    }
+    Ok(flat)
 }
 
 /// riscv64 (QEMU `virt`, S-mode under OpenSBI): the same host-AOT precompile pipeline as

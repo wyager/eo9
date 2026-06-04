@@ -1864,3 +1864,44 @@ the default and the verified configuration.
     svcdemo, gicv3 demo + disk smoke, 10/10 unpaced paste bursts, check-gpu
     pixel-exact (TCG); boot + lspci + disk round-trip + l4check DNS + draw cold/warm
     (session-cache hit) + 3 paste bursts + the PL031 wall-clock read (HVF); full ci.
+
+## Entry 76 — the Orange Pi 5 Plus board profile (2026-06-04)
+
+The board arrived alive (vendor U-Boot in SPI NOR, GICv3 PIDR2=0x3b and UART2 base
+0xfeb5_0000 verified live at the `opi#` prompt at 1.5 Mbaud). `board-opi5plus` is a
+cargo feature off by default — every QEMU path keeps its own constants:
+
+* **Entry**: the 64-byte arm64 `Image` header (`.text.header`, text_offset 0,
+  `__image_size` covers .bss + boot stack) + an EL2→EL1 drop (TF-A hands U-Boot EL2h —
+  boot log `SPSR = 0x3c9`; the trampoline zeroes CNTVOFF_EL2 for the CNTV timer, sets
+  HCR_EL2.RW, parks the FP/CP15 traps, seeds SCTLR_EL1 = 0x30D00800, `eret`s to EL1h).
+  QEMU's ELF loader enters `_start` at EL1 and never sees either.
+* **Layout**: linked at 0x0020_0000 (the DRAM bank base; booti dst = bank+text_offset
+  lands there under both the 2017.09 and the round-down relocation rules, and a direct
+  `fatload` to 0x0020_0000 runs in place). MMU window: DRAM 0x0..0x2100_0000 (528 MiB,
+  RAM at level-1 entry 0) + a Device gigabyte at entry 3 (0xC000_0000.. — UART2, GIC,
+  U-Boot's relocated remains and control FDT, all readable). TF-A's low regions are
+  mapped RW-NX and never touched.
+* **Console**: DW-APB UART2 register layer (stride 4 via mmio.rs; LSR/THR/RBR only) —
+  the line stays exactly as U-Boot programmed it (24 MHz / 1.5 M = divisor 1; nothing
+  writes LCR/DLL/FCR). uart.rs is now a shared core (ring/Ctrl-C/console) over a
+  cfg-selected `hw` layer; the PL011 layer is byte-for-behavior the old code. Day-one
+  input flows through the idle scavenger's poll (≤ ~10 ms latency) because UART2's GIC
+  SPI is deliberately unwired; wiring it is the recorded follow-up.
+* **GIC**: GICD 0xfe60_0000 / GICR 0xfe68_0000 (frame 0 = the boot core, cpu-hwid-0);
+  the existing v2-in-frame-first version probe lands RAZ→0xFFE8→0x3b→v3 exactly as on
+  QEMU gicv3. PSCI via SMC (TF-A); PL031 absent → wall clock reads 0 (PMIC RTC later);
+  ECAM_BUSES = 0 (lspci finds nothing instead of dereferencing DRAM — the DW-PCIe shim
+  is its own session, docs/board/rk3588-pcie.md).
+* **Build**: `cargo xtask build-kernel aarch64 opi5plus [minimal]` → flattens PT_LOADs
+  into `kernel/target/eo9-opi5plus[-min].img` (header magic asserted). `minimal` bakes a
+  hello-only store (12.4 MiB image) for fatload-speed iteration; full bakes the standard
+  52. Boot recipe + expected output + fallbacks: .claude/board-bringup/BOOT.md.
+* Pre-existing (also on the standard QEMU build, untouched): the three
+  `eo9-kernel` warnings (unused `Val`/`NAME`/`COMPILER_FINGERPRINT` under
+  wasm-store-without-storedisk feature sets).
+
+Board-only residue for bring-up day: first serial output through the DW layer, the GIC
+on real silicon, SMC SYSTEM_OFF, booti's relocation behavior on the vendor 2017.09
+U-Boot (fallback `go 0x00200000` documented). QEMU regression: demo canonical + gicv3
+demo + paste burst re-run green on this branch (the board feature off).
