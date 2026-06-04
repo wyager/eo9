@@ -1769,3 +1769,79 @@ preemption/hardening work.
       (U-Boot recipe, SD layout, the eight known kernel changes with sizes, the day-one
       smoke ladder), docs/board/gfx-simplefb.md (the dumb-framebuffer provider + the
       minimal FDT reader as its blind-implementable core).
+
+## Entry 73 — the fusion-graph spawn cache, the compiler fingerprint, and the spawn-path numbers (2026-06-04)
+
+**Decision (owner design, granularity correction):** spawn-path caches key on the
+**fusion graph hash** — blake3 per node (leaf = component bytes; interior = op tag ‖
+ordered child hashes ‖ canonicalized args), domain-separated — not on prompt spelling
+and not on fused bytes. `KComponent` carries the hash; the session fused-bytes cache,
+the session compiled-artifact cache (now also covering pristine entries'
+deserialization), and svc's `compile_component` all key on it. Invalidation is
+structural (a changed binding changes exactly the subtrees containing it). The
+`graph-verify` feature re-encodes on every fusion hit and asserts byte equality (the
+encoder-determinism check; verified live). Subtree-level partial-encode sharing:
+recorded follow-up, not built.
+
+**Decision (owner): the compiler fingerprint lives in the lookup key.** build.rs hashes
+kernel/vendor/** + the engine-config sources into `EO9_COMPILER_FINGERPRINT`; the
+storedisk compile-cache key is blake3(domain ‖ fingerprint ‖ executable-bytes). A
+compiler change makes old entries clean misses — never a verification failure; the
+keyed MAC stays reserved for integrity. Hidden-dep audit: codegen target features are
+build-time fixed (explicit triple + explicit cranelift flags; x86's CPUID probe is
+load-time verification only) — no runtime-detected set joins the key. Follow-up: fold
+the same fingerprint into xtask's host-side precompile stamps (they still rely on the
+manual PRECOMPILE_CONFIG_REV).
+
+**Spawn linker:** built once per boot (host-fn set is boot-constant), grant-shape bit
+stored and re-checked on every reuse (the security review's guard); per-spawn authority
+lives in the per-spawn Store. InstancePre measured-and-skipped: instantiation is
+0.9 ms / 0.4 ms — the composite-key machinery isn't paid for by a sub-ms saving.
+
+**Numbers (TCG, medians):** warm `gpu.virtio $ draw` 377 ms → 121 ms external (kernel
+195 ms → 2.1 ms); `time.frozen … $ hello` 151 ms → 28 ms; bare `hello` 2 ms external /
+0.6 ms kernel. The remaining warm cost is guest-side eosh resolve/byte-passing
+(~119 ms for the gpu line) — the eosh lane's problem, out of this one. Cold is
+unchanged (codegen dominates). Full table: docs/spikes/spawn-latency.md.
+
+**Eviction audit:** session caches LRU-8 (confirmed); usermode ~/.eo9 cache bounded by
+`Store::gc` (LFU-then-LRU under a size budget — confirmed, and its `compiler_version`
+key field is adequate for registry wasmtime but would not catch vendored content
+changes); the kernel storedisk compile cache is **unbounded** — recommendation (not
+implemented here): per-entry last-used + a ~32 MiB budget sweep at mount, which also
+reclaims dead-fingerprint entries after kernel upgrades (artifacts 0.5–1.5 MiB;
+~50–100 compiles fill the 64 MiB scratch disk today).
+
+**HVF (xtask `hvf` flag, aarch64-only, opt-in):** boots through MMU/heap, then the
+timer self-test faults (ESR EC=0x00 at `arch::aarch64::timer::self_test`) — Apple's
+Hypervisor.framework exposes only the *virtual* generic timer to guests and the kernel
+drives the EL1 *physical* timer (`cntp_*`). Finding recorded; the CNTV switch
+(cntpct→cntvct, cntp_*→cntv_*, PPI 30→27) is the follow-up that would unlock
+native-speed aarch64 sessions; the flag stays as the experiment vehicle. TCG remains
+the default and the verified configuration.
+
+74. **CNTV switch + syndrome-valid MMIO: the kernel runs under Apple HVF (2026-06-04,
+    `area/12-cntv-hvf`).** Two changes unlock `cargo xtask qemu aarch64 hvf` end to end
+    (docs/spikes/hvf-cntv.md has the full analysis and numbers):
+    * **The EL1 virtual timer (CNTV)** replaces the physical timer everywhere in
+      `arch/aarch64/timer.rs` (`cntpct→cntvct`, `cntp_*→cntv_*`): Apple HVF exposes only
+      the virtual timer to guests. Safe on TCG (`CNTVOFF = 0` on QEMU `virt`, so
+      virtual == physical there — canonical demo values byte-identical before/after);
+      no interrupt-path change needed because the PPI family 26/27/29/30 was already
+      enabled and `kirq` already serviced all four (the live PPI moves 30→27). The boot
+      banner's "counter advancing" line now spins until it observes a real advance (at
+      HVF's host-passthrough 24 MHz, back-to-back reads are routinely equal).
+    * **`pci::mmio` syndrome-valid accessors**: LLVM compiled the ECAM volatile reads
+      into SIMD/FP loads (`ldr s0`/`ldr b0` — found by disassembly), whose ISV=0
+      data-abort syndromes hardware virtualizers cannot decode (QEMU hvf asserts; KVM
+      shares the restriction). Inline-asm GPR forms (`ldrb/ldrh/ldr`, no writeback) on
+      aarch64 behind the four PCI primitives — every wasm driver and the in-kernel
+      virtio-blk routes through them. Plain volatile preserved on other arches.
+      *Residual:* UART/GIC/RTC/INTx-mask volatiles currently compile to GPR forms
+      (battery-proven) but only by compiler choice — sweep them through `mmio` if HVF
+      becomes a daily driver or for any real-hypervisor deployment.
+    * **Verified**: full HVF battery (lspci, disk INTx round-trip with zero polled
+      fallbacks, net ARP + DNS, gpu draw cold/warm, switch vnicheck) with guest
+      values byte-identical to TCG; TCG regression (demo, disk, check-gpu pixel-exact,
+      svcdemo backoff pacing, 10/10 unpaced paste bursts, riscv64/x86_64 demos)
+      unchanged. Speedups: ~10× on-target codegen, 9.4× cold draw, 14× demo session.
