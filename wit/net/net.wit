@@ -352,6 +352,21 @@ interface l2-switch-config {
     configure: func(mac-base: string) -> result<_, string>;
 }
 
+/// Compose-time configuration entry for net.l2.bridge: binds the locally-administered
+/// MAC base its ports *advertise* (see the `l2-bridge` world: an advertised MAC is a
+/// suggestion for consumers that source from `interface-info.mac`, never enforced —
+/// the bridge does not rewrite). Same format and validation as `l2-switch-config`:
+/// colon-separated hex, locally-administered bit set, multicast bit clear in the first
+/// octet; malformed or non-local is a configure-time error, never a trap. Advertised
+/// port MACs are `base + slot index + 1` in the last octet (wrapping). Unconfigured,
+/// the bridge keeps its documented default base, `02:e0:09:00:01:00` — so `port-a`
+/// advertises `02:e0:09:00:01:01` and `port-b` advertises `02:e0:09:00:01:02`
+/// (deliberately distinct from the switch's default-derived MACs, so mixed
+/// switch/bridge stacks at defaults never advertise colliding addresses).
+interface l2-bridge-config {
+    configure: func(mac-base: string) -> result<_, string>;
+}
+
 // --- stub worlds (one per standard stub provider) ------------------------------
 
 /// net.l2.none — absence: exports the optional flavor answering `none`.
@@ -377,6 +392,39 @@ world l2-switch {
     export port-a: l2;
     export port-b: l2;
     export l2-switch-config;
+}
+
+/// net.l2.bridge — the 802.1D learning bridge: imports ONE upstream link
+/// (`eo9:net/l2` — the physical NIC's driver, another bridge, or a switch port: it
+/// stacks) and exports the named ports `port-a` and `port-b`, each a full
+/// `eo9:net/l2` with its own root-handle type. Where the switch is an
+/// identity-ENFORCING attenuator (it rewrites every source to the port's own MAC, so
+/// a consumer cannot spoof), the bridge is a transparent segment that TRUSTS its
+/// ports: frames pass with their original source MACs — **handing a program a bridge
+/// port hands it the ability to claim any link-layer identity on that segment**, and
+/// choosing switch vs. bridge is therefore a capability decision the composer makes,
+/// not a tuning knob.
+///
+/// Forwarding is classic 802.1D, with the upstream treated as just another port:
+/// every ingress frame's source MAC is learned (source → port; bounded table,
+/// least-recently-learned evicted when full; a migrating MAC's last sighting wins);
+/// a known unicast destination is forwarded to the learned port alone (including
+/// port-to-port local delivery that never touches the upstream); unknown unicast is
+/// FLOODED to every other port (the deliberate opposite of the switch's drop policy —
+/// flooding is how learning converges); broadcast/multicast goes to every other
+/// port; a frame is never reflected to its ingress port. There is no STP: composition
+/// wiring is a DAG, so loops are unconstructible by the algebra itself. Each port's
+/// `interface-info.mac` is an *advertised suggestion* (derived from the configured
+/// base) for consumers that source from it — the bridge never checks it. Wire it
+/// exactly like the switch:
+///
+///   net.virtio $ rename port-a link-a $ rename port-b link-b $ net.l2.bridge
+///     $ (consumers whose l2 imports are named link-a / link-b)
+world l2-bridge {
+    import l2;
+    export port-a: l2;
+    export port-b: l2;
+    export l2-bridge-config;
 }
 
 /// net.l2.echo — the frame-reflector test fixture: a self-contained `eo9:net/l2` whose
