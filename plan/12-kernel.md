@@ -1769,3 +1769,29 @@ preemption/hardening work.
       (U-Boot recipe, SD layout, the eight known kernel changes with sizes, the day-one
       smoke ladder), docs/board/gfx-simplefb.md (the dumb-framebuffer provider + the
       minimal FDT reader as its blind-implementable core).
+
+73. **CNTV switch + syndrome-valid MMIO: the kernel runs under Apple HVF (2026-06-04,
+    `area/12-cntv-hvf`).** Two changes unlock `cargo xtask qemu aarch64 hvf` end to end
+    (docs/spikes/hvf-cntv.md has the full analysis and numbers):
+    * **The EL1 virtual timer (CNTV)** replaces the physical timer everywhere in
+      `arch/aarch64/timer.rs` (`cntpct→cntvct`, `cntp_*→cntv_*`): Apple HVF exposes only
+      the virtual timer to guests. Safe on TCG (`CNTVOFF = 0` on QEMU `virt`, so
+      virtual == physical there — canonical demo values byte-identical before/after);
+      no interrupt-path change needed because the PPI family 26/27/29/30 was already
+      enabled and `kirq` already serviced all four (the live PPI moves 30→27). The boot
+      banner's "counter advancing" line now spins until it observes a real advance (at
+      HVF's host-passthrough 24 MHz, back-to-back reads are routinely equal).
+    * **`pci::mmio` syndrome-valid accessors**: LLVM compiled the ECAM volatile reads
+      into SIMD/FP loads (`ldr s0`/`ldr b0` — found by disassembly), whose ISV=0
+      data-abort syndromes hardware virtualizers cannot decode (QEMU hvf asserts; KVM
+      shares the restriction). Inline-asm GPR forms (`ldrb/ldrh/ldr`, no writeback) on
+      aarch64 behind the four PCI primitives — every wasm driver and the in-kernel
+      virtio-blk routes through them. Plain volatile preserved on other arches.
+      *Residual:* UART/GIC/RTC/INTx-mask volatiles currently compile to GPR forms
+      (battery-proven) but only by compiler choice — sweep them through `mmio` if HVF
+      becomes a daily driver or for any real-hypervisor deployment.
+    * **Verified**: full HVF battery (lspci, disk INTx round-trip with zero polled
+      fallbacks, net ARP + DNS, gpu draw cold/warm, switch vnicheck) with guest
+      values byte-identical to TCG; TCG regression (demo, disk, check-gpu pixel-exact,
+      svcdemo backoff pacing, 10/10 unpaced paste bursts, riscv64/x86_64 demos)
+      unchanged. Speedups: ~10× on-target codegen, 9.4× cold draw, 14× demo session.
