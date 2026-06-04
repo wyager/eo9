@@ -10,6 +10,8 @@ interface types {
     resource entropy-impl;
 }
 
+/// The randomness surface: random bytes from whatever source the composer granted
+/// (real hardware, or a seeded deterministic stream).
 interface entropy {
     use types.{entropy-impl};
 

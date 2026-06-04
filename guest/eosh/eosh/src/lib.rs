@@ -310,6 +310,22 @@ impl Backend for WitBackend {
         info_from_wit(component_algebra::describe(component))
     }
 
+    async fn list_bin(&mut self) -> Vec<String> {
+        // The OS API cards' live section. Any error (no /bin, a read-only quirk)
+        // just means no live section — the static card already printed.
+        let entries = match fs::list_directory(&self.fs, String::from("/bin")).await {
+            Ok(entries) => entries,
+            Err(_) => return Vec::new(),
+        };
+        let mut names: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| entry.strip_suffix(".wasm"))
+            .map(String::from)
+            .collect();
+        names.sort();
+        names
+    }
+
     fn wiring(&mut self, component: &Self::Component) -> String {
         component_algebra::wiring(component)
     }

@@ -11,6 +11,8 @@ interface types {
     resource time-impl;
 }
 
+/// The clock surface: wall-clock now and a monotonic instant, at whatever
+/// resolution and truthfulness the composed provider grants.
 interface time {
     use types.{time-impl};
 

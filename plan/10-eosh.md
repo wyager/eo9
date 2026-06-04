@@ -260,3 +260,36 @@ eosh is the first client of `eo9:svc` (executor v1, docs/design/executor-model.m
     convention. Remaining instance of the class, deliberately untouched (example, not a
     coreutil, and pinned by cli.rs's "Denied" assertion): `readwrite`'s `{err:?}` mapper —
     a one-line follow-up for whoever next touches guest/examples.
+
+## D20 — `describe` on the OS APIs themselves (2026-06-04)
+
+Owner TODO: `describe eo9:pci` and `describe eo9:pci/pci` should explain the APIs the
+way `describe describe` explains the shell. Decisions:
+
+- **The WIT docs are the single source.** `eosh-core/build.rs` parses the repository's
+  `wit/` tree at build time (line-oriented; our one-decl-per-line style) and bakes
+  package + interface cards into a generated table (`apidocs.rs` includes it). No
+  hand-maintained duplicate to rot; enriching a WIT doc comment enriches the card on
+  the next build. Nine main interfaces (disk, entropy, fs, gfx, io/buffers, pci, perf,
+  text, time) had no interface-level docs — given one-paragraph docs (additive,
+  doc-only WIT change; `wit/check.sh` green).
+- **Precedence:** in `describe <word>`, a single trailing word containing `:` routes to
+  the API cards (`Command::DescribeApi`). Store names cannot contain `:` (the lexer
+  reserves the spelling for interface references), so the route is unambiguous;
+  parentheses still force the expression path, exactly as for builtins. `@version`
+  suffixes are tolerated (`describe eo9:fs/fs@0.1.0` — the spelling import lists use).
+  Unknown API names render the package inventory, not a resolution error.
+- **The live section.** After the static card the session scans `/bin` (new
+  `Backend::list_bin`, fs `list-directory` in the component; the registered names in
+  the mock) and prints who exports / imports the described surface in *this* store —
+  the card answers "what is this" and "who here speaks it" together. Broken store
+  entries are skipped; an empty or unlistable store just omits the section.
+- **Coverage discipline** mirrors the builtin cards:
+  `every_wit_package_and_interface_has_a_card` re-scans `wit/` independently of the
+  build-script parser and asserts every package and interface renders within the
+  109-column budget — a new API cannot ship undescribed.
+
+Follow-ups (not done here): the package inventory error line is one long line (matches
+the long `builtins:` help line precedent); `describe` of a *world* (`describe
+pci.filtered` already works through the store — the world spelling `eo9:pci/filtered`
+is not a thing users meet).

@@ -162,6 +162,12 @@ pub trait Backend {
     /// Kind, imports, exports, and argument signature.
     fn describe(&mut self, component: &Self::Component) -> ComponentInfo;
 
+    /// The program names installed in `/bin` (bare dotted names, no path or
+    /// extension), for the OS API cards' live cross-references ("in this store:
+    /// exported by …"). Backends without a listable store answer empty — the cards
+    /// simply omit the live section.
+    async fn list_bin(&mut self) -> Vec<String>;
+
     /// The composition tree of how the component was built, rendered as an indented
     /// tree (one node per line). Provenance is recorded by the algebra operations in
     /// this session and is not carried in component bytes, so a freshly resolved

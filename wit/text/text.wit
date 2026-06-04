@@ -14,6 +14,7 @@ interface types {
     resource text-impl;
 }
 
+/// The console surface: write a line out or to the error stream, read a line in.
 interface text {
     use types.{text-impl};
 

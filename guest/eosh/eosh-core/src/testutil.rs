@@ -206,6 +206,10 @@ impl Backend for MockBackend {
         self.info(*component)
     }
 
+    async fn list_bin(&mut self) -> Vec<String> {
+        self.programs.keys().cloned().collect()
+    }
+
     fn wiring(&mut self, component: &u32) -> String {
         self.log.push(format!("wiring(c{component})"));
         let info = self.info(*component);

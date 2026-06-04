@@ -32,6 +32,8 @@ interface types {
     resource gfx-impl;
 }
 
+/// The framebuffer surface: query the mode, clear, present damage rectangles of
+/// packed pixels, and read back what was presented.
 interface gfx {
     use eo9:io/buffers@0.1.0.{buffer};
     use types.{gfx-impl};
