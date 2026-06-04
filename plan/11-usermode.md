@@ -452,3 +452,26 @@ fixed. Root cause, with the reproduction that proves it:
   regression test would need fault-injection hooks in the host fn's poll (rejected: prod code
   carrying interleaving hooks); the regression guards are the CLI suite under load and this
   recorded experiment.
+
+### D20 (2026-06-04) — the registry liveness margin: characterized, the park wake-set fixed
+
+The resolve-cache work (plan/10 D21 finding #2) suspected services advance only in the
+drive loop's parked 10 ms windows. Instrumented characterization
+(docs/spikes/registry-liveness.md) shows the truth is narrower: `pump` runs on every
+drive-loop iteration and services advance on pumps; pump *opportunities* are rationed by
+the foreground's return events (genuine `Blocked` returns, or `OutOfFuel` past ~1M fuel
+per donation) — a foreground that rides sync wakes adds none (measured: two 5000-round
+crunchers → zero extra return events; one loopback sockcheck → many). No usermode service
+can be completion-blocked today (the registry's provider surface is eager end to end), so
+the active failure was a test margin, correctly fixed by pacing.
+
+The genuine structural gap was the park path: the embedder's park woke only on the
+foreground's doorbell, so a restart deadline due mid-park waited out the 10 ms backstop,
+and any future parking service would pay up to 10 ms per completion. Fixed:
+`park_until_progress` registers the parking thread's waker with every parked Running
+service's doorbell (per-service `Doorbell::poll_edge` — the loom-checked protocol) and
+bounds the timeout by the earliest restart deadline; the 10 ms backstop is unchanged. The
+kernel already had both halves (`request_timer_wake` for restart deadlines; completions
+ring the shared idle wakers) — usermode now matches. The fleet's "CLI transient failures
+under load" class is **not** explained by this margin (0/120 failures on both sides of
+the A/B under 8-way load); the workaround ledger's contention explanation stands there.

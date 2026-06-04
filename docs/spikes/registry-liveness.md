@@ -86,3 +86,21 @@ ring those wakers directly (the 5fa53e8 drain-all list plus the pciwait sticky c
 so a parked kernel loop is woken by service completions already. The kernel svcdemo's
 restart pacing runs through `request_timer_wake`, which already bounds the halt by the
 deadline. No kernel change needed; noted in plan/12 by reference.
+
+## Verification numbers (release, warm store)
+
+* Foreground latency A/B (20 interleaved `--svc shell` hello sessions each):
+  base median 54.2 ms (min 52.2, max 60.8) vs fixed median 55.4 ms (min 52.2, max
+  154.3 — one ambient-load outlier): no regression; the new code runs only on the
+  already-parked edge.
+* Suites: svc_shell 8/8 (incl. the new park-path test, marker-gated so debug-build
+  startup cannot eat the quiet window), svc_registry 14/14, CLI 60/60, loom 4/4
+  (the Doorbell protocol is reused, not changed), full `cargo xtask ci` green.
+* Chaos: 15 seeds on the old-pacing session shape and 5 seeds on the quiet-gap
+  shape, sleep-pct 25: zero failures.
+* Ledger-#2 payoff test: the old-pacing svc session under 8-way parallel self-load,
+  120 sessions per binary, per-worker stores: **0 failures on base and 0 on fixed**
+  — the "CLI transient failures under load" class is *not* explained by this
+  margin on this machine; that ledger entry's target-dir-contention explanation
+  stands for the non-svc flakes, and the svc-shaped flake needed the fast-world
+  pump collapse (now paced correctly in the test).
