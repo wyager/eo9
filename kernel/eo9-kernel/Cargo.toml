@@ -42,9 +42,10 @@ wasm-codegen = ["dep:wasmtime", "wasmtime/cranelift", "dep:eo9-component"]
 wasm-storedisk = ["wasm-store", "dep:eo9-eofs", "dep:blake3"]
 # First-poll-inline (docs/spikes/first-poll-inline.md, vendor/README.md): run callback-ABI
 # guest callees inline on the caller's stack in the vendored wasmtime instead of queueing
-# them to the event loop. Off by default and not part of any xtask build; for a kernel
-# measurement build append it to the aarch64 feature list in xtask's build_kernel. The
-# weak reference keeps host-triple (stub) builds inert.
+# them to the event loop. DEFAULT-ON since the owner's GO ruling (2026-06-03): xtask's
+# standard kernel feature lists include it on all three arches. The escape hatch for an
+# A/B or bisection build is `EO9_KERNEL_FEATURES_REMOVE=first-poll-inline` (see xtask's
+# kernel_features). The weak reference keeps host-triple (stub) builds inert.
 first-poll-inline = ["wasmtime?/component-model-async-first-poll"]
 
 # These dependencies are only used by the real bare-metal build; host-triple builds (unit
