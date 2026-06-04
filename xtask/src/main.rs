@@ -675,6 +675,11 @@ fn test(root: &Path) -> Result<(), String> {
     run(&root.join("www"), "cargo", ["test", "--workspace"])
 }
 
+/// Validate feature set for componentized guests. Part of every componentize stamp
+/// AND the `wasm-tools validate` invocation: one constant, so the stamp cannot drift
+/// from the flags actually passed.
+const COMPONENT_VALIDATE_FEATURES: &str = "cm-async,cm-implements";
+
 /// One guest-workspace build per xtask invocation (see [`ensure_guest_workspace_built`]).
 static GUEST_WORKSPACE_BUILT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -797,7 +802,7 @@ fn componentize_guest_package(root: &Path, package: &str) -> Result<PathBuf, Str
         .map_err(|err| format!("failed to read {}: {err}", module.display()))?;
     let stamp = components_dir.join(format!("{package}.wasm.stamp"));
     let fingerprint = format!(
-        "module={} {} features=cm-async,cm-implements",
+        "module={} {} features={COMPONENT_VALIDATE_FEATURES}",
         fingerprint_bytes(&module_bytes),
         wasm_tools_version()?,
     );
@@ -826,7 +831,7 @@ fn componentize_guest_package(root: &Path, package: &str) -> Result<PathBuf, Str
         [
             OsStr::new("validate"),
             OsStr::new("--features"),
-            OsStr::new("cm-async,cm-implements"),
+            OsStr::new(COMPONENT_VALIDATE_FEATURES),
             component.as_os_str(),
         ],
     )?;
@@ -2212,10 +2217,13 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
 /// every Cranelift backend.
 /// Bump whenever anything compile-relevant changes in [`precompile_for_kernel`]'s
 /// engine configuration (flag changes, or a wasmtime upgrade through the workspace
-/// pin): the freshness stamps key on it. Safety net for a missed bump: wasmtime embeds
-/// its own engine/config fingerprint in every artifact and the kernel refuses to
-/// deserialize a mismatch, so a stale skip fails loudly at boot instead of running
-/// outdated code.
+/// pin): the freshness stamps key on it. Partial safety net for a missed bump:
+/// wasmtime embeds its engine version and compatibility-relevant settings (trap
+/// model, memory layout, target features) in every artifact and the kernel refuses
+/// a mismatch loudly at boot — but settings that only change codegen quality
+/// (e.g. opt level) are NOT refused, so a missed bump there silently keeps the old
+/// (semantically equivalent) artifacts. The bump discipline is load-bearing for
+/// that class; when in doubt, bump.
 const PRECOMPILE_CONFIG_REV: u32 = 1;
 
 fn precompile_for_kernel(
