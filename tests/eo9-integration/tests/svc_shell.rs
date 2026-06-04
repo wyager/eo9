@@ -236,10 +236,16 @@ fn logs_are_captured_and_restart_always_restarts_in_the_background() {
             "detach phoenix = cruncher --seed 1 --rounds 100 restart restart.always",
             // A capture-logged one-shot greeter (time sealed; text = the log).
             "detach greeter = time.frozen $ hello --name background restart restart.never",
-            // Foreground work — each command gives the registry thousands of pump slices.
+            // Foreground work. Services advance on the root drive loop's pump, and a
+            // *blocked* foreground is what yields the loop's parked 10ms wake windows —
+            // the same idle a real interactive session has between keystrokes. The
+            // sockcheck line blocks on real loopback I/O, providing those windows
+            // deterministically. (Three quick hellos used to provide them by accident;
+            // the session resolve cache made trivial lines too fast for that.)
             "hello --name one",
             "hello --name two",
             "hello --name three",
+            "net.l4.loopback $ sockcheck --payload pacing",
             "svc list",
             "svc log greeter",
             "svc stop phoenix",

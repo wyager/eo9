@@ -12,7 +12,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::ast::{Command, Expr};
-use crate::backend::{AbnormalExit, Backend, ComponentKind, Outcome, ServiceInfo};
+use crate::backend::{AbnormalExit, Backend, ComponentInfo, ComponentKind, Outcome, ServiceInfo};
+use crate::cache::SessionCache;
 use crate::envinfo::{self, SessionManifest};
 use crate::eval::{EvalError, Evaluator, complete_args};
 use crate::parse::parse_command;
@@ -57,6 +58,7 @@ pub struct Session<B: Backend> {
     backend: B,
     bindings: BTreeMap<String, B::Component>,
     environment: Option<B::Component>,
+    cache: SessionCache<B::Image>,
     history: Vec<String>,
     /// Where the per-command outcome line (`ok: …`/`error: …`) goes: standard output in
     /// an interactive REPL (the default), standard error in one-shot (`--command`) mode so
@@ -71,6 +73,7 @@ impl<B: Backend> Session<B> {
             backend,
             bindings: BTreeMap::new(),
             environment: None,
+            cache: SessionCache::new(),
             history: Vec::new(),
             outcome_on_stderr: false,
         }
@@ -184,7 +187,8 @@ impl<B: Backend> Session<B> {
     /// `env <expr>`: how this session would treat the expression's imports if it were
     /// run — without running (or even compiling) anything.
     async fn run_env_of(&mut self, expr: &Expr) -> LineResult {
-        let mut evaluator = Evaluator::new(&mut self.backend, &self.bindings);
+        let mut evaluator =
+            Evaluator::with_cache(&mut self.backend, &self.bindings, &mut self.cache.bytes);
         let component = match evaluator.eval(expr).await {
             Ok(output) => output.component,
             Err(err) => return self.report(err),
@@ -206,7 +210,8 @@ impl<B: Backend> Session<B> {
 
     /// `let name = expr`: evaluate to a component value and remember it.
     async fn run_let(&mut self, name: String, expr: &Expr) -> LineResult {
-        let mut evaluator = Evaluator::new(&mut self.backend, &self.bindings);
+        let mut evaluator =
+            Evaluator::with_cache(&mut self.backend, &self.bindings, &mut self.cache.bytes);
         match evaluator
             .eval_plain(expr, "a `let` binding (arguments are bound at run time)")
             .await
@@ -233,6 +238,9 @@ impl<B: Backend> Session<B> {
                     }
                 };
                 self.backend.print(&confirmation);
+                // The binding's cache identity freezes now: a later `save` over a leaf
+                // it was built from must not retroactively change what it means.
+                self.cache.record_binding(&name, expr);
                 self.bindings.insert(name, component);
                 LineResult::Ok
             }
@@ -259,7 +267,8 @@ impl<B: Backend> Session<B> {
             self.backend.print_error(&message);
             return LineResult::Error(message);
         }
-        let mut evaluator = Evaluator::new(&mut self.backend, &self.bindings);
+        let mut evaluator =
+            Evaluator::with_cache(&mut self.backend, &self.bindings, &mut self.cache.bytes);
         let component = match evaluator
             .eval_plain(expr, "a `save` command (arguments are bound at run time)")
             .await
@@ -269,6 +278,9 @@ impl<B: Backend> Session<B> {
         };
         match self.backend.persist(&name, &component).await {
             Ok(()) => {
+                // `/bin/<name>.wasm` changed: keys built from that leaf must miss, and
+                // its cached bytes are stale. Unrelated entries are untouched.
+                self.cache.note_bin_write(&name);
                 self.backend
                     .print(&format!("saved: /bin/{name}.wasm (run it as `{name}`)"));
                 LineResult::Ok
@@ -313,7 +325,8 @@ impl<B: Backend> Session<B> {
         // arguments are completed/refused against the signature, and the session's
         // granted environment (when there is one) is composed in. A detached service
         // runs with what *this session* could have given a foreground run, never more.
-        let mut evaluator = Evaluator::new(&mut self.backend, &self.bindings);
+        let mut evaluator =
+            Evaluator::with_cache(&mut self.backend, &self.bindings, &mut self.cache.bytes);
         let output = match evaluator.eval(expr).await {
             Ok(output) => output,
             Err(err) => return self.report(err),
@@ -328,6 +341,7 @@ impl<B: Backend> Session<B> {
         if let Err(err) = complete_args(&mut args, &info.args) {
             return self.report(err);
         }
+        let child_imports_fs = imports_fs(&info);
         if let Some(environment) = &self.environment {
             let environment = match self.backend.duplicate(environment) {
                 Ok(environment) => environment,
@@ -342,7 +356,8 @@ impl<B: Backend> Session<B> {
         // The restart policy: an expression evaluating to a policy component (its
         // configure arguments, e.g. `restart.backoff --max-restarts 5`, were applied by
         // the evaluator as compose-time configuration).
-        let mut evaluator = Evaluator::new(&mut self.backend, &self.bindings);
+        let mut evaluator =
+            Evaluator::with_cache(&mut self.backend, &self.bindings, &mut self.cache.bytes);
         let policy_component = match evaluator
             .eval_plain(
                 policy,
@@ -359,6 +374,12 @@ impl<B: Backend> Session<B> {
             .svc_detach(component, policy_component, &name, &args)
         {
             Ok(service) => {
+                if child_imports_fs {
+                    // The service is a *concurrent* potential `/bin` writer for the rest
+                    // of the session: no point-in-time invalidation is sound, so the
+                    // resolve cache turns itself off.
+                    self.cache.disable();
+                }
                 self.backend.print(&format!(
                     "detached: {service} is running in the background (`svc list` to \
                      inspect, `svc log {service}` for its output, `svc stop {service}` \
@@ -501,7 +522,8 @@ impl<B: Backend> Session<B> {
 
     /// `describe expr` / `imports expr`.
     async fn run_describe(&mut self, expr: &Expr, imports_only: bool) -> LineResult {
-        let mut evaluator = Evaluator::new(&mut self.backend, &self.bindings);
+        let mut evaluator =
+            Evaluator::with_cache(&mut self.backend, &self.bindings, &mut self.cache.bytes);
         let component = match evaluator.eval(expr).await {
             Ok(output) => output.component,
             Err(err) => return self.report(err),
@@ -598,8 +620,33 @@ impl<B: Backend> Session<B> {
 
     /// The top-level rule: compose the granted environment onto the command, compile,
     /// spawn with the bound arguments, await the outcome, print it.
+    ///
+    /// A structurally identical run this session already compiled (the session resolve
+    /// cache — see [`crate::cache`]) skips resolution, the algebra, and `compile`
+    /// entirely: the cached image spawns again with the arguments bound last time.
     async fn run_program(&mut self, expr: &Expr) -> LineResult {
-        let mut evaluator = Evaluator::new(&mut self.backend, &self.bindings);
+        let key = self.cache.run_key(expr, self.environment.is_some());
+
+        if let Some(key) = key.as_deref() {
+            let Session { backend, cache, .. } = self;
+            let hit = cache
+                .image_get(key)
+                .map(|(image, args, fs_run)| (backend.spawn(image, args), fs_run));
+            if let Some((spawned, fs_run)) = hit {
+                let task = match spawned {
+                    Ok(task) => task,
+                    Err(err) => return self.report(EvalError::Backend(err)),
+                };
+                let outcome = self.backend.wait(task).await;
+                if fs_run {
+                    self.cache.note_fs_run();
+                }
+                return self.finish_run(outcome);
+            }
+        }
+
+        let mut evaluator =
+            Evaluator::with_cache(&mut self.backend, &self.bindings, &mut self.cache.bytes);
         let output = match evaluator.eval(expr).await {
             Ok(output) => output,
             Err(err) => return self.report(err),
@@ -614,6 +661,7 @@ impl<B: Backend> Session<B> {
         if let Err(err) = complete_args(&mut args, &info.args) {
             return self.report(err);
         }
+        let fs_run = imports_fs(&info);
 
         if let Some(environment) = &self.environment {
             let environment = match self.backend.duplicate(environment) {
@@ -634,8 +682,23 @@ impl<B: Backend> Session<B> {
             Ok(task) => task,
             Err(err) => return self.report(EvalError::Backend(err)),
         };
+        // The image is good (it spawned): remember it for the next structurally
+        // identical line, whatever the program's own outcome turns out to be.
+        if let Some(key) = key {
+            self.cache.image_insert(key, image, args, fs_run);
+        }
         let outcome = self.backend.wait(task).await;
+        if fs_run {
+            // The program holds the filesystem capability, so it *could* have rewritten
+            // `/bin`; nothing tells us whether it did. Honesty rule: re-resolve.
+            self.cache.note_fs_run();
+        }
+        self.finish_run(outcome)
+    }
 
+    /// Render and classify a finished run's outcome (shared by the cached-image fast
+    /// path and the full path).
+    fn finish_run(&mut self, outcome: Outcome) -> LineResult {
         let rendered = render_outcome(&outcome);
         if self.outcome_on_stderr {
             self.backend.print_error(&rendered);
@@ -660,6 +723,16 @@ impl<B: Backend> Session<B> {
         self.backend.print_error(&message);
         LineResult::Error(message)
     }
+}
+
+/// Whether a program's residual imports include the filesystem (required or optional):
+/// the conservative signal that running it could rewrite `/bin` under the session's
+/// resolve cache. The filesystem API has no read/write split at the interface level, so
+/// read-only users bump too — correctness over cleverness.
+fn imports_fs(info: &ComponentInfo) -> bool {
+    info.imports
+        .iter()
+        .any(|need| need.interface.starts_with("eo9:fs/"))
 }
 
 /// Wrap a `prefix: a, b, c` name list at the page column budget, continuation lines
@@ -1079,7 +1152,10 @@ mod tests {
             run(&mut session, "let det-env = time.frozen & virtualnet"),
             LineResult::Ok
         );
-        // Use it twice: each use duplicates the stored value rather than consuming it.
+        // Use it twice. The first use duplicates the stored value rather than
+        // consuming it; the second is a resolve-cache hit (same structural key), which
+        // re-spawns the cached image without touching the binding at all — the binding
+        // demonstrably survives both.
         assert_eq!(run(&mut session, "det-env $ app"), LineResult::Ok);
         assert_eq!(run(&mut session, "det-env $ app"), LineResult::Ok);
         let duplicates = session
@@ -1088,7 +1164,168 @@ mod tests {
             .iter()
             .filter(|line| line.starts_with("duplicate"))
             .count();
-        assert_eq!(duplicates, 2);
+        assert_eq!(duplicates, 1);
+        let spawns = session
+            .backend
+            .log
+            .iter()
+            .filter(|line| line.starts_with("spawn"))
+            .count();
+        assert_eq!(spawns, 2);
+    }
+
+    /// A binary whose residual imports include the filesystem (the conservative
+    /// could-rewrite-/bin signal).
+    fn fs_binary() -> crate::backend::ComponentInfo {
+        let mut info = binary(&[]);
+        info.imports.push(crate::backend::ImportNeed {
+            slot: "eo9:fs/fs".to_string(),
+            interface: "eo9:fs/fs".to_string(),
+            version: "0.1.0".to_string(),
+            required: true,
+        });
+        info
+    }
+
+    #[test]
+    fn a_repeated_line_respawns_the_cached_image_and_touches_nothing_else() {
+        let mut session = session_with(&[
+            ("gpu.virtio", provider(&["eo9:gfx/gfx"])),
+            ("draw", binary(&[])),
+        ]);
+        assert_eq!(run(&mut session, "gpu.virtio $ draw"), LineResult::Ok);
+        let first_len = session.backend.log.len();
+        // A different spelling of the same structure: extra whitespace and parens.
+        assert_eq!(run(&mut session, "gpu.virtio  $  (draw)"), LineResult::Ok);
+        let second: Vec<&String> = session.backend.log[first_len..].iter().collect();
+        assert_eq!(second.len(), 2, "expected spawn+wait only, got {second:?}");
+        assert!(second[0].starts_with("spawn(i1"), "got {second:?}");
+        assert!(second[1].starts_with("wait"), "got {second:?}");
+    }
+
+    #[test]
+    fn changed_arguments_miss_and_rebuild() {
+        let mut session = session_with(&[("hello", binary(&[("name", "string")]))]);
+        assert_eq!(run(&mut session, "hello --name a"), LineResult::Ok);
+        let first_len = session.backend.log.len();
+        assert_eq!(run(&mut session, "hello --name b"), LineResult::Ok);
+        // Different argument value = different structural key: the line re-evaluates
+        // (v1 keys include arguments; argument-stripped sharing is the recorded
+        // follow-up) — and the spawn carries the new value.
+        assert!(
+            session.backend.log[first_len..]
+                .iter()
+                .any(|line| line.contains("name=\"b\"") && line.starts_with("spawn")),
+            "log: {:?}",
+            &session.backend.log[first_len..]
+        );
+    }
+
+    #[test]
+    fn save_invalidates_runs_built_from_that_name_only() {
+        let mut session = session_with(&[("x", binary(&[])), ("y", binary(&[]))]);
+        assert_eq!(run(&mut session, "x"), LineResult::Ok);
+        assert_eq!(run(&mut session, "y"), LineResult::Ok);
+        assert_eq!(run(&mut session, "save x = y"), LineResult::Ok);
+        let len = session.backend.log.len();
+        // `x` was rewritten: its key moved, the line re-resolves.
+        assert_eq!(run(&mut session, "x"), LineResult::Ok);
+        assert!(
+            session.backend.log[len..]
+                .iter()
+                .any(|line| line.starts_with("resolve(x)") || line.starts_with("load(x)")),
+            "log: {:?}",
+            &session.backend.log[len..]
+        );
+        // `y` was not: its cached image respawns untouched.
+        let len = session.backend.log.len();
+        assert_eq!(run(&mut session, "y"), LineResult::Ok);
+        let tail: Vec<&String> = session.backend.log[len..].iter().collect();
+        assert_eq!(tail.len(), 2, "expected spawn+wait only, got {tail:?}");
+    }
+
+    #[test]
+    fn fs_importing_runs_invalidate_bin_keys() {
+        let mut session = session_with(&[("hello", binary(&[])), ("rm", fs_binary())]);
+        assert_eq!(run(&mut session, "hello"), LineResult::Ok);
+        // `rm` holds the filesystem capability: it could have rewritten /bin, and the
+        // filesystem cannot tell us whether it did.
+        assert_eq!(run(&mut session, "rm"), LineResult::Ok);
+        let len = session.backend.log.len();
+        assert_eq!(run(&mut session, "hello"), LineResult::Ok);
+        assert!(
+            session.backend.log[len..]
+                .iter()
+                .any(|line| line.starts_with("resolve(hello)")),
+            "log: {:?}",
+            &session.backend.log[len..]
+        );
+    }
+
+    #[test]
+    fn an_unrelated_let_evicts_nothing() {
+        let mut session = session_with(&[
+            ("hello", binary(&[])),
+            ("time.frozen", provider(&["eo9:time/time"])),
+        ]);
+        assert_eq!(run(&mut session, "hello"), LineResult::Ok);
+        assert_eq!(run(&mut session, "let t = time.frozen"), LineResult::Ok);
+        let len = session.backend.log.len();
+        assert_eq!(run(&mut session, "hello"), LineResult::Ok);
+        let tail: Vec<&String> = session.backend.log[len..].iter().collect();
+        assert_eq!(tail.len(), 2, "expected spawn+wait only, got {tail:?}");
+    }
+
+    #[test]
+    fn partial_reuse_loads_cached_bytes_instead_of_re_reading() {
+        let mut session = session_with(&[
+            ("time.frozen", provider(&["eo9:time/time"])),
+            ("a", binary(&[])),
+            ("b", binary(&[])),
+        ]);
+        assert_eq!(run(&mut session, "time.frozen $ a"), LineResult::Ok);
+        let len = session.backend.log.len();
+        // A different line sharing a leaf: the image cache misses, but the shared
+        // leaf's bytes are already in the session — `load`, not a filesystem re-read.
+        assert_eq!(run(&mut session, "time.frozen $ b"), LineResult::Ok);
+        let tail: Vec<&String> = session.backend.log[len..].iter().collect();
+        assert!(
+            tail.iter()
+                .any(|line| line.starts_with("load(time.frozen)")),
+            "log: {tail:?}"
+        );
+        assert!(
+            !tail
+                .iter()
+                .any(|line| line.starts_with("resolve(time.frozen)")),
+            "log: {tail:?}"
+        );
+    }
+
+    #[test]
+    fn detaching_an_fs_importing_child_disables_the_cache() {
+        let mut session = session_with(&[
+            ("hello", binary(&[])),
+            ("worker", fs_binary()),
+            ("restart.never", provider(&["eo9:svc/restart-policy"])),
+        ]);
+        session.backend.svc_grants = (true, true);
+        assert_eq!(run(&mut session, "hello"), LineResult::Ok);
+        assert_eq!(
+            run(&mut session, "detach w = worker restart restart.never"),
+            LineResult::Ok
+        );
+        // The service is a concurrent potential /bin writer: caching is off for the
+        // rest of the session, so even a previously cached line re-resolves.
+        let len = session.backend.log.len();
+        assert_eq!(run(&mut session, "hello"), LineResult::Ok);
+        assert!(
+            session.backend.log[len..]
+                .iter()
+                .any(|line| line.starts_with("resolve(hello)")),
+            "log: {:?}",
+            &session.backend.log[len..]
+        );
     }
 
     #[test]

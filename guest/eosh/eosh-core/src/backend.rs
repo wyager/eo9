@@ -153,6 +153,17 @@ pub trait Backend {
     /// Resolve a (possibly dotted) program name to an open component value.
     async fn resolve(&mut self, name: &str) -> Result<Self::Component, BackendError>;
 
+    /// Resolve a name and, when the backend read raw component bytes to do it, hand
+    /// those bytes back too so the session can cache them (the session resolve cache —
+    /// see [`crate::cache`]). The default keeps byte-less backends working: the name
+    /// resolves, nothing gets cached.
+    async fn resolve_with_bytes(
+        &mut self,
+        name: &str,
+    ) -> Result<(Self::Component, Option<Vec<u8>>), BackendError> {
+        Ok((self.resolve(name).await?, None))
+    }
+
     /// Load a component from raw bytes (the `load` half of `save`/`load`).
     fn load(&mut self, bytes: &[u8]) -> Result<Self::Component, BackendError>;
 

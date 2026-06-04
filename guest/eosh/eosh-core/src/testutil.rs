@@ -187,7 +187,26 @@ impl Backend for MockBackend {
         }
     }
 
+    async fn resolve_with_bytes(
+        &mut self,
+        name: &str,
+    ) -> Result<(u32, Option<Vec<u8>>), BackendError> {
+        // The mock's "bytes" are the program name itself, so `load` can find the same
+        // info again — mirroring the real backend, where the bytes round-trip exactly.
+        let component = self.resolve(name).await?;
+        Ok((component, Some(name.as_bytes().to_vec())))
+    }
+
     fn load(&mut self, bytes: &[u8]) -> Result<u32, BackendError> {
+        // Cached-bytes loads (the session resolve cache) hand back the bytes that
+        // `resolve_with_bytes` produced: a program name. Anything else is opaque bytes.
+        if let Ok(name) = core::str::from_utf8(bytes)
+            && let Some(info) = self.programs.get(name).cloned()
+        {
+            let id = self.fresh(info);
+            self.log.push(format!("load({name}) -> c{id}"));
+            return Ok(id);
+        }
         let id = self.fresh(binary(&[]));
         self.log
             .push(format!("load({} bytes) -> c{id}", bytes.len()));
