@@ -24,6 +24,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-l4check",
     "eo9-example-vnicheck",
     "eo9-example-vnic4check",
+    "eo9-example-bridgecheck",
     "eo9-example-cancelcheck",
     "eosh",
     // The service-boot program (executor v1, docs/design/executor-model.md).
@@ -58,6 +59,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-gfx-mem",
     "eo9-stub-gfx-none",
     "eo9-stub-gpu-virtio",
+    "eo9-stub-net-l2-bridge",
     "eo9-stub-net-l2-deny",
     "eo9-stub-net-l2-echo",
     "eo9-stub-net-l2-none",
@@ -183,6 +185,13 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     //   net.virtio $ sw $ vnicheck --mode arp
     ("eo9-stub-net-l2-switch", "net.l2.switch"),
     ("eo9-example-vnicheck", "vnicheck"),
+    // The 802.1D learning bridge — the switch's trusting sibling (no source rewrite,
+    // learned forwarding, flood-on-unknown; plan/09 D42): stacks for fan-out, so the
+    // metal payoff is BOTH vnicheck ports completing through a stacked pair:
+    //   net.virtio $ (rename port-a eo9:net/l2 $ net.l2.bridge)
+    //     $ (rename port-a link-a $ rename port-b link-b $ net.l2.bridge)
+    //     $ vnicheck --mode arp
+    ("eo9-stub-net-l2-bridge", "net.l2.bridge"),
     ("eo9-stub-net-l4-over-l2", "net.l4.over-l2"),
     ("eo9-example-l4check", "l4check"),
     // The two-stack transport check, so the full shared-link payoff runs at the metal
