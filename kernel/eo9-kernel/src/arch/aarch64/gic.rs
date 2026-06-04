@@ -152,9 +152,7 @@ pub fn acknowledge() -> Option<Ack> {
         // SAFETY: reading ICC_IAR1_EL1 acknowledges the pending group-1 interrupt; the
         // sysreg interface was enabled by `init` (ICC_SRE_EL1.SRE).
         let raw: u64;
-        unsafe {
-            core::arch::asm!("mrs {0}, S3_0_C12_C12_0", out(reg) raw, options(nostack))
-        };
+        unsafe { core::arch::asm!("mrs {0}, S3_0_C12_C12_0", out(reg) raw, options(nostack)) };
         let raw = raw as u32;
         (raw, raw & 0xff_ffff)
     } else {
