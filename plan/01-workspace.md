@@ -178,3 +178,31 @@ None. Everything else depends on this.
     Earlier decisions in this file refer to the old names; they are historical record, not current
     state. The publish sequence is now: eo9-component, eo9-store, eo9-providers-unix,
     eo9-bundled-programs, eo9-eofs, eo9-runtime, eo9-embed, eo9.
+
+D27 (2026-06-04, owner TODO "make gfx shouldn't re-kick component compilation when nothing
+changed"). Warm `cargo xtask build-kernel` dropped 23.4s -> 2.8s; warm `make gfx` additionally
+stops double-building (the Makefile's explicit `build-kernel` line is gone — `xtask qemu` builds
+internally), so the pre-QEMU wait fell from ~47s to ~3s. Mechanism, three layers, all
+content-keyed (never mtime-keyed):
+  1. One `cargo build --workspace` per xtask invocation (`ensure_guest_workspace_built`,
+     process-global flag) replaces the one-cargo-spawn-per-package pattern (54 spawns warm).
+  2. Freshness stamps skip pure-function steps when their recorded input fingerprint (blake3)
+     matches: componentize (inputs: core module bytes + `wasm-tools --version` + validate
+     features) and `precompile_for_kernel` (inputs: component bytes + target +
+     PRECOMPILE_CONFIG_REV). The config rev must be bumped on engine-config changes; a missed
+     bump fails loudly at kernel boot (wasmtime artifacts embed a config fingerprint and the
+     kernel refuses mismatched deserialization), never silently runs stale code. Stamps record
+     inputs only — the cargo contract; hand-corrupted outputs are out of scope exactly as with
+     any cargo target dir.
+  3. `write_if_different` on every produced artifact (cwasm, store.img, seed.wasm) keeps mtimes
+     stable so the kernel's build.rs `rerun-if-changed` skips the ~5s rebuild+relink when
+     embedded bytes are unchanged.
+Escape hatch: `EO9_FORCE_REBUILD=1` (spelled `make gfx FORCE=1`) disables every stamp skip;
+outputs still go through write_if_different so a forced identical rebuild does not relink the
+kernel. Soundness demonstrated: a one-line guest-source edit rebuilt exactly its own chain
+(1 componentize + 2 precompiles + store + relink) and the new string appeared in the booted
+store; reverting restored byte-identical artifacts without a relink; an mtime-only `touch` of
+wit/ produced zero artifact churn (content-keyed); `refresh-components` byte-identical on all
+components except the documented checkout-dependent fs-eofs (plan/01 D15, pre-existing). The
+pulley pre-AOT path (build-web-vm) keeps its own unconditional behavior — candidate for the
+same stamps later.
