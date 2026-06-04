@@ -127,7 +127,16 @@ pub fn wait_for_interrupt(delay_ns: u64) {
 pub fn self_test() {
     let frequency = frequency();
     let first = counter();
-    let second = counter();
+    // At low counter frequencies (HVF passes through the host's 24 MHz clock; TCG runs at
+    // 1 GHz) two back-to-back reads can return the same value — spin briefly so the banner
+    // only claims an advance it actually observed.
+    let mut second = counter();
+    let mut spins = 0u32;
+    while second == first && spins < 100_000 {
+        core::hint::spin_loop();
+        second = counter();
+        spins += 1;
+    }
     crate::kprintln!(
         "generic timer: counter advancing ({first} -> {second}), resolution {} ns, uptime {} us",
         resolution_ns(),
