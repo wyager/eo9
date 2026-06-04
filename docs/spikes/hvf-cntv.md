@@ -36,11 +36,15 @@ through them, which covers every wasm driver and the in-kernel virtio-blk (their
 device access all flows through these host functions; the virtio DMA rings are
 ordinary RAM and never trap).
 
-**Residual (recorded, not fixed):** the UART, GIC, RTC, and PCI-INTx-mask register
-accesses still use `read_volatile`/`write_volatile` and currently compile to GPR
-forms (the full HVF battery passes), but that is compiler luck, not a guarantee — the
-same `mmio` treatment should be applied in a sweep if HVF becomes a daily driver, and
-must be part of any real-hardware-hypervisor story.
+**Residual — CLOSED (`area/12-mmio-sweep`, plan/12 entry 75):** every remaining
+aarch64 device-memory access (PL011 UART, GICv2/v3 distributor/redistributor/CPU
+interface, PL031 RTC) now routes through the accessors, promoted to the crate-level
+`src/mmio.rs`. The non-aarch64 volatiles stay (ISV syndrome decoding is an
+aarch64-hypervisor concern; each site carries a one-line comment saying so), and the
+RAM-classified volatiles (virtio DMA regions, the DTB blob, the PVH start_info) stay
+plain volatile with their classification documented in place — the sweep's inventory
+is provably complete because `grep read_volatile kernel/eo9-kernel/src/arch/aarch64`
+now returns nothing.
 
 ## The numbers (HVF vs TCG, same kernel, same machine)
 
