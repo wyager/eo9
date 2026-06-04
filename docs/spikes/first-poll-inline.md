@@ -212,6 +212,19 @@ gate (`cargo test` twice in tests/firstpoll-ab; an xtask subcommand would be the
 ergonomic spelling), quantify per-hop costs on a quiet machine with work-item counters,
 and a metal (not QEMU) measurement once a board is in hand.
 
+## Default-on (area/04-firstpoll-on, 2026-06-03)
+
+The owner ruled GO and the feature is now in xtask's standard kernel feature lists on
+all three arches (`first-poll-inline` appended to every `kernel_features(...)` base
+list). Default `make qemu`, `check-gpu`, demo, and CI kernel builds therefore run with
+inline first-poll. The escape hatch is `EO9_KERNEL_FEATURES_REMOVE=first-poll-inline`
+(xtask strips it from the final list and prints a MEASUREMENT BUILD notice), verified to
+produce a feature-off kernel that boots and runs the standard composition. The
+`firstpoll-ab` workspace is unaffected by the default (its arms set the feature
+explicitly), so the A/B gate remains the standing regression gate. The browser blob
+already required the feature (fiberless wasm32); kernel and blob now agree. Usermode
+(registry wasmtime) remains out of scope until the upstream conversation.
+
 ## Default-on evaluation (area/04-firstpoll-eval, 2026-06-02)
 
 **The standing gate now exists**: `cargo xtask firstpoll-ab` refreshes the guest

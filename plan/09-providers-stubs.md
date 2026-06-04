@@ -820,3 +820,78 @@ Match the priority order above; (1)+(2) unblock I2.
     bring-up). Verified: vnic_switch/vnic_stacked/vnic_l4/net_l4_over_l2/eofs/
     pci_filtered/gfx suites green (the deny suites exercise the error-path restore
     repeatedly), metal smokes per family, full `cargo xtask ci` green.
+
+42. **`net.l2.bridge` — the 802.1D learning bridge; D37 resolves as separate providers
+    (owner ruling 2026-06-03, branch `area/09-l2-bridge`).** The stacked-fan-out
+    question (D37) is not a tuning knob on the switch: the owner ruled the candidate
+    semantics — reverse-mapping MAC-NAT, learn-don't-rewrite, point-to-point-only,
+    wider switches — are *separate providers*, and the first to ship is the classic
+    802.1D bridge. The capability stance is the headline: the switch is an
+    identity-ENFORCING attenuator (source rewrite = consumers cannot spoof); the
+    bridge is a transparent segment that TRUSTS its ports (no rewrite = a bridge port
+    carries the ability to claim any link-layer identity on the segment). Choosing
+    which to compose is the composer's security decision; the WIT docs on both worlds
+    say so loudly. The switch keeps its rewrite/point-to-point semantics untouched;
+    learning-NAT and wider static switches stay deferred until a topology demands
+    them.
+
+    The provider (`guest/stubs/net-l2-bridge`, world `eo9:net/l2-bridge`): one
+    upstream `eo9:net/l2` import + the named ports `port-a`/`port-b`, the switch's
+    exact wiring shape, so compositions swap one provider for the other freely.
+    Forwarding is classic 802.1D with the upstream as just another port: learn every
+    ingress source (learn-then-lookup, so an eviction caused by the current frame's
+    own source is visible to its own lookup); known unicast to the learned port alone
+    — including local port-to-port delivery the upstream never sees; unknown unicast
+    FLOODED to every other port (the deliberate opposite of the switch's drop policy;
+    flooding is how learning converges); broadcast/multicast to every other port;
+    never reflect to the ingress port. The learning table is bounded (64) with
+    least-recently-LEARNED eviction instead of time-based aging — eviction follows
+    source sightings, the same events that reset a real bridge's aging timer, but
+    with no clock import the provider stays pure and deterministic (the documented
+    trade: an idle station's entry survives until table pressure evicts it). No STP:
+    composition wiring is a DAG, loops are unconstructible by the algebra. Delivery
+    is atomic: a forward needing the upstream acquires it first, local copies enqueue
+    only after the upstream send succeeds, so a typed failure means nothing was
+    delivered. Advertised port MACs are a *suggestion* (consumers like the l4
+    middleware source from `interface-info.mac`; the bridge never checks): derived
+    base+1/+2 from `l2-bridge-config`, default `02:e0:09:00:01:00` — deliberately
+    distinct from the switch's default so mixed stacks at defaults never advertise
+    colliding MACs. Async discipline per D40/D41 from day one: honest awaits, the
+    take/put uplink slot with claim flag and bring-up guard, sibling-no-wedge,
+    bounded drains, typed busy errors.
+
+    Verified, usermode (`vnic_bridge.rs` 6, `vnic_bridge_stacked.rs` 4, all green):
+    the full policy suite over the echo fixture via the new `bridgecheck` example
+    (custom consumer MACs carried unrewritten; flood-before/unicast-after learning;
+    local delivery proven by upstream silence; broadcast + unknown-unicast flooding —
+    the behavioral line vs. the switch, whose same probe `vnicheck` pins as
+    delivered-to-NEITHER; MAC migration both directions); the bounded table both ways
+    (the 65th distinct source evicts the least-recently-learned entry, observable as
+    the probe flooding upstream; the 64-source control keeps it local); configured +
+    default advertised-MAC derivation and the typed bad-base refusal. Stacking: the
+    fan-out payoff — BOTH consumers' custom-MAC exchanges complete through two
+    stacked bridges (the exact shape `vnic_stacked.rs` pins as the switch's MAC-NAT
+    typed failure). The mixed matrix: switch-under-a-bridge passes the FULL
+    `vnicheck --mode echo` suite verbatim (the switch's rewritten port MACs are just
+    stations to the bridge; its drop policy still protects its consumers from the
+    bridge's floods — each provider keeps its contract through the other);
+    bridge-under-a-switch composes and runs but the switch's rewrite collapses every
+    station behind the bridge onto one port identity, replies flood, and
+    bridgecheck's typed check failure pins it (the switch enforcing its contract —
+    fan-out compositions put the bridge on top).
+
+    Verified, metal (QEMU aarch64, all compiled on-target): `net.virtio $ (rename
+    port-a link-a $ rename port-b link-b $ net.l2.bridge) $ vnicheck --mode arp` →
+    `verified("mac-a=02:e0:09:00:01:01 gw-a=52:55:0a:00:02:02 mac-b=02:e0:09:00:01:02
+    gw-b=52:55:0a:00:02:02")`, with the `netdump` pcap showing both advertised MACs
+    as Ethernet sources on the wire and ZERO frames sourced by the NIC's real MAC —
+    transparency, photographed (slirp note: QEMU user-net answers ARP for arbitrary
+    source MACs, no promiscuous quirk); the two-stack transport payoff over bridge
+    ports → `verified("left=dns answered (61 bytes) right=dns answered (61 bytes)")`
+    (384 KiB single-bridge composition compiled in 37.6 s, the 6-component dns one in
+    200.8 s); and the metal fan-out the switch structurally cannot do —
+    bridge-over-bridge with the FULL `--mode arp` (both ports through the stacked
+    pair; the switch's stacked smoke is `arp-a`, port A alone) → both gateways
+    verified, 74.1 s compile, clean poweroff. Kernel store 51→52
+    (`net.l2.bridge`); `bridgecheck` is usermode-only (GUEST_COMPONENTS, not the
+    kernel store). Full `cargo xtask ci` green per milestone.

@@ -431,3 +431,14 @@ usermode v1 is implemented:
   Recommendation in the spike note: GO for default-on in Eo9's vendored builds (one line per kernel
   feature list), escape hatch retained; usermode (registry wasmtime) and real-board timing explicitly out
   of scope. The flip itself is the owner's call.
+
+- **D (2026-06-03, area/04-firstpoll-on): first-poll-inline is default-on.** Owner GO ruling executed:
+  `first-poll-inline` joined the three xtask kernel feature base lists (aarch64 incl. storedisk,
+  riscv64, x86_64); `kernel_features` gained `EO9_KERNEL_FEATURES_REMOVE` (comma list, strips
+  features) as the documented escape hatch alongside the existing `EO9_KERNEL_FEATURES_EXTRA`.
+  Verified: a REMOVE build prints the measurement notice, boots, and runs the standard composition
+  (the off-arm stays producible for bisection); the full metal battery on the now-default kernels
+  (three arch demos, storage round-trip + filtered chain + power-cycle, cancelcheck hits with zero
+  data-miss, net ARP/DNS + switch, svcdemo, storedisk two-boot, check-gpu, 30 unpaced paste bursts);
+  `cargo xtask firstpoll-ab --rounds 5` semantic-identity PASS; full ci. GAPS' off-by-default open is
+  closed; the upstream spec conversation rides with the upstream branches.

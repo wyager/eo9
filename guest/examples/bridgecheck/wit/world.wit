@@ -1,0 +1,48 @@
+// bridgecheck — the 802.1D learning-bridge example: drive two bridge ports (wired
+// into the named slots `link-a` / `link-b`) over one upstream link and verify the
+// bridging policy a consumer can observe: no source rewrite (custom MACs reach the
+// upstream verbatim), learning (flood before, unicast after), local port-to-port
+// delivery that never touches the upstream, broadcast and unknown-unicast FLOODING
+// (the deliberate opposite of the switch's drop policy), MAC migration, and the
+// bounded learning table's least-recently-learned eviction. Composed as
+//
+//   <upstream l2> $ rename port-a link-a $ rename port-b link-b $ net.l2.bridge
+//     $ bridgecheck
+//
+// where the upstream is `net.l2.echo` in tests (its probe ethertypes and seen-source
+// payload convention are what the checks below read) — see that fixture's docs. The
+// same `learn` mode also runs over a STACKED bridge pair (the fan-out story the
+// switch's MAC-NAT structurally cannot provide).
+package eo9-examples:bridgecheck@0.1.0;
+
+/// Verifies the bridge's 802.1D forwarding policy over two ports.
+world bridgecheck {
+    import link-a: eo9:net/l2@0.1.0;
+    import link-b: eo9:net/l2@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    variant program-success {
+        /// Every check passed; carries `mac-a=<…> mac-b=<…>` (the advertised per-port
+        /// MACs) for `learn` mode, or the probe verdict for the table modes.
+        verified(string),
+    }
+
+    variant program-failure {
+        /// A link-layer capability refused an operation.
+        denied,
+        /// A link-layer operation failed, carrying the l2 API's own error.
+        net(string),
+        /// A bridging-policy check failed (what was expected, what happened).
+        check(string),
+        /// A console error.
+        io(string),
+    }
+
+    /// `mode`: `learn` runs the full 802.1D suite against the `net.l2.echo` fixture
+    /// (no-rewrite, flood-before/unicast-after learning, local delivery, broadcast
+    /// and unknown-unicast flooding, MAC migration) — over one bridge or a stacked
+    /// pair; `evict` proves the 65th distinct source evicts the least-recently-learned
+    /// entry (the probe's flood reaches the upstream); `keep` is the control (64
+    /// sources fit, the probe stays local).
+    export main: async func(mode: string) -> result<program-success, program-failure>;
+}
