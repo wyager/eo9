@@ -293,3 +293,44 @@ Follow-ups (not done here): the package inventory error line is one long line (m
 the long `builtins:` help line precedent); `describe` of a *world* (`describe
 pci.filtered` already works through the store — the world spelling `eo9:pci/filtered`
 is not a thing users meet).
+
+## D21 — the session resolve cache (owner TODO: warm spawn, the eosh lane; 2026-06-04)
+
+The spawn-fast spike (docs/spikes/spawn-latency.md) left ~98% of warm external latency
+guest-side: per prompt line, eosh re-read every component from `/bin` through fs host
+calls, re-ran the algebra, and re-passed every byte through the canonical ABI. The
+session now carries a two-layer resolve cache (`eosh-core/src/cache.rs`):
+
+- **Bytes cache** (name → component bytes, LRU 16 entries / 4 MiB): a repeated name
+  `load`s from the session's copy instead of re-reading `/bin/<name>.wasm`
+  (`Backend::resolve_with_bytes`, a default-method extension — byte-less backends are
+  untouched). One canonical-ABI pass instead of read + load.
+- **Image cache** (canonical run key → compiled image + bound args, LRU 8): a
+  structurally identical line skips resolution, the algebra, `compile` — straight to
+  `spawn` (images are many-spawn by the SPEC's own design). The key is the
+  **fusion-graph identity at eosh's granularity** (the owner's ruling, mirroring the
+  kernel's graph hash): canonicalized expression structure with netstring atoms,
+  `/bin` leaves generation-tagged, `let` bindings substituted by sub-keys **frozen at
+  bind time** — spelling, whitespace, parens, and binding names vanish; `let e = X`
+  then `e $ hello` hits the same entry as inline `X $ hello`.
+
+Invalidation is structural and conservative (a stale resolve is a correctness bug; when
+in doubt, re-resolve):
+
+| event | effect |
+|---|---|
+| `save <name>` | that name's generation bumps + its bytes drop; nothing else moves |
+| a run whose program imports `eo9:fs` completes | global generation bumps + bytes clear (it *could* have rewritten `/bin`; the fs API exposes no content identity to check — node-stat is kind+size only) |
+| `let` rebind | the frozen sub-key is replaced; unrelated entries untouched |
+| `detach` of an fs-importing child | both caches disabled for the session (a concurrent writer defeats point-in-time invalidation) |
+
+Store-immutability assumptions, per embedding: usermode sessions materialize a private
+session dir (the session is its only writer); metal storedisk's only writers are this
+console's `save` and fs-granted programs (both intercepted); the browser store is
+read-only. External writers inside a session don't exist today on any target.
+
+Deliberate v1 limits, recorded: argument values are part of the key (`hello --name a`
+vs `--name b` rebuilds — argument-stripped image sharing via cached arg-specs is the
+follow-up); fs-importing programs invalidate even when composed behind a read-only
+attenuation (the import name is all eosh can see); a future `eo9:fs` content-hash stat
+(the wit TODO at fs.wit:4) would turn the global bump into precise revalidation.
