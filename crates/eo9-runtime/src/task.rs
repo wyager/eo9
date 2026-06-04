@@ -50,7 +50,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -134,18 +133,44 @@ pub enum ResumeOutcome {
 // Doorbell
 // ---------------------------------------------------------------------------------------
 
+/// The Doorbell's synchronization primitives, swapped to loom's model-checked versions
+/// under `--cfg loom` so the ring/register/re-check interleavings can be explored
+/// exhaustively (`crate::loom_tests`; docs/spikes/timing-strategies.md). Production builds
+/// use `std`; this shim is the only loom seam in the crate.
+mod bell_sync {
+    #[cfg(loom)]
+    pub(crate) use loom::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    #[cfg(not(loom))]
+    pub(crate) use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+}
+
 /// Edge-triggered per-task doorbell. Rung by any wake of the task's store (host completions
 /// from provider threads, guest fuel yields); drained by the run loop and by `runnable`.
-#[derive(Default)]
 pub(crate) struct Doorbell {
-    rung: AtomicBool,
-    waiters: Mutex<Vec<Waker>>,
+    rung: bell_sync::AtomicBool,
+    waiters: bell_sync::Mutex<Vec<Waker>>,
+}
+
+impl Default for Doorbell {
+    // Manual (not derived) because loom's primitives don't implement `Default`.
+    fn default() -> Self {
+        Self {
+            rung: bell_sync::AtomicBool::new(false),
+            waiters: bell_sync::Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl Doorbell {
-    fn ring(&self) {
+    pub(crate) fn ring(&self) {
         crate::chaos::point("doorbell.ring");
-        self.rung.store(true, Ordering::SeqCst);
+        self.rung.store(true, bell_sync::Ordering::SeqCst);
         let waiters = std::mem::take(&mut *self.waiters.lock().unwrap());
         for waker in waiters {
             waker.wake();
@@ -154,16 +179,40 @@ impl Doorbell {
 
     /// Clear the doorbell, returning whether it had been rung (the edge).
     fn take(&self) -> bool {
-        self.rung.swap(false, Ordering::SeqCst)
+        self.rung.swap(false, bell_sync::Ordering::SeqCst)
     }
 
-    fn is_rung(&self) -> bool {
-        self.rung.load(Ordering::SeqCst)
+    pub(crate) fn is_rung(&self) -> bool {
+        self.rung.load(bell_sync::Ordering::SeqCst)
     }
 
-    fn register(&self, waker: &Waker) {
+    pub(crate) fn register(&self, waker: &Waker) {
         crate::chaos::point("doorbell.register");
         self.waiters.lock().unwrap().push(waker.clone());
+    }
+
+    /// The edge-wait protocol shared by [`Task::runnable`] and [`Task::wait`]: observe,
+    /// register, re-observe.
+    ///
+    /// The re-observation closes the observe→ring race: a ring landing between the first
+    /// observation and `register` drains an *empty* waiter list (it can wake nobody), so
+    /// its only trace is the state `observe` reads — the second observation is the last
+    /// chance to see that edge, and discarding a `Ready` from here is exactly the
+    /// lost-wakeup hang of plan/11 (bd67f89). The protocol is model-checked exhaustively
+    /// in `crate::loom_tests`.
+    pub(crate) fn poll_edge<T>(
+        &self,
+        mut observe: impl FnMut() -> Option<T>,
+        cx: &mut Context<'_>,
+    ) -> Poll<T> {
+        if let Some(value) = observe() {
+            return Poll::Ready(value);
+        }
+        self.register(cx.waker());
+        match observe() {
+            Some(value) => Poll::Ready(value),
+            None => Poll::Pending,
+        }
     }
 }
 
@@ -732,17 +781,8 @@ impl Task {
     pub fn runnable(&self) -> impl Future<Output = ()> + '_ {
         std::future::poll_fn(move |cx| {
             crate::chaos::point("task.runnable.poll");
-            if self.is_runnable() {
-                Poll::Ready(())
-            } else {
-                self.doorbell.register(cx.waker());
-                // Re-check to close the race between the check above and registration.
-                if self.is_runnable() {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            }
+            self.doorbell
+                .poll_edge(|| self.is_runnable().then_some(()), cx)
         })
     }
 
@@ -760,17 +800,7 @@ impl Task {
     /// Like the WIT operation, this only observes completion: the task still only makes
     /// progress when someone donates fuel through [`Task::resume`].
     pub fn wait(&self) -> impl Future<Output = Outcome> + '_ {
-        std::future::poll_fn(move |cx| {
-            if let Some(outcome) = self.outcome() {
-                return Poll::Ready(outcome.clone());
-            }
-            self.doorbell.register(cx.waker());
-            // Re-check to close the race between the check above and registration.
-            match self.outcome() {
-                Some(outcome) => Poll::Ready(outcome.clone()),
-                None => Poll::Pending,
-            }
-        })
+        std::future::poll_fn(move |cx| self.doorbell.poll_edge(|| self.outcome().cloned(), cx))
     }
 
     /// Kill the task and return its final outcome.

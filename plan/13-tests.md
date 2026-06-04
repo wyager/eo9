@@ -236,3 +236,20 @@ Everything; starts alongside Phase 1 (law tests) and grows with each milestone.
     the metal-side analog (follow-up); the DST-for-the-embedding endgame (completion delivery as a
     test-owned schedule, generalizing ParkBed through the BlockingPool's single completion choke point)
     is sketched with a ~3-session estimate. CPU hogs appear nowhere on the ladder.
+
+21. **Doorbell loom model landed (area/13-doorbell-loom).** The narrow-adopt item from entry 20, built:
+    `--cfg loom` swaps the Doorbell's `AtomicBool`/`Mutex` for loom's checked versions (the `bell_sync`
+    shim in `eo9-runtime/src/task.rs` — the only loom seam in the crate; loom is a
+    `[target.'cfg(loom)'.dev-dependencies]` entry, never compiled in default builds — verified absent
+    from `cargo tree`). The check/register/re-check protocol is extracted as `Doorbell::poll_edge`, and
+    `Task::runnable` + `Task::wait` are now thin wrappers over it — so the loom tests model-check the
+    **production protocol code**, not a copy (the callers' poll shapes in link.rs remain restated in the
+    tests with line-mapped comments; wasmtime entanglement keeps them unconstructible under loom).
+    Four tests in `src/loom_tests.rs` (run:
+    `RUSTFLAGS="--cfg loom" cargo test -p eo9-runtime --lib loom_ -- --nocapture`, < 1 s):
+    ring-vs-edge-wait never loses the edge (33 schedules); the **pre-fix discarded-Ready shape — loom
+    finds the plan/11 lost-wakeup counterexample** (ring's drain between check and register, sticky-flag
+    Ready discarded, parent parked forever; pinned via catch_unwind so the test fails if the model ever
+    stops finding it); the fixed shape passes exhaustively (141 schedules); one ring wakes every
+    registered waiter (the 5fa53e8 drain-all shape; 4,303 schedules). Standing rule from entry 20 now
+    enforceable: any change to Doorbell or its callers' poll shapes must keep the loom suite green.
