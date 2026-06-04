@@ -121,7 +121,6 @@ pub struct BarDescription {
     pub wide: bool,
 }
 
-
 /// Syndrome-valid MMIO accessors. `read_volatile`/`write_volatile` leave the register
 /// class to LLVM, which may emit SIMD/FP loads (`ldr s0, [x]` was observed for the ECAM
 /// dword read) — architecturally fine, but such accesses produce ISV=0 data-abort
