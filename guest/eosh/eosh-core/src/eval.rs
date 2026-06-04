@@ -168,15 +168,34 @@ impl fmt::Display for EvalError {
 /// `async fn` needs one level of boxing).
 type EvalFuture<'s, C> = Pin<Box<dyn Future<Output = Result<EvalOutput<C>, EvalError>> + 's>>;
 
-/// The evaluator: a backend plus the session's `let` bindings.
+/// The evaluator: a backend plus the session's `let` bindings, and (when run inside a
+/// session) the session's bytes cache so repeated names skip the filesystem re-read.
 pub struct Evaluator<'a, B: Backend> {
     pub backend: &'a mut B,
     pub bindings: &'a BTreeMap<String, B::Component>,
+    pub cache: Option<&'a mut crate::cache::BytesCache>,
 }
 
 impl<'a, B: Backend> Evaluator<'a, B> {
     pub fn new(backend: &'a mut B, bindings: &'a BTreeMap<String, B::Component>) -> Self {
-        Evaluator { backend, bindings }
+        Evaluator {
+            backend,
+            bindings,
+            cache: None,
+        }
+    }
+
+    /// An evaluator wired to the session's bytes cache.
+    pub fn with_cache(
+        backend: &'a mut B,
+        bindings: &'a BTreeMap<String, B::Component>,
+        cache: &'a mut crate::cache::BytesCache,
+    ) -> Self {
+        Evaluator {
+            backend,
+            bindings,
+            cache: Some(cache),
+        }
     }
 
     /// Evaluate `expr` to a component value (plus applied `main` arguments).
@@ -306,7 +325,18 @@ impl<'a, B: Backend> Evaluator<'a, B> {
         if let Some(bound) = self.bindings.get(name) {
             return Ok(self.backend.duplicate(bound)?);
         }
-        Ok(self.backend.resolve(name).await?)
+        // The session bytes cache: a repeated name loads from the bytes already read
+        // this session instead of re-reading `/bin/<name>.wasm` through the filesystem.
+        if let Some(cache) = self.cache.as_deref_mut()
+            && let Some(bytes) = cache.get(name)
+        {
+            return Ok(self.backend.load(bytes)?);
+        }
+        let (component, bytes) = self.backend.resolve_with_bytes(name).await?;
+        if let (Some(cache), Some(bytes)) = (self.cache.as_deref_mut(), bytes) {
+            cache.insert(name, bytes);
+        }
+        Ok(component)
     }
 
     /// Argument application, type-directed by the callee's argument signature. For a
