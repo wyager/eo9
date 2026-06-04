@@ -13,8 +13,8 @@
 //! and wakes promptly on a keystroke or the armed timer deadline (src/timer.rs, src/uart.rs).
 //!
 //! Both GIC architecture versions are supported and selected at boot by reading the
-//! distributor's architectural `GICD_PIDR2.ArchRev` field (the kernel has no device-tree
-//! parser yet, and PIDR2 is present at the same offset on both versions — recorded in
+//! distributor's architectural `GICD_PIDR2.ArchRev` field (the kernel's only device-tree
+//! reader is the bootargs lookup in src/fdt.rs, and PIDR2 is present at the same offset on both versions — recorded in
 //! plan/12; a real board will eventually want DTB-supplied base addresses instead of the
 //! QEMU `virt` constants below):
 //!
