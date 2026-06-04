@@ -630,6 +630,16 @@ The l4-over-l2 middleware (`net.l4.over-l2`, a smoltcp-based TCP/IP stack) accep
 (`address`, `prefix-length`, `gateway`) through `l4-over-l2-config`; unconfigured, it uses QEMU user-net's
 10.0.2.15/24 with gateway 10.0.2.2.
 
+Sharing one link has two providers because it has two trust stances. `net.l2.switch` is the
+identity-enforcing attenuator: it rewrites every frame's source to the port's own MAC, so a consumer cannot
+claim any identity but the one the composer granted — and consequently stacked switches collapse identities
+(point-to-point only). `net.l2.bridge` is the classic 802.1D learning bridge: frames pass with their
+original sources, learned forwarding with flood-on-unknown, local port-to-port delivery, and full fan-out
+through stacked bridges — and consequently a bridge port hands its holder the ability to claim any
+link-layer identity on that segment. Neither is a tuning knob on the other: choosing switch or bridge is a
+capability decision the composer makes per port tree. (No spanning-tree protocol exists or is needed:
+composition wiring is a DAG, so loops are unconstructible.)
+
 ### Text API
 
 TODO - std{i,o,err}
