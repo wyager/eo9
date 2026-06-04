@@ -329,13 +329,34 @@ session dir (the session is its only writer); metal storedisk's only writers are
 console's `save` and fs-granted programs (both intercepted); the browser store is
 read-only. External writers inside a session don't exist today on any target.
 
-Measured (QEMU aarch64 TCG, this branch vs master, back-to-back same-load A/B; the
-machine carried a concurrent agent's QEMU both sides): warm repeats of
-`time.frozen … $ hello` 25 ms -> **2-3 ms**; `gpu.virtio $ draw` ~165 ms of guest+algebra
-overhead -> ~1 ms (the residual 150-220 ms is the draw program itself running under
-TCG); bare `hello` was already ~1 ms (the kernel session compile cache covers
-single-leaf lines) and stays there. Live probes on metal: `save greet2 = hello` then
-`greet2` runs the saved bytes; the old name still runs; both sub-2 ms.
+Measured (QEMU aarch64 TCG, back-to-back same-load A/B against master @ bc1b868; a
+concurrent agent's QEMU ran both sides): warm repeats of `time.frozen … $ hello`
+25 ms -> **2 ms**; `gpu.virtio $ draw` ~165 ms of guest+algebra overhead -> ~1 ms (the
+residual ~150 ms is the draw program itself running under TCG); bare `hello` was
+already ~1 ms (the kernel session compile cache) and stays there. On the final
+reconciled tree (with spawn-fast's kernel merged): gpu warm 147-154 ms, frozen-hello
+warm 2 ms, bare hello 1 ms. Live probes on metal: `save greet2 = hello` then `greet2`
+runs the saved bytes; the old name still runs; both sub-2 ms.
+
+Two findings from verification, recorded:
+
+- **Image retention is bounded at 4, not 8**: a cached entry retains a live image
+  handle in the embedder's exec provider, whose table is a bounded resource shared
+  with detached services' respawn churn (usermode `MAX_IMAGES` = 16). Retaining 8
+  measurably tightened that pool. A shell citizenship rule worth keeping in mind for
+  any future guest-side caching of host resources.
+- **A pre-existing usermode-registry liveness margin, exposed**: svc_shell's
+  `logs_are_captured_…` test passes or fails with session *wall time* — services
+  blocked on completion advance only in the root drive loop's parked 10 ms wake
+  windows, not on pump slices, so a fast foreground starves them (bisect evidence:
+  with both caches compiled out, the flake reproduces at master's own rate; pass/fail
+  tracked run duration on identical bytes; fuel-heavy foreground pacing did not help,
+  blocking-I/O pacing fixed it deterministically). The test now paces with a
+  `net.l4.loopback $ sockcheck` line (real park windows — what an interactive session
+  has between keystrokes). The registry-side question — why a completion-blocked
+  service needs a wall-clock park rather than advancing on the next pump — belongs to
+  the crates/eo9-runtime lane; this is likely the mechanism behind the fleet's
+  long-standing "CLI suite transient failures under load" flake class.
 
 Deliberate v1 limits, recorded: argument values are part of the key (`hello --name a`
 vs `--name b` rebuilds — argument-stripped image sharing via cached arg-specs is the
