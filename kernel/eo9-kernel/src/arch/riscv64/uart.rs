@@ -33,6 +33,8 @@ const FCR_ENABLE_CLEAR: u8 = 0x07;
 fn mmio_read(offset: usize) -> u8 {
     // SAFETY: `UART_BASE + offset` is a valid NS16550A register on the `virt` machine, and
     // volatile MMIO reads have no other side conditions.
+    // Plain volatile is fine here: ISV syndrome decoding is an aarch64-hypervisor
+    // concern (see crate::mmio) — riscv64 runs under TCG only.
     unsafe { core::ptr::read_volatile((UART_BASE + offset) as *const u8) }
 }
 

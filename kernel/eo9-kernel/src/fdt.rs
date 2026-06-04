@@ -59,6 +59,8 @@ fn cmdline_at(ptr: *const u8) -> Option<&'static str> {
     while len < MAX_CMDLINE {
         // SAFETY: the boot protocol hands a readable, NUL-terminated string in
         // identity-mapped RAM; reads stop at the terminator or the size bound.
+        // Plain volatile is correct: this is RAM, not device MMIO (crate::mmio is
+        // for device registers only).
         let byte = unsafe { core::ptr::read_volatile(ptr.add(len)) };
         if byte == 0 {
             break;

@@ -11,7 +11,7 @@ const RTCDR: usize = 0x000;
 
 /// Seconds since the Unix epoch.
 pub fn seconds() -> u32 {
-    // SAFETY: `RTC_BASE + RTCDR` is the PL031 data register on the `virt` machine; a
-    // volatile MMIO read has no other side conditions.
-    unsafe { core::ptr::read_volatile((RTC_BASE + RTCDR) as *const u32) }
+    // SAFETY: `RTC_BASE + RTCDR` is the PL031 data register on the `virt` machine;
+    // `crate::mmio` pins the access to a syndrome-valid GPR form.
+    unsafe { crate::mmio::read_u32(RTC_BASE + RTCDR) }
 }

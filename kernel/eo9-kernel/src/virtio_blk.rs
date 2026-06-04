@@ -118,6 +118,8 @@ impl DmaRegion {
         debug_assert!(offset + bytes.len() <= self.layout.size());
         for (i, byte) in bytes.iter().enumerate() {
             // SAFETY: bounds asserted above; the device only reads this memory.
+            // Plain volatile is correct: this is heap RAM (a DMA region), not device
+            // MMIO — accesses never trap, so syndrome validity (crate::mmio) is moot.
             unsafe { core::ptr::write_volatile(self.pointer.add(offset + i), *byte) };
         }
     }
@@ -127,6 +129,8 @@ impl DmaRegion {
         let mut out = Vec::with_capacity(len);
         for i in 0..len {
             // SAFETY: bounds asserted above; volatile because the device writes this memory.
+            // Plain volatile is correct: heap RAM (DMA region), never traps (crate::mmio is
+            // for device MMIO only).
             out.push(unsafe { core::ptr::read_volatile(self.pointer.add(offset + i)) });
         }
         out

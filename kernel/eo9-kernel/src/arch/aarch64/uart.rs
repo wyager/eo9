@@ -50,14 +50,15 @@ const UART_INT_RX: u32 = 1 << 4;
 const UART_INT_RT: u32 = 1 << 6;
 
 fn mmio_read(offset: usize) -> u32 {
-    // SAFETY: `UART_BASE + offset` is a valid PL011 register on the `virt` machine, and
-    // volatile MMIO reads have no other side conditions.
-    unsafe { core::ptr::read_volatile((UART_BASE + offset) as *const u32) }
+    // SAFETY: `UART_BASE + offset` is a valid PL011 register on the `virt` machine;
+    // `crate::mmio` pins the access to a syndrome-valid GPR form (device memory must
+    // never be touched through plain volatile on aarch64 — see that module's docs).
+    unsafe { crate::mmio::read_u32(UART_BASE + offset) }
 }
 
 fn mmio_write(offset: usize, value: u32) {
     // SAFETY: as above, for writes.
-    unsafe { core::ptr::write_volatile((UART_BASE + offset) as *mut u32, value) }
+    unsafe { crate::mmio::write_u32(UART_BASE + offset, value) }
 }
 
 /// Write one byte, spinning while the transmit FIFO is full.
