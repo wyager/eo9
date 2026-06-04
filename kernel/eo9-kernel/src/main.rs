@@ -29,6 +29,10 @@ mod arch;
 mod fdt;
 #[cfg(target_os = "none")]
 mod heap;
+// aarch64 always (UART/GIC/RTC route through it); other arches only alongside the
+// `wasm-store`-gated pci module, their sole consumer (feature-less builds stay lean).
+#[cfg(any(target_arch = "aarch64", feature = "wasm-store"))]
+mod mmio;
 #[cfg(target_os = "none")]
 mod panic;
 // Raw ECAM/PCIe support; only the wasm `eo9:pci` root provider drives it, so it is gated

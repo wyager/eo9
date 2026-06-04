@@ -29,6 +29,8 @@ pub(super) const UART0_SOURCE: u32 = 10;
 fn mmio_read(offset: usize) -> u32 {
     // SAFETY: `PLIC_BASE + offset` is a valid PLIC register on the `virt` machine, and
     // volatile MMIO reads have no other side conditions.
+    // Plain volatile is fine here: ISV syndrome decoding is an aarch64-hypervisor
+    // concern (see crate::mmio) — riscv64 runs under TCG only.
     unsafe { core::ptr::read_volatile((PLIC_BASE + offset) as *const u32) }
 }
 
