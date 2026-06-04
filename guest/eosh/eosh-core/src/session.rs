@@ -144,6 +144,7 @@ impl<B: Backend> Session<B> {
                 }
                 LineResult::Ok
             }
+            Command::DescribeApi(word) => self.run_describe_api(&word).await,
             Command::Imports(expr) => self.run_describe(&expr, true).await,
             Command::Run(expr) => self.run_program(&expr).await,
         }
@@ -527,6 +528,74 @@ impl<B: Backend> Session<B> {
         LineResult::Ok
     }
 
+    /// `describe eo9:pci` / `describe eo9:pci/pci`: the OS API cards. The static part
+    /// comes from the build-time WIT-doc extraction (`apidocs`); the live part scans
+    /// `/bin` through the backend so the card also says who, in *this* store, exports
+    /// or imports the thing being described. Unknown API names get the package
+    /// inventory instead of a resolution error.
+    async fn run_describe_api(&mut self, word: &str) -> LineResult {
+        use crate::apidocs::{self, ApiDoc};
+        let Some(doc) = apidocs::api_doc(word) else {
+            let message = format!(
+                "error: no OS API named `{word}` — packages: {} (describe one, or an interface like eo9:fs/fs)",
+                apidocs::package_names().join(", ")
+            );
+            self.backend.print_error(&message);
+            return LineResult::Error(message);
+        };
+        let (lines, target) = match &doc {
+            ApiDoc::Package(doc) => (apidocs::render_package(doc), format!("{}/", doc.name)),
+            ApiDoc::Interface(doc) => (
+                apidocs::render_interface(doc),
+                format!("{}/{}", doc.package, doc.name),
+            ),
+        };
+        for line in &lines {
+            self.backend.print(line);
+        }
+        // The live section: who in /bin exports or imports the described surface. A
+        // package matches any of its interfaces (the trailing-slash prefix); an
+        // interface matches exactly. Entries that fail to open are skipped — a broken
+        // store file should not break describing an API.
+        let names = self.backend.list_bin().await;
+        if names.is_empty() {
+            return LineResult::Ok;
+        }
+        let matches_target = |interface: &str| match target.ends_with('/') {
+            true => interface.starts_with(target.as_str()),
+            false => interface == target,
+        };
+        let mut exporters: Vec<String> = Vec::new();
+        let mut importers: Vec<String> = Vec::new();
+        for name in names {
+            let Ok(component) = self.backend.resolve(&name).await else {
+                continue;
+            };
+            let info = self.backend.describe(&component);
+            if info.exports.iter().any(|e| matches_target(&e.interface)) {
+                exporters.push(name.clone());
+            } else if info.imports.iter().any(|i| matches_target(&i.interface)) {
+                importers.push(name.clone());
+            }
+        }
+        self.backend.print("in this store:");
+        if exporters.is_empty() && importers.is_empty() {
+            self.backend
+                .print("  nothing in /bin imports or exports it yet");
+        }
+        if !exporters.is_empty() {
+            for line in wrap_names("  exported by: ", &exporters) {
+                self.backend.print(&line);
+            }
+        }
+        if !importers.is_empty() {
+            for line in wrap_names("  imported by: ", &importers) {
+                self.backend.print(&line);
+            }
+        }
+        LineResult::Ok
+    }
+
     /// The top-level rule: compose the granted environment onto the command, compile,
     /// spawn with the bound arguments, await the outcome, print it.
     async fn run_program(&mut self, expr: &Expr) -> LineResult {
@@ -593,6 +662,33 @@ impl<B: Backend> Session<B> {
     }
 }
 
+/// Wrap a `prefix: a, b, c` name list at the page column budget, continuation lines
+/// indented to the prefix.
+fn wrap_names(prefix: &str, names: &[String]) -> Vec<String> {
+    const COLUMN_BUDGET: usize = 109;
+    let indent = " ".repeat(prefix.chars().count());
+    let mut lines = Vec::new();
+    let mut line = String::from(prefix);
+    for (index, name) in names.iter().enumerate() {
+        let piece = if index == 0 {
+            name.clone()
+        } else {
+            format!(", {name}")
+        };
+        if line.chars().count() + piece.chars().count() > COLUMN_BUDGET
+            && line.chars().count() > indent.chars().count()
+        {
+            line.push(',');
+            lines.push(core::mem::take(&mut line));
+            line = format!("{indent}{name}");
+        } else {
+            line.push_str(&piece);
+        }
+    }
+    lines.push(line);
+    lines
+}
+
 /// Render the `svc list` table: fixed-width columns, one service per line.
 fn render_service_table(services: &[ServiceInfo]) -> Vec<String> {
     let mut lines = Vec::with_capacity(services.len() + 1);
@@ -640,7 +736,8 @@ pub fn help_lines() -> &'static [&'static str] {
         "explore the sandbox:",
         "  ls /bin                       list what is installed (programs and providers)",
         "  describe <name or expr>       its kind, arguments, imports, exports, and wiring; also",
-        "                                  explains the shell's own words — e.g. describe describe",
+        "                                  explains the shell's own words (describe describe) and the",
+        "                                  OS APIs themselves — e.g. describe eo9:fs/fs",
         "  imports <expr>                just the residual imports of an expression",
         "  env                           what this session holds and what programs run from it receive",
         "  env <expr>                    how this session treats the expression's imports, without running it",
@@ -1218,6 +1315,68 @@ mod tests {
                 "describe {word}: {out}"
             );
         }
+    }
+
+    #[test]
+    fn describe_works_on_api_packages_and_interfaces() {
+        use crate::backend::{ComponentKind, ImportNeed};
+        let importer = crate::backend::ComponentInfo {
+            kind: ComponentKind::Binary,
+            imports: alloc::vec![ImportNeed {
+                slot: String::from("eo9:fs/fs"),
+                interface: String::from("eo9:fs/fs"),
+                version: String::from("0.1.0"),
+                required: true,
+            }],
+            exports: Vec::new(),
+            args: Vec::new(),
+        };
+        let mut session = session_with(&[("cat", importer), ("memfs", provider(&["eo9:fs/fs"]))]);
+
+        assert_eq!(run(&mut session, "describe eo9:fs"), LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(
+            out.contains("kind: OS API package") && out.contains("package: eo9:fs@"),
+            "package card renders: {out}"
+        );
+        assert!(
+            out.contains("eo9:fs/fs —"),
+            "the package card lists its interfaces: {out}"
+        );
+        assert!(
+            out.contains("in this store:")
+                && out.contains("exported by: memfs")
+                && out.contains("imported by: cat"),
+            "the live store section cross-references /bin: {out}"
+        );
+
+        session.backend.out.clear();
+        assert_eq!(run(&mut session, "describe eo9:fs/fs"), LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(
+            out.contains("kind: OS API interface") && out.contains("interface: eo9:fs/fs@"),
+            "interface card renders: {out}"
+        );
+        assert!(
+            out.contains("functions:"),
+            "the interface card lists functions: {out}"
+        );
+        assert!(
+            out.contains("exported by: memfs") && out.contains("imported by: cat"),
+            "the interface card's live section matches exactly: {out}"
+        );
+    }
+
+    #[test]
+    fn describe_of_an_unknown_api_lists_the_packages() {
+        let mut session = session_with(&[]);
+        let result = run(&mut session, "describe eo9:nope");
+        assert!(matches!(result, LineResult::Error(_)));
+        let err = session.backend.err.join("\n");
+        assert!(
+            err.contains("no OS API named `eo9:nope`") && err.contains("eo9:fs"),
+            "the not-found message lists the package inventory: {err}"
+        );
     }
 
     #[test]

@@ -16,6 +16,8 @@ interface types {
     resource disk-impl;
 }
 
+/// The block-device surface: the device size, offset-addressed reads and writes with
+/// the owned-buffer round-trip, and flush-to-durable.
 interface disk {
     use eo9:io/buffers@0.1.0.{buffer};
     use types.{disk-impl};

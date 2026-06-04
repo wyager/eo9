@@ -5,6 +5,8 @@
 /// the way up the tree — not yet specified here.
 package eo9:fs@0.1.0;
 
+/// The filesystem surface: files and directories under the granted root — open,
+/// read, write, list, stat, remove, and open-exec for loading programs.
 interface fs {
     use eo9:io/buffers@0.1.0.{buffer};
 

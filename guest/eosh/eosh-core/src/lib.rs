@@ -34,6 +34,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod apidocs;
 pub mod ast;
 pub mod backend;
 pub mod builtins;

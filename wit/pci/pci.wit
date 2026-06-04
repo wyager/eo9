@@ -28,6 +28,8 @@ interface types {
     }
 }
 
+/// The device surface: enumerate visible functions, open one, and drive it — config
+/// space, BAR registers, DMA allocations, bus mastering, and interrupt waits.
 interface pci {
     use types.{pci-impl, device-address};
 

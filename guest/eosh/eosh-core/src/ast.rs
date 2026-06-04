@@ -90,6 +90,10 @@ pub enum Command {
     /// `describe <builtin-or-operator>` — print the shell word's own card
     /// (`describe describe`, `describe $`, …). Carries the word as typed.
     DescribeBuiltin(String),
+    /// `describe <OS API name>` — the card of a WIT package (`describe eo9:pci`) or
+    /// interface (`describe eo9:pci/pci`). Any single colon-bearing word routes here:
+    /// store program names cannot contain `:`, so the spelling is unambiguous.
+    DescribeApi(String),
     /// `imports <expr>` — print the residual imports.
     Imports(Expr),
     /// `env` — show the session's capability picture (what the shell holds, what

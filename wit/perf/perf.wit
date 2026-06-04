@@ -11,6 +11,8 @@ interface types {
     resource perf-impl;
 }
 
+/// The measurement surface: a raw cycle counter (a fine-grained timer, granted
+/// deliberately — see the package note).
 interface perf {
     use types.{perf-impl};
 

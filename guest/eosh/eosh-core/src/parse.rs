@@ -256,11 +256,20 @@ impl Parser {
                             Token::Amp => Some(String::from("&")),
                             _ => None,
                         };
-                        if let Some(word) = word
-                            && crate::builtins::builtin_doc(&word).is_some()
-                        {
-                            self.next();
-                            return Ok(Command::DescribeBuiltin(word));
+                        if let Some(word) = word {
+                            if crate::builtins::builtin_doc(&word).is_some() {
+                                self.next();
+                                return Ok(Command::DescribeBuiltin(word));
+                            }
+                            // A colon marks an OS API name (`eo9:pci`, `eo9:pci/pci`):
+                            // store programs cannot be named with a colon, so the word
+                            // routes to the API cards (parentheses still force the
+                            // expression path). Unknown API names get the inventory
+                            // message from the session rather than a resolution error.
+                            if word.contains(':') {
+                                self.next();
+                                return Ok(Command::DescribeApi(word));
+                            }
                         }
                     }
                     return Ok(Command::Describe(self.expr()?));
@@ -1171,6 +1180,41 @@ mod tests {
                 )
             ))
         );
+    }
+
+    #[test]
+    fn describe_of_a_colon_word_routes_to_the_api_cards() {
+        assert_eq!(
+            parse_command("describe eo9:pci").expect("parses"),
+            Command::DescribeApi(String::from("eo9:pci"))
+        );
+        assert_eq!(
+            parse_command("describe eo9:pci/pci").expect("parses"),
+            Command::DescribeApi(String::from("eo9:pci/pci"))
+        );
+        assert_eq!(
+            parse_command("describe eo9:fs/fs@0.1.0").expect("parses"),
+            Command::DescribeApi(String::from("eo9:fs/fs@0.1.0"))
+        );
+        // Parentheses force the expression path, exactly as for builtins.
+        assert!(matches!(
+            parse_command("describe (eo9:pci)").expect("parses"),
+            Command::Describe(_)
+        ));
+        // A colon word that is not the lone argument stays an expression.
+        assert!(matches!(
+            parse_command("describe eo9:pci $ hello").expect("parses"),
+            Command::Describe(_)
+        ));
+        // Plain words are untouched: builtins and programs as before.
+        assert!(matches!(
+            parse_command("describe describe").expect("parses"),
+            Command::DescribeBuiltin(_)
+        ));
+        assert!(matches!(
+            parse_command("describe hello").expect("parses"),
+            Command::Describe(_)
+        ));
     }
 
     // -- errors ---------------------------------------------------------------------

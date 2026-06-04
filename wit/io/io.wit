@@ -3,6 +3,8 @@
 /// See SPEC.md: "WASM runtime" (the buffer sketch) and "Ownership and buffers".
 package eo9:io@0.1.0;
 
+/// Owned byte buffers, passed by handle across API boundaries so exactly one side
+/// holds the bytes at a time (the owned-buffer round-trip).
 interface buffers {
     /// A handle to a (possibly DMA-backed) block of memory. Transferred by
     /// ownership (a bare `buffer` parameter/result is an owned handle in WIT),
