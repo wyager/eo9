@@ -168,10 +168,12 @@ open:
   parks its canceller forever (the SPEC bounded-await rule's concrete shape); the converted providers
   carry drop-guards + drain-before-reuse so a cancelled operation can't wedge state or misattribute
   completions.
-- **First-poll-inline is off by default** (kernel/vendor feature `component-model-async-first-poll`,
-  docs/spikes/first-poll-inline.md): default-on awaits quiet-machine + metal A/B numbers, an
-  `xtask firstpoll-ab` gate, and an upstream conversation about the one semantic deviation (a callee
-  that computes a long time before its first await now blocks the caller's frame inline).
+- **First-poll-inline is DEFAULT-ON in every kernel build** (owner GO ruling 2026-06-03; the quiet-machine
+  + metal numbers, the `xtask firstpoll-ab` gate, and the full feature-on battery are in
+  docs/spikes/first-poll-inline.md "Default-on"). The escape hatch for an A/B or bisection build is
+  `EO9_KERNEL_FEATURES_REMOVE=first-poll-inline`. Still open upstream-side: the spec conversation about
+  the one semantic deviation (a callee that computes a long time before its first await blocks the
+  caller's frame inline — unreachable from callback-ABI Eo9 guests, pinned by the gate).
 - **The cancel-mid-flight metal probe is analysis-pinned, not executable**: the virtio drain-before-reuse
   invariant (plan/09 D34) is argued + unit-covered; an end-to-end cancel-during-DMA probe needs a
   cancellable metal consumer (queued with the hardening lane).

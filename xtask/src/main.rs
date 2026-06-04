@@ -1680,26 +1680,26 @@ fn build_kernel(root: &Path, arch: &str) -> Result<PathBuf, String> {
 ///     `EO9_KERNEL_FEATURES_REMOVE=first-poll-inline cargo xtask qemu aarch64 pci disk`
 fn kernel_features(base: &str) -> String {
     let mut features: Vec<String> = base.split(',').map(str::to_string).collect();
-    if let Ok(extra) = std::env::var("EO9_KERNEL_FEATURES_EXTRA") {
-        if !extra.trim().is_empty() {
-            let extra = extra.trim();
-            println!(
-                "xtask: MEASUREMENT BUILD — appending kernel feature(s) `{extra}` \
-                 (EO9_KERNEL_FEATURES_EXTRA)"
-            );
-            features.extend(extra.split(',').map(|f| f.trim().to_string()));
-        }
+    if let Ok(extra) = std::env::var("EO9_KERNEL_FEATURES_EXTRA")
+        && !extra.trim().is_empty()
+    {
+        let extra = extra.trim();
+        println!(
+            "xtask: MEASUREMENT BUILD — appending kernel feature(s) `{extra}` \
+             (EO9_KERNEL_FEATURES_EXTRA)"
+        );
+        features.extend(extra.split(',').map(|f| f.trim().to_string()));
     }
-    if let Ok(remove) = std::env::var("EO9_KERNEL_FEATURES_REMOVE") {
-        if !remove.trim().is_empty() {
-            let names: Vec<&str> = remove.split(',').map(str::trim).collect();
-            println!(
-                "xtask: MEASUREMENT BUILD — removing kernel feature(s) `{}` \
-                 (EO9_KERNEL_FEATURES_REMOVE)",
-                names.join(",")
-            );
-            features.retain(|f| !names.contains(&f.as_str()));
-        }
+    if let Ok(remove) = std::env::var("EO9_KERNEL_FEATURES_REMOVE")
+        && !remove.trim().is_empty()
+    {
+        let names: Vec<&str> = remove.split(',').map(str::trim).collect();
+        println!(
+            "xtask: MEASUREMENT BUILD — removing kernel feature(s) `{}` \
+             (EO9_KERNEL_FEATURES_REMOVE)",
+            names.join(",")
+        );
+        features.retain(|f| !names.contains(&f.as_str()));
     }
     features.join(",")
 }
