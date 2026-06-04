@@ -786,6 +786,18 @@ impl Task {
         })
     }
 
+    /// One edge-poll of "is this task runnable?" with the caller's waker: registers the
+    /// waker with the task's doorbell and reports current readiness, using the same
+    /// observe->register->re-observe protocol as [`Task::runnable`] (loom-checked in
+    /// `crate::loom_tests`). Embedder park loops use this to add a task to their wake
+    /// set without constructing a future.
+    pub fn poll_runnable_with(&self, waker: &std::task::Waker) -> bool {
+        let mut cx = Context::from_waker(waker);
+        self.doorbell
+            .poll_edge(|| self.is_runnable().then_some(()), &mut cx)
+            .is_ready()
+    }
+
     /// The task's final outcome, if it has finished.
     pub fn outcome(&self) -> Option<&Outcome> {
         match &self.state {

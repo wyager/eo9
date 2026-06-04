@@ -273,6 +273,142 @@ fn logs_are_captured_and_restart_always_restarts_in_the_background() {
 }
 
 // -------------------------------------------------------------------------------------
+// The park path (docs/spikes/registry-liveness.md)
+// -------------------------------------------------------------------------------------
+
+/// Run a session whose stdin is held open and quiet between two line batches: the drive
+/// loop spends the gap parked on a blocked `read-line`, which is exactly the edge the
+/// park wake-set serves (restart deadlines and, in the future, service completions).
+/// The gap starts only once `marker` has appeared on stdout (e.g. the `detached:`
+/// acknowledgment), so slow startup (debug builds) cannot consume the quiet window.
+fn shell_session_with_gap(
+    store: &Path,
+    extra_args: &[&str],
+    before: &[&str],
+    marker: &str,
+    gap: std::time::Duration,
+    after: &[&str],
+) -> Session {
+    use std::io::Read;
+    use std::sync::{Arc, Mutex};
+
+    guest::ensure_components(&["eosh", "eo9-stub-restart-never"]);
+    let mut command = Command::new(eo9_binary());
+    command
+        .args(extra_args)
+        .arg("shell")
+        .env("EO9_STORE", store)
+        .current_dir(guest::repo_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("failed to spawn the eo9 binary");
+
+    // Drain stdout on a thread into a shared buffer so the main thread can watch for the
+    // marker without deadlocking the child on a full pipe.
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let stdout_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let reader_buf = Arc::clone(&stdout_buf);
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stdout_pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => reader_buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+            }
+        }
+    });
+
+    {
+        let stdin = child.stdin.as_mut().expect("piped stdin");
+        let mut head = before.join("\n");
+        head.push('\n');
+        stdin.write_all(head.as_bytes()).expect("first batch");
+        stdin.flush().expect("flush first batch");
+
+        // Wait (bounded) for the marker before starting the quiet gap.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let seen = {
+                let buf = stdout_buf.lock().unwrap();
+                String::from_utf8_lossy(&buf).contains(marker)
+            };
+            if seen {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session never printed {marker:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::thread::sleep(gap);
+
+        let mut tail = after.join("\n");
+        tail.push('\n');
+        stdin.write_all(tail.as_bytes()).expect("second batch");
+    }
+    drop(child.stdin.take());
+
+    let status = child.wait().expect("waiting for the session");
+    reader.join().expect("stdout reader");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut stderr)
+        .expect("reading stderr");
+    let stdout = String::from_utf8_lossy(&stdout_buf.lock().unwrap()).into_owned();
+    Session {
+        stdout,
+        stderr,
+        code: status.code().unwrap_or(-1),
+    }
+}
+
+/// A backoff service completes its restart cycles while the foreground sits quietly
+/// blocked on `read-line` — service progress during the gap comes entirely from the
+/// drive loop's parked edge (deadline-bounded parks; the wake-set fix keeps this path
+/// honest). The service traps instantly, restarts twice with a 40ms delay, then gives
+/// up: by the end of a 600ms quiet gap the whole lifecycle must have finished.
+#[test]
+fn restart_cycles_complete_while_the_foreground_is_quietly_blocked() {
+    let store = temp_store("park-path");
+    let session = shell_session_with_gap(
+        &store,
+        &["--svc"],
+        &[
+            "detach crasher = outcomes --mode trap --detail park-path restart \
+              restart.backoff --max-restarts 2 --base-delay-ms 40",
+        ],
+        "detached: crasher",
+        std::time::Duration::from_millis(600),
+        &["svc list", "exit"],
+    );
+    assert_eq!(session.code, 0);
+    let out = &session.stdout;
+    let crasher_line = out
+        .lines()
+        .find(|line| line.trim_start().starts_with("crasher"))
+        .unwrap_or_else(|| panic!("crasher appears in svc list:\n{out}"));
+    assert!(
+        crasher_line.contains("finished"),
+        "the backoff lifecycle (trap, 2 delayed restarts, give-up) completed during the \
+         quiet gap:\n{out}"
+    );
+    let restarts: u32 = crasher_line
+        .split_whitespace()
+        .nth(2)
+        .and_then(|column| column.parse().ok())
+        .unwrap_or_else(|| panic!("the crasher line has a restart count: {crasher_line}"));
+    assert_eq!(
+        restarts, 2,
+        "both delayed restarts happened while the foreground was parked:\n{out}"
+    );
+}
+
+// -------------------------------------------------------------------------------------
 // Process-bound lifetime (owner ruling E)
 // -------------------------------------------------------------------------------------
 

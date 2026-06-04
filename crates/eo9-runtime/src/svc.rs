@@ -664,6 +664,46 @@ impl ServiceRegistry {
         })
     }
 
+    /// Park support for the embedder's drive loop: register `waker` with every parked
+    /// Running service's doorbell and report whether any service is ready *right now*
+    /// (runnable, or a restart already due). The per-service registration uses the same
+    /// observe->register->re-observe edge protocol as [`crate::Task::runnable`], so a
+    /// completion landing between the embedder's readiness check and its park cannot be
+    /// lost: it either flips this call's return to `true` or wakes the registered waker.
+    pub fn park_ready(&self, waker: &std::task::Waker) -> bool {
+        let now = Instant::now();
+        let mut ready = false;
+        for service in &self.services {
+            match &service.run {
+                RunState::Running(task) => {
+                    if task.poll_runnable_with(waker) {
+                        ready = true;
+                    }
+                }
+                RunState::WaitingRestart { until } => {
+                    if *until <= now {
+                        ready = true;
+                    }
+                }
+                RunState::Finished => {}
+            }
+        }
+        ready
+    }
+
+    /// The earliest pending restart deadline, if any service is waiting on one. The
+    /// embedder bounds its park timeout by this so a due restart is picked up on time
+    /// rather than at the backstop's granularity.
+    pub fn next_restart_due(&self) -> Option<Instant> {
+        self.services
+            .iter()
+            .filter_map(|service| match &service.run {
+                RunState::WaitingRestart { until } => Some(*until),
+                _ => None,
+            })
+            .min()
+    }
+
     /// True when any service is still alive (running, blocked, or waiting on a restart).
     pub fn any_alive(&self) -> bool {
         self.services

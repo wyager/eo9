@@ -164,11 +164,12 @@ pub(crate) fn drive_with_services(
                     // Services still want CPU: keep looping without parking.
                     continue;
                 }
-                // Everything is parked. Wait for the foreground's doorbell, but wake on
-                // a short timer too so due service restarts (and clock-driven service
-                // work) are picked up promptly.
-                providers::wait_until_runnable_with_timeout(
+                // Everything is parked. Wake on the foreground's doorbell, any parked
+                // service's doorbell, the earliest restart deadline, or the 10ms
+                // backstop — whichever comes first (docs/spikes/registry-liveness.md).
+                providers::park_until_progress(
                     task,
+                    registry,
                     std::time::Duration::from_millis(10),
                 );
             }
