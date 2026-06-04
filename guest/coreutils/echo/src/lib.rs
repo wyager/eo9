@@ -4,6 +4,7 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use eo9_guest::text;
 
@@ -22,8 +23,11 @@ fn io_fail(e: text::TextError) -> ProgramFailure {
 }
 
 eo9_guest::main! {
-    fn main(text: String) -> Result<ProgramSuccess, ProgramFailure> {
-        text::write_out_line(&text).map_err(io_fail)?;
+    /// `echo <word>…` — write the words to stdout joined by single spaces (variadic
+    /// tail, like cat's paths). A bare `echo` prints an empty line. The legacy
+    /// named-flag spelling `echo --text hi` binds the one-element list.
+    fn main(text: Vec<String>) -> Result<ProgramSuccess, ProgramFailure> {
+        text::write_out_line(&text.join(" ")).map_err(io_fail)?;
         Ok(ProgramSuccess::Done)
     }
 }

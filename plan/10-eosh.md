@@ -293,3 +293,28 @@ Follow-ups (not done here): the package inventory error line is one long line (m
 the long `builtins:` help line precedent); `describe` of a *world* (`describe
 pci.filtered` already works through the store — the world spelling `eo9:pci/filtered`
 is not a thing users meet).
+
+## D22 — variadic echo (2026-06-04, owner request)
+
+`echo hello world` now works: echo's `main` takes the variadic tail
+(`text: list<string>`, the cat precedent), words joined by single spaces, trailing
+newline as before; a bare `echo` prints the empty line. The legacy `--text hi`
+spelling keeps working **for free** because the parameter kept its name: a single
+token bound by name to a `list<string>` parameter is the one-element list (the
+named-flag spelling of the variadic tail, wave.rs). Choice recorded: keep the legacy
+form (it costs nothing and every existing init config / harness line keeps running);
+the visible examples (README, verify-eosh, the cli test) show the variadic form, and
+the cli test pins all three shapes (variadic, legacy, bare). (D21 is the in-flight
+resolve-cache record on area/10-resolve-cache.)
+
+## D23 — `time` is NOT a builtin (2026-06-04, owner overruled)
+
+The owner asked for a way to time program execution. The planner's draft made it a
+shell builtin (`time <expr>`) on the reasoning that execution lifecycle belongs to the
+executor; the owner OVERRULED: `time` must be expressible as a **standard component**,
+like `/usr/bin/time` on Linux — a guest program that holds a granted exec capability,
+takes the program-to-run as a component-typed argument, runs it, and reports the
+timing in its own typed outcome. Nothing was built in this lane; the work needs
+component-typed shell arguments (the `push_arg` refusal
+`ComponentArgumentUnsupported` is the current wall) plus a `time` guest program, and
+dispatches as its own lane after this one merges (it shares the eosh grammar files).
