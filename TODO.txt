@@ -1,0 +1,3 @@
+wy 2026-06-03: Make `describe` work on OS API types like eo9:pci and eo9:pci/pci
+wy 2026-06-03: Make it so if I run `make gfx` it doesn't spend a bunch of time kicking off component compilation xtasks even if I just ran `make gfx`
+wy 2026-06-03: Figure out why `gpu.virtio $ draw` is kind of slow. Do a bit of benchmarking
