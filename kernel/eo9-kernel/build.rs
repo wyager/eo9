@@ -97,7 +97,9 @@ fn hash_tree(hasher: &mut blake3::Hasher, root: &Path, dir: &Path) {
     };
     entries.sort();
     for path in entries {
-        let Ok(relative) = path.strip_prefix(root) else { continue };
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
         let name = relative.to_string_lossy();
         // Skip build products and VCS metadata; hash sources only.
         if name.contains("target/") || name.ends_with(".lock") || name.contains(".git") {

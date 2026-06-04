@@ -1177,7 +1177,12 @@ pub(super) mod spawn_trace {
         let mut total = 0u64;
         for i in 0..N {
             if counts[i] > 0 {
-                line.push_str(&alloc::format!(" {}={}us/{}", NAMES[i], phases[i], counts[i]));
+                line.push_str(&alloc::format!(
+                    " {}={}us/{}",
+                    NAMES[i],
+                    phases[i],
+                    counts[i]
+                ));
                 total += phases[i];
             }
         }
@@ -1647,9 +1652,8 @@ pub(super) fn compile_component(
         // SAFETY: the artifact comes from the store image produced by `cargo xtask
         // build-kernel` with the same wasmtime version and engine configuration.
         Some(entry) => {
-            let deserialized =
-                unsafe { Component::deserialize(engine, entries[entry].artifact) }
-                    .map_err(|err| format!("the baked-in artifact failed to load: {err:?}"));
+            let deserialized = unsafe { Component::deserialize(engine, entries[entry].artifact) }
+                .map_err(|err| format!("the baked-in artifact failed to load: {err:?}"));
             #[cfg(feature = "wasm-codegen")]
             if let Ok(image) = &deserialized {
                 exec.cache_compile(component.graph_hash, image.clone());
@@ -1866,7 +1870,13 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
             };
             #[cfg(feature = "wasm-codegen")]
             {
-                Ok((alg_binary_op(&mut store, "compose", pb, cb, eo9_component::compose),))
+                Ok((alg_binary_op(
+                    &mut store,
+                    "compose",
+                    pb,
+                    cb,
+                    eo9_component::compose,
+                ),))
             }
             #[cfg(not(feature = "wasm-codegen"))]
             {
@@ -1890,7 +1900,13 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
             };
             #[cfg(feature = "wasm-codegen")]
             {
-                Ok((alg_binary_op(&mut store, "extend", bb, lb, eo9_component::extend),))
+                Ok((alg_binary_op(
+                    &mut store,
+                    "extend",
+                    bb,
+                    lb,
+                    eo9_component::extend,
+                ),))
             }
             #[cfg(not(feature = "wasm-codegen"))]
             {
@@ -2132,10 +2148,9 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                 #[cfg(feature = "spawn-trace")]
                 spawn_trace::add_since(spawn_trace::HASH_LOOKUP, __trace_hl);
                 if let Some(component_hit) = hit {
-                    let rep = store
-                        .data_mut()
-                        .shell_exec()?
-                        .insert_image(KImage { component: component_hit });
+                    let rep = store.data_mut().shell_exec()?.insert_image(KImage {
+                        component: component_hit,
+                    });
                     return Ok((Ok(Resource::new_own(rep)),));
                 }
             }

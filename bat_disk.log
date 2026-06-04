@@ -1,0 +1,181 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running `target/debug/xtask qemu aarch64 pci disk`
+xtask: [/Users/wy/code/eo9/.claude/worktrees/spawnfast/guest] cargo build --workspace --release --target wasm32-unknown-unknown
+    Finished `release` profile [optimized] target(s) in 0.08s
+xtask: assembled store image /Users/wy/code/eo9/.claude/worktrees/spawnfast/kernel/target/precompiled/store.img (37518360 bytes, 52 components, target aarch64-unknown-none, unchanged)
+xtask: [/Users/wy/code/eo9/.claude/worktrees/spawnfast/kernel] cargo build -p eo9-kernel --release --target aarch64-unknown-none --features wasm-seed,wasm-hello,wasm-async,wasm-store,wasm-codegen,wasm-storedisk,first-poll-inline
+warning: unused import: `Context`
+  --> vendor/wac-types/src/package.rs:10:20
+   |
+10 | use anyhow::{bail, Context, Result};
+   |                    ^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `alloc::vec::Vec`
+ --> vendor/wac-types/src/targets.rs:7:5
+  |
+7 | use alloc::vec::Vec;
+  |     ^^^^^^^^^^^^^^^
+
+warning: `wac-types` (lib) generated 2 warnings (run `cargo fix --lib -p wac-types` to apply 2 suggestions)
+warning: unused import: `alloc::boxed::Box`
+  --> vendor/wit-component/src/lib.rs:17:20
+   |
+17 |     pub(crate) use alloc::boxed::Box;
+   |                    ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `String` and `ToString`
+  --> vendor/wit-component/src/lib.rs:23:21
+   |
+23 | use alloc::string::{String, ToString};
+   |                     ^^^^^^  ^^^^^^^^
+
+warning: unused import: `RawCustomSection`
+ --> vendor/wit-component/src/gc.rs:8:40
+  |
+8 | use wasm_encoder::{Encode, EntityType, RawCustomSection, reencode::Reencode};
+  |                                        ^^^^^^^^^^^^^^^^
+
+warning: unused import: `RawCustomSection`
+  --> vendor/wit-component/src/linking.rs:38:52
+   |
+38 |         MemArg, MemorySection, MemoryType, Module, RawCustomSection, RefType, StartSection,
+   |                                                    ^^^^^^^^^^^^^^^^
+
+warning: unused `#[macro_use]` import
+  --> vendor/wasmtime-cranelift/src/lib.rs:21:1
+   |
+21 | #[macro_use]
+   | ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `prelude::*`
+  --> vendor/wasmtime-cranelift/src/compiler.rs:45:18
+   |
+45 |     WasmValType, prelude::*,
+   |                  ^^^^^^^^^^
+
+warning: unexpected `cfg` condition value: `std`
+    --> vendor/wasmtime-cranelift/src/compiler.rs:1496:15
+     |
+1496 |         #[cfg(feature = "std")]
+     |               ^^^^^^^^^^^^^^^
+     |
+     = note: expected values for `feature` are: `all-arch`, `component-model`, `cranelift-native`, `gc`, `gc-copying`, `gc-drc`, `gc-null`, `host-arch`, `incremental-cache`, `pulley`, `stack-switching`, `threads`, `trace-log`, and `wmemcheck`
+     = help: consider adding `std` as a feature in `Cargo.toml`
+     = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+     = note: requested on the command line with `-W unexpected-cfgs`
+
+warning: unused import: `prelude::*`
+  --> vendor/wasmtime-cranelift/src/debug/transform/mod.rs:15:83
+   |
+15 |     DefinedFuncIndex, ModuleTranslation, PrimaryMap, StaticModuleIndex, Tunables, prelude::*,
+   |                                                                                   ^^^^^^^^^^
+
+warning: unused import: `Context`
+  --> vendor/wasmtime-cranelift/src/debug/transform/simulate.rs:14:31
+   |
+14 | use wasmtime_environ::error::{Context, Error};
+   |                               ^^^^^^^
+
+warning: unused variable: `symbol`
+    --> vendor/wasmtime-cranelift/src/compiler.rs:1480:9
+     |
+1480 |         symbol: &str,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_symbol`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `new` is never used
+  --> vendor/wasmtime-cranelift/src/sync.rs:34:18
+   |
+33 | impl<T> Mutex<T> {
+   | ---------------- associated function in this implementation
+34 |     pub const fn new(val: T) -> Mutex<T> {
+   |                  ^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `clif_dir` is never read
+  --> vendor/wasmtime-cranelift/src/compiler.rs:92:5
+   |
+83 | pub struct Compiler {
+   |            -------- field in this struct
+...
+92 |     clif_dir: Option<String>,
+   |     ^^^^^^^^
+
+warning: `wit-component` (lib) generated 4 warnings (run `cargo fix --lib -p wit-component` to apply 4 suggestions)
+warning: `wasmtime-internal-cranelift` (lib) generated 8 warnings (run `cargo fix --lib -p wasmtime-internal-cranelift` to apply 4 suggestions)
+warning: unused import: `Val`
+  --> eo9-kernel/src/wasm/providers.rs:31:91
+   |
+31 |     Accessor, ComponentType, Lift, Linker, LinkerInstance, Lower, Resource, ResourceType, Val,
+   |                                                                                           ^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `NAME` is never used
+  --> eo9-kernel/src/arch/aarch64/mod.rs:15:18
+   |
+15 | pub(crate) const NAME: &str = "aarch64";
+   |                  ^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `COMPILER_FINGERPRINT` is never used
+    --> eo9-kernel/src/wasm/shellexec.rs:1250:18
+     |
+1250 | pub(super) const COMPILER_FINGERPRINT: &str = env!("EO9_COMPILER_FINGERPRINT");
+     |                  ^^^^^^^^^^^^^^^^^^^^
+
+warning: `eo9-kernel` (bin "eo9-kernel") generated 3 warnings (run `cargo fix --bin "eo9-kernel" -p eo9-kernel` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 0.08s
+xtask: built kernel image /Users/wy/code/eo9/.claude/worktrees/spawnfast/kernel/target/aarch64-unknown-none/release/eo9-kernel
+xtask: booting /Users/wy/code/eo9/.claude/worktrees/spawnfast/kernel/target/aarch64-unknown-none/release/eo9-kernel under qemu-system-aarch64 (serial on stdio; the kernel powers off when done, or press Ctrl-A then X to quit)
+xtask: created blank 64 MiB scratch disk at /Users/wy/code/eo9/.claude/worktrees/spawnfast/kernel/target/eo9-scratch-disk.raw
+xtask: [/Users/wy/code/eo9/.claude/worktrees/spawnfast] qemu-system-aarch64 -M virt,gic-version=2,highmem=off -cpu max -device virtio-rng-pci -smp 1 -m 512M -nographic -kernel /Users/wy/code/eo9/.claude/worktrees/spawnfast/kernel/target/aarch64-unknown-none/release/eo9-kernel -drive if=none,format=raw,id=eo9disk,file=/Users/wy/code/eo9/.claude/worktrees/spawnfast/kernel/target/eo9-scratch-disk.raw -object iothread,id=eo9diskio -device virtio-blk-pci,drive=eo9disk,iothread=eo9diskio,disable-legacy=on -append pci
+
+Eo9 kernel — aarch64 (QEMU virt)
+  exception level: EL1
+  counter-timer frequency: 1000000000 Hz
+  wall clock: 1780605746.001132000 s since the Unix epoch (PL031 + generic timer)
+mmu: identity map enabled (device 0..1 GiB, DRAM 1..1.5 GiB at 4 KiB pages, heap W^X, caches on)
+heap: 460 MiB at 0x4336d000..0x60000000
+heap self-test passed (box, 10k-element vec, 4 MiB buffer, string); 131160 bytes in use, 460 MiB free
+generic timer: counter advancing (4041000 -> 4046000), resolution 1 ns, uptime 4046 us
+generic timer: 10 ms timer condition asserted after 12563 us (polled ISTATUS)
+cmdline: pci
+store: 52 components baked in (4046 KiB components, 32577 KiB artifacts): eosh, init, restart.never, restart.always, restart.backoff, hello, outcomes, cruncher, readwrite, lspci, entropy.seeded, time.frozen, disk.virtio, fs.eofs, fs.filtered, fs.policy-subtree, pci.filtered, pci.admit-address, pci.admit-vendor, pci.none, pci.deny, net.virtio, l2check, net.l2.switch, vnicheck, net.l2.bridge, net.l4.over-l2, l4check, vnic4check, cancelcheck, net.l2.deny, net.l2.none, net.l3.deny, net.l3.none, net.l4.deny, net.l4.none, net.l4.loopback, net.l4.filtered, net.policy-ports, sockcheck, ls, cat, echo, wc, head, stat, rm, gpu.virtio, gfx.mem, gfx.none, gfx.deny, draw
+init: starting the boot supervisor from the baked-in store (52 programs under /bin)
+eosh — the Eo9 shell (type `help` to explore, `ls /bin` to see what's installed)
+eosh> disk.virtio $ fs.eofs $ readwrite --path /k.txt --contents spawnfast
+codegen: compiling the composed component on-target (476 KiB) …
+codegen: compiled in 47652 ms
+disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx interrupt
+pci: INTx delivery on line 3 served an interrupt wait (the task parked instead of polling)
+pci: quiesced 1 device(s) at task teardown (bus-master cleared before the task's DMA buffers were freed)
+ok: round-tripped(9)
+eosh> pci.admit-address --allow [{segment: 0, bus: 0, device: 3, function: 0}] $ pci.filtered $ disk.virtio $ fs.eofs $ ls /
+codegen: compiling the composed component on-target (636 KiB) …
+codegen: compiled in 80303 ms
+disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx interrupt
+k.txt
+ok: listed(1)
+eosh> disk.virtio $ cancelcheck --attempts 25
+codegen: compiling the composed component on-target (251 KiB) …
+codegen: compiled in 10523 ms
+disk.virtio: virtio-blk 131072 sectors (64 MiB), queue size 16, completion: INTx interrupt
+cancelcheck: regions seeded and flushed
+cancelcheck: attempts=25 hits=1 eager=24 data-miss=0
+ok: probed("attempts=25 hits=1 eager=24 data-miss=0")
+eosh> poweroff
+init: the console exited (success(poweroff-requested))
+init: the console requested poweroff; init exiting
+init: ended, outcome = ok(exited)
+[145037335 us] kernel run complete; requesting PSCI SYSTEM_OFF
+BATTERY: PASS
