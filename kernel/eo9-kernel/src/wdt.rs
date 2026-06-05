@@ -79,12 +79,21 @@ mod hw {
         pat();
         write(WDT_CR, 0x1);
         pat();
-        // Verify: the sticky enable bit must read back, and the counter must be live
-        // (a clock-gated block reads as dead). CCVR right after a kick sits near
-        // 2^(16+TOP), which is non-zero — zero means the block never loaded TOP.
+        // Verify: the sticky enable bit must read back, and the counter must be observed
+        // actually MOVING (a clock-gated block reads frozen or zero; a single non-zero
+        // read would also pass on a block that loaded TOP and then froze). At 24 MHz a
+        // tick is ~42 ns, so this bounded spin costs microseconds at most.
         let enabled = read(WDT_CR) & 0x1 == 0x1;
-        let counting = read(WDT_CCVR) != 0;
-        enabled && counting
+        let first = read(WDT_CCVR);
+        let mut moving = false;
+        for _ in 0..100_000u32 {
+            if read(WDT_CCVR) != first {
+                moving = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        enabled && moving
     }
 }
 
