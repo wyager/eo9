@@ -432,14 +432,127 @@ fn add_time(linker: &mut Linker<KernelState>) -> Result<()> {
 /// ended; backspace still works at the boundary.
 const MAX_READ_LINE_BYTES: usize = 4096;
 
-/// Future that reads one line from the PL011, echoing input as it arrives.
+/// Recall entries the console keeps (per boot). Eviction drops the oldest.
+const READ_HISTORY_CAP: usize = 32;
+
+/// The console's input recall ring: every line `read-line` returns (trimmed non-empty,
+/// not a duplicate of the newest entry) lands here, and the arrow keys at any later
+/// `read-line` recall it. One console, one input history — this is the line
+/// discipline's recall (what was *typed* at this serial console), not the shell's
+/// `history` builtin (which records what the session *executed*); the same split as a
+/// host terminal's scrollback vs. a shell's history file.
+static READ_HISTORY: super::shellexec::KLock<Vec<String>> =
+    super::shellexec::KLock::new(Vec::new());
+
+/// Escape-sequence parser state for [`ReadLine`]: arrow keys (and friends) arrive over
+/// serial as `ESC [ <final>` / `ESC O <final>` sequences, with optional parameter bytes
+/// (`0x30..=0x3f`) and intermediates (`0x20..=0x2f`) before the final (`0x40..=0x7e`).
+#[derive(Default, Clone, Copy, PartialEq)]
+enum EscState {
+    /// Not inside an escape sequence.
+    #[default]
+    Idle,
+    /// Saw ESC; deciding whether a CSI/SS3 sequence follows.
+    Esc,
+    /// Inside `ESC [` / `ESC O`; consuming until the final byte.
+    Csi,
+}
+
+/// Future that reads one line from the console UART, echoing input as it arrives.
 ///
 /// Resolves to `Some(line)` on CR/LF (without the terminator) and to `None` (end of
 /// input) on Ctrl-D at the start of an empty line. Backspace/DEL erase the last
-/// character. Other control bytes are ignored.
+/// character. Up/Down arrows recall previously entered lines (the [`READ_HISTORY`]
+/// ring), and the recalled line is editable; editing it commits it as the fresh line
+/// (recall position and stash reset — the bash-like per-entry edit buffer is out of
+/// scope). Left/Right and other escape sequences are consumed and ignored (they no
+/// longer leak `[A`-style garbage into the line). Other control bytes are ignored.
 #[derive(Default)]
 struct ReadLine {
     line: String,
+    /// Escape-sequence parser state.
+    esc: EscState,
+    /// History browsing: `None` = typing a fresh line; `Some(i)` = showing entry `i`.
+    recall: Option<usize>,
+    /// The fresh line stashed when browsing began (restored by ↓ past the newest).
+    stash: String,
+}
+
+impl ReadLine {
+    /// Erase the visible line (every byte in it is a printable ASCII echo, one column
+    /// each) and replace it with `text`, echoing the replacement.
+    fn replace_line(&mut self, text: String) {
+        for _ in 0..self.line.len() {
+            crate::kprint!("\u{8} \u{8}");
+        }
+        self.line = text;
+        crate::kprint!("{}", self.line);
+    }
+
+    /// ↑ (`back == true`) / ↓ through the recall ring.
+    fn recall_step(&mut self, back: bool) {
+        let (entry, index) = READ_HISTORY.with(|history| {
+            if history.is_empty() {
+                return (None, None);
+            }
+            match (back, self.recall) {
+                // First ↑: stash the in-progress line, show the newest entry.
+                (true, None) => {
+                    let index = history.len() - 1;
+                    (Some(history[index].clone()), Some(index))
+                }
+                // ↑ at the oldest entry: stay.
+                (true, Some(0)) => (None, self.recall),
+                (true, Some(index)) => (Some(history[index - 1].clone()), Some(index - 1)),
+                // ↓ while not browsing: nothing to do.
+                (false, None) => (None, None),
+                // ↓ past the newest: restore the stashed fresh line.
+                (false, Some(index)) if index + 1 >= history.len() => (None, None),
+                (false, Some(index)) => (Some(history[index + 1].clone()), Some(index + 1)),
+            }
+        });
+        match (back, self.recall, index) {
+            // ↓ past the newest entry: leave browsing, restore the stash.
+            (false, Some(_), None) => {
+                let stash = core::mem::take(&mut self.stash);
+                self.recall = None;
+                self.replace_line(stash);
+            }
+            _ => {
+                if let Some(text) = entry {
+                    if self.recall.is_none() {
+                        self.stash = core::mem::take(&mut self.line);
+                    }
+                    self.recall = index;
+                    self.replace_line(text);
+                }
+            }
+        }
+    }
+
+    /// Any edit while browsing commits the shown entry as the fresh line.
+    fn commit_recall(&mut self) {
+        if self.recall.take().is_some() {
+            self.stash.clear();
+        }
+    }
+}
+
+/// Push a submitted line into the recall ring (trimmed non-empty, no immediate dupes).
+fn push_read_history(line: &str) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    READ_HISTORY.with(|history| {
+        if history.last().map(String::as_str) == Some(trimmed) {
+            return;
+        }
+        if history.len() >= READ_HISTORY_CAP {
+            history.remove(0);
+        }
+        history.push(String::from(trimmed));
+    });
 }
 
 impl Future for ReadLine {
@@ -450,20 +563,52 @@ impl Future for ReadLine {
         // Consume from the interrupt-filled input ring (src/uart.rs): the UART RX interrupt
         // moves bytes in and wakes the `wfi`, so this just drains what has arrived.
         while let Some(byte) = crate::uart::ring_get_byte() {
+            // Escape sequences first: arrows recall history, everything else inside a
+            // sequence is consumed silently instead of leaking into the line.
+            match this.esc {
+                EscState::Esc => {
+                    if byte == b'[' || byte == b'O' {
+                        this.esc = EscState::Csi;
+                        continue;
+                    }
+                    // A lone ESC: drop it, handle this byte normally below.
+                    this.esc = EscState::Idle;
+                }
+                EscState::Csi => {
+                    if (0x20..=0x3f).contains(&byte) {
+                        // Parameter / intermediate bytes.
+                        continue;
+                    }
+                    this.esc = EscState::Idle;
+                    match byte {
+                        b'A' => this.recall_step(true),
+                        b'B' => this.recall_step(false),
+                        // Left/Right/Home/End/Delete finals: consumed, ignored (v1).
+                        _ => {}
+                    }
+                    continue;
+                }
+                EscState::Idle => {}
+            }
             match byte {
+                0x1b => this.esc = EscState::Esc,
                 b'\r' | b'\n' => {
                     crate::kprint!("\n");
-                    return Poll::Ready(Some(core::mem::take(&mut this.line)));
+                    let line = core::mem::take(&mut this.line);
+                    push_read_history(&line);
+                    return Poll::Ready(Some(line));
                 }
                 // Ctrl-D on an empty line: end of input.
                 0x04 if this.line.is_empty() => return Poll::Ready(None),
                 // Backspace / DEL.
                 0x08 | 0x7f => {
                     if this.line.pop().is_some() {
+                        this.commit_recall();
                         crate::kprint!("\u{8} \u{8}");
                     }
                 }
                 0x20..=0x7e if this.line.len() < MAX_READ_LINE_BYTES => {
+                    this.commit_recall();
                     let ch = char::from(byte);
                     this.line.push(ch);
                     crate::kprint!("{ch}");

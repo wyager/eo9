@@ -1865,7 +1865,14 @@ the default and the verified configuration.
     pixel-exact (TCG); boot + lspci + disk round-trip + l4check DNS + draw cold/warm
     (session-cache hit) + 3 paste bursts + the PL031 wall-clock read (HVF); full ci.
 
-## Entry 76 — the backstop accountability sweep: every progress backstop is an armed detector (2026-06-04)
+## Entry 76 — console read-line gains arrow-key recall (2026-06-04)
+
+See plan/10 D24: the ReadLine future in `wasm/providers.rs` now parses ESC/CSI
+sequences (consumed, never leaked into the line) and serves ↑/↓ recall from a
+32-entry per-boot KLock ring. Shared across all three arches; paste-rate input and
+Ctrl-C semantics unchanged (12/12 aarch64 battery + riscv64/x86_64 smokes).
+
+## Entry 77 — the backstop accountability sweep: every progress backstop is an armed detector (2026-06-04)
 
 The SPEC doctrine ("liveness is event-driven, never timer-driven; a progress backstop is
 a confession; a backstop firing that discovers stranded work is a high-priority bug")
