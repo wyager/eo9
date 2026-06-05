@@ -204,7 +204,7 @@ pub fn drain_rx() {
 ///   keystroke, only ever during an already-silent second); permanent deafness is traded
 ///   for that vanishingly rare single-character loss.
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
-pub fn scavenge_rx(now_ns: u64) {
+pub fn scavenge_rx(now_ns: u64) -> usize {
     use core::sync::atomic::AtomicU64;
     /// Uptime of the last observed receive activity (ring movement or FIFO data).
     static LAST_ACTIVITY_NS: AtomicU64 = AtomicU64::new(0);
@@ -235,6 +235,7 @@ pub fn scavenge_rx(now_ns: u64) {
     }
     // SAFETY: restore IRQ delivery.
     unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags)) };
+    moved
 }
 
 /// Consume one received byte from the interrupt-filled ring, or `None` if none is waiting.

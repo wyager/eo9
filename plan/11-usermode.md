@@ -475,3 +475,14 @@ kernel already had both halves (`request_timer_wake` for restart deadlines; comp
 ring the shared idle wakers) — usermode now matches. The fleet's "CLI transient failures
 under load" class is **not** explained by this margin (0/120 failures on both sides of
 the A/B under 8-way load); the workaround ledger's contention explanation stands there.
+
+### D21 (2026-06-04) — the park backstop is an armed stranded-work detector
+
+Part of the backstop accountability sweep (plan/12 entry 76, docs/spikes/backstop-audit.md).
+`park_until_progress` distinguishes cap-rated timeouts (the unconditional 10 ms backstop)
+from deadline-rated ones (a restart due within the cap): a full cap-rated timeout that then
+finds the foreground or a service runnable prints the rate-limited `liveness:` stderr line —
+the work's wake edge was missed while the thread slept the whole backstop. The svc_shell
+session helper asserts no such line in any captured session (the zero-findings gate, in ci).
+`wait_until_runnable` (no services) remains timeoutless and purely event-driven — the model
+citizen the doctrine's end state generalizes. Battery + chaos + suites: zero findings.

@@ -1872,7 +1872,34 @@ sequences (consumed, never leaked into the line) and serves ↑/↓ recall from 
 32-entry per-boot KLock ring. Shared across all three arches; paste-rate input and
 Ctrl-C semantics unchanged (12/12 aarch64 battery + riscv64/x86_64 smokes).
 
-## Entry 77 — the Orange Pi serial-loader stub (area/12-serial-loader)
+## Entry 77 — the backstop accountability sweep: every progress backstop is an armed detector (2026-06-04)
+
+The SPEC doctrine ("liveness is event-driven, never timer-driven; a progress backstop is
+a confession; a backstop firing that discovers stranded work is a high-priority bug")
+implemented as instrumentation. docs/spikes/backstop-audit.md carries the full inventory:
+three progress-backstops kernel-side (the 10 ms child-running idle cap, the 1 s bare-prompt
+cap, the UART scavenger's two rescues), one usermode (the 10 ms park cap), everything else
+deadline-class or event-driven.
+
+- `idle_wait` now returns a `WakeKind` (Event / Deadline / Backstop): cap-rated late wakes
+  probe for stranded input (the scavenger's moved-byte count), stranded INTx deliveries
+  (`pci::intx_pending_total`, a non-consuming peek), and — via the drive loops and
+  `block_on` — stranded runnables (`any_runnable`/`Ready` on the pass right after a
+  backstop wake). Findings print a rate-limited grep-stable `liveness:` line (first, then
+  every 16th) and count in per-kind atomics. Deadline-rated wakes (sleep, IntxWait bound,
+  svc restart) are never findings.
+- Usermode `park_until_progress` applies the same rule: a full cap-rated `park_timeout`
+  followed by foreground/service readiness is a find on stderr. The svc_shell suite's
+  session helper asserts no `liveness:` line — the zero-findings gate, enforced in ci.
+  The kernel-side gate lives in the battery convention (ci runs no QEMU).
+- The battery (three arch demos canonical, storage/net/gpu incl. check-gpu pixel-exact,
+  svcdemo + timer-paced backoff churn, cancelcheck hits=1/data-miss=0, 10/10 unpaced paste
+  bursts, HVF disk round-trip, chaos 3x60 `-c` + 20 seeded `--svc` sessions, suites + full
+  ci): **zero findings everywhere** — today's backstops rescue nothing we could observe.
+  The backstops stay in place per the owner's ruling; removal is the end-state follow-up,
+  and any future `liveness:` line is a bug to root-cause, never an assertion to relax.
+
+## Entry 78 — the Orange Pi serial-loader stub (area/12-serial-loader)
 
 `boards/opi5-serial-loader/` (own workspace, never in the root build): a 1,060-byte
 flat stub typed into board RAM once via the vendor U-Boot's `mm.l` at 0x0400_0000
