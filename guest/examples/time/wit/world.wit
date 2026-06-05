@@ -1,0 +1,43 @@
+// time — run a program and report how long it took (see SPEC.md, "Execution APIs":
+// schedulers and executors are ordinary programs; this is the smallest one).
+//
+// `time` is a standard component, not a shell builtin: it imports the exec capability
+// (compile + task) like any executor, takes the program to run as a component-typed
+// `main` argument, and measures with its own granted clock. The measuring instrument
+// is therefore a capability like everything else: under `time.frozen $ time <prog>`
+// it honestly reports frozen durations.
+package eo9-examples:time@0.1.0;
+
+/// Runs `prog` and reports wall-clock durations for the compile and run phases on
+/// standard output, forwarding the child's own outcome:
+///
+///   time hello
+///   time (gpu.virtio $ draw)
+world time {
+    use eo9:exec/component-algebra@0.1.0.{component};
+
+    import eo9:text/text@0.1.0;
+    import eo9:time/time@0.1.0;
+    import eo9:exec/component-algebra@0.1.0;
+    import eo9:exec/compile@0.1.0;
+    import eo9:exec/task@0.1.0;
+
+    variant program-success {
+        /// The child completed with its own success; carries the child's rendered outcome.
+        timed(string),
+    }
+
+    variant program-failure {
+        /// The child returned its own failure (or ended abnormally); carries the child's
+        /// rendered outcome — `time` forwards rather than masks it.
+        child-failed(string),
+        /// Compiling the program failed.
+        compile(string),
+        /// Spawning the compiled program failed.
+        spawn(string),
+        /// Writing the report failed, carrying the text API's own error.
+        io(string),
+    }
+
+    export main: async func(prog: component) -> result<program-success, program-failure>;
+}
