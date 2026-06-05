@@ -611,9 +611,7 @@ pub fn complete_args(
     specs: &[ArgSpec],
 ) -> Result<(), EvalError> {
     for (index, spec) in specs.iter().enumerate() {
-        if args.iter().any(|arg| arg.name == spec.name)
-            || filled_components.contains(&spec.name)
-        {
+        if args.iter().any(|arg| arg.name == spec.name) || filled_components.contains(&spec.name) {
             continue;
         }
         if wave::is_component_type(&spec.ty) {
