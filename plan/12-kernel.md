@@ -1871,3 +1871,23 @@ See plan/10 D24: the ReadLine future in `wasm/providers.rs` now parses ESC/CSI
 sequences (consumed, never leaked into the line) and serves ↑/↓ recall from a
 32-entry per-boot KLock ring. Shared across all three arches; paste-rate input and
 Ctrl-C semantics unchanged (12/12 aarch64 battery + riscv64/x86_64 smokes).
+
+## Entry 77 — the Orange Pi serial-loader stub (area/12-serial-loader)
+
+`boards/opi5-serial-loader/` (own workspace, never in the root build): a 1,060-byte
+flat stub typed into board RAM once via the vendor U-Boot's `mm.l` at 0x0400_0000
+(265 words, prompt-paced — seconds), then launched with `booti 0x04000000 -
+${fdtcontroladdr}` (preferred: vendor booti's relocation is a no-op there — dram base
+0x0020_0000 + text_offset 0x03E0_0000 — and U-Boot hands over caches-off with x0 =
+the device tree) or `go 0x04000000` (fallback; x0 via the protocol header). It then
+loops forever: receive `"EO9L" + load/len/x0 + payload + crc32` on UART2 at 1.5 Mbaud
+(~85 s for the 12.4 MiB minimal image), `k` per 64 KiB, verify, `K`, `dc cvau` sweep +
+`ic iallu`, jump. CRC mismatch or a 3 s stall re-arms it — a failed transfer never
+needs hands. No flow control needed: byte service is ~1 µs against the line's 6.7 µs.
+Mac side: `tools/make_mm_script.py` (bootstrap + U-Boot `crc32` verify) and
+`tools/send_image.py` (transfer + console tail). Host-verified only (protocol tests,
+header bytes, disassembly): the stub's first live run is on the board.
+
+Dev-loop follow-up recorded: the board kernel should power off via PSCI SYSTEM_RESET
+instead of SYSTEM_OFF so every run returns to the U-Boot prompt by itself (fold into
+the area/12-opi5-profile review).

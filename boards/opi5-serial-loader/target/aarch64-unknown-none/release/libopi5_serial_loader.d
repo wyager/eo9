@@ -1,0 +1,1 @@
+/Users/wy/code/eo9/.claude/worktrees/serload/boards/opi5-serial-loader/target/aarch64-unknown-none/release/libopi5_serial_loader.rlib: /Users/wy/code/eo9/.claude/worktrees/serload/boards/opi5-serial-loader/src/lib.rs
