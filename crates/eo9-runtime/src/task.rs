@@ -667,7 +667,8 @@ impl Task {
                 minted.push((name, rep));
             }
             for (name, rep) in minted {
-                let resource = wasmtime::component::Resource::<crate::link::AlgComponentRes>::new_own(rep);
+                let resource =
+                    wasmtime::component::Resource::<crate::link::AlgComponentRes>::new_own(rep);
                 let any = resource
                     .try_into_resource_any(&mut store)
                     .map_err(internal)?;
