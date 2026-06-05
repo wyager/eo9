@@ -2089,7 +2089,11 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
         out.display(),
         flat.len() as f64 / (1024.0 * 1024.0)
     );
-    println!("xtask: boot it from the U-Boot prompt (1.5 Mbaud serial):");
+    println!("xtask: PREFERRED transport: the UART serial-loader stub (boards/opi5-serial-loader)");
+    println!("       — mm-poke the stub, `go 0x04000000`, then send_image.py streams this file");
+    println!("       to 0x00200000 and jumps. The vendor U-Boot's booti DATA-ABORTS on minimal");
+    println!("       images (see .claude/board-bringup/BOOT.md) and is untested for this one;");
+    println!("       if trying it anyway from a FAT stick:");
     println!("         usb start");
     println!("         setenv bootargs program=hello   (minimal image: required)");
     println!("         fatload usb 0:1 0x00200000 <file on the stick>");
