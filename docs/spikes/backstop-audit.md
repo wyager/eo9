@@ -88,7 +88,31 @@ the hot path. The detectors stay on in normal builds.
   the honest limit; the metal gate rides every reviewer battery the same way the
   canonical-values check does.
 
-## Battery results
+## Battery results (2026-06-04, detectors armed throughout)
 
-(Phase 3 — see plan/12 entry 76: which detectors fired, with what stranded work, and the
-root-cause or pin for each.)
+**Zero stranded-work findings across the entire battery.** Today's backstops are already
+silent — they rescued nothing anywhere we could make them speak. They stay armed as
+detectors; the first `liveness:` line in any future transcript is a high-priority bug by
+doctrine, with the missing wake edge as the fix (never a relaxed assertion).
+
+| Session | Result | `liveness:` lines |
+|---|---|---|
+| aarch64 / riscv64 / x86_64 demos | canonical values byte-identical | 0 / 0 / 0 |
+| storage: round-trip + admit-filtered chain (INTx-served) | green | 0 |
+| net: l2check ARP + l4check DNS | green | 0 |
+| gpu: interactive draw (checksum exact) + `check-gpu` (pixel-exact) | green | 0 |
+| svcdemo + backoff crasher (2 timer-paced restarts, deadline-rated — correctly not flagged) | green | 0 |
+| cancelcheck `--attempts 25` (hits=1, data-miss=0) | green | 0 |
+| 10 unpaced 53-char paste bursts | 10/10 | 0 |
+| HVF: boot + disk round-trip over INTx | green | 0 |
+| chaos sweep: 3 seed bases x 60 `-c` iterations | 0 hangs | 0 |
+| chaos x services: 20 seeded `--svc` sessions (detach/list/stop churn) | 20/20 | 0 |
+| usermode suites: svc_shell 8/8 (x8 runs, gate embedded), full `cargo xtask ci` | green | 0 |
+
+Honest coverage notes: the `-c` chaos sweep cannot exercise the park backstop at all
+(`drive_to_completion` uses the timeoutless `wait_until_runnable`); the service-bearing
+coverage is the seeded `--svc` sessions, the svc_shell gate, and the kernel svcdemo
+session. The IntxWait take→register window — the audit's prime suspect — was exercised by
+the INTx-heavy storage/cancelcheck/HVF sessions and never needed the backstop: the
+masked-`wfi` pending-interrupt rule plus the every-hot-pass `wake_idle` cover the edge in
+practice, exactly as the design argued.
