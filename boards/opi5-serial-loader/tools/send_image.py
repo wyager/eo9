@@ -27,6 +27,10 @@ import struct
 import sys
 import time
 
+# Line-buffer stdout even when piped: a killed process must never take the board's
+# console output with it (the 2026-06-04 first-jump output was lost exactly this way).
+sys.stdout.reconfigure(line_buffering=True)
+
 MAGIC = b"EO9L"
 ACK_INTERVAL = 64 * 1024
 PORT = "/dev/cu.usbserial-AC009X7K"
@@ -76,6 +80,8 @@ def main() -> None:
     ap.add_argument("--port", default=PORT)
     ap.add_argument("--baud", type=int, default=BAUD)
     ap.add_argument("--no-console", action="store_true")
+    ap.add_argument("--log", type=str, default=None,
+                    help="tee everything (progress + console tail) to this file, line-flushed")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
@@ -84,6 +90,22 @@ def main() -> None:
     if not args.image:
         print("image required (or --selftest)", file=sys.stderr)
         sys.exit(2)
+    if args.log:
+        logf = open(args.log, "a", buffering=1)
+
+        class _Tee:
+            def __init__(self, *streams):
+                self.streams = streams
+
+            def write(self, data):
+                for st in self.streams:
+                    st.write(data)
+
+            def flush(self):
+                for st in self.streams:
+                    st.flush()
+
+        sys.stdout = _Tee(sys.stdout, logf)
 
     import serial
 

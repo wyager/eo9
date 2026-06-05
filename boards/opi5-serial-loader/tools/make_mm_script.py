@@ -88,8 +88,8 @@ def send(blob: bytes, port: str, baud: int, delay: float) -> None:
         print(out)
         if f"{crc_local:08x}" in out.lower():
             print(f"CRC MATCH ({crc_local:08x}) — stub is in RAM, ready to launch:")
-            print("  booti 0x04000000 - ${fdtcontroladdr}   (preferred)")
-            print("  go 0x04000000                           (fallback; pass x0 via --x0)")
+            print("  go 0x04000000        (THE launch method; pass x0 via send_image --x0)")
+            print("  (vendor booti is BANNED: it data-aborts on this image — BOOT.md incident)")
         else:
             print(f"CRC MISMATCH (expected {crc_local:08x}) — re-run --send")
             sys.exit(1)

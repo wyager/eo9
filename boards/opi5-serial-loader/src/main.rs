@@ -1,13 +1,15 @@
 //! The bare-metal serial-loader stub for the Orange Pi 5 Plus (RK3588).
 //!
-//! Launched from the vendor U-Boot either via `booti 0x04000000 - ${fdtcontroladdr}`
-//! (preferred: U-Boot flushes caches and enters with the MMU and D-cache OFF, x0 = the
-//! device tree — exactly the Linux arm64 boot protocol; the Image header below carries
-//! text_offset 0x03E0_0000 so the vendor relocation lands the stub exactly where `mm`
-//! typed it, dram_base 0x0020_0000 + 0x03E0_0000 == 0x0400_0000, a no-op move) or via
-//! `go 0x04000000` (fallback: MMU and caches stay ON as U-Boot runs them, x0 = argc —
-//! pass the real device-tree address in the protocol header's `x0_value` instead; the
-//! pre-jump `dc cvau` sweep makes the freshly written payload fetchable either way).
+//! LAUNCH WITH `go 0x04000000` — and ONLY `go`. The vendor U-Boot's `booti`
+//! data-aborts inside U-Boot itself when handed this minimal image (its Android/FIT
+//! heuristics; live incident 2026-06-04, see .claude/board-bringup/BOOT.md — the
+//! board wedged and needed a physical power cycle). Under `go` the MMU and caches
+//! stay ON as U-Boot runs them and x0 is argc — pass the real device-tree address in
+//! the protocol header's `x0_value`; the pre-jump `dc cvau` sweep makes the freshly
+//! written payload fetchable. (The Image header below is still correct — text_offset
+//! 0x03E0_0000 over dram_base 0x0020_0000 lands at exactly 0x0400_0000 — but vendor
+//! booti crashes before ever honoring it, so the header is kept only for a future
+//! sane bootloader.)
 //!
 //! The stub never reconfigures the UART — the line stays exactly as U-Boot programmed
 //! it (1.5 Mbaud, FIFOs on). It only reads LSR and RBR and writes THR.
@@ -29,7 +31,8 @@ mod bare {
     };
 
     // The arm64 Image header (64 bytes) + the entry trampoline. `code0` branches over
-    // the header; `mm`-typed and `booti`/`go`-launched alike enter at offset 0.
+    // the header, so the `go`-launched entry at offset 0 works; the header itself is
+    // dormant (vendor booti is banned — see the module doc).
     global_asm!(
         r#"
         .section .text.head, "ax"

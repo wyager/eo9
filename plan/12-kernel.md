@@ -1876,10 +1876,11 @@ Ctrl-C semantics unchanged (12/12 aarch64 battery + riscv64/x86_64 smokes).
 
 `boards/opi5-serial-loader/` (own workspace, never in the root build): a 1,060-byte
 flat stub typed into board RAM once via the vendor U-Boot's `mm.l` at 0x0400_0000
-(265 words, prompt-paced — seconds), then launched with `booti 0x04000000 -
-${fdtcontroladdr}` (preferred: vendor booti's relocation is a no-op there — dram base
-0x0020_0000 + text_offset 0x03E0_0000 — and U-Boot hands over caches-off with x0 =
-the device tree) or `go 0x04000000` (fallback; x0 via the protocol header). It then
+(265 words, prompt-paced — seconds), then launched with `go 0x04000000` ONLY (x0 via
+the protocol header). Vendor `booti` is banned for the stub: it data-aborts inside
+U-Boot itself on this minimal image and its own recovery reset then failed — the
+2026-06-04 live incident (board wedged, physical power cycle). The stub keeps its
+arm64 Image header for a future sane bootloader, but the dev loop never uses it. It then
 loops forever: receive `"EO9L" + load/len/x0 + payload + crc32` on UART2 at 1.5 Mbaud
 (~85 s for the 12.4 MiB minimal image), `k` per 64 KiB, verify, `K`, `dc cvau` sweep +
 `ic iallu`, jump. CRC mismatch or a 3 s stall re-arms it — a failed transfer never
