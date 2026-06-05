@@ -1194,21 +1194,57 @@ pub fn park_until_progress(
     }
 
     // Service readiness + registration, and the restart-deadline bound, under one lock.
-    let timeout = {
+    // `cap_rated`: the unconditional backstop, not a restart deadline, set the timeout —
+    // a deadline-bounded park is the legitimate "the event is time" case.
+    let (timeout, cap_rated) = {
         let registry = registry.lock().unwrap();
         if registry.park_ready(&waker) {
             return;
         }
         match registry.next_restart_due() {
-            Some(due) => due
-                .saturating_duration_since(std::time::Instant::now())
-                .min(backstop),
-            None => backstop,
+            Some(due) => {
+                let until_due = due.saturating_duration_since(std::time::Instant::now());
+                (until_due.min(backstop), until_due > backstop)
+            }
+            None => (backstop, true),
         }
     };
 
     eo9_runtime::chaos::point("embedder.park");
+    let parked_at = std::time::Instant::now();
     std::thread::park_timeout(timeout);
+
+    // Liveness detector (SPEC: a backstop firing that discovers actionable work no event
+    // delivered is a high-priority bug). An early return is an unpark — event-driven,
+    // never a finding (spurious unparks land here too: conservative). A full cap-rated
+    // timeout that then finds runnable work means the work's wake edge was missed while
+    // this thread slept the entire backstop.
+    if cap_rated && parked_at.elapsed() >= timeout {
+        let fg = {
+            let runnable = task.runnable();
+            let runnable = std::pin::pin!(runnable);
+            runnable.poll(&mut context).is_ready()
+        };
+        let services = registry.lock().unwrap().any_runnable();
+        if fg || services {
+            liveness_backstop_finding(fg, services);
+        }
+    }
+}
+
+/// Running count of stranded-work finds by the park backstop, and the rate-limited
+/// `liveness:` line (first find, then every 16th). The line goes to stderr so every
+/// captured transcript — and the suites' no-`liveness:` assertions — see it.
+static LIVENESS_PARK_FINDINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn liveness_backstop_finding(fg: bool, services: bool) {
+    let n = LIVENESS_PARK_FINDINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(16) {
+        eprintln!(
+            "liveness: the park backstop found stranded work (foreground={fg}, \
+             services={services}, n={n})"
+        );
+    }
 }
 
 #[cfg(test)]
