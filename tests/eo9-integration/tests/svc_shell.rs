@@ -87,9 +87,18 @@ fn shell_session(store: &Path, extra_args: &[&str], lines: &[&str]) -> Session {
             .expect("writing the session script");
     }
     let output = child.wait_with_output().expect("waiting for the session");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    // The zero-findings liveness gate (SPEC: a backstop firing that discovers stranded
+    // work is a high-priority bug; docs/spikes/backstop-audit.md): every service-bearing
+    // session in this suite is a busy workload, and none may trip the park backstop's
+    // stranded-work detector. If this fires, do not relax it — find the missing wake edge.
+    assert!(
+        !stderr.contains("liveness:"),
+        "the park backstop found stranded work during the session:\n{stderr}"
+    );
     Session {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stderr,
         code: output.status.code().unwrap_or(-1),
     }
 }

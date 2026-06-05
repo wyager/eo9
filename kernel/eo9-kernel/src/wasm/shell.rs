@@ -137,6 +137,7 @@ fn run_init(entries: &'static [StoreEntry], config: &str) -> Result<String, wasm
         let mut call = pin!(call);
         let waker = Waker::from(Arc::new(LoopWaker));
         let mut cx = Context::from_waker(&waker);
+        let mut last_wake = super::WakeKind::Event;
         loop {
             match call.as_mut().poll(&mut cx) {
                 Poll::Ready(Ok(())) => break,
@@ -149,8 +150,14 @@ fn run_init(entries: &'static [StoreEntry], config: &str) -> Result<String, wasm
                     let services = super::svc::drive_services();
                     let any_runnable = children.any_runnable || services.any_runnable;
                     let any_running = children.any_running || services.any_running;
+                    // Liveness detector: runnable work discovered on the pass right after
+                    // a backstop-rated wake was runnable while the core slept the cap.
+                    if any_runnable && last_wake == super::WakeKind::Backstop {
+                        super::liveness_stranded_runnable();
+                    }
+                    last_wake = super::WakeKind::Event;
                     if !any_runnable {
-                        super::idle_wait(any_running);
+                        last_wake = super::idle_wait(any_running);
                     } else {
                         // The loop stays hot for a runnable child/service; wake any
                         // input-parked future (the console's read-line) each pass so
@@ -310,6 +317,7 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
         let mut call = pin!(call);
         let waker = Waker::from(Arc::new(LoopWaker));
         let mut cx = Context::from_waker(&waker);
+        let mut last_wake = super::WakeKind::Event;
         loop {
             match call.as_mut().poll(&mut cx) {
                 Poll::Ready(Ok(())) => break,
@@ -330,8 +338,14 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
                     let services = super::svc::drive_services();
                     let any_runnable = children.any_runnable || services.any_runnable;
                     let any_running = children.any_running || services.any_running;
+                    // Liveness detector: runnable work discovered on the pass right after
+                    // a backstop-rated wake was runnable while the core slept the cap.
+                    if any_runnable && last_wake == super::WakeKind::Backstop {
+                        super::liveness_stranded_runnable();
+                    }
+                    last_wake = super::WakeKind::Event;
                     if !any_runnable {
-                        super::idle_wait(any_running);
+                        last_wake = super::idle_wait(any_running);
                     } else {
                         // The loop stays hot for a runnable child/service; wake any
                         // input-parked future (the console's read-line) each pass so
