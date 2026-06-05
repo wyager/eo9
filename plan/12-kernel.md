@@ -1898,3 +1898,24 @@ deadline-class or event-driven.
   ci): **zero findings everywhere** — today's backstops rescue nothing we could observe.
   The backstops stay in place per the owner's ruling; removal is the end-state follow-up,
   and any future `liveness:` line is a bug to root-cause, never an assertion to relax.
+
+## Entry 78 — the Orange Pi serial-loader stub (area/12-serial-loader)
+
+`boards/opi5-serial-loader/` (own workspace, never in the root build): a 1,060-byte
+flat stub typed into board RAM once via the vendor U-Boot's `mm.l` at 0x0400_0000
+(265 words, prompt-paced — seconds), then launched with `go 0x04000000` ONLY (x0 via
+the protocol header). Vendor `booti` is banned for the stub: it data-aborts inside
+U-Boot itself on this minimal image and its own recovery reset then failed — the
+2026-06-04 live incident (board wedged, physical power cycle). The stub keeps its
+arm64 Image header for a future sane bootloader, but the dev loop never uses it. It then
+loops forever: receive `"EO9L" + load/len/x0 + payload + crc32` on UART2 at 1.5 Mbaud
+(~85 s for the 12.4 MiB minimal image), `k` per 64 KiB, verify, `K`, `dc cvau` sweep +
+`ic iallu`, jump. CRC mismatch or a 3 s stall re-arms it — a failed transfer never
+needs hands. No flow control needed: byte service is ~1 µs against the line's 6.7 µs.
+Mac side: `tools/make_mm_script.py` (bootstrap + U-Boot `crc32` verify) and
+`tools/send_image.py` (transfer + console tail). Host-verified only (protocol tests,
+header bytes, disassembly): the stub's first live run is on the board.
+
+Dev-loop follow-up recorded: the board kernel should power off via PSCI SYSTEM_RESET
+instead of SYSTEM_OFF so every run returns to the U-Boot prompt by itself (fold into
+the area/12-opi5-profile review).
