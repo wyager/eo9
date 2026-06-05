@@ -612,7 +612,7 @@ pub fn complete_args(
 ) -> Result<(), EvalError> {
     for (index, spec) in specs.iter().enumerate() {
         if args.iter().any(|arg| arg.name == spec.name)
-            || filled_components.iter().any(|name| *name == spec.name)
+            || filled_components.contains(&spec.name)
         {
             continue;
         }
