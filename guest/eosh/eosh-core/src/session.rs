@@ -333,12 +333,19 @@ impl<B: Backend> Session<B> {
         };
         let mut component = output.component;
         let mut args = output.args;
+        if !output.components.is_empty() {
+            let message = "error: a detached service cannot carry component-typed \
+                           arguments yet (services respawn from their image, but a \
+                           component argument is consumed by the spawn that binds it)";
+            self.backend.print_error(message);
+            return LineResult::Error(String::from(message));
+        }
 
         let info = self.backend.describe(&component);
         if info.kind == ComponentKind::Provider {
             return self.report(EvalError::TopLevelProvider);
         }
-        if let Err(err) = complete_args(&mut args, &info.args) {
+        if let Err(err) = complete_args(&mut args, &[], &info.args) {
             return self.report(err);
         }
         let child_imports_fs = imports_fs(&info);
@@ -653,12 +660,15 @@ impl<B: Backend> Session<B> {
         };
         let mut component = output.component;
         let mut args = output.args;
+        let components = output.components;
 
         let info = self.backend.describe(&component);
         if info.kind == ComponentKind::Provider {
             return self.report(EvalError::TopLevelProvider);
         }
-        if let Err(err) = complete_args(&mut args, &info.args) {
+        let filled_components: Vec<String> =
+            components.iter().map(|arg| arg.name.clone()).collect();
+        if let Err(err) = complete_args(&mut args, &filled_components, &info.args) {
             return self.report(err);
         }
         let fs_run = imports_fs(&info);
@@ -678,13 +688,18 @@ impl<B: Backend> Session<B> {
             Ok(image) => image,
             Err(err) => return self.report(EvalError::Backend(err)),
         };
-        let task = match self.backend.spawn(&image, &args, Vec::new()) {
+        // Component arguments are owned values, consumed by the spawn that binds them —
+        // a line that carries one can never take the cached-image fast path, so it is
+        // never remembered (the honesty rule twice over: the argument's referent may
+        // also have changed by the next structurally identical line).
+        let cacheable = components.is_empty();
+        let task = match self.backend.spawn(&image, &args, components) {
             Ok(task) => task,
             Err(err) => return self.report(EvalError::Backend(err)),
         };
         // The image is good (it spawned): remember it for the next structurally
         // identical line, whatever the program's own outcome turns out to be.
-        if let Some(key) = key {
+        if let (Some(key), true) = (key, cacheable) {
             self.cache.image_insert(key, image, args, fs_run);
         }
         let outcome = self.backend.wait(task).await;
@@ -1050,6 +1065,68 @@ mod tests {
         );
         assert_eq!(session.backend.out, vec!["ok: done"]);
         assert!(session.backend.err.is_empty());
+    }
+
+    #[test]
+    fn component_arguments_spawn_alongside_data_arguments_and_are_never_cached() {
+        let mut session = session_with(&[
+            (
+                "timeit",
+                binary(&[("prog", "component"), ("verbose", "option<bool>")]),
+            ),
+            ("hello", binary(&[])),
+        ]);
+        // `timeit hello`: the positional word fills the component-typed parameter as a
+        // program expression; the spawn carries it as a live value.
+        let result = run(&mut session, "timeit hello");
+        assert_eq!(result, LineResult::Ok);
+        let spawn = session
+            .backend
+            .log
+            .iter()
+            .find(|line| line.starts_with("spawn"))
+            .expect("a spawn happened")
+            .clone();
+        assert!(spawn.contains("prog=c"), "component arg missing: {spawn}");
+        assert!(
+            spawn.contains("verbose=none"),
+            "option default missing: {spawn}"
+        );
+
+        // A structurally identical second line re-resolves and re-spawns in full: lines
+        // carrying component arguments never take the cached-image fast path (the value
+        // is consumed by the spawn, and its referent may have changed).
+        session.backend.log.clear();
+        let result = run(&mut session, "timeit hello");
+        assert_eq!(result, LineResult::Ok);
+        let compiles = session
+            .backend
+            .log
+            .iter()
+            .filter(|line| line.starts_with("compile"))
+            .count();
+        assert_eq!(
+            compiles, 1,
+            "expected a full re-run, got {:?}",
+            session.backend.log
+        );
+    }
+
+    #[test]
+    fn detach_refuses_component_arguments() {
+        let mut session = session_with(&[
+            ("timeit", binary(&[("prog", "component")])),
+            ("hello", binary(&[])),
+            ("restart.never", provider(&["eo9:svc/restart-policy"])),
+        ]);
+        session.backend.svc_grants = (true, true);
+        let result = run(
+            &mut session,
+            "detach t = timeit hello restart restart.never",
+        );
+        assert!(matches!(result, LineResult::Error(_)));
+        let err = session.backend.err.join("\n");
+        assert!(err.contains("component-typed"), "got: {err}");
     }
 
     #[test]
