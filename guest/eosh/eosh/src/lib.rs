@@ -271,6 +271,16 @@ impl Backend for WitBackend {
     type Task = task::Task;
 
     async fn resolve(&mut self, name: &str) -> Result<Self::Component, BackendError> {
+        let (component, _) = self.resolve_with_bytes(name).await?;
+        Ok(component)
+    }
+
+    /// Resolve by reading `/bin/<name>.wasm` — and hand the bytes back so the session's
+    /// resolve cache can skip this filesystem round-trip the next time the name is used.
+    async fn resolve_with_bytes(
+        &mut self,
+        name: &str,
+    ) -> Result<(Self::Component, Option<Vec<u8>>), BackendError> {
         let path = eosh_core::module_path(name);
         // `open-exec` is an async import, so its string argument is passed by value.
         // Resolution is only ever reached after the session's `let` bindings were
@@ -292,8 +302,9 @@ impl Backend for WitBackend {
                 )),
             })?;
         let bytes = Self::read_exec(&handle).await?;
-        component_algebra::load(&bytes)
-            .map_err(|err| BackendError::new(format!("cannot load `{name}`: {err:?}")))
+        let component = component_algebra::load(&bytes)
+            .map_err(|err| BackendError::new(format!("cannot load `{name}`: {err:?}")))?;
+        Ok((component, Some(bytes)))
     }
 
     fn load(&mut self, bytes: &[u8]) -> Result<Self::Component, BackendError> {

@@ -65,6 +65,19 @@ pub fn intx_take(line: usize) -> u64 {
     INTX_DELIVERIES[line % INTX_LINES].swap(0, Ordering::AcqRel)
 }
 
+/// Sum of pending (recorded, not yet taken) deliveries across every line, without
+/// consuming them. Used only by the liveness backstop detector (src/wasm/mod.rs): a
+/// nonzero count observed on a backstop-rated late idle wake means a delivery's re-poll
+/// edge was missed — the waiting future should have been re-polled by the wake pass the
+/// delivery's own interrupt triggered.
+#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
+pub fn intx_pending_total() -> u64 {
+    INTX_DELIVERIES
+        .iter()
+        .map(|line| line.load(Ordering::Acquire))
+        .sum()
+}
+
 /// The standard INTx swizzle: which host-bridge line the given function's interrupt pin
 /// lands on. `pin` is the configuration-space Interrupt Pin value (1 = INTA .. 4 = INTD).
 pub fn intx_line(address: FunctionAddress, pin: u8) -> usize {

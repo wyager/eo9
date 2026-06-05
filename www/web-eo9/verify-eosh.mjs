@@ -101,7 +101,7 @@ const oneShot = lines.join("\n");
 // Sub-step 3: the interactive `eosh>` prompt — feed command lines through read-line (JSPI),
 // the same path the page terminal uses. eosh runs each and reads the next until EOF/exit.
 inputQueue = [
-  "echo --text hi",
+  "echo hi there",
   // The try-it page's "Explore the sandbox" loop: help, ls /bin, describe (one binary, one
   // provider), env — then "compose what you learned" runs at the end (after EXPLOREMARK).
   "help",
@@ -127,7 +127,7 @@ inputQueue = [
   // dropping a required capability is refused (restrict: required-outside-allow).
   "only eo9:text/text,eo9:time/time $ hello --name boxed --excited true",
   "only eo9:text/text $ echo --text restricted",
-  "only eo9:text $ echo --text shorthand",
+  "only eo9:text $ echo shorthand spaced",
   "only eo9:text/text $ hello --name nope --excited true",
   // The page's bare-default forms of the same lockdowns, in the page's exact (short-form)
   // spelling: the pass case greets the default name, the refusal case must not add a
@@ -255,7 +255,7 @@ const checks = [
   ["eosh ran hello (greeting)", /Hello, web/.test(oneShot)],
   ["hello outcome greeted", /greeted/.test(oneShot)],
   ["eosh command rc == 0", cmdRc === 0],
-  ["interactive: echo printed hi", /\bhi\b/.test(interactive)],
+  ["interactive: echo joined the variadic words", /\bhi there\b/.test(interactive)],
   [
     "every program the welcome file recommends exists in /bin",
     welcomeProgramsExist,

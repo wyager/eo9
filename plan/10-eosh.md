@@ -293,3 +293,129 @@ Follow-ups (not done here): the package inventory error line is one long line (m
 the long `builtins:` help line precedent); `describe` of a *world* (`describe
 pci.filtered` already works through the store — the world spelling `eo9:pci/filtered`
 is not a thing users meet).
+
+## D21 — the session resolve cache (owner TODO: warm spawn, the eosh lane; 2026-06-04)
+
+The spawn-fast spike (docs/spikes/spawn-latency.md) left ~98% of warm external latency
+guest-side: per prompt line, eosh re-read every component from `/bin` through fs host
+calls, re-ran the algebra, and re-passed every byte through the canonical ABI. The
+session now carries a two-layer resolve cache (`eosh-core/src/cache.rs`):
+
+- **Bytes cache** (name → component bytes, LRU 16 entries / 4 MiB): a repeated name
+  `load`s from the session's copy instead of re-reading `/bin/<name>.wasm`
+  (`Backend::resolve_with_bytes`, a default-method extension — byte-less backends are
+  untouched). One canonical-ABI pass instead of read + load.
+- **Image cache** (canonical run key → compiled image + bound args, LRU 8): a
+  structurally identical line skips resolution, the algebra, `compile` — straight to
+  `spawn` (images are many-spawn by the SPEC's own design). The key is the
+  **fusion-graph identity at eosh's granularity** (the owner's ruling, mirroring the
+  kernel's graph hash): canonicalized expression structure with netstring atoms,
+  `/bin` leaves generation-tagged, `let` bindings substituted by sub-keys **frozen at
+  bind time** — spelling, whitespace, parens, and binding names vanish; `let e = X`
+  then `e $ hello` hits the same entry as inline `X $ hello`.
+
+Invalidation is structural and conservative (a stale resolve is a correctness bug; when
+in doubt, re-resolve):
+
+| event | effect |
+|---|---|
+| `save <name>` | that name's generation bumps + its bytes drop; nothing else moves |
+| a run whose program imports `eo9:fs` completes | global generation bumps + bytes clear (it *could* have rewritten `/bin`; the fs API exposes no content identity to check — node-stat is kind+size only) |
+| `let` rebind | the frozen sub-key is replaced; unrelated entries untouched |
+| `detach` of an fs-importing child | both caches disabled for the session (a concurrent writer defeats point-in-time invalidation) |
+
+Store-immutability assumptions, per embedding: usermode sessions materialize a private
+session dir (the session is its only writer); metal storedisk's only writers are this
+console's `save` and fs-granted programs (both intercepted); the browser store is
+read-only. External writers inside a session don't exist today on any target.
+
+Measured (QEMU aarch64 TCG, back-to-back same-load A/B against master @ bc1b868; a
+concurrent agent's QEMU ran both sides): warm repeats of `time.frozen … $ hello`
+25 ms -> **2 ms**; `gpu.virtio $ draw` ~165 ms of guest+algebra overhead -> ~1 ms (the
+residual ~150 ms is the draw program itself running under TCG); bare `hello` was
+already ~1 ms (the kernel session compile cache) and stays there. On the final
+reconciled tree (with spawn-fast's kernel merged): gpu warm 147-154 ms, frozen-hello
+warm 2 ms, bare hello 1 ms. Live probes on metal: `save greet2 = hello` then `greet2`
+runs the saved bytes; the old name still runs; both sub-2 ms.
+
+Two findings from verification, recorded:
+
+- **Image retention is bounded at 4, not 8**: a cached entry retains a live image
+  handle in the embedder's exec provider, whose table is a bounded resource shared
+  with detached services' respawn churn (usermode `MAX_IMAGES` = 16). Retaining 8
+  measurably tightened that pool. A shell citizenship rule worth keeping in mind for
+  any future guest-side caching of host resources.
+- **A pre-existing usermode-registry liveness margin, exposed**: svc_shell's
+  `logs_are_captured_…` test passes or fails with session *wall time* — services
+  blocked on completion advance only in the root drive loop's parked 10 ms wake
+  windows, not on pump slices, so a fast foreground starves them (bisect evidence:
+  with both caches compiled out, the flake reproduces at master's own rate; pass/fail
+  tracked run duration on identical bytes; fuel-heavy foreground pacing did not help,
+  blocking-I/O pacing fixed it deterministically). The test now paces with a
+  `net.l4.loopback $ sockcheck` line (real park windows — what an interactive session
+  has between keystrokes). The registry-side question — why a completion-blocked
+  service needs a wall-clock park rather than advancing on the next pump — belongs to
+  the crates/eo9-runtime lane; this is likely the mechanism behind the fleet's
+  long-standing "CLI suite transient failures under load" flake class.
+
+Deliberate v1 limits, recorded: argument values are part of the key (`hello --name a`
+vs `--name b` rebuilds — argument-stripped image sharing via cached arg-specs is the
+follow-up); fs-importing programs invalidate even when composed behind a read-only
+attenuation (the import name is all eosh can see); a future `eo9:fs` content-hash stat
+(the wit TODO at fs.wit:4) would turn the global bump into precise revalidation.
+
+## D22 — variadic echo (2026-06-04, owner request)
+
+`echo hello world` now works: echo's `main` takes the variadic tail
+(`text: list<string>`, the cat precedent), words joined by single spaces, trailing
+newline as before; a bare `echo` prints the empty line. The legacy `--text hi`
+spelling keeps working **for free** because the parameter kept its name: a single
+token bound by name to a `list<string>` parameter is the one-element list (the
+named-flag spelling of the variadic tail, wave.rs). Choice recorded: keep the legacy
+form (it costs nothing and every existing init config / harness line keeps running);
+the visible examples (README, verify-eosh, the cli test) show the variadic form, and
+the cli test pins all three shapes (variadic, legacy, bare). (D21 is the in-flight
+resolve-cache record on area/10-resolve-cache.)
+
+## D23 — `time` is NOT a builtin (2026-06-04, owner overruled)
+
+The owner asked for a way to time program execution. The planner's draft made it a
+shell builtin (`time <expr>`) on the reasoning that execution lifecycle belongs to the
+executor; the owner OVERRULED: `time` must be expressible as a **standard component**,
+like `/usr/bin/time` on Linux — a guest program that holds a granted exec capability,
+takes the program-to-run as a component-typed argument, runs it, and reports the
+timing in its own typed outcome. Nothing was built in this lane; the work needs
+component-typed shell arguments (the `push_arg` refusal
+`ComponentArgumentUnsupported` is the current wall) plus a `time` guest program, and
+dispatches as its own lane after this one merges (it shares the eosh grammar files).
+
+## D24 — up/down arrow history at the eosh prompt (2026-06-04, owner request)
+
+Architecture chosen: **host-side editing** (option (a)) — each host's read-line already
+owns echo and line assembly, and usermode already had the full editor
+(`crates/eo9/src/editor.rs`: CSI parsing, recall, completion), so the kernel and the
+browser were brought up to parity rather than inventing a raw-key WIT surface. No WIT
+change; eosh and every read-line consumer are untouched (scripted/piped input carries
+no ESC bytes, so non-interactive behavior is byte-identical).
+
+- **Kernel** (`wasm/providers.rs` ReadLine): an ESC/CSI state machine consumes escape
+  sequences (they no longer leak `[A` garbage into the line); CSI `A`/`B` recall
+  through a 32-entry per-boot ring (`READ_HISTORY`, KLock) pushed on every submitted
+  line (trimmed non-empty, no immediate dupes); the recalled line is editable — any
+  edit commits it as the fresh line (recall position and stash reset; the bash-style
+  per-entry edit buffer is deliberately out of scope); ↓ past the newest restores the
+  stashed in-progress line; erase-and-reprint uses the established `\b \b` idiom (all
+  line bytes are printable ASCII, one column each). Left/Right/Home/End/Delete are
+  consumed and ignored — v1 has no mid-line cursor; recorded follow-up.
+- **Browser** (`vm.js`): `termHistory` + ArrowUp/ArrowDown over the live line with the
+  same stash/commit-on-edit semantics; `verify-render.mjs` gained recall assertions
+  (recall echo on the live line, rerun, stash restore, and the prompt-count invariant
+  proving browsing never mints prompt lines).
+- **History split recorded**: this is the line discipline's recall (what was typed at
+  that console), not the shell's `history` builtin (what the session executed) — the
+  same split as a host terminal vs. a shell history file. One console, one input
+  history; lines read by programs through the same console share the ring (v1, noted).
+
+Verified: aarch64 12/12 (recall, edit, stash, CSI-consumption, 10/10 unpaced paste
+bursts, Ctrl-C); riscv64 + x86_64 arrow smokes PASS (same shared code path, 16550
+consoles); browser render harness 9/9 incl. the new recall checks; full ci green.

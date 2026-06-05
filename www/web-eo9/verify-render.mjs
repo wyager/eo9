@@ -189,6 +189,42 @@ await type("ls /bin");
 await waitFor("ls outcome", () => transcriptLines().some((l) => l.includes("listed(")));
 await atPrompt();
 
+// --- arrow-key recall (the live prompt line is the last transcript line) -------------------
+const liveLineText = () => transcriptLines()[transcriptLines().length - 1] ?? "";
+
+// Up recalls the newest command onto the live line; Enter reruns it.
+key("ArrowUp");
+await waitFor("recall of ls /bin", () => liveLineText().includes("ls /bin"));
+const listedBefore = transcriptLines().filter((l) => l.includes("listed(")).length;
+key("Enter");
+await waitFor(
+  "the recalled command reran",
+  () => transcriptLines().filter((l) => l.includes("listed(")).length > listedBefore,
+);
+await atPrompt();
+
+// Up-up reaches the older entry; Down comes back; editing a recalled line commits it.
+key("ArrowUp"); // ls /bin
+await waitFor("recall newest again", () => liveLineText().includes("ls /bin"));
+key("ArrowUp"); // nosuchprogram
+await waitFor("recall the older entry", () => liveLineText().includes("nosuchprogram"));
+key("ArrowDown"); // back down to ls /bin
+await waitFor("down moves back to the newer entry", () => liveLineText().includes("ls /bin"));
+
+// Down past the newest restores the stashed fresh line (typed, never submitted).
+key("ArrowDown"); // leave browsing: the (empty) fresh line returns
+for (const ch of "echo stash kept") key(ch);
+await waitFor("typed a fresh line", () => liveLineText().includes("echo stash kept"));
+key("ArrowUp");
+await waitFor("browsed away from the fresh line", () => liveLineText().includes("ls /bin"));
+key("ArrowDown");
+await waitFor("the stash came back", () => liveLineText().includes("echo stash kept"));
+key("Enter");
+await waitFor("the restored line ran (variadic echo)", () =>
+  transcriptLines().some((l) => l.trim() === "stash kept"),
+);
+await atPrompt();
+
 await type("exit");
 await waitFor("session end", () => transcriptLines().some((l) => l.includes("session ended")));
 
@@ -233,13 +269,21 @@ check(
   lines.some((line) => /Hello, world/.test(line) && !line.includes("eosh>")),
 );
 
-// One prompt line per read: 7 commands were typed (2 empty, hello, help, nosuchprogram,
-// ls /bin, exit), so exactly 7 lines start with the prompt.
+// One prompt line per read: 9 commands were typed (2 empty, hello, help, nosuchprogram,
+// ls /bin, the recalled rerun, the stash-restored echo, exit), so exactly 9 lines start
+// with the prompt — arrow browsing itself must never mint extra prompt lines.
 const promptLines = lines.filter((line) => line.startsWith("eosh>"));
 check(
   "exactly one prompt line per command read",
-  promptLines.length === 7,
+  promptLines.length === 9,
   `got ${promptLines.length}: ${JSON.stringify(promptLines)}`,
+);
+
+// Recall renders in place: the rerun shows as a frozen `eosh> ls /bin` line a second time.
+check(
+  "the recalled command froze on its own prompt line",
+  promptLines.filter((line) => /^eosh> ls \/bin\s*$/.test(line)).length === 2,
+  `prompt lines: ${JSON.stringify(promptLines)}`,
 );
 
 // The stderr in-band marker must never reach the transcript.

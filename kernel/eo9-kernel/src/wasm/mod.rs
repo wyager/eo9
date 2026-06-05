@@ -363,9 +363,12 @@ pub(crate) fn wake_idle() {
 /// window between the caller's last poll and the `wfi` then stays pending and still wakes the
 /// `wfi` (architecturally, a masked-but-pending IRQ is a `wfi` wake-up event), so there is no
 /// lost-wakeup race; unmasking afterwards takes the interrupt (`kirq` services + EOIs it).
-pub(crate) fn idle_wait(child_running: bool) {
+pub(crate) fn idle_wait(child_running: bool) -> WakeKind {
     // Board profile: every idle wake pats the hardware watchdog (the busy passes pat in
     // the drive loops, so neither a parked nor a hot kernel starves it). No-op on QEMU.
+    // The pat runs before the backstop-detector rating below: the watchdog is a
+    // dead-man's switch for the whole kernel, not a liveness probe, so the ordering is
+    // immaterial to the detector — patting first just keeps the dead-man margin maximal.
     crate::wdt::pat();
     let now = crate::timer::uptime_ns();
     let requested = NEXT_TIMER_WAKE_NS.swap(u64::MAX, Ordering::AcqRel);
@@ -374,6 +377,10 @@ pub(crate) fn idle_wait(child_running: bool) {
     } else {
         IDLE_BACKSTOP_NS
     };
+    // Cap-rated: the backstop, not a requested deadline, decides when we wake. A
+    // requested deadline at or inside the cap makes the wake deadline-rated (the event
+    // is time — SleepUntil, an IntxWait bound, a service restart).
+    let cap_rated = requested == u64::MAX || requested.saturating_sub(now) > cap;
     let delay = if requested == u64::MAX {
         cap
     } else {
@@ -384,12 +391,79 @@ pub(crate) fn idle_wait(child_running: bool) {
     // which is also the compiler-level memory barrier that makes whatever the interrupt
     // handler wrote (the UART input ring) visible to the re-poll below.
     crate::timer::wait_for_interrupt(delay);
+    let woke = crate::timer::uptime_ns();
+    // Early wake = an interrupt (UART RX, INTx, an earlier-armed timer) ended the halt
+    // before the armed delay: event-driven, never a finding. Late + cap-rated = the
+    // backstop fired; anything actionable it now discovers was stranded while we slept
+    // (on this single core nothing changes guest-visible state during the masked `wfi`
+    // except interrupts, and an interrupt would have woken us early).
+    let late = woke.saturating_sub(now) >= delay;
     // Idle-path UART scavenge (plan/12, the paste-freeze fix): rescue any receive bytes
     // the interrupt path missed and, after a second of total input silence, nudge QEMU's
     // character feed (which has been observed to wedge under host load) back to life.
     // Runs on every idle wake — at least about once a second via the backstop above.
-    crate::uart::scavenge_rx(crate::timer::uptime_ns());
+    let scavenged = crate::uart::scavenge_rx(woke);
+    let kind = if !late {
+        WakeKind::Event
+    } else if cap_rated {
+        WakeKind::Backstop
+    } else {
+        WakeKind::Deadline
+    };
+    if kind == WakeKind::Backstop {
+        // Detector probes (SPEC: every backstop firing that discovers actionable work no
+        // event delivered is a high-priority bug). The runnable-child probe lives in the
+        // drive loops (shell.rs), which see the next pass's `any_runnable`.
+        if scavenged > 0 {
+            liveness_finding(
+                "stranded input: the idle backstop scavenged receive bytes the interrupt \
+                 path missed (possible benign race only within the same microsecond)",
+                &LIVENESS_STRANDED_INPUT,
+            );
+        }
+        let pending = crate::pci::intx_pending_total();
+        if pending > 0 {
+            liveness_finding(
+                "stranded intx: deliveries were pending across an entire idle backstop",
+                &LIVENESS_STRANDED_INTX,
+            );
+        }
+    }
     wake_idle();
+    kind
+}
+
+/// Why [`idle_wait`] returned: an interrupt (event-driven, the healthy path), the armed
+/// deadline (the event is time), or the liveness backstop (no event arrived for a full
+/// cap — anything the next pass finds runnable was stranded; see the backstop audit).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WakeKind {
+    Event,
+    Deadline,
+    Backstop,
+}
+
+/// Per-kind running counts of backstop findings, and the rate-limited `liveness:` line.
+/// Print on the first find and every 16th after, so a stranded-work regression is loud in
+/// every transcript without flooding a wedged console.
+static LIVENESS_STRANDED_INPUT: AtomicU64 = AtomicU64::new(0);
+static LIVENESS_STRANDED_INTX: AtomicU64 = AtomicU64::new(0);
+static LIVENESS_STRANDED_RUNNABLE: AtomicU64 = AtomicU64::new(0);
+
+fn liveness_finding(what: &str, counter: &AtomicU64) {
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(16) {
+        crate::kprintln!("liveness: {what} (n={n})");
+    }
+}
+
+/// The drive loops report a runnable child/service discovered immediately after a
+/// [`WakeKind::Backstop`] wake — the work was runnable while the core slept the full cap.
+pub(crate) fn liveness_stranded_runnable() {
+    liveness_finding(
+        "stranded runnable: a child or service was runnable across an entire idle backstop",
+        &LIVENESS_STRANDED_RUNNABLE,
+    );
 }
 
 /// Drive a wasmtime future (`instantiate_async`, `call_async`, …) to completion on the
@@ -407,9 +481,18 @@ pub fn block_on<F: Future>(what: &str, future: F) -> Result<F::Output, wasmtime:
     let waker = Waker::from(Arc::new(Doorbell));
     let mut cx = Context::from_waker(&waker);
     let deadline = crate::timer::uptime_ns().saturating_add(BLOCK_ON_WATCHDOG_NS);
+    let mut last_wake = WakeKind::Event;
     loop {
         match future.as_mut().poll(&mut cx) {
-            Poll::Ready(value) => return Ok(value),
+            Poll::Ready(value) => {
+                if last_wake == WakeKind::Backstop {
+                    // The future was ready only after a full backstop with no event: its
+                    // wake edge was missed (it should have rung a waker or requested a
+                    // timer wake).
+                    liveness_stranded_runnable();
+                }
+                return Ok(value);
+            }
             Poll::Pending => {
                 if crate::timer::uptime_ns() > deadline {
                     return Err(wasmtime::Error::msg(alloc::format!(
@@ -422,7 +505,7 @@ pub fn block_on<F: Future>(what: &str, future: F) -> Result<F::Output, wasmtime:
                 // `child_running = false`: it sleeps to the requested deadline (or the long
                 // backstop). A guest awaiting `time.sleep`/`read-line` registered its waker
                 // rather than self-waking, so this is what lets the core actually sleep.
-                idle_wait(false);
+                last_wake = idle_wait(false);
             }
         }
     }

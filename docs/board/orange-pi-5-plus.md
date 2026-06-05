@@ -84,3 +84,21 @@ its own session.
   Day-one fallback: vendor image on eMMC boots → use its U-Boot to load our kernel from SD
   partition 1.
 * **The 1.5 Mbaud adapter** — have a known-good one before the board arrives.
+
+## Hardware goals (owner, 2026-06-04)
+
+Real-hardware "done" = HDMI + USB keyboard + ethernet working, in planned order:
+
+1. **First light** (in progress): boot to eosh over UART2.
+2. **Ethernet** — the 2× 2.5GbE NICs are RTL8125 **on PCIe**, so this is our existing driver
+   model end-to-end: the DW-PCIe config shim (rk3588-pcie.md) → enumerate → an rtl8125 wasm
+   driver exporting eo9:net/l2 → the entire existing l4/switch/bridge stack unchanged on top.
+   Highest value, least new machinery.
+3. **HDMI** — via gfx.simplefb (gfx-simplefb.md): the vendor U-Boot already brings up
+   VOP2/HDMI (DRM v1.0.1 + plane configs in the boot log); we read its framebuffer rather
+   than writing a display driver. Console-on-HDMI additionally needs a text renderer over
+   eo9:gfx (font blitter — new, small).
+4. **USB keyboard** — the biggest new machinery: EHCI on RK3588 is a *platform* MMIO device,
+   so this motivates extending the wasm-driver model beyond eo9:pci to platform MMIO+IRQ
+   grants (SPEC already anticipates "MMIO regions, interrupt lines" as hardware roots), then
+   EHCI + hub + HID boot-protocol keyboard.
