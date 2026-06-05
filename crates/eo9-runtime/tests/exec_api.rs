@@ -80,7 +80,10 @@ const EXECUTOR_WAT: &str = r#"
     (export "spawn-limits" (type $limits (eq $limits-def)))
     (type $spawn-error-def (variant (case "bad-arguments" string) (case "internal" string)))
     (export "spawn-error" (type $spawn-error (eq $spawn-error-def)))
-    (export "spawn" (func (param "i" (borrow $image3)) (param "args" (list $named-arg)) (param "limits" $limits)
+    (export "component" (type $component3 (eq $component)))
+    (type $component-arg-def (record (field "name" string) (field "value" (own $component3))))
+    (export "component-arg" (type $component-arg (eq $component-arg-def)))
+    (export "spawn" (func (param "i" (borrow $image3)) (param "args" (list $named-arg)) (param "components" (list $component-arg)) (param "limits" $limits)
       (result (result (own $task-res) (error $spawn-error)))))
     (export "wait" (func async (param "t" (borrow $task-res)) (result $outcome)))))
 
@@ -116,7 +119,7 @@ const EXECUTOR_WAT: &str = r#"
     (import "host" "load" (func $load (param i32 i32 i32)))
     (import "host" "compose" (func $compose (param i32 i32 i32)))
     (import "host" "compile" (func $compile (param i32 i32 i32 i32)))
-    (import "host" "spawn" (func $spawn (param i32 i32 i32 i32 i64 i32)))
+    (import "host" "spawn" (func $spawn (param i32 i32 i32 i32 i32 i32 i64 i32)))
     (import "host" "wait" (func $wait (param i32 i32)))
     (import "host" "task-return" (func $task-return (param i32 i32 i32)))
 
@@ -141,7 +144,7 @@ const EXECUTOR_WAT: &str = r#"
       (if (i32.load8_u (i32.const 512)) (then (call $fail) (return)))
       (local.set $img (i32.load (i32.const 516)))
       ;; spawn it (no args, no memory ceiling)
-      (call $spawn (local.get $img) (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 512))
+      (call $spawn (local.get $img) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 0) (i32.const 512))
       (if (i32.load8_u (i32.const 512)) (then (call $fail) (return)))
       (local.set $t (i32.load (i32.const 516)))
       ;; wait for the child's outcome
