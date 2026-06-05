@@ -24,6 +24,7 @@ static BUNDLED_COMPONENTS: &[(&str, &[u8])] = &[
     ("eo9-example-outcomes", include_bytes!("eo9-example-outcomes.wasm") as &[u8]),
     ("eo9-example-readwrite", include_bytes!("eo9-example-readwrite.wasm") as &[u8]),
     ("eo9-example-sockcheck", include_bytes!("eo9-example-sockcheck.wasm") as &[u8]),
+    ("eo9-example-time", include_bytes!("eo9-example-time.wasm") as &[u8]),
     ("eo9-example-vnic4check", include_bytes!("eo9-example-vnic4check.wasm") as &[u8]),
     ("eo9-example-vnicheck", include_bytes!("eo9-example-vnicheck.wasm") as &[u8]),
     ("eo9-stub-disk-mem", include_bytes!("eo9-stub-disk-mem.wasm") as &[u8]),
