@@ -19,6 +19,62 @@
 
 use core::arch::global_asm;
 
+// Board profile (`board-opi5plus`): the 64-byte arm64 Linux `Image` header U-Boot's
+// `booti` requires on a flat binary, placed first in the image by the board linker
+// script (`.text.header`), plus the EL2->EL1 entry drop. The RK3588's TF-A hands
+// control to U-Boot at EL2 (boot log: `SPSR = 0x3c9` — EL2h), and `booti` enters the
+// kernel at that level; this kernel runs at EL1, so the trampoline zeroes CNTVOFF_EL2
+// (the virtual timer must equal the physical one — src/timer.rs uses CNTV), sets
+// HCR_EL2.RW (EL1 is aarch64), disables the EL2 FP/CP15 traps, gives SCTLR_EL1 its
+// canonical MMU-off reset value, and `eret`s to EL1h with interrupts masked. QEMU's
+// `-kernel` loader enters at EL1 directly, so the trampoline also tolerates that.
+#[cfg(feature = "board-opi5plus")]
+global_asm!(
+    r#"
+.section .text.header, "ax"
+.globl _image_header
+_image_header:
+    b       _board_entry            // code0: jump over the header
+    .word   0                       // code1
+    .quad   0                       // text_offset: run at the DRAM bank base (0x0020_0000)
+    .quad   __image_size            // image_size: kernel + .bss + boot stack
+    .quad   0xA                     // flags: little-endian, 4 KiB pages, placement anywhere
+    .quad   0                       // res2
+    .quad   0                       // res3
+    .quad   0                       // res4
+    .ascii  "ARMd"               // magic
+    .word   0                       // res5
+
+.section .text.boot, "ax"
+.globl _board_entry
+_board_entry:
+    // Preserve the DTB pointer (x0) across the drop; x20 is dead this early.
+    mov     x20, x0
+    mrs     x1, CurrentEL
+    lsr     x1, x1, #2
+    cmp     x1, #2
+    b.ne    9f                      // already EL1: continue
+    // Configure EL1 from EL2, then drop.
+    msr     cntvoff_el2, xzr        // virtual counter == physical counter
+    mov     x1, #(1 << 31)          // HCR_EL2.RW: EL1 executes aarch64
+    msr     hcr_el2, x1
+    mov     x1, #0x33ff             // CPTR_EL2: no FP/SIMD trap to EL2 (RES1 pattern)
+    msr     cptr_el2, x1
+    msr     hstr_el2, xzr           // no CP15 traps
+    mov     x1, #0x30d0
+    lsl     x1, x1, #16
+    movk    x1, #0x0800             // SCTLR_EL1 = 0x30D00800: RES1 bits, MMU/caches off
+    msr     sctlr_el1, x1
+    mov     x1, #0x3c5              // SPSR_EL2: EL1h, DAIF masked
+    msr     spsr_el2, x1
+    adr     x1, 9f
+    msr     elr_el2, x1
+    eret
+9:  mov     x0, x20
+    b       _start
+"#
+);
+
 global_asm!(
     r#"
 .section .text.boot, "ax"

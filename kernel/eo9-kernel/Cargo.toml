@@ -59,6 +59,13 @@ spawn-trace = []
 # Re-run every fusion the graph cache serves from memory and assert byte equality
 # (the encoder-determinism check, owner design). Verification batteries only.
 graph-verify = []
+# Board profile: Orange Pi 5 Plus (RK3588) — real-hardware constants instead of QEMU
+# `virt` (docs/board/orange-pi-5-plus.md, plan/12). Selects the DW-APB UART2 console at
+# 0xfeb5_0000 (1.5 Mbaud, left as U-Boot programmed it), the GIC-600 (GICv3) bases
+# (GICD 0xfe60_0000 / GICR 0xfe68_0000), DRAM-at-zero link/MMU layout, the SMC PSCI
+# conduit (TF-A BL31), the EL2->EL1 entry drop, and the 64-byte Linux `Image` boot header
+# `booti` requires. Off by default — every QEMU path is byte-for-behavior unchanged.
+board-opi5plus = []
 
 # These dependencies are only used by the real bare-metal build; host-triple builds (unit
 # tests, `cargo check` without --target) compile the stub entry point and need neither.

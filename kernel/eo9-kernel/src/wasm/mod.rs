@@ -364,6 +364,12 @@ pub(crate) fn wake_idle() {
 /// `wfi` (architecturally, a masked-but-pending IRQ is a `wfi` wake-up event), so there is no
 /// lost-wakeup race; unmasking afterwards takes the interrupt (`kirq` services + EOIs it).
 pub(crate) fn idle_wait(child_running: bool) -> WakeKind {
+    // Board profile: every idle wake pats the hardware watchdog (the busy passes pat in
+    // the drive loops, so neither a parked nor a hot kernel starves it). No-op on QEMU.
+    // The pat runs before the backstop-detector rating below: the watchdog is a
+    // dead-man's switch for the whole kernel, not a liveness probe, so the ordering is
+    // immaterial to the detector — patting first just keeps the dead-man margin maximal.
+    crate::wdt::pat();
     let now = crate::timer::uptime_ns();
     let requested = NEXT_TIMER_WAKE_NS.swap(u64::MAX, Ordering::AcqRel);
     let cap = if child_running {

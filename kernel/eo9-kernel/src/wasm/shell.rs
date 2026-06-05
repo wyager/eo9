@@ -161,7 +161,10 @@ fn run_init(entries: &'static [StoreEntry], config: &str) -> Result<String, wasm
                     } else {
                         // The loop stays hot for a runnable child/service; wake any
                         // input-parked future (the console's read-line) each pass so
-                        // the prompt stays responsive while something spins.
+                        // the prompt stays responsive while something spins. Busy passes
+                        // also pat the board watchdog (idle passes pat in `idle_wait`),
+                        // so a hot loop never starves the hang backstop. No-op on QEMU.
+                        crate::wdt::pat();
                         super::wake_idle();
                     }
                 }
@@ -349,7 +352,10 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
                     } else {
                         // The loop stays hot for a runnable child/service; wake any
                         // input-parked future (the console's read-line) each pass so
-                        // the prompt stays responsive while something spins.
+                        // the prompt stays responsive while something spins. Busy passes
+                        // also pat the board watchdog (idle passes pat in `idle_wait`),
+                        // so a hot loop never starves the hang backstop. No-op on QEMU.
+                        crate::wdt::pat();
                         super::wake_idle();
                     }
                 }

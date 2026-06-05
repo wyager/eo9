@@ -1,72 +1,210 @@
-//! PL011 UART console on QEMU's aarch64 `virt` machine.
+//! Serial console: PL011 on QEMU's aarch64 `virt` machine, or the RK3588's DW-APB UART2
+//! on the `board-opi5plus` profile (1.5 Mbaud debug header; the line stays exactly as
+//! U-Boot programmed it — divisor untouched, per docs/board/orange-pi-5-plus.md).
 //!
-//! The UART sits at its fixed `virt` address (0x0900_0000) and QEMU wires it to stdio
-//! under `-nographic`, so transmit is just "poll the FIFO-full flag, write the data
-//! register". QEMU's model needs no initialization for transmit-only use, which is all the
-//! spike needs. The console is stateless (every write goes straight to the MMIO
-//! registers), so no global state or locking is required on the single boot core.
+//! The register layer lives in the cfg-selected `hw` module below; everything above it —
+//! the RX ring, Ctrl-C scanning, the console writer — is shared. Transmit is "poll the
+//! ready flag, write the data register" on both parts. The console is stateless (every
+//! write goes straight to the MMIO registers), so no global state or locking is required
+//! on the single boot core.
+//!
+//! Board receive path, day one: the UART's GIC SPI is not wired yet (the interrupt number
+//! is board-DTB territory), so `enable_rx_interrupt`/`drain_rx` are inert there and input
+//! flows through the executor's idle-path [`scavenge_rx`] poll instead — bytes land in the
+//! same ring with at most the idle-wake latency. Wiring the SPI is a recorded follow-up.
 
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// PL011 base address on the QEMU `virt` machine.
-const UART_BASE: usize = 0x0900_0000;
-/// Data register.
-const UARTDR: usize = 0x000;
-/// Flag register.
-const UARTFR: usize = 0x018;
-/// Interrupt mask set/clear register (write 1 to a bit to unmask that interrupt source).
-const UARTIMSC: usize = 0x038;
-/// Interrupt clear register (write 1 to a bit to clear that pending interrupt source).
-const UARTICR: usize = 0x044;
-/// Line control register: word length, FIFO enable.
-const UARTLCR_H: usize = 0x02C;
-/// Control register: UART/TX/RX enables.
-const UARTCR: usize = 0x030;
-/// Interrupt FIFO level select register.
-const UARTIFLS: usize = 0x034;
-/// Line control: enable the 16-byte FIFOs.
-const UARTLCR_H_FEN: u32 = 1 << 4;
-/// Line control: 8-bit words.
-const UARTLCR_H_WLEN8: u32 = 0b11 << 5;
-/// Control: UART enable / transmit enable / receive enable.
-const UARTCR_UARTEN: u32 = 1 << 0;
-const UARTCR_TXE: u32 = 1 << 8;
-const UARTCR_RXE: u32 = 1 << 9;
-/// Flag register: transmit FIFO full.
-const UARTFR_TXFF: u32 = 1 << 5;
-/// Flag register: receive FIFO empty.
-// Receive is only consumed by the wasm `read-line` provider, which the feature-less CI
-// build does not compile; keep the path unconditional rather than feature-gating MMIO.
-#[allow(dead_code)]
-const UARTFR_RXFE: u32 = 1 << 4;
-/// Receive interrupt (UARTIMSC/UARTICR bit 4).
-#[allow(dead_code)] // used only on the wasm/interactive path, not the feature-less CI build
-const UART_INT_RX: u32 = 1 << 4;
-/// Receive-timeout interrupt (UARTIMSC/UARTICR bit 6): fires when RX data has waited without
-/// reaching the FIFO threshold, so a single keystroke still raises an interrupt.
-#[allow(dead_code)]
-const UART_INT_RT: u32 = 1 << 6;
+/// PL011 register layer (QEMU `virt`).
+#[cfg(not(feature = "board-opi5plus"))]
+mod hw {
+    /// PL011 base address on the QEMU `virt` machine.
+    const UART_BASE: usize = 0x0900_0000;
+    /// Data register.
+    const UARTDR: usize = 0x000;
+    /// Flag register.
+    const UARTFR: usize = 0x018;
+    /// Interrupt mask set/clear register (write 1 to a bit to unmask that interrupt source).
+    const UARTIMSC: usize = 0x038;
+    /// Interrupt clear register (write 1 to a bit to clear that pending interrupt source).
+    const UARTICR: usize = 0x044;
+    /// Line control register: word length, FIFO enable.
+    const UARTLCR_H: usize = 0x02C;
+    /// Control register: UART/TX/RX enables.
+    const UARTCR: usize = 0x030;
+    /// Interrupt FIFO level select register.
+    const UARTIFLS: usize = 0x034;
+    /// Line control: enable the 16-byte FIFOs.
+    const UARTLCR_H_FEN: u32 = 1 << 4;
+    /// Line control: 8-bit words.
+    const UARTLCR_H_WLEN8: u32 = 0b11 << 5;
+    /// Control: UART enable / transmit enable / receive enable.
+    const UARTCR_UARTEN: u32 = 1 << 0;
+    const UARTCR_TXE: u32 = 1 << 8;
+    const UARTCR_RXE: u32 = 1 << 9;
+    /// Flag register: transmit FIFO full.
+    const UARTFR_TXFF: u32 = 1 << 5;
+    /// Flag register: receive FIFO empty.
+    // Receive is only consumed by the wasm `read-line` provider, which the feature-less CI
+    // build does not compile; keep the path unconditional rather than feature-gating MMIO.
+    #[allow(dead_code)]
+    const UARTFR_RXFE: u32 = 1 << 4;
+    /// Receive interrupt (UARTIMSC/UARTICR bit 4).
+    #[allow(dead_code)] // used only on the wasm/interactive path, not the feature-less CI build
+    const UART_INT_RX: u32 = 1 << 4;
+    /// Receive-timeout interrupt (UARTIMSC/UARTICR bit 6): fires when RX data has waited
+    /// without reaching the FIFO threshold, so a single keystroke still raises an interrupt.
+    #[allow(dead_code)]
+    const UART_INT_RT: u32 = 1 << 6;
 
-fn mmio_read(offset: usize) -> u32 {
-    // SAFETY: `UART_BASE + offset` is a valid PL011 register on the `virt` machine;
-    // `crate::mmio` pins the access to a syndrome-valid GPR form (device memory must
-    // never be touched through plain volatile on aarch64 — see that module's docs).
-    unsafe { crate::mmio::read_u32(UART_BASE + offset) }
+    fn mmio_read(offset: usize) -> u32 {
+        // SAFETY: `UART_BASE + offset` is a valid PL011 register on the `virt` machine;
+        // `crate::mmio` pins the access to a syndrome-valid GPR form (device memory must
+        // never be touched through plain volatile on aarch64 — see that module's docs).
+        unsafe { crate::mmio::read_u32(UART_BASE + offset) }
+    }
+
+    fn mmio_write(offset: usize, value: u32) {
+        // SAFETY: as above, for writes.
+        unsafe { crate::mmio::write_u32(UART_BASE + offset, value) }
+    }
+
+    /// Transmit not ready (FIFO full).
+    pub(super) fn tx_busy() -> bool {
+        mmio_read(UARTFR) & UARTFR_TXFF != 0
+    }
+
+    /// Write one byte to the data register.
+    pub(super) fn tx_write(byte: u8) {
+        mmio_write(UARTDR, u32::from(byte));
+    }
+
+    /// No received byte waiting.
+    #[allow(dead_code)] // wasm/interactive path only; see UARTFR_RXFE
+    pub(super) fn rx_empty() -> bool {
+        mmio_read(UARTFR) & UARTFR_RXFE != 0
+    }
+
+    /// Read the data register (low byte = the received character).
+    #[allow(dead_code)]
+    pub(super) fn rx_read() -> u32 {
+        mmio_read(UARTDR)
+    }
+
+    /// Acknowledge the receive interrupt sources. PL011: W1C via UARTICR — and the
+    /// acknowledge-then-drain order is load-bearing (see `drain_rx`).
+    #[allow(dead_code)]
+    pub(super) fn irq_ack() {
+        mmio_write(UARTICR, UART_INT_RX | UART_INT_RT);
+    }
+
+    /// Program the line for interactive use and unmask receive interrupts: 8-bit words,
+    /// 16-byte FIFOs (paste robustness — QEMU paces its feed by free FIFO space; depth 1
+    /// wedges under load, the paste-freeze bug, plan/12), earliest RX trigger, the
+    /// TRM-correct enables, then a clean slate and RX+RT unmasked.
+    #[allow(dead_code)]
+    pub(super) fn line_init() {
+        mmio_write(UARTLCR_H, UARTLCR_H_WLEN8 | UARTLCR_H_FEN);
+        mmio_write(UARTIFLS, 0);
+        mmio_write(UARTCR, UARTCR_UARTEN | UARTCR_TXE | UARTCR_RXE);
+        mmio_write(UARTICR, 0x7FF);
+        mmio_write(UARTIMSC, UART_INT_RX | UART_INT_RT);
+    }
 }
 
-fn mmio_write(offset: usize, value: u32) {
-    // SAFETY: as above, for writes.
-    unsafe { crate::mmio::write_u32(UART_BASE + offset, value) }
+/// DW-APB (Synopsys 8250-family) register layer — the RK3588's UART2 debug console
+/// (`board-opi5plus`): 32-bit registers at stride 4 (reg-shift 2 / reg-io-width 4),
+/// base verified live at the board's U-Boot prompt. The line (1.5 Mbaud 8n1, FIFOs) is
+/// exactly as U-Boot left it: nothing here touches LCR/the divisor/FCR — at 24 MHz the
+/// 1.5 Mbaud divisor is exactly 1, and reprogramming a live line is day-two polish.
+#[cfg(feature = "board-opi5plus")]
+mod hw {
+    /// UART2 base on the RK3588 (the Orange Pi 5 Plus debug header).
+    const UART_BASE: usize = 0xfeb5_0000;
+    /// Receive buffer (read) / transmit holding (write) register, reg 0 at stride 4.
+    const DW_RBR_THR: usize = 0x00;
+    /// Line status register, reg 5 at stride 4.
+    const DW_LSR: usize = 0x14;
+    /// LSR: data ready.
+    const DW_LSR_DR: u32 = 1 << 0;
+    /// LSR: transmit holding register empty.
+    const DW_LSR_THRE: u32 = 1 << 5;
+    /// LSR: transmitter empty (FIFO *and* shift register — everything is on the wire).
+    const DW_LSR_TEMT: u32 = 1 << 6;
+
+    fn mmio_read(offset: usize) -> u32 {
+        // SAFETY: `UART_BASE + offset` is a valid DW-APB UART register on the RK3588;
+        // `crate::mmio` pins the access to a syndrome-valid GPR form.
+        unsafe { crate::mmio::read_u32(UART_BASE + offset) }
+    }
+
+    fn mmio_write(offset: usize, value: u32) {
+        // SAFETY: as above, for writes.
+        unsafe { crate::mmio::write_u32(UART_BASE + offset, value) }
+    }
+
+    /// Transmit not ready (holding register still full).
+    pub(super) fn tx_busy() -> bool {
+        mmio_read(DW_LSR) & DW_LSR_THRE == 0
+    }
+
+    /// Write one byte to the transmit holding register.
+    pub(super) fn tx_write(byte: u8) {
+        mmio_write(DW_RBR_THR, u32::from(byte));
+    }
+
+    /// No received byte waiting.
+    #[allow(dead_code)] // wasm/interactive path only
+    pub(super) fn rx_empty() -> bool {
+        mmio_read(DW_LSR) & DW_LSR_DR == 0
+    }
+
+    /// Read the receive buffer (low byte = the received character).
+    #[allow(dead_code)]
+    pub(super) fn rx_read() -> u32 {
+        mmio_read(DW_RBR_THR)
+    }
+
+    /// Acknowledge receive interrupt sources: nothing to do on the DW-APB — reading RBR
+    /// (the drain that follows) clears the receive condition; there is no W1C latch to
+    /// race, so the PL011's acknowledge-then-drain ordering concern does not exist here.
+    #[allow(dead_code)]
+    pub(super) fn irq_ack() {}
+
+    /// Day-one no-op: the UART's GIC SPI is not wired yet, so no interrupt is unmasked
+    /// (input flows through the idle-path scavenger's poll), and the line itself is left
+    /// exactly as U-Boot programmed it.
+    #[allow(dead_code)]
+    pub(super) fn line_init() {}
+
+    /// Everything transmitted is on the wire (FIFO and shift register both empty).
+    pub(super) fn tx_idle() -> bool {
+        mmio_read(DW_LSR) & DW_LSR_TEMT != 0
+    }
 }
 
-/// Write one byte, spinning while the transmit FIFO is full.
-pub fn put_byte(byte: u8) {
-    while mmio_read(UARTFR) & UARTFR_TXFF != 0 {
+/// Block (bounded) until the transmit path is fully drained — FIFO and shift register —
+/// so output already printed survives an imminent PSCI SYSTEM_RESET. At 1.5 Mbaud a full
+/// 16-byte FIFO takes ~107 µs; the bound (~50 M spins) is pure paranoia against a wedged
+/// transmitter, in which case losing the tail beats hanging the reset.
+#[cfg(feature = "board-opi5plus")]
+pub fn tx_drain() {
+    for _ in 0..50_000_000u32 {
+        if hw::tx_idle() {
+            return;
+        }
         core::hint::spin_loop();
     }
-    mmio_write(UARTDR, u32::from(byte));
+}
+
+/// Write one byte, spinning while the transmitter is busy.
+pub fn put_byte(byte: u8) {
+    while hw::tx_busy() {
+        core::hint::spin_loop();
+    }
+    hw::tx_write(byte);
 }
 
 /// Read one received byte if one is waiting (non-blocking; QEMU feeds the RX FIFO from
@@ -76,12 +214,12 @@ pub fn put_byte(byte: u8) {
 /// run the interrupt handler ([`drain_rx`]) moves bytes into [`RX_RING`] and the read-line
 /// provider consumes them via [`ring_get_byte`] instead — so the core can `wfi`-idle and be
 /// woken by a keystroke rather than polling the data register.
-#[allow(dead_code)] // see UARTFR_RXFE above
+#[allow(dead_code)] // wasm/interactive path only
 pub fn try_get_byte() -> Option<u8> {
-    if mmio_read(UARTFR) & UARTFR_RXFE != 0 {
+    if hw::rx_empty() {
         None
     } else {
-        Some((mmio_read(UARTDR) & 0xff) as u8)
+        Some((hw::rx_read() & 0xff) as u8)
     }
 }
 
@@ -132,17 +270,7 @@ static RX_RING: RxRing = RxRing {
 /// 16 bytes. On real hardware the FIFO is equally desirable (fewer interrupts per burst).
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
 pub fn enable_rx_interrupt() {
-    // 8n1, FIFOs on. Written before the enables per the PL011 programming sequence.
-    mmio_write(UARTLCR_H, UARTLCR_H_WLEN8 | UARTLCR_H_FEN);
-    // Earliest RX trigger (1/8 full) so real hardware interrupts promptly; QEMU's model
-    // raises the receive interrupt on the first byte regardless.
-    mmio_write(UARTIFLS, 0);
-    // QEMU works without touching UARTCR (its reset state already moves data), but the
-    // TRM-correct enables cost nothing and matter on real silicon.
-    mmio_write(UARTCR, UARTCR_UARTEN | UARTCR_TXE | UARTCR_RXE);
-    // Start from a clean slate, then unmask receive + receive-timeout.
-    mmio_write(UARTICR, 0x7FF);
-    mmio_write(UARTIMSC, UART_INT_RX | UART_INT_RT);
+    hw::line_init();
 }
 
 /// Move every byte waiting in the RX FIFO into [`RX_RING`]; returns how many moved.
@@ -151,8 +279,8 @@ pub fn enable_rx_interrupt() {
 /// either the IRQ handler, or thread context with IRQs masked ([`scavenge_rx`]).
 fn fifo_to_ring() -> usize {
     let mut moved = 0;
-    while mmio_read(UARTFR) & UARTFR_RXFE == 0 {
-        let byte = (mmio_read(UARTDR) & 0xff) as u8;
+    while !hw::rx_empty() {
+        let byte = (hw::rx_read() & 0xff) as u8;
         moved += 1;
         let head = RX_RING.head.load(Ordering::Relaxed);
         let next = (head + 1) % RX_RING_CAP;
@@ -181,7 +309,7 @@ fn fifo_to_ring() -> usize {
 /// arrives after the final drain check re-latches the interrupt and is delivered normally.
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
 pub fn drain_rx() {
-    mmio_write(UARTICR, UART_INT_RX | UART_INT_RT);
+    hw::irq_ack();
     fifo_to_ring();
 }
 
@@ -229,8 +357,9 @@ pub fn scavenge_rx(now_ns: u64) -> usize {
             LAST_KICK_NS.store(now_ns, Ordering::Relaxed);
             // The FIFO is empty (checked under the mask just above): this read returns
             // stale data and exists purely for QEMU's unconditional `accept_input` side
-            // effect, which resumes a wedged character feed.
-            let _ = mmio_read(UARTDR);
+            // effect, which resumes a wedged character feed (harmless stale read on real
+            // hardware).
+            let _ = hw::rx_read();
         }
     }
     // SAFETY: restore IRQ delivery.

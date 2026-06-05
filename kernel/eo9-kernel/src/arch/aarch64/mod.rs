@@ -17,12 +17,21 @@ pub(crate) const NAME: &str = "aarch64";
 /// Where PCI Express lives on this machine (QEMU `virt` with `highmem=off` — xtask passes
 /// it so the ECAM stays below 4 GiB, inside the identity-mapped device gigabyte). Consumed
 /// by the shared `src/pci.rs`, which is only built with the wasm-store feature.
+///
+/// On the `board-opi5plus` profile the RK3588's DesignWare PCIe controllers have no plain
+/// ECAM (docs/board/rk3588-pcie.md — the config-access shim is its own bring-up session),
+/// so the bus count is zero: enumeration cleanly finds nothing (`lspci` → no devices)
+/// instead of dereferencing a QEMU-specific window that is plain DRAM on this board.
 #[cfg(feature = "wasm-store")]
 pub(crate) mod pci_map {
     /// ECAM (PCIe configuration space) base.
     pub(crate) const ECAM_BASE: usize = 0x3f00_0000;
     /// Buses covered by the 16 MiB low ECAM window (1 MiB per bus).
-    pub(crate) const ECAM_BUSES: u8 = 16;
+    pub(crate) const ECAM_BUSES: u8 = if cfg!(feature = "board-opi5plus") {
+        0
+    } else {
+        16
+    };
     /// 32-bit PCIe MMIO window: where unassigned memory BARs get placed.
     pub(crate) const MMIO_BASE: usize = 0x1000_0000;
     pub(crate) const MMIO_END: usize = 0x3eff_0000;
@@ -61,6 +70,9 @@ pub(crate) mod pci_intx {
 /// Boot banner: machine identification, exception level, timer frequency, wall clock.
 pub(crate) fn banner() {
     crate::kprintln!();
+    #[cfg(feature = "board-opi5plus")]
+    crate::kprintln!("Eo9 kernel — aarch64 (Orange Pi 5 Plus, RK3588)");
+    #[cfg(not(feature = "board-opi5plus"))]
     crate::kprintln!("Eo9 kernel — aarch64 (QEMU virt)");
     crate::kprintln!("  exception level: EL{}", current_el());
     crate::kprintln!("  counter-timer frequency: {} Hz", timer::frequency());
@@ -79,11 +91,20 @@ pub(crate) fn banner() {
 /// (draining UART input into the ring); every other exception stays fatal.
 pub(crate) fn interrupts_init() {
     gic::init();
-    for intid in [26u32, 27, 29, 30, 33] {
+    // The generic-timer PPI family everywhere; the console UART's SPI only where it is
+    // known (QEMU `virt`: PL011 on SPI 33). The board profile leaves the UART SPI unwired
+    // for day one — input arrives through the executor's idle-path scavenger poll instead
+    // (src/arch/aarch64/uart.rs module docs; wiring UART2's SPI is a recorded follow-up).
+    #[cfg(not(feature = "board-opi5plus"))]
+    const INTIDS: [u32; 5] = [26, 27, 29, 30, 33];
+    #[cfg(feature = "board-opi5plus")]
+    const INTIDS: [u32; 4] = [26, 27, 29, 30];
+    for intid in INTIDS {
         gic::configure_intid(intid);
         gic::enable_intid(intid);
     }
-    // Unmask the UART receive interrupt so an arriving byte asserts SPI 33.
+    // Unmask the UART receive interrupt so an arriving byte asserts its line (a no-op on
+    // the board profile, where the line is left exactly as U-Boot programmed it).
     uart::enable_rx_interrupt();
     // SAFETY: clearing PSTATE.I (DAIF.I) enables IRQ delivery; the IRQ vector is installed.
     unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };

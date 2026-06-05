@@ -1919,3 +1919,81 @@ header bytes, disassembly): the stub's first live run is on the board.
 Dev-loop follow-up recorded: the board kernel should power off via PSCI SYSTEM_RESET
 instead of SYSTEM_OFF so every run returns to the U-Boot prompt by itself (fold into
 the area/12-opi5-profile review).
+## Entry 79 — the Orange Pi 5 Plus board profile (2026-06-04)
+
+The board arrived alive (vendor U-Boot in SPI NOR, GICv3 PIDR2=0x3b and UART2 base
+0xfeb5_0000 verified live at the `opi#` prompt at 1.5 Mbaud). `board-opi5plus` is a
+cargo feature off by default — every QEMU path keeps its own constants:
+
+* **Entry**: the 64-byte arm64 `Image` header (`.text.header`, text_offset 0,
+  `__image_size` covers .bss + boot stack) + an EL2→EL1 drop (TF-A hands U-Boot EL2h —
+  boot log `SPSR = 0x3c9`; the trampoline zeroes CNTVOFF_EL2 for the CNTV timer, sets
+  HCR_EL2.RW, parks the FP/CP15 traps, seeds SCTLR_EL1 = 0x30D00800, `eret`s to EL1h).
+  QEMU's ELF loader enters `_start` at EL1 and never sees either.
+* **Layout**: linked at 0x0020_0000 (the DRAM bank base; booti dst = bank+text_offset
+  lands there under both the 2017.09 and the round-down relocation rules, and a direct
+  `fatload` to 0x0020_0000 runs in place). MMU window: DRAM 0x0..0x2100_0000 (528 MiB,
+  RAM at level-1 entry 0) + a Device gigabyte at entry 3 (0xC000_0000.. — UART2, GIC,
+  U-Boot's relocated remains and control FDT, all readable). TF-A's low regions are
+  mapped RW-NX and never touched.
+* **Console**: DW-APB UART2 register layer (stride 4 via mmio.rs; LSR/THR/RBR only) —
+  the line stays exactly as U-Boot programmed it (24 MHz / 1.5 M = divisor 1; nothing
+  writes LCR/DLL/FCR). uart.rs is now a shared core (ring/Ctrl-C/console) over a
+  cfg-selected `hw` layer; the PL011 layer is byte-for-behavior the old code. Day-one
+  input flows through the idle scavenger's poll (≤ ~10 ms latency) because UART2's GIC
+  SPI is deliberately unwired; wiring it is the recorded follow-up.
+* **GIC**: GICD 0xfe60_0000 / GICR 0xfe68_0000 (frame 0 = the boot core, cpu-hwid-0);
+  the existing v2-in-frame-first version probe lands RAZ→0xFFE8→0x3b→v3 exactly as on
+  QEMU gicv3. PSCI via SMC (TF-A); PL031 absent → wall clock reads 0 (PMIC RTC later);
+  ECAM_BUSES = 0 (lspci finds nothing instead of dereferencing DRAM — the DW-PCIe shim
+  is its own session, docs/board/rk3588-pcie.md).
+* **Build**: `cargo xtask build-kernel aarch64 opi5plus [minimal]` → flattens PT_LOADs
+  into `kernel/target/eo9-opi5plus[-min].img` (header magic asserted). `minimal` bakes a
+  hello-only store (12.4 MiB image) for fatload-speed iteration; full bakes the standard
+  52. Boot recipe + expected output + fallbacks: .claude/board-bringup/BOOT.md.
+* Pre-existing (also on the standard QEMU build, untouched): the three
+  `eo9-kernel` warnings (unused `Val`/`NAME`/`COMPILER_FINGERPRINT` under
+  wasm-store-without-storedisk feature sets).
+
+Board-only residue for bring-up day: first serial output through the DW layer, the GIC
+on real silicon, SMC SYSTEM_OFF, booti's relocation behavior on the vendor 2017.09
+U-Boot (fallback `go 0x00200000` documented). QEMU regression: demo canonical + gicv3
+demo + paste burst re-run green on this branch (the board feature off).
+
+## Entry 80 — board loop-safety: exit-is-reset, panic marker, the hardware watchdog (2026-06-04)
+
+The autonomous UART dev loop runs unattended — every kernel outcome must land back at the
+U-Boot prompt. Three `board-opi5plus`-gated changes (QEMU byte-for-behavior unchanged,
+canonical v2 + gicv3 demos re-verified; the standard kernel binary carries none of the new
+strings):
+
+* **Exit = reset** (src/arch/aarch64/power.rs): the end-of-run PSCI call is
+  `SYSTEM_RESET` (0x8400_0009) on the board, `SYSTEM_OFF` on QEMU — one
+  `PSCI_END_OF_RUN` id, cfg-selected; `OFF_REQUEST` names the truth per profile. The
+  board arm drains the UART transmit path (new `uart::tx_drain`, bounded spin on DW LSR
+  TEMT) before the SMC so the outcome line survives the reset.
+* **Panic = print + reset** (src/panic.rs): the report gains a grep-stable `EO9-PANIC`
+  marker line on the board profile (loop drivers classify the boot), then flows into the
+  same drained SYSTEM_RESET via `system_off()`. QEMU panic text is untouched.
+* **The watchdog** (src/wdt.rs, new): RK3588 DW-WDT (`wdt@feaf0000`, rk3588s.dtsi;
+  driven per Linux dw_wdt.c) armed at boot — TORR TOP=13 (≈22.4 s at the 24 MHz
+  `tclk_wdt0`, gated from xin24m per clk-rk3588.c), response mode 0 (direct SoC reset),
+  CRR `0x76` pats. Patted from `idle_wait` (every idle wake) and both busy-pass branches
+  of the shell/init drive loops, so neither a hot nor a parked kernel starves it; a hang
+  → reset → U-Boot in ≤ ~22 s. Doctrine note: a dead-man's switch, not a progress
+  backstop — it never makes anything advance (SPEC "liveness is event-driven").
+  Arming is best-effort with loud verification (enable readback + live counter): if
+  firmware left the WDT clock gated we print `wdt: arm FAILED` and boot on rather than
+  blind-poking CRU gates (write-mask-high; the ungate is a bench follow-up if the live
+  board needs it). Mainline evidence that no CRU glue is required: rk3588 dts carries no
+  reset-mode property and dw_wdt.c does nothing CRU-side — the WDT→global-reset routing
+  is SoC/firmware default. Live validation (deliberate starve → observe reboot) is the
+  planner's first on-board test.
+
+Both images rebuilt: `eo9-opi5plus-min.img` 12,976,896 B / `eo9-opi5plus.img`
+50,135,120 B, each carrying exactly one `EO9-PANIC` / `wdt: armed` /
+`SYSTEM_RESET (back to U-Boot)` string; the QEMU kernel carries zero. Known flake while
+gating: `svc_shell::restart_cycles_complete_while_the_foreground_is_quietly_blocked`
+fails under heavy parallel host load on the UNMODIFIED base tree too (2/3 base-tree
+failures at load ≈ 17 with a concurrent agent's QEMU battery; 8/8 green in a quiet
+window) — the wall-time pacing class, not this branch.

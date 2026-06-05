@@ -33,6 +33,11 @@ fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let script = match arch.as_str() {
+        // The Orange Pi 5 Plus board profile links for the RK3588's DRAM-at-zero layout
+        // (and prepends the Linux Image header section); QEMU `virt` keeps its own script.
+        "aarch64" if env::var("CARGO_FEATURE_BOARD_OPI5PLUS").is_ok() => {
+            "linker-aarch64-opi5plus.ld"
+        }
         "aarch64" => "linker-aarch64.ld",
         "riscv64" => "linker-riscv64.ld",
         "x86_64" => "linker-x86_64.ld",
