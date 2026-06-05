@@ -328,13 +328,23 @@ impl Backend for MockBackend {
         Ok(id)
     }
 
-    fn spawn(&mut self, image: &u32, args: &[NamedArg]) -> Result<u32, BackendError> {
+    fn spawn(
+        &mut self,
+        image: &u32,
+        args: &[NamedArg],
+        components: Vec<crate::backend::ComponentArg<u32>>,
+    ) -> Result<u32, BackendError> {
         self.next_task += 1;
         let id = self.next_task;
-        let rendered: Vec<String> = args
+        let mut rendered: Vec<String> = args
             .iter()
             .map(|arg| format!("{}={}", arg.name, arg.value))
             .collect();
+        rendered.extend(
+            components
+                .iter()
+                .map(|arg| format!("{}=c{}", arg.name, arg.value)),
+        );
         self.log.push(format!(
             "spawn(i{image}, [{}]) -> t{id}",
             rendered.join(", ")

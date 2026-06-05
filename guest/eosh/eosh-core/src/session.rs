@@ -631,7 +631,7 @@ impl<B: Backend> Session<B> {
             let Session { backend, cache, .. } = self;
             let hit = cache
                 .image_get(key)
-                .map(|(image, args, fs_run)| (backend.spawn(image, args), fs_run));
+                .map(|(image, args, fs_run)| (backend.spawn(image, args, Vec::new()), fs_run));
             if let Some((spawned, fs_run)) = hit {
                 let task = match spawned {
                     Ok(task) => task,
@@ -678,7 +678,7 @@ impl<B: Backend> Session<B> {
             Ok(image) => image,
             Err(err) => return self.report(EvalError::Backend(err)),
         };
-        let task = match self.backend.spawn(&image, &args) {
+        let task = match self.backend.spawn(&image, &args, Vec::new()) {
             Ok(task) => task,
             Err(err) => return self.report(EvalError::Backend(err)),
         };

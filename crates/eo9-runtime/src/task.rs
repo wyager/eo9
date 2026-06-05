@@ -507,6 +507,20 @@ impl Task {
         limits: SpawnLimits,
         providers: Providers,
     ) -> Result<Self, SpawnError> {
+        Self::spawn_with(image, args, Vec::new(), limits, providers)
+    }
+
+    /// [`Task::spawn`] with component-typed `main` arguments: each named component value
+    /// transfers into the child's exec provider and binds as an owned handle of the
+    /// child's imported component-algebra resource. Binding one therefore requires the
+    /// child to hold the exec capability (that is where component handles live).
+    pub fn spawn_with(
+        image: &Image,
+        args: &[NamedArg],
+        components: Vec<(String, eo9_component::Component)>,
+        limits: SpawnLimits,
+        providers: Providers,
+    ) -> Result<Self, SpawnError> {
         let internal = |err: wasmtime::Error| SpawnError::Internal(format!("{err:#}"));
 
         let engine = image.engine().clone();
@@ -634,7 +648,34 @@ impl Task {
             .ok_or_else(|| SpawnError::Internal("component does not export `main`".into()))?;
 
         let signature = main.ty(&store);
-        let params = wave::parse_args(&signature, args).map_err(SpawnError::BadArguments)?;
+        // Component-typed arguments: re-mint each value in the child's exec table and
+        // bind it as an owned handle (`detach` precedent generalized to arguments).
+        let mut component_vals = std::collections::BTreeMap::new();
+        if !components.is_empty() {
+            let exec = store.data_mut().exec_provider().map_err(|_| {
+                SpawnError::BadArguments(
+                    "the program declares a component-typed parameter, but it was not                      granted the exec capability (component handles live in the exec                      provider); grant eo9:exec or restrict the parameter away"
+                        .to_string(),
+                )
+            })?;
+            let mut minted = Vec::with_capacity(components.len());
+            for (name, value) in components {
+                let size = value.save().len() as u64;
+                let rep = exec
+                    .insert_component(value, size)
+                    .map_err(|err| SpawnError::Internal(format!("{err:#}")))?;
+                minted.push((name, rep));
+            }
+            for (name, rep) in minted {
+                let resource = wasmtime::component::Resource::<crate::link::AlgComponentRes>::new_own(rep);
+                let any = resource
+                    .try_into_resource_any(&mut store)
+                    .map_err(internal)?;
+                component_vals.insert(name, Val::Resource(any));
+            }
+        }
+        let params = wave::parse_args(&signature, args, &mut component_vals)
+            .map_err(SpawnError::BadArguments)?;
         let result_ty = signature.results().next();
 
         // The long-lived drive: owns the store, runs the event loop, performs the one call

@@ -239,6 +239,17 @@ struct WitNamedArg {
     value: String,
 }
 
+/// `eo9:exec/task.component-arg`: accepted at the API so the shared WIT stays one
+/// surface, but the blob's single-child Pulley runner cannot transfer live component
+/// values into a child yet — a spawn that carries one gets a typed refusal.
+#[derive(ComponentType, Lift, Lower)]
+#[component(record)]
+#[allow(dead_code)]
+struct WitComponentArg {
+    name: String,
+    value: Resource<ComponentRes>,
+}
+
 #[derive(Clone, ComponentType, Lift, Lower)]
 #[component(record)]
 struct WitImportNeed {
@@ -1075,8 +1086,19 @@ fn add_task(linker: &mut Linker<WebState>) -> Result<()> {
     task.func_wrap(
         "spawn",
         |mut store: StoreContextMut<'_, WebState>,
-         (image, args, _limits): (Resource<ImageRes>, Vec<WitNamedArg>, WitSpawnLimits)|
+         (image, args, components, _limits): (
+            Resource<ImageRes>,
+            Vec<WitNamedArg>,
+            Vec<WitComponentArg>,
+            WitSpawnLimits,
+        )|
          -> Result<(std::result::Result<Resource<TaskRes>, WitSpawnError>,)> {
+            if !components.is_empty() {
+                return Ok((Err(WitSpawnError::Internal(
+                    "component-typed arguments are not supported in the browser blob yet                      (the in-page runner cannot transfer live component values into a                      child); native Eo9 and the bare-metal kernel support them"
+                        .to_string(),
+                )),));
+            }
             let (artifact, allow, specs) = {
                 let entry = store.data_mut().exec().image(image.rep())?;
                 (
