@@ -442,3 +442,20 @@ usermode v1 is implemented:
   data-miss, net ARP/DNS + switch, svcdemo, storedisk two-boot, check-gpu, 30 unpaced paste bursts);
   `cargo xtask firstpoll-ab --rounds 5` semantic-identity PASS; full ci. GAPS' off-by-default open is
   closed; the upstream spec conversation rides with the upstream branches.
+
+### D14. Component arguments at the spawn surface (2026-06-04, branch `area/03-component-args`)
+
+`eo9:exec/task.spawn` gains `components: list<component-arg>` (`component-arg` =
+name + owned `component`; the record-with-handle shape WIT and both runtimes already
+support). Binding: the host takes each value out of the *spawner's* exec table at the
+API boundary (ownership transfer) and re-mints it in the *child's* exec table after
+instantiation, binding the `main` parameter as an owned handle
+(`Resource::try_into_resource_any` → `Val::Resource`). Mirrored binder rules in the
+kernel (`bind_args`) and usermode (`wave::parse_args`): a component parameter refuses
+WAVE text with a teaching message, a missing one names itself, an unknown component
+argument is refused, and binding requires the child to hold exec (usermode: a typed
+spawn refusal; the kernel session surface always links exec). The blob accepts the
+parameter and refuses non-empty lists with a typed message (its single-child Pulley
+runner has no child exec table — recorded follow-up). Services (`svc`) pass no
+component arguments by construction (detach's WIT carries WAVE args only); the kernel
+service respawn path asserts the same via the shared binder.
