@@ -27,7 +27,11 @@ pub(crate) mod pci_map {
     /// ECAM (PCIe configuration space) base.
     pub(crate) const ECAM_BASE: usize = 0x3f00_0000;
     /// Buses covered by the 16 MiB low ECAM window (1 MiB per bus).
-    pub(crate) const ECAM_BUSES: u8 = if cfg!(feature = "board-opi5plus") { 0 } else { 16 };
+    pub(crate) const ECAM_BUSES: u8 = if cfg!(feature = "board-opi5plus") {
+        0
+    } else {
+        16
+    };
     /// 32-bit PCIe MMIO window: where unassigned memory BARs get placed.
     pub(crate) const MMIO_BASE: usize = 0x1000_0000;
     pub(crate) const MMIO_END: usize = 0x3eff_0000;

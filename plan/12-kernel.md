@@ -1905,3 +1905,41 @@ Board-only residue for bring-up day: first serial output through the DW layer, t
 on real silicon, SMC SYSTEM_OFF, booti's relocation behavior on the vendor 2017.09
 U-Boot (fallback `go 0x00200000` documented). QEMU regression: demo canonical + gicv3
 demo + paste burst re-run green on this branch (the board feature off).
+
+## Entry 77 — board loop-safety: exit-is-reset, panic marker, the hardware watchdog (2026-06-04)
+
+The autonomous UART dev loop runs unattended — every kernel outcome must land back at the
+U-Boot prompt. Three `board-opi5plus`-gated changes (QEMU byte-for-behavior unchanged,
+canonical v2 + gicv3 demos re-verified; the standard kernel binary carries none of the new
+strings):
+
+* **Exit = reset** (src/arch/aarch64/power.rs): the end-of-run PSCI call is
+  `SYSTEM_RESET` (0x8400_0009) on the board, `SYSTEM_OFF` on QEMU — one
+  `PSCI_END_OF_RUN` id, cfg-selected; `OFF_REQUEST` names the truth per profile. The
+  board arm drains the UART transmit path (new `uart::tx_drain`, bounded spin on DW LSR
+  TEMT) before the SMC so the outcome line survives the reset.
+* **Panic = print + reset** (src/panic.rs): the report gains a grep-stable `EO9-PANIC`
+  marker line on the board profile (loop drivers classify the boot), then flows into the
+  same drained SYSTEM_RESET via `system_off()`. QEMU panic text is untouched.
+* **The watchdog** (src/wdt.rs, new): RK3588 DW-WDT (`wdt@feaf0000`, rk3588s.dtsi;
+  driven per Linux dw_wdt.c) armed at boot — TORR TOP=13 (≈22.4 s at the 24 MHz
+  `tclk_wdt0`, gated from xin24m per clk-rk3588.c), response mode 0 (direct SoC reset),
+  CRR `0x76` pats. Patted from `idle_wait` (every idle wake) and both busy-pass branches
+  of the shell/init drive loops, so neither a hot nor a parked kernel starves it; a hang
+  → reset → U-Boot in ≤ ~22 s. Doctrine note: a dead-man's switch, not a progress
+  backstop — it never makes anything advance (SPEC "liveness is event-driven").
+  Arming is best-effort with loud verification (enable readback + live counter): if
+  firmware left the WDT clock gated we print `wdt: arm FAILED` and boot on rather than
+  blind-poking CRU gates (write-mask-high; the ungate is a bench follow-up if the live
+  board needs it). Mainline evidence that no CRU glue is required: rk3588 dts carries no
+  reset-mode property and dw_wdt.c does nothing CRU-side — the WDT→global-reset routing
+  is SoC/firmware default. Live validation (deliberate starve → observe reboot) is the
+  planner's first on-board test.
+
+Both images rebuilt: `eo9-opi5plus-min.img` 12,976,896 B / `eo9-opi5plus.img`
+50,135,120 B, each carrying exactly one `EO9-PANIC` / `wdt: armed` /
+`SYSTEM_RESET (back to U-Boot)` string; the QEMU kernel carries zero. Known flake while
+gating: `svc_shell::restart_cycles_complete_while_the_foreground_is_quietly_blocked`
+fails under heavy parallel host load on the UNMODIFIED base tree too (2/3 base-tree
+failures at load ≈ 17 with a concurrent agent's QEMU battery; 8/8 green in a quiet
+window) — the wall-time pacing class, not this branch.

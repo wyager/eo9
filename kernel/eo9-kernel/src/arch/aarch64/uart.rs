@@ -131,6 +131,8 @@ mod hw {
     const DW_LSR_DR: u32 = 1 << 0;
     /// LSR: transmit holding register empty.
     const DW_LSR_THRE: u32 = 1 << 5;
+    /// LSR: transmitter empty (FIFO *and* shift register — everything is on the wire).
+    const DW_LSR_TEMT: u32 = 1 << 6;
 
     fn mmio_read(offset: usize) -> u32 {
         // SAFETY: `UART_BASE + offset` is a valid DW-APB UART register on the RK3588;
@@ -176,6 +178,25 @@ mod hw {
     /// exactly as U-Boot programmed it.
     #[allow(dead_code)]
     pub(super) fn line_init() {}
+
+    /// Everything transmitted is on the wire (FIFO and shift register both empty).
+    pub(super) fn tx_idle() -> bool {
+        mmio_read(DW_LSR) & DW_LSR_TEMT != 0
+    }
+}
+
+/// Block (bounded) until the transmit path is fully drained — FIFO and shift register —
+/// so output already printed survives an imminent PSCI SYSTEM_RESET. At 1.5 Mbaud a full
+/// 16-byte FIFO takes ~107 µs; the bound (~50 M spins) is pure paranoia against a wedged
+/// transmitter, in which case losing the tail beats hanging the reset.
+#[cfg(feature = "board-opi5plus")]
+pub fn tx_drain() {
+    for _ in 0..50_000_000u32 {
+        if hw::tx_idle() {
+            return;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// Write one byte, spinning while the transmitter is busy.

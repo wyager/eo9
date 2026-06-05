@@ -35,6 +35,11 @@ mod heap;
 mod mmio;
 #[cfg(target_os = "none")]
 mod panic;
+// The board profile's hang backstop (a hardware dead-man's switch, not a progress
+// backstop — SPEC "liveness is event-driven"): no-op stubs everywhere except
+// `board-opi5plus` on aarch64, where it arms the RK3588 DW-WDT.
+#[cfg(target_os = "none")]
+mod wdt;
 // Raw ECAM/PCIe support; only the wasm `eo9:pci` root provider drives it, so it is gated
 // with the store/runner feature to keep the featureless CI build lean.
 #[cfg(all(target_os = "none", feature = "wasm-store"))]
@@ -90,6 +95,10 @@ extern "C" fn kmain(dtb: *const u8) -> ! {
     // executor can idle in a low-power wait — woken by a sleep deadline or by a keystroke —
     // instead of busy-polling (see each architecture's `interrupts_init`).
     arch::interrupts_init();
+
+    // Board profile only: arm the hardware watchdog so a hung kernel resets back to U-Boot
+    // instead of stranding the unattended dev loop (no-op on QEMU).
+    wdt::arm_and_report();
 
     // The kernel command line (QEMU -append) selects what to run: `program=<name>` runs a
     // store entry headless, `demo` runs the original demo sequence below, and nothing at
