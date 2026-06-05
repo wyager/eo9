@@ -8,5 +8,7 @@ world echo {
     variant program-failure {
         io(string),
     }
-    export main: func(text: string) -> result<program-success, program-failure>;
+    /// The words to print, joined by single spaces (the variadic tail: `echo hello world`).
+    /// The named-flag spelling `echo --text hi` still binds the one-element list.
+    export main: func(text: list<string>) -> result<program-success, program-failure>;
 }

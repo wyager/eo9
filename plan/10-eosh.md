@@ -363,3 +363,59 @@ vs `--name b` rebuilds — argument-stripped image sharing via cached arg-specs 
 follow-up); fs-importing programs invalidate even when composed behind a read-only
 attenuation (the import name is all eosh can see); a future `eo9:fs` content-hash stat
 (the wit TODO at fs.wit:4) would turn the global bump into precise revalidation.
+
+## D22 — variadic echo (2026-06-04, owner request)
+
+`echo hello world` now works: echo's `main` takes the variadic tail
+(`text: list<string>`, the cat precedent), words joined by single spaces, trailing
+newline as before; a bare `echo` prints the empty line. The legacy `--text hi`
+spelling keeps working **for free** because the parameter kept its name: a single
+token bound by name to a `list<string>` parameter is the one-element list (the
+named-flag spelling of the variadic tail, wave.rs). Choice recorded: keep the legacy
+form (it costs nothing and every existing init config / harness line keeps running);
+the visible examples (README, verify-eosh, the cli test) show the variadic form, and
+the cli test pins all three shapes (variadic, legacy, bare). (D21 is the in-flight
+resolve-cache record on area/10-resolve-cache.)
+
+## D23 — `time` is NOT a builtin (2026-06-04, owner overruled)
+
+The owner asked for a way to time program execution. The planner's draft made it a
+shell builtin (`time <expr>`) on the reasoning that execution lifecycle belongs to the
+executor; the owner OVERRULED: `time` must be expressible as a **standard component**,
+like `/usr/bin/time` on Linux — a guest program that holds a granted exec capability,
+takes the program-to-run as a component-typed argument, runs it, and reports the
+timing in its own typed outcome. Nothing was built in this lane; the work needs
+component-typed shell arguments (the `push_arg` refusal
+`ComponentArgumentUnsupported` is the current wall) plus a `time` guest program, and
+dispatches as its own lane after this one merges (it shares the eosh grammar files).
+
+## D24 — up/down arrow history at the eosh prompt (2026-06-04, owner request)
+
+Architecture chosen: **host-side editing** (option (a)) — each host's read-line already
+owns echo and line assembly, and usermode already had the full editor
+(`crates/eo9/src/editor.rs`: CSI parsing, recall, completion), so the kernel and the
+browser were brought up to parity rather than inventing a raw-key WIT surface. No WIT
+change; eosh and every read-line consumer are untouched (scripted/piped input carries
+no ESC bytes, so non-interactive behavior is byte-identical).
+
+- **Kernel** (`wasm/providers.rs` ReadLine): an ESC/CSI state machine consumes escape
+  sequences (they no longer leak `[A` garbage into the line); CSI `A`/`B` recall
+  through a 32-entry per-boot ring (`READ_HISTORY`, KLock) pushed on every submitted
+  line (trimmed non-empty, no immediate dupes); the recalled line is editable — any
+  edit commits it as the fresh line (recall position and stash reset; the bash-style
+  per-entry edit buffer is deliberately out of scope); ↓ past the newest restores the
+  stashed in-progress line; erase-and-reprint uses the established `\b \b` idiom (all
+  line bytes are printable ASCII, one column each). Left/Right/Home/End/Delete are
+  consumed and ignored — v1 has no mid-line cursor; recorded follow-up.
+- **Browser** (`vm.js`): `termHistory` + ArrowUp/ArrowDown over the live line with the
+  same stash/commit-on-edit semantics; `verify-render.mjs` gained recall assertions
+  (recall echo on the live line, rerun, stash restore, and the prompt-count invariant
+  proving browsing never mints prompt lines).
+- **History split recorded**: this is the line discipline's recall (what was typed at
+  that console), not the shell's `history` builtin (what the session executed) — the
+  same split as a host terminal vs. a shell history file. One console, one input
+  history; lines read by programs through the same console share the ring (v1, noted).
+
+Verified: aarch64 12/12 (recall, edit, stash, CSI-consumption, 10/10 unpaced paste
+bursts, Ctrl-C); riscv64 + x86_64 arrow smokes PASS (same shared code path, 16550
+consoles); browser render harness 9/9 incl. the new recall checks; full ci green.

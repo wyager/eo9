@@ -1834,15 +1834,27 @@ fn coreutils_take_several_positional_paths() {
 
 #[test]
 fn echo_needs_no_filesystem() {
-    // echo imports only eo9:text, so it runs with no fs grant at all.
+    // echo imports only eo9:text, so it runs with no fs grant at all. It takes the
+    // variadic tail (words joined by single spaces) ...
     let store = temp_store("coreutils-echo");
-    let run = eo9(&store, &["-c", "echo --text hello-coreutils"]);
+    let run = eo9(&store, &["-c", "echo hello coreutils world"]);
     assert_eq!(run.code, 0, "stderr: {}", run.stderr);
     assert!(
-        run.stdout.contains("hello-coreutils"),
+        run.stdout.contains("hello coreutils world"),
         "echo output: {}",
         run.stdout
     );
+    // ... and the legacy named-flag spelling still binds the one-element list.
+    let legacy = eo9(&store, &["-c", "echo --text hello-coreutils"]);
+    assert_eq!(legacy.code, 0, "stderr: {}", legacy.stderr);
+    assert!(
+        legacy.stdout.contains("hello-coreutils"),
+        "echo legacy output: {}",
+        legacy.stdout
+    );
+    // A bare `echo` is the empty line, not an error.
+    let bare = eo9(&store, &["-c", "echo"]);
+    assert_eq!(bare.code, 0, "stderr: {}", bare.stderr);
 }
 
 #[test]

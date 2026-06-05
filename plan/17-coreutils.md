@@ -21,7 +21,7 @@ Tools and their capabilities (imports):
 | rm    | `--path`                     | eo9:fs                 | `removed` |
 | cp    | `--src --dst`                | eo9:fs                 | `copied(bytes)` |
 | touch | `--path`                     | eo9:fs                 | `touched` |
-| echo  | `--text`                     | eo9:text (no fs)       | `done` |
+| echo  | `<word>…` (variadic tail; legacy `--text` still binds) | eo9:text (no fs) | `done` |
 | rng   | `--count`                    | eo9:entropy, eo9:text  | `generated(count)` |
 
 `rng` exists specifically to give a real entropy-consuming program: `entropy.seeded --seed N

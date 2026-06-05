@@ -100,9 +100,53 @@ function renderLiveLine() {
   output.scrollTop = output.scrollHeight;
 }
 
+// Up/Down-arrow recall: lines previously submitted at this terminal (the page's input
+// history — the same split as the kernel console: the line discipline's recall, not the
+// shell's `history` builtin). Editing a recalled line commits it as the fresh line.
+const termHistory = [];
+let termHistoryPos = null; // null = typing a fresh line; otherwise an index into termHistory
+let termStash = "";
+
+function termRecallStep(back) {
+  if (termHistory.length === 0) return;
+  if (back) {
+    if (termHistoryPos === null) {
+      termStash = liveBuffer;
+      termHistoryPos = termHistory.length - 1;
+    } else if (termHistoryPos > 0) {
+      termHistoryPos -= 1;
+    } else {
+      return; // at the oldest entry: stay
+    }
+    liveBuffer = termHistory[termHistoryPos];
+  } else {
+    if (termHistoryPos === null) return;
+    termHistoryPos += 1;
+    if (termHistoryPos >= termHistory.length) {
+      termHistoryPos = null;
+      liveBuffer = termStash;
+      termStash = "";
+    } else {
+      liveBuffer = termHistory[termHistoryPos];
+    }
+  }
+  renderLiveLine();
+}
+
+function termCommitRecall() {
+  termHistoryPos = null;
+  termStash = "";
+}
+
 function submitTerminalLine() {
   if (pendingReadLine === null) return;
   const line = liveBuffer;
+  const trimmed = line.trim();
+  if (trimmed !== "" && termHistory[termHistory.length - 1] !== trimmed) {
+    termHistory.push(trimmed);
+  }
+  termHistoryPos = null;
+  termStash = "";
   // Freeze the typed command where it is (on the prompt line) and drop the cursor.
   if (liveText !== null) liveText.textContent = line;
   if (liveCursor !== null) liveCursor.remove();
@@ -140,12 +184,20 @@ document.addEventListener("keydown", (event) => {
   if (inFormField) return;
   if (pendingReadLine !== null) {
     if (event.key.length === 1) {
+      termCommitRecall();
       liveBuffer += event.key;
       renderLiveLine();
       event.preventDefault();
     } else if (event.key === "Backspace") {
+      termCommitRecall();
       liveBuffer = liveBuffer.slice(0, -1);
       renderLiveLine();
+      event.preventDefault();
+    } else if (event.key === "ArrowUp") {
+      termRecallStep(true);
+      event.preventDefault();
+    } else if (event.key === "ArrowDown") {
+      termRecallStep(false);
       event.preventDefault();
     } else if (event.key === "Enter") {
       event.preventDefault();

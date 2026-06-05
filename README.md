@@ -50,7 +50,7 @@ eo9 hello --name world --excited true
 eo9 cruncher --seed 9 --rounds 200000
 #> success(digest(14341732361190694547))
 
-eo9 echo --text "hello pipes" | tr a-z A-Z
+eo9 echo hello pipes | tr a-z A-Z
 #> HELLO PIPES                                # only the program's bytes go through the pipe
 ```
 

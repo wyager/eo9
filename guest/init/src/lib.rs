@@ -340,6 +340,18 @@ fn encode_for_type(ty: &str, value: &str) -> String {
         }
         return format!("some({})", encode_for_type(inner.trim(), value));
     }
+    // A single token for a `list<string>` parameter is the one-element list -- the
+    // named-flag spelling of the variadic tail (`echo --text hi`), same rule as the
+    // shell (eosh-core wave.rs). A bracketed value passes through as written.
+    if ty
+        .strip_prefix("list<")
+        .and_then(|t| t.strip_suffix(">"))
+        .map(str::trim)
+        == Some("string")
+        && !value.trim_start().starts_with('[')
+    {
+        return format!("[{}]", wave_string(value));
+    }
     value.to_string()
 }
 
