@@ -419,3 +419,36 @@ no ESC bytes, so non-interactive behavior is byte-identical).
 Verified: aarch64 12/12 (recall, edit, stash, CSI-consumption, 10/10 unpaced paste
 bursts, Ctrl-C); riscv64 + x86_64 arrow smokes PASS (same shared code path, 16550
 consoles); browser render harness 9/9 incl. the new recall checks; full ci green.
+
+## D25 — `time` as a standard component + the exec grant posture (2026-06-04)
+
+The lane D23 deferred to: `time` is `eo9-example-time` (store name `time`), the
+smallest executor — imports text + time + exec (component-algebra, compile, task),
+takes the program as a component-typed `main` argument (`time hello`,
+`time (gpu.virtio $ draw)`), reports `compile X.XXXs  real Y.YYYs` (the phases align
+with the kernel's codegen announcements), and forwards the child's outcome
+(`ok: timed("greeted")`; a failing child forwards as `child-failed`). The measuring
+instrument is a capability: `time.frozen … $ time hello` honestly reports
+`compile 0.000s  real 0.000s` (test-pinned in the CLI suite) while the child still
+runs against the executor-granted session clock. The component argument passes
+*as evaluated* — the session's `&`-granted environment composes onto the top-level
+program (`time`), never implicitly onto the argument (the detach rule: as composed,
+never more).
+
+**The grant posture (recorded honestly):** the directive sketched "exec is NOT in
+default grants — pin that a default child cannot exec", but the implemented and
+documented project reality since the layered-session change (plan/11 D14–15) is the
+opposite: session children inherit the full environment *including* exec ("a nested
+eosh is a full peer"), in both executors, with `only` as the restriction tool. This
+lane follows the implemented precedent rather than silently flipping a settled
+posture: `time hello` works at any session prompt because exec flows to children by
+default; `only eo9:text,eo9:time $ time hello` is the pinned refusal showing the
+restriction tool works (it names the missing exec interfaces at compose time). If the
+owner wants exec demoted to an explicit grant (the svc generation-count pattern),
+that is a separate, deliberate change with its own migration story — flagged, not
+made.
+
+Shell precedence pin: `time.frozen $ hello` stays a composition (dotted words are
+names); `time hello` is an invocation filling the component parameter positionally.
+`describe time` renders the component card with `--prog: component` (no API-card
+involvement — `time` has no colon).

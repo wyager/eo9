@@ -1,0 +1,7 @@
+# Default to the bare-metal target; the linker script places the stub at 0x0400_0000.
+# Host-side protocol tests override with `cargo test --target <host-triple>`.
+[build]
+target = "aarch64-unknown-none"
+
+[target.aarch64-unknown-none]
+rustflags = ["-C", "link-arg=-Tlink.ld", "-C", "relocation-model=static"]

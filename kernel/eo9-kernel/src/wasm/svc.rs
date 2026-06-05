@@ -471,7 +471,10 @@ fn spawn_service_run(
             value: value.clone(),
         })
         .collect();
-    let params = shellexec::bind_args(&signature, &wit_args)?;
+    // Services carry no component-typed arguments (detach's WIT passes WAVE args only);
+    // a service whose `main` declares one is refused here with the binder's own message.
+    let mut no_components = alloc::collections::BTreeMap::new();
+    let params = shellexec::bind_args(&signature, &wit_args, &mut no_components)?;
     let result_ty = signature.results().next();
 
     Ok(Box::pin(async move {

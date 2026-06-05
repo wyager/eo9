@@ -191,8 +191,21 @@ interface compile {
 interface task {
     use args.{named-arg};
     use images.{image};
+    use component-algebra.{component};
 
     resource task;
+
+    /// One component-typed `main` argument: the program value bound to the parameter
+    /// named `name`. Data-typed arguments travel as WAVE text (`named-arg`); a component
+    /// cannot be text — it is passed as an owned handle, transferred into the child at
+    /// spawn (the `detach` handle-passing precedent generalized to arguments; see SPEC
+    /// "Arguments and outcomes"). The child receives it through its own imported
+    /// component-algebra surface, exactly as if it had `load`ed it — except no bytes
+    /// round-trip: composition provenance survives.
+    record component-arg {
+        name: string,
+        value: component,
+    }
 
     /// A WAVE-encoded value carrying its WIT type text, so an outcome can outlive its component.
     record wave-value {
@@ -230,9 +243,12 @@ interface task {
         internal(string),
     }
 
-    /// `args` are main's named, typed arguments, WAVE-encoded and checked against main's signature.
-    /// The image is only borrowed: one cached image can be spawned any number of times.
-    spawn: func(i: borrow<image>, args: list<named-arg>, limits: spawn-limits) -> result<task, spawn-error>;
+    /// `args` are main's named, typed arguments, WAVE-encoded and checked against main's signature;
+    /// `components` are its component-typed arguments, one per component-typed parameter (each
+    /// required — a component parameter has no `none`). The image is only borrowed: one cached
+    /// image can be spawned any number of times (component arguments, being owned values, are
+    /// consumed by the spawn that binds them).
+    spawn: func(i: borrow<image>, args: list<named-arg>, components: list<component-arg>, limits: spawn-limits) -> result<task, spawn-error>;
 
     variant resume-outcome {
         out-of-fuel,

@@ -475,7 +475,7 @@ impl Guest for Init {
             // console contract; a console with no arguments works too (none are passed
             // beyond what its signature declares as optional).
             let limits = task::SpawnLimits { max_memory: None };
-            let console_task = task::spawn(&image, &[], limits).map_err(|err| {
+            let console_task = task::spawn(&image, &[], Vec::new(), limits).map_err(|err| {
                 ProgramFailure::ConsoleFailed(format!("spawning the console failed: {err:?}"))
             })?;
             console_runs += 1;

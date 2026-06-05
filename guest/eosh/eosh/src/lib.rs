@@ -408,6 +408,7 @@ impl Backend for WitBackend {
         &mut self,
         image: &Self::Image,
         args: &[eosh_core::NamedArg],
+        components: Vec<eosh_core::backend::ComponentArg<Self::Component>>,
     ) -> Result<Self::Task, BackendError> {
         let args: Vec<task::NamedArg> = args
             .iter()
@@ -417,7 +418,14 @@ impl Backend for WitBackend {
             })
             .collect();
         let limits = task::SpawnLimits { max_memory: None };
-        task::spawn(image, &args, limits).map_err(spawn_error)
+        let components: Vec<task::ComponentArg> = components
+            .into_iter()
+            .map(|arg| task::ComponentArg {
+                name: arg.name,
+                value: arg.value,
+            })
+            .collect();
+        task::spawn(image, &args, components, limits).map_err(spawn_error)
     }
 
     async fn wait(&mut self, task: Self::Task) -> Outcome {

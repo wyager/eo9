@@ -1,0 +1,26 @@
+# The Orange Pi 5 Plus serial-loader stub (plan/12: the autonomous board dev loop).
+#
+# A ≤4 KiB flat binary, typed into RAM once via the vendor U-Boot's `mm.l` and then
+# launched with `go 0x04000000` — NEVER vendor `booti`, which data-aborts inside
+# U-Boot on this image (2026-06-04 incident; .claude/board-bringup/BOOT.md).
+# It then receives kernel images over the 1.5 Mbaud UART2 debug line — header,
+# payload, CRC — and jumps to them, replacing every stick-shuffle with an ~85 s serial
+# transfer. See tools/ for the Mac-side bootstrap and sender scripts.
+#
+# This is its own workspace (the firstpoll-ab precedent): it must never enter the root
+# workspace build — it only compiles for aarch64-unknown-none via .cargo/config.toml,
+# while its lib half (protocol constants + CRC) stays host-testable with `cargo test
+# --target <host>`.
+[package]
+name = "opi5-serial-loader"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

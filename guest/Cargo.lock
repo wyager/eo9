@@ -328,6 +328,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-example-time"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-example-vnic4check"
 version = "0.0.0"
 dependencies = [

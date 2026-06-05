@@ -146,6 +146,16 @@ pub(super) struct WitNamedArg {
     pub(super) value: String,
 }
 
+/// `eo9:exec/task.component-arg`: one component-typed `main` argument. The handle is the
+/// spawner's; the host takes the underlying component value out of the spawner's table
+/// and re-mints it in the child's (ownership transfer — the detach precedent).
+#[derive(ComponentType, Lift, Lower)]
+#[component(record)]
+pub(super) struct WitComponentArg {
+    pub(super) name: String,
+    pub(super) value: Resource<AlgComponentRes>,
+}
+
 #[derive(Clone, ComponentType, Lift, Lower)]
 #[component(variant)]
 #[allow(dead_code)]
@@ -664,7 +674,7 @@ fn try_preemption_demo(entries: &'static [super::store::StoreEntry]) -> Result<(
                 value: format!("{rounds}"),
             },
         ];
-        spawn_child(&engine, entries, &component, &args, None, 0).map_err(|err| {
+        spawn_child(&engine, entries, &component, &args, Vec::new(), None, 0).map_err(|err| {
             wasmtime::Error::msg(match err {
                 WitSpawnError::BadArguments(msg) => format!("spawn failed (bad arguments): {msg}"),
                 WitSpawnError::Internal(msg) => format!("spawn failed: {msg}"),
@@ -762,6 +772,7 @@ fn try_preemption_demo(entries: &'static [super::store::StoreEntry]) -> Result<(
 pub(super) fn bind_args(
     signature: &wasmtime::component::types::ComponentFunc,
     args: &[WitNamedArg],
+    component_vals: &mut alloc::collections::BTreeMap<String, Val>,
 ) -> Result<Vec<Val>, String> {
     let params: Vec<(String, Type)> = signature
         .params()
@@ -772,8 +783,33 @@ pub(super) fn bind_args(
             return Err(format!("unknown argument `{}`", arg.name));
         }
     }
+    for name in component_vals.keys() {
+        if !params.iter().any(|(param, _)| param == name) {
+            return Err(format!("unknown component argument `{name}`"));
+        }
+    }
     let mut vals = Vec::with_capacity(params.len());
     for (index, (name, ty)) in params.iter().enumerate() {
+        // A component-typed parameter binds from the spawn's component arguments — an
+        // owned handle minted in the child, never WAVE text.
+        if matches!(ty, Type::Own(_)) {
+            if args.iter().any(|arg| arg.name == *name) {
+                return Err(format!(
+                    "parameter `{name}` is component-typed; it takes a program value, not text"
+                ));
+            }
+            match component_vals.remove(name) {
+                Some(val) => {
+                    vals.push(val);
+                    continue;
+                }
+                None => {
+                    return Err(format!(
+                        "missing component argument `{name}` (pass a program expression)"
+                    ));
+                }
+            }
+        }
         let matching: Vec<&WitNamedArg> = args.iter().filter(|arg| arg.name == *name).collect();
         let arg = match matching.as_slice() {
             // Variadic tail: a missing final `list<…>` parameter is the empty list, so
@@ -855,6 +891,7 @@ fn spawn_child(
     entries: &'static [super::store::StoreEntry],
     component: &Component,
     args: &[WitNamedArg],
+    components: Vec<(String, KComponent)>,
     max_memory: Option<u64>,
     svc_generations: u32,
 ) -> Result<u32, WitSpawnError> {
@@ -1033,7 +1070,24 @@ fn spawn_child(
         .get_func(&mut store, "main")
         .ok_or_else(|| WitSpawnError::Internal("component does not export `main`".to_string()))?;
     let signature = main.ty(&store);
-    let params = bind_args(&signature, args).map_err(WitSpawnError::BadArguments)?;
+    // Component-typed arguments: each value transfers into the *child's* exec table and
+    // binds as an owned handle of the child's imported component-algebra resource — the
+    // child receives a live component value, provenance intact, never bytes.
+    let mut component_vals = alloc::collections::BTreeMap::new();
+    for (name, value) in components {
+        let rep = store
+            .data_mut()
+            .shell_exec()
+            .map_err(internal)?
+            .insert_component(value);
+        let resource = Resource::<AlgComponentRes>::new_own(rep);
+        let any = resource
+            .try_into_resource_any(&mut store)
+            .map_err(internal)?;
+        component_vals.insert(name, Val::Resource(any));
+    }
+    let params =
+        bind_args(&signature, args, &mut component_vals).map_err(WitSpawnError::BadArguments)?;
     let result_ty = signature.results().next();
 
     // The drive future owns the child's store and performs the one call to `main`.
@@ -2325,7 +2379,12 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
     task.func_wrap(
         "spawn",
         |mut store: StoreContextMut<'_, KernelState>,
-         (image, args, limits): (Resource<ExecImageRes>, Vec<WitNamedArg>, WitSpawnLimits)|
+         (image, args, components, limits): (
+            Resource<ExecImageRes>,
+            Vec<WitNamedArg>,
+            Vec<WitComponentArg>,
+            WitSpawnLimits,
+        )|
          -> Result<(Result<Resource<ChildTaskRes>, WitSpawnError>,)> {
             let engine = store.data_mut().shell_engine()?;
             let entries = store.data_mut().shell_entries()?;
@@ -2334,12 +2393,24 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                 let exec = store.data_mut().shell_exec()?;
                 exec.image(image.rep())?.component.clone()
             };
+            // Take each component argument out of the *spawner's* table now (ownership
+            // transfer at the API boundary); they are re-minted in the child by
+            // `spawn_child`.
+            let mut component_args = Vec::with_capacity(components.len());
+            {
+                let exec = store.data_mut().shell_exec()?;
+                for arg in components {
+                    let value = exec.take_component(arg.value.rep())?;
+                    component_args.push((arg.name, value));
+                }
+            }
             Ok((
                 match spawn_child(
                     &engine,
                     entries,
                     &component,
                     &args,
+                    component_args,
                     limits.max_memory,
                     child_generations,
                 ) {
