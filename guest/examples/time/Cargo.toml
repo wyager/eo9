@@ -1,0 +1,15 @@
+[package]
+name = "eo9-example-time"
+description = "Eo9 example program: run another program and report how long it took — a standard component, not a builtin (targets the eo9-examples:time/time world: text + time + the exec capability, with a component-typed main argument)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

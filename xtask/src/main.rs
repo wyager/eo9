@@ -26,6 +26,9 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-vnic4check",
     "eo9-example-bridgecheck",
     "eo9-example-cancelcheck",
+    // The smallest executor: runs another program (a component-typed main argument)
+    // and reports how long it took (plan/03 component arguments).
+    "eo9-example-time",
     "eosh",
     // The service-boot program (executor v1, docs/design/executor-model.md).
     "init",
@@ -145,6 +148,8 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-stub-restart-always", "restart.always"),
     ("eo9-stub-restart-backoff", "restart.backoff"),
     ("eo9-example-hello", "hello"),
+    // `time <prog>`: the component-argument demo and the smallest executor.
+    ("eo9-example-time", "time"),
     ("eo9-example-outcomes", "outcomes"),
     ("eo9-example-cruncher", "cruncher"),
     ("eo9-example-readwrite", "readwrite"),

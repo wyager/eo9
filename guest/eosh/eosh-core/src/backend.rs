@@ -71,6 +71,16 @@ pub struct NamedArg {
     pub value: String,
 }
 
+/// One component-typed `main` argument: the program value bound to the parameter named
+/// `name`. Data-typed arguments are WAVE text ([`NamedArg`]); a component cannot be text
+/// — it rides as a live component value and transfers into the child at spawn (the
+/// `detach` handle-passing precedent generalized to arguments).
+#[derive(Debug)]
+pub struct ComponentArg<C> {
+    pub name: String,
+    pub value: C,
+}
+
 /// A WAVE-encoded value carrying its WIT type text (mirrors `wave-value`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaveValue {
@@ -226,9 +236,16 @@ pub trait Backend {
     /// Compile a closed binary to an image.
     fn compile(&mut self, component: Self::Component) -> Result<Self::Image, BackendError>;
 
-    /// Spawn a task from an image with WAVE-encoded `main` arguments.
-    fn spawn(&mut self, image: &Self::Image, args: &[NamedArg])
-    -> Result<Self::Task, BackendError>;
+    /// Spawn a task from an image with WAVE-encoded `main` arguments plus any
+    /// component-typed ones (owned program values, consumed by the spawn that binds
+    /// them — which is why the cached-image fast path never applies to lines that
+    /// carry them).
+    fn spawn(
+        &mut self,
+        image: &Self::Image,
+        args: &[NamedArg],
+        components: Vec<ComponentArg<Self::Component>>,
+    ) -> Result<Self::Task, BackendError>;
 
     /// Wait for a task to finish and return its outcome.
     async fn wait(&mut self, task: Self::Task) -> Outcome;

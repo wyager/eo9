@@ -23,7 +23,9 @@ use core::future::Future;
 use core::pin::Pin;
 
 use crate::ast::{Arg, ArgValue, Expr, WithBinding};
-use crate::backend::{ArgSpec, Backend, BackendError, ComponentKind, InterfaceRef, NamedArg};
+use crate::backend::{
+    ArgSpec, Backend, BackendError, ComponentArg, ComponentKind, InterfaceRef, NamedArg,
+};
 use crate::wave;
 
 /// The result of evaluating an expression: an open component value, plus any `main`
@@ -34,6 +36,10 @@ use crate::wave;
 pub struct EvalOutput<C> {
     pub component: C,
     pub args: Vec<NamedArg>,
+    /// Component-typed `main` arguments applied along the way: live program values that
+    /// ride to the top level and transfer into the child at spawn. Like `args` they are
+    /// invocation data and never affect composition.
+    pub components: Vec<ComponentArg<C>>,
 }
 
 /// An evaluation error, rendered for the user by its `Display` impl.
@@ -52,8 +58,16 @@ pub enum EvalError {
     MissingArgument { name: String, ty: String },
     /// A data-typed parameter was given a parenthesized program expression.
     ExpressionForDataParameter { name: String, ty: String },
-    /// A component-typed parameter: understood, but not yet supported end to end.
-    ComponentArgumentUnsupported { name: String },
+    /// A component-typed parameter was given quoted text (it takes a program name or a
+    /// parenthesized expression).
+    ComponentArgumentText { name: String },
+    /// A component argument expression carried `main` arguments of its own (the
+    /// receiving program decides its child's arguments; compose-time configuration is
+    /// fine, run-time arguments are not).
+    ComponentArgumentWithArgs { name: String },
+    /// A provider declared a component-typed `configure` parameter (configuration is
+    /// constant WAVE data; program values cannot be baked at compose time).
+    ComponentArgumentForConfigure { name: String },
     /// Arguments are not allowed in this position (e.g. on an `&` operand).
     ArgumentsNotAllowed { context: &'static str },
     /// An `&` operand is a program (binary), not a provider. Names the offending side
@@ -111,10 +125,21 @@ impl fmt::Display for EvalError {
                 f,
                 "parameter `{name}` is {ty}-typed and takes literal text, not a program expression"
             ),
-            EvalError::ComponentArgumentUnsupported { name } => write!(
+            EvalError::ComponentArgumentText { name } => write!(
                 f,
-                "parameter `{name}` is component-typed; passing programs as arguments is not \
-                 supported yet (the task API takes only WAVE-encoded data arguments)"
+                "parameter `{name}` is component-typed; it takes a program name or a \
+                 parenthesized expression, not quoted text"
+            ),
+            EvalError::ComponentArgumentWithArgs { name } => write!(
+                f,
+                "the expression for component parameter `{name}` carries `main` arguments, \
+                 which would be dropped: the receiving program decides its child's \
+                 arguments (compose-time `configure` flags are fine)"
+            ),
+            EvalError::ComponentArgumentForConfigure { name } => write!(
+                f,
+                "configure parameter `{name}` is component-typed; configuration is constant \
+                 data, so program values cannot be baked at compose time"
             ),
             EvalError::ArgumentsNotAllowed { context } => {
                 write!(f, "arguments cannot be applied to {context}")
@@ -206,6 +231,7 @@ impl<'a, B: Backend> Evaluator<'a, B> {
                 Ok(EvalOutput {
                     component,
                     args: Vec::new(),
+                    components: Vec::new(),
                 })
             }
             Expr::App { callee, args } => self.eval_app(callee, args).await,
@@ -218,6 +244,7 @@ impl<'a, B: Backend> Evaluator<'a, B> {
                 Ok(EvalOutput {
                     component,
                     args: consumer.args,
+                    components: consumer.components,
                 })
             }
             Expr::Extend { base, layer } => {
@@ -247,7 +274,11 @@ impl<'a, B: Backend> Evaluator<'a, B> {
                 // Both operands are providers, whose arguments (if any) were consumed as
                 // compose-time configuration — so leftover run-time arguments cannot
                 // occur here. Keep the guard for the impossible case.
-                if !base_out.args.is_empty() || !layer_out.args.is_empty() {
+                if !base_out.args.is_empty()
+                    || !layer_out.args.is_empty()
+                    || !base_out.components.is_empty()
+                    || !layer_out.components.is_empty()
+                {
                     return Err(EvalError::ArgumentsNotAllowed {
                         context: "an `&` operand",
                     });
@@ -258,6 +289,7 @@ impl<'a, B: Backend> Evaluator<'a, B> {
                 Ok(EvalOutput {
                     component,
                     args: Vec::new(),
+                    components: Vec::new(),
                 })
             }
             Expr::Only { allow, body } => {
@@ -270,6 +302,7 @@ impl<'a, B: Backend> Evaluator<'a, B> {
                 Ok(EvalOutput {
                     component,
                     args: body.args,
+                    components: body.components,
                 })
             }
             Expr::Rename { from, to, body } => {
@@ -278,6 +311,7 @@ impl<'a, B: Backend> Evaluator<'a, B> {
                 Ok(EvalOutput {
                     component,
                     args: body.args,
+                    components: body.components,
                 })
             }
             Expr::With { bindings, body } => {
@@ -293,6 +327,7 @@ impl<'a, B: Backend> Evaluator<'a, B> {
                 Ok(EvalOutput {
                     component,
                     args: body.args,
+                    components: body.components,
                 })
             }
         }
@@ -306,7 +341,7 @@ impl<'a, B: Backend> Evaluator<'a, B> {
         context: &'static str,
     ) -> Result<B::Component, EvalError> {
         let out = self.eval_boxed(expr).await?;
-        if out.args.is_empty() {
+        if out.args.is_empty() && out.components.is_empty() {
             Ok(out.component)
         } else {
             Err(EvalError::ArgumentsNotAllowed { context })
@@ -351,25 +386,67 @@ impl<'a, B: Backend> Evaluator<'a, B> {
     ) -> Result<EvalOutput<B::Component>, EvalError> {
         let callee_out = self.eval_boxed(callee).await?;
         let info = self.backend.describe(&callee_out.component);
-        let named = collect_named_args(callee_out.args, &info.args, args)?;
 
         if info.kind == ComponentKind::Provider {
+            // Configuration is constant WAVE data: a provider declaring a
+            // component-typed configure parameter is refused before anything matches.
+            if let Some(spec) = info
+                .args
+                .iter()
+                .find(|spec| wave::is_component_type(&spec.ty))
+            {
+                return Err(EvalError::ComponentArgumentForConfigure {
+                    name: spec.name.clone(),
+                });
+            }
+            let collected = collect_named_args(callee_out.args, &info.args, args)?;
+            debug_assert!(collected.components.is_empty());
             // The configure signature is final here, so omitted optional arguments are
             // filled with `none` and missing required ones fail now, before anything is
             // composed. A provider with no flags never reaches this point (the parser
             // only builds an application when arguments are present) and is used as-is.
-            let mut named = named;
-            complete_args(&mut named, &info.args)?;
+            let mut named = collected.named;
+            complete_args(&mut named, &[], &info.args)?;
             let configured = self.backend.configure(callee_out.component, &named)?;
             return Ok(EvalOutput {
                 component: configured,
                 args: Vec::new(),
+                components: Vec::new(),
+            });
+        }
+
+        let collected = collect_named_args(callee_out.args, &info.args, args)?;
+        // Component-typed parameters: each matched value is itself a program
+        // expression — a bare word is a name, a parenthesized expression is evaluated
+        // as written. The value must be *plain* (no main arguments of its own: the
+        // receiving program decides its child's arguments).
+        let mut components = callee_out.components;
+        for (name, value) in collected.components {
+            let expr_owned;
+            let expr: &Expr = match &value {
+                ArgValue::Word(text) => {
+                    expr_owned = Expr::Name(text.clone());
+                    &expr_owned
+                }
+                ArgValue::Quoted(_) => {
+                    return Err(EvalError::ComponentArgumentText { name });
+                }
+                ArgValue::Expr(e) => e,
+            };
+            let out = self.eval_boxed(expr).await?;
+            if !out.args.is_empty() || !out.components.is_empty() {
+                return Err(EvalError::ComponentArgumentWithArgs { name });
+            }
+            components.push(ComponentArg {
+                name,
+                value: out.component,
             });
         }
 
         Ok(EvalOutput {
             component: callee_out.component,
-            args: named,
+            args: collected.named,
+            components,
         })
     }
 
@@ -405,16 +482,24 @@ impl<'a, B: Backend> Evaluator<'a, B> {
 /// signature's **final** parameter is `list<string>` it is the variadic tail: positional
 /// values left over once the other parameters are filled are collected into it, so
 /// `cat a.txt b.txt` passes both paths as one list argument.
+struct CollectedArgs {
+    named: Vec<NamedArg>,
+    /// Component-typed matches, still unevaluated: (parameter name, the value as
+    /// written). The caller evaluates each as a program expression.
+    components: Vec<(String, ArgValue)>,
+}
+
 fn collect_named_args(
     initial: Vec<NamedArg>,
     specs: &[ArgSpec],
     args: &[Arg],
-) -> Result<Vec<NamedArg>, EvalError> {
+) -> Result<CollectedArgs, EvalError> {
     let variadic = specs
         .last()
         .filter(|spec| wave::is_string_list(&spec.ty))
         .map(|spec| spec.name.clone());
     let mut named = initial;
+    let mut components: Vec<(String, ArgValue)> = Vec::new();
     let mut tail: Vec<String> = Vec::new();
     for arg in args {
         match arg {
@@ -423,15 +508,25 @@ fn collect_named_args(
                     .iter()
                     .find(|spec| spec.name == *name)
                     .ok_or_else(|| EvalError::UnknownFlag { name: name.clone() })?;
-                push_arg(&mut named, spec, value)?;
+                if wave::is_component_type(&spec.ty) {
+                    push_component(&mut components, &named, spec, value)?;
+                } else {
+                    push_arg(&mut named, &components, spec, value)?;
+                }
             }
             Arg::Positional(value) => {
-                let spec = specs.iter().find(|spec| {
-                    Some(&spec.name) != variadic.as_ref()
-                        && !named.iter().any(|arg| arg.name == spec.name)
-                });
+                let filled = |name: &String| {
+                    named.iter().any(|arg| arg.name == *name)
+                        || components.iter().any(|(filled, _)| filled == name)
+                };
+                let spec = specs
+                    .iter()
+                    .find(|spec| Some(&spec.name) != variadic.as_ref() && !filled(&spec.name));
                 match (spec, &variadic) {
-                    (Some(spec), _) => push_arg(&mut named, spec, value)?,
+                    (Some(spec), _) if wave::is_component_type(&spec.ty) => {
+                        push_component(&mut components, &named, spec, value)?;
+                    }
+                    (Some(spec), _) => push_arg(&mut named, &components, spec, value)?,
                     (None, Some(name)) => match value {
                         ArgValue::Word(text) | ArgValue::Quoted(text) => tail.push(text.clone()),
                         ArgValue::Expr(_) => {
@@ -457,21 +552,38 @@ fn collect_named_args(
             value: wave::string_list(&tail),
         });
     }
-    Ok(named)
+    Ok(CollectedArgs { named, components })
 }
 
-/// Fill one parameter, encoding the value per the parameter's declared type.
-fn push_arg(named: &mut Vec<NamedArg>, spec: &ArgSpec, value: &ArgValue) -> Result<(), EvalError> {
-    if named.iter().any(|arg| arg.name == spec.name) {
+/// Match one component-typed parameter, recording the still-unevaluated value.
+fn push_component(
+    components: &mut Vec<(String, ArgValue)>,
+    named: &[NamedArg],
+    spec: &ArgSpec,
+    value: &ArgValue,
+) -> Result<(), EvalError> {
+    if components.iter().any(|(name, _)| *name == spec.name)
+        || named.iter().any(|arg| arg.name == spec.name)
+    {
         return Err(EvalError::DuplicateArgument {
             name: spec.name.clone(),
         });
     }
-    if wave::is_component_type(&spec.ty) {
-        // Type-directed: this parameter takes a program expression, not text. The
-        // grammar and classification are in place; actually passing a component
-        // through `spawn`'s WAVE-text arguments is not representable yet.
-        return Err(EvalError::ComponentArgumentUnsupported {
+    components.push((spec.name.clone(), value.clone()));
+    Ok(())
+}
+
+/// Fill one data-typed parameter, encoding the value per the parameter's declared type.
+fn push_arg(
+    named: &mut Vec<NamedArg>,
+    components: &[(String, ArgValue)],
+    spec: &ArgSpec,
+    value: &ArgValue,
+) -> Result<(), EvalError> {
+    if named.iter().any(|arg| arg.name == spec.name)
+        || components.iter().any(|(name, _)| *name == spec.name)
+    {
+        return Err(EvalError::DuplicateArgument {
             name: spec.name.clone(),
         });
     }
@@ -493,10 +605,21 @@ fn push_arg(named: &mut Vec<NamedArg>, spec: &ArgSpec, value: &ArgValue) -> Resu
 /// parameter (the variadic tail) is filled with the empty list, and missing required
 /// ones are an error. Used where the signature is final — the top-level run rule for
 /// `main` arguments, the application site for a provider's `configure` arguments.
-pub fn complete_args(args: &mut Vec<NamedArg>, specs: &[ArgSpec]) -> Result<(), EvalError> {
+pub fn complete_args(
+    args: &mut Vec<NamedArg>,
+    filled_components: &[String],
+    specs: &[ArgSpec],
+) -> Result<(), EvalError> {
     for (index, spec) in specs.iter().enumerate() {
-        if args.iter().any(|arg| arg.name == spec.name) {
+        if args.iter().any(|arg| arg.name == spec.name) || filled_components.contains(&spec.name) {
             continue;
+        }
+        if wave::is_component_type(&spec.ty) {
+            // A component parameter has no `none` and no default: it is always required.
+            return Err(EvalError::MissingArgument {
+                name: spec.name.clone(),
+                ty: spec.ty.clone(),
+            });
         }
         if wave::option_inner(&spec.ty).is_some() {
             args.push(NamedArg {
@@ -1053,7 +1176,7 @@ mod tests {
             name: "paths".to_string(),
             ty: "list<string>".to_string(),
         }];
-        complete_args(&mut args, &specs).expect("completes");
+        complete_args(&mut args, &[], &specs).expect("completes");
         assert_eq!(
             args,
             vec![NamedArg {
@@ -1093,22 +1216,65 @@ mod tests {
     }
 
     #[test]
-    fn component_typed_parameters_are_recognised_but_unsupported() {
+    fn component_typed_parameters_take_program_expressions() {
         let mut backend = MockBackend::new();
         backend.program("interpret", binary(&[("program", "borrow<component>")]));
         backend.program("cruncher", binary(&[]));
-        let err = eval(&mut backend, "interpret (only eo9:time $ cruncher)").unwrap_err();
+        backend.program("net.none", provider(&["eo9:net/net"]));
+        // A parenthesized expression evaluates as written and rides as a component
+        // argument named after the parameter.
+        let out = eval(&mut backend, "interpret (net.none $ cruncher)").unwrap();
+        assert_eq!(out.args.len(), 0);
+        assert_eq!(out.components.len(), 1);
+        assert_eq!(out.components[0].name, "program");
+        // A bare word in that position is a program name, not text.
+        let out = eval(&mut backend, "interpret cruncher").unwrap();
+        assert_eq!(out.components.len(), 1);
+        assert_eq!(out.components[0].name, "program");
+        // Quoted text is refused: the parameter wants a program, not a string.
+        let err = eval(&mut backend, "interpret \"cruncher\"").unwrap_err();
         assert_eq!(
             err,
-            EvalError::ComponentArgumentUnsupported {
+            EvalError::ComponentArgumentText {
                 name: "program".to_string()
             }
         );
-        // A bare word in that position is also a program expression, not text.
-        let err = eval(&mut backend, "interpret cruncher").unwrap_err();
+        // A component argument may not carry main arguments of its own.
+        backend.program("greet", binary(&[("name", "string")]));
+        let err = eval(&mut backend, "interpret (greet --name x)").unwrap_err();
         assert_eq!(
             err,
-            EvalError::ComponentArgumentUnsupported {
+            EvalError::ComponentArgumentWithArgs {
+                name: "program".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn component_arguments_are_required_and_unique() {
+        let mut backend = MockBackend::new();
+        backend.program("interpret", binary(&[("program", "component")]));
+        backend.program("cruncher", binary(&[]));
+        // Missing: complete_args (the top-level rule) refuses by name.
+        let out = eval(&mut backend, "interpret").unwrap();
+        let mut named = out.args.clone();
+        let filled: Vec<String> = out.components.iter().map(|c| c.name.clone()).collect();
+        let specs = alloc::vec![crate::backend::ArgSpec {
+            name: "program".to_string(),
+            ty: "component".to_string(),
+        }];
+        assert_eq!(
+            complete_args(&mut named, &filled, &specs).unwrap_err(),
+            EvalError::MissingArgument {
+                name: "program".to_string(),
+                ty: "component".to_string()
+            }
+        );
+        // Twice: refused as a duplicate.
+        let err = eval(&mut backend, "interpret cruncher --program cruncher").unwrap_err();
+        assert_eq!(
+            err,
+            EvalError::DuplicateArgument {
                 name: "program".to_string()
             }
         );
@@ -1344,7 +1510,7 @@ mod tests {
             name: "url".to_string(),
             value: "\"https://example.com\"".to_string(),
         }];
-        complete_args(&mut args, &specs).expect("completes");
+        complete_args(&mut args, &[], &specs).expect("completes");
         assert_eq!(
             args,
             vec![
@@ -1361,7 +1527,7 @@ mod tests {
 
         let mut missing = Vec::new();
         assert_eq!(
-            complete_args(&mut missing, &specs).unwrap_err(),
+            complete_args(&mut missing, &[], &specs).unwrap_err(),
             EvalError::MissingArgument {
                 name: "url".to_string(),
                 ty: "string".to_string()

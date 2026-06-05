@@ -438,3 +438,26 @@ The pure, unprivileged value algebra on components, as a host library: load/save
     `[`/`{` enters compound mode. Tests: 6 new lexer cases (the pci.admit form, nesting,
     opaque strings, quoted form, top-level commas, both unterminated errors) and a parser
     case pinning the literal as a single flag value.
+
+28. **Component-typed `main` arguments (2026-06-04, owner-commissioned; branch
+    `area/03-component-args`).** The policy-components study's "component-typed
+    arguments" candidate, built: when a binary's `main` declares a `component` parameter
+    (`prog: component` — the algebra's resource, recognised by `wave::is_component_type`),
+    the shell fills it from a *program expression* — a bare word is a name, a
+    parenthesized expression evaluates as written — and the value rides `EvalOutput`
+    alongside the WAVE arguments, transferring into the child at spawn as an owned
+    handle (`eo9:exec/task.component-arg`; the `detach` handle-passing precedent
+    generalized). Type direction is total: quoted text for a component parameter is
+    refused, an expression for a data parameter still is too, a component argument
+    expression carrying `main` arguments of its own is refused ("the receiving program
+    decides its child's arguments" — they would otherwise drop silently), and a
+    provider declaring a component-typed `configure` parameter is refused (configuration
+    is constant data). Both native executors bind them (kernel `bind_args`, usermode
+    `parse_args`, mirrored rules: missing component arguments name themselves; binding
+    requires the child to hold exec, since component handles live in the exec provider's
+    table); the browser blob accepts the API and refuses with a typed message
+    (single-child Pulley runner — recorded follow-up). Lines carrying component
+    arguments never enter the session's cached-image fast path: the value is consumed by
+    the spawn that binds it, and its referent may have changed by the next structurally
+    identical line. `detach` refuses them (services respawn from their image; a consumed
+    argument cannot respawn). The demo consumer is `time` (plan/10 D25).

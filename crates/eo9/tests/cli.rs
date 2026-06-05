@@ -677,6 +677,78 @@ fn shell_runs_a_program_by_bare_name() {
 }
 
 #[test]
+fn time_runs_a_program_passed_as_a_component_argument() {
+    // `time` is a standard component, not a builtin (plan/10 D23): the smallest
+    // executor, taking the program to run as a component-typed main argument.
+    let store = temp_store("shell-time");
+    let run = eo9(&store, &["shell", "-c", "time hello"]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(run.stdout.contains("Hello, world."), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("compile ") && run.stdout.contains("  real "),
+        "timing report missing: {}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("ok: timed(\"greeted\")"),
+        "forwarded outcome missing: {}",
+        run.stderr
+    );
+
+    // The measuring instrument is a capability: a frozen clock composed onto `time`
+    // freezes the measurement itself (both phases report 0.000s), while the child
+    // still runs against the session's own clock.
+    let frozen = eo9(
+        &store,
+        &[
+            "shell",
+            "-c",
+            "time.frozen --now-seconds 5 --monotonic-ns 0 $ time hello",
+        ],
+    );
+    assert_eq!(frozen.code, 0, "stderr: {}", frozen.stderr);
+    assert!(
+        frozen.stdout.contains("compile 0.000s  real 0.000s"),
+        "frozen measurement missing: {}",
+        frozen.stdout
+    );
+
+    // A component argument expression evaluates as written: the child here gets the
+    // frozen clock, and `time` measures with the session's real one.
+    let composed = eo9(
+        &store,
+        &[
+            "shell",
+            "-c",
+            "time (time.frozen --now-seconds 7 --monotonic-ns 0 $ hello)",
+        ],
+    );
+    assert_eq!(composed.code, 0, "stderr: {}", composed.stderr);
+    assert!(
+        composed.stdout.contains("[7.000000000] Hello, world."),
+        "composed child clock missing: {}",
+        composed.stdout
+    );
+
+    // Refusals teach: quoted text is not a program, and an argument expression may not
+    // carry main arguments of its own.
+    let quoted = eo9(&store, &["shell", "-c", "time \"hello\""]);
+    assert_ne!(quoted.code, 0);
+    assert!(
+        quoted.stderr.contains("component-typed"),
+        "{}",
+        quoted.stderr
+    );
+    let inner = eo9(&store, &["shell", "-c", "time (hello --name x)"]);
+    assert_ne!(inner.code, 0);
+    assert!(
+        inner.stderr.contains("would be dropped"),
+        "{}",
+        inner.stderr
+    );
+}
+
+#[test]
 fn shell_verbose_announces_child_grants() {
     // `-v` makes the capability set children inherit visible at spawn time (user-study
     // finding #8); a default run stays quiet (the full picture is still in `env`).

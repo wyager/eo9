@@ -972,7 +972,7 @@ impl TaskState {
             .ok_or_else(|| wasmtime::Error::msg("entropy capability was not granted to this task"))
     }
 
-    fn exec_provider(&mut self) -> Result<&mut crate::exec::ExecProvider> {
+    pub(crate) fn exec_provider(&mut self) -> Result<&mut crate::exec::ExecProvider> {
         self.providers
             .exec
             .as_mut()
@@ -1147,6 +1147,16 @@ enum WitCompileError {
 struct WitNamedArg {
     name: String,
     value: String,
+}
+
+/// `eo9:exec/task.component-arg`: one component-typed `main` argument. The handle is the
+/// spawner's; the host takes the component value out of the spawner's table and hands it
+/// to the child (ownership transfer — the detach precedent generalized).
+#[derive(ComponentType, Lift, Lower)]
+#[component(record)]
+struct WitComponentArg {
+    name: String,
+    value: Resource<AlgComponentRes>,
 }
 
 #[derive(Clone, ComponentType, Lift, Lower)]
@@ -1536,7 +1546,12 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
     task.func_wrap(
         "spawn",
         |mut store: StoreContextMut<'_, TaskState>,
-         (image, args, limits): (Resource<ExecImageRes>, Vec<WitNamedArg>, WitSpawnLimits)|
+         (image, args, components, limits): (
+            Resource<ExecImageRes>,
+            Vec<WitNamedArg>,
+            Vec<WitComponentArg>,
+            WitSpawnLimits,
+        )|
          -> Result<(Result<Resource<ChildTaskRes>, WitSpawnError>,)> {
             let exec = store.data_mut().exec_provider()?;
             let providers = exec.policy.providers_for_child();
@@ -1544,12 +1559,20 @@ fn add_exec(linker: &mut Linker<TaskState>) -> Result<()> {
                 .into_iter()
                 .map(|arg| crate::wave::NamedArg::new(arg.name, arg.value))
                 .collect();
+            // Take each component argument out of the *spawner's* table now (ownership
+            // transfer at the API boundary); `Task::spawn` re-mints them in the child.
+            let mut component_args = Vec::with_capacity(components.len());
+            for arg in components {
+                let value = take_component(exec, arg.value.rep())?;
+                component_args.push((arg.name, value));
+            }
             let limits = crate::task::SpawnLimits {
                 max_memory: limits.max_memory,
                 max_table_elements: None,
             };
             let image = exec.images.get_mut(image.rep())?;
-            let spawned = crate::task::Task::spawn(image, &args, limits, providers);
+            let spawned =
+                crate::task::Task::spawn_with(image, &args, component_args, limits, providers);
             let exec = store.data_mut().exec_provider()?;
             Ok((match spawned {
                 Ok(child) => {

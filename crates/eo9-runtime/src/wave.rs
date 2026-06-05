@@ -42,7 +42,11 @@ impl NamedArg {
 /// in-program defaults), and a **final `list<string>` parameter** is the variadic tail by
 /// convention (`cat a.txt b.txt`) — when nothing supplies it, it defaults to the empty
 /// list instead of being a missing-argument error.
-pub(crate) fn parse_args(signature: &ComponentFunc, args: &[NamedArg]) -> Result<Vec<Val>, String> {
+pub(crate) fn parse_args(
+    signature: &ComponentFunc,
+    args: &[NamedArg],
+    component_vals: &mut std::collections::BTreeMap<String, Val>,
+) -> Result<Vec<Val>, String> {
     let params: Vec<(String, Type)> = signature
         .params()
         .map(|(name, ty)| (name.to_string(), ty))
@@ -53,9 +57,34 @@ pub(crate) fn parse_args(signature: &ComponentFunc, args: &[NamedArg]) -> Result
             return Err(format!("unknown argument `{}`", arg.name));
         }
     }
+    for name in component_vals.keys() {
+        if !params.iter().any(|(param, _)| param == name) {
+            return Err(format!("unknown component argument `{name}`"));
+        }
+    }
 
     let mut vals = Vec::with_capacity(params.len());
     for (index, (name, ty)) in params.iter().enumerate() {
+        // A component-typed parameter binds from the spawn's component arguments — an
+        // owned handle minted in the child, never WAVE text.
+        if matches!(ty, Type::Own(_)) {
+            if args.iter().any(|arg| arg.name == *name) {
+                return Err(format!(
+                    "parameter `{name}` is component-typed; it takes a program value, not                      text (pass a program expression at the eosh prompt)"
+                ));
+            }
+            match component_vals.remove(name) {
+                Some(val) => {
+                    vals.push(val);
+                    continue;
+                }
+                None => {
+                    return Err(format!(
+                        "missing component argument `{name}` (pass a program expression)"
+                    ));
+                }
+            }
+        }
         let matching: Vec<&NamedArg> = args.iter().filter(|arg| arg.name == *name).collect();
         let arg = match matching.as_slice() {
             [] => {
