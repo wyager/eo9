@@ -6,6 +6,17 @@ day one — the DTB is the authority, this doc is the map. Sources: mainline U-B
 (`orangepi-5-plus-rk3588_defconfig`, supported since v2024.04), mainline Linux
 `rk3588-orangepi-5-plus.dts`, the RK3588 TRM.
 
+## Bring-up
+
+The generalized lessons from this board's bring-up — transport doctrine (the serial
+loader stub; vendor `booti` is treated as hostile after a live wedge), the PoC
+cache-coherency rules for loader/kernel/FDT handoffs, loop-safety (exit-is-reset,
+panic marker, watchdog, boot beacons), bench electrics, and the ordered checklist for
+the next board — live in **[bringup-playbook.md](bringup-playbook.md)**. Note the
+recipes below predate the board: the live bring-up loaded over serial via
+`boards/opi5-serial-loader/` (linked at `0x0020_0000`), not the SD `booti` flow this
+draft sketches.
+
 ## What the kernel must gain (the known list, in dependency order)
 
 | # | Change | Size | Notes |
