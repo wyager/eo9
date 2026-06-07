@@ -265,7 +265,6 @@ pub(crate) mod dw_state {
     /// Bring-up has not run or failed before the DBI was usable: map nothing.
     pub(crate) const DISABLED: u8 = 0;
     /// DBI alive but link training failed: only the root port is visible.
-    #[allow(dead_code)] // consumed by the bring-up commit (arch::rk3588_pcie::init)
     pub(crate) const ROOT_ONLY: u8 = 1;
     /// Link up: root port + downstream devices visible.
     pub(crate) const FULL: u8 = 2;
@@ -305,13 +304,11 @@ impl DwPcie {
     }
 
     /// The DBI base (the board bring-up programs port-logic registers through it).
-    #[allow(dead_code)] // consumed by the bring-up commit (arch::rk3588_pcie::init)
     pub(crate) fn dbi(&self) -> usize {
         self.dbi
     }
 
     /// Board bring-up reports the controller's outcome (a `dw_state` value).
-    #[allow(dead_code)] // consumed by the bring-up commit (arch::rk3588_pcie::init)
     pub(crate) fn set_state(&self, state: u8) {
         // Force the first post-bring-up access to route the iATU from scratch.
         self.last_target.store(u32::MAX, Ordering::Relaxed);
@@ -398,9 +395,14 @@ impl ConfigAccess for DwPcie {
     }
 
     fn buses(&self) -> u8 {
-        // The DT gives every RK3588 controller a 16-bus range (`bus-range = <N N+0xf>`,
-        // rk3588-base.dtsi); the shim numbers them 0..16 per segment.
-        16
+        // Root port (bus 0) + its secondary (bus 1). The DT gives each controller a
+        // 16-bus range, but reaching bus 2+ requires a PCI-to-PCI bridge below the root
+        // port with a programmed secondary bus — firmware work this kernel does not do
+        // (module docs) — so deeper bus numbers can never hold a reachable device.
+        // Walking them anyway would fire hundreds of UR-completing CFG1 probes per
+        // enumeration (and UR handling on untested silicon is an SError surface worth
+        // zero). The CFG1 arm in `map` stays for the bridge-programming follow-up.
+        2
     }
 }
 
