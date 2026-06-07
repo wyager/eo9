@@ -23,6 +23,22 @@ mod ticks;
 #[cfg(target_os = "none")]
 extern crate alloc;
 
+/// Emit a boot-milestone beacon character: one raw char banged straight at the board UART
+/// (uart.rs `beacon_raw`). Board profile only — everywhere else this expands to nothing
+/// (zero bytes of code), so the QEMU images stay byte-identical. The legend:
+/// 'A' image entry, 'B'/'b' after the EL2 drop / EL1-direct entry (both in boot.rs asm),
+/// 'C' kmain reached (BSS zeroed, stack live), 'H' console path about to print the banner,
+/// 'E' MMU enabled, 'F' heap initialised, 'G' watchdog armed, 'D' FDT/bootargs parse
+/// returned. The last surviving letter pinpoints the dead boot stage; the beacons stay in
+/// the final image (they cost nothing and read as a boot signature).
+#[macro_export]
+macro_rules! beacon {
+    ($c:expr) => {{
+        #[cfg(all(target_arch = "aarch64", feature = "board-opi5plus"))]
+        $crate::uart::beacon_raw($c);
+    }};
+}
+
 #[cfg(target_os = "none")]
 mod arch;
 #[cfg(target_os = "none")]
@@ -75,6 +91,10 @@ pub(crate) use arch::{mmu, power, rtc, timer, uart};
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
 extern "C" fn kmain(dtb: *const u8) -> ! {
+    // 'C': Rust entry reached — the stub's BSS zero and stack setup survived.
+    beacon!(b'C');
+    // 'H': the console write path is about to carry the banner.
+    beacon!(b'H');
     // Machine identification, privilege level, timer frequency, wall clock.
     arch::banner();
 
@@ -86,6 +106,8 @@ extern "C" fn kmain(dtb: *const u8) -> ! {
     // Heap: everything from the end of the kernel image to the architecture's usable top of
     // RAM.
     heap::init();
+    // 'F': the heap is initialised.
+    beacon!(b'F');
     heap::self_test();
 
     // Platform timer: readable counter plus a polled 10 ms timer condition.
@@ -104,6 +126,8 @@ extern "C" fn kmain(dtb: *const u8) -> ! {
     // store entry headless, `demo` runs the original demo sequence below, and nothing at
     // all boots to the interactive eosh shell.
     let bootargs = fdt::bootargs(dtb);
+    // 'D': the FDT/bootargs parse returned (whatever the vendor control FDT held).
+    beacon!(b'D');
     if let Some(bootargs) = bootargs {
         kprintln!("cmdline: {bootargs}");
     }
