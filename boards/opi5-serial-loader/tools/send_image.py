@@ -9,17 +9,24 @@ Protocol (must match src/lib.rs, pinned by --selftest):
 The stub answers 'k' per 64 KiB (progress), then 'K' (verified, jumping) or 'E'
 (CRC mismatch — it re-arms, just re-run) or 'T' (3 s stall — re-run).
 
-Why streaming without flow control is safe: the stub services one byte in well under
-1 µs (a couple of MMIO polls) against the line's 6.7 µs/byte at 1.5 Mbaud, so the
-UART's 32-byte RX FIFO can never fill. The 'k' bytes are progress truth (macOS buffers
-serial writes deeply, so local write counts mean little).
+Why streaming is safe AND fast: the stub services one byte in well under 1 µs (a
+couple of MMIO polls) against the line's 6.7 µs/byte at 1.5 Mbaud, so the UART's
+32-byte RX FIFO can never fill — the board never needs byte-level back-pressure. The
+per-64-KiB 'k' acks are the flow control: the host streams at line rate, polling acks
+without blocking, and only stops to wait when it gets more than WINDOW bytes ahead of
+the stub's last ack. That keeps the wire the pacer (~87 s for the 12.4 MiB minimal
+image) while still catching a dead/derailed stub within seconds instead of at the end.
+(macOS buffers serial writes deeply, so local write counts mean little; the acks are
+the progress truth.)
 
 x0_value: pass U-Boot's ${fdtcontroladdr} (`printenv fdtcontroladdr` on the board).
 With the booti launch you may pass --x0 0 — the stub then forwards its own entry x0,
 which booti already set to the device tree.
 
 After 'K' the stub jumps; this script switches to dumb console mode and tails the
-board's output (Ctrl-C to detach; the port is then free for the planner's console).
+board's output. --tail-seconds N (default 20) detaches after N seconds of console
+SILENCE — a stall alarm for unattended runs that also frees the port for the planner's
+console; 0 tails forever (Ctrl-C to detach).
 """
 import argparse
 import binascii
@@ -36,6 +43,14 @@ ACK_INTERVAL = 64 * 1024
 PORT = "/dev/cu.usbserial-AC009X7K"
 BAUD = 1_500_000
 CHUNK = 4096
+# Flow-control window: how far (in payload bytes) the host may run ahead of the stub's
+# last 'k' ack before it blocks waiting for acks. 512 KiB ≈ 3.5 s of line time: deep
+# enough that ack latency never starves the wire, shallow enough that a stub that stops
+# acking (or answers 'E'/'T') is noticed within a few seconds.
+WINDOW = 8 * ACK_INTERVAL
+# Mid-transfer alarm: abort if the window is full and no new ack arrives for this long
+# (the stub's own stall timeout is ~3 s, so 10 s of nothing means it is gone).
+ACK_STALL_SECONDS = 10.0
 
 
 def selftest() -> None:
@@ -45,29 +60,57 @@ def selftest() -> None:
     print("selftest ok: crc vector + 28-byte header")
 
 
-def drain_acks(s, seen: int) -> tuple[int, bytes]:
-    """Consume any pending stub bytes; count 'k's, return (count, terminal byte or b'')."""
+def scan_stub_bytes(data: bytes, seen: int) -> tuple[int, bytes]:
+    """Count 'k' acks in `data`; return (count, terminal byte or b'')."""
+    for b in data:
+        ch = bytes([b])
+        if ch == b"k":
+            seen += 1
+        elif ch in (b"K", b"E", b"T"):
+            return seen, ch
+        # anything else is line noise; ignore
+    return seen, b""
+
+
+def drain_acks(s, seen: int, block: bool = True) -> tuple[int, bytes]:
+    """Consume pending stub bytes; count 'k's, return (count, terminal byte or b'').
+
+    block=False reads only what the OS already buffered (in_waiting) and never sleeps
+    in the port timeout — the streaming path uses this so the wire, not host polling,
+    sets the transfer pace (a blocking 50 ms drain per 4 KiB chunk is what stretched
+    the first 13 MB send to 182 s against the 87 s line rate)."""
     while True:
-        chunk = s.read(64)
-        if not chunk:
+        pending = s.in_waiting
+        if pending:
+            seen, term = scan_stub_bytes(s.read(pending), seen)
+        elif block:
+            chunk = s.read(64)  # blocks up to the port timeout
+            if not chunk:
+                return seen, b""
+            seen, term = scan_stub_bytes(chunk, seen)
+        else:
             return seen, b""
-        for b in chunk:
-            ch = bytes([b])
-            if ch == b"k":
-                seen += 1
-            elif ch in (b"K", b"E", b"T"):
-                return seen, ch
-            # anything else is line noise; ignore
+        if term:
+            return seen, term
 
 
-def console(s) -> None:
-    print("--- console (Ctrl-C to detach) ---")
+def console(s, tail_seconds: float) -> None:
+    if tail_seconds > 0:
+        print(f"--- console (exits after {tail_seconds:g}s of silence; Ctrl-C to detach) ---")
+    else:
+        print("--- console (Ctrl-C to detach) ---")
+    last = time.time()
     try:
-        while True:
+        while tail_seconds <= 0 or time.time() - last < tail_seconds:
             data = s.read(4096)
             if data:
                 sys.stdout.write(data.decode("utf-8", errors="replace"))
                 sys.stdout.flush()
+                last = time.time()
+        print(
+            f"\n--- console quiet for {tail_seconds:g}s; detaching "
+            "(board state: whatever you last saw) ---"
+        )
     except KeyboardInterrupt:
         print("\n--- detached ---")
 
@@ -80,6 +123,13 @@ def main() -> None:
     ap.add_argument("--port", default=PORT)
     ap.add_argument("--baud", type=int, default=BAUD)
     ap.add_argument("--no-console", action="store_true")
+    ap.add_argument(
+        "--tail-seconds",
+        type=float,
+        default=20.0,
+        help="exit the console tail after this many seconds of SILENCE "
+        "(stall alarm; frees the port). 0 = tail forever",
+    )
     ap.add_argument("--log", type=str, default=None,
                     help="tee everything (progress + console tail) to this file, line-flushed")
     ap.add_argument("--selftest", action="store_true")
@@ -122,19 +172,39 @@ def main() -> None:
         s.reset_input_buffer()
         s.write(MAGIC + struct.pack("<QQQ", args.load_addr, len(payload), args.x0))
 
-        acks, start = 0, time.time()
+        acks, start, last_paint = 0, time.time(), 0.0
         for off in range(0, len(payload), CHUNK):
             s.write(payload[off : off + CHUNK])
-            acks, term = drain_acks(s, acks)
+            sent = min(off + CHUNK, len(payload))
+            # Poll acks without blocking; the wire sets the pace.
+            acks, term = drain_acks(s, acks, block=False)
+            # Window flow control: block for acks only when too far ahead of the stub.
+            stall_deadline = time.time() + ACK_STALL_SECONDS
+            while not term and sent - acks * ACK_INTERVAL > WINDOW:
+                before = acks
+                acks, term = drain_acks(s, acks)  # blocking slice (port timeout)
+                if acks != before:
+                    stall_deadline = time.time() + ACK_STALL_SECONDS
+                elif time.time() > stall_deadline:
+                    print(
+                        f"\nno ack progress for {ACK_STALL_SECONDS:g}s mid-transfer "
+                        "— stub gone? re-run",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
             if term:
                 print(f"\nstub answered {term.decode()!r} mid-transfer", file=sys.stderr)
                 sys.exit(1)
-            done = acks * ACK_INTERVAL
-            sys.stdout.write(
-                f"\racked {done}/{len(payload)} bytes "
-                f"({100 * done / len(payload):.0f}%) {time.time() - start:.0f}s"
-            )
-            sys.stdout.flush()
+            # Repaint at most twice a second (every chunk floods a tee'd log).
+            now = time.time()
+            if now - last_paint >= 0.5 or sent == len(payload):
+                done = acks * ACK_INTERVAL
+                sys.stdout.write(
+                    f"\racked {done}/{len(payload)} bytes "
+                    f"({100 * done / len(payload):.0f}%) {now - start:.0f}s"
+                )
+                sys.stdout.flush()
+                last_paint = now
         s.write(struct.pack("<I", crc))
 
         # Wait for the remaining acks + the verdict.
@@ -149,7 +219,7 @@ def main() -> None:
         if verdict == b"K":
             print(f"K: verified ({acks}/{expected_acks} acks), stub is jumping")
             if not args.no_console:
-                console(s)
+                console(s, args.tail_seconds)
         elif verdict in (b"E", b"T"):
             print(f"{verdict.decode()}: transfer failed — stub re-armed, re-run")
             sys.exit(1)

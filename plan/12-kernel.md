@@ -1909,9 +1909,13 @@ U-Boot itself on this minimal image and its own recovery reset then failed — t
 2026-06-04 live incident (board wedged, physical power cycle). The stub keeps its
 arm64 Image header for a future sane bootloader, but the dev loop never uses it. It then
 loops forever: receive `"EO9L" + load/len/x0 + payload + crc32` on UART2 at 1.5 Mbaud
-(~85 s for the 12.4 MiB minimal image), `k` per 64 KiB, verify, `K`, `dc cvau` sweep +
+(~85 s for the 12.4 MiB minimal image), `k` per 64 KiB, verify, `K`, `dc civac` sweep
+(to PoC since 2026-06-07 — the original `dc cvau` reached only PoU, leaving DRAM
+stale for a next stage that runs with caches off; the first-light cache lesson) +
 `ic iallu`, jump. CRC mismatch or a 3 s stall re-arms it — a failed transfer never
-needs hands. No flow control needed: byte service is ~1 µs against the line's 6.7 µs.
+needs hands. The board needs no byte-level flow control (byte service is ~1 µs
+against the line's 6.7 µs); the host sender uses the 64 KiB `k` acks as a windowed
+flow control so the wire, not host polling, sets the transfer pace.
 Mac side: `tools/make_mm_script.py` (bootstrap + U-Boot `crc32` verify) and
 `tools/send_image.py` (transfer + console tail). Host-verified only (protocol tests,
 header bytes, disassembly): the stub's first live run is on the board.
