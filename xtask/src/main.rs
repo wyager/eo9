@@ -75,6 +75,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-net-l4-none",
     "eo9-stub-net-l4-over-l2",
     "eo9-stub-net-policy-ports",
+    "eo9-stub-net-text",
     "eo9-stub-net-virtio",
     "eo9-stub-pci-admit-address",
     "eo9-stub-pci-admit-vendor",

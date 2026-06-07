@@ -61,6 +61,24 @@ interface capture-config {
     configure: func() -> result<text-impl, string>;
 }
 
+/// Compose-time configuration entry for net.text — the socket-backed text provider
+/// (`net.virtio $ net.l4.over-l2 $ net.text $ eosh`: the shell over the network).
+/// `configure` binds the TCP port the provider listens on; unconfigured, the provider
+/// keeps its documented default, port 23, so plain composition works and never traps.
+///
+/// **SECURITY: net.text speaks cleartext, unauthenticated telnet-style NVT.** Whoever
+/// can reach the port owns the composed session — it is a trusted-LAN/dev tool only
+/// (the QEMU slirp-hostfwd bring-up path), never an exposure surface. An authenticated,
+/// encrypted transport (SSH) is explicitly deferred by the owner.
+///
+/// The stub's world is crate-local (`eo9:net-text/net-text` — imports `eo9:net/l4`,
+/// exports `types`, `text`, and this entry), following the `net.l4.over-l2` precedent
+/// for cross-package middleware.
+interface net-text-config {
+    use types.{text-impl};
+    configure: func(port: u16) -> result<text-impl, string>;
+}
+
 /// text.none — absence: exports the optional flavor answering `none`.
 world none {
     export types;

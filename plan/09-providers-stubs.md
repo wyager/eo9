@@ -913,3 +913,58 @@ Match the priority order above; (1)+(2) unblock I2.
     profile the 339 ms spawn path — hash-equality memcmp, pre-instantiation validation,
     per-spawn linker construction — if warm spawn latency ever matters beyond TCG demos.
     No gpu.virtio or draw changes warranted.
+
+44. **`net.text` — the socket-backed text provider: shell over the network as pure composition
+    (2026-06-07, branch area/09-telnetd).** Owner directive: "target shell-over-network. Telnet is
+    fine, no need for SSH yet." The design goal was telnetd-accepts-then-hands-the-connection-to-a-
+    composed-child; the investigation pinned why that exact handle plumbing is impossible today, and
+    what the Eo9-shaped alternative is:
+
+    *The handle-transfer finding (the load-bearing design decision).* A component-typed `main`
+    argument (plan/04 D14) transfers because a component value is **passive bytes** moved between two
+    host-side exec tables. An accepted `eo9:net/l4.tcp-connection` is **live state inside the
+    spawner's own store**: the l4 provider is composed wasm (`net.l4.over-l2`'s smoltcp instance in
+    the spawner's linear memory) — there is no host net provider, no host table to take the handle
+    from, and no cross-store call brokering (that is the Message API, deliberately not yet designed).
+    Wasm task stores are isolated; one NIC is claimable by one task at a time. Consequences, pinned:
+    a per-connection child task cannot receive the spawner's connection; concurrent network sessions
+    in separate tasks would each need their own NIC+stack. **Chosen mechanism:** the connection never
+    crosses a task boundary — `net.text` owns listen+accept *inside the fused session task*
+    (`net.virtio $ net.l4.over-l2 $ net.text $ eosh` is one task), and the supervisor (`telnetd`,
+    plan/10) serves sessions *sequentially*, one fused task per session, respawning the same compiled
+    image. Bounded-concurrency-of-4 from the area brief is therefore deferred to the Message API (or
+    a host-side per-task text broker): recorded here so it is not silently dropped.
+
+    *The stub.* `guest/stubs/net-text` (crate-local world `eo9:net-text/net-text`, the over-l2
+    cross-package precedent: imports `eo9:net/l4`, exports `eo9:text/{types,text,net-text-config}`).
+    `configure(port: u16)` — additive `net-text-config` interface in `wit/text` (port 0 is a
+    configure error); unconfigured default port 23, bound lazily on first `read-line` (option-C
+    plain-composition rule). One session per instance: after accepting, the listener is **dropped**,
+    so extra connection attempts are refused by the transport itself (TCP RST — immediate and
+    deterministic). Refuse-with-a-message was considered and rejected for v1: l4 `accept` carries a
+    fixed multi-second deadline and no quick-poll flavor, so interleaving accept with the session's
+    recv would add up to one accept-deadline of input latency per idle cycle; recorded as a possible
+    follow-up if the WIT ever grows caller-supplied deadlines (the F8 open call).
+
+    *NVT.* Refuse-all telnet negotiation (WILL→DONT, DO→WONT, negatives never answered — the RFC 854
+    loop rule; subnegotiations skipped; IAC IAC literal; everything else of telnet unimplemented and
+    documented as such: no ECHO/SGA/NAWS, no urgent data — clients local-echo, which is what nc and
+    line-mode telnet do anyway). CR LF / CR NUL / bare CR / bare LF all end a line; 4 KiB line cap;
+    lossy UTF-8. `write` is sync in the text WIT while the transport is async, so output is buffered
+    (64 KiB cap, drop-and-flag-once) and delivered at `read-line` boundaries — exactly right for a
+    prompt-driven consumer (eosh writes its prompt immediately before reading); a write-only program
+    composed over net.text would never connect, documented.
+
+    *Session end — and the l4 close gap (workaround, ledger-worthy).* Peer close → `read-line`
+    answers `none` → eosh exits cleanly. The line `exit` is intercepted at the NVT layer: goodbye,
+    FIN, then `none` — because once the consumer exits, nothing ever runs the provider again to
+    perform the close handshake, and a task-store teardown sends no FIN (the client would hang).
+    Flushing the FIN itself needs a pump, and l4 has **no explicit close/flush operation** — the
+    workaround is a bounded throwaway `accept` on an ephemeral listener (its deadline pumps the
+    FIN/ACK exchange). GAP recorded: `eo9:net/l4` wants a `close: async func(tcp-connection)`
+    (graceful shutdown as a first-class await); until then every l4 consumer that must close cleanly
+    after its last real operation needs this trick. Remote `poweroff` is *not* intercepted: it
+    propagates as the fused task's outcome and the supervisor refuses it (plan/10).
+
+    **SECURITY, said loudly here as in the WIT and the crate header: cleartext, unauthenticated.
+    Whoever reaches the port owns the session. Trusted-LAN/dev tool only; SSH explicitly deferred.**
