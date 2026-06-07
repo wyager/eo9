@@ -31,6 +31,18 @@ use core::arch::global_asm;
 #[cfg(feature = "board-opi5plus")]
 global_asm!(
     r#"
+// Boot-bisection beacon: bang one raw char at the DW UART2 THR (0xfeb5_0000, stride-4),
+// polling LSR (+0x14) THRE (bit 5) first. Pre-MMU, pre-stack, EL2 or EL1 — the line is
+// whatever U-Boot left (1.5 Mbaud 8n1). Clobbers x1/x2 only. The beacons stay in the
+// final image: they cost nothing and the "ABC…" prefix reads as a boot signature.
+.macro eo9_beacon ch
+    movz    x1, #0xfeb5, lsl #16
+10: ldr     w2, [x1, #0x14]
+    tbz     w2, #5, 10b
+    mov     w2, #\ch
+    str     w2, [x1]
+.endm
+
 .section .text.header, "ax"
 .globl _image_header
 _image_header:
@@ -50,10 +62,50 @@ _image_header:
 _board_entry:
     // Preserve the DTB pointer (x0) across the drop; x20 is dead this early.
     mov     x20, x0
+
+    // 'A': the literal first instructions after the loader's jump. If even A is missing,
+    // the jump itself (address, image bytes, UART) is the problem, not any later stage.
+    eo9_beacon 0x41
+
+    // Clean+invalidate the whole kernel footprint ([__kernel_start, __image_end) — image
+    // plus .bss and the boot stack) to the Point of Coherency, then drop the I-cache.
+    //
+    // Why: the serial-loader stub writes the payload through U-Boot's live EL2 D-cache
+    // and its pre-jump sweep is `dc cvau` — Point of Unification only. This kernel then
+    // `eret`s to EL1 with SCTLR_EL1 M/C/I = 0, where every fetch and data access goes
+    // straight to DRAM (the PoC): any line still dirty above the PoC means stale DRAM
+    // bytes — a silent wild jump. Sweeping to PoC here, while still on the boot path the
+    // loader's own PoU sweep made fetchable, makes the image self-coherent no matter how
+    // it was loaded (under `booti` with caches off every op is a cheap clean-line no-op).
+    // Covering .bss/.stack also evicts stale *dirty* lines left over from U-Boot's earlier
+    // use of low DRAM, which could otherwise write back over our cache-off stores at any
+    // moment (the EL1 pre-MMU world writes uncached; translation tables live in .bss).
+    adrp    x1, __kernel_start
+    add     x1, x1, :lo12:__kernel_start
+    adrp    x2, __image_end
+    add     x2, x2, :lo12:__image_end
+    mrs     x3, ctr_el0
+    ubfx    x3, x3, #16, #4         // DminLine: log2(words)
+    mov     x4, #4
+    lsl     x3, x4, x3              // D-cache line size in bytes
+    sub     x4, x3, #1
+    bic     x1, x1, x4              // align down to a line
+11: dc      civac, x1               // clean+invalidate to PoC
+    add     x1, x1, x3
+    cmp     x1, x2
+    b.lo    11b
+    dsb     sy
+    ic      iallu
+    dsb     sy
+    isb
+
+    // 'b' if entered at EL1 directly; 'B' after the EL2->EL1 drop (banged at 9: below).
+    mov     w21, #0x62
     mrs     x1, CurrentEL
     lsr     x1, x1, #2
     cmp     x1, #2
     b.ne    9f                      // already EL1: continue
+    mov     w21, #0x42
     // Configure EL1 from EL2, then drop.
     msr     cntvoff_el2, xzr        // virtual counter == physical counter
     mov     x1, #(1 << 31)          // HCR_EL2.RW: EL1 executes aarch64
@@ -70,7 +122,12 @@ _board_entry:
     adr     x1, 9f
     msr     elr_el2, x1
     eret
-9:  mov     x0, x20
+9:  // 'B' (post-drop) or 'b' (entered at EL1): the EL2->EL1 trampoline survived.
+    movz    x1, #0xfeb5, lsl #16
+12: ldr     w2, [x1, #0x14]
+    tbz     w2, #5, 12b
+    str     w21, [x1]
+    mov     x0, x20
     b       _start
 "#
 );

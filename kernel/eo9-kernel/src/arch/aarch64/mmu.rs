@@ -199,6 +199,8 @@ pub fn init() {
             options(nostack, preserves_flags),
         );
     }
+    // 'E': translation and caches are on — the first device access through the new map.
+    crate::beacon!(b'E');
     crate::kprintln!(
         "mmu: identity map enabled (device {} GiB block(s), DRAM {:#x}..{:#x} at 4 KiB \
          pages, heap W^X, caches on)",

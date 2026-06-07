@@ -99,7 +99,11 @@ mod hw {
 
 #[cfg(all(target_arch = "aarch64", feature = "board-opi5plus"))]
 pub fn arm_and_report() {
-    if hw::arm() {
+    let armed = hw::arm();
+    // 'G': the watchdog arm sequence completed (either way); `wdt: …` follows on the
+    // real console path.
+    crate::beacon!(b'G');
+    if armed {
         crate::kprintln!(
             "wdt: armed ({}s) - a hang now resets the SoC back to U-Boot",
             hw::TIMEOUT_SECS
@@ -111,11 +115,35 @@ pub fn arm_and_report() {
 
 /// Pat the watchdog. Called from every drive-loop pass and every idle wake; a no-op off
 /// the board profile (QEMU runs carry no watchdog and are byte-for-behavior unchanged).
+///
+/// The console heartbeat rides the same chokepoint: a pat is exactly the "the kernel is
+/// making scheduling progress" signal, so its console echo (`hb <ms>`) belongs here —
+/// every drive-loop pass and every idle wake (the backstop guarantees at least ~1/s when
+/// idle) flows through, and a live-but-quiet kernel stays distinguishable from a hung one
+/// within seconds on a serial capture.
 #[cfg(all(target_arch = "aarch64", feature = "board-opi5plus"))]
 #[allow(dead_code)] // callers live in the wasm drive loops (feature-gated)
 #[inline]
 pub fn pat() {
     hw::pat();
+    heartbeat();
+}
+
+/// Emit `hb <uptime-ms>` on the console roughly every [`HB_PERIOD_NS`] (grep-stable; the
+/// cadence is pat-quantised, so "rate-exact enough"). Single boot core: relaxed atomics.
+#[cfg(all(target_arch = "aarch64", feature = "board-opi5plus"))]
+fn heartbeat() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    /// ~5 s between heartbeats.
+    const HB_PERIOD_NS: u64 = 5_000_000_000;
+    /// Uptime at/after which the next heartbeat fires (0 → first pat prints `hb 0`-ish
+    /// immediately, a cheap "drive loop reached" marker).
+    static NEXT_HB_NS: AtomicU64 = AtomicU64::new(0);
+    let now = crate::timer::uptime_ns();
+    if now >= NEXT_HB_NS.load(Ordering::Relaxed) {
+        NEXT_HB_NS.store(now + HB_PERIOD_NS, Ordering::Relaxed);
+        crate::kprintln!("hb {}", now / 1_000_000);
+    }
 }
 
 #[cfg(not(all(target_arch = "aarch64", feature = "board-opi5plus")))]

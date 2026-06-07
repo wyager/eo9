@@ -199,6 +199,16 @@ pub fn tx_drain() {
     }
 }
 
+/// Boot-bisection beacon (board profile): bang one raw char straight at the DW UART THR,
+/// polling LSR THRE — usable from any boot stage, pre- and post-MMU (the UART window is
+/// identity-mapped Device memory once translation is on, and plain physical before).
+/// The asm twin lives in boot.rs (`eo9_beacon`) for the stages before Rust runs.
+/// Call through the [`crate::beacon!`] macro so non-board builds stay byte-identical.
+#[cfg(feature = "board-opi5plus")]
+pub fn beacon_raw(c: u8) {
+    put_byte(c);
+}
+
 /// Write one byte, spinning while the transmitter is busy.
 pub fn put_byte(byte: u8) {
     while hw::tx_busy() {
