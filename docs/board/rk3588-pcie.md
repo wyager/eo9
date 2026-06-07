@@ -1,10 +1,31 @@
 # RK3588 PCIe: the DesignWare config-access shim (design note)
 
-Status: **design only** — QEMU cannot emulate the DesignWare controller, so nothing here is
-verifiable before the board arrives. Register names/addresses come from the public RK3588
-TRM (V1.0, part 2) and the mainline Linux drivers (`pcie-designware-host.c`,
-`pcie-dw-rockchip.c`); every address is marked **[verify-on-board]** where the DTB is the
-real authority.
+Status: **implemented** (area/12-pcie-eth) — the `ConfigAccess` shim + DW implementation
+live in `kernel/eo9-kernel/src/pci.rs`, the board constants + full bring-up (clocks,
+resets, combphy, PERST, LTSSM) in `kernel/eo9-kernel/src/arch/aarch64/rk3588_pcie.rs`
+(every constant cited to its Linux v6.12 source there). The QEMU half (ECAM behind the
+same trait) is verified bit-for-bit; the DW half awaits its first board run. Two design
+notes below were superseded by implementation findings, marked **[superseded]**.
+
+**Board-derived facts replacing the old [verify-on-board] marks** (the captured vendor
+control FDT `.claude/board-bringup/vendor-control-fdt.dtb` + mainline
+`rk3588-orangepi-5-plus.dts` / `rk3588-base.dtsi`):
+
+* The two onboard RTL8125 NICs hang off **`pcie2x1l1`** (right port, combphy2, PERST
+  GPIO3_B3) and **`pcie2x1l2`** (left port, combphy0, PERST GPIO4_A2) — *not* the
+  controllers this note originally guessed. `pcie2x1l0` is the M.2 E-key.
+* **Vendor U-Boot pre-initializes none of them.** Its control FDT contains exactly one
+  PCIe node (`pcie@fe150000` = pcie3x4, the M.2 M-key); "PCIe-0 Link Fail" in the boot
+  log was the empty M.2 socket. The day-one "rely on U-Boot bring-up" shortcut from the
+  table below is therefore **void**: the kernel owns the full PHY/clock/reset/LTSSM
+  sequence from the first run.
+* DBI blocks live at `0x0a_40c0_0000` / `0x0a_4100_0000` — **above 4 GiB**, which forced
+  the board MMU profile to T0SZ=28 (36-bit VA) with a Device block at level-1 entry 41
+  (mmu.rs). The config apertures (`0xf300_0000`/`0xf400_0000`), APB blocks
+  (`0xfe18_0000`/`0xfe19_0000`) and 32-bit mem windows stay inside the existing
+  fourth-gigabyte device map.
+* Both NICs share one GPIO-gated 3.3 V rail (`vcc3v3_pcie_eth`, GPIO3_B4 **active low**,
+  50 ms startup) — a bring-up step no PCIe doc mentions.
 
 ## The problem
 
@@ -30,6 +51,13 @@ but it has to go behind an abstraction.
 
 ## The shim: a `ConfigAccess` trait
 
+**[superseded]** The shipped trait is *address-mapping* shaped (`map(bus, dev, fn,
+offset) -> Option<usize>`, Linux's `pci_ops.map_bus` pattern) rather than the
+read32/write32 pair sketched here: deriving sub-word writes from a 32-bit RMW would
+write Status (offset 0x06, RW1C bits) back when a driver writes Command (0x04, Word) —
+a real bug the sketch contained. With `map`, every access width hits the bus exactly as
+the pre-shim ECAM code did. The sketch, for the record:
+
 ```rust
 /// How configuration space is reached on this machine. All methods take the
 /// canonical (segment, bus, device, function) + register offset.
@@ -37,7 +65,7 @@ trait ConfigAccess {
     fn read32(&self, bdf: Bdf, offset: u16) -> u32;
     fn write32(&self, bdf: Bdf, offset: u16, value: u32);
     // read8/16 + write8/16 derived from the 32-bit ops (RMW for sub-word writes,
-    // exactly as pci.rs already does internally for ECAM).
+    // exactly as pci.rs already does internally for ECAM).   // <- wrong, see above
 }
 
 struct Ecam { base: usize }                  // QEMU virt: today's behavior, verbatim.
@@ -79,7 +107,17 @@ implementing blind).
 | MSI | not used (INTx only) | available via the DW core's internal MSI block (doorbell write to a controller-owned address, one SPI upstream) — **defer**; INTx first, exactly like the QEMU bring-up did |
 | ECAM `highmem=off` pin | keeps ECAM < 1 GiB | n/a — but the DBI/aperture addresses live at `0xf500_0000`–`0xfe9f_ffff`, so the kernel's identity-mapped device window must cover that range (see the board doc's MMU item) |
 
-## Suggested order on the board
+## Suggested order on the board **[superseded by the implemented bring-up]**
+
+What actually shipped (rk3588_pcie.rs `init`): PD_PCIE check/poke → PPLL diagnostic →
+NIC rail on (50 ms) → shared clock roots → per controller: PERST low, controller resets
+asserted, combphy (resets asserted → clocks + 100 MHz refclk div/mux → GRF PCIe mode →
+PHY tuning regs → resets deasserted), controller resets deasserted + clocks, APB RC
+mode, DBI sanity + root-port setup (x1 lanes, buses 0/1/15, bridge class, mem window +
+identity MEM iATU region 1), LTSSM enable, 100 ms, PERST high, ≤1.1 s bounded link poll
+→ `link UP genX x1` / `link DOWN (ltssm …, debug …)`, controller marked FULL/ROOT_ONLY
+for the shim. Every wait bounded; every step prints before touching a new block. The
+original sketch:
 
 1. Refactor `pci.rs` over `ConfigAccess` under QEMU (no behavior change, full battery green) — *can be done before arrival*.
 2. Day one: read the DTB's `pcie@…` nodes for dbi/aperture/ranges/interrupts; hardcode the

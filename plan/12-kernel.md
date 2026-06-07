@@ -1997,3 +1997,59 @@ gating: `svc_shell::restart_cycles_complete_while_the_foreground_is_quietly_bloc
 fails under heavy parallel host load on the UNMODIFIED base tree too (2/3 base-tree
 failures at load ≈ 17 with a concurrent agent's QEMU battery; 8/8 green in a quiet
 window) — the wall-time pacing class, not this branch.
+
+## Entry 81 — the ethernet lane, kernel side: ConfigAccess shim + RK3588 DW-PCIe bring-up (2026-06-07)
+
+Hardware goal #2 (docs/board/orange-pi-5-plus.md): the two onboard RTL8125 NICs are PCIe
+devices, so `lspci` showing `10ec:8125` on the board is the acceptance for this lane. The
+wasm rtl8125 driver (eo9:net/l2) is the follow-up lane; this entry is config access +
+link bring-up + enumeration.
+
+* **`ConfigAccess` shim** (src/pci.rs): config space goes behind a per-controller trait,
+  *map-shaped* (`map(bus,dev,fn,offset) -> Option<usize>`, Linux `pci_ops.map_bus`) rather
+  than the design note's read32/write32 sketch — sub-word writes derived by 32-bit RMW
+  would have written RW1C Status bits back on every Command word write. `Ecam` keeps
+  QEMU's address arithmetic verbatim; `DwPcie` (board-gated) reaches the root port via
+  DBI (ghost-device guard: only 0/0/0 answers on the root bus, only dev 0 on the
+  secondary — mainline `dw_pcie_valid_device` parity) and downstream functions via an
+  unrolled-iATU outbound CFG0/CFG1 region (settle-checked enable readback, target cache).
+  The DW walk covers buses 0–1 only: the kernel does not program bridge secondary buses,
+  so deeper bus numbers can never hold a reachable device, and blind CFG1 probes there
+  are an UR/SError surface worth zero (the CFG1 arm stays for the bridge follow-up).
+  `FunctionAddress` gains the segment; controllers are segments with per-segment BAR
+  windows/bump allocators. QEMU = single ECAM segment 0: canonical demo + `pci
+  program=lspci` outputs diffed against the unrefactored base — byte-identical kernel
+  output (timing/heap-start aside). riscv64/x86_64 pci_map surfaces unchanged.
+* **Board reality vs the design note** (vendor control FDT captured from the board +
+  mainline dts): the NICs are `pcie2x1l1` (right port, combphy2, PERST GPIO3_B3) and
+  `pcie2x1l2` (left, combphy0, PERST GPIO4_A2); vendor U-Boot's control FDT carries ONLY
+  `pcie3x4` (its "PCIe-0 Link Fail" = the empty M.2) → **zero firmware pre-init for the
+  NIC controllers**, the kernel owns everything. Both NICs share one GPIO-gated 3.3 V
+  rail (GPIO3_B4 active-low, 50 ms startup, opi-5-plus dts `vcc3v3_pcie_eth`).
+* **MMU**: the DBI blocks sit at 41 GiB (`0xa_40c0_0000`/`0xa_4100_0000`) — board profile
+  widened to T0SZ=28 (36-bit VA, still a level-1 walk start) + Device block at L1 entry
+  41. QEMU keeps T0SZ=32.
+* **Bring-up** (arch/aarch64/rk3588_pcie.rs, every constant cited to Linux v6.12 source
+  in the module's table): PD_PCIE check (PMU 0x150 bit7; poke + settle if gated) → PPLL
+  diagnostic (m/p/s decode, expected 1100 MHz — the 100 MHz combphy refclk divides it by
+  11) → NIC rail → CRU gates (shared roots + per-port aclk/pclk/aux/pipe) → combphy per
+  phy-rockchip-naneng-combphy.c rk3588 PCIe arm (GRF con0..3, pipe sel for combphy2,
+  pipe_clk_100m, KVCO/LPF/rx_trim/su_trim) wrapped in the mainline reset choreography →
+  controller resets/clocks → APB RC mode + LTSSM_ENABLE_ENHANCE → DBI sanity print →
+  dw_pcie_setup_rc essentials (x1 lanes, buses 0/1/15, bridge class behind DBI_RO_WR_EN,
+  type-1 mem window, identity MEM iATU region 1; region 0 belongs to the config shim) →
+  LTSSM enable, 100 ms PERST hold (mainline's deliberate margin), release, ≤1.1 s bounded
+  poll. Outcomes are typed + grep-stable: `link UP genN xM (ltssm …)` → controller FULL
+  (root port + endpoints enumerate), `link DOWN … (ltssm …, debug …)` → ROOT_ONLY (config
+  access still provable on the bench), DBI dead → disabled. Every step prints before
+  first touch of a new block, all waits bounded, watchdog armed before any of it runs.
+* **INTx**: deferred by design — DW muxes all four pins on one SPI per controller
+  (245/250, edge-rising) demuxed via PCIE_CLIENT_INTR_STATUS_LEGACY; per-(segment,line)
+  state the swizzle model lacks. `pci_intx::WIRED = false` on the board (provider answers
+  `unsupported`; lspci needs none); the demux design is in the module docs for the driver
+  lane.
+* **Images**: minimal store gains `lspci`; bench = serial-loader path, bootargs
+  `program=lspci pci`. Acceptance lines: two `pcie[…]: link …` prints, then lspci showing
+  `0000:00:00.0 1d87:3588 … pci-bridge`, `0000:01:00.0 10ec:8125 … endpoint` (right) and
+  the same pair on segment 0001 (left). Full ci + canonical aarch64/riscv64 demos +
+  `pci program=lspci` green; board images rebuilt.
