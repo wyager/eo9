@@ -70,12 +70,15 @@ _board_entry:
     // Clean+invalidate the whole kernel footprint ([__kernel_start, __image_end) — image
     // plus .bss and the boot stack) to the Point of Coherency, then drop the I-cache.
     //
-    // Why: the serial-loader stub writes the payload through U-Boot's live EL2 D-cache
-    // and its pre-jump sweep is `dc cvau` — Point of Unification only. This kernel then
+    // Why: loaders make no PoC promise this kernel can rely on. The serial-loader stub
+    // writes the payload through U-Boot's live EL2 D-cache; its pre-jump sweep is
+    // `dc civac` (PoC) since 2026-06-07, but it was `dc cvau` (Point of Unification
+    // only) before that, an already-running stub keeps its old sweep until re-poked,
+    // and other transports (`booti`, mm-poke) promise nothing. This kernel then
     // `eret`s to EL1 with SCTLR_EL1 M/C/I = 0, where every fetch and data access goes
     // straight to DRAM (the PoC): any line still dirty above the PoC means stale DRAM
     // bytes — a silent wild jump. Sweeping to PoC here, while still on the boot path the
-    // loader's own PoU sweep made fetchable, makes the image self-coherent no matter how
+    // loader's own sweep made fetchable, makes the image self-coherent no matter how
     // it was loaded (under `booti` with caches off every op is a cheap clean-line no-op).
     // Covering .bss/.stack also evicts stale *dirty* lines left over from U-Boot's earlier
     // use of low DRAM, which could otherwise write back over our cache-off stores at any
