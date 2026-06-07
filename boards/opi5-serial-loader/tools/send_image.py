@@ -19,7 +19,9 @@ image) while still catching a dead/derailed stub within seconds instead of at th
 (macOS buffers serial writes deeply, so local write counts mean little; the acks are
 the progress truth.)
 
-x0_value: pass U-Boot's ${fdtcontroladdr} (`printenv fdtcontroladdr` on the board).
+x0_value: pass the control FDT address from `bdinfo` on the board (the `fdt_blob`
+line — the `fdtcontroladdr` environment variable is UNSET on this vendor U-Boot, so
+`printenv fdtcontroladdr` yields nothing).
 With the booti launch you may pass --x0 0 — the stub then forwards its own entry x0,
 which booti already set to the device tree.
 

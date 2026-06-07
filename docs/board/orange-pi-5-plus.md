@@ -51,19 +51,23 @@ Vendor (Orange Pi) U-Boot images use the same offsets. If the shipped SD/eMMC al
 boots to a U-Boot prompt, **skip all of this on day one** and use the existing loader —
 the recipe matters only for a from-scratch card.
 
-## Boot flow (day one: load over serial-interactive U-Boot from SD)
+## Boot flow (as actually flown: the serial loader, not SD/`booti`)
 
-```
-# at the U-Boot prompt (1500000 8N1 on the 3-pin debug header):
-bdinfo                                   # confirm DRAM base/size        [verify-on-board]
-fdt addr ${fdtcontroladdr}; fdt print /chosen
-load mmc 1:1 0x00480000 eo9-kernel.img   # flat Image with Linux header (item 1)
-load mmc 1:1 0x0a000000 rk3588-orangepi-5-plus.dtb
-booti 0x00480000 - 0x0a000000
-```
+The live flow is the serial loader stub: bootstrap it once over the prompt
+(prompt-paced `mm.l` + a `crc32` cross-check), launch with `go`, then
+`boards/opi5-serial-loader/tools/send_image.py` streams the flat image to
+`0x0020_0000` and jumps with the control FDT address in `x0` — the full recipe and
+doctrine live in [bringup-playbook.md](bringup-playbook.md) §2.
 
-`text_offset` in the Image header must match the load offset convention (`0x0` with
-`booti` placing the kernel at a 2 MiB-aligned address it likes; print-and-verify day one).
+The SD/`booti` recipe this draft originally sketched here is retired as a launch
+path. Historical incident (2026-06-04): the vendor U-Boot's `booti` data-aborted
+inside its own image heuristics on our minimal image (ESR `0x96000010`) and its
+recovery reset then failed, wedging the board until a physical power cycle
+(playbook §2.3) — vendor boot commands are treated as hostile. The image keeps its
+64-byte arm64 `Image` header anyway, for mainline U-Boot or any future sane
+bootloader. Two prompt-side cautions that survive from the draft: take the control
+FDT address from `bdinfo`'s `fdt_blob` (the `fdtcontroladdr` environment variable was
+unset on the vendor U-Boot), and print-and-verify any load address before jumping.
 
 ## Day-one smoke plan (in order, each step has a visible success)
 
