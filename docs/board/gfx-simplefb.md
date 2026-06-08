@@ -33,11 +33,14 @@ host-tested `gfxfb` module: the cross-backend checksum identity with gfx.mem at
 800×480 is pinned there and in tests/eo9-integration/tests/gfx.rs
 (`0xd66b49ee575ff0d9` for draw's frame 1).
 
-**Colorspace caveat (docs, not contract):** the board's HDMI link mangles chroma — the
-buffer is scanned as RGB while the link/downstream interprets YCbCr, so saturated
-colors render consistently wrong while grayscale (r=g=b) renders faithfully. Pixel
-values are stored and read back faithfully regardless; the fix is an AVI
-InfoFrame/colorspace change at the HDMI TX, recorded as the deferred color follow-up.
+**Colorspace caveat (docs, not contract):** the board's HDMI link can mangle chroma —
+the buffer is scanned as RGB while the link/downstream may interpret YCbCr, in which
+case saturated colors render consistently wrong while grayscale (r=g=b) always renders
+faithfully. The M1+M2 acceptance boot (2026-06-08) showed the mangling is
+**boot-state-dependent**: colors rendered correctly that cycle after U-Boot's HDMI
+re-init (see the plan doc's observed variance). Pixel values are stored and read back
+faithfully regardless; the deferred follow-up is making the link colorspace
+deterministic at the HDMI TX (AVI InfoFrame), not a provider change.
 
 The sections below are the original design note (the simple-framebuffer FDT path stays
 the plan for boards whose firmware publishes the node).

@@ -37,6 +37,13 @@ deferred follow-up lane.
   Consequence: **grayscale (r=g=b) renders correctly through the mismatch** — the
   luma-first v1 needs no pipeline fix at all. True color later = AVI InfoFrame /
   colorspace fix at the HDMI TX, recorded as the deferred color follow-up.
+  - **Observed variance (M1+M2 acceptance boot, 2026-06-08): the mangling did NOT
+    recur** — `draw`'s pattern rendered with correct colors after that boot's U-Boot
+    HDMI re-init, so the mismatch is boot-state-dependent (whatever AVI/colorspace
+    state the TX negotiates that cycle), not a fixed property of the link. The
+    provider semantics are unaffected either way (pixel values are stored and read
+    back faithfully; the identity checksum passed on the same boot); the deferred
+    color follow-up becomes "make the colorspace deterministic", not "fix it".
 
 ## Consequences for the lane (luma-first, per owner direction)
 
