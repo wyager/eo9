@@ -29,6 +29,9 @@ const GUEST_COMPONENTS: &[&str] = &[
     // The smallest executor: runs another program (a component-typed main argument)
     // and reports how long it took (plan/03 component arguments).
     "eo9-example-time",
+    // The shell-over-network supervisor (plan/09 D44, plan/10): serves
+    // `net.virtio $ net.l4.over-l2 $ net.text $ eosh` sessions sequentially.
+    "eo9-example-telnetd",
     "eosh",
     // The service-boot program (executor v1, docs/design/executor-model.md).
     "init",
@@ -200,6 +203,14 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-stub-net-l2-bridge", "net.l2.bridge"),
     ("eo9-stub-net-l4-over-l2", "net.l4.over-l2"),
     ("eo9-example-l4check", "l4check"),
+    // The shell over the network (plan/09 D44): the socket-backed text provider and its
+    // supervisor, so the metal prompt can serve telnet sessions against the QEMU
+    // user-mode NIC (boot with the `pci` grant and the xtask `net telnet` flags, then
+    // `telnetd`, then from the host `nc localhost 5555`). Cleartext + unauthenticated —
+    // a trusted-LAN/dev tool only; `check-telnet` is the scripted end-to-end gate.
+    //   net.virtio $ net.l4.over-l2 $ net.text $ eosh   (what telnetd composes)
+    ("eo9-stub-net-text", "net.text"),
+    ("eo9-example-telnetd", "telnetd"),
     // The two-stack transport check, so the full shared-link payoff runs at the metal
     // prompt — two l4 stacks, each riding its own switch port, each resolving real DNS
     // (one physical NIC, two virtual MACs, two IP stacks; plan/09 D31):

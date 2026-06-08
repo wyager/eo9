@@ -1,0 +1,17 @@
+# The network-shell supervisor: composes the per-session stack and serves sessions
+# sequentially (one fused task per session).
+[package]
+name = "eo9-example-telnetd"
+description = "Eo9 program `telnetd`: the shell-over-network supervisor — resolves net.virtio, net.l4.over-l2, net.text, and eosh from /bin, composes them into one session stack, compiles once, and serves telnet sessions sequentially (spawn, wait, respawn). Cleartext and unauthenticated (net.text): a trusted-LAN/dev tool only; remote poweroff is refused."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }
