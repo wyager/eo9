@@ -428,4 +428,8 @@ the 5555 hostfwd port; the NEXT gate then died instantly with "serial stream end
 and zero output — a failure mode that doesn't name the cause. Two fixes: make the
 gates' teardown verify process exit (kill-by-port preflight or a bind check before
 launch), and make the instant-EOF failure print "port 5555 already in use?" as a
-hint. xtask lane, small.
+hint. xtask lane, small. Same family (usb lane, same day): check-telnet's FLAT step
+timeout killed a healthy run on a loaded host — the round-9 sliced codegen trades
+wall-clock for liveness, so compiles take longer under contention while printing
+progress the whole way. Gates should use progress-aware timeouts (no-progress alarm,
+like the serial-loader sender) rather than flat bounds.
