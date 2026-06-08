@@ -421,3 +421,15 @@ During the area/09 merge review, `svc_shell` failed once (exit 101) in the paral
 branch under review does not touch svc/shell paths — smells like load-sensitive
 timing in the service-restart tests. Watch item: if it recurs, it graduates to a
 real bug hunt (record the failing test name and seed next time).
+
+## Platform-provider DMA teardown has no generic quiesce (recorded 2026-06-08, USB M0 lane)
+`eo9:platform` frees a task's DMA buffers at teardown exactly like `eo9:pci` — but a
+platform device has no bus-master bit, so the provider cannot generically revoke a
+device's licence to DMA before the memory returns to the heap (pci_provider's
+quiesce-before-free, study 09 finding 6, has no platform analogue). Harmless today:
+the only region tables are the QEMU test regions (PL031/PL061, no bus mastering) and
+the empty board table. BEFORE the M1 board lane adds the RK3588 OHCI regions, region
+teardown must gain a device-aware quiesce hook (for OHCI: HcControl -> reset, which
+halts all schedule DMA) or an equivalent containment story. Also recorded there: the
+PCI provider's claim exclusivity is still per-task while platform's is machine-wide —
+converge PCI on the machine-wide discipline (its recorded follow-up).

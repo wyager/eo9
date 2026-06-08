@@ -371,6 +371,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("check-telnet", rest)?;
             check_telnet(&root)
         }
+        "check-usb" => {
+            expect_no_args("check-usb", rest)?;
+            check_usb(&root)
+        }
         "firstpoll-ab" => {
             let mut rounds: u32 = 5;
             let mut gate_only = false;
@@ -487,6 +491,14 @@ COMMANDS:
                          at the serial eosh prompt, screendump the scanout over QMP after each,
                          and compare both images pixel-for-pixel against the independently
                          computed expected pattern
+    check-usb            Boot the aarch64 kernel under QEMU with an OHCI USB controller and a
+                         keyboard (-device pci-ohci -device usb-kbd) plus the platform grant
+                         (pci platform=pl031-rtc), drive the M0 USB lane at the serial eosh
+                         prompt: platcheck (the eo9:platform typed contract, 6 probes),
+                         `usb.ohci-pci $ usbcheck` (full enumeration + descriptor chain of the
+                         QEMU keyboard, 0627:0001), `usb.ohci $ usbcheck` (typed no-controller
+                         — no OHCI region on QEMU), and `usb.ohci-pci $ hidcheck` with QMP
+                         input-send-event key injection (decoded boot-protocol keystrokes)
     check-telnet         Boot the aarch64 kernel under QEMU with a user-mode NIC and a slirp
                          host-forward (pci net telnet), drive `telnetd --sessions 2` at the
                          serial eosh prompt, and validate the shell-over-network end to end
@@ -2706,6 +2718,11 @@ fn ensure_storedisk_mac_key(root: &Path) -> Result<PathBuf, String> {
 /// scanout is visible while you type at the prompt — `cargo xtask qemu aarch64 pci gpu
 /// display`, then `gpu.virtio $ draw` (this is what `make gfx` runs).
 ///
+/// A bare `usb` argument attaches an OHCI USB controller as a PCI function with a
+/// usb-kbd behind it plus a QMP socket for key injection, so the `usb.ohci-pci` driver
+/// has a controller to claim — `cargo xtask qemu aarch64 pci usb` (add
+/// `platform=pl031-rtc` to also grant the platform test region for `platcheck`).
+///
 /// A bare `telnet` argument implies `net` and adds a slirp host-forward to the user-mode
 /// netdev (`hostfwd=tcp:127.0.0.1:5555-:23`), so a guest telnet daemon listening on port
 /// 23 (`telnetd`, plan/09 D44 — cleartext, unauthenticated, dev use only) is reachable
@@ -2846,6 +2863,7 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
     let mut attach_disk = false;
     let mut attach_net = false;
     let mut attach_gpu = false;
+    let mut attach_usb = false;
     let mut net_dump = false;
     let mut telnet_fwd = false;
     let mut attach_store_disk = false;
@@ -2861,6 +2879,8 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
             telnet_fwd = true;
         } else if argument == "gpu" {
             attach_gpu = true;
+        } else if argument == "usb" {
+            attach_usb = true;
         } else if argument == "netdump" {
             // Capture the user-net link to kernel/target/eo9-net.pcap (implies `net`),
             // so link-level evidence — e.g. the virtual-NIC switch's per-port MACs in
@@ -2939,6 +2959,19 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         }
         args.push("-device".into());
         args.push("virtio-net-pci,netdev=eo9net,disable-legacy=on".into());
+    }
+    if attach_usb {
+        // An OHCI USB host controller as a PCI function carrying a full-speed
+        // keyboard, plus a QMP socket so keys can be injected (`check-usb` is the
+        // scripted gate; this flag is the manual exploration path):
+        //   cargo xtask qemu aarch64 pci "platform=pl031-rtc" usb
+        // then `usb.ohci-pci $ usbcheck` / `platcheck` at the prompt.
+        args.push("-device".into());
+        args.push("pci-ohci,id=eo9ohci".into());
+        args.push("-device".into());
+        args.push("usb-kbd,bus=eo9ohci.0".into());
+        args.push("-qmp".into());
+        args.push(format!("unix:{},server=on,wait=off", usb_qmp_socket(root).display()).into());
     }
     if attach_gpu {
         // A virtio-gpu function at a pinned 640x480 (so the draw demo's pattern — and
@@ -3796,6 +3829,281 @@ fn compare_ppm(path: &Path, frame: u32) -> Result<(), String> {
 }
 
 // ----------------------------------------------------------------------------------------
+// ----------------------------------------------------------------------------------------
+// check-usb: headless verification of the USB host stack M0 lane (wit/platform, wit/usb,
+// the eo9-ohci core, usb.ohci-pci/usb.ohci, usbcheck/hidcheck/platcheck) — see
+// docs/board/usb-ohci-plan.md.
+//
+// Boots the aarch64 kernel under QEMU with the `pci` grant plus the restricted platform
+// grant `platform=pl031-rtc`, an OHCI controller as a PCI function (-device pci-ohci)
+// carrying a full-speed keyboard (-device usb-kbd), and a QMP socket for key injection;
+// drives the serial eosh prompt like a (paced) human through four steps:
+//
+//   1. `platcheck` — the eo9:platform provider's typed contract, live: enumerate shows
+//      exactly the granted region, claim works and reads, double-claim answers busy,
+//      out-of-range refuses typed, a present-but-ungranted region answers denied (the
+//      cross-region containment of the per-name grant), an unknown name not-found.
+//   2. `usb.ohci-pci $ usbcheck` — bring-up (HcRevision/ports), port watch, then the
+//      full enumeration and descriptor chain of the QEMU keyboard (0627:0001, boot
+//      keyboard 3/1/1, interrupt-IN 0x81).
+//   3. `usb.ohci $ usbcheck` — the board shell over eo9:platform refuses typed with
+//      no-controller (QEMU's region table carries no OHCI; the M1 board profile does).
+//   4. `usb.ohci-pci $ hidcheck` — boot-protocol configuration, then QMP
+//      `input-send-event` key injection ('h', 'i', Enter, down+up each) decoded as
+//      keystrokes, with the closing reports/s line.
+// ----------------------------------------------------------------------------------------
+
+/// How long to wait for the eosh prompt / a step outcome before declaring the boot hung.
+/// On-target compilation of the composed stacks dominates (~10 s each under TCG).
+const USB_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn usb_qmp_socket(root: &Path) -> PathBuf {
+    root.join("kernel").join("target").join("eo9-usb-qmp.sock")
+}
+
+fn check_usb(root: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::sync::mpsc;
+
+    let arch = "aarch64";
+    let image = build_kernel(root, arch)?;
+    let qmp_path = usb_qmp_socket(root);
+    let _ = std::fs::remove_file(&qmp_path);
+
+    println!(
+        "xtask: check-usb — booting {} with -device pci-ohci -device usb-kbd, driving \
+         platcheck / usbcheck / hidcheck at the eosh prompt, injecting keys over QMP",
+        image.display()
+    );
+
+    // The standard aarch64 invocation plus the OHCI function, its keyboard, and QMP;
+    // the kernel command line grants pci (the OHCI claim path) and exactly one
+    // platform region (platcheck's restricted-grant probes need a present-but-
+    // ungranted second region in the machine table — pl061-gpio stays outside).
+    let mut command = Command::new(format!("qemu-system-{arch}"));
+    command
+        .current_dir(root)
+        .args(["-M", "virt,gic-version=2,highmem=off", "-cpu", "max"])
+        .args(["-device", "virtio-rng-pci"])
+        .args(["-smp", "1", "-m", KERNEL_QEMU_MEMORY, "-nographic"])
+        .arg("-kernel")
+        .arg(&image)
+        .args(["-append", "pci platform=pl031-rtc"])
+        .args(["-device", "pci-ohci,id=eo9ohci"])
+        .args(["-device", "usb-kbd,bus=eo9ohci.0"])
+        .arg("-qmp")
+        .arg(format!("unix:{},server=on,wait=off", qmp_path.display()))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("check-usb: failed to spawn qemu-system-{arch}: {err}"))?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+
+    // Reader thread: forward serial bytes over a channel so waits can time out.
+    let (sender, receiver) = mpsc::channel::<u8>();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut stdout = stdout;
+        let mut byte = [0u8; 1];
+        while let Ok(n) = stdout.read(&mut byte) {
+            if n == 0 || sender.send(byte[0]).is_err() {
+                break;
+            }
+        }
+    });
+
+    /// Accumulate serial output until `marker` appears, or time out.
+    fn wait_for(receiver: &mpsc::Receiver<u8>, marker: &str, what: &str) -> Result<String, String> {
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + USB_STEP_TIMEOUT;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| {
+                    format!(
+                        "check-usb: timed out waiting for {what} (last output: …{})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    )
+                })?;
+            match receiver.recv_timeout(remaining) {
+                Ok(byte) => {
+                    seen.push(byte as char);
+                    if seen.contains(marker) {
+                        return Ok(seen);
+                    }
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "check-usb: the serial stream ended or timed out waiting for {what} \
+                         (last output: …{})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Type a line the way a human would (the metal console drops fast input —
+    /// plan/12 D49; same pacing as check-gpu).
+    fn type_line(stdin: &mut std::process::ChildStdin, line: &str) -> Result<(), String> {
+        for byte in line.as_bytes() {
+            stdin
+                .write_all(core::slice::from_ref(byte))
+                .map_err(|err| format!("check-usb: writing to the console: {err}"))?;
+            stdin
+                .flush()
+                .map_err(|err| format!("check-usb: flushing the console: {err}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        stdin
+            .write_all(b"\n")
+            .and_then(|()| stdin.flush())
+            .map_err(|err| format!("check-usb: writing to the console: {err}"))
+    }
+
+    let drive = (|| -> Result<(), String> {
+        wait_for(&receiver, "eosh>", "the eosh prompt")?;
+
+        // Step 1: the platform provider's typed contract (all six probes, the
+        // cross-region denial included, or platcheck reports a contract violation).
+        type_line(&mut stdin, "platcheck")?;
+        let output = wait_for(&receiver, "ok: probes(6)", "platcheck's six green probes")?;
+        for line in [
+            "answered busy - ok",
+            "answered out-of-range - ok",
+            "outside the grant answered denied - ok",
+            "answered not-found - ok",
+        ] {
+            if !output.contains(line) {
+                return Err(format!(
+                    "check-usb: platcheck succeeded but its transcript is missing \
+                     `{line}` (see the serial output above)"
+                ));
+            }
+        }
+        wait_for(&receiver, "eosh>", "the prompt after platcheck")?;
+
+        // Step 2: full enumeration of the QEMU keyboard through the PCI shell.
+        type_line(&mut stdin, "usb.ohci-pci $ usbcheck")?;
+        let output = wait_for(&receiver, "ok: enumerated(1)", "usbcheck's enumeration")?;
+        for line in [
+            "usb.ohci-pci: OHCI 1.0",
+            "usbcheck: device 0627:0001",
+            "boot-protocol HID interface 0 (protocol keyboard)",
+            "endpoint 0x81: interrupt IN",
+        ] {
+            if !output.contains(line) {
+                return Err(format!(
+                    "check-usb: usbcheck enumerated but its transcript is missing \
+                     `{line}` (see the serial output above)"
+                ));
+            }
+        }
+        wait_for(&receiver, "eosh>", "the prompt after usbcheck")?;
+
+        // Step 3: the board shell refuses typed on QEMU (no OHCI platform region).
+        type_line(&mut stdin, "usb.ohci $ usbcheck")?;
+        wait_for(
+            &receiver,
+            "error: no-controller",
+            "the platform shell's typed no-controller refusal",
+        )?;
+        wait_for(&receiver, "eosh>", "the prompt after the refusal probe")?;
+
+        // Step 4: boot-protocol reports with QMP key injection.
+        type_line(&mut stdin, "usb.ohci-pci $ hidcheck --reports 6")?;
+        wait_for(&receiver, "hidcheck: polling", "hidcheck's polling banner")?;
+        qmp_inject_keys(&qmp_path, &["h", "i", "ret"])?;
+        let output = wait_for(&receiver, "ok: reports(6)", "hidcheck's six reports")?;
+        for line in ["'h'", "'i'", "<enter>", "reports/s"] {
+            if !output.contains(line) {
+                return Err(format!(
+                    "check-usb: hidcheck finished but its transcript is missing \
+                     `{line}` (see the serial output above)"
+                ));
+            }
+        }
+        wait_for(&receiver, "eosh>", "the prompt after hidcheck")?;
+
+        type_line(&mut stdin, "exit")?;
+        Ok(())
+    })();
+    if let Err(err) = drive {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    let _ = child.wait();
+
+    println!(
+        "xtask: check-usb ok — platform contract pinned (6 probes), the QEMU keyboard \
+         enumerated with its full descriptor chain, the board shell refused typed, and \
+         injected keystrokes decoded through the boot protocol"
+    );
+    Ok(())
+}
+
+/// Inject key presses over QMP `input-send-event`: each qcode pressed then released,
+/// paced so the guest's interrupt-endpoint polling observes every transition.
+fn qmp_inject_keys(socket: &Path, keys: &[&str]) -> Result<(), String> {
+    use std::io::{Read as _, Write as _};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|err| format!("check-usb: connecting to the QMP socket: {err}"))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .map_err(|err| format!("check-usb: QMP socket timeout: {err}"))?;
+
+    fn read_until(
+        stream: &mut std::os::unix::net::UnixStream,
+        needle: &str,
+    ) -> Result<(), String> {
+        let mut seen = String::new();
+        let mut buf = [0u8; 512];
+        loop {
+            let n = stream
+                .read(&mut buf)
+                .map_err(|err| format!("check-usb: reading QMP: {err}"))?;
+            if n == 0 {
+                return Err(format!("check-usb: QMP closed early (saw: {seen})"));
+            }
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+            if seen.contains("\"error\"") {
+                return Err(format!("check-usb: QMP reported an error: {seen}"));
+            }
+            if seen.contains(needle) {
+                return Ok(());
+            }
+        }
+    }
+
+    read_until(&mut stream, "QMP")?;
+    stream
+        .write_all(b"{\"execute\":\"qmp_capabilities\"}\n")
+        .map_err(|err| format!("check-usb: writing QMP: {err}"))?;
+    read_until(&mut stream, "\"return\"")?;
+    for key in keys {
+        for down in [true, false] {
+            let event = format!(
+                "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":[{{\"type\":\"key\",\
+                 \"data\":{{\"down\":{down},\"key\":{{\"type\":\"qcode\",\"data\":\"{key}\"}}}}}}]}}}}\n"
+            );
+            stream
+                .write_all(event.as_bytes())
+                .map_err(|err| format!("check-usb: writing QMP: {err}"))?;
+            read_until(&mut stream, "\"return\"")?;
+            // Pace the transitions: the boot keyboard reports at its polling interval,
+            // and hidcheck must observe press and release as distinct reports.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+    Ok(())
+}
+
 // check-telnet: headless end-to-end verification of the shell-over-network stack
 // (net.text + telnetd, plan/09 D44, plan/10 entry 20). Boots with a user-mode NIC plus a
 // slirp host-forward, drives `telnetd --sessions 2` at the serial eosh prompt, then acts
