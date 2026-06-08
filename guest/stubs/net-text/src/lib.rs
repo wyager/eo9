@@ -405,7 +405,13 @@ async fn bring_up() -> Result<(), TextError> {
     with_state(|s| {
         s.conn = Some(conn);
         s.phase = Phase::Live;
-        s.queue_out(GREETING);
+        // The greeting goes FIRST on the wire, ahead of anything the consumer wrote
+        // while no connection existed yet (the shell buffers its banner and prompt
+        // before the first read-line brings the session up).
+        let mut first: Vec<u8> = Vec::with_capacity(GREETING.len() + s.out.len());
+        first.extend_from_slice(GREETING);
+        first.extend_from_slice(&s.out);
+        s.out = first;
     });
     Ok(())
 }

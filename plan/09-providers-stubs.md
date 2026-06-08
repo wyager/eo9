@@ -968,3 +968,44 @@ Match the priority order above; (1)+(2) unblock I2.
 
     **SECURITY, said loudly here as in the WIT and the crate header: cleartext, unauthenticated.
     Whoever reaches the port owns the session. Trusted-LAN/dev tool only; SSH explicitly deferred.**
+
+45. **Shell-over-network verified end to end under QEMU; usermode and board lanes assessed
+    (2026-06-07, branch area/09-telnetd; completes D44 and plan/10 entry 20).** xtask grows two
+    pieces: the bare `telnet` qemu token (implies `net`; adds `hostfwd=tcp::5555-:23` to the slirp
+    netdev, so the guest's port 23 is `nc localhost 5555` from the host) and `check-telnet`, the
+    scripted gate modeled on `check-gpu` (piped serial + a host-side TCP client in place of the QMP
+    socket; D49 byte-paced console typing; per-step timeouts; transcripts printed).
+
+    Verified, metal (QEMU aarch64, `pci` boot grant, `telnetd --sessions 2` typed at the serial
+    prompt; the fused 4-component session compiled on-target once, spawned per session) — the
+    repo's FIRST inbound-TCP validation over a live link (the D21 gap, now exercised: slirp SYN →
+    smoltcp listen/accept through net.virtio):
+
+    * session 1: host connect → greeting first on the wire (`eo9 net.text: cleartext telnet
+      session - unauthenticated; trusted networks only`), then the eosh banner and prompt;
+      `hello` over the socket → `ok: greeted` + the next prompt (the child's own stdout lands on
+      the serial console — the recorded per-task text gap); a CONCURRENT second connection while
+      session 1 is live is refused by the transport (listener dropped after accept → smoltcp RST →
+      slirp closes the host side; 0 bytes seen, no prompt served); `exit` → goodbye line → FIN →
+      host sees EOF (the D44 close-handshake pump, working).
+    * session 2: fresh task, NIC re-claimed (PCI quiesce-on-teardown + reset-on-bring-up held
+      across sequential sessions), independent greeting/banner/prompt, `exit` closes cleanly.
+    * telnetd narrates each session on serial, refuses-by-policy nothing it shouldn't, exits
+      `ok: served(2)`; console exit powers the machine off; `cargo xtask check-telnet` exits 0.
+
+    *Usermode parity: deferred, recorded.* The `eo9` CLI links no l4 root provider (plan/11: "disk
+    and net are still not linked") and the only self-contained l4 is `net.l4.loopback`, which by
+    design nothing outside the process can reach — a usermode telnetd would serve sessions no
+    external client can connect to. Parity waits on a host unix-l4 provider (or l2-over-tap);
+    nothing in net.text/telnetd is kernel-specific (they speak only eo9:net/l4 + text + fs + exec).
+
+    *Board notes (RTL8125, Orange Pi 5 Plus lane).* Nothing above l2 changes: swap `net.virtio`
+    for an RTL8125 l2 driver claiming through eo9:pci and the same
+    `<l2-driver> $ net.l4.over-l2 $ net.text $ eosh` serves the bench LAN (addressing via
+    `net.l4.over-l2 --address …` for the bench layout). On a real LAN the D44 security posture
+    stops being theoretical: port 23, cleartext, unauthenticated — bench/trusted-LAN only, and the
+    bench bring-up must not touch the serial-loader port rules (boards/BOOT.md).
+
+    *Also fixed while validating:* the greeting is now PREPENDED to net.text's pending output at
+    accept time, so it precedes the banner/prompt the shell buffered while no connection existed
+    (first transcript had it after the prompt — wire order now reads greeting → banner → prompt).
