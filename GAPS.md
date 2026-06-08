@@ -421,3 +421,11 @@ During the area/09 merge review, `svc_shell` failed once (exit 101) in the paral
 branch under review does not touch svc/shell paths — smells like load-sensitive
 timing in the service-restart tests. Watch item: if it recurs, it graduates to a
 real bug hunt (record the failing test name and seed next time).
+
+## Check gates can leak the QEMU on the failure path (dhcp lane, 2026-06-08)
+A failed check gate (kill()+wait on error) left its qemu-system-aarch64 alive holding
+the 5555 hostfwd port; the NEXT gate then died instantly with "serial stream ended"
+and zero output — a failure mode that doesn't name the cause. Two fixes: make the
+gates' teardown verify process exit (kill-by-port preflight or a bind check before
+launch), and make the instant-EOF failure print "port 5555 already in use?" as a
+hint. xtask lane, small.
