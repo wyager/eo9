@@ -95,6 +95,15 @@ pub(crate) fn banner() {
     crate::kprintln!("Eo9 kernel — aarch64 (QEMU virt)");
     crate::kprintln!("  exception level: EL{}", current_el());
     crate::kprintln!("  counter-timer frequency: {} Hz", timer::frequency());
+    // The board profile has no PL031 (rtc.rs: the RK3588's RTC lives on the PMIC, unread
+    // on day one) — say so instead of claiming a device that is not there.
+    #[cfg(feature = "board-opi5plus")]
+    crate::kprintln!(
+        "  wall clock: {}.{:09} s since the Unix epoch (no RTC read on this board yet - generic timer only)",
+        rtc::seconds(),
+        timer::subsecond_ns()
+    );
+    #[cfg(not(feature = "board-opi5plus"))]
     crate::kprintln!(
         "  wall clock: {}.{:09} s since the Unix epoch (PL031 + generic timer)",
         rtc::seconds(),

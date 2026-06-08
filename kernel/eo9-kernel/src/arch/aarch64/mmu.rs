@@ -214,6 +214,8 @@ pub fn init() {
             options(nostack, preserves_flags),
         );
     }
+    // 'E': translation and caches are on — the first device access through the new map.
+    crate::beacon!(b'E');
     crate::kprintln!(
         "mmu: identity map enabled (device {} GiB block(s), DRAM {:#x}..{:#x} at 4 KiB \
          pages, heap W^X, caches on)",
@@ -320,4 +322,40 @@ pub unsafe fn flush_code_range(ptr: *const u8, len: usize) {
     }
     // SAFETY: ordering + context-synchronization so the new instructions are fetched.
     unsafe { asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
+}
+
+/// Board profile: clean+invalidate every D-cache line covering `[start, start+len)` to the
+/// Point of Coherency, by VA, then barrier until the maintenance completes.
+///
+/// Why this works across translation regimes: `dc civac` takes a *virtual* address but
+/// operates on the cache lines holding the *physical* address behind the current
+/// translation. So sweeping through this kernel's fourth-GiB Device window evicts lines
+/// another agent dirtied under a different, *cacheable* mapping of the same physical bytes
+/// — exactly the U-Boot case: its `fdt set` edits to the control FDT sit in dirty D-cache
+/// lines from its own cacheable mapping, while this kernel's Device (non-cacheable) reads
+/// go straight to DRAM and would otherwise see the stale pre-edit data (proven live on the
+/// board, 2026-06-07: `bootargs` vanished until those lines were forced out). After the
+/// `civac` the line is in DRAM and out of every cache level, so a subsequent non-cacheable
+/// read observes the written-back bytes.
+#[cfg(feature = "board-opi5plus")]
+pub(crate) fn clean_invalidate_to_poc(start: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let ctr: usize;
+    // SAFETY: CTR_EL0 is readable at EL1 and has no side effects.
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
+    let dminline = 4usize << ((ctr >> 16) & 0xf); // smallest D-cache line, bytes
+    let end = start.saturating_add(len);
+    let mut addr = start & !(dminline - 1);
+    while addr < end {
+        // SAFETY: `dc civac` is a clean+invalidate-by-VA maintenance op; it reads/writes no
+        // memory through this mapping and faults only where a load would fault too (the
+        // callers pass ranges they are about to read anyway).
+        unsafe { asm!("dc civac, {}", in(reg) addr, options(nostack, preserves_flags)) };
+        addr += dminline;
+    }
+    // SAFETY: full-system barrier so the write-backs reach DRAM before the caller's
+    // non-cacheable reads (`dsb sy`, not `ish`: Device reads are outside the inner domain).
+    unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
 }
