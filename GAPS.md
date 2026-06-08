@@ -432,4 +432,7 @@ hint. xtask lane, small. Same family (usb lane, same day): check-telnet's FLAT s
 timeout killed a healthy run on a loaded host — the round-9 sliced codegen trades
 wall-clock for liveness, so compiles take longer under contention while printing
 progress the whole way. Gates should use progress-aware timeouts (no-progress alarm,
-like the serial-loader sender) rather than flat bounds.
+like the serial-loader sender) rather than flat bounds. Third sighting same day (gfx
+lane): three worktree batteries serialized on the single hard-coded 127.0.0.1:5555
+hostfwd — parallel lane batteries are now routine, so the gates want a per-worktree
+port (xtask --port or derive from the worktree path hash).
