@@ -5,9 +5,12 @@ SoC. Distilled from the Orange Pi 5 Plus (RK3588) bring-up — every example bel
 real register, command, or incident from that effort, but each lesson is framed as
 what the *next* board port needs. Deeper companion docs:
 
-* [orange-pi-5-plus.md](orange-pi-5-plus.md) — the concrete RK3588 board profile.
+* [orange-pi-5-plus.md](orange-pi-5-plus.md) — the concrete RK3588 board profile + status.
 * [rk3588-pcie.md](rk3588-pcie.md) — non-ECAM PCIe config access (the DesignWare shim).
-* [gfx-simplefb.md](gfx-simplefb.md) — pixels via the firmware framebuffer, no display driver.
+* [gfx-simplefb.md](gfx-simplefb.md) — pixels via the firmware framebuffer, no display driver
+  (and [hdmi-simplefb-plan.md](hdmi-simplefb-plan.md) for how it actually went on this board).
+* [usb-ohci-plan.md](usb-ohci-plan.md) / [usb-boot-demo-plan.md](usb-boot-demo-plan.md) —
+  the USB input and USB-boot lanes.
 * `boards/opi5-serial-loader/` — the serial loader stub and host tools (the transport).
 * [../spikes/hvf-cntv.md](../spikes/hvf-cntv.md) — the MMIO/ISV lesson referenced in §1.4.
 
@@ -339,3 +342,84 @@ Each step has a verification gate; do not advance past a failed gate.
 10. **Only now, the peripherals**, each its own session with its own doc: PCIe
     enumeration (rk3588-pcie.md), framebuffer (gfx-simplefb.md), and onward per the
     board doc's hardware-goals roadmap.
+
+## 7. After first light — incident classes from the running system
+
+First light moves the failure modes up the stack: the board boots reliably, and the
+incidents start coming from the kernel, the network, and the bench process itself.
+Five classes from this bring-up, each with the workaround that held the bench and the
+real fix it points at.
+
+### 7.1 Console input truncates at the RX FIFO depth
+
+Any console line longer than 64 bytes truncated at exactly byte 64 — deterministic
+(two identical commands mangled at the same column; a 64-char command lost only its
+newline, byte 65). The DW-APB UART RX FIFO is 64 bytes deep, and the board profile's
+RX interrupt path never drains it: input reaches the shell only when the kernel's
+idle backstop scavenges the FIFO — the backstop's own `stranded input` line named the
+mechanism (accountability lines earn their keep). Between scavenges the FIFO
+overflows silently. QEMU never showed it: the emulated console path has no FIFO
+reality. Bench workaround: type in sub-FIFO chunks with pauses long enough for a
+scavenge (eosh_cmd.py: 40-byte chunks, 6 s pauses, a redundant trailing newline).
+Real fix (GAPS'd, kernel lane): drain the FIFO from the RX interrupt (or an adequate
+poll cadence) so the backstop goes back to being a detector, not the input path. The
+lesson: **an emulator's console is not your UART** — FIFO depths and drain paths
+exist only on silicon, so "type a long line" is a real bring-up test.
+
+### 7.2 Long synchronous kernel work starves the drive loop — and the watchdog
+
+A 486 KiB composed-component compile ran synchronously inside one host call; for the
+whole compile no drive-loop pass ran — no heartbeat, no watchdog pat — and at
+codegen+18.2 s the 22.4 s DW-WDT reset the board mid-compile, reproduced 2-for-2.
+The fix (merged): on-target codegen runs on a fiber and yields every ~5 ms of compile
+work; between slices the kernel pumps children/services, pats the watchdog, and
+prints a throttled `codegen: still compiling` line. The pat stays honest per the §4
+doctrine — it fires only after a slice of real progress plus a scheduling pass, so a
+compile wedged inside one function still resets the board. The general rule: **any
+synchronous kernel work longer than the watchdog period is a hardware reset waiting
+for a big enough input** — slice it or budget it. Watch the same shape guest-side: a
+guest hot-spinning on synchronous host calls is invisible to cooperative scheduling
+for its entire bound (the stranded-runnable backstop's first real hit, GAPS'd).
+
+### 7.3 Never cycle the board while a foreground server owns the prompt
+
+A power cycle was started while `telnetd` was serving on the eosh foreground. The
+serial `poweroff` was swallowed (a foreground child owns the console; eosh is not
+reading), Ctrl-C did not kill the server, and the scripted U-Boot command sequence
+poured into the kernel console — the transfer stalled at 0%. Compounding it: a
+`poweroff` typed in a *telnet* session no-ops silently (the session stack lacks the
+power capability and refuses without saying so — GAPS'd as a UX bug). Proven
+recovery: **burn the session budget** — telnetd exits after serving `--sessions N`,
+so quick scripted `exit` sessions (`nc`) walk it to completion, the serial prompt
+returns, and serial `poweroff` works; wait a few seconds after the last session (an
+immediate poweroff raced the teardown and was swallowed too). The rule: before any
+cycle, check what owns the console — a foreground server means the bench's normal
+channel is gone.
+
+### 7.4 Verify protocol-level identity claims before trusting any filtering theory
+
+Days of "TX is blocked by the switch" theorizing dissolved when a probe finally
+printed its own sender fields: every ARP the board had ever sent carried the driver's
+hardcoded emulator-era source IP (10.0.2.15) — off-subnet, so the network rightly
+ignored it, and the bench evidence ("the gateway never replies, the Mac never learns
+the board") was exactly what *perfect* TX would have produced. The lesson
+generalizes: **before reasoning about why the other end doesn't answer, print the
+identity fields your frames actually carry** (source MAC/IP, VLAN, advertised
+capabilities) — one diagnostic line kills whole theory families. The probe grew
+`--source` and a counts line on every exit so each run advances a round.
+
+### 7.5 Managed-LAN reality: source validation against DHCP-snooping bindings
+
+The office LAN validates traffic source IPs against its DHCP-snooping bindings: an
+address the switch has no lease binding for is silently filtered — no ICMP, no log,
+dead air indistinguishable from a driver bug (which is why §7.4's discipline must
+come first; the two effects were entangled in the same "TX blocked" mystery).
+Consequence: **DHCP addressing is canonical on a managed network** — static
+addressing is a lab convenience the switch may simply refuse, and it can appear to
+work in some flows while silently failing in others, depending on what the policy
+validates. The stack's `--address dhcp` exists for this reason; the printed
+`dhcp acquired` line is the operator's source of truth for the board's address. The
+broader rule: the network is a managed system with its own policy agents — bring-up
+debugging must hold "the switch filters us by policy" and "our frames are wrong" as
+separately falsifiable theories, and the falsifiers are cheap (tcpdump on the same
+VLAN, a second host's ARP table, an unprivileged `nc` beacon listener).
