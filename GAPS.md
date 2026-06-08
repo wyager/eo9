@@ -414,3 +414,10 @@ round (the operator assumed the command executed). eosh/session-stack lane: make
 the refusal explicit; decide whether network sessions should ever be grantable
 power (probably yes behind an explicit telnetd flag — remote reset is operationally
 valuable, as this same incident proved via the session-burn workaround).
+
+## svc_shell flaked once under parallel workspace test load (review, 2026-06-08)
+During the area/09 merge review, `svc_shell` failed once (exit 101) in the parallel
+`cargo test --workspace` run, then passed 8/8 solo and the full ci re-ran green. The
+branch under review does not touch svc/shell paths — smells like load-sensitive
+timing in the service-restart tests. Watch item: if it recurs, it graduates to a
+real bug hunt (record the failing test name and seed next time).
