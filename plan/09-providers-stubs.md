@@ -1417,3 +1417,12 @@ Match the priority order above; (1)+(2) unblock I2.
     --resolver 10.20.3.1 --tcp-target 10.20.3.1` and `telnetd --nic net.rtl8125
     --advertise-max 1000 --address dhcp`, reading the leased address off the serial
     console.
+
+> Entry 46, round-7 clarification (planner, 2026-06-08 evening): "no DAI, no port
+> security" was correct for what round 7 measured — L2 ARP and broadcast UDP from the
+> static source DID cross the switch. The later DHCP work (entry 47 board run) added
+> the missing piece: ROUTED IP from a non-DHCP-bound source is filtered upstream
+> (DNS to 8.8.8.8 timed out from static 10.20.3.70, resolved from leased 10.20.3.115
+> — same resolver, same driver). The two effects were entangled in one mystery;
+> the network facts now live in docs/board/orange-pi-5-plus.md and playbook §7.5.
+> DHCP addressing is canonical on this LAN.
