@@ -43,6 +43,12 @@ macro_rules! beacon {
 mod arch;
 #[cfg(target_os = "none")]
 mod fdt;
+// Pure math for the Orange Pi 5 Plus firmware framebuffer (geometry, rect/buffer
+// validation, the xrgb8888 ↔ RGB888 boundary). Hardware-free, so its unit tests run on
+// the host triple (the `ticks` pattern); compiled into the kernel only where its
+// consumers are (the board profile's probe and gfx.simplefb provider).
+#[cfg(any(test, feature = "board-opi5plus"))]
+mod gfxfb;
 #[cfg(target_os = "none")]
 mod heap;
 // aarch64 always (UART/GIC/RTC route through it); other arches only alongside the
@@ -51,6 +57,14 @@ mod heap;
 mod mmio;
 #[cfg(target_os = "none")]
 mod panic;
+// The board framebuffer: locator, the `gfxprobe` first-light diagnostic, and the
+// Device-mapping-safe accessors the gfx.simplefb provider copies through.
+#[cfg(all(
+    target_os = "none",
+    target_arch = "aarch64",
+    feature = "board-opi5plus"
+))]
+mod simplefb;
 // The board profile's hang backstop (a hardware dead-man's switch, not a progress
 // backstop — SPEC "liveness is event-driven"): no-op stubs everywhere except
 // `board-opi5plus` on aarch64, where it arms the RK3588 DW-WDT.
@@ -138,6 +152,19 @@ extern "C" fn kmain(dtb: *const u8) -> ! {
     beacon!(b'D');
     if let Some(bootargs) = bootargs {
         kprintln!("cmdline: {bootargs}");
+    }
+    // Board profile: the `gfxprobe` boot token runs the M1 framebuffer first-light
+    // diagnostic (locate + cross-check, map check, grayscale band paint, read-back CRC)
+    // before any program runs — see src/simplefb.rs and docs/board/hdmi-simplefb-plan.md.
+    #[cfg(all(target_arch = "aarch64", feature = "board-opi5plus"))]
+    if bootargs
+        .map(|args| {
+            args.split_ascii_whitespace()
+                .any(|token| token == "gfxprobe")
+        })
+        .unwrap_or(false)
+    {
+        simplefb::probe();
     }
     #[cfg(feature = "wasm-store")]
     let handled = wasm::runner::boot(bootargs);

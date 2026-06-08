@@ -214,7 +214,7 @@ impl BufferTable {
         u32::try_from(index).map_err(|_| wasmtime::Error::msg("buffer table full"))
     }
 
-    fn bytes(&mut self, rep: u32) -> Result<&mut Vec<u8>> {
+    pub(super) fn bytes(&mut self, rep: u32) -> Result<&mut Vec<u8>> {
         self.slots
             .get_mut(rep as usize)
             .and_then(Option::as_mut)

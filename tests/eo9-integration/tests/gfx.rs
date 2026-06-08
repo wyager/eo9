@@ -144,6 +144,26 @@ fn an_unconfigured_gfx_mem_defaults_to_640x480_and_never_traps() {
     assert_presented(&outcome, expected_checksum(1, 640, 480));
 }
 
+/// FNV-1a-64 of draw's frame-1 pattern at the Orange Pi 5 Plus board geometry, as
+/// tightly packed xrgb8888 (X = 0). The SAME literal is pinned in the kernel's
+/// gfx.simplefb core tests (kernel/eo9-kernel/src/gfxfb.rs), where the RGB888 packing
+/// must reproduce it — the cross-backend checksum identity. If either side's copy of
+/// the pattern or packing drifts, its own pin fails; on the board, `draw` (granted
+/// `gfx`) reporting `presented(…)` with this number is the M3 acceptance.
+const PATTERN_800X480_FRAME1_FNV: u64 = 0xd66b_49ee_575f_f0d9;
+
+#[test]
+fn the_board_geometry_checksum_is_pinned_for_gfx_simplefb() {
+    assert_eq!(
+        expected_checksum(1, 800, 480),
+        PATTERN_800X480_FRAME1_FNV,
+        "the local pattern copy drifted from the pinned board-geometry checksum"
+    );
+    let chain = configured_chain(800, 480);
+    let outcome = run_draw(&chain, &[]);
+    assert_presented(&outcome, PATTERN_800X480_FRAME1_FNV);
+}
+
 #[test]
 fn a_second_frame_presents_only_the_damage_rectangle() {
     let chain = configured_chain(320, 200);

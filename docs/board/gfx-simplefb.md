@@ -1,5 +1,49 @@
 # gfx.simplefb: the dumb-framebuffer provider for real boards (design note)
 
+## As built (M1+M2, 2026-06-08) — the Orange Pi 5 Plus variant
+
+The Round-0 bench recon (docs/board/hdmi-simplefb-plan.md) changed the locator: vendor
+U-Boot publishes **no** simple-framebuffer node on this board (its fixups only run in
+bootm/booti, which we never use), but it leaves VOP2's Esmart0 window live across the
+`go`/serial-loader handoff. So the FDT-reader path below is deferred, and the shipped
+locator is:
+
+* **Primary**: board-profile constants — base `0xee01a000`, 800×480, packed RGB888
+  (3 bytes/px), stride 2400 (`kernel/eo9-kernel/src/gfxfb.rs`).
+* **Cross-check**: the live Esmart0 window registers at `0xfdd91800` (MST/VIR/ACT),
+  read through the syndrome-valid mmio accessors. Both are printed (`fb: profile …` /
+  `fb: vop2 …`), a disagreement warns `MISMATCH`, and a DRAM-plausible MST wins —
+  U-Boot heap-allocates the buffer, so the base may move across power cycles.
+* **Map check before first touch**: the surface must sit in the identity map's
+  fourth-GiB Device-nGnRnE block (RW+PXN+UXN — W^X holds without new tables); anything
+  else prints `fb: unmapped 0x…` and stops cleanly. Device mapping is the v1 choice
+  (384 KiB frames; a Normal-NC MAIR attribute is the recorded perf follow-up), and the
+  first present prints `gfx: first present (mapping=device)` as the A/B datum.
+
+The provider (`kernel/eo9-kernel/src/wasm/gfx_provider.rs`) is gfx.mem semantics over
+`base + y*2400 + x*3`, converting the WIT's xrgb8888 ↔ packed RGB888 at the boundary
+(present drops the X byte; read synthesizes X = 0; framebuffer byte order pinned to the
+little-endian DRM RGB888 convention B,G,R — grayscale-invariant, see below). `mode()`
+reports 800×480 xrgb8888 with stride = width×4 (the API's pixel model, honoring the
+WIT's `stride >= width * 4`; the RGB888 backing stride is a provider internal) and
+refuses any other live scanout geometry with the typed `io` error. The grant is the
+bare `gfx` boot token (the `pci` grammar, never linked by default); the `gfxprobe`
+token runs the M1 first-light band paint. The rect/stride/conversion math is the pure
+host-tested `gfxfb` module: the cross-backend checksum identity with gfx.mem at
+800×480 is pinned there and in tests/eo9-integration/tests/gfx.rs
+(`0xd66b49ee575ff0d9` for draw's frame 1).
+
+**Colorspace caveat (docs, not contract):** the board's HDMI link mangles chroma — the
+buffer is scanned as RGB while the link/downstream interprets YCbCr, so saturated
+colors render consistently wrong while grayscale (r=g=b) renders faithfully. Pixel
+values are stored and read back faithfully regardless; the fix is an AVI
+InfoFrame/colorspace change at the HDMI TX, recorded as the deferred color follow-up.
+
+The sections below are the original design note (the simple-framebuffer FDT path stays
+the plan for boards whose firmware publishes the node).
+
+---
+
 The `eo9:gfx` API was designed framebuffer-first precisely so that a firmware-configured
 scanout can implement it (plan/02 D28: mode + present/read with damage rects + clear,
 xrgb8888, provider owns the stride). On the Orange Pi 5 Plus the cheapest path to pixels
