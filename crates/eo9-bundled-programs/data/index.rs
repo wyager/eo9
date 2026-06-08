@@ -57,6 +57,7 @@ static BUNDLED_COMPONENTS: &[(&str, &[u8])] = &[
     ("eo9-stub-net-l4-none", include_bytes!("eo9-stub-net-l4-none.wasm") as &[u8]),
     ("eo9-stub-net-l4-over-l2", include_bytes!("eo9-stub-net-l4-over-l2.wasm") as &[u8]),
     ("eo9-stub-net-policy-ports", include_bytes!("eo9-stub-net-policy-ports.wasm") as &[u8]),
+    ("eo9-stub-net-rtl8125", include_bytes!("eo9-stub-net-rtl8125.wasm") as &[u8]),
     ("eo9-stub-net-text", include_bytes!("eo9-stub-net-text.wasm") as &[u8]),
     ("eo9-stub-net-virtio", include_bytes!("eo9-stub-net-virtio.wasm") as &[u8]),
     ("eo9-stub-pci-admit-address", include_bytes!("eo9-stub-pci-admit-address.wasm") as &[u8]),

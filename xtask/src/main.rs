@@ -78,6 +78,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-net-l4-none",
     "eo9-stub-net-l4-over-l2",
     "eo9-stub-net-policy-ports",
+    "eo9-stub-net-rtl8125",
     "eo9-stub-net-text",
     "eo9-stub-net-virtio",
     "eo9-stub-pci-admit-address",
@@ -187,6 +188,13 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // can compose `net.virtio $ l2check` and `net.virtio $ net.l4.over-l2 $ l4check`
     // against a QEMU user-mode NIC (boot with the `pci` grant and the xtask `net` flag).
     ("eo9-stub-net-virtio", "net.virtio"),
+    // The RTL8125 2.5GbE driver — net.virtio's real-silicon sibling for the Orange
+    // Pi 5 Plus's two onboard NICs (10ec:8125 behind the RK3588 DW root ports;
+    // plan/09 D46, plan/12 board lane). Under QEMU (no RTL8125 model) it refuses
+    // typed, naming what it probed; the same compositions swap in on the board:
+    //   net.rtl8125 $ l2check --gateway 192.168.1.1
+    //   net.rtl8125 $ (net.l4.over-l2 --address … --gateway …) $ l4check --resolver …
+    ("eo9-stub-net-rtl8125", "net.rtl8125"),
     ("eo9-example-l2check", "l2check"),
     // The virtual-NIC switch and its two-port check, so the single-owner-NIC sharing
     // demo runs at the metal prompt (one physical NIC, two isolated virtual MACs):

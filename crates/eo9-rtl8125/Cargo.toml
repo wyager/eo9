@@ -1,0 +1,18 @@
+# eo9-rtl8125 is the pure, host-testable core of the `net.rtl8125` guest driver
+# (plan/09): the RTL8125 register map (every constant cited to a reference driver),
+# the legacy 16-byte descriptor ring encode/decode, and the GPHY OCP command words —
+# everything about the device conversation that is plain bit arithmetic, factored out
+# of the wasm component so `cargo test` exercises it on the host (the eofs/eosh-core
+# precedent: pure logic lives in a library crate the workspace tests, the component
+# stays a thin I/O shell).
+#
+# no_std claim is kept honest with: cargo check -p eo9-rtl8125 --target aarch64-unknown-none
+[package]
+name = "eo9-rtl8125"
+description = "RTL8125 register map, descriptor ring encode/decode, and PHY OCP command words: the pure core of Eo9's net.rtl8125 driver."
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
