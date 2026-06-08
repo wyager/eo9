@@ -1,5 +1,17 @@
 # gfx.simplefb: the dumb-framebuffer provider for real boards (design note)
 
+Status update (2026-06-08): **implemented and proven on the board** (area/15-gfx-simplefb,
+merging) — with one important divergence from the sketch below. The vendor U-Boot never
+publishes a `simple-framebuffer` /chosen node (its fixups run only under `bootm`/`booti`,
+which the bench never uses), so the provider locates the live scanout by reading the
+VOP2 Esmart0 window registers instead, and the verified surface is 800×480 **RGB888
+packed** (stride 2400) at `0xee01a000` — not xrgb8888; the provider converts at the
+boundary. The current plan, verified constants, and bench results live in
+[hdmi-simplefb-plan.md](hdmi-simplefb-plan.md). The FDT-node path below remains the
+design for boards whose firmware does publish the node, and the cross-backend checksum
+identity (gfx.mem vs gfx.simplefb) was proven on silicon exactly as predicted under
+"What is implementable blind".
+
 The `eo9:gfx` API was designed framebuffer-first precisely so that a firmware-configured
 scanout can implement it (plan/02 D28: mode + present/read with damage rects + clear,
 xrgb8888, provider owns the stride). On the Orange Pi 5 Plus the cheapest path to pixels
@@ -57,7 +69,7 @@ firmware-provided base pointer. Estimated size: ~150 lines + the MMU attribute p
    simplefb fixup enabled for RK3588 HDMI — support is recent and may require the vendor
    U-Boot instead **[verify-on-board]**), and the real-monitor pixel check.
 
-## Arrival-day verification plan
+## Arrival-day verification plan [superseded — see hdmi-simplefb-plan.md Round-0]
 
 1. At the U-Boot prompt: does video init print? `fdt print /chosen` — is there a
    `framebuffer@…` node? If not: try `setenv stdout serial,vidconsole` + reinit, or fall
