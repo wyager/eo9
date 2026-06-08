@@ -356,3 +356,11 @@ open:
 grant PCI") even on a `pci` boot, while direct interactive `lspci` works — contradicts
 the earlier verified filtered-chain flow (plan/12). Needs a lane: the spawn-path grant
 propagation for composed pci chains vs the interactive path.
+
+## Backstop detector first real hit: stranded runnable on the board (2026-06-08)
+During net.rtl8125's polled gateway wait on the Orange Pi, the idle backstop detector
+fired once: `liveness: stranded runnable: a child or service was runnable across an
+entire idle backstop (n=1)`. Per the event-driven-liveness doctrine this is a
+high-priority bug (a wake edge is missing on some board-profile path the QEMU battery
+never exercised). Reproduction context: board profile, polled driver wait, l2check
+gateway ARP wait. Needs a kernel-lane investigation once the driver lane settles.
