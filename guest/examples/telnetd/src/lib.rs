@@ -159,18 +159,30 @@ impl Guest for Telnetd {
             None => MAX_SESSIONS,
         };
 
-        // Static addressing: address and gateway travel together (the middleware's
-        // configure binds all three fields at once; prefix-length alone is meaningless).
-        if address.is_some() != gateway.is_some() {
-            return Err(ProgramFailure::BadArguments(String::from(
-                "--address and --gateway must be given together (prefix-length \
-                 defaults to 24)",
-            )));
-        }
-        if prefix_length.is_some() && address.is_none() {
-            return Err(ProgramFailure::BadArguments(String::from(
-                "--prefix-length needs --address and --gateway",
-            )));
+        // Addressing: `--address dhcp` acquires everything from the network's DHCP
+        // service, so the static-only arguments must not ride along (option-C
+        // discipline: a clean argument error, never a silent ignore). Static
+        // addressing keeps the existing rule — address and gateway travel together.
+        let dhcp = address.as_deref() == Some("dhcp");
+        if dhcp {
+            if gateway.is_some() || prefix_length.is_some() {
+                return Err(ProgramFailure::BadArguments(String::from(
+                    "--address dhcp acquires the prefix length and gateway from the \
+                     lease; do not combine it with --prefix-length or --gateway",
+                )));
+            }
+        } else {
+            if address.is_some() != gateway.is_some() {
+                return Err(ProgramFailure::BadArguments(String::from(
+                    "--address and --gateway must be given together (prefix-length \
+                     defaults to 24), or use `--address dhcp` alone",
+                )));
+            }
+            if prefix_length.is_some() && address.is_none() {
+                return Err(ProgramFailure::BadArguments(String::from(
+                    "--prefix-length needs --address and --gateway",
+                )));
+            }
         }
 
         // ----- resolve, configure, compose, compile — once -----------------------------
@@ -206,11 +218,16 @@ impl Guest for Telnetd {
             .await
             .map_err(ProgramFailure::Resolve)?;
 
-        // Bake static IPv4 addressing into the middleware when given (the board
-        // bench: `--address 10.20.3.70 --gateway 10.20.3.1`); without the arguments
-        // the middleware keeps its documented QEMU user-net default.
-        let tcp = match (&address, &gateway) {
-            (Some(address), Some(gateway)) => algebra::configure(
+        // Bake IPv4 addressing into the middleware when given: static values (the
+        // board bench: `--address 10.20.3.70 --gateway 10.20.3.1`) or `--address dhcp`
+        // (acquired from the LAN's DHCP service on first use; the middleware announces
+        // the lease on the machine console — that printed address is how the operator
+        // learns where to telnet). Without the arguments the middleware keeps its
+        // documented QEMU user-net default. The configure entry takes optional
+        // prefix-length/gateway (WAVE `some(…)`/`none`); the middleware itself
+        // defaults the static prefix to 24.
+        let tcp = match &address {
+            Some(address) => algebra::configure(
                 tcp,
                 &[
                     algebra::NamedArg {
@@ -219,16 +236,22 @@ impl Guest for Telnetd {
                     },
                     algebra::NamedArg {
                         name: String::from("prefix-length"),
-                        value: prefix_length.unwrap_or(24).to_string(),
+                        value: match prefix_length {
+                            Some(n) => format!("some({n})"),
+                            None => String::from("none"),
+                        },
                     },
                     algebra::NamedArg {
                         name: String::from("gateway"),
-                        value: format!("{gateway:?}"),
+                        value: match &gateway {
+                            Some(gateway) => format!("some({gateway:?})"),
+                            None => String::from("none"),
+                        },
                     },
                 ],
             )
             .map_err(|err| ProgramFailure::Configure(format!("net.l4.over-l2: {err:?}")))?,
-            _ => tcp,
+            None => tcp,
         };
 
         // Bind the port at compose time (the config interface disappears with this, so

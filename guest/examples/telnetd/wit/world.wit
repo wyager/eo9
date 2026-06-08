@@ -35,6 +35,9 @@ package eo9-examples:telnetd@0.1.0;
 ///   telnetd --port 2323
 ///   telnetd --nic net.rtl8125 --advertise-max 1000 --address 10.20.3.70
 ///           --gateway 10.20.3.1  # the board bench: real NIC, static LAN addressing
+///   telnetd --address dhcp       # acquire addressing from the LAN's DHCP service;
+///                                # the middleware announces the leased address on the
+///                                # machine console — that line is where to telnet
 world telnetd {
     import eo9:text/text@0.1.0;
     import eo9:fs/fs@0.1.0;
@@ -64,12 +67,14 @@ world telnetd {
 
     /// `nic`: the /bin name of the link-layer driver the session stack composes
     /// over (default `net.virtio`; the board uses `net.rtl8125`). `address` /
-    /// `prefix-length` / `gateway`: static IPv4 addressing baked into the stack's
-    /// net.l4.over-l2 (give address AND gateway together; prefix-length defaults to
-    /// 24; omitted entirely = the middleware's documented QEMU user-net default).
-    /// `advertise-max`: forwarded to the NIC's own configure interface when given
-    /// (net.rtl8125's autoneg speed cap); a NIC with no such interface answers with
-    /// a clean configure error, never a trap.
+    /// `prefix-length` / `gateway`: IPv4 addressing baked into the stack's
+    /// net.l4.over-l2 — static values (give address AND gateway together;
+    /// prefix-length defaults to 24), or `--address dhcp` alone (acquired from the
+    /// network on first use; combining it with the static-only arguments is a clean
+    /// argument error); omitted entirely = the middleware's documented QEMU user-net
+    /// default. `advertise-max`: forwarded to the NIC's own configure interface when
+    /// given (net.rtl8125's autoneg speed cap); a NIC with no such interface answers
+    /// with a clean configure error, never a trap.
     export main: async func(port: option<u16>, sessions: option<u32>,
         nic: option<string>, address: option<string>, prefix-length: option<u8>,
         gateway: option<string>, advertise-max: option<u16>)

@@ -349,6 +349,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("check-telnet", rest)?;
             check_telnet(&root)
         }
+        "check-dhcp" => {
+            expect_no_args("check-dhcp", rest)?;
+            check_dhcp(&root)
+        }
         "firstpoll-ab" => {
             let mut rounds: u32 = 5;
             let mut gate_only = false;
@@ -472,6 +476,13 @@ COMMANDS:
                          eosh prompt, run `hello`, verify a concurrent second connection is
                          refused, `exit` closes the connection, and a second sequential
                          session works independently
+    check-dhcp           Boot the same machine and validate `--address dhcp` against slirp's
+                         built-in DHCP server: the transport chain
+                         `net.virtio $ (net.l4.over-l2 --address dhcp) $ l4check` must
+                         announce its lease (10.0.2.15/24, gateway, DNS, lease secs) on the
+                         serial console and still resolve, and
+                         `telnetd --sessions 1 --address dhcp` must serve a session over
+                         the host-forward exactly like the static path
     firstpoll-ab [--rounds N] [--gate-only]
                          A/B gate for the vendored `first-poll-inline` feature
                          (docs/spikes/first-poll-inline.md): run the async-hardening matrix,
@@ -3797,31 +3808,210 @@ const TELNET_PROMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// gap: respawn, NIC re-claim, listen bring-up).
 const TELNET_CONNECT_RETRY: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// Boot, serve two telnet sessions, validate both plus the concurrent refusal.
-fn check_telnet(root: &Path) -> Result<(), String> {
+/// Accumulate serial output until `marker` appears, or time out. `cmd` names the
+/// calling gate (check-telnet / check-dhcp) in failure messages.
+fn serial_wait_for(
+    cmd: &str,
+    receiver: &std::sync::mpsc::Receiver<u8>,
+    marker: &str,
+    what: &str,
+) -> Result<String, String> {
+    let mut seen = String::new();
+    let deadline = std::time::Instant::now() + TELNET_STEP_TIMEOUT;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .ok_or_else(|| {
+                format!(
+                    "{cmd}: timed out waiting for {what} (last serial output: …{})",
+                    &seen[seen.len().saturating_sub(400)..]
+                )
+            })?;
+        match receiver.recv_timeout(remaining) {
+            Ok(byte) => {
+                seen.push(byte as char);
+                if seen.contains(marker) {
+                    return Ok(seen);
+                }
+            }
+            Err(_) => {
+                return Err(format!(
+                    "{cmd}: the serial stream ended or timed out waiting for {what} \
+                     (last serial output: …{})",
+                    &seen[seen.len().saturating_sub(400)..]
+                ));
+            }
+        }
+    }
+}
+
+/// Type a line at the serial console the way a human would (plan/12 D49: the metal
+/// console drops bytes from fast input).
+fn console_type_line(
+    cmd: &str,
+    stdin: &mut std::process::ChildStdin,
+    line: &str,
+) -> Result<(), String> {
     use std::io::Write as _;
-    use std::net::TcpStream;
+    for byte in line.as_bytes() {
+        stdin
+            .write_all(core::slice::from_ref(byte))
+            .map_err(|err| format!("{cmd}: writing to the console: {err}"))?;
+        stdin
+            .flush()
+            .map_err(|err| format!("{cmd}: flushing the console: {err}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    stdin
+        .write_all(b"\n")
+        .and_then(|()| stdin.flush())
+        .map_err(|err| format!("{cmd}: writing to the console: {err}"))
+}
+
+/// Read from the socket until `marker` appears, or the per-step deadline passes.
+fn socket_read_until(
+    cmd: &str,
+    stream: &mut std::net::TcpStream,
+    marker: &str,
+    deadline: std::time::Duration,
+    what: &str,
+) -> Result<String, String> {
+    use std::io::Read as _;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let start = std::time::Instant::now();
+    let mut seen = String::new();
+    let mut buf = [0u8; 1024];
+    while start.elapsed() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                return Err(format!(
+                    "{cmd}: the connection closed waiting for {what} (saw: {seen:?})"
+                ));
+            }
+            Ok(n) => {
+                seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if seen.contains(marker) {
+                    return Ok(seen);
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(err) => {
+                return Err(format!(
+                    "{cmd}: reading the socket waiting for {what}: {err} (saw: {seen:?})"
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "{cmd}: timed out waiting for {what} on the socket (saw: {seen:?})"
+    ))
+}
+
+/// Read until the peer closes (EOF or reset both count — slirp surfaces a guest-side
+/// close either way); everything seen comes back.
+fn socket_read_to_eof(
+    cmd: &str,
+    stream: &mut std::net::TcpStream,
+    deadline: std::time::Duration,
+    what: &str,
+) -> Result<String, String> {
+    use std::io::Read as _;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let start = std::time::Instant::now();
+    let mut seen = String::new();
+    let mut buf = [0u8; 1024];
+    while start.elapsed() < deadline {
+        match stream.read(&mut buf) {
+            Ok(0) => return Ok(seen),
+            Ok(n) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Ok(seen);
+            }
+            Err(err) => {
+                return Err(format!(
+                    "{cmd}: reading the socket waiting for {what}: {err}"
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "{cmd}: timed out waiting for {what} (the peer never closed; saw: {seen:?})"
+    ))
+}
+
+/// Connect to the forwarded port and wait for a session prompt, retrying the whole
+/// connection while the guest stack is still coming up (or between sessions, when it
+/// is briefly down — slirp accepts the host side either way, so a connection that
+/// stalls or dies without a prompt is dropped and retried).
+fn telnet_connect_session(cmd: &str, what: &str) -> Result<(std::net::TcpStream, String), String> {
+    let start = std::time::Instant::now();
+    let mut last = String::from("no connection attempt completed");
+    while start.elapsed() < TELNET_CONNECT_RETRY {
+        match std::net::TcpStream::connect(("127.0.0.1", TELNET_HOST_PORT)) {
+            Ok(mut stream) => {
+                match socket_read_until(cmd, &mut stream, "eosh> ", TELNET_PROMPT_TIMEOUT, what) {
+                    Ok(transcript) => return Ok((stream, transcript)),
+                    Err(err) => {
+                        last = err;
+                        drop(stream);
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
+            }
+            Err(err) => {
+                last = format!("connect: {err}");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+    Err(format!(
+        "{cmd}: could not reach a session prompt for {what} within \
+         {TELNET_CONNECT_RETRY:?} (last attempt: {last})"
+    ))
+}
+
+/// Boot the aarch64 kernel under QEMU with the user-mode NIC + slirp host-forward
+/// (the `pci net telnet` shape), with stdio piped for scripting. Returns the child,
+/// its piped stdin, and the serial-byte channel.
+fn spawn_telnet_qemu(
+    cmd: &str,
+    root: &Path,
+    image: &Path,
+) -> Result<
+    (
+        std::process::Child,
+        std::process::ChildStdin,
+        std::sync::mpsc::Receiver<u8>,
+    ),
+    String,
+> {
     use std::sync::mpsc;
 
-    let arch = "aarch64";
-    let image = build_kernel(root, arch)?;
-
-    println!(
-        "xtask: check-telnet — booting {} with a user-mode NIC \
-         (hostfwd tcp:127.0.0.1:{TELNET_HOST_PORT}-:{TELNET_GUEST_PORT}), driving \
-         `telnetd --sessions 2` at the eosh prompt, then connecting from the host",
-        image.display()
-    );
-
-    // The same invocation as `qemu aarch64 pci net telnet`, with stdio piped for scripting.
-    let mut command = Command::new(format!("qemu-system-{arch}"));
+    let mut command = Command::new("qemu-system-aarch64");
     command
         .current_dir(root)
         .args(["-M", "virt,gic-version=2,highmem=off", "-cpu", "max"])
         .args(["-device", "virtio-rng-pci"])
         .args(["-smp", "1", "-m", KERNEL_QEMU_MEMORY, "-nographic"])
         .arg("-kernel")
-        .arg(&image)
+        .arg(image)
         .args(["-append", "pci"])
         .arg("-netdev")
         .arg(format!(
@@ -3833,8 +4023,8 @@ fn check_telnet(root: &Path) -> Result<(), String> {
         .stderr(std::process::Stdio::inherit());
     let mut child = command
         .spawn()
-        .map_err(|err| format!("check-telnet: failed to spawn qemu-system-{arch}: {err}"))?;
-    let mut stdin = child.stdin.take().expect("piped stdin");
+        .map_err(|err| format!("{cmd}: failed to spawn qemu-system-aarch64: {err}"))?;
+    let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
 
     // Reader thread: forward serial bytes over a channel so waits can time out.
@@ -3849,181 +4039,44 @@ fn check_telnet(root: &Path) -> Result<(), String> {
             }
         }
     });
+    Ok((child, stdin, receiver))
+}
 
-    /// Accumulate serial output until `marker` appears, or time out.
-    fn wait_for(receiver: &mpsc::Receiver<u8>, marker: &str, what: &str) -> Result<String, String> {
-        let mut seen = String::new();
-        let deadline = std::time::Instant::now() + TELNET_STEP_TIMEOUT;
-        loop {
-            let remaining = deadline
-                .checked_duration_since(std::time::Instant::now())
-                .ok_or_else(|| {
-                    format!(
-                        "check-telnet: timed out waiting for {what} (last serial output: …{})",
-                        &seen[seen.len().saturating_sub(400)..]
-                    )
-                })?;
-            match receiver.recv_timeout(remaining) {
-                Ok(byte) => {
-                    seen.push(byte as char);
-                    if seen.contains(marker) {
-                        return Ok(seen);
-                    }
-                }
-                Err(_) => {
-                    return Err(format!(
-                        "check-telnet: the serial stream ended or timed out waiting for {what} \
-                         (last serial output: …{})",
-                        &seen[seen.len().saturating_sub(400)..]
-                    ));
-                }
-            }
-        }
-    }
+/// Boot, serve two telnet sessions, validate both plus the concurrent refusal.
+fn check_telnet(root: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::net::TcpStream;
 
-    /// Type a line at the serial console the way a human would (plan/12 D49: the metal
-    /// console drops bytes from fast input).
-    fn type_line(stdin: &mut std::process::ChildStdin, line: &str) -> Result<(), String> {
-        for byte in line.as_bytes() {
-            stdin
-                .write_all(core::slice::from_ref(byte))
-                .map_err(|err| format!("check-telnet: writing to the console: {err}"))?;
-            stdin
-                .flush()
-                .map_err(|err| format!("check-telnet: flushing the console: {err}"))?;
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        stdin
-            .write_all(b"\n")
-            .and_then(|()| stdin.flush())
-            .map_err(|err| format!("check-telnet: writing to the console: {err}"))
-    }
+    let image = build_kernel(root, "aarch64")?;
 
-    /// Read from the socket until `marker` appears, or the per-step deadline passes.
-    fn read_until(
-        stream: &mut TcpStream,
-        marker: &str,
-        deadline: std::time::Duration,
-        what: &str,
-    ) -> Result<String, String> {
-        use std::io::Read as _;
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-        let start = std::time::Instant::now();
-        let mut seen = String::new();
-        let mut buf = [0u8; 1024];
-        while start.elapsed() < deadline {
-            match stream.read(&mut buf) {
-                Ok(0) => {
-                    return Err(format!(
-                        "check-telnet: the connection closed waiting for {what} (saw: {seen:?})"
-                    ));
-                }
-                Ok(n) => {
-                    seen.push_str(&String::from_utf8_lossy(&buf[..n]));
-                    if seen.contains(marker) {
-                        return Ok(seen);
-                    }
-                }
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
-                Err(err) => {
-                    return Err(format!(
-                        "check-telnet: reading the socket waiting for {what}: {err} (saw: {seen:?})"
-                    ));
-                }
-            }
-        }
-        Err(format!(
-            "check-telnet: timed out waiting for {what} on the socket (saw: {seen:?})"
-        ))
-    }
+    println!(
+        "xtask: check-telnet — booting {} with a user-mode NIC \
+         (hostfwd tcp:127.0.0.1:{TELNET_HOST_PORT}-:{TELNET_GUEST_PORT}), driving \
+         `telnetd --sessions 2` at the eosh prompt, then connecting from the host",
+        image.display()
+    );
 
-    /// Read until the peer closes (EOF or reset both count — slirp surfaces a guest-side
-    /// close either way); everything seen comes back.
-    fn read_to_eof(
-        stream: &mut TcpStream,
-        deadline: std::time::Duration,
-        what: &str,
-    ) -> Result<String, String> {
-        use std::io::Read as _;
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-        let start = std::time::Instant::now();
-        let mut seen = String::new();
-        let mut buf = [0u8; 1024];
-        while start.elapsed() < deadline {
-            match stream.read(&mut buf) {
-                Ok(0) => return Ok(seen),
-                Ok(n) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::BrokenPipe
-                            | std::io::ErrorKind::UnexpectedEof
-                    ) =>
-                {
-                    return Ok(seen);
-                }
-                Err(err) => {
-                    return Err(format!(
-                        "check-telnet: reading the socket waiting for {what}: {err}"
-                    ));
-                }
-            }
-        }
-        Err(format!(
-            "check-telnet: timed out waiting for {what} (the peer never closed; saw: {seen:?})"
-        ))
-    }
-
-    /// Connect to the forwarded port and wait for a session prompt, retrying the whole
-    /// connection while the guest stack is still coming up (or between sessions, when it
-    /// is briefly down — slirp accepts the host side either way, so a connection that
-    /// stalls or dies without a prompt is dropped and retried).
-    fn connect_session(what: &str) -> Result<(TcpStream, String), String> {
-        let start = std::time::Instant::now();
-        let mut last = String::from("no connection attempt completed");
-        while start.elapsed() < TELNET_CONNECT_RETRY {
-            match TcpStream::connect(("127.0.0.1", TELNET_HOST_PORT)) {
-                Ok(mut stream) => {
-                    match read_until(&mut stream, "eosh> ", TELNET_PROMPT_TIMEOUT, what) {
-                        Ok(transcript) => return Ok((stream, transcript)),
-                        Err(err) => {
-                            last = err;
-                            drop(stream);
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                        }
-                    }
-                }
-                Err(err) => {
-                    last = format!("connect: {err}");
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-            }
-        }
-        Err(format!(
-            "check-telnet: could not reach a session prompt for {what} within \
-             {TELNET_CONNECT_RETRY:?} (last attempt: {last})"
-        ))
-    }
+    let (mut child, mut stdin, receiver) = spawn_telnet_qemu("check-telnet", root, &image)?;
+    let wait_for =
+        |marker: &str, what: &str| serial_wait_for("check-telnet", &receiver, marker, what);
+    let type_line = |stdin: &mut std::process::ChildStdin, line: &str| {
+        console_type_line("check-telnet", stdin, line)
+    };
+    let read_until = |stream: &mut TcpStream, marker: &str, deadline, what: &str| {
+        socket_read_until("check-telnet", stream, marker, deadline, what)
+    };
+    let read_to_eof = |stream: &mut TcpStream, deadline, what: &str| {
+        socket_read_to_eof("check-telnet", stream, deadline, what)
+    };
+    let connect_session = |what: &str| telnet_connect_session("check-telnet", what);
 
     // Drive the whole conversation; any failure kills QEMU before returning.
     let drive = (|| -> Result<(), String> {
-        wait_for(&receiver, "eosh>", "the eosh prompt")?;
+        wait_for("eosh>", "the eosh prompt")?;
         type_line(&mut stdin, "telnetd --sessions 2")?;
-        wait_for(&receiver, "telnetd --sessions 2", "the command echo")?;
+        wait_for("telnetd --sessions 2", "the command echo")?;
         // The one-time fused-session compile happens here (the long pole under TCG).
         wait_for(
-            &receiver,
             "session 1: waiting for a connection",
             "telnetd to start serving",
         )?;
@@ -4058,11 +4111,7 @@ fn check_telnet(root: &Path) -> Result<(), String> {
         println!("----- check-telnet: session 1 transcript (hello) -----\n{hello_out}");
         // The child's own stdout lands on the machine console (the recorded per-task
         // text gap, plan/10 entry 20) — verify it arrived there.
-        wait_for(
-            &receiver,
-            "Hello, world.",
-            "hello's stdout on the serial console",
-        )?;
+        wait_for("Hello, world.", "hello's stdout on the serial console")?;
 
         // ----- a concurrent second connection is refused ------------------------------
         // net.text dropped its listener after accepting, so the transport answers the
@@ -4100,15 +4149,10 @@ fn check_telnet(root: &Path) -> Result<(), String> {
             ));
         }
         println!("----- check-telnet: session 1 transcript (exit) -----\n{close_out}");
-        wait_for(
-            &receiver,
-            "session 1 ended",
-            "telnetd's session-1 narration",
-        )?;
+        wait_for("session 1 ended", "telnetd's session-1 narration")?;
 
         // ----- session 2: sequential independence -------------------------------------
         wait_for(
-            &receiver,
             "session 2: waiting for a connection",
             "telnetd to serve session 2",
         )?;
@@ -4134,13 +4178,9 @@ fn check_telnet(root: &Path) -> Result<(), String> {
         println!("----- check-telnet: session 2 transcript (exit) -----\n{close2}");
 
         // ----- telnetd finishes; the machine winds down --------------------------------
-        wait_for(
-            &receiver,
-            "served 2 session(s); exiting",
-            "telnetd to finish",
-        )?;
-        wait_for(&receiver, "served(2)", "telnetd's outcome at the console")?;
-        wait_for(&receiver, "eosh>", "the console prompt after telnetd")?;
+        wait_for("served 2 session(s); exiting", "telnetd to finish")?;
+        wait_for("served(2)", "telnetd's outcome at the console")?;
+        wait_for("eosh>", "the console prompt after telnetd")?;
         type_line(&mut stdin, "exit")?;
         Ok(())
     })();
@@ -4155,6 +4195,141 @@ fn check_telnet(root: &Path) -> Result<(), String> {
         "xtask: check-telnet ok — two sequential sessions served over \
          localhost:{TELNET_HOST_PORT} (greeting + eosh banner + prompt, `hello` → \
          `ok: greeted`, concurrent connection refused, `exit` closed both cleanly)"
+    );
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------------------
+// check-dhcp: headless verification of the middleware's `--address dhcp` acquisition
+// against slirp's built-in DHCP server (which leases 10.0.2.15 to the guest — the same
+// address as the static default, so everything downstream behaves identically). Two
+// probes at the serial eosh prompt: the transport chain
+// `net.virtio $ (net.l4.over-l2 --address dhcp) $ l4check` must print the middleware's
+// lease announcement and still resolve, and `telnetd --sessions 1 --address dhcp` must
+// serve a session over the hostfwd exactly like the static path. On a real LAN the
+// announcement line is the operator's only way to learn the leased address — this gate
+// pins that the line appears and carries the lease.
+// ----------------------------------------------------------------------------------------
+
+/// Boot, acquire a DHCP lease in both probe shapes, validate the announcement + service.
+fn check_dhcp(root: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let image = build_kernel(root, "aarch64")?;
+
+    println!(
+        "xtask: check-dhcp — booting {} with a user-mode NIC \
+         (hostfwd tcp:127.0.0.1:{TELNET_HOST_PORT}-:{TELNET_GUEST_PORT}), driving the \
+         dhcp-addressed l4check chain and `telnetd --sessions 1 --address dhcp` at the \
+         eosh prompt",
+        image.display()
+    );
+
+    let (mut child, mut stdin, receiver) = spawn_telnet_qemu("check-dhcp", root, &image)?;
+    let wait_for =
+        |marker: &str, what: &str| serial_wait_for("check-dhcp", &receiver, marker, what);
+
+    let drive = (|| -> Result<(), String> {
+        wait_for("eosh>", "the eosh prompt")?;
+
+        // ----- probe 1: the transport chain over a DHCP lease --------------------------
+        console_type_line(
+            "check-dhcp",
+            &mut stdin,
+            "net.virtio $ (net.l4.over-l2 --address dhcp) $ l4check",
+        )?;
+        wait_for("--address dhcp) $ l4check", "the command echo")?;
+        // The lease announcement precedes any l4 traffic (the acquisition gate): slirp
+        // leases the guest 10.0.2.15/24 via gateway 10.0.2.2 with DNS 10.0.2.3. Wait
+        // for the line's start, then for its newline, so the dns/lease assertions see
+        // the whole line rather than a prefix race.
+        let lease = wait_for(
+            "dhcp acquired 10.0.2.15/24 gw 10.0.2.2",
+            "the middleware's lease announcement",
+        )?;
+        let lease = format!(
+            "{lease}{}",
+            wait_for("\n", "the end of the lease announcement line")?
+        );
+        println!("\n----- check-dhcp: l4check transcript (lease) -----\n{lease}");
+        if !lease.contains("dns 10.0.2.3") {
+            return Err(format!(
+                "check-dhcp: the lease announcement is missing slirp's DNS server: {lease:?}"
+            ));
+        }
+        if !lease.contains(" lease ") {
+            return Err(format!(
+                "check-dhcp: the lease announcement is missing the lease duration: {lease:?}"
+            ));
+        }
+        let resolved = wait_for("ok: resolved(", "l4check's resolved outcome over the lease")?;
+        let resolved = format!(
+            "{resolved}{}",
+            wait_for("\n", "the end of the resolved outcome line")?
+        );
+        println!("----- check-dhcp: l4check transcript (outcome) -----\n{resolved}");
+        wait_for("eosh>", "the prompt after l4check")?;
+
+        // ----- probe 2: telnetd over a DHCP-addressed session stack --------------------
+        console_type_line(
+            "check-dhcp",
+            &mut stdin,
+            "telnetd --sessions 1 --address dhcp",
+        )?;
+        wait_for("telnetd --sessions 1 --address dhcp", "the command echo")?;
+        wait_for(
+            "session 1: waiting for a connection",
+            "telnetd to start serving",
+        )?;
+        // The session stack is a fresh middleware instance: it acquires its own lease
+        // when net.text first listens.
+        let session_lease = wait_for(
+            "dhcp acquired 10.0.2.15/24 gw 10.0.2.2",
+            "the session stack's lease announcement",
+        )?;
+        println!("----- check-dhcp: telnetd transcript (session lease) -----\n{session_lease}");
+
+        let (mut session, greeting) = telnet_connect_session("check-dhcp", "the dhcp session")?;
+        if !greeting.contains("cleartext telnet session") {
+            return Err(format!(
+                "check-dhcp: the session greeting (security banner) is missing: {greeting:?}"
+            ));
+        }
+        println!("----- check-dhcp: telnetd transcript (connect) -----\n{greeting}");
+        session
+            .write_all(b"exit\r\n")
+            .map_err(|err| format!("check-dhcp: writing `exit` to the socket: {err}"))?;
+        let close = socket_read_to_eof(
+            "check-dhcp",
+            &mut session,
+            std::time::Duration::from_secs(30),
+            "the connection to close after `exit`",
+        )?;
+        if !close.contains("session closed") {
+            return Err(format!(
+                "check-dhcp: the goodbye line is missing after `exit`: {close:?}"
+            ));
+        }
+        println!("----- check-dhcp: telnetd transcript (exit) -----\n{close}");
+
+        wait_for("served 1 session(s); exiting", "telnetd to finish")?;
+        wait_for("served(1)", "telnetd's outcome at the console")?;
+        wait_for("eosh>", "the console prompt after telnetd")?;
+        console_type_line("check-dhcp", &mut stdin, "exit")?;
+        Ok(())
+    })();
+    if let Err(err) = drive {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    let _ = child.wait();
+
+    println!(
+        "xtask: check-dhcp ok — the dhcp-addressed transport chain announced its lease \
+         (10.0.2.15/24, gw 10.0.2.2, dns, lease duration) and resolved, and \
+         `telnetd --sessions 1 --address dhcp` served a session over \
+         localhost:{TELNET_HOST_PORT}"
     );
     Ok(())
 }

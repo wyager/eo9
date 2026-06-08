@@ -631,8 +631,10 @@ round-trip, and a typed error vocabulary that includes `denied`.
 Standard stubs: `net.l2.none`/`.deny`, `net.l3.none`/`.deny`, `net.l4.none`/`.deny`, and `net.l4.loopback` —
 a self-contained in-memory transport that gives tests working TCP/UDP sockets with no lower layers at all.
 The l4-over-l2 middleware (`net.l4.over-l2`, a smoltcp-based TCP/IP stack) accepts compose-time addressing
-(`address`, `prefix-length`, `gateway`) through `l4-over-l2-config`; unconfigured, it uses QEMU user-net's
-10.0.2.15/24 with gateway 10.0.2.2.
+through `l4-over-l2-config`: static values (`address` + `gateway`, with `prefix-length` defaulting to 24) or
+`--address dhcp`, which acquires address, prefix, and gateway from the network's DHCP service on first use
+and announces the lease on the console (the operator's way to learn the address on a real LAN); unconfigured,
+it uses QEMU user-net's 10.0.2.15/24 with gateway 10.0.2.2.
 
 Sharing one link has two providers because it has two trust stances. `net.l2.switch` is the
 identity-enforcing attenuator: it rewrites every frame's source to the port's own MAC, so a consumer cannot

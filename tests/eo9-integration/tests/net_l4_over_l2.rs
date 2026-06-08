@@ -14,24 +14,20 @@ use eo9_integration::{guest, run};
 use eo9_runtime::{NamedArg, Outcome, Providers, SpawnError, SpawnLimits, Task};
 
 /// The full denied-link composition over an already-configured middleware, ready to
-/// compile and spawn.
-fn configured_stack(address: &str) -> eo9_component::Component {
-    let address_literal = format!("{address:?}");
-    let configured = configure(
-        &guest::load_stub("net.l4.over-l2"),
-        &[
-            ("address", address_literal.as_str()),
-            ("prefix-length", "24"),
-            ("gateway", "\"192.168.7.1\""),
-        ],
-    )
-    .expect("baking a syntactically-valid string succeeds; address validation is the provider's");
+/// compile and spawn. `args` is handed to `configure` verbatim (WAVE text; the
+/// prefix-length and gateway parameters are options — `some(…)`/`none`).
+fn configured_stack(args: &[(&str, &str)]) -> eo9_component::Component {
+    let configured = configure(&guest::load_stub("net.l4.over-l2"), args)
+        .expect("baking syntactically-valid values succeeds; validation is the provider's");
     let stack = compose(&configured, &guest::load_example("l4check"))
         .expect("configure(net.l4.over-l2, …) $ l4check");
     let stack = compose(&guest::load_stub("net.l2.deny"), &stack).expect("net.l2.deny $ …");
     let stack =
         compose(&guest::load_stub("time.monotonic-stub"), &stack).expect("time.monotonic-stub $ …");
-    compose(&guest::load_stub("entropy.seeded"), &stack).expect("entropy.seeded $ …")
+    let stack = compose(&guest::load_stub("entropy.seeded"), &stack).expect("entropy.seeded $ …");
+    // The middleware's console-diagnostic import (the DHCP lease announcement), sealed
+    // so the stack runs against no host providers at all.
+    compose(&guest::load_stub("text.null"), &stack).expect("text.null $ …")
 }
 
 #[test]
@@ -39,6 +35,7 @@ fn deny_at_l2_surfaces_through_the_middleware_as_the_programs_own_failure() {
     guest::ensure_components(&[
         "eo9-stub-entropy-seeded",
         "eo9-stub-time-monotonic-stub",
+        "eo9-stub-text-null",
         "eo9-stub-net-l2-deny",
         "eo9-stub-net-l4-over-l2",
         "eo9-example-l4check",
@@ -54,6 +51,7 @@ fn deny_at_l2_surfaces_through_the_middleware_as_the_programs_own_failure() {
     let stack =
         compose(&guest::load_stub("time.monotonic-stub"), &stack).expect("time.monotonic-stub $ …");
     let stack = compose(&guest::load_stub("entropy.seeded"), &stack).expect("entropy.seeded $ …");
+    let stack = compose(&guest::load_stub("text.null"), &stack).expect("text.null $ …");
 
     let outcome = run::run_component(&stack, &[], Providers::none());
     match outcome {
@@ -75,6 +73,7 @@ fn the_middlewares_listen_path_over_a_denied_link_is_refused_typed() {
     guest::ensure_components(&[
         "eo9-stub-entropy-seeded",
         "eo9-stub-time-monotonic-stub",
+        "eo9-stub-text-null",
         "eo9-stub-net-l2-deny",
         "eo9-stub-net-l4-over-l2",
         "eo9-example-sockcheck",
@@ -89,6 +88,7 @@ fn the_middlewares_listen_path_over_a_denied_link_is_refused_typed() {
     let stack =
         compose(&guest::load_stub("time.monotonic-stub"), &stack).expect("time.monotonic-stub $ …");
     let stack = compose(&guest::load_stub("entropy.seeded"), &stack).expect("entropy.seeded $ …");
+    let stack = compose(&guest::load_stub("text.null"), &stack).expect("text.null $ …");
 
     let outcome = run::run_component(
         &stack,
@@ -118,6 +118,7 @@ fn configuring_the_middleware_bakes_and_the_configured_chain_still_runs() {
     guest::ensure_components(&[
         "eo9-stub-entropy-seeded",
         "eo9-stub-time-monotonic-stub",
+        "eo9-stub-text-null",
         "eo9-stub-net-l2-deny",
         "eo9-stub-net-l4-over-l2",
         "eo9-example-l4check",
@@ -127,8 +128,8 @@ fn configuring_the_middleware_bakes_and_the_configured_chain_still_runs() {
         &guest::load_stub("net.l4.over-l2"),
         &[
             ("address", "\"192.168.7.2\""),
-            ("prefix-length", "24"),
-            ("gateway", "\"192.168.7.1\""),
+            ("prefix-length", "some(24)"),
+            ("gateway", "some(\"192.168.7.1\")"),
         ],
     )
     .expect("configure(net.l4.over-l2, address/prefix/gateway) must bake under alias + bind");
@@ -151,6 +152,7 @@ fn configuring_the_middleware_bakes_and_the_configured_chain_still_runs() {
     let stack =
         compose(&guest::load_stub("time.monotonic-stub"), &stack).expect("time.monotonic-stub $ …");
     let stack = compose(&guest::load_stub("entropy.seeded"), &stack).expect("entropy.seeded $ …");
+    let stack = compose(&guest::load_stub("text.null"), &stack).expect("text.null $ …");
 
     let outcome = run::run_component(&stack, &[], Providers::none());
     match outcome {
@@ -174,12 +176,17 @@ fn a_malformed_configure_address_is_a_typed_refusal_not_a_trap() {
     guest::ensure_components(&[
         "eo9-stub-entropy-seeded",
         "eo9-stub-time-monotonic-stub",
+        "eo9-stub-text-null",
         "eo9-stub-net-l2-deny",
         "eo9-stub-net-l4-over-l2",
         "eo9-example-l4check",
     ]);
 
-    let stack = configured_stack("not-an-ip");
+    let stack = configured_stack(&[
+        ("address", "\"not-an-ip\""),
+        ("prefix-length", "some(24)"),
+        ("gateway", "some(\"192.168.7.1\")"),
+    ]);
     let image = run::compile_component(&stack);
     let err = Task::spawn(&image, &[], SpawnLimits::default(), Providers::none())
         .expect_err("a malformed configured address must refuse the spawn");
@@ -209,6 +216,7 @@ fn a_merged_bind_propagates_the_nested_configure_refusal() {
     guest::ensure_components(&[
         "eo9-stub-entropy-seeded",
         "eo9-stub-time-monotonic-stub",
+        "eo9-stub-text-null",
         "eo9-stub-net-l2-deny",
         "eo9-stub-net-l4-over-l2",
         "eo9-example-l4check",
@@ -219,8 +227,8 @@ fn a_merged_bind_propagates_the_nested_configure_refusal() {
         &guest::load_stub("net.l4.over-l2"),
         &[
             ("address", "\"999.0.0.1\""),
-            ("prefix-length", "24"),
-            ("gateway", "\"192.168.7.1\""),
+            ("prefix-length", "some(24)"),
+            ("gateway", "some(\"192.168.7.1\")"),
         ],
     )
     .expect("baking succeeds; validation is the provider's");
@@ -228,6 +236,7 @@ fn a_merged_bind_propagates_the_nested_configure_refusal() {
     let inner = compose(&guest::load_stub("net.l2.deny"), &inner).expect("net.l2.deny $ …");
     let inner =
         compose(&guest::load_stub("time.monotonic-stub"), &inner).expect("time.monotonic-stub $ …");
+    let inner = compose(&guest::load_stub("text.null"), &inner).expect("text.null $ …");
 
     // Outer: a *configured* entropy provider over the inner stack -- both operands carry
     // a bind entrypoint, so this compose synthesizes the bind merger.
@@ -242,6 +251,98 @@ fn a_merged_bind_propagates_the_nested_configure_refusal() {
         SpawnError::ConfigurationRefused(reason) => assert!(
             reason.contains("not a dotted-quad IPv4 address"),
             "the merger must propagate the nested provider's own message: {reason}"
+        ),
+        other => panic!("expected ConfigurationRefused, got: {other}"),
+    }
+}
+
+/// `--address dhcp` is a first-class configure value: it bakes, the config interface
+/// seals away, and the configured chain still surfaces a dead link as the program's own
+/// typed failure (the acquisition gate sits *behind* the link bring-up, so a denied l2
+/// refuses before any DHCP exchange is attempted — typed, never a hang or a trap).
+#[test]
+fn dhcp_mode_bakes_and_a_denied_link_is_still_the_programs_typed_failure() {
+    guest::ensure_components(&[
+        "eo9-stub-entropy-seeded",
+        "eo9-stub-time-monotonic-stub",
+        "eo9-stub-text-null",
+        "eo9-stub-net-l2-deny",
+        "eo9-stub-net-l4-over-l2",
+        "eo9-example-l4check",
+    ]);
+
+    let stack = configured_stack(&[
+        ("address", "\"dhcp\""),
+        ("prefix-length", "none"),
+        ("gateway", "none"),
+    ]);
+    let outcome = run::run_component(&stack, &[], Providers::none());
+    match outcome {
+        Outcome::Failure(failure) => assert!(
+            failure.value.to_lowercase().contains("denied"),
+            "expected the link layer's refusal in the program's own failure value: {}",
+            failure.value
+        ),
+        other => panic!("expected the program's own typed failure, got {other:?}"),
+    }
+}
+
+/// `--address dhcp` combined with the static-only arguments is a typed pre-run refusal
+/// (option-C discipline: the configuration is contradictory, so it is refused with the
+/// provider's own message — never silently ignored, never a trap).
+#[test]
+fn combining_dhcp_with_static_arguments_is_a_typed_refusal() {
+    guest::ensure_components(&[
+        "eo9-stub-entropy-seeded",
+        "eo9-stub-time-monotonic-stub",
+        "eo9-stub-text-null",
+        "eo9-stub-net-l2-deny",
+        "eo9-stub-net-l4-over-l2",
+        "eo9-example-l4check",
+    ]);
+
+    let stack = configured_stack(&[
+        ("address", "\"dhcp\""),
+        ("prefix-length", "some(24)"),
+        ("gateway", "none"),
+    ]);
+    let image = run::compile_component(&stack);
+    let err = Task::spawn(&image, &[], SpawnLimits::default(), Providers::none())
+        .expect_err("dhcp combined with a static-only argument must refuse the spawn");
+    match err {
+        SpawnError::ConfigurationRefused(reason) => assert!(
+            reason.contains("do not combine"),
+            "the refusal must carry the provider's own validation message: {reason}"
+        ),
+        other => panic!("expected ConfigurationRefused, got: {other}"),
+    }
+}
+
+/// A static address without a gateway is a typed pre-run refusal: static addressing
+/// binds address and gateway together (the prefix length alone defaults to 24).
+#[test]
+fn a_static_address_without_a_gateway_is_a_typed_refusal() {
+    guest::ensure_components(&[
+        "eo9-stub-entropy-seeded",
+        "eo9-stub-time-monotonic-stub",
+        "eo9-stub-text-null",
+        "eo9-stub-net-l2-deny",
+        "eo9-stub-net-l4-over-l2",
+        "eo9-example-l4check",
+    ]);
+
+    let stack = configured_stack(&[
+        ("address", "\"192.168.7.2\""),
+        ("prefix-length", "none"),
+        ("gateway", "none"),
+    ]);
+    let image = run::compile_component(&stack);
+    let err = Task::spawn(&image, &[], SpawnLimits::default(), Providers::none())
+        .expect_err("a static address without a gateway must refuse the spawn");
+    match err {
+        SpawnError::ConfigurationRefused(reason) => assert!(
+            reason.contains("needs --gateway"),
+            "the refusal must carry the provider's own validation message: {reason}"
         ),
         other => panic!("expected ConfigurationRefused, got: {other}"),
     }
