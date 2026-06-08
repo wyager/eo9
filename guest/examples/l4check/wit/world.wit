@@ -1,16 +1,20 @@
 // l4check — the transport-layer (eo9:net/l4) example: bind a UDP socket, send a DNS
-// query for `example.com` to the QEMU user-net resolver (10.0.2.3), and report the
-// answer; then attempt a TCP connection to the gateway's discard port and report its
-// typed outcome. A DNS answer proves UDP datagrams travel both ways through whatever
-// l4 provider the program is composed with (`net.virtio $ net.l4.over-l2` on metal);
-// the TCP attempt proves the stack turns a refused/ignored SYN into a typed error
-// rather than a trap. Capabilities: eo9:net/l4 only.
+// query for `example.com` to the resolver, and report the answer; then attempt a TCP
+// connection to a port nothing should answer on and report its typed outcome. A DNS
+// answer proves UDP datagrams travel both ways through whatever l4 provider the
+// program is composed with (`net.virtio $ net.l4.over-l2` on QEMU metal,
+// `net.rtl8125 $ net.l4.over-l2` on the board); the TCP attempt proves the stack turns
+// a refused/ignored SYN into a typed error rather than a trap. The targets default to
+// QEMU user-net's layout (resolver 10.0.2.3, probe 10.0.2.2); `--resolver`/`--probe`
+// aim them at a real LAN's DNS server (typically the router). Capabilities:
+// eo9:net/l4 only.
 package eo9-examples:l4check@0.1.0;
 
 /// Resolves `example.com` over the granted transport capability and reports what the
 /// resolver answered, plus the typed outcome of a TCP connection attempt.
 ///
 ///   net.virtio $ net.l4.over-l2 $ l4check
+///   net.rtl8125 $ (net.l4.over-l2 --address …) $ l4check --resolver 10.20.3.1
 world l4check {
     import eo9:net/l4@0.1.0;
 
@@ -21,6 +25,8 @@ world l4check {
     }
 
     variant program-failure {
+        /// An argument was unusable (e.g. a resolver that is not a dotted quad).
+        bad-arguments(string),
         /// The transport capability refused (e.g. composed over net.l2.deny).
         denied,
         /// A transport operation failed, carrying the l4 API's own error.
@@ -29,5 +35,8 @@ world l4check {
         no-answer(string),
     }
 
-    export main: async func() -> result<program-success, program-failure>;
+    /// `resolver`: the DNS server, dotted quad (default 10.0.2.3). `probe`: the
+    /// host whose discard port (9) the TCP attempt targets (default 10.0.2.2).
+    export main: async func(resolver: option<string>, probe: option<string>)
+        -> result<program-success, program-failure>;
 }

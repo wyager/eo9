@@ -27,6 +27,9 @@ use alloc::vec::Vec;
 
 use eo9_guest::buffer;
 
+// Six typed `main` parameters lower to more core-glue arguments than clippy's
+// budget; the WIT signature is the real interface, so the lint is noise here.
+#[allow(clippy::too_many_arguments)]
 mod bindings {
     wit_bindgen::generate!({
         world: "telnetd",
@@ -51,8 +54,9 @@ const DEFAULT_PORT: u16 = 23;
 /// forever unsupervised (the init console-restart cap, same number, same reason).
 const MAX_SESSIONS: u32 = 1000;
 
-/// The /bin names of the session stack, bottom to top.
-const STACK_NIC: &str = "net.virtio";
+/// The /bin names of the session stack, bottom to top (`--nic` overrides the NIC:
+/// `net.rtl8125` on the board bench).
+const DEFAULT_STACK_NIC: &str = "net.virtio";
 const STACK_TCP: &str = "net.l4.over-l2";
 const STACK_TEXT: &str = "net.text";
 const STACK_SHELL: &str = "eosh";
@@ -132,6 +136,10 @@ impl Guest for Telnetd {
     async fn main(
         port: Option<u16>,
         sessions: Option<u32>,
+        nic: Option<String>,
+        address: Option<String>,
+        prefix_length: Option<u8>,
+        gateway: Option<String>,
     ) -> Result<ProgramSuccess, ProgramFailure> {
         let out = Out::new();
         let port = port.unwrap_or(DEFAULT_PORT);
@@ -150,9 +158,24 @@ impl Guest for Telnetd {
             None => MAX_SESSIONS,
         };
 
+        // Static addressing: address and gateway travel together (the middleware's
+        // configure binds all three fields at once; prefix-length alone is meaningless).
+        if address.is_some() != gateway.is_some() {
+            return Err(ProgramFailure::BadArguments(String::from(
+                "--address and --gateway must be given together (prefix-length \
+                 defaults to 24)",
+            )));
+        }
+        if prefix_length.is_some() && address.is_none() {
+            return Err(ProgramFailure::BadArguments(String::from(
+                "--prefix-length needs --address and --gateway",
+            )));
+        }
+
         // ----- resolve, configure, compose, compile — once -----------------------------
         let fs_handle = fs::default();
-        let nic = resolve(&fs_handle, STACK_NIC)
+        let nic_name = nic.as_deref().unwrap_or(DEFAULT_STACK_NIC);
+        let nic = resolve(&fs_handle, nic_name)
             .await
             .map_err(ProgramFailure::Resolve)?;
         let tcp = resolve(&fs_handle, STACK_TCP)
@@ -164,6 +187,31 @@ impl Guest for Telnetd {
         let shell = resolve(&fs_handle, STACK_SHELL)
             .await
             .map_err(ProgramFailure::Resolve)?;
+
+        // Bake static IPv4 addressing into the middleware when given (the board
+        // bench: `--address 10.20.3.70 --gateway 10.20.3.1`); without the arguments
+        // the middleware keeps its documented QEMU user-net default.
+        let tcp = match (&address, &gateway) {
+            (Some(address), Some(gateway)) => algebra::configure(
+                tcp,
+                &[
+                    algebra::NamedArg {
+                        name: String::from("address"),
+                        value: format!("{address:?}"),
+                    },
+                    algebra::NamedArg {
+                        name: String::from("prefix-length"),
+                        value: prefix_length.unwrap_or(24).to_string(),
+                    },
+                    algebra::NamedArg {
+                        name: String::from("gateway"),
+                        value: format!("{gateway:?}"),
+                    },
+                ],
+            )
+            .map_err(|err| ProgramFailure::Configure(format!("net.l4.over-l2: {err:?}")))?,
+            _ => tcp,
+        };
 
         // Bind the port at compose time (the config interface disappears with this, so
         // the session can neither observe nor re-run it).
@@ -183,7 +231,7 @@ impl Guest for Telnetd {
         let session = algebra::compose(tcp, session)
             .map_err(|err| ProgramFailure::Compose(format!("net.l4.over-l2 $ …: {err:?}")))?;
         let session = algebra::compose(nic, session)
-            .map_err(|err| ProgramFailure::Compose(format!("net.virtio $ …: {err:?}")))?;
+            .map_err(|err| ProgramFailure::Compose(format!("{nic_name} $ …: {err:?}")))?;
 
         let opts = compile::CompileOpts {
             debug_info: false,

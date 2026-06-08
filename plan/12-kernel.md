@@ -2082,9 +2082,18 @@ link bring-up + enumeration.
   (245/250, edge-rising) demuxed via PCIE_CLIENT_INTR_STATUS_LEGACY; per-(segment,line)
   state the swizzle model lacks. `pci_intx::WIRED = false` on the board (provider answers
   `unsupported`; lspci needs none); the demux design is in the module docs for the driver
-  lane.
+  lane. *Driver-lane assessment (2026-06-08, area/09-rtl8125, plan/09 D46): wiring the
+  demux is NOT small — per-(segment,line) mask/record state vs the four global gpex
+  lines, an APB status read in the IRQ path, and edge-ack semantics the level-oriented
+  mask/unmask contract does not express, with QEMU-path regression risk. The RTL8125
+  driver ships polled v1 (honest bounds, net.virtio parity); the kernel INTx demux stays
+  the recorded follow-up, to land together with the D59 interrupt-receive conversions.*
 * **Images**: minimal store gains `lspci`; bench = serial-loader path, bootargs
   `program=lspci pci`. Acceptance lines: two `pcie[…]: link …` prints, then lspci showing
   `0000:00:00.0 1d87:3588 … pci-bridge`, `0000:01:00.0 10ec:8125 … endpoint` (right) and
   the same pair on segment 0001 (left). Full ci + canonical aarch64/riscv64 demos +
-  `pci program=lspci` green; board images rebuilt.
+  `pci program=lspci` green; board images rebuilt. *Since area/09-rtl8125: the minimal
+  store is the 9-component acceptance set (hello, lspci, net.rtl8125, l2check,
+  net.l4.over-l2, l4check, net.text, telnetd, eosh — 22.2 MiB image, ~155 s at
+  1.5 Mbaud); the network acceptance ladder runs at the serial eosh prompt under a `pci`
+  boot grant — bench lines in plan/09 D46.*

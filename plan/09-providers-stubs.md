@@ -1010,3 +1010,91 @@ Match the priority order above; (1)+(2) unblock I2.
     *Also fixed while validating:* the greeting is now PREPENDED to net.text's pending output at
     accept time, so it precedes the banner/prompt the shell buffered while no connection existed
     (first transcript had it after the prompt — wire order now reads greeting → banner → prompt).
+
+46. **`net.rtl8125` — the RTL8125 2.5GbE driver: the board's trained PCIe links carry real
+    packets (2026-06-08, branch area/09-rtl8125; the convergence lane of plan/12's Orange Pi 5
+    Plus bring-up).** A guest component importing `eo9:pci/pci` (+ text for one diagnostic
+    line), exporting `eo9:net/l2` — net.virtio's real-silicon sibling, with every discipline
+    carried over verbatim: the take/put driver slot + cancellation-safe guard, the bring-up
+    claim (D41), drain-before-reuse on the transmit ring (D34, the `tx_published`/`tx_consumed`
+    cursor pair), bounded polls everywhere (reset, PHY OCP, link wait, tx completion, the
+    study-08-F2 short receive poll), typed errors never traps, and the "empty result = nothing
+    waiting" receive contract.
+
+    *Device model (the citation rule, every constant sourced).* The driver follows mainline
+    Linux r8169 — which drives the RTL8125 family with the **legacy 16-byte descriptor rings**
+    (opts1/opts2/addr), not the vendor driver's 32-byte v3 format — cross-checked against
+    Realtek r8125 and OpenBSD rge(4) where the 8125 diverges (IMR/ISR at 0x38/0x3c dword,
+    TxPoll_8125 doorbell at 0x90, GPHY_OCP MDIO window at 0xb8, the 2.5G advertisement in PHY
+    OCP 0xa5d4 bit 7, PHYstatus 0x6c bit 10 for 2500M). All of that lives in
+    `crates/eo9-rtl8125`, a pure no_std crate in the host workspace: register map, descriptor
+    encode/decode, GPHY command words — 10 host unit tests pin the encodings (the
+    eofs/eosh-core precedent: the component is a thin I/O shell, the bit arithmetic is
+    host-tested). Rings are 32/32 in one `alloc-dma` page (256-byte alignment checked, typed);
+    receive slots are 32 × 2 KiB with `RxMaxSize` = slot size so frames never span slots;
+    transmit pads to the 60-byte minimum in its bounce buffer rather than trusting hardware
+    padding (the first acceptance frame is a 42-byte ARP). Bring-up: MAC read → soft reset →
+    IMR 0 + ISR ack (the polled driver's ISR-suppression discipline in this device's dialect:
+    with the mask clear the NIC never asserts INTx) → PHY autoneg (10/100 + 1000FD + 2500FD)
+    with a bounded link wait that does NOT fail bring-up — link state is typed
+    (`info.up`/`link-down`) and re-read by later operations, so a slow negotiation just means
+    a retried check. Promiscuous OFF; **multicast = none for v1** (recorded: ARP/IPv4 need
+    broadcast + unicast only; all-multi is one RxConfig bit away when IPv6 ND arrives).
+    Deliberately omitted, recorded as first suspects if board traffic misbehaves: the
+    reference drivers' MAC-OCP errata pokes / MCU patch tables / EEE tuning, and the 8125B's
+    RX_PAUSE_SLOT_ON.
+
+    *INTx assessment (the rk3588_pcie design-note follow-up): polled v1, demux deferred.*
+    Wiring SPIs 245/250 is not the small path: each DW controller folds all four pins onto ONE
+    edge-rising SPI demuxed by an APB status read (+ hiword mask register), so the kernel
+    would need per-(segment, line) mask/record state where the shared swizzle model carries
+    four global level-triggered gpex lines, an APB read in the IRQ path, and edge-ack
+    semantics the level-oriented mask/unmask contract does not express — a real kernel
+    sub-lane with QEMU-path regression risk (`pci_intx` stays `WIRED = false` on the board;
+    the provider answers `unsupported`; the QEMU INTx path is untouched — disk.virtio's
+    interrupt round-trip stays green). The driver is polled with honest bounds by design and
+    by measurement parity with net.virtio; the kernel INTx demux is the recorded follow-up
+    alongside D59's interrupt-receive conversion.
+
+    *What QEMU can and cannot validate.* QEMU has no RTL8125 model (rtl8139 is its newest
+    Realtek NIC), so emulated coverage is exactly: composition shape (l2 sealed, pci the
+    residual), `pci.deny` underneath surfacing as the consumer's typed failure (both pinned in
+    tests/eo9-integration/tests/net_rtl8125.rs), and the live metal probe — verified at the
+    QEMU aarch64 eosh prompt: `net.rtl8125 $ l2check` compiled on-target (9.3 s) and refused
+    typed, naming the identity (`no RTL8125 (10ec:8125) function is visible…`), prompt intact
+    after. Everything past the probe is board-validated by the planner (this lane never
+    touches the serial port).
+
+    *Board deliverables.* The opi5plus **minimal** store grows from {hello, lspci} to the
+    acceptance set {hello, lspci, net.rtl8125, l2check, net.l4.over-l2, l4check, net.text,
+    telnetd, eosh} — 9 components, 10.6 MiB store, 22.2 MiB image (the full image carries all
+    56). The acceptance compositions run at the serial eosh prompt (boot grant `pci` in
+    bootargs; the headless `program=` runner links only kernel root providers, so composed
+    stacks are the shell's job — same shape as check-telnet). Three examples grew the minimal
+    arguments the bench needs, defaults preserving QEMU behavior exactly: `l2check
+    --gateway <ip>` (ARP target, default 10.0.2.2), `l4check --resolver <ip> --probe <ip>`
+    (DNS server / TCP-probe host, defaults 10.0.2.3 / 10.0.2.2), `telnetd --nic <name>
+    --address <ip> --prefix-length <n> --gateway <ip>` (the NIC the session stack composes
+    over, default net.virtio, plus static addressing baked into net.l4.over-l2's configure;
+    address+gateway travel together, prefix defaults to 24). The bench ladder (owner's LAN:
+    board 10.20.3.70/24, gateway 10.20.3.1, Mac client 10.20.3.108):
+
+    * (a) link layer: `net.rtl8125 $ l2check --gateway 10.20.3.1` → the router's MAC.
+    * (b) transport: `net.rtl8125 $ (net.l4.over-l2 --address 10.20.3.70 --prefix-length 24
+      --gateway 10.20.3.1) $ l4check --resolver 10.20.3.1 --probe 10.20.3.1` → an A record
+      for example.com + a typed TCP outcome. (No DHCP exists anywhere in the stack — static
+      config is the design, not a gap.)
+    * (c) the prize: `telnetd --nic net.rtl8125 --address 10.20.3.70 --gateway 10.20.3.1`,
+      then `telnet 10.20.3.70` from the Mac (port 23; cleartext, trusted-LAN only per D44).
+
+    Also in this lane (bench tooling): the serial-loader sender's mid-transfer stall alarm now
+    fires on **no ack progress for >10 s regardless of which loop holds control** (one
+    progress clock checked on every pass of both loops, wall-clock so a host sleep trips it on
+    wake) plus a serial `write_timeout` so a post-sleep wedged port driver cannot hang the
+    sender inside `write()` — the 2026-06-07 incident was per-loop-entry deadlines being
+    re-armed forever (boards/opi5-serial-loader/tools/send_image.py).
+
+    Verified: full `cargo xtask ci` green per milestone; `cargo test -p eo9-rtl8125` (10 ring/
+    PHY-word tests); the two usermode composition tests; the QEMU typed-refusal probe; bundle
+    refreshed (77 components); both board images rebuilt. Board acceptance is the planner's
+    bench run — recorded here as pending.

@@ -1,14 +1,17 @@
 // l2check — the link-layer (eo9:net/l2) example: open the provider's interface, send a
-// broadcast ARP request for the QEMU user-net gateway (10.0.2.2), and wait for the
-// reply. Getting one proves whole frames move in both directions through whatever l2
-// provider the program is composed with (`net.virtio` on metal). Capabilities:
+// broadcast ARP request for the gateway, and wait for the reply. Getting one proves
+// whole frames move in both directions through whatever l2 provider the program is
+// composed with (`net.virtio` on QEMU metal, `net.rtl8125` on the board). Capabilities:
 // eo9:net/l2, eo9:text.
 package eo9-examples:l2check@0.1.0;
 
-/// ARP-resolves 10.0.2.2 (the QEMU user-mode-networking gateway) over the granted
-/// link-layer capability and reports the MAC address that answered.
+/// ARP-resolves the gateway over the granted link-layer capability and reports the MAC
+/// address that answered. The target defaults to 10.0.2.2 (the QEMU user-mode-networking
+/// gateway every slirp instance answers ARP for); `--gateway` points the probe at a real
+/// LAN's router when the link is physical.
 ///
 ///   net.virtio $ l2check
+///   net.rtl8125 $ l2check --gateway 10.20.3.1     (board bench)
 world l2check {
     import eo9:net/l2@0.1.0;
     import eo9:text/text@0.1.0;
@@ -19,6 +22,8 @@ world l2check {
     }
 
     variant program-failure {
+        /// An argument was unusable (e.g. a gateway that is not a dotted quad).
+        bad-arguments(string),
         /// The link-layer capability refused the request (e.g. composed over net.l2.deny).
         denied,
         /// A link-layer operation failed, carrying the l2 API's own error.
@@ -29,5 +34,7 @@ world l2check {
         io(string),
     }
 
-    export main: async func() -> result<program-success, program-failure>;
+    /// `gateway`: the IPv4 address to ARP for, dotted quad (default 10.0.2.2).
+    export main: async func(gateway: option<string>)
+        -> result<program-success, program-failure>;
 }
