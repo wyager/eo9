@@ -772,6 +772,13 @@ name = "eosh-core"
 version = "0.0.0"
 
 [[package]]
+name = "eosh-inc"
+version = "0.0.0"
+dependencies = [
+ "eosh-core",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -722,15 +722,22 @@ fn test(root: &Path) -> Result<(), String> {
     run(root, "cargo", ["test", "--workspace"])?;
     // Kernel unit tests run on the host triple; the placeholder crate is `no_std`
     // except under `cfg(test)`. Guest component crates have no wasm test runner wired
-    // up and are exercised by host-side integration tests instead, but eosh-core is a
-    // plain no_std library whose unit tests run on the host triple — passed explicitly,
-    // because the guest workspace defaults to the wasm target (guest/.cargo/config.toml).
+    // up and are exercised by host-side integration tests instead, but eosh-core and
+    // eosh-inc are plain no_std libraries whose unit tests run on the host triple —
+    // passed explicitly, because the guest workspace defaults to the wasm target
+    // (guest/.cargo/config.toml). eosh-inc's battery includes the differential
+    // superset gate against eosh-core's parser (study 19 M1).
     run(&root.join("kernel"), "cargo", ["test", "--workspace"])?;
     let host = host_triple()?;
     run(
         &root.join("guest"),
         "cargo",
         ["test", "-p", "eosh-core", "--target", host.as_str()],
+    )?;
+    run(
+        &root.join("guest"),
+        "cargo",
+        ["test", "-p", "eosh-inc", "--target", host.as_str()],
     )?;
     // The website server workspace (www/): its unit + integration tests are quick and
     // native; the wasm32 blob workspace stays out of the gate (built by build-web-vm).

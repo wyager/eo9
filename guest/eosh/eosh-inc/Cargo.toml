@@ -1,0 +1,16 @@
+[package]
+name = "eosh-inc"
+description = "Incremental parser-combinator core for the eosh per-keystroke editor (study 19): a byte-at-a-time step/admissible/completions parser whose v1 grammar mirrors eosh-core's lexer+parser as a superset, so the editor can mark dead input and offer TAB completion without ever rejecting a line the real parser accepts. no_std + alloc, dependency-free, host-tested; not yet wired into eosh (M2)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Intentionally none: like eosh-core, the crate is pure no_std + alloc so it can be
+# unit-tested on the host and linked unchanged into the eosh component.
+
+[dev-dependencies]
+# The differential soundness gate parses every corpus line with BOTH parsers:
+# eosh-core's parse_command is the ground truth the incremental grammar must cover.
+eosh-core = { path = "../eosh-core" }
