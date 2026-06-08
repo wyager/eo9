@@ -1331,3 +1331,32 @@ Match the priority order above; (1)+(2) unblock I2.
     validation: the same l4check fusion compiled in 56 s across 1178 slices with liveness
     lines every 5 s and resolved; check-telnet green through the sliced path (its
     sessions compile the 4-component stack). The telnet prize ladder is unblocked.
+
+    *Round 10 (2026-06-08): the merge review's one blocker — the RX re-arm line-clobber —
+    fixed with lazy line-granularity re-arm.* The defect (review-verified): descriptors
+    are 16 bytes, the board's DMA cache maintenance is 64-byte-line granular, and the
+    ring base is line-aligned, so 4 RX descriptors share each line; `recv()`'s immediate
+    per-slot re-arm wrote back the CPU's stale snapshot of the 3 neighbors — racing a
+    completion the NIC stores in a neighbor between the poll's read and the sweep's
+    writeback. The writeback restores OWN=1 over the device's completion; the NIC never
+    rewrites it; the frame is lost and the ring stalls at that slot until wrap.
+    Microburst traffic lands in the µs-scale window; QEMU cannot reproduce (coherent,
+    sweeps no-op); TX was already safe (single in-flight + D34 drain).
+
+    The fix follows the reviewer's shape exactly (the code agreed — ring consumption is
+    strictly sequential, which makes the policy a one-liner): a line is re-armed only
+    when its LAST slot is consumed, at which point all 4 slots are OWN=0 and the device
+    provably owns nothing in the line (it never writes a descriptor it does not own);
+    one 64-byte dma-write re-posts the whole line. Costs at most 3 of 32 slots parked
+    unarmed. The invariant is documented in the core crate at the stride definition
+    (`DESC_BYTES`), the policy helpers (`rx_line_to_rearm`, `encode_rx_line`) are pure
+    and host-tested (20 tests now): a consumed/posted model over two ring wraps asserts
+    no re-post while any line slot is device-owned, the ≤3-slot backlog bound, and the
+    slots-28..31 wrap with EOR only on slot 31. Bench visibility: the counters
+    diagnostic line gains `consumed-slots N rearmed-lines M` (expect N ≈ 4M under
+    traffic). Also folded in (reviewer non-blocking #2): fibercompile's UNITS counter
+    is now per-compile across nesting; #1 (fiber guard page) is the kernel lane's
+    GAPS entry. Re-verified: crate tests, full ci, QEMU probes A
+    (`net.virtio $ l2check` → resolved) and C (typed refusal) matching the reviewer's
+    transcripts; both board images rebuilt. Board burst-RX confirmation is the
+    planner's post-merge run.

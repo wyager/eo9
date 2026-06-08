@@ -421,8 +421,25 @@ pub mod phy {
 // RxDesc`: __le32 opts1, __le32 opts2, __le64 addr).
 // ------------------------------------------------------------------------------------
 
-/// One descriptor is 16 bytes.
+/// One descriptor is 16 bytes. THE CACHE-LINE INVARIANT HANGS OFF THIS NUMBER: the
+/// stride is fixed by the NIC's descriptor format, aarch64 D-cache lines are 64 bytes,
+/// and the ring base is line-aligned (page-aligned DMA), so exactly
+/// [`RX_DESCRIPTORS_PER_LINE`] = 4 descriptors share every line. On a non-coherent
+/// bus (the board) every CPU write to a descriptor is swept to DRAM at LINE
+/// granularity — the sweep writes back all 64 bytes, neighbors included. A receive
+/// descriptor must therefore never be re-armed individually while any neighbor in
+/// its line may still be receiving a device write: the re-arm's writeback would
+/// restore the CPU's stale snapshot of that neighbor (OWN=1) over the completion the
+/// NIC stored in DRAM, and the NIC never rewrites a completion — the frame is lost
+/// and the ring stalls at that slot until wrap. The safe policy is line-granularity
+/// lazy re-arm: [`rx_line_to_rearm`] + [`encode_rx_line`], re-posting a line only
+/// once ALL four of its slots are consumed (OWN=0 everywhere — the device never
+/// writes a descriptor it does not own, so the line is provably quiescent). Costs at
+/// most 3 of the ring's slots being parked unarmed at any time.
 pub const DESC_BYTES: u64 = 16;
+
+/// Descriptors per 64-byte cache line (see [`DESC_BYTES`]'s invariant note).
+pub const RX_DESCRIPTORS_PER_LINE: u16 = 4;
 
 /// `opts1` ownership / ring bits (r8169 `enum desc_status_bit`).
 pub const DESC_OWN: u32 = 1 << 31;
@@ -523,6 +540,46 @@ pub fn rx_payload_len(completion: &RxCompletion) -> Option<u16> {
 /// Byte offset of descriptor `index` within a ring.
 pub const fn descriptor_offset(index: u16) -> u64 {
     index as u64 * DESC_BYTES
+}
+
+/// The lazy line re-arm policy (see [`DESC_BYTES`]'s invariant): consuming receive
+/// slot `consumed_slot` re-arms a line only when it is the line's LAST slot — the
+/// ring is filled and consumed strictly in order, so at that moment all four slots
+/// are consumed and the device owns nothing in the line. Returns the line's first
+/// slot when a re-arm is due. (Ring sizes must be a multiple of
+/// [`RX_DESCRIPTORS_PER_LINE`]; 32 is.)
+pub const fn rx_line_to_rearm(consumed_slot: u16) -> Option<u16> {
+    if (consumed_slot + 1).is_multiple_of(RX_DESCRIPTORS_PER_LINE) {
+        Some(consumed_slot + 1 - RX_DESCRIPTORS_PER_LINE)
+    } else {
+        None
+    }
+}
+
+/// Encode one full cache line of receive descriptors (4 × 16 bytes), arming slots
+/// `first_slot .. first_slot + 4` over their buffers; `RingEnd` lands on the ring's
+/// final slot when it falls inside this line. Written to the ring with ONE DMA write
+/// so the (line-granular) sweep that publishes it is the only writeback the line sees.
+pub fn encode_rx_line(
+    buffer_base: u64,
+    slot_bytes: u64,
+    first_slot: u16,
+    ring_slots: u16,
+) -> [u8; 64] {
+    let mut line = [0u8; 64];
+    let mut index = 0u16;
+    while index < RX_DESCRIPTORS_PER_LINE {
+        let slot = first_slot + index;
+        let descriptor = encode_rx_descriptor(
+            buffer_base + slot as u64 * slot_bytes,
+            slot_bytes as u16,
+            slot == ring_slots - 1,
+        );
+        let at = (index as usize) * DESC_BYTES as usize;
+        line[at..at + 16].copy_from_slice(&descriptor);
+        index += 1;
+    }
+    line
 }
 
 /// The minimum Ethernet frame length (without CRC). Frames shorter than this are
@@ -746,6 +803,94 @@ mod tests {
                 *register >= 0xa000,
                 "unexpected PHY MCU register {register:#x}"
             );
+        }
+    }
+
+    #[test]
+    fn rx_line_rearm_policy_never_reposts_a_line_the_device_still_owns() {
+        // Model: a 32-slot ring, filled and consumed strictly in order (the NIC fills
+        // descriptors in ring order and the driver's cursor follows). `device_owned`
+        // tracks OWN=1 slots; consuming clears OWN; a re-arm sets OWN on its 4 slots.
+        const RING: u16 = 32;
+        assert_eq!(RING % RX_DESCRIPTORS_PER_LINE, 0);
+        let mut device_owned = [true; RING as usize]; // bring-up posts all 32
+        let mut rearm_slots: Vec<u16> = Vec::new();
+        let mut max_unarmed_backlog = 0usize;
+
+        // Two full wraps of sequential consumption.
+        for consumed in 0u32..(2 * RING as u32) {
+            let slot = (consumed % RING as u32) as u16;
+            assert!(
+                device_owned[slot as usize],
+                "the model consumed slot {slot} the device did not own — ring stalled"
+            );
+            device_owned[slot as usize] = false; // completion consumed (OWN=0)
+
+            if let Some(first) = rx_line_to_rearm(slot) {
+                rearm_slots.push(slot);
+                // THE INVARIANT: at re-arm time, no slot of the line is device-owned —
+                // the line-granular writeback cannot clobber an in-flight completion.
+                for line_slot in first..first + RX_DESCRIPTORS_PER_LINE {
+                    assert!(
+                        !device_owned[line_slot as usize],
+                        "re-arm of line at {first} while slot {line_slot} is device-owned"
+                    );
+                }
+                for line_slot in first..first + RX_DESCRIPTORS_PER_LINE {
+                    device_owned[line_slot as usize] = true;
+                }
+            }
+            let backlog = device_owned.iter().filter(|owned| !**owned).count();
+            max_unarmed_backlog = max_unarmed_backlog.max(backlog);
+        }
+        // Re-arms fire exactly on each line's last slot: 3, 7, …, 31, twice over.
+        let expected: Vec<u16> = (0..2 * RING / 4).map(|i| (i * 4 + 3) % RING).collect();
+        assert_eq!(rearm_slots, expected);
+        // The cost bound the policy promises: at most 3 slots parked unarmed.
+        assert_eq!(max_unarmed_backlog as u16, RX_DESCRIPTORS_PER_LINE - 1);
+        // And after the final line re-arm the ring is fully armed again.
+        assert!(device_owned.iter().all(|owned| *owned));
+    }
+
+    #[test]
+    fn rx_line_rearm_fires_only_on_line_boundaries() {
+        for slot in 0u16..32 {
+            match rx_line_to_rearm(slot) {
+                Some(first) => {
+                    assert_eq!((slot + 1) % 4, 0);
+                    assert_eq!(first, slot - 3);
+                }
+                None => assert_ne!((slot + 1) % 4, 0),
+            }
+        }
+        assert_eq!(rx_line_to_rearm(3), Some(0));
+        assert_eq!(rx_line_to_rearm(31), Some(28));
+        assert_eq!(rx_line_to_rearm(30), None);
+    }
+
+    #[test]
+    fn rx_line_encode_matches_per_descriptor_encoding_and_wrap_eor() {
+        let base = 0x4000_0000u64;
+        // The wrap line (slots 28..31): EOR must sit ONLY in the final descriptor.
+        let line = encode_rx_line(base, 2048, 28, 32);
+        for index in 0u16..4 {
+            let slot = 28 + index;
+            let expected = encode_rx_descriptor(base + slot as u64 * 2048, 2048, slot == 31);
+            let at = (index as usize) * 16;
+            assert_eq!(
+                &line[at..at + 16],
+                &expected,
+                "slot {slot} encoding differs"
+            );
+            let opts1 = decode_opts1(line[at..at + 4].try_into().unwrap());
+            assert!(owned_by_nic(opts1));
+            assert_eq!(opts1 & DESC_RING_END != 0, slot == 31, "EOR placement");
+        }
+        // A middle line carries no EOR anywhere.
+        let line = encode_rx_line(base, 2048, 8, 32);
+        for index in 0usize..4 {
+            let opts1 = decode_opts1(line[index * 16..index * 16 + 4].try_into().unwrap());
+            assert_eq!(opts1 & DESC_RING_END, 0);
         }
     }
 

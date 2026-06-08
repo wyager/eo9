@@ -221,6 +221,12 @@ struct Driver {
     /// One-shot guard for the receive diagnostic (printed the first time a receive
     /// poll window expires empty after a successful transmit).
     rx_diagnosed: bool,
+    /// Receive-ring re-arm accounting (the round-10 lazy line policy): slots
+    /// consumed vs whole lines re-posted — `consumed ≈ 4 × lines` once traffic
+    /// flows, and the bench counters line carries both so a board run can confirm
+    /// the policy is active.
+    rx_slots_consumed: u64,
+    rx_lines_rearmed: u64,
     /// The GPHY ram code version: before the MCU load (0x0000 on a cold PHY) and
     /// the post-load re-read (must be 0x0b99 on an 8125B — the rge(4) R25B patch
     /// level; anything else after a load is a hard warning).
@@ -461,6 +467,8 @@ impl Driver {
             link: Link::Down,
             xid: 0,
             rx_diagnosed: false,
+            rx_slots_consumed: 0,
+            rx_lines_rearmed: 0,
             ram_code_before: 0,
             ram_code: 0,
             advertise_max: advertise_max(),
@@ -1477,7 +1485,7 @@ impl Driver {
             use eo9_rtl8125::counters as c;
             format!(
                 "net.rtl8125: counters - tx {} rx {} missed {} rx-errors {} unicast {} \
-                 broadcast {} multicast {}\n",
+                 broadcast {} multicast {} consumed-slots {} rearmed-lines {}\n",
                 self.counter(c::TX_PACKETS, 8),
                 self.counter(c::RX_PACKETS, 8),
                 self.counter(c::RX_MISSED, 2),
@@ -1485,6 +1493,8 @@ impl Driver {
                 self.counter(c::RX_UNICAST, 8),
                 self.counter(c::RX_BROADCAST, 8),
                 self.counter(c::RX_MULTICAST, 4),
+                self.rx_slots_consumed,
+                self.rx_lines_rearmed,
             )
         } else {
             String::from(
@@ -1626,17 +1636,33 @@ impl Driver {
             None => Vec::new(),
         };
 
-        // Hand the slot straight back to the NIC and advance.
-        let descriptor = eo9_rtl8125::encode_rx_descriptor(
-            pci::dma_address(&self.rx_data) + u64::from(slot) * RX_SLOT_BYTES,
-            RX_SLOT_BYTES as u16,
-            slot == RX_SLOTS - 1,
-        );
-        pci::dma_write(
-            &self.rings,
-            RX_RING_BASE + eo9_rtl8125::descriptor_offset(slot),
-            &descriptor,
-        );
+        // Lazy LINE-granularity re-arm (plan/09 D46 round 10). Descriptors are 16
+        // bytes and the board's DMA cache maintenance is 64-byte-line granular, so 4
+        // descriptors share every line and a per-slot re-arm would write back the
+        // CPU's stale snapshot of the 3 neighbors — racing (and losing) against a
+        // completion the NIC stores in a neighbor between our poll's read and the
+        // sweep's writeback (lost frame, ring stall until wrap). Re-arming only when
+        // the line's LAST slot is consumed is provably safe: consumption is
+        // sequential, so all 4 slots are OWN=0 and the device never writes a
+        // descriptor it does not own. Cost: at most 3 of the 32 slots parked
+        // unarmed. The invariant and the policy helpers live in eo9-rtl8125 (see
+        // DESC_BYTES) with host tests modeling consumed/posted slots and the
+        // 28..31 wrap.
+        self.rx_slots_consumed = self.rx_slots_consumed.wrapping_add(1);
+        if let Some(first_slot) = eo9_rtl8125::rx_line_to_rearm(slot) {
+            let line = eo9_rtl8125::encode_rx_line(
+                pci::dma_address(&self.rx_data),
+                RX_SLOT_BYTES,
+                first_slot,
+                RX_SLOTS,
+            );
+            pci::dma_write(
+                &self.rings,
+                RX_RING_BASE + eo9_rtl8125::descriptor_offset(first_slot),
+                &line,
+            );
+            self.rx_lines_rearmed = self.rx_lines_rearmed.wrapping_add(1);
+        }
         self.rx_cursor = self.rx_cursor.wrapping_add(1);
         Ok(bytes)
     }

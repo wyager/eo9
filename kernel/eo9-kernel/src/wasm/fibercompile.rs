@@ -130,8 +130,11 @@ pub(super) fn compile(engine: &Engine, bytes: &[u8]) -> (CompileOut, u64) {
     // fiber while it lives, and back to the outer one afterwards.
     let outer_suspend = SUSPEND_PTR.load(Ordering::Relaxed);
     let outer_deadline = SLICE_DEADLINE_NS.load(Ordering::Relaxed);
+    // The diagnostic unit counter is per-compile: a nested compile counts from zero
+    // and the outer count (plus the inner work) is restored on the way out, so the
+    // progress lines always describe the compile they appear inside.
+    let outer_units = UNITS.swap(0, Ordering::Relaxed);
     if outer_suspend == 0 {
-        UNITS.store(0, Ordering::Relaxed);
         NEXT_PROGRESS_NS.store(
             crate::timer::uptime_ns() + PROGRESS_PRINT_NS,
             Ordering::Relaxed,
@@ -175,9 +178,11 @@ pub(super) fn compile(engine: &Engine, bytes: &[u8]) -> (CompileOut, u64) {
         }
     };
     PUMP_DEPTH.fetch_sub(1, Ordering::Relaxed);
-    // Restore the outer compile's routing (no-op for the outermost).
+    // Restore the outer compile's routing and unit count (no-op for the outermost).
     SUSPEND_PTR.store(outer_suspend, Ordering::Relaxed);
     SLICE_DEADLINE_NS.store(outer_deadline, Ordering::Relaxed);
+    let inner_units = UNITS.load(Ordering::Relaxed);
+    UNITS.store(outer_units.wrapping_add(inner_units), Ordering::Relaxed);
     (result, slices)
 }
 
