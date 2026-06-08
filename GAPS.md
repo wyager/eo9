@@ -380,7 +380,7 @@ plus a redundant trailing newline). Needs a kernel lane: enable/fix the DW-APB U
 interrupt (or an adequate poll cadence) on the board profile so console input drains at
 line rate; the liveness backstop scavenge is currently the ONLY input path.
 
-## [FIXED pending area/09 merge — round 9 fiber-sliced codegen] Heartbeat (and possibly watchdog pat) starves during on-target codegen (board, 2026-06-08)
+## [FIXED 2026-06-08, area/09 merged — round 9 fiber-sliced codegen] Heartbeat (and possibly watchdog pat) starves during on-target codegen (board, 2026-06-08)
 During a 486 KiB composed-component compile on the Orange Pi the 5s `hb` heartbeat
 stopped for the whole compile (>12s) — the drive loop isn't running while codegen hogs
 the core. If the DW-WDT pat lives in the same loop, any composition that compiles
