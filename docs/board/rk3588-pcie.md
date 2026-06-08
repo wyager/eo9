@@ -4,8 +4,12 @@ Status: **implemented** (area/12-pcie-eth) — the `ConfigAccess` shim + DW impl
 live in `kernel/eo9-kernel/src/pci.rs`, the board constants + full bring-up (clocks,
 resets, combphy, PERST, LTSSM) in `kernel/eo9-kernel/src/arch/aarch64/rk3588_pcie.rs`
 (every constant cited to its Linux v6.12 source there). The QEMU half (ECAM behind the
-same trait) is verified bit-for-bit; the DW half awaits its first board run. Two design
-notes below were superseded by implementation findings, marked **[superseded]**.
+same trait) is verified bit-for-bit; the DW half is **board-validated** (2026-06-07:
+both NIC controllers train gen2 x1 and lspci enumerates all four functions through the
+shim; the links have since carried real traffic — the net.rtl8125 lane, plan/09
+entry 46, which also added DMA cache maintenance to the pci provider: RK3588 PCIe
+masters are not dma-coherent). Two design notes below were superseded by implementation
+findings, marked **[superseded]**.
 
 **Board-derived facts replacing the old [verify-on-board] marks** (the captured vendor
 control FDT `.claude/board-bringup/vendor-control-fdt.dtb` + mainline
