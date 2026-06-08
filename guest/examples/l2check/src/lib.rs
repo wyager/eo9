@@ -33,9 +33,12 @@ const DEFAULT_GATEWAY: [u8; 4] = [10, 0, 2, 2];
 const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 /// How many receive polls to spend waiting for the reply before giving up. The l2
 /// provider's `recv-frame` reports "nothing waiting" after a short (few-millisecond)
-/// window — the consumer owns the wait policy — so this is roughly a 100–200 ms ARP
-/// wait: generous for any real network segment, instant for QEMU user-net.
-const RECEIVE_ATTEMPTS: u32 = 64;
+/// window — the consumer owns the wait policy — so this is roughly a half-second to
+/// one-second ARP wait. Instant for QEMU user-net; sized generously for a physical
+/// LAN, where the FIRST frame from a fresh MAC can be slowed by switch table
+/// flooding/learning and the reply by the peer's own ARP processing (board bench,
+/// plan/09 D46 round 3 — was 64, a ~100-200 ms window).
+const RECEIVE_ATTEMPTS: u32 = 256;
 
 /// The l2 API's own error, rendered into the world's failure variant.
 fn net_failure(err: l2::L2Error) -> ProgramFailure {

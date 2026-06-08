@@ -44,6 +44,13 @@ pub mod reg {
     /// multicast acceptance OFF (plan/09: multicast = none for v1), so both dwords are
     /// written 0 for determinism.
     pub const MAR0: u64 = 0x08;
+    /// `CounterAddrLow`/`High` — the hardware tally-counter dump address (r8169
+    /// `enum rtl_registers` + `rtl8169_do_counters`): write the DMA address, then the
+    /// low dword again with the command bit; the chip DMA-writes the counter block
+    /// and clears the bit. The dump doubles as an inbound-WRITE probe independent of
+    /// the receive path.
+    pub const COUNTER_ADDR_LOW: u64 = 0x10;
+    pub const COUNTER_ADDR_HIGH: u64 = 0x14;
     /// `INT_CFG0_8125` — 8125 interrupt-configuration byte at 0x34; hw_start writes 0
     /// (r8169 `enum rtl8125_registers` + `rtl_hw_start_8125`).
     pub const INT_CFG0_8125: u64 = 0x34;
@@ -168,6 +175,34 @@ pub mod bits {
 
     /// `TxPoll_8125` bit 0: poll queue 0 (r8169 `rtl8125_doorbell`).
     pub const TX_POLL_QUEUE0: u64 = 0x01;
+
+    /// Interrupt status bits (r8169 "InterruptStatusBits"; the 8125's 32-bit ISR
+    /// keeps the same low-bit layout). The ISR latches events even with IMR = 0, so
+    /// the polled driver reads it as a "what has the MAC done since bring-up"
+    /// history register for diagnostics: `RxOK` set = a frame was accepted AND
+    /// stored to a descriptor; `RxOverflow` (the rx-descriptor-unavailable bit) set
+    /// = a frame was accepted but the chip saw no OWN'd descriptor to store it.
+    pub const ISR_RX_OK: u64 = 0x0001;
+    pub const ISR_RX_ERR: u64 = 0x0002;
+    pub const ISR_TX_OK: u64 = 0x0004;
+    pub const ISR_TX_ERR: u64 = 0x0008;
+    pub const ISR_RX_DESC_UNAVAIL: u64 = 0x0010; // r8169 `RxOverflow`
+    pub const ISR_LINK_CHANGE: u64 = 0x0020;
+    pub const ISR_RX_FIFO_OVER: u64 = 0x0040;
+    pub const ISR_TX_DESC_UNAVAIL: u64 = 0x0080;
+
+    /// Tally-counter commands, OR'd into the `CounterAddrLow` write (r8169
+    /// `CounterDump` / `CounterReset`; the chip clears the bit when the DMA dump
+    /// completes — `rtl_counters_cond`).
+    pub const COUNTER_DUMP: u64 = 0x8;
+    pub const COUNTER_RESET: u64 = 0x1;
+
+    /// `RxMaxSize` value: `R8169_RX_BUF_SIZE + 1` = 16384 (r8169
+    /// `rtl_set_rx_max_size`, with its in-tree warning — "Low hurts. Let's disable
+    /// the filtering." — a small RMS has historically broken receive on this
+    /// family). Frames longer than one 2 KiB slot span descriptors and are dropped
+    /// whole by the driver's fragment check, so the large limit is safe here.
+    pub const RX_MAX_SIZE_VALUE: u64 = 16384;
 }
 
 // ------------------------------------------------------------------------------------
@@ -277,6 +312,29 @@ pub mod mac_ocp {
     pub const START_HANDSHAKE: (u16, u16) = (0xe098, 0xc302);
     pub const START_HANDSHAKE_STATUS: u16 = 0xe00e;
     pub const START_HANDSHAKE_BUSY: u16 = 1 << 13;
+}
+
+// ------------------------------------------------------------------------------------
+// Hardware tally counters (the CounterAddr dump block)
+// ------------------------------------------------------------------------------------
+
+/// Byte offsets into the DMA'd counter block (r8169 `struct rtl8169_counters`:
+/// `__le64 tx_packets; __le64 rx_packets; __le64 tx_errors; __le32 rx_errors;
+/// __le16 rx_missed; __le16 align_errors; __le32 tx_one_collision;
+/// __le32 tx_multi_collision; __le64 rx_unicast; __le64 rx_broadcast;
+/// __le32 rx_multicast; …` — the RTL8125 appends more u64s after these).
+pub mod counters {
+    /// Allocation size for the dump target: the 8125's extended block fits well
+    /// within this, and the address must carry zero low command bits.
+    pub const DUMP_BYTES: u64 = 256;
+    pub const TX_PACKETS: u64 = 0; // u64
+    pub const RX_PACKETS: u64 = 8; // u64
+    pub const TX_ERRORS: u64 = 16; // u64
+    pub const RX_ERRORS: u64 = 24; // u32
+    pub const RX_MISSED: u64 = 28; // u16
+    pub const RX_UNICAST: u64 = 40; // u64
+    pub const RX_BROADCAST: u64 = 48; // u64
+    pub const RX_MULTICAST: u64 = 56; // u32
 }
 
 // ------------------------------------------------------------------------------------
@@ -598,6 +656,38 @@ mod tests {
         assert!(!xid_is_8125a(0x641));
         // The mask strips the 10BASE-T-lite / fuzz bits the table ignores.
         assert_eq!(xid_from_tx_config(0x641 << 20 | 0xfffff), 0x641);
+    }
+
+    #[test]
+    fn counter_offsets_match_the_r8169_struct_layout() {
+        // Walk the cited struct field by field and check the recorded offsets.
+        let mut at = 0u64;
+        assert_eq!(counters::TX_PACKETS, at);
+        at += 8; // tx_packets
+        assert_eq!(counters::RX_PACKETS, at);
+        at += 8; // rx_packets
+        assert_eq!(counters::TX_ERRORS, at);
+        at += 8; // tx_errors
+        assert_eq!(counters::RX_ERRORS, at);
+        at += 4; // rx_errors
+        assert_eq!(counters::RX_MISSED, at);
+        at += 2 + 2 + 4 + 4; // rx_missed, align_errors, one_collision, multi_collision
+        assert_eq!(counters::RX_UNICAST, at);
+        at += 8;
+        assert_eq!(counters::RX_BROADCAST, at);
+        at += 8;
+        assert_eq!(counters::RX_MULTICAST, at);
+    }
+
+    #[test]
+    fn isr_bits_match_the_cited_interrupt_status_layout() {
+        // r8169 InterruptStatusBits: RxOK 0x01 … TxDescUnavail 0x80.
+        assert_eq!(bits::ISR_RX_OK, 0x0001);
+        assert_eq!(bits::ISR_RX_DESC_UNAVAIL, 0x0010);
+        assert_eq!(bits::ISR_RX_FIFO_OVER, 0x0040);
+        assert_eq!(bits::ISR_TX_OK, 0x0004);
+        // RxMaxSize: R8169_RX_BUF_SIZE (SZ_16K - 1) + 1.
+        assert_eq!(bits::RX_MAX_SIZE_VALUE, 0x4000);
     }
 
     #[test]

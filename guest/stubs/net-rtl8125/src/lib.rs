@@ -195,6 +195,9 @@ struct Driver {
     rings: pci::DmaBuffer,
     rx_data: pci::DmaBuffer,
     tx_data: pci::DmaBuffer,
+    /// Target of the hardware tally-counter dump (the one-shot receive diagnostic;
+    /// also an inbound-WRITE probe independent of the receive path).
+    stats: pci::DmaBuffer,
     /// Transmit cursors: descriptors published vs completions consumed
     /// (free-running; their difference is the in-flight count, 0 or 1 between
     /// healthy operations — the D34 drain invariant made visible).
@@ -207,6 +210,9 @@ struct Driver {
     /// The chip variant per `(TxConfig >> 20) & 0xfcf` (0x609 = 8125A, 0x641 =
     /// 8125B — the Orange Pi 5 Plus parts; newer variants take the B arms).
     xid: u16,
+    /// One-shot guard for the receive diagnostic (printed the first time a receive
+    /// poll window expires empty after a successful transmit).
+    rx_diagnosed: bool,
 }
 
 /// Failures of the link-layer operations, mapped to the WIT error variants by the
@@ -393,6 +399,11 @@ impl Driver {
             pci::alloc_dma(&device, TX_DATA_BYTES),
         )
         .await?;
+        let stats = pci_call(
+            "net.rtl8125: alloc-dma (tally counters)",
+            pci::alloc_dma(&device, eo9_rtl8125::counters::DUMP_BYTES),
+        )
+        .await?;
         // The chip requires 256-byte ring alignment (eo9_rtl8125::RING_ALIGN); the
         // provider documents page alignment, but a different provider may not —
         // check, typed.
@@ -410,12 +421,14 @@ impl Driver {
             rings,
             rx_data,
             tx_data,
+            stats,
             tx_published: 0,
             tx_consumed: 0,
             rx_cursor: 0,
             mac: [0; 6],
             link: Link::Down,
             xid: 0,
+            rx_diagnosed: false,
         };
         driver.start().await?;
         Ok(driver)
@@ -649,9 +662,16 @@ impl Driver {
         self.phy_write(phy::MII_BMCR, phy::BMCR_START_AUTONEG)
             .await?;
 
-        // Receive size limit.
-        self.write(reg::RX_MAX_SIZE, pci::AccessWidth::Word, RX_SLOT_BYTES)
-            .await?;
+        // Receive size limit: the reference's large value, NOT the slot size —
+        // r8169's in-tree warning ("Low hurts. Let's disable the filtering.") says a
+        // small RMS has broken receive on this family before. Frames longer than one
+        // slot span descriptors and are dropped whole by the fragment check.
+        self.write(
+            reg::RX_MAX_SIZE,
+            pci::AccessWidth::Word,
+            bits::RX_MAX_SIZE_VALUE,
+        )
+        .await?;
 
         // Multicast filter: both MAR dwords 0 — multicast acceptance is off (v1:
         // none), this just makes the filter state deterministic.
@@ -726,19 +746,31 @@ impl Driver {
             }
         }
 
-        // One best-effort diagnostic line so a metal session shows what was probed.
+        // One best-effort diagnostic line so a metal session shows what was probed —
+        // including the receive-path state READ BACK from the chip (RxConfig, the
+        // RXDV gate byte, the latched ISR), so a bench transcript shows what the
+        // hardware actually holds, not what the driver wrote.
+        let rx_config_now = self.read(reg::RX_CONFIG, pci::AccessWidth::Dword).await?;
+        let rxdv_now = self
+            .read(reg::RXDV_GATE_BYTE, pci::AccessWidth::Byte)
+            .await?;
+        let isr_now = self
+            .read(reg::INTR_STATUS_8125, pci::AccessWidth::Dword)
+            .await?;
         let handle = text::default();
         let chip = if is_8125a { "8125A" } else { "8125B+" };
+        let state =
+            format!("rxcfg {rx_config_now:#010x} rxdv-byte {rxdv_now:#04x} isr {isr_now:#06x}");
         let line = match self.link {
             Link::Up(mbps) => format!(
                 "net.rtl8125: {} (xid {:#05x} {chip}) link up {mbps} Mb/s, rings rx/tx \
-                 {RX_SLOTS}/{TX_SLOTS}\n",
+                 {RX_SLOTS}/{TX_SLOTS}, {state}\n",
                 format_mac(&self.mac),
                 self.xid,
             ),
             Link::Down => format!(
                 "net.rtl8125: {} (xid {:#05x} {chip}) link DOWN after the bounded autoneg \
-                 wait (cable? negotiation still running? operations re-check)\n",
+                 wait (cable? negotiation still running? operations re-check), {state}\n",
                 format_mac(&self.mac),
                 self.xid,
             ),
@@ -958,6 +990,117 @@ impl Driver {
         eo9_rtl8125::decode_opts1([raw[0], raw[1], raw[2], raw[3]])
     }
 
+    /// Dump the hardware tally counters into the `stats` DMA buffer (r8169
+    /// `rtl8169_do_counters` with `CounterDump`): write the address, re-write the low
+    /// dword with the command bit, bounded-poll for the chip to clear it. The dump is
+    /// the chip DMA-WRITING host memory, so its completion (or not) also probes the
+    /// inbound write path independently of the receive ring. Returns whether the
+    /// command bit cleared.
+    async fn dump_counters(&self) -> Result<bool, String> {
+        let address = pci::dma_address(&self.stats);
+        self.write(
+            reg::COUNTER_ADDR_HIGH,
+            pci::AccessWidth::Dword,
+            address >> 32,
+        )
+        .await?;
+        let low = address & 0xffff_ffff;
+        self.write(reg::COUNTER_ADDR_LOW, pci::AccessWidth::Dword, low)
+            .await?;
+        self.write(
+            reg::COUNTER_ADDR_LOW,
+            pci::AccessWidth::Dword,
+            low | bits::COUNTER_DUMP,
+        )
+        .await?;
+        let mut spins: u64 = 0;
+        loop {
+            let readback = self
+                .read(reg::COUNTER_ADDR_LOW, pci::AccessWidth::Dword)
+                .await?;
+            if readback & (bits::COUNTER_DUMP | bits::COUNTER_RESET) == 0 {
+                return Ok(true);
+            }
+            spins += 1;
+            if spins > QUIESCE_POLL_LIMIT {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// One u64 / u32 / u16 little-endian field of the dumped counter block.
+    fn counter(&self, offset: u64, bytes: u64) -> u64 {
+        let raw = pci::dma_read(&self.stats, offset, bytes);
+        let mut value: u64 = 0;
+        for (index, byte) in raw.iter().enumerate() {
+            value |= u64::from(*byte) << (8 * index);
+        }
+        value
+    }
+
+    /// The one-shot receive diagnostic (board bench disambiguation, plan/09 D46
+    /// round 3): printed the first time a receive poll window expires empty after a
+    /// successful transmit. Reads the LATCHED interrupt status (the ISR records
+    /// events even with IMR = 0): `rok+` = the MAC accepted AND stored a frame (the
+    /// fault would be ours, cursor/decode side); `rdu+` = the MAC accepted a frame
+    /// but saw no OWN'd descriptor (ring not visible to the chip); everything clear
+    /// = no frame was ever accepted (filter or nothing on the wire). The tally dump
+    /// adds the MAC's own counts (tx/rx/missed/broadcast/unicast) and is itself an
+    /// inbound-write probe.
+    async fn rx_diagnostic(&mut self) -> Result<(), String> {
+        let isr = self
+            .read(reg::INTR_STATUS_8125, pci::AccessWidth::Dword)
+            .await?;
+        let rx_config = self.read(reg::RX_CONFIG, pci::AccessWidth::Dword).await?;
+        let rxdv = self
+            .read(reg::RXDV_GATE_BYTE, pci::AccessWidth::Byte)
+            .await?;
+        let mcu = self.read(reg::MCU, pci::AccessWidth::Byte).await?;
+        let chip_cmd = self.read(reg::CHIP_CMD, pci::AccessWidth::Byte).await?;
+        let slot = self.rx_cursor % RX_SLOTS;
+        let opts1 = self.rx_opts1(slot);
+        let flag = |bit: u64, label: &str| {
+            if isr & bit != 0 {
+                format!("{label}+")
+            } else {
+                format!("{label}-")
+            }
+        };
+        let handle = text::default();
+        let line = format!(
+            "net.rtl8125: rx diagnostic - isr {isr:#06x} ({} {} {} {} {}) rxcfg \
+             {rx_config:#010x} rxdv-byte {rxdv:#04x} mcu {mcu:#04x} cmd {chip_cmd:#04x} \
+             rx slot {slot} opts1 {opts1:#010x}\n",
+            flag(bits::ISR_RX_OK, "rok"),
+            flag(bits::ISR_RX_DESC_UNAVAIL, "rdu"),
+            flag(bits::ISR_RX_FIFO_OVER, "fovw"),
+            flag(bits::ISR_TX_OK, "tok"),
+            flag(bits::ISR_LINK_CHANGE, "link"),
+        );
+        let _ = text::write(&handle, text::OutputStream::Out, &line);
+        let counters_line = if self.dump_counters().await? {
+            use eo9_rtl8125::counters as c;
+            format!(
+                "net.rtl8125: counters - tx {} rx {} missed {} rx-errors {} unicast {} \
+                 broadcast {} multicast {}\n",
+                self.counter(c::TX_PACKETS, 8),
+                self.counter(c::RX_PACKETS, 8),
+                self.counter(c::RX_MISSED, 2),
+                self.counter(c::RX_ERRORS, 4),
+                self.counter(c::RX_UNICAST, 8),
+                self.counter(c::RX_BROADCAST, 8),
+                self.counter(c::RX_MULTICAST, 4),
+            )
+        } else {
+            String::from(
+                "net.rtl8125: counters - DUMP NEVER COMPLETED (the chip could not \
+                 DMA-write host memory: inbound write path suspect)\n",
+            )
+        };
+        let _ = text::write(&handle, text::OutputStream::Out, &counters_line);
+        Ok(())
+    }
+
     /// Settle a transmit a *cancelled* `send-frame` left published before the bounce
     /// buffer and descriptor slot are reused (the plan/09 D34 drain-before-reuse
     /// invariant, net.virtio's `drain_tx` in this device's dialect). A cancellation
@@ -1057,6 +1200,15 @@ impl Driver {
         while eo9_rtl8125::owned_by_nic(opts1) {
             spins += 1;
             if spins > RX_POLL_LIMIT {
+                // One-shot bench diagnostic: the first empty window after a
+                // successful transmit prints the MAC's latched receive state, so a
+                // board transcript disambiguates filter-vs-ring-vs-wire (see
+                // rx_diagnostic). Best effort - a diagnostic failure must not turn
+                // an honest "nothing waiting" into an error.
+                if !self.rx_diagnosed && self.tx_consumed != 0 {
+                    self.rx_diagnosed = true;
+                    let _ = self.rx_diagnostic().await;
+                }
                 return Ok(Vec::new());
             }
             opts1 = self.rx_opts1(slot);
