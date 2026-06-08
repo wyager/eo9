@@ -122,3 +122,42 @@ A USB boot means vendor `usb start` ran (controllers touched, keyboard addressed
 EHCI CONFIGFLAGs possibly set). The OHCI driver already clears CONFIGFLAGs and does
 its own port reset; each USB milestone adds a "after vendor usb start" arm (USB boot
 makes it the production arm).
+
+## Part A final revision (after the live env dump settled the open questions)
+
+- **extlinux landmine**: `scan_dev_for_boot` checks `extlinux/extlinux.conf` BEFORE
+  boot scripts, and `boot_extlinux`/sysboot funnels into the bootm/booti-class
+  launcher — the exact family that data-aborted and wedged the board. The stick must
+  carry NO /extlinux/ and NO /boot/ directory, and no boot.scr.uimg (scanned before
+  boot.scr).
+- **usb_boot runs `usb start` itself** — the script never needs to.
+- **scriptaddr collision gate**: scriptaddr=0x00500000 sits INSIDE our image
+  footprint; loading EO9.IMG overwrites the sourced script's load address mid-
+  execution. 2017.09's `source` → run_command_list mallocs a heap copy (relocated
+  high RAM) so this should be safe — GATED in Round A1 (`echo one; load big; echo
+  two`); degradation = two-stage chain-load via a boot2.scr at 0x10000000.
+- **bootdelay=0**: autoboot non-interruptible; recovery from any bad-stick state =
+  pull the stick (chain fails through to opi# exactly as captured). Firmware stays
+  untouched — we do not raise bootdelay.
+- **fdtcontroladdr confirmed ABSENT** from the env; `fdt_addr_r=0x0a100000` is a
+  distro load target, NOT the control FDT. gd->fdt_blob (0xeb9f6c38) is fixed at
+  relocation, flow-independent, stable across all campaigns; Option 1 avoids baking
+  it anywhere regardless.
+- **Bootargs handoff menu (final)**: Option 1 (recommended) = BOOTARGS.TXT staged at
+  0x00100000 + ~10-line kernel board fallback (x0-valid always wins; bounded
+  first-line parse defends against warm-reset DRAM residue). Option 2 (zero kernel
+  change fallback) = a script-poked 6-word trampoline at 0x00180000 setting
+  x0=0xeb9f6c38 then br to the image (the mm.l-stub pattern in miniature; costs
+  hand-assembled words + baked FDT address + re-mkimage per bootargs change).
+- **Cache ranking**: the kernel's own entry self-sweep owns data coherency; USB
+  mass-storage DMA lands at PoC (better than the serial mm.l case); residual = first
+  ~3 I-fetch lines, gated by crc32+beacon in A1; staged mitigations: dcache/icache
+  cmds (A0 recon `help dcache`), the proven crc32 cache-pressure eviction, or the
+  trampoline growing a civac loop.
+- **CRC-fail path**: scan chain continues benignly (pxe/dhcp time out, the
+  boot_android/bootrkp tail fails as captured today) → prompt. Fail-safe, hands-free.
+- **A0 narrowed** (printenv done): `help dcache/icache/crc32/itest` + stick-behind-
+  the-xhci1-hub `usb storage` check. Then A1 (manual load+go + the two gates), A2
+  (kernel fallback + QEMU regression + cmdline bench), A3 (hands-in-pockets ×3).
+- Freebie: stdout=serial,vidconsole means the monitor narrates from power-on until
+  fbcon takes over — demo continuity for free.
