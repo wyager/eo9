@@ -119,6 +119,67 @@ pub fn enable_intx_output(address: FunctionAddress) -> bool {
     config_write(address, 0x04, AccessWidth::Word, command & !(1 << 10))
 }
 
+/// Board diagnostic, printed when a driver claims a function (`when = "claim"`) and again
+/// when it enables bus mastering (`when = "busmaster"`): the function's command register
+/// plus its segment's root-port (type-1) command, bus numbers, and memory window — so a
+/// bench transcript proves on the wire whether inbound DMA can traverse the bridge (root
+/// port BME/MSE set, window routing the endpoint's BARs). QEMU builds stay silent (the
+/// scripted suites pin their transcripts).
+#[cfg(feature = "board-opi5plus")]
+pub fn claim_diagnostic(address: FunctionAddress, when: &str) {
+    let command = config_read(address, 0x04, AccessWidth::Word).unwrap_or(0xffff);
+    crate::kprintln!(
+        "pci[{when}]: {:04x}:{:02x}:{:02x}.{} command {command:#06x} (mem{} busmaster{})",
+        address.segment,
+        address.bus,
+        address.device,
+        address.function,
+        if command & 0x2 != 0 { "+" } else { "-" },
+        if command & 0x4 != 0 { "+" } else { "-" },
+    );
+    // The segment's root port: bus 0, device 0, function 0 — a type-1 bridge on the DW
+    // controllers (header type field: low 7 bits of offset 0x0e).
+    let bridge = FunctionAddress {
+        segment: address.segment,
+        bus: 0,
+        device: 0,
+        function: 0,
+    };
+    if bridge == address {
+        return; // the claimed function IS the bridge; one line is enough
+    }
+    let header = config_read(bridge, 0x0e, AccessWidth::Byte).unwrap_or(0xff) & 0x7f;
+    if header != 0x01 {
+        crate::kprintln!(
+            "pci[{when}]: segment {:04x} has no type-1 root port at 00:00.0 (header {header:#04x})",
+            address.segment
+        );
+        return;
+    }
+    let bridge_command = config_read(bridge, 0x04, AccessWidth::Word).unwrap_or(0xffff);
+    let buses = config_read(bridge, 0x18, AccessWidth::Dword).unwrap_or(0);
+    let window = config_read(bridge, 0x20, AccessWidth::Dword).unwrap_or(0);
+    // Type-1 memory window fields: base = bits [15:4] << 16 (address bits [31:20]),
+    // limit = bits [31:20] in the high word | 0xfffff (PCI-to-PCI bridge spec — the
+    // same fields rk3588_pcie programs at bring-up).
+    let mem_base = (window & 0xfff0) << 16;
+    let mem_limit = (window & 0xfff0_0000) | 0xf_ffff;
+    crate::kprintln!(
+        "pci[{when}]: root port {:04x}:00:00.0 command {bridge_command:#06x} (mem{} \
+         busmaster{}) buses {:#x}->{:#x}..{:#x} mem window {mem_base:#010x}..{mem_limit:#010x}",
+        address.segment,
+        if bridge_command & 0x2 != 0 { "+" } else { "-" },
+        if bridge_command & 0x4 != 0 { "+" } else { "-" },
+        buses & 0xff,
+        (buses >> 8) & 0xff,
+        (buses >> 16) & 0xff,
+    );
+}
+
+/// QEMU builds: no claim diagnostic (see the board version above).
+#[cfg(not(feature = "board-opi5plus"))]
+pub fn claim_diagnostic(_address: FunctionAddress, _when: &str) {}
+
 /// One PCI(e) function address. `segment` selects the controller (QEMU `virt` has a single
 /// ECAM segment 0; the board profile numbers its DW controllers 0, 1, …).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -747,7 +808,34 @@ pub fn set_bus_master(address: FunctionAddress, enable: bool) -> bool {
     } else {
         command & !0x4
     };
-    config_write(address, 0x04, AccessWidth::Word, command)
+    if !config_write(address, 0x04, AccessWidth::Word, command) {
+        return false;
+    }
+    // Board: a function behind a root port can only DMA if the BRIDGE also forwards —
+    // an RC port without Bus Master Enable drops inbound memory requests, and without
+    // Memory Space Enable it does not decode at all. rk3588_pcie sets the port command
+    // at bring-up; this re-asserts it at the moment a driver is granted DMA, so nothing
+    // that ran in between can have silently revoked forwarding.
+    #[cfg(feature = "board-opi5plus")]
+    if enable && address.bus != 0 {
+        let bridge = FunctionAddress {
+            segment: address.segment,
+            bus: 0,
+            device: 0,
+            function: 0,
+        };
+        if let Some(bridge_command) = config_read(bridge, 0x04, AccessWidth::Word)
+            && bridge_command & 0x6 != 0x6
+        {
+            crate::kprintln!(
+                "pci: root port {:04x}:00:00.0 command was {bridge_command:#06x} — \
+                 re-enabling mem decode + bus-master forwarding",
+                address.segment
+            );
+            config_write(bridge, 0x04, AccessWidth::Word, bridge_command | 0x6);
+        }
+    }
+    true
 }
 
 /// Read a register inside an assigned BAR window. `base`/`size` come from [`assign_bar`] /

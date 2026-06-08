@@ -2078,6 +2078,17 @@ link bring-up + enumeration.
   (root port + endpoints enumerate), `link DOWN … (ltssm …, debug …)` → ROOT_ONLY (config
   access still provable on the bench), DBI dead → disabled. Every step prints before
   first touch of a new block, all waits bounded, watchdog armed before any of it runs.
+* **DMA coherence** (2026-06-08, via area/09-rtl8125 board round 2): RK3588 PCIe masters
+  are NOT cache-coherent (no `dma-coherent` in mainline rk3588-base.dtsi), and the wasm
+  provider's DMA buffers are cacheable heap — the first inbound DMA on the board (the
+  RTL8125's ring fetch) read stale DRAM and saw no descriptors. The provider now brackets
+  every DMA-buffer access with `arch::dma_coherence::sync` (board: civac-to-PoC sweep +
+  `dsb sy`, the playbook §3 primitive; QEMU/riscv64/x86_64: no-op): at `alloc-dma`
+  (memset eviction), after `dma-write` (also the `dma_wmb()`-before-doorbell ordering),
+  before `dma-read`. Plus board claim diagnostics (`pci[claim]`/`pci[busmaster]` lines:
+  endpoint + root-port command/buses/mem-window) and a defensive root-port MSE+BME
+  re-assert when a downstream function gets bus mastering. Mainline pcie-dw-rockchip
+  confirms no inbound ATU is needed in RC mode (pass-through).
 * **INTx**: deferred by design — DW muxes all four pins on one SPI per controller
   (245/250, edge-rising) demuxed via PCIE_CLIENT_INTR_STATUS_LEGACY; per-(segment,line)
   state the swizzle model lacks. `pci_intx::WIRED = false` on the board (provider answers

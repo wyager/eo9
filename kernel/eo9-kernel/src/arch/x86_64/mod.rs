@@ -49,6 +49,15 @@ pub(crate) mod pci_intx {
     pub(crate) fn mask(_line: usize) {}
 }
 
+/// DMA-coherence maintenance for PCI-mastered buffers: a no-op on this port — its only
+/// machine is QEMU, whose emulated DMA is coherent (device writes land in the same host
+/// memory the guest's cached accesses use). The aarch64 board profile carries the real
+/// clean+invalidate sweeps; see its `dma_coherence` docs.
+#[cfg(feature = "wasm-store")]
+pub(crate) mod dma_coherence {
+    pub(crate) fn sync(_start: usize, _len: usize) {}
+}
+
 /// Boot banner: machine identification, privilege level, timer frequency, wall clock.
 pub(crate) fn banner() {
     crate::kprintln!();

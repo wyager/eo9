@@ -86,6 +86,36 @@ pub(crate) mod pci_intx {
     pub(crate) fn mask(_line: usize) {}
 }
 
+/// DMA-coherence maintenance for buffers a PCI device masters (descriptor rings, frame
+/// buffers). On the board the RK3588's PCIe controllers are NOT cache-coherent — mainline
+/// `rk3588-base.dtsi` carries no `dma-coherent` on any pcie node, so Linux uses
+/// non-cacheable coherent allocations + streaming cache maintenance there — while this
+/// kernel's DMA buffers live in the ordinary (cacheable) heap. Every CPU access to such a
+/// buffer therefore brackets itself with a clean+invalidate-to-PoC sweep (the
+/// bringup-playbook §3 rule: every handoff between cache regimes sweeps the shared bytes,
+/// and a bus-mastering device is exactly an agent reading/writing at the PoC):
+///
+/// * after the CPU writes (descriptor publish, transmit payload): the sweep's `dsb sy`
+///   also IS the reference drivers' `dma_wmb()`-before-doorbell — the descriptor reaches
+///   DRAM before any subsequent Device-memory doorbell store can be issued;
+/// * before the CPU reads (completion poll, received frame): the invalidate discards
+///   stale lines so the load observes what the device wrote.
+///
+/// QEMU `virt` emulates coherent DMA (device writes land in the same host memory the
+/// guest's cached accesses use), so the non-board build is a no-op.
+#[cfg(feature = "wasm-store")]
+pub(crate) mod dma_coherence {
+    /// Clean+invalidate `[start, start+len)` to the PoC and barrier (board), or nothing
+    /// (QEMU virt — coherent).
+    #[cfg(feature = "board-opi5plus")]
+    pub(crate) fn sync(start: usize, len: usize) {
+        super::mmu::clean_invalidate_to_poc(start, len);
+    }
+
+    #[cfg(not(feature = "board-opi5plus"))]
+    pub(crate) fn sync(_start: usize, _len: usize) {}
+}
+
 /// Boot banner: machine identification, exception level, timer frequency, wall clock.
 pub(crate) fn banner() {
     crate::kprintln!();

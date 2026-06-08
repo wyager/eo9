@@ -1141,3 +1141,42 @@ Match the priority order above; (1)+(2) unblock I2.
     scheduling until its activation returns, and only preemption (plan/05) or a host-call
     budget covers it. recv's empty poll has the same shape at 2k calls (~ms), below the
     backstop's window.
+
+    *Board round 2 (2026-06-08) → the DMA-coherence fix (kernel-side).* The OOB fix held
+    (the new diagnostic printed `xid 0x641 8125B+ link up 2500 Mb/s`) but the typed TX
+    failure repeated. The planner's triage was right that the failure is INBOUND (outbound
+    config/MMIO provably worked); the root cause sits one layer below the bridge hypothesis:
+    **mainline `rk3588-base.dtsi` carries no `dma-coherent` on any pcie node — RK3588 PCIe
+    masters are not cache-coherent** — while the kernel's `alloc-dma` buffers are ordinary
+    cacheable heap with no maintenance. The driver's descriptor writes (OWN bits included)
+    sat in dirty D-cache lines; the NIC's ring fetches read stale DRAM zeros and never saw
+    a descriptor to consume — and RX would have failed the same way, silently. This was the
+    board's FIRST inbound DMA ever (lspci is config-only), i.e. the bringup-playbook §3
+    rule meeting a brand-new handoff: a bus-mastering device is an agent at the PoC.
+
+    The fix is in the shared pci provider, so every driver gets it: `arch::dma_coherence::
+    sync` (board: the existing `clean_invalidate_to_poc` civac sweep + `dsb sy`; QEMU/other
+    arches: no-op — emulated DMA is coherent) is applied (a) once at `alloc-dma` (evicting
+    the allocation memset's dirty lines, which could otherwise write back OVER
+    device-written bytes later), (b) after every `dma-write` (the device's next fetch reads
+    DRAM; the sweep's `dsb sy` doubles as the reference drivers' `dma_wmb()` — a doorbell
+    `bar-write` can no longer overtake the descriptor, closing the round-2 hypothesis-2
+    ordering question by construction), (c) before every `dma-read` (the invalidate drops
+    stale lines so completions and received frames are observed). Driver code unchanged —
+    the discipline that every CPU access goes through the dma accessors is what makes the
+    provider the single right place.
+
+    Also landed for the bench (round-2 hypothesis 1, instrumented + defended): a
+    board-only claim diagnostic — on `open` and on `set-bus-master(true)` the kernel
+    prints the endpoint's command register AND its segment's root-port command, bus
+    numbers, and type-1 memory window (`pci[claim] …` / `pci[busmaster] …` lines), so the
+    next transcript proves bridge forwarding on the wire; and `set_bus_master(enable)` on
+    the board now re-asserts MSE+BME on the root port if anything cleared them since
+    bring-up (rk3588_pcie sets 0x107 at init; nothing is known to clear it — the re-assert
+    prints loudly if it ever fires). Hypothesis 3 closed by reference: mainline
+    `pcie-dw-rockchip.c` programs no inbound ATU in RC mode — inbound requests pass
+    through untranslated, matching our setup.
+
+    Verified: full ci green; check-telnet green (net.virtio DMA through the modified
+    accessors); one QEMU session running both `net.rtl8125 $ l2check` (typed refusal) and
+    `net.virtio $ l2check` (ARP resolved); both board images rebuilt.
