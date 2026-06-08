@@ -67,6 +67,13 @@ pub mod reg {
     /// `INT_CFG1_8125` — 16-bit interrupt configuration at 0x7a; hw_start writes 0 on
     /// the 8125B and later (r8169 `rtl_hw_start_8125`, the VER_63+ arm).
     pub const INT_CFG1_8125: u64 = 0x7a;
+    /// `PMCH` — the PHY power byte at 0x6f: bits 7:6 set powers the GPHY rail
+    /// (rge(4) `rge_set_phy_power`: `RGE_SETBIT_1(sc, RGE_PMCH, 0xc0)`).
+    pub const PMCH: u64 = 0x6f;
+    /// `EPHYAR` — the PCIe SerDes (EPHY) register window at 0x80 (r8169 `EPHYAR`;
+    /// rge(4) `RGE_EPHYAR`): busy bit 31, address bits [22:16] (rge masks the
+    /// table's address to 7 bits), data [15:0]. A write completes when busy clears.
+    pub const EPHYAR: u64 = 0x80;
     /// `OCPDR` — the MAC-side OCP window at 0xb0 (r8169 `__r8168_mac_ocp_write` /
     /// `__r8168_mac_ocp_read`): same word encoding as `GPHY_OCP`, but transactions
     /// complete immediately (the reference drivers never poll it).
@@ -313,6 +320,11 @@ pub mod mac_ocp {
     pub const START_HANDSHAKE_STATUS: u16 = 0xe00e;
     pub const START_HANDSHAKE_BUSY: u16 = 1 << 13;
 }
+
+/// RTL8125B bring-up tables transcribed from OpenBSD rge(4) (see the module docs
+/// for provenance/licensing): the MAC MCU patch, the EPHY (PCIe SerDes) tuning, and
+/// the GPHY MCU patch.
+pub mod r25b_tables;
 
 // ------------------------------------------------------------------------------------
 // Hardware tally counters (the CounterAddr dump block)
@@ -688,6 +700,31 @@ mod tests {
         assert_eq!(bits::ISR_TX_OK, 0x0004);
         // RxMaxSize: R8169_RX_BUF_SIZE (SZ_16K - 1) + 1.
         assert_eq!(bits::RX_MAX_SIZE_VALUE, 0x4000);
+    }
+
+    #[test]
+    fn r25b_tables_match_the_openbsd_source_shape() {
+        // Sizes as transcribed from if_rge.c / if_rgereg.h (2026-06-08).
+        assert_eq!(r25b_tables::MAC_MCU.len(), 138);
+        assert_eq!(r25b_tables::EPHY.len(), 46);
+        assert_eq!(r25b_tables::PHY_MCU.len(), 1447);
+        assert_eq!(r25b_tables::PHY_MCU_VERSION, 0x0b99);
+        // Spot pins: first/last entries of each table, against the source.
+        assert_eq!(r25b_tables::MAC_MCU[0], (0xf800, 0xe010));
+        assert_eq!(r25b_tables::MAC_MCU[137], (0xfc48, 0x003f));
+        assert_eq!(r25b_tables::EPHY[0], (0x000b, 0xa908));
+        assert_eq!(r25b_tables::EPHY[45], (0x9c1c, 0x0140));
+        assert_eq!(r25b_tables::PHY_MCU[0], (0xa436, 0x8024));
+        assert_eq!(r25b_tables::PHY_MCU[1], (0xa438, 0x3701));
+        assert_eq!(r25b_tables::PHY_MCU[1446], (0xb820, 0x0000));
+        // Every PHY MCU write targets the GPHY OCP space (sanity against
+        // transcription corruption).
+        for (register, _) in r25b_tables::PHY_MCU {
+            assert!(
+                *register >= 0xa000,
+                "unexpected PHY MCU register {register:#x}"
+            );
+        }
     }
 
     #[test]

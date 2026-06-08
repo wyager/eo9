@@ -213,6 +213,9 @@ struct Driver {
     /// One-shot guard for the receive diagnostic (printed the first time a receive
     /// poll window expires empty after a successful transmit).
     rx_diagnosed: bool,
+    /// The GPHY ram code version read at bring-up (0x0b99 = the rge(4) R25B patch
+    /// level; anything else on an 8125B means the MCU patch was applied this boot).
+    ram_code: u16,
 }
 
 /// Failures of the link-layer operations, mapped to the WIT error variants by the
@@ -429,6 +432,7 @@ impl Driver {
             link: Link::Down,
             xid: 0,
             rx_diagnosed: false,
+            ram_code: 0,
         };
         driver.start().await?;
         Ok(driver)
@@ -509,17 +513,7 @@ impl Driver {
         self.write(reg::CHIP_CMD, pci::AccessWidth::Byte, 0).await?;
 
         // Soft reset: ChipCmd.RST, bounded wait for the chip to clear it.
-        self.write(reg::CHIP_CMD, pci::AccessWidth::Byte, bits::CMD_RESET)
-            .await?;
-        let mut spins: u64 = 0;
-        while self.read(reg::CHIP_CMD, pci::AccessWidth::Byte).await? & bits::CMD_RESET != 0 {
-            spins += 1;
-            if spins > RESET_POLL_LIMIT {
-                return Err(String::from(
-                    "net.rtl8125: the chip did not come out of soft reset (poll limit)",
-                ));
-            }
-        }
+        self.soft_reset().await?;
 
         // The ownership bit itself: MCU.NOW_IS_OOB cleared (rtl_hw_init_8125 /
         // rge_exit_oob's RGE_MCUCMD_IS_OOB clear).
@@ -546,14 +540,143 @@ impl Driver {
         }
         self.wait_link_list_ready().await?;
 
-        // Interrupts: mask everything, acknowledge anything pending, and leave the
-        // mask clear for the driver's lifetime — the polled driver's suppression
-        // discipline (no source ever asserts the INTx line, which is unwired on the
-        // board; see the module docs).
+        // ---- Phase 1b: halt + patch the MAC MCU (rge_hw_init, MAC_R25B arm) --------------
+        // The board round-4 wire truth (frames dead between the MAC engine and the
+        // wire in BOTH directions while link + DMA work) is what these tables exist
+        // for: rge(4) loads them unconditionally before any traffic, with no external
+        // firmware files — the known-working minimal set this driver now mirrors.
+        // (The 8125A tables are not carried; the board NICs are 8125B, xid 0x641.)
+        if !is_8125a {
+            // rge_hw_init: clear 0xf1 bit 7, then halt the MAC MCU — break vector
+            // 0xfc48 = 0, the per-page break registers 0xfc28..0xfc46 = 0, settle
+            // (the reference's DELAY(3000)), control 0xfc26 = 0.
+            self.set_byte_bits(0xf1, 0x80, false).await?;
+            self.mac_ocp_write(0xfc48, 0).await?;
+            let mut break_register = 0xfc28u16;
+            while break_register < 0xfc48 {
+                self.mac_ocp_write(break_register, 0).await?;
+                break_register += 2;
+            }
+            self.settle(1_500).await?;
+            self.mac_ocp_write(0xfc26, 0).await?;
+            // Ram page 0, then the rge `rtl8125b_mac_bps` patch table.
+            self.mac_ocp_modify(0xe446, 0x0003, 0).await?;
+            for (register, value) in eo9_rtl8125::r25b_tables::MAC_MCU {
+                self.mac_ocp_write(*register, *value).await?;
+            }
+        }
+        // (Omitted from rge_hw_init, recorded: the ASPM/clkreq disable and the CSI
+        // 0x108 write — PCIe power-management plumbing through the CSI window, not in
+        // the frame path.)
+
+        // ---- Phase 1c: PHY power on (rge_set_phy_power) -----------------------------------
+        self.set_byte_bits(reg::PMCH, 0xc0, true).await?;
+        self.phy_write(phy::MII_BMCR, 0x1000).await?; // AUTOEN, PDOWN clear
+        let mut spins: u64 = 0;
+        loop {
+            // GPHY state machine in OCP 0xa420 [2:0]: 3 = ready (rge_set_phy_power).
+            if self.phy_ocp_read(0xa420).await? & 0x0007 == 3 {
+                break;
+            }
+            spins += 1;
+            if spins > QUIESCE_POLL_LIMIT {
+                break; // bounded, best effort like the reference
+            }
+        }
+
+        // ---- Phase 1d: interrupts off + the second reset (rge_hw_reset) -------------------
+        // Mask everything, acknowledge anything pending, and leave the mask clear for
+        // the driver's lifetime — the polled driver's suppression discipline (no
+        // source ever asserts the INTx line, which is unwired on the board).
         self.write(reg::INTR_MASK_8125, pci::AccessWidth::Dword, 0)
             .await?;
         self.write(reg::INTR_STATUS_8125, pci::AccessWidth::Dword, 0xffff_ffff)
             .await?;
+        self.soft_reset().await?;
+
+        // ---- Phase 1e: the full PHY configuration (rge_phy_config) ------------------------
+        // EPHY (PCIe SerDes) tuning first (rge_ephy_config, MAC_R25B arm).
+        if !is_8125a {
+            for (register, value) in eo9_rtl8125::r25b_tables::EPHY {
+                self.ephy_write(*register, *value).await?;
+            }
+        }
+        // Advertise nothing, then PHY reset + autoneg (rge_phy_config: the real
+        // advertisement set + restart happens after the configuration below).
+        let anar = self.phy_read(phy::MII_ANAR).await?;
+        self.phy_write(phy::MII_ANAR, anar & !0x01e0).await?;
+        let gbcr = self.phy_read(phy::MII_GBCR).await?;
+        self.phy_write(phy::MII_GBCR, gbcr & !0x0300).await?;
+        self.phy_ocp_modify(phy::OCP_ADV_2500, phy::ADV_2500_FULL, 0)
+            .await?;
+        self.phy_write(phy::MII_BMCR, 0x9200).await?; // RESET | AUTOEN | STARTNEG
+        let mut spins: u64 = 0;
+        while self.phy_read(phy::MII_BMCR).await? & 0x8000 != 0 {
+            spins += 1;
+            if spins > QUIESCE_POLL_LIMIT {
+                return Err(String::from(
+                    "net.rtl8125: the PHY did not come out of reset (poll limit)",
+                ));
+            }
+        }
+        // Ram code version (rge: OCP 0xa436 = 0x801e selects it, 0xa438 reads it).
+        self.phy_ocp_write(0xa436, 0x801e).await?;
+        let ram_code = self.phy_ocp_read(0xa438).await?;
+        self.ram_code = ram_code;
+        if !is_8125a {
+            // GPHY MCU patch, only when the PHY's ram code is not current
+            // (rge_phy_config_mcu): enter patch mode, replay the table, leave, stamp
+            // the version.
+            if ram_code != eo9_rtl8125::r25b_tables::PHY_MCU_VERSION {
+                self.patch_phy_mcu(true).await?;
+                for (register, value) in eo9_rtl8125::r25b_tables::PHY_MCU {
+                    self.phy_ocp_write(*register, *value).await?;
+                }
+                self.patch_phy_mcu(false).await?;
+                self.phy_ocp_write(0xa436, 0x801e).await?;
+                self.phy_ocp_write(0xa438, eo9_rtl8125::r25b_tables::PHY_MCU_VERSION)
+                    .await?;
+            }
+            // rge_phy_config_mac_r25b's register writes, in its order.
+            self.phy_ocp_modify(0xa442, 0x0000, 0x0800).await?;
+            self.phy_ocp_modify(0xac46, 0x00f0, 0x0090).await?;
+            self.phy_ocp_modify(0xad30, 0x0003, 0x0001).await?;
+            self.phy_ocp_write(0xb87c, 0x80f5).await?;
+            self.phy_ocp_write(0xb87e, 0x760e).await?;
+            self.phy_ocp_write(0xb87c, 0x8107).await?;
+            self.phy_ocp_write(0xb87e, 0x360e).await?;
+            self.phy_ocp_write(0xb87c, 0x8551).await?;
+            self.phy_ocp_modify(0xb87e, 0xff00, 0x0800).await?;
+            self.phy_ocp_modify(0xbf00, 0xe000, 0xa000).await?;
+            self.phy_ocp_modify(0xbf46, 0x0f00, 0x0300).await?;
+            for index in 0..10u16 {
+                self.phy_ocp_write(0xa436, 0x8044 + index * 6).await?;
+                self.phy_ocp_write(0xa438, 0x2417).await?;
+            }
+            self.phy_ocp_modify(0xa4ca, 0x0000, 0x0040).await?;
+            self.phy_ocp_modify(0xbf84, 0xe000, 0xa000).await?;
+            self.phy_ocp_write(0xa436, 0x8170).await?;
+            self.phy_ocp_modify(0xa438, 0x2700, 0xd800).await?;
+            self.phy_ocp_modify(0xa424, 0x0000, 0x0008).await?;
+        }
+        self.phy_ocp_modify(0xa5b4, 0x8000, 0).await?;
+        // Disable EEE, MAC and PHY side (rge_phy_config tail, the MAC_R25B arms).
+        // Un-configured EEE is a frame blackhole candidate: a link partner that
+        // negotiates low-power idle against a MAC never set up for it parks the
+        // datapath while the link still reads up.
+        self.mac_ocp_modify(0xe040, 0x0003, 0).await?;
+        if !is_8125a {
+            self.phy_ocp_modify(0xa432, 0x0000, 0x0010).await?;
+        }
+        self.phy_ocp_modify(0xa5d0, 0x0006, 0).await?;
+        self.phy_ocp_modify(0xa6d4, 0x0001, 0).await?;
+        self.phy_ocp_modify(0xa6d8, 0x0010, 0).await?;
+        self.phy_ocp_modify(0xa428, 0x0080, 0).await?;
+        self.phy_ocp_modify(0xa4a2, 0x0200, 0).await?;
+        // Advanced EEE off.
+        self.mac_ocp_modify(0xe052, 0x0001, 0).await?;
+        self.phy_ocp_modify(0xa442, 0x3000, 0).await?;
+        self.phy_ocp_modify(0xa430, 0x8000, 0).await?;
 
         // ---- Phase 2: MAC configuration (rtl_hw_start_8125 + _common) --------------------
 
@@ -757,10 +880,19 @@ impl Driver {
         let isr_now = self
             .read(reg::INTR_STATUS_8125, pci::AccessWidth::Dword)
             .await?;
+        // Datapath state for the bench transcript: the GPHY state machine (OCP
+        // 0xa420 [2:0], 3 = ready — rge_set_phy_power's wait condition), the
+        // MAC-side EEE enables (MAC OCP 0xe040 [1:0], must read 0 after the
+        // rge-style disable), and the GPHY ram code version.
+        let phy_state = self.phy_ocp_read(0xa420).await? & 0x0007;
+        let eee_mac = self.mac_ocp_read(0xe040).await? & 0x0003;
         let handle = text::default();
         let chip = if is_8125a { "8125A" } else { "8125B+" };
-        let state =
-            format!("rxcfg {rx_config_now:#010x} rxdv-byte {rxdv_now:#04x} isr {isr_now:#06x}");
+        let state = format!(
+            "rxcfg {rx_config_now:#010x} rxdv-byte {rxdv_now:#04x} isr {isr_now:#06x} \
+             phy-state {phy_state} eee-mac {eee_mac:#x} ram-code {:#06x}",
+            self.ram_code
+        );
         let line = match self.link {
             Link::Up(mbps) => format!(
                 "net.rtl8125: {} (xid {:#05x} {chip}) link up {mbps} Mb/s, rings rx/tx \
@@ -922,6 +1054,79 @@ impl Driver {
                 ));
             }
         }
+    }
+
+    /// Read a standard MII register of the integrated PHY.
+    async fn phy_read(&self, mii_register: u8) -> Result<u16, String> {
+        self.phy_ocp_read(eo9_rtl8125::phy_ocp_address(mii_register))
+            .await
+    }
+
+    /// Read-modify-write a PHY OCP register (rge(4)'s `RGE_PHY_SETBIT`/`CLRBIT` and
+    /// masked-update idiom).
+    async fn phy_ocp_modify(&self, ocp_address: u16, mask: u16, set: u16) -> Result<(), String> {
+        let value = self.phy_ocp_read(ocp_address).await?;
+        self.phy_ocp_write(ocp_address, (value & !mask) | set).await
+    }
+
+    /// Write one EPHY (PCIe SerDes) register through `EPHYAR` (rge(4)
+    /// `rge_write_ephy`, replayed exactly: the table address is masked to the 7-bit
+    /// field, busy bit 31 set, bounded completion poll).
+    async fn ephy_write(&self, register: u16, value: u16) -> Result<(), String> {
+        let word = 0x8000_0000u64 | (u64::from(register & 0x7f) << 16) | u64::from(value);
+        self.write(reg::EPHYAR, pci::AccessWidth::Dword, word)
+            .await?;
+        let mut spins: u64 = 0;
+        loop {
+            let readback = self.read(reg::EPHYAR, pci::AccessWidth::Dword).await?;
+            if readback & 0x8000_0000 == 0 {
+                return Ok(());
+            }
+            spins += 1;
+            if spins > PHY_POLL_LIMIT {
+                return Err(format!(
+                    "net.rtl8125: EPHY write to {register:#06x} never completed (poll limit)"
+                ));
+            }
+        }
+    }
+
+    /// Enter/leave GPHY MCU patch mode: set/clear OCP 0xb820 bit 4 and wait for the
+    /// PHY to acknowledge in OCP 0xb800 bit 6 (rge(4) `rge_patch_phy_mcu`; bounded,
+    /// best effort like the reference's printf-and-continue).
+    async fn patch_phy_mcu(&self, enter: bool) -> Result<(), String> {
+        if enter {
+            self.phy_ocp_modify(0xb820, 0x0000, 0x0010).await?;
+        } else {
+            self.phy_ocp_modify(0xb820, 0x0010, 0x0000).await?;
+        }
+        let mut spins: u64 = 0;
+        loop {
+            let ack = self.phy_ocp_read(0xb800).await? & 0x0040;
+            if (enter && ack != 0) || (!enter && ack == 0) {
+                return Ok(());
+            }
+            spins += 1;
+            if spins > QUIESCE_POLL_LIMIT {
+                return Ok(()); // the reference warns and continues; same posture
+            }
+        }
+    }
+
+    /// Soft reset (`ChipCmd.RST`), bounded wait for the chip to clear it.
+    async fn soft_reset(&self) -> Result<(), String> {
+        self.write(reg::CHIP_CMD, pci::AccessWidth::Byte, bits::CMD_RESET)
+            .await?;
+        let mut spins: u64 = 0;
+        while self.read(reg::CHIP_CMD, pci::AccessWidth::Byte).await? & bits::CMD_RESET != 0 {
+            spins += 1;
+            if spins > RESET_POLL_LIMIT {
+                return Err(String::from(
+                    "net.rtl8125: the chip did not come out of soft reset (poll limit)",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Write a standard MII register of the integrated PHY.

@@ -1180,3 +1180,40 @@ Match the priority order above; (1)+(2) unblock I2.
     Verified: full ci green; check-telnet green (net.virtio DMA through the modified
     accessors); one QEMU session running both `net.rtl8125 $ l2check` (typed refusal) and
     `net.virtio $ l2check` (ARP resolved); both board images rebuilt.
+
+    *Board round 4 (2026-06-08, wire truth) → the full rge(4) bring-up tables.* Host-side
+    tcpdump on the same VLAN proved BOTH directions dead between the MAC engine and the
+    wire — the ARP request never appeared on a busy VLAN (35k pkts/min) and the receiver
+    caught none of it — while link (2500 Mb/s), descriptors (consumed), and the bridge
+    diagnostics were all healthy. The link-up-MAC-speed-config hypothesis is REFUTED by
+    reference: rge(4)'s `rge_link_state` does NOTHING at link change (no MAC writes), so a
+    working 8125B driver carries no post-autoneg MAC speed programming. What rge carries
+    that this driver did not is the bring-up table set it loads unconditionally before any
+    traffic — and OpenBSD ships these IN-SOURCE (ISC-licensed, no firmware files), which
+    both proves external firmware is unnecessary AND makes them transcribable into this
+    MIT tree with attribution. Transcribed into `crates/eo9-rtl8125/src/r25b_tables.rs`
+    (provenance header; sizes + spot values pinned by host tests):
+
+    * `MAC_MCU` (138 pairs, rge `rtl8125b_mac_bps`): replayed after halting the MAC MCU
+      (break vector 0xfc48=0, break registers 0xfc28..0xfc46=0, settle, 0xfc26=0; ram
+      page 0 via 0xe446) — `rge_hw_init`'s MAC_R25B arm.
+    * `EPHY` (46 pairs, rge `mac_r25b_ephy`): PCIe SerDes tuning through EPHYAR 0x80,
+      rge's exact 7-bit address masking replayed.
+    * `PHY_MCU` (1447 pairs, rge `MAC_R25B_MCU`): the GPHY MCU patch, applied inside the
+      0xb820/0xb800 patch-mode bracket ONLY when the PHY's ram code version (OCP
+      0xa436=0x801e → 0xa438) is not 0x0b99, then stamped — `rge_phy_config_mcu`.
+
+    Bring-up now mirrors rge's `rge_chipinit` → `rge_phy_config` order: exit-OOB → MAC
+    MCU halt+patch → PHY power (PMCH 0x6f |= 0xc0, BMCR=AUTOEN, GPHY state 0xa420==3) →
+    second reset + IMR/ISR → EPHY table → advertise-nothing + PHY reset → ram-code check
+    + PHY MCU patch → the ~30 `rge_phy_config_mac_r25b` writes → 0xa5b4 fix → **EEE
+    disabled MAC- and PHY-side** (0xe040[1:0], 0xe052[0], the a432/a5d0/a6d4/a6d8/a428/
+    a4a2/a442/a430 bits — un-configured EEE is itself a known frame-blackhole shape) →
+    hw_start_8125 → advertise + autoneg → rings/enable. Bring-up diagnostic now also
+    prints the GPHY state machine, the MAC EEE bits, and the ram code version, so the
+    next transcript shows the datapath state either way. Omitted from rge, recorded:
+    ASPM/clkreq disable + the CSI 0x108 write (PCIe power management, not frame path);
+    8125A tables (the board is 8125B, xid 0x641 — an A part would skip the tables and
+    likely still need its own set). Core crate: 16 host tests. Licensing note: the tables
+    are transcribed from OpenBSD rge(4) (Copyright (c) 2019-2024 Kevin Lo, ISC license) —
+    register/value facts plus replay order, with the provenance header in the module.
