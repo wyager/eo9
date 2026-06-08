@@ -161,3 +161,15 @@ makes it the production arm).
   (kernel fallback + QEMU regression + cmdline bench), A3 (hands-in-pockets ×3).
 - Freebie: stdout=serial,vidconsole means the monitor narrates from power-on until
   fbcon takes over — demo continuity for free.
+
+## Round A0 results (bench, 2026-06-08 evening)
+- `dcache`/`icache` commands ABSENT (no CONFIG_CMD_CACHE) — cache mitigation if A1's
+  beacon gate fails = the proven crc32 cache-pressure eviction or the trampoline.
+- `crc32 address count [addr]` exists (no -v verify form); `itest` ABSENT; `setexpr`
+  ABSENT; `test` EXISTS; `source` EXISTS; hush `if` proven by the env's own scripts.
+- **CRC gate construction without -v/itest/setexpr**: `crc32 0x00200000 ${filesize}
+  0x00180000` (save), `mw.l 0x00184000 <expected> 1`, `if cmp.l 0x00180000 0x00184000
+  1; then go 0x00200000; fi` — cmp returns success on equality. A1 verifies `cmp`
+  exists (standard mem command family; mm/md proven present).
+- Pending A0 residue: stick-behind-xhci1-hub `usb storage` check (stick not yet
+  plugged; operator asked to put it in a USB 3.0 port).
