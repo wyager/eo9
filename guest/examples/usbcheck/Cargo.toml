@@ -1,0 +1,17 @@
+[package]
+name = "eo9-example-usbcheck"
+description = "Eo9 example program: bring up the granted eo9:usb host controller, watch its root-hub ports, and enumerate + descriptor-dump a connected device (targets the eo9-examples:usbcheck/usbcheck world: usb + text)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+# Descriptor parsing (the pure, host-tested core the usb.ohci shells share).
+eo9-ohci = { workspace = true }
+wit-bindgen = { workspace = true }

@@ -41,6 +41,11 @@ eo9-eofs = { path = "../crates/eo9-eofs" }
 # command words) for the net.rtl8125 driver: no_std, host-tested in the root
 # workspace — the same shared-engine pattern as eo9-eofs.
 eo9-rtl8125 = { path = "../crates/eo9-rtl8125" }
+# The OHCI device core (register map, ED/TD encode/decode, HCCA, enumeration state
+# machine, HID boot decode, and the RegionIo-generic driver) for the usb.ohci /
+# usb.ohci-pci shells and the usbcheck/hidcheck examples: no_std, host-tested in the
+# root workspace — the same shared-engine pattern as eo9-eofs and eo9-rtl8125.
+eo9-ohci = { path = "../crates/eo9-ohci" }
 # The TCP/IP engine for the net.l4.over-l2 middleware provider (plan/09 Decision 18):
 # no_std + alloc, Ethernet + IPv4 + TCP + UDP only. Guest-workspace-only — it never
 # enters the host or kernel dependency tree.

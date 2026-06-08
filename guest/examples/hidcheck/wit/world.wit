@@ -1,0 +1,44 @@
+// hidcheck — the HID boot-protocol example: enumerate the first connected device,
+// configure its boot interface, and print decoded interrupt-IN reports with a
+// reports/s counter. Capabilities: eo9:usb, eo9:time, eo9:text.
+package eo9-examples:hidcheck@0.1.0;
+
+/// Drives whatever eo9:usb provider the program is composed with through the HID
+/// boot-protocol ladder (docs/board/usb-ohci-plan.md M3, QEMU-first): attach, parse
+/// the configuration for the boot interface, SET_CONFIGURATION + SET_PROTOCOL(boot) +
+/// SET_IDLE, open the interrupt-IN endpoint, then poll — each report printed raw and
+/// decoded (keystrokes for keyboards, buttons/deltas for mice), with a closing
+/// reports/s line (the plan's dropped-poll detector: a healthy keyboard under
+/// autorepeat sits near 1000/interval).
+///
+///   usb.ohci-pci $ hidcheck
+///   usb.ohci-pci $ hidcheck --reports 20 --window-ms 10000
+world hidcheck {
+    import eo9:usb/usb@0.1.0;
+    import eo9:time/time@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    variant program-success {
+        /// Reports received and decoded; carries how many.
+        reports(u32),
+    }
+
+    variant program-failure {
+        /// An argument was unusable.
+        bad-arguments(string),
+        /// The USB capability refused.
+        denied,
+        /// No host controller is visible through the underlying capability.
+        no-controller,
+        /// No device connected, or the device has no boot-protocol HID interface.
+        no-hid(string),
+        /// Any other USB or console error.
+        io(string),
+    }
+
+    /// `reports`: stop after this many reports (default 5).
+    /// `window-ms`: give up after this much wall time without reaching the count
+    /// (default 30000 — enough for scripted key injection to land).
+    export main: async func(reports: option<u32>, window-ms: option<u32>)
+        -> result<program-success, program-failure>;
+}

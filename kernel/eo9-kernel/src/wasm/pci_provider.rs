@@ -69,15 +69,6 @@ use crate::pci;
 /// providers).
 type ConcurrentFuture<'a, R> = Pin<Box<dyn Future<Output = Result<R>> + Send + 'a>>;
 
-/// Per-allocation ceiling for `alloc-dma`, so one call cannot take a huge bite out of the
-/// kernel heap (the buffer is host memory, not guest linear memory).
-const MAX_DMA_ALLOC_BYTES: u64 = 4 * 1024 * 1024;
-/// Ceiling on live DMA buffers per task.
-const MAX_DMA_BUFFERS: usize = 64;
-/// DMA buffers are aligned to a page: enough for every virtio structure and friendly to a
-/// future IOMMU mapping path.
-const DMA_ALIGN: usize = 4096;
-
 /// How long a single `wait` call waits for a delivery before giving up with a typed `io`
 /// error. Generous for any healthy device (QEMU completes block requests in well under a
 /// millisecond); a hung device falls back to the driver's polled path, which has its own
@@ -142,60 +133,9 @@ struct OpenInterrupt {
     line: usize,
 }
 
-/// One DMA-able allocation. The page-aligned window `[offset, offset + len)` inside
-/// `storage` is what the guest sees; with the identity map its CPU address is also the
-/// bus address the device DMAs to.
-struct DmaBuffer {
-    storage: Vec<u8>,
-    offset: usize,
-    len: usize,
-}
-
-impl DmaBuffer {
-    fn allocate(len: usize) -> DmaBuffer {
-        let storage = alloc::vec![0u8; len + DMA_ALIGN];
-        let misalignment = storage.as_ptr() as usize % DMA_ALIGN;
-        let offset = if misalignment == 0 {
-            0
-        } else {
-            DMA_ALIGN - misalignment
-        };
-        let buffer = DmaBuffer {
-            storage,
-            offset,
-            len,
-        };
-        // The zeroing above went through the (cacheable) heap mapping: push it to the
-        // PoC NOW, or those dirty lines could write back LATER — over bytes the device
-        // has DMA'd in the meantime (arch::dma_coherence docs; a no-op on coherent
-        // machines).
-        crate::arch::dma_coherence::sync(buffer.bus_address() as usize, len);
-        buffer
-    }
-
-    fn bus_address(&self) -> u64 {
-        (self.storage.as_ptr() as usize + self.offset) as u64
-    }
-
-    fn bytes(&self) -> &[u8] {
-        &self.storage[self.offset..self.offset + self.len]
-    }
-
-    fn bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.storage[self.offset..self.offset + self.len]
-    }
-
-    /// Cache-maintain `[start, end)` of the window around a CPU access — clean +
-    /// invalidate to the PoC, then barrier. Called BEFORE the copy on `dma-read` (drop
-    /// stale lines so the load sees what the device wrote) and AFTER the copy on
-    /// `dma-write` (the device's next fetch reads the bytes from DRAM; the sweep's
-    /// `dsb sy` is also the reference drivers' `dma_wmb()` — a doorbell written through
-    /// a later `bar-write` cannot overtake the descriptor). No-op where DMA is coherent
-    /// (QEMU); see `arch::dma_coherence`.
-    fn sync_range(&self, start: usize, end: usize) {
-        crate::arch::dma_coherence::sync(self.bus_address() as usize + start, end - start);
-    }
-}
+// `DmaBuffer` and the coherence-sweep brackets are shared with the platform provider —
+// see `super::dma` (one implementation of the board-proven discipline, no copy-paste).
+use super::dma::{DmaBuffer, MAX_DMA_ALLOC_BYTES, MAX_DMA_BUFFERS, dma_byte_range};
 
 /// The task's PCI state: open devices, opened BARs, and live DMA buffers (rep → slot).
 /// Lives on [`KernelState`], so each task tracks (and bounds) its own handles; exclusive
@@ -982,7 +922,7 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
         |mut store: StoreContextMut<'_, KernelState>,
          (buffer,): (Resource<DmaRes>,)|
          -> Result<(u64,)> {
-            Ok((store.data_mut().pci_tables().buffer(buffer.rep())?.len as u64,))
+            Ok((store.data_mut().pci_tables().buffer(buffer.rep())?.len() as u64,))
         },
     )?;
 
@@ -992,7 +932,7 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
          (buffer, offset, len): (Resource<DmaRes>, u64, u64)|
          -> Result<(Vec<u8>,)> {
             let buffer = store.data_mut().pci_tables().buffer(buffer.rep())?;
-            let (start, end) = dma_byte_range(buffer.len, offset, len)?;
+            let (start, end) = dma_byte_range(buffer.len(), offset, len)?;
             // Invalidate before the read: the device may have DMA'd here since the
             // CPU last looked (no-op on coherent machines).
             buffer.sync_range(start, end);
@@ -1006,7 +946,7 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
          (buffer, offset, bytes): (Resource<DmaRes>, u64, Vec<u8>)|
          -> Result<()> {
             let buffer = store.data_mut().pci_tables().buffer_mut(buffer.rep())?;
-            let (start, end) = dma_byte_range(buffer.len, offset, bytes.len() as u64)?;
+            let (start, end) = dma_byte_range(buffer.len(), offset, bytes.len() as u64)?;
             buffer.bytes_mut()[start..end].copy_from_slice(&bytes);
             // Clean to the PoC after the write: the device's next fetch reads DRAM,
             // and the sweep's barrier orders this ahead of any subsequent doorbell
@@ -1118,17 +1058,5 @@ fn bar_access_in_bounds(offset: u64, width: WitAccessWidth, size: u64) -> Result
     match offset.checked_add(bytes) {
         Some(end) if end <= size => Ok(()),
         _ => Err(WitPciError::OutOfRange),
-    }
-}
-
-/// Bounds check for the DMA copy accessors; out of range traps (same contract as the
-/// `eo9:io` buffer accessors).
-fn dma_byte_range(total: usize, offset: u64, len: u64) -> Result<(usize, usize)> {
-    let end = offset.checked_add(len);
-    match end {
-        Some(end) if end <= total as u64 => Ok((offset as usize, end as usize)),
-        _ => Err(wasmtime::Error::msg(
-            "dma-buffer access out of bounds (this traps, as the WIT documents)",
-        )),
     }
 }

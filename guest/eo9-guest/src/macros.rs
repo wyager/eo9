@@ -31,7 +31,7 @@
 /// * `world` — the world name, defined in the crate's own `wit/` directory (with the
 ///   repo-level packages it imports symlinked under `wit/deps/`).
 /// * `apis` — which eo9 APIs the world imports, as bare identifiers (`io`, `text`,
-///   `time`, `entropy`, `perf`, `disk`, `fs`, `gfx`, `pci`, and the net layers `net_l2`,
+///   `time`, `entropy`, `perf`, `disk`, `fs`, `gfx`, `pci`, `platform`, `usb`, and the net layers `net_l2`,
 ///   `net_l3`, `net_l4`). Listing an API maps its interfaces onto [`crate::api`] instead
 ///   of regenerating them; `io` must be listed exactly when the world's imports use
 ///   `eo9:io/buffers` (i.e. for `disk`, `fs`, and the net layers).
@@ -173,6 +173,26 @@ macro_rules! __bindings_with {
             with [$($acc)*
                 "eo9:pci/types@0.1.0": eo9_guest::api::pci::types,
                 "eo9:pci/pci@0.1.0": eo9_guest::api::pci::pci,
+            ]
+            $($tail)*
+        );
+    };
+    (apis [platform $($rest:ident)*] with [$($acc:tt)*] $($tail:tt)*) => {
+        $crate::__bindings_with!(
+            apis [$($rest)*]
+            with [$($acc)*
+                "eo9:platform/types@0.1.0": eo9_guest::api::platform::types,
+                "eo9:platform/platform@0.1.0": eo9_guest::api::platform::platform,
+            ]
+            $($tail)*
+        );
+    };
+    (apis [usb $($rest:ident)*] with [$($acc:tt)*] $($tail:tt)*) => {
+        $crate::__bindings_with!(
+            apis [$($rest)*]
+            with [$($acc)*
+                "eo9:usb/types@0.1.0": eo9_guest::api::usb::types,
+                "eo9:usb/usb@0.1.0": eo9_guest::api::usb::usb,
             ]
             $($tail)*
         );

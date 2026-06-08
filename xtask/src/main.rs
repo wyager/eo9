@@ -20,6 +20,9 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-draw",
     "eo9-example-sockcheck",
     "eo9-example-lspci",
+    "eo9-example-platcheck",
+    "eo9-example-usbcheck",
+    "eo9-example-hidcheck",
     "eo9-example-l2check",
     "eo9-example-l4check",
     "eo9-example-vnicheck",
@@ -86,6 +89,8 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-pci-deny",
     "eo9-stub-pci-filtered",
     "eo9-stub-pci-none",
+    "eo9-stub-platform-deny",
+    "eo9-stub-platform-none",
     "eo9-stub-perf-none",
     "eo9-stub-perf-null",
     "eo9-stub-restart-always",
@@ -97,6 +102,8 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-time-fuzzy",
     "eo9-stub-time-monotonic-stub",
     "eo9-stub-time-none",
+    "eo9-stub-usb-ohci",
+    "eo9-stub-usb-ohci-pci",
 ];
 
 /// Target used to build guest crates before componentizing them.
@@ -183,6 +190,21 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // to observe a typed `denied` (`pci.deny $ lspci`) instead of an unsatisfied import.
     ("eo9-stub-pci-none", "pci.none"),
     ("eo9-stub-pci-deny", "pci.deny"),
+    // The platform-device capability's absence/refusal stubs (same posture as pci's),
+    // and the USB host lane (docs/board/usb-ohci-plan.md M0): the two OHCI driver
+    // shells over eo9:platform (board) and eo9:pci (QEMU's -device pci-ohci), the
+    // enumeration / HID example pair check-usb scripts, and the platform-provider
+    // semantics probe:
+    //   usb.ohci-pci $ usbcheck
+    //   usb.ohci-pci $ hidcheck
+    //   platcheck            (boot grant: platform=pl031-rtc)
+    ("eo9-stub-platform-none", "platform.none"),
+    ("eo9-stub-platform-deny", "platform.deny"),
+    ("eo9-stub-usb-ohci", "usb.ohci"),
+    ("eo9-stub-usb-ohci-pci", "usb.ohci-pci"),
+    ("eo9-example-usbcheck", "usbcheck"),
+    ("eo9-example-hidcheck", "hidcheck"),
+    ("eo9-example-platcheck", "platcheck"),
     // The network stack for real hardware: the virtio-net driver, its link-layer
     // check, the TCP/IP middleware, and its transport-layer check, so the metal shell
     // can compose `net.virtio $ l2check` and `net.virtio $ net.l4.over-l2 $ l4check`

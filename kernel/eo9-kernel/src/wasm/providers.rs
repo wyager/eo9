@@ -64,6 +64,11 @@ pub struct KernelState {
     /// boot granted PCI and the program imports `eo9:pci` (see `super::pci_provider`).
     #[cfg(feature = "wasm-store")]
     pub pci: super::pci_provider::PciTables,
+    /// The task's platform-device handles (claimed regions, DMA buffers); only populated
+    /// when the boot granted the `platform` token and the program imports `eo9:platform`
+    /// (see `super::platform_provider`).
+    #[cfg(feature = "wasm-store")]
+    pub platform: super::platform_provider::PlatformTables,
 }
 
 impl KernelState {
@@ -78,6 +83,8 @@ impl KernelState {
             shell: None,
             #[cfg(feature = "wasm-store")]
             pci: super::pci_provider::PciTables::default(),
+            #[cfg(feature = "wasm-store")]
+            platform: super::platform_provider::PlatformTables::default(),
         }
     }
 

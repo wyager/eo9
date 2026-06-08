@@ -51,3 +51,11 @@ pub mod net {
 pub mod pci {
     pub use crate::bindings::eo9::pci::{pci, types};
 }
+
+pub mod platform {
+    pub use crate::bindings::eo9::platform::{platform, types};
+}
+
+pub mod usb {
+    pub use crate::bindings::eo9::usb::{types, usb};
+}

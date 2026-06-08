@@ -1,0 +1,19 @@
+[package]
+name = "eo9-stub-usb-ohci"
+description = "Eo9 device driver `usb.ohci`: drives a memory-mapped OHCI USB host controller (the RK3588 usb-host blocks) through the eo9:platform capability and exports eo9:usb — the board lane of the USB host stack."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+# The pure device core shared with usb.ohci-pci: OHCI register map, ED/TD
+# encode/decode, the enumeration state machine, and the RegionIo-generic driver —
+# host-tested in the root workspace (`cargo test -p eo9-ohci`).
+eo9-ohci = { workspace = true }
+wit-bindgen = { workspace = true }

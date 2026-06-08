@@ -1,0 +1,26 @@
+/// eo9:usb-ohci — the board-lane OHCI USB host driver world
+/// (docs/board/usb-ohci-plan.md §2).
+///
+/// `usb.ohci` drives an OHCI controller reached as a memory-mapped platform region —
+/// the RK3588's usb-host0/1 OHCI blocks on the Orange Pi 5 Plus — through the
+/// `eo9:platform/platform` capability, and exports `eo9:usb/usb`. It claims the first
+/// region whose name ends in `-ohci` visible through the granted capability (the
+/// board profile's table names them `usb-host0-ohci` / `usb-host1-ohci`; narrowing to
+/// one controller is the boot grant's job: `platform=usb-host0-ohci`).
+///
+/// The QEMU sibling `usb.ohci-pci` exports the same surface over `eo9:pci` against
+/// `-device pci-ohci` — byte-identical protocol logic (the shared `eo9-ohci` core),
+/// different claim path; the whole stack is battery-tested there first, and this
+/// shell's real exercise arrives with the M1 board profile region table.
+///
+/// `eo9:text/text` is imported only for one diagnostic line at bring-up; the driver
+/// works identically without a console.
+package eo9:usb-ohci@0.1.0;
+
+world ohci-platform {
+    import eo9:platform/platform@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    export eo9:usb/types@0.1.0;
+    export eo9:usb/usb@0.1.0;
+}
