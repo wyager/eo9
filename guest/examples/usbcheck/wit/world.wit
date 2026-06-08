@@ -1,0 +1,36 @@
+// usbcheck — the USB host example: bring the controller up, print its identity,
+// watch the root-hub ports, and — with a device connected — run the full enumeration
+// and dump the descriptor chain. Capabilities: eo9:usb, eo9:text.
+package eo9-examples:usbcheck@0.1.0;
+
+/// Drives whatever eo9:usb provider the program is composed with (`usb.ohci-pci`
+/// against QEMU's `-device pci-ohci`, `usb.ohci` on the board) through the milestone
+/// ladder of docs/board/usb-ohci-plan.md: controller info (HcRevision/port count), a
+/// bounded port-status watch, then — when a port reports a connection — attach (port
+/// reset, SET_ADDRESS) and the GET_DESCRIPTOR chain, printed descriptor by
+/// descriptor.
+///
+///   usb.ohci-pci $ usbcheck
+world usbcheck {
+    import eo9:usb/usb@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    variant program-success {
+        /// A device was enumerated on this port; the descriptor chain printed.
+        enumerated(u8),
+        /// No device connected within the watch window — the controller facts and
+        /// port statuses printed (the M1 bench shape: plug a device and re-run).
+        no-device,
+    }
+
+    variant program-failure {
+        /// The USB capability refused (composed over a deny, or an ungranted boot).
+        denied,
+        /// No host controller is visible through the underlying capability.
+        no-controller,
+        /// Any other USB or console error.
+        io(string),
+    }
+
+    export main: async func() -> result<program-success, program-failure>;
+}

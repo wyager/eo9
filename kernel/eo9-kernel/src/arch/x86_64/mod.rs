@@ -108,3 +108,15 @@ pub(crate) fn interrupts_init() {
         crate::kprintln!("interrupts: WARNING: no timer interrupt within 1 s of arming");
     }
 }
+
+/// The machine's platform (memory-mapped, non-PCI) device region table, consumed by
+/// `src/platform.rs` for the `eo9:platform` root provider (wasm-store builds only).
+/// Empty: no platform-device driver targets this architecture yet — `enumerate` shows
+/// nothing and every `claim` answers `not-found` (the aarch64 QEMU profile carries the
+/// test regions the battery drives).
+#[cfg(feature = "wasm-store")]
+pub(crate) mod platform_regions {
+    use crate::platform::RegionDef;
+
+    pub(crate) const REGIONS: &[RegionDef] = &[];
+}

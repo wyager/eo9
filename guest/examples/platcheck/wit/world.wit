@@ -1,0 +1,49 @@
+// platcheck — the platform-capability semantics probe: enumerate the granted region
+// table, then pin every typed refusal the provider promises (claim, busy,
+// out-of-range, cross-region denial, not-found) in one transcript. Capabilities:
+// eo9:platform, eo9:text.
+package eo9-examples:platcheck@0.1.0;
+
+/// Drives the granted eo9:platform capability through its whole contract and prints
+/// one line per probe — the live half of the platform provider's typed-refusal test
+/// suite (docs/board/usb-ohci-plan.md M0; the host half is the composition tests over
+/// platform.deny). Run under `check-usb` with the grant `platform=pl031-rtc`, the
+/// probes pin, in order:
+///
+/// 1. `enumerate` lists exactly the granted regions;
+/// 2. `claim` of the first granted region succeeds and a register reads;
+/// 3. a second `claim` of the same name answers `busy` (machine-wide exclusivity);
+/// 4. a read past the region's end answers `out-of-range`;
+/// 5. `claim` of a present-but-ungranted region answers `denied` (the cross-region
+///    containment the per-name grant exists for);
+/// 6. `claim` of a nonexistent name answers `not-found`.
+///
+///   platcheck
+///   platcheck --expect-denied pl061-gpio
+world platcheck {
+    import eo9:platform/platform@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    variant program-success {
+        /// Every probe answered as the contract promises; carries the probe count.
+        probes(u32),
+    }
+
+    variant program-failure {
+        /// The capability refused outright (no grant / composed over platform.deny).
+        denied,
+        /// The grant exposes no regions to probe with.
+        no-regions,
+        /// A probe got the WRONG answer; carries which one and what came back.
+        contract(string),
+        /// A console error.
+        io(string),
+    }
+
+    /// `expect-denied`: a region name expected to exist in the machine's table but
+    /// sit OUTSIDE this boot's grant; its claim must answer `denied` (default
+    /// `pl061-gpio`, the QEMU profile's ungranted test region; pass none-empty to
+    /// skip the probe on machines without one — spell it `--expect-denied ""`).
+    export main: async func(expect-denied: option<string>)
+        -> result<program-success, program-failure>;
+}

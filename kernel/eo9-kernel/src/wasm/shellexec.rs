@@ -865,17 +865,20 @@ pub(super) fn bind_args(
 /// imports, so granting the full set is inert for programs that never asked for it, and a
 /// nested `eosh` is a full peer that can resolve `/bin`, spawn, and compose.
 /// The one spawn `Linker`, built lazily on first use and reused for every spawn (the
-/// host-function set is boot-constant: the only conditional registration is `eo9:pci`,
-/// gated by the boot command line's `pci` token, which never changes after boot). The
-/// stored bool is that grant bit — re-checked on every reuse as the grant-shape guard
-/// (security review of the spawn-cache design): a linker built under one grant shape can
-/// never serve a spawn under another. Per-spawn capability state (svc generations, the
-/// session fs, buffer tables) lives in the per-spawn `Store`, not the linker, so reuse
-/// shares no authority between spawns.
-static SPAWN_LINKER: KLock<Option<(bool, Arc<Linker<KernelState>>)>> = KLock::new(None);
+/// host-function set is boot-constant: the only conditional registrations are `eo9:pci`
+/// and `eo9:platform`, gated by the boot command line's `pci`/`platform` tokens, which
+/// never change after boot). The stored bools are those grant bits — re-checked on
+/// every reuse as the grant-shape guard (security review of the spawn-cache design): a
+/// linker built under one grant shape can never serve a spawn under another. Per-spawn
+/// capability state (svc generations, the session fs, buffer tables) lives in the
+/// per-spawn `Store`, not the linker, so reuse shares no authority between spawns.
+static SPAWN_LINKER: KLock<Option<((bool, bool), Arc<Linker<KernelState>>)>> = KLock::new(None);
 
 fn spawn_linker(engine: &Engine) -> Result<Arc<Linker<KernelState>>, wasmtime::Error> {
-    let granted = super::pci_provider::granted();
+    let granted = (
+        super::pci_provider::granted(),
+        super::platform_provider::granted(),
+    );
     if let Some(linker) = SPAWN_LINKER.with(|slot| match slot {
         Some((shape, linker)) if *shape == granted => Some(linker.clone()),
         _ => None,
@@ -889,9 +892,13 @@ fn spawn_linker(engine: &Engine) -> Result<Arc<Linker<KernelState>>, wasmtime::E
     add_exec(&mut linker)?;
     // PCI is never granted by default (bus mastering means DMA): only when the boot's
     // command line carried the `pci` token — and even then the loader rule applies, so
-    // only a child that imports `eo9:pci/pci` actually links it.
-    if granted {
+    // only a child that imports `eo9:pci/pci` actually links it. `eo9:platform` is the
+    // same posture under its own token (MMIO + DMA without an IOMMU).
+    if granted.0 {
         super::pci_provider::add_pci(&mut linker)?;
+    }
+    if granted.1 {
+        super::platform_provider::add_platform(&mut linker)?;
     }
     let linker = Arc::new(linker);
     SPAWN_LINKER.with(|slot| *slot = Some((granted, linker.clone())));
@@ -2567,6 +2574,9 @@ fn missing_capability(text: &str) -> Option<String> {
     } else if text.contains("eo9:pci/") {
         "PCI device access, which this boot did not grant (add the `pci` token to the \
          kernel command line — `cargo xtask qemu aarch64 pci` — to provide it)"
+    } else if text.contains("eo9:platform/") {
+        "platform device access, which this boot did not grant (add the `platform` token \
+         — or `platform=<region>,…` for specific regions — to the kernel command line)"
     } else {
         return None;
     };

@@ -60,6 +60,10 @@ mod wdt;
 // with the store/runner feature to keep the featureless CI build lean.
 #[cfg(all(target_os = "none", feature = "wasm-store"))]
 mod pci;
+// The eo9:platform root provider's hardware half: the machine's memory-mapped region
+// table + width-explicit access (src/platform.rs); wasm-store-gated like pci.
+#[cfg(all(target_os = "none", feature = "wasm-store"))]
+mod platform;
 // The kernel's own polled virtio-blk driver, used only for the persistent store disk
 // (the `storedisk` boot token); guests keep getting their disks through the wasm
 // `disk.virtio` driver over `eo9:pci`.

@@ -86,6 +86,52 @@ pub(crate) mod pci_intx {
     pub(crate) fn mask(_line: usize) {}
 }
 
+/// The machine's platform (memory-mapped, non-PCI) device region table, consumed by
+/// `src/platform.rs` for the `eo9:platform` root provider (wasm-store builds only).
+///
+/// QEMU `virt` exposes two benign test regions so the provider's full semantics —
+/// exclusive claim/busy, in-bounds access, the per-name boot grant — are exercisable
+/// under the scripted battery before any board hardware exists (the M0 lane of
+/// docs/board/usb-ohci-plan.md; `check-usb`'s platcheck step drives them):
+///
+/// * `pl031-rtc` — the PL031 real-time clock (the same device `rtc.rs` reads at boot;
+///   reads are side-effect-free, RTCDR at offset 0 ticks once a second).
+/// * `pl061-gpio` — the PL061 GPIO block (QEMU `virt` memmap: 0x0903_0000). Listed so a
+///   table with MORE regions than a restricted grant (`platform=pl031-rtc`) exists —
+///   the cross-region claim-denied case needs a present-but-ungranted name.
+///
+/// Both sit in the identity-mapped device gigabyte. The board profile's table (the
+/// RK3588 EHCI/OHCI register blocks) lands with the M1 board lane — empty until then,
+/// so a board boot with the `platform` token grants nothing yet.
+#[cfg(all(feature = "wasm-store", not(feature = "board-opi5plus")))]
+pub(crate) mod platform_regions {
+    use crate::platform::RegionDef;
+
+    pub(crate) const REGIONS: &[RegionDef] = &[
+        RegionDef {
+            name: "pl031-rtc",
+            base: 0x0901_0000,
+            size: 0x1000,
+            has_irq: false,
+        },
+        RegionDef {
+            name: "pl061-gpio",
+            base: 0x0903_0000,
+            size: 0x1000,
+            has_irq: false,
+        },
+    ];
+}
+
+/// Platform region table, board profile: empty until the M1 USB lane lands the four
+/// RK3588 EHCI/OHCI register blocks (docs/board/usb-ohci-plan.md §0).
+#[cfg(all(feature = "wasm-store", feature = "board-opi5plus"))]
+pub(crate) mod platform_regions {
+    use crate::platform::RegionDef;
+
+    pub(crate) const REGIONS: &[RegionDef] = &[];
+}
+
 /// DMA-coherence maintenance for buffers a PCI device masters (descriptor rings, frame
 /// buffers). On the board the RK3588's PCIe controllers are NOT cache-coherent — mainline
 /// `rk3588-base.dtsi` carries no `dma-coherent` on any pcie node, so Linux uses

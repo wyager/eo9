@@ -77,6 +77,12 @@ pub fn boot(bootargs: Option<&str>) -> bool {
     // is refused at instantiation with the capability story (PCI implies DMA, so it is
     // never linked by default; see `pci_provider` and `shellexec::missing_capability`).
     super::pci_provider::set_granted(tokenize(bootargs).iter().any(|token| token == "pci"));
+    // The `platform` token is the same idea for memory-mapped (non-PCI) devices —
+    // never linked by default; `platform=<name>,…` narrows the grant to exactly those
+    // regions of the machine's table (see `platform_provider`).
+    super::platform_provider::set_granted_from_tokens(
+        tokenize(bootargs).iter().map(String::as_str),
+    );
     // The bare `storedisk` token claims a virtio-blk function for the kernel's own
     // persistent store: a disk-backed cache of on-target compile results (and nothing
     // else); see `diskcache`. Independent of the guest-facing `pci` grant above.
@@ -231,9 +237,13 @@ fn try_run(entry: &StoreEntry, args: &[(String, String)]) -> Result<String, wasm
     let mut linker: Linker<KernelState> = Linker::new(&engine);
     providers::add_providers(&mut linker)?;
     // The eo9:pci root provider is opt-in per boot (the `pci` command-line token), never a
-    // default grant — see `pci_provider`.
+    // default grant — see `pci_provider`; eo9:platform is the same posture under its
+    // own `platform` token.
     if super::pci_provider::granted() {
         super::pci_provider::add_pci(&mut linker)?;
+    }
+    if super::platform_provider::granted() {
+        super::platform_provider::add_platform(&mut linker)?;
     }
 
     let mut store = Store::new(&engine, KernelState::new());

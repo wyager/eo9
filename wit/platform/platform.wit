@@ -1,0 +1,171 @@
+/// eo9:platform — memory-mapped platform (non-PCI) device access: region enumeration,
+/// exclusive claiming, width-explicit register access, interrupts, and DMA buffers.
+///
+/// This is `eo9:pci`'s sibling for devices that sit directly on the SoC bus rather than
+/// behind a PCI hierarchy (SPEC line 574 anticipates exactly this; the first consumer is
+/// the OHCI USB host driver — docs/board/usb-ohci-plan.md). The same posture applies in
+/// full: the capability carries no device-class semantics (what the registers mean is the
+/// driver's business) and no kernel policy (which regions a program may see is the
+/// provider's business). A region capability that can allocate DMA buffers is, absent an
+/// IOMMU, effectively full-memory authority; providers hand out the narrowest region set
+/// that works (see SPEC: Security, The capability algebra).
+///
+/// Regions are named (the names come from the machine's region table — e.g.
+/// `usb-host0-ohci` on the Orange Pi 5 Plus board profile) rather than addressed: the
+/// base address is the provider's secret, so a driver can never aim a register access
+/// outside its claimed window.
+///
+/// See SPEC.md: "Eo9 API design" (async operations, ownership), "Execution APIs"
+/// (hardware roots are satisfied only by the OS core at instantiation).
+package eo9:platform@0.1.0;
+
+/// Root-handle type, shared by the required and `-optional` flavors and by the config
+/// interfaces. (Types-only interface — see plan/02-wit.md Decisions.)
+interface types {
+    /// The platform capability's root handle: a view of (some of) the machine's
+    /// memory-mapped device regions.
+    resource platform-impl;
+}
+
+/// The device surface: enumerate visible regions, claim one, and drive it — registers,
+/// DMA allocations, and interrupt waits.
+interface platform {
+    use types.{platform-impl};
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> platform-impl;
+
+    /// One memory-mapped device region, as the provider exposes it. The base address is
+    /// deliberately absent: accesses are region-relative, so the window is the whole
+    /// authority.
+    record region-info {
+        /// The region's name in the machine's region table (e.g. `usb-host0-ohci`).
+        name: string,
+        /// Size of the region in bytes.
+        size: u64,
+        /// Whether the region has an interrupt line the provider can route.
+        has-irq: bool,
+    }
+
+    /// Access width for register accesses. Register access is width-sensitive, so the
+    /// width is explicit rather than inferred from a buffer length; values are
+    /// zero-extended to / truncated from u64.
+    enum access-width {
+        byte,
+        word,
+        dword,
+        qword,
+    }
+
+    variant platform-error {
+        /// Refused by policy — the error `platform.deny` answers every op with, and what
+        /// the kernel root answers for a region outside the boot grant's allow-list
+        /// (`platform=<name>,…` on the kernel command line).
+        denied,
+        /// No region of that name (or no such interrupt).
+        not-found,
+        /// The region is already claimed by another driver.
+        busy,
+        /// Access outside the region or DMA buffer.
+        out-of-range,
+        /// The region or provider does not support the request (e.g. interrupt delivery
+        /// where the provider has no routing — the v1 kernel root answers every
+        /// interrupt op this way).
+        unsupported,
+        /// No DMA address space left.
+        exhausted,
+        io(string),
+    }
+
+    /// A claimed region: the unit of grant and of driver ownership. Exclusive — a second
+    /// `claim` of the same name answers `busy` until the first handle drops.
+    resource region;
+    /// One routed interrupt line; await it repeatedly to receive deliveries.
+    /// (Present in the API from v1 so drivers are written against the final shape, but
+    /// the kernel root answers `unsupported` until platform interrupt routing lands.)
+    resource interrupt;
+    /// A DMA-able memory region allocated for (and reachable by) the claimed device.
+    resource dma-buffer;
+
+    // --- enumeration and claiming ----------------------------------------------------
+
+    /// The regions visible through this capability. A provider may expose any subset of
+    /// the machine's region table (the kernel root shows exactly the boot grant).
+    enumerate: async func(p: borrow<platform-impl>) -> result<list<region-info>, platform-error>;
+
+    /// Claim one region for exclusive driver use.
+    claim: async func(p: borrow<platform-impl>, name: string) -> result<region, platform-error>;
+
+    // --- registers --------------------------------------------------------------------
+
+    /// Read a register at `offset` within the region. The value is zero-extended to u64.
+    read: async func(r: borrow<region>, offset: u64, width: access-width)
+        -> result<u64, platform-error>;
+
+    /// Write a register at `offset` within the region. The value is truncated to `width`.
+    write: async func(r: borrow<region>, offset: u64, width: access-width, value: u64)
+        -> result<_, platform-error>;
+
+    // --- interrupts ---------------------------------------------------------------------
+
+    /// Route the region's interrupt line and return a handle to await deliveries on.
+    /// Dropping the handle disables delivery. `unsupported` in v1 (drivers poll with
+    /// honest bounds — the same posture as the board's PCI INTx).
+    enable-interrupts: async func(r: borrow<region>) -> result<interrupt, platform-error>;
+
+    /// Wait for the next delivery on this line. Returns the number of deliveries
+    /// coalesced since the previous wait (at least 1); call again for the next batch.
+    wait: async func(i: borrow<interrupt>) -> result<u64, platform-error>;
+
+    // --- DMA ------------------------------------------------------------------------------
+
+    /// Allocate a DMA-able buffer of `len` bytes reachable by the claimed device. The
+    /// allocation is per-region because the device-visible address is only meaningful
+    /// for the device it was allocated for.
+    alloc-dma: async func(r: borrow<region>, len: u64) -> result<dma-buffer, platform-error>;
+
+    /// The device-visible (bus) address of the buffer — what the driver writes into the
+    /// device's descriptors.
+    dma-address: func(b: borrow<dma-buffer>) -> u64;
+
+    /// Total length of the buffer in bytes.
+    dma-len: func(b: borrow<dma-buffer>) -> u64;
+
+    /// Copy `len` bytes starting at `offset` out of the buffer.
+    /// Traps if the range is out of bounds (same contract as eo9:io buffer accessors).
+    dma-read: func(b: borrow<dma-buffer>, offset: u64, len: u64) -> list<u8>;
+
+    /// Copy `bytes` into the buffer starting at `offset`.
+    /// Traps if the range is out of bounds (same contract as eo9:io buffer accessors).
+    dma-write: func(b: borrow<dma-buffer>, offset: u64, bytes: list<u8>);
+}
+
+/// Optional flavor of `platform` (hand-written for v0; see SPEC: The capability algebra).
+interface platform-optional {
+    use types.{platform-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<platform-impl>;
+}
+
+/// Compose-time configuration entry for platform.deny: `configure` returns the root
+/// handle that the exported `platform` serves via `default()` (see SPEC: Binary or
+/// provider, never both).
+interface deny-config {
+    use types.{platform-impl};
+    configure: func() -> result<platform-impl, string>;
+}
+
+/// platform.none — absence: exports the optional flavor answering `none`.
+world none {
+    export types;
+    export platform-optional;
+}
+
+/// platform.deny — refusal: exports `platform` with every operation failing with
+/// `denied`.
+world deny {
+    export types;
+    export platform;
+    export deny-config;
+}

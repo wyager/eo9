@@ -1,0 +1,153 @@
+/// eo9:usb — a USB host capability at the device level: root-hub port status, device
+/// attachment (reset + address + descriptor head), control transfers, and interrupt-IN
+/// endpoints.
+///
+/// This is what a USB *host controller driver* exports and what USB-aware programs
+/// import (docs/board/usb-ohci-plan.md §2): the controller shells (`usb.ohci` over
+/// eo9:platform on the board, `usb.ohci-pci` over eo9:pci under QEMU's `-device
+/// pci-ohci`) own the register/schedule conversation, and the consumer (`usbcheck`,
+/// `hidcheck`, eventually the HID-to-console service) speaks setup packets and
+/// descriptors — the same split eo9:net draws between the NIC driver and the l2
+/// consumer. The interface is deliberately transfer-shaped, not class-shaped: HID,
+/// hubs, and everything else are the consumer's business.
+///
+/// v1 scope is what a boot-protocol keyboard/mouse needs — control transfers and
+/// interrupt-IN polling. Bulk and isochronous endpoints arrive with their first
+/// consumer.
+package eo9:usb@0.1.0;
+
+/// Root-handle type (types-only interface — see plan/02-wit.md Decisions).
+interface types {
+    /// The USB capability's root handle: one host controller's root hub.
+    resource usb-impl;
+}
+
+/// The host surface: controller identity, port status, attachment, transfers.
+interface usb {
+    use types.{usb-impl};
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> usb-impl;
+
+    variant usb-error {
+        /// The underlying device capability refused (e.g. the shell composed over
+        /// `platform.deny` / `pci.deny`, or a boot that did not grant the root).
+        denied,
+        /// No host controller is visible/claimable through the underlying capability.
+        no-controller,
+        /// No such port, or the device went away (disconnect mid-conversation).
+        not-found,
+        /// The controller or device is already claimed/in use.
+        busy,
+        /// The endpoint answered STALL (request not supported by the device).
+        stall,
+        /// A bounded wait expired (transfer never completed; enumeration timing).
+        timeout,
+        /// The provider does not support the request.
+        unsupported,
+        io(string),
+    }
+
+    /// Controller identity, read at bring-up.
+    record controller-info {
+        /// BCD revision of the host controller interface (OHCI: HcRevision & 0xff,
+        /// expect 0x10 for OHCI 1.0).
+        revision: u8,
+        /// Number of root-hub ports (OHCI: HcRhDescriptorA.NDP).
+        ports: u8,
+    }
+
+    /// One root-hub port's status (OHCI: HcRhPortStatus decoded).
+    record port-status {
+        /// A device is connected (CCS).
+        connected: bool,
+        /// The port is enabled (PES).
+        enabled: bool,
+        /// The port is powered (PPS).
+        powered: bool,
+        /// The connected device is low-speed (LSDA).
+        low-speed: bool,
+        /// Connect status changed since last cleared (CSC).
+        connect-change: bool,
+    }
+
+    /// An attached (reset + addressed) device on one root-hub port.
+    resource device;
+    /// An opened interrupt-IN endpoint on an attached device.
+    resource endpoint;
+
+    /// Bring up the controller if needed (claiming it through the underlying
+    /// capability on first use — the D41 bring-up-claim discipline) and describe it.
+    controller: async func(u: borrow<usb-impl>) -> result<controller-info, usb-error>;
+
+    /// One port's current status. Ports are numbered from 1, as in the OHCI register
+    /// file.
+    port: async func(u: borrow<usb-impl>, port: u8) -> result<port-status, usb-error>;
+
+    /// Reset the port (OHCI 1.0a port-reset timing), assign the device an address, and
+    /// size endpoint 0 from the descriptor head. The returned device is ready for
+    /// control transfers; the full descriptor chain is the consumer's to read.
+    attach: async func(u: borrow<usb-impl>, port: u8) -> result<device, usb-error>;
+
+    /// A control transfer with an IN data stage: returns the data the device sent
+    /// (possibly shorter than `length` — USB short reads are normal).
+    control-in: async func(
+        d: borrow<device>,
+        request-type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        length: u16,
+    ) -> result<list<u8>, usb-error>;
+
+    /// A control transfer with no data stage (`data` empty) or an OUT data stage.
+    control-out: async func(
+        d: borrow<device>,
+        request-type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: list<u8>,
+    ) -> result<_, usb-error>;
+
+    /// Open an interrupt-IN endpoint (number, max packet size, and polling interval
+    /// come from the device's configuration descriptor, which the consumer parsed).
+    open-interrupt-in: async func(
+        d: borrow<device>,
+        endpoint: u8,
+        max-packet: u16,
+        interval-ms: u8,
+    ) -> result<endpoint, usb-error>;
+
+    /// Poll for the next report on the endpoint. An empty list means nothing arrived
+    /// within the provider's short poll window — the consumer owns the wait policy
+    /// (the same "empty result = nothing waiting" contract as eo9:net's recv-frame).
+    read: async func(e: borrow<endpoint>) -> result<list<u8>, usb-error>;
+}
+
+/// Optional flavor of `usb` (hand-written for v0; see SPEC: The capability algebra).
+interface usb-optional {
+    use types.{usb-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<usb-impl>;
+}
+
+/// Compose-time configuration entry for usb.deny.
+interface deny-config {
+    use types.{usb-impl};
+    configure: func() -> result<usb-impl, string>;
+}
+
+/// usb.none — absence: exports the optional flavor answering `none`.
+world none {
+    export types;
+    export usb-optional;
+}
+
+/// usb.deny — refusal: exports `usb` with every operation failing with `denied`.
+world deny {
+    export types;
+    export usb;
+    export deny-config;
+}

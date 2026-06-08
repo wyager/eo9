@@ -21,4 +21,6 @@ world sdk {
     import eo9:net/l3@0.1.0;
     import eo9:net/l4@0.1.0;
     import eo9:pci/pci@0.1.0;
+    import eo9:platform/platform@0.1.0;
+    import eo9:usb/usb@0.1.0;
 }

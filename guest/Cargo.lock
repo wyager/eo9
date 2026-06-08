@@ -280,6 +280,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-example-hidcheck"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "eo9-ohci",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-example-l2check"
 version = "0.0.0"
 dependencies = [
@@ -305,6 +314,14 @@ dependencies = [
 
 [[package]]
 name = "eo9-example-outcomes"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-example-platcheck"
 version = "0.0.0"
 dependencies = [
  "eo9-guest",
@@ -344,6 +361,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-example-usbcheck"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "eo9-ohci",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-example-vnic4check"
 version = "0.0.0"
 dependencies = [
@@ -366,6 +392,10 @@ dependencies = [
  "dlmalloc",
  "wit-bindgen",
 ]
+
+[[package]]
+name = "eo9-ohci"
+version = "0.1.0"
 
 [[package]]
 name = "eo9-rtl8125"
@@ -687,6 +717,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-stub-platform-deny"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-platform-none"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-stub-restart-always"
 version = "0.0.0"
 dependencies = [
@@ -755,6 +801,24 @@ name = "eo9-stub-time-none"
 version = "0.0.0"
 dependencies = [
  "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-usb-ohci"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "eo9-ohci",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-usb-ohci-pci"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "eo9-ohci",
  "wit-bindgen",
 ]
 

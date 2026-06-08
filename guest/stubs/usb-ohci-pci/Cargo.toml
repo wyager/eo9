@@ -1,0 +1,20 @@
+[package]
+name = "eo9-stub-usb-ohci-pci"
+description = "Eo9 device driver `usb.ohci-pci`: drives an OHCI USB host controller appearing as a PCI function (QEMU -device pci-ohci) through the eo9:pci capability and exports eo9:usb, so the USB protocol stack is QEMU-testable by composition."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+# The pure device core: OHCI register map, ED/TD encode/decode, the enumeration state
+# machine, and the shared RegionIo-generic driver — all host-tested in the root
+# workspace (`cargo test -p eo9-ohci`), consumed here the way net.rtl8125 consumes
+# eo9-rtl8125.
+eo9-ohci = { workspace = true }
+wit-bindgen = { workspace = true }

@@ -1,0 +1,28 @@
+/// eo9:usb-ohci-pci — the QEMU-lane OHCI USB host driver world
+/// (docs/board/usb-ohci-plan.md §2).
+///
+/// `usb.ohci-pci` drives an OHCI controller that appears as a PCI function — QEMU's
+/// `-device pci-ohci` (class 0c.03.10) — through the `eo9:pci/pci` capability, and
+/// exports `eo9:usb/usb` so the whole protocol stack (schedules, enumeration, HID) is
+/// battery-testable without board time: `usb.ohci-pci $ usbcheck`,
+/// `usb.ohci-pci $ hidcheck`. The board sibling `usb.ohci` exports the same surface
+/// over `eo9:platform` — byte-identical protocol logic (the shared `eo9-ohci` core),
+/// different claim path; divergence between the two lanes on real hardware points at
+/// DMA coherence or PHY plumbing, never at the protocol (the plan's M2 discriminator).
+///
+/// `eo9:text/text` is imported only for one diagnostic line at bring-up (controller
+/// revision and port count); the driver works identically without a console.
+///
+/// There is no configure interface: the documented default behaviour is to claim the
+/// first OHCI-class function visible through the granted PCI capability on first use
+/// (the option-C default-configuration rule). Narrowing to one controller is
+/// `pci.filtered`'s job, composed in front.
+package eo9:usb-ohci-pci@0.1.0;
+
+world ohci-pci {
+    import eo9:pci/pci@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    export eo9:usb/types@0.1.0;
+    export eo9:usb/usb@0.1.0;
+}
