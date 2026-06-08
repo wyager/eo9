@@ -5,8 +5,9 @@
 //! heuristics; live incident 2026-06-04, see .claude/board-bringup/BOOT.md — the
 //! board wedged and needed a physical power cycle). Under `go` the MMU and caches
 //! stay ON as U-Boot runs them and x0 is argc — pass the real device-tree address in
-//! the protocol header's `x0_value`; the pre-jump `dc cvau` sweep makes the freshly
-//! written payload fetchable. (The Image header below is still correct — text_offset
+//! the protocol header's `x0_value`; the pre-jump `dc civac` sweep pushes the freshly
+//! written payload out to the Point of Coherency, where both instruction fetch and the
+//! next stage's cache-off reads see it. (The Image header below is still correct — text_offset
 //! 0x03E0_0000 over dram_base 0x0020_0000 lands at exactly 0x0400_0000 — but vendor
 //! booti crashes before ever honoring it, so the header is kept only for a future
 //! sane bootloader.)
@@ -145,18 +146,25 @@ mod bare {
     }
 
     // ---- The pre-jump cache sweep ----------------------------------------------------
-    // Under `go` the payload was written through the live D-cache: clean it to the point
-    // of unification so instruction fetch sees it. Under `booti` the D-cache is off and
-    // every `dc cvau` is a cheap no-op on clean lines. Either way, drop the whole
-    // I-cache (one instruction) rather than 200k `ic ivau`s.
+    // Under `go` the payload was written through the live D-cache: clean+invalidate it
+    // to the point of COHERENCY (`dc civac`), not just the point of unification. PoU
+    // (`dc cvau`, the original sweep) only guarantees instruction fetch sees the bytes;
+    // the payload kernel then drops to EL1 with MMU and caches off, where every *data*
+    // read goes straight to DRAM at the PoC — a line cleaned only to PoU can still be
+    // dirty above the PoC, leaving stale bytes in DRAM (the 2026-06-07 first-light
+    // cache-coherency lesson; the kernel now also self-defends with its own entry-path
+    // PoC sweep, but a loader must not hand over an incoherent image). PoC covers
+    // instruction fetch too (PoU is at or below PoC). Under `booti` the D-cache is off
+    // and every op is a cheap clean-line no-op. Either way, drop the whole I-cache
+    // (one instruction) rather than 200k `ic ivau`s.
     unsafe fn make_executable(start: u64, len: u64) {
         let mut line = start & !63;
         let end = start.wrapping_add(len);
         while line < end {
-            asm!("dc cvau, {0}", in(reg) line);
+            asm!("dc civac, {0}", in(reg) line);
             line += 64;
         }
-        asm!("dsb ish");
+        asm!("dsb sy"); // full-system: the write-backs must reach DRAM (PoC), not just PoU
         asm!("ic iallu");
         asm!("dsb ish");
         asm!("isb");

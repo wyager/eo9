@@ -1909,9 +1909,13 @@ U-Boot itself on this minimal image and its own recovery reset then failed — t
 2026-06-04 live incident (board wedged, physical power cycle). The stub keeps its
 arm64 Image header for a future sane bootloader, but the dev loop never uses it. It then
 loops forever: receive `"EO9L" + load/len/x0 + payload + crc32` on UART2 at 1.5 Mbaud
-(~85 s for the 12.4 MiB minimal image), `k` per 64 KiB, verify, `K`, `dc cvau` sweep +
+(~85 s for the 12.4 MiB minimal image), `k` per 64 KiB, verify, `K`, `dc civac` sweep
+(to PoC since 2026-06-07 — the original `dc cvau` reached only PoU, leaving DRAM
+stale for a next stage that runs with caches off; the first-light cache lesson) +
 `ic iallu`, jump. CRC mismatch or a 3 s stall re-arms it — a failed transfer never
-needs hands. No flow control needed: byte service is ~1 µs against the line's 6.7 µs.
+needs hands. The board needs no byte-level flow control (byte service is ~1 µs
+against the line's 6.7 µs); the host sender uses the 64 KiB `k` acks as a windowed
+flow control so the wire, not host polling, sets the transfer pace.
 Mac side: `tools/make_mm_script.py` (bootstrap + U-Boot `crc32` verify) and
 `tools/send_image.py` (transfer + console tail). Host-verified only (protocol tests,
 header bytes, disassembly): the stub's first live run is on the board.
@@ -1997,3 +2001,31 @@ gating: `svc_shell::restart_cycles_complete_while_the_foreground_is_quietly_bloc
 fails under heavy parallel host load on the UNMODIFIED base tree too (2/3 base-tree
 failures at load ≈ 17 with a concurrent agent's QEMU battery; 8/8 green in a quiet
 window) — the wall-time pacing class, not this branch.
+
+## Entry 81 — the misaligned fiber stack: spinner-kill panic on riscv64/x86_64 (2026-06-07)
+
+Two reviewers independently caught the master regression: the sched demo's spinner kill
+panics the riscv64 and x86_64 demos in the unwinder (`stack should always be aligned to
+16, left: 8`) while aarch64 completes `abnormal(killed)` cleanly. The bisect landed on
+`bc8e639` — the commit that adds the `time` example to the baked-in store and nothing
+else — which reframed it: a pure layout shift cannot break an unwinder, it can only
+expose one. Root cause (full record: docs/spikes/fiber-stack-alignment.md): the
+`wasmtime-internal-fiber` no_std backend allocates fiber stacks as byte vectors and
+aligns only the *base* up to 16 — the *top*, where execution starts, keeps the raw
+allocation's end address, so allocator parity decides whether every FP on the stack is
+8 bytes off. The kill path walks the suspended child's frames and trips the riscv64/x86
+`assert_fp_is_aligned`; aarch64's assert is an AAPCS64-sanctioned no-op, so it ran the
+same misaligned stacks silently rather than being unaffected. Both named suspects
+checked out clean first: the panic reproduces with
+`EO9_KERNEL_FEATURES_REMOVE=first-poll-inline`, and `cruncher.wasm` is byte-identical
+across the window.
+
+Fix: `wasmtime-internal-fiber` 45.0.0 joins the vendored set
+(`kernel/vendor/wasmtime-fiber`, kernel workspace only, kernel/Cargo.toml
+`[patch.crates-io]`) with one change in `src/nostd.rs::FiberStack::new` — after aligning
+the base up, round the usable length down to a multiple of `STACK_ALIGN`, so the top is
+16-aligned regardless of what the global allocator returns. Upstream-shaped; unix/windows
+backends and the host/guest workspaces (registry crate, mmap'd page-aligned stacks) are
+untouched. Verified: all three QEMU demos canonical including the spinner kill
+(`abnormal(killed)` + clean SBI/ACPI/PSCI power-off, exit 0), `firstpoll-ab --gate-only`
+semantic-identity PASS both arms, full `cargo xtask ci` green.

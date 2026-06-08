@@ -47,8 +47,10 @@ the std surface it actually uses is small and mostly incidental. Changes, by fil
   stray `std::` paths that are really `core` (`pin!`, `poll_fn`, `MaybeUninit`).
 
 Behavior on `std` builds is unchanged (the std paths are kept under `cfg(feature = "std")`
-or are re-exports). `wasmtime-fiber` needed no changes: upstream already ships a `no_std`
-backend with the aarch64 stack-switching code.
+or are re-exports). `wasmtime-fiber` originally needed no changes — upstream already ships a
+`no_std` backend with the stack-switching code for all three kernel arches — until its
+stack-top alignment bug surfaced; it is now vendored too (see the
+`wasmtime-internal-fiber` section below).
 
 The kernel additionally provides, as the embedder: `wasmtime_tls_get/set`,
 `wasmtime_concurrent_tls_get/set`, and a `CustomCodeMemory` publisher (D-cache clean +
@@ -194,3 +196,25 @@ as exact power-of-two divisions (`1.0 / 65536.0`, …), which are bit-identical 
 changes nothing else. No codegen or safety logic is touched; aarch64 and every other
 backend are byte-identical to the registry crate. Drop this copy once upstream replaces the
 `powi` calls with `core`-compatible constants.
+
+## wasmtime-internal-fiber (45.0.0)
+
+Vendored for one reason: the no_std fiber backend (`src/nostd.rs`, the backend the bare-metal
+kernel uses) allocates each fiber stack as a plain byte vector from the global allocator and
+aligns only the *base* up to 16 — the *top* (`base + len`), where `wasmtime_fiber_init`
+writes the saved-state words and where execution starts, keeps the raw allocation's end
+address. A byte vector has alignment 1, so the top's alignment is whatever the allocator
+happens to return; the kernel's `linked_list_allocator` hands out 8-aligned blocks, and a
+stack whose top lands on an 8-(not-16-)aligned address shifts **every** frame pointer on the
+fiber stack by 8. The unwinder's `assert_fp_is_aligned` then panics the kernel mid
+kill/cancel on riscv64 and x86_64 (`stack should always be aligned to 16, left: 8`);
+aarch64's assert is an AAPCS64-sanctioned no-op, so it ran the same misaligned stacks
+silently. Whether a given boot trips it depends on heap-allocation parity — adding one
+component to the baked-in store flipped it (docs/spikes/fiber-stack-alignment.md has the
+full bisect and root-cause record).
+
+The vendored copy makes one change in `FiberStack::new`: after aligning the base up, the
+usable length is rounded down to a multiple of `STACK_ALIGN`, so the top is 16-aligned
+regardless of allocator parity. The unix (mmap, page-aligned) and windows backends are
+byte-identical to the registry crate and unaffected; host and guest workspaces keep the
+registry crate. Drop this copy once upstream aligns the no_std stack top.

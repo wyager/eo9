@@ -2125,7 +2125,9 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
     println!("         usb start");
     println!("         setenv bootargs program=hello   (minimal image: required)");
     println!("         fatload usb 0:1 0x00200000 <file on the stick>");
-    println!("         booti 0x00200000 - ${{fdtcontroladdr}}");
+    println!(
+        "         booti 0x00200000 - <fdt_blob from bdinfo>   (fdtcontroladdr is unset in the vendor env)"
+    );
     Ok(out)
 }
 
