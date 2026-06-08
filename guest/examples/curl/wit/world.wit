@@ -1,0 +1,56 @@
+// curl — the demo HTTP client (docs/board/usb-boot-demo-plan.md Part B): GET one
+// http:// URL over the granted transport capability and print what comes back.
+//
+// One request, one report: the status line, the header count, the body (capped at
+// 16 KiB with an honest truncation note), and a final counts line on every exit —
+// success or failure — so each run advances a bench round (one-run-one-round). The
+// host is resolved over UDP DNS (the shared eo9-dns wire core, the l4check encoder
+// factored out) when it is not a literal IPv4 address; at most ONE 301/302 redirect
+// to another http:// URL is followed. https:// — in the URL or in a redirect — is
+// refused with a typed message naming the deferred-TLS decision (certificate
+// validation needs wall-clock time and entropy provenance the hardware does not
+// carry yet; the post-demo TLS lane in the demo plan). Capabilities: eo9:net/l4,
+// eo9:text.
+package eo9-examples:curl@0.1.0;
+
+/// Fetches one `http://host[:port][/path]` URL with a single HTTP/1.1 GET
+/// (`Connection: close`) and prints the status line, the header count, and the body.
+///
+///   net.virtio $ net.l4.over-l2 $ curl http://10.0.2.2:8080/hello.txt
+///   net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address dhcp)
+///       $ curl http://example.com --resolver 10.20.3.1
+world curl {
+    import eo9:text/text@0.1.0;
+    import eo9:net/l4@0.1.0;
+
+    variant program-success {
+        /// The GET completed; carries the status line plus the transfer summary
+        /// (header count, body bytes, redirects followed).
+        fetched(string),
+    }
+
+    variant program-failure {
+        /// An argument was unusable (a URL that is not http://, a resolver that is
+        /// not a dotted quad, a host name no DNS question can carry).
+        bad-arguments(string),
+        /// The URL — or a redirect target — needs https://: TLS is a deferred
+        /// decision (see the demo plan), so the refusal is typed, never attempted.
+        unsupported(string),
+        /// The transport capability refused (e.g. composed over net.l4.deny).
+        denied,
+        /// The host could not be resolved to an IPv4 address.
+        dns(string),
+        /// A transport operation failed, carrying the l4 API's own error.
+        net(string),
+        /// The server answered, but not with usable HTTP (malformed status line,
+        /// header section never completed, a redirect without a usable target).
+        http(string),
+    }
+
+    /// `url`: the http:// URL to fetch. `resolver`: the DNS server consulted when
+    /// the URL's host is not a literal IPv4 address, dotted quad (default 10.0.2.3 —
+    /// the QEMU user-net forwarder; on the bench LAN pass the router,
+    /// `--resolver 10.20.3.1`).
+    export main: async func(url: string, resolver: option<string>)
+        -> result<program-success, program-failure>;
+}

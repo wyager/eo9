@@ -1,0 +1,16 @@
+[package]
+name = "eo9-example-curl"
+description = "Eo9 example program: a minimal HTTP/1.1 GET client over the granted transport capability — parse http://host[:port][/path], resolve the host over UDP DNS when it is not a literal IPv4 address, print the status line, header count, and body (16 KiB cap), follow at most one 301/302 redirect, refuse https typed (targets the eo9-examples:curl/curl world: net l4 + text + io)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+eo9-dns = { workspace = true }
+wit-bindgen = { workspace = true }
