@@ -971,8 +971,9 @@ Match the priority order above; (1)+(2) unblock I2.
 
 45. **Shell-over-network verified end to end under QEMU; usermode and board lanes assessed
     (2026-06-07, branch area/09-telnetd; completes D44 and plan/10 entry 20).** xtask grows two
-    pieces: the bare `telnet` qemu token (implies `net`; adds `hostfwd=tcp::5555-:23` to the slirp
-    netdev, so the guest's port 23 is `nc localhost 5555` from the host) and `check-telnet`, the
+    pieces: the bare `telnet` qemu token (implies `net`; adds `hostfwd=tcp:127.0.0.1:5555-:23` to
+    the slirp netdev, so the guest's port 23 is `nc localhost 5555` from the host — loopback-bound:
+    the unauthenticated session must never be reachable beyond the dev machine) and `check-telnet`, the
     scripted gate modeled on `check-gpu` (piped serial + a host-side TCP client in place of the QMP
     socket; D49 byte-paced console typing; per-step timeouts; transcripts printed).
 

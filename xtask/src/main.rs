@@ -2659,10 +2659,11 @@ fn ensure_storedisk_mac_key(root: &Path) -> Result<PathBuf, String> {
 /// display`, then `gpu.virtio $ draw` (this is what `make gfx` runs).
 ///
 /// A bare `telnet` argument implies `net` and adds a slirp host-forward to the user-mode
-/// netdev (`hostfwd=tcp::5555-:23`), so a guest telnet daemon listening on port 23
-/// (`telnetd`, plan/09 D44 — cleartext, unauthenticated, dev use only) is reachable from
-/// the host as `nc localhost 5555` — `cargo xtask qemu aarch64 pci net telnet`, then
-/// `telnetd` at the serial prompt.
+/// netdev (`hostfwd=tcp:127.0.0.1:5555-:23`), so a guest telnet daemon listening on port
+/// 23 (`telnetd`, plan/09 D44 — cleartext, unauthenticated, dev use only) is reachable
+/// from the host as `nc localhost 5555` — `cargo xtask qemu aarch64 pci net telnet`, then
+/// `telnetd` at the serial prompt. The forward binds the host's loopback only: the
+/// session is unauthenticated, so it must never be reachable from beyond the dev machine.
 ///
 /// A bare `storedisk` argument attaches the *persistent* store-disk image and also stays on
 /// the kernel command line: the kernel claims that virtio-blk function for its own
@@ -2867,8 +2868,12 @@ fn qemu(root: &Path, arch: &str, append: &[String]) -> Result<(), String> {
         args.push("-netdev".into());
         if telnet_fwd {
             args.push(
-                format!("user,id=eo9net,hostfwd=tcp::{TELNET_HOST_PORT}-:{TELNET_GUEST_PORT}")
-                    .into(),
+                // Loopback only: the forwarded session is cleartext and unauthenticated,
+                // so it must never be reachable from beyond the dev machine.
+                format!(
+                    "user,id=eo9net,hostfwd=tcp:127.0.0.1:{TELNET_HOST_PORT}-:{TELNET_GUEST_PORT}"
+                )
+                .into(),
             );
         } else {
             args.push("user,id=eo9net".into());
@@ -3777,7 +3782,7 @@ fn check_telnet(root: &Path) -> Result<(), String> {
 
     println!(
         "xtask: check-telnet — booting {} with a user-mode NIC \
-         (hostfwd tcp::{TELNET_HOST_PORT}-:{TELNET_GUEST_PORT}), driving \
+         (hostfwd tcp:127.0.0.1:{TELNET_HOST_PORT}-:{TELNET_GUEST_PORT}), driving \
          `telnetd --sessions 2` at the eosh prompt, then connecting from the host",
         image.display()
     );
@@ -3794,7 +3799,7 @@ fn check_telnet(root: &Path) -> Result<(), String> {
         .args(["-append", "pci"])
         .arg("-netdev")
         .arg(format!(
-            "user,id=eo9net,hostfwd=tcp::{TELNET_HOST_PORT}-:{TELNET_GUEST_PORT}"
+            "user,id=eo9net,hostfwd=tcp:127.0.0.1:{TELNET_HOST_PORT}-:{TELNET_GUEST_PORT}"
         ))
         .args(["-device", "virtio-net-pci,netdev=eo9net,disable-legacy=on"])
         .stdin(std::process::Stdio::piped())
