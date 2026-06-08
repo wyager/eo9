@@ -1217,3 +1217,33 @@ Match the priority order above; (1)+(2) unblock I2.
     likely still need its own set). Core crate: 16 host tests. Licensing note: the tables
     are transcribed from OpenBSD rge(4) (Copyright (c) 2019-2024 Kevin Lo, ISC license) —
     register/value facts plus replay order, with the provenance header in the module.
+
+    *Board round 5 (2026-06-08) readings → round 6 instrumentation.* The one-run
+    diagnostics worked: bring-up showed `xid 0x641, link up 2500, phy-state 3, eee-mac 0x0,
+    ram-code 0x0000`; the rx diagnostic showed `tok+` with tally `tx 1` (TX provably leaves
+    the MAC) and `rok- rdu- rx 0 missed 0` with the RXDV gate open (RX stone dead at the
+    PHY→MAC boundary — the PHY delivered zero symbols on a VLAN carrying broadcast ARP).
+    IMPORTANT correction recorded: round 5's `ram-code` print was the PRE-patch read — on a
+    cold PHY 0x0000 proves the patch branch RAN, not that the load failed; whether it took
+    was unobservable. Round 6 closes that hole and adds discrimination:
+
+    * The GPHY ram code is RE-READ after the load and reported `before->after` in the
+      bring-up line; `after != 0x0b99` on an 8125B prints a hard WARNING line, and both
+      patch-mode handshakes (0xb820 bit 4 / 0xb800 bit 6) warn loudly on
+      non-acknowledgement instead of the reference's silent continue.
+    * Loopback self-tests at every bring-up, one line each: MAC loopback (TxConfig bit 17,
+      vendor r8125.h `TxMACLoopBack`) proves descriptors/DMA/receive engine inside the
+      chip; PHY PCS loopback (IEEE BMCR bit 14, forced 1000FD = 0x4140) proves the
+      MAC<->PHY datapath to the MDI. PASS on both + dead wire RX discriminates
+      cable/switch (e.g. 802.1X-style port policy) from silicon — the competing theory the
+      board side could not previously kill. The tests share the raw transmit path (no
+      link check) and park the one-shot rx diagnostic while running.
+    * Compose-time speed cap: `rtl8125-config.configure(advertise-max)` (2500 default |
+      1000 | 100; option-C unconfigured default, never traps). Bench triage:
+      `net.rtl8125 --advertise-max 1000 $ l2check --gateway …` — frames at 1000 but not
+      2500 pin the 2.5G datapath. Validated end-to-end under QEMU through eosh's
+      compose/configure machinery (the configured composition compiles, instantiates,
+      validates, probes, refuses typed).
+
+    Core crate: 17 host tests (+ the loopback words). Full ci green; QEMU bare and
+    configured refusal probes green; both board images rebuilt.

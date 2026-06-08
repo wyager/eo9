@@ -160,6 +160,12 @@ pub mod bits {
     /// `rtl_set_tx_config_registers`.
     pub const TX_CONFIG_VALUE: u64 = (7 << 8) | (3 << 24);
 
+    /// `TxConfig` bit 17: MAC loopback — transmit frames loop internally to the
+    /// receive path without touching the PHY (vendor r8125.h:
+    /// `TxMACLoopBack = (1 << 17), /* MAC loopback */`). Used by the bring-up
+    /// self-test only.
+    pub const TX_CONFIG_MAC_LOOPBACK: u64 = 1 << 17;
+
     /// `RxConfig` base for the 8125: `RX_FETCH_DFLT_8125` (8 << 27) |
     /// `RX_DMA_BURST` (7 << 8) — r8169 `rtl_init_rxcfg`, the `RTL_GIGA_MAC_VER_61`
     /// arm; the 8125B-and-later arm adds `RX_PAUSE_SLOT_ON` (1 << 11, "8125b and
@@ -381,6 +387,12 @@ pub mod phy {
     pub const MII_BMCR: u8 = 0;
     pub const MII_ANAR: u8 = 4;
     pub const MII_GBCR: u8 = 9;
+
+    /// BMCR: PCS loopback (IEEE 802.3 clause 22 bit 14) with speed forced to
+    /// 1000 full duplex (bits 6 + 8), autoneg off — the conventional integrated-PHY
+    /// loopback word (0x4140) ethtool-style self-tests use. Used by the bring-up
+    /// self-test only; normal operation restores [`BMCR_START_AUTONEG`].
+    pub const BMCR_LOOPBACK_1000FD: u16 = 0x4140;
 
     /// BMCR: autoneg enable (0x1000) + restart (0x0200). Writing this value also
     /// clears the power-down bit (bit 11), so one write both wakes the PHY and starts
@@ -700,6 +712,16 @@ mod tests {
         assert_eq!(bits::ISR_TX_OK, 0x0004);
         // RxMaxSize: R8169_RX_BUF_SIZE (SZ_16K - 1) + 1.
         assert_eq!(bits::RX_MAX_SIZE_VALUE, 0x4000);
+    }
+
+    #[test]
+    fn loopback_words_match_the_cited_values() {
+        // Vendor r8125.h: TxMACLoopBack = (1 << 17).
+        assert_eq!(bits::TX_CONFIG_MAC_LOOPBACK, 0x0002_0000);
+        // IEEE BMCR: loopback bit 14 | speed-select 1000 (bit 6) | full duplex
+        // (bit 8) = 0x4140; autoneg (bit 12) off.
+        assert_eq!(phy::BMCR_LOOPBACK_1000FD, 0x4140);
+        assert_eq!(phy::BMCR_LOOPBACK_1000FD & 0x1000, 0);
     }
 
     #[test]

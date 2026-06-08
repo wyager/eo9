@@ -57,6 +57,14 @@
 //! a typed `io` error, never a trap. Multicast acceptance is OFF for v1 (recorded:
 //! IPv4/ARP need broadcast + unicast only); promiscuous mode is OFF and has no knob.
 //!
+//! Bring-up ends with two one-line loopback self-tests (round-6 bench discipline):
+//! a frame through MAC loopback (TxConfig bit 17 — proves descriptors/DMA/receive
+//! engine inside the chip) and through PHY PCS loopback (BMCR bit 14, forced
+//! 1000FD — proves the MAC<->PHY datapath to the MDI). The compose-time
+//! `rtl8125-config.configure(advertise-max)` knob caps autoneg advertisements
+//! (2500 default | 1000 | 100) so a bench run can pin a speed-specific datapath
+//! fault without rebuilding.
+//!
 //! QEMU cannot emulate an RTL8125 (it stops at rtl8139), so emulated boots exercise
 //! exactly two things: composition/instantiation, and the typed refusal naming what
 //! was probed (`no RTL8125 (10ec:8125) function is visible…`). Everything beyond the
@@ -213,9 +221,14 @@ struct Driver {
     /// One-shot guard for the receive diagnostic (printed the first time a receive
     /// poll window expires empty after a successful transmit).
     rx_diagnosed: bool,
-    /// The GPHY ram code version read at bring-up (0x0b99 = the rge(4) R25B patch
-    /// level; anything else on an 8125B means the MCU patch was applied this boot).
+    /// The GPHY ram code version: before the MCU load (0x0000 on a cold PHY) and
+    /// the post-load re-read (must be 0x0b99 on an 8125B — the rge(4) R25B patch
+    /// level; anything else after a load is a hard warning).
+    ram_code_before: u16,
     ram_code: u16,
+    /// The highest speed autonegotiation advertises (2500 default; the
+    /// `rtl8125-config` compose-time knob caps it for bench triage).
+    advertise_max: u16,
 }
 
 /// Failures of the link-layer operations, mapped to the WIT error variants by the
@@ -248,6 +261,22 @@ struct DriverSlot {
 }
 
 static STATE: ProviderState<DriverSlot> = ProviderState::new();
+
+/// Compose-time configuration (`rtl8125-config.configure`): the highest speed
+/// autonegotiation advertises. Unset = 2500 (everything the silicon has — the
+/// option-C default; plain composition never traps). The knob exists for bench
+/// triage: frames flowing at `--advertise-max 1000` but not at 2500 pin the 2.5G
+/// datapath.
+static ADVERTISE_MAX: ProviderState<u16> = ProviderState::new();
+
+/// The configured advertisement cap (2500 unless `configure` bound one).
+fn advertise_max() -> u16 {
+    if ADVERTISE_MAX.is_set() {
+        ADVERTISE_MAX.with(|max| *max)
+    } else {
+        2500
+    }
+}
 
 /// Puts the driver back in its slot when the operation that took it finishes —
 /// including by cancellation (the operation's future dropped mid-await), so a
@@ -432,7 +461,9 @@ impl Driver {
             link: Link::Down,
             xid: 0,
             rx_diagnosed: false,
+            ram_code_before: 0,
             ram_code: 0,
+            advertise_max: advertise_max(),
         };
         driver.start().await?;
         Ok(driver)
@@ -620,22 +651,51 @@ impl Driver {
             }
         }
         // Ram code version (rge: OCP 0xa436 = 0x801e selects it, 0xa438 reads it).
+        // Round-5 lesson: the value printed before was the PRE-patch read, so
+        // `ram-code 0x0000` proved only that the patch branch was taken on a cold
+        // PHY, not that the load failed. The version is now RE-READ after stamping
+        // and reported as before->after, with hard warning lines for every
+        // handshake that does not acknowledge.
         self.phy_ocp_write(0xa436, 0x801e).await?;
-        let ram_code = self.phy_ocp_read(0xa438).await?;
-        self.ram_code = ram_code;
+        let ram_code_before = self.phy_ocp_read(0xa438).await?;
+        self.ram_code_before = ram_code_before;
+        self.ram_code = ram_code_before;
         if !is_8125a {
             // GPHY MCU patch, only when the PHY's ram code is not current
             // (rge_phy_config_mcu): enter patch mode, replay the table, leave, stamp
             // the version.
-            if ram_code != eo9_rtl8125::r25b_tables::PHY_MCU_VERSION {
-                self.patch_phy_mcu(true).await?;
+            if ram_code_before != eo9_rtl8125::r25b_tables::PHY_MCU_VERSION {
+                if !self.patch_phy_mcu(true).await? {
+                    Self::warn(
+                        "net.rtl8125: WARNING: phy mcu patch-mode ENTER not \
+                         acknowledged (0xb800 bit 6 never set) - the microcode table \
+                         is being written anyway, per the reference, but a dead \
+                         handshake usually means a dead load",
+                    );
+                }
                 for (register, value) in eo9_rtl8125::r25b_tables::PHY_MCU {
                     self.phy_ocp_write(*register, *value).await?;
                 }
-                self.patch_phy_mcu(false).await?;
+                if !self.patch_phy_mcu(false).await? {
+                    Self::warn(
+                        "net.rtl8125: WARNING: phy mcu patch-mode LEAVE not \
+                         acknowledged (0xb800 bit 6 never cleared)",
+                    );
+                }
                 self.phy_ocp_write(0xa436, 0x801e).await?;
                 self.phy_ocp_write(0xa438, eo9_rtl8125::r25b_tables::PHY_MCU_VERSION)
                     .await?;
+            }
+            // The post-load truth: re-select and re-read the version register.
+            self.phy_ocp_write(0xa436, 0x801e).await?;
+            self.ram_code = self.phy_ocp_read(0xa438).await?;
+            if self.ram_code != eo9_rtl8125::r25b_tables::PHY_MCU_VERSION {
+                Self::warn(&format!(
+                    "net.rtl8125: WARNING: phy mcu ram code reads {:#06x} after the \
+                     load (expected {:#06x}) - the patch did NOT take",
+                    self.ram_code,
+                    eo9_rtl8125::r25b_tables::PHY_MCU_VERSION,
+                ));
             }
             // rge_phy_config_mac_r25b's register writes, in its order.
             self.phy_ocp_modify(0xa442, 0x0000, 0x0800).await?;
@@ -773,15 +833,21 @@ impl Driver {
 
         // ---- Phase 3: PHY autoneg, rings, enable (rtl_hw_start order) --------------------
 
-        // PHY: advertise 10/100 (ANAR), 1000FD (GBCR), 2500FD (the Realtek vendor
-        // register), then restart autonegotiation.
-        let adv_2500 = self.phy_ocp_read(phy::OCP_ADV_2500).await?;
-        self.phy_ocp_write(phy::OCP_ADV_2500, adv_2500 | phy::ADV_2500_FULL)
-            .await?;
+        // PHY: advertise 10/100 (ANAR) and, capped by the compose-time
+        // `advertise-max` knob, 1000FD (GBCR) and 2500FD (the Realtek vendor
+        // register), then restart autonegotiation. Phase 1e cleared every
+        // advertisement, so a capped speed stays cleared by simply not setting it.
+        if self.advertise_max >= 2500 {
+            let adv_2500 = self.phy_ocp_read(phy::OCP_ADV_2500).await?;
+            self.phy_ocp_write(phy::OCP_ADV_2500, adv_2500 | phy::ADV_2500_FULL)
+                .await?;
+        }
         self.phy_write(phy::MII_ANAR, phy::ANAR_ADVERTISE_10_100)
             .await?;
-        self.phy_write(phy::MII_GBCR, phy::GBCR_ADVERTISE_1000_FULL)
-            .await?;
+        if self.advertise_max >= 1000 {
+            self.phy_write(phy::MII_GBCR, phy::GBCR_ADVERTISE_1000_FULL)
+                .await?;
+        }
         self.phy_write(phy::MII_BMCR, phy::BMCR_START_AUTONEG)
             .await?;
 
@@ -855,6 +921,31 @@ impl Driver {
         )
         .await?;
 
+        // Loopback self-tests (round-6 deliverable B): one frame through MAC
+        // loopback (proves descriptors/DMA/RX engine inside the chip), one through
+        // PHY loopback (proves the MAC<->PHY datapath up to the MDI). Together with
+        // a wire test they localize chip vs PHY vs cable/switch in one run. Best
+        // effort: a test failure prints its line and bring-up continues. The
+        // one-shot rx diagnostic is parked during the tests so it stays armed for
+        // real traffic.
+        let rx_diag_saved = self.rx_diagnosed;
+        self.rx_diagnosed = true;
+        let mac_loopback = self.loopback_test(false).await;
+        let phy_loopback = self.loopback_test(true).await;
+        self.rx_diagnosed = rx_diag_saved;
+        Self::warn(&match mac_loopback {
+            Ok(detail) => format!("net.rtl8125: mac-loopback PASS ({detail})"),
+            Err(reason) => format!("net.rtl8125: mac-loopback FAIL ({reason})"),
+        });
+        Self::warn(&match phy_loopback {
+            Ok(detail) => format!("net.rtl8125: phy-loopback PASS ({detail})"),
+            Err(reason) => format!("net.rtl8125: phy-loopback FAIL ({reason})"),
+        });
+        // The PHY test forced a speed; restart autonegotiation for real operation
+        // (the advertisement registers were untouched by the tests).
+        self.phy_write(phy::MII_BMCR, phy::BMCR_START_AUTONEG)
+            .await?;
+
         // Bounded link wait: autoneg to 2.5G takes seconds; an expired bound is NOT
         // an error — the link stays typed-down and later operations re-read it.
         let mut spins: u64 = 0;
@@ -890,8 +981,9 @@ impl Driver {
         let chip = if is_8125a { "8125A" } else { "8125B+" };
         let state = format!(
             "rxcfg {rx_config_now:#010x} rxdv-byte {rxdv_now:#04x} isr {isr_now:#06x} \
-             phy-state {phy_state} eee-mac {eee_mac:#x} ram-code {:#06x}",
-            self.ram_code
+             phy-state {phy_state} eee-mac {eee_mac:#x} ram-code {:#06x}->{:#06x} \
+             adv-max {}",
+            self.ram_code_before, self.ram_code, self.advertise_max
         );
         let line = match self.link {
             Link::Up(mbps) => format!(
@@ -1092,9 +1184,11 @@ impl Driver {
     }
 
     /// Enter/leave GPHY MCU patch mode: set/clear OCP 0xb820 bit 4 and wait for the
-    /// PHY to acknowledge in OCP 0xb800 bit 6 (rge(4) `rge_patch_phy_mcu`; bounded,
-    /// best effort like the reference's printf-and-continue).
-    async fn patch_phy_mcu(&self, enter: bool) -> Result<(), String> {
+    /// PHY to acknowledge in OCP 0xb800 bit 6 (rge(4) `rge_patch_phy_mcu`). Returns
+    /// whether the PHY acknowledged within the bound — the reference warns and
+    /// continues; here the CALLER prints the loud warning so a board transcript
+    /// records exactly which handshake failed (round-6 deliverable A).
+    async fn patch_phy_mcu(&self, enter: bool) -> Result<bool, String> {
         if enter {
             self.phy_ocp_modify(0xb820, 0x0000, 0x0010).await?;
         } else {
@@ -1104,13 +1198,21 @@ impl Driver {
         loop {
             let ack = self.phy_ocp_read(0xb800).await? & 0x0040;
             if (enter && ack != 0) || (!enter && ack == 0) {
-                return Ok(());
+                return Ok(true);
             }
             spins += 1;
             if spins > QUIESCE_POLL_LIMIT {
-                return Ok(()); // the reference warns and continues; same posture
+                return Ok(false);
             }
         }
+    }
+
+    /// One best-effort warning line on the console (bring-up diagnostics that must
+    /// not fail bring-up).
+    fn warn(message: &str) {
+        let handle = text::default();
+        let _ = text::write(&handle, text::OutputStream::Out, message);
+        let _ = text::write(&handle, text::OutputStream::Out, "\n");
     }
 
     /// Soft reset (`ChipCmd.RST`), bounded wait for the chip to clear it.
@@ -1193,6 +1295,94 @@ impl Driver {
             4,
         );
         eo9_rtl8125::decode_opts1([raw[0], raw[1], raw[2], raw[3]])
+    }
+
+    /// One loopback self-test: build a self-addressed 60-byte frame, enter the
+    /// loopback mode, transmit through the raw path (no wire link needed), poll the
+    /// receive ring for the frame, leave the mode. `phy_level = false` is MAC
+    /// loopback (TxConfig bit 17, vendor r8125.h `TxMACLoopBack` — frames loop
+    /// inside the MAC, the PHY untouched); `phy_level = true` is PCS loopback at
+    /// the PHY (IEEE BMCR bit 14, speed forced to 1000FD — frames cross the
+    /// MAC<->PHY datapath and loop at the MDI boundary). Returns a one-line detail
+    /// (Ok = the frame round-tripped intact).
+    async fn loopback_test(&mut self, phy_level: bool) -> Result<String, String> {
+        // A self-addressed test frame: dst = src = our MAC, the experimental
+        // ethertype 0x88b5 (IEEE local experimental — never forwarded as real
+        // traffic), counting payload, minimum length.
+        let mut frame = Vec::with_capacity(60);
+        frame.extend_from_slice(&self.mac);
+        frame.extend_from_slice(&self.mac);
+        frame.extend_from_slice(&[0x88, 0xb5]);
+        while frame.len() < 60 {
+            frame.push(frame.len() as u8);
+        }
+
+        // Enter the loopback mode.
+        if phy_level {
+            self.phy_write(phy::MII_BMCR, phy::BMCR_LOOPBACK_1000FD)
+                .await
+                .map_err(|e| format!("entering phy loopback: {e}"))?;
+            // The PCS needs a moment to lock its forced-speed loopback datapath.
+            self.settle(100_000)
+                .await
+                .map_err(|e| format!("settling phy loopback: {e}"))?;
+        } else {
+            self.write(
+                reg::TX_CONFIG,
+                pci::AccessWidth::Dword,
+                bits::TX_CONFIG_VALUE | bits::TX_CONFIG_MAC_LOOPBACK,
+            )
+            .await
+            .map_err(|e| format!("entering mac loopback: {e}"))?;
+        }
+
+        // Transmit raw (loopback needs no link), then poll the receive ring.
+        let outcome = async {
+            self.drain_tx().await.map_err(|fail| match fail {
+                L2Fail::Io(message) => message,
+                _ => String::from("drain failed"),
+            })?;
+            if let Err(fail) = self.transmit(&frame).await {
+                return Err(match fail {
+                    L2Fail::Io(message) => format!("transmit: {message}"),
+                    _ => String::from("transmit failed"),
+                });
+            }
+            for _ in 0..30u32 {
+                let received = self.recv(2048).await.map_err(|fail| match fail {
+                    L2Fail::Io(message) => format!("receive: {message}"),
+                    _ => String::from("receive failed"),
+                })?;
+                if received.is_empty() {
+                    continue;
+                }
+                if received.len() >= 60 && received[..60] == frame[..60] {
+                    return Ok(format!("{} bytes round-tripped", received.len()));
+                }
+                return Err(format!(
+                    "a {}-byte frame arrived but did not match the test pattern",
+                    received.len()
+                ));
+            }
+            Err(String::from(
+                "no frame in the receive ring after 30 windows",
+            ))
+        }
+        .await;
+
+        // Leave the loopback mode (always, pass or fail).
+        if phy_level {
+            // BMCR is restored by the caller's autoneg restart.
+        } else {
+            let _ = self
+                .write(
+                    reg::TX_CONFIG,
+                    pci::AccessWidth::Dword,
+                    bits::TX_CONFIG_VALUE,
+                )
+                .await;
+        }
+        outcome
     }
 
     /// Dump the hardware tally counters into the `stats` DMA buffer (r8169
@@ -1339,7 +1529,9 @@ impl Driver {
     }
 
     /// Transmit one Ethernet frame: bounce copy (zero-padded to the 60-byte
-    /// minimum), one OWN'd descriptor, doorbell, bounded OWN-clear poll.
+    /// minimum), one OWN'd descriptor, doorbell, bounded OWN-clear poll. The link
+    /// check lives here; [`Self::transmit`] below is the raw path the loopback
+    /// self-tests share (a loopback frame never needs a wire link).
     async fn send(&mut self, frame: &[u8]) -> Result<u64, L2Fail> {
         let frame_len = frame.len() as u64;
         if frame_len > MAX_FRAME {
@@ -1350,7 +1542,12 @@ impl Driver {
             return Err(L2Fail::LinkDown);
         }
         self.drain_tx().await?;
+        self.transmit(frame).await?;
+        Ok(frame_len)
+    }
 
+    /// The raw transmit path (no link check, no drain — callers handle both).
+    async fn transmit(&mut self, frame: &[u8]) -> Result<(), L2Fail> {
         let padded_len = (frame.len() as u16).max(eo9_rtl8125::MIN_FRAME_LEN);
         let mut packet = vec![0u8; usize::from(padded_len)];
         packet[..frame.len()].copy_from_slice(frame);
@@ -1386,7 +1583,7 @@ impl Driver {
             }
         }
         self.tx_consumed = self.tx_consumed.wrapping_add(1);
-        Ok(frame_len)
+        Ok(())
     }
 
     /// Receive the next delivered frame (CRC stripped), truncated to `max_len`
@@ -1565,6 +1762,25 @@ impl l2::Guest for Stub {
             }
             Err(fail) => (dst, Err(L2Error::from(fail))),
         }
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// The configure entry (`eo9:net-rtl8125/rtl8125-config`)
+// ------------------------------------------------------------------------------------------
+
+impl exports::eo9::net_rtl8125::rtl8125_config::Guest for Stub {
+    /// Cap the advertised speeds at compose time (bench triage: 1000-but-not-2500
+    /// pins the 2.5G datapath). Validation happens here: an unknown cap is a
+    /// configure error, never a trap.
+    fn configure(advertise_max: u16) -> Result<l2::L2Impl, String> {
+        if !matches!(advertise_max, 100 | 1000 | 2500) {
+            return Err(format!(
+                "advertise-max must be 100, 1000, or 2500 (got {advertise_max})"
+            ));
+        }
+        ADVERTISE_MAX.set(advertise_max);
+        Ok(l2::L2Impl::new(RtlL2))
     }
 }
 

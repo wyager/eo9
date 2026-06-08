@@ -21,9 +21,20 @@
 /// so the vendor policy cannot).
 package eo9:net-rtl8125@0.1.0;
 
+/// Compose-time configuration: `configure(advertise-max)` caps the speeds
+/// autonegotiation advertises (2500, 1000, or 100). Unconfigured, the driver
+/// advertises everything up to 2500BASE-T (the option-C default rule — plain
+/// composition never traps). The knob exists for bench triage: a link that moves
+/// frames at `--advertise-max 1000` but not at 2500 pins the 2.5G datapath.
+interface rtl8125-config {
+    use eo9:net/l2@0.1.0.{l2-impl};
+    configure: func(advertise-max: u16) -> result<l2-impl, string>;
+}
+
 world rtl8125-net {
     import eo9:pci/pci@0.1.0;
     import eo9:text/text@0.1.0;
 
     export eo9:net/l2@0.1.0;
+    export rtl8125-config;
 }
