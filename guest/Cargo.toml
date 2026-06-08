@@ -50,4 +50,7 @@ smoltcp = { version = "0.12.0", default-features = false, features = [
     "proto-ipv4",
     "socket-tcp",
     "socket-udp",
+    # The built-in DHCPv4 client socket (pulls in proto-dhcpv4), for the middleware's
+    # `--address dhcp` acquisition mode.
+    "socket-dhcpv4",
 ] }

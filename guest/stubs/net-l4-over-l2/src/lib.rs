@@ -16,9 +16,18 @@
 //! * **Addressing.** The documented default is QEMU user-mode networking's layout —
 //!   `10.0.2.15/24` with gateway `10.0.2.2` — bound lazily on first use, so plain
 //!   composition works and never traps (plan/09 Decision 14). The exported
-//!   `eo9:net/l4-over-l2-config` entry binds different addressing; baking it through
-//!   `configure(…)` waits on compose-time configuration of resource-owning API
-//!   providers (plan/03 D13, plan/09 D20).
+//!   `eo9:net/l4-over-l2-config` entry binds different addressing: static values, or
+//!   `--address dhcp` to acquire address, prefix length, and gateway from the network's
+//!   DHCP service on first use (smoltcp's built-in DHCPv4 client — discover → offer →
+//!   request → ack — gated before any l4 operation is served; the lease is announced in
+//!   one console line, and no lease within the bounded window is a typed error, never a
+//!   trap or a hang). DNS servers offered by the lease are only logged: the middleware
+//!   sends no DNS queries — resolvers live *above* `l4`. Lease renewal (T1/T2) is
+//!   handled inside smoltcp's client as long as the stack is pumped, which in this
+//!   executor model means **while l4 operations are in flight** — an idle stack does
+//!   not renew. Sessions here are short-lived relative to any real lease, so this is
+//!   documented rather than worked around; a lease that does expire mid-pump
+//!   deconfigures the stack honestly and the next operation re-acquires.
 //! * **Driving the link.** Every l2 import call is a genuine await (the SPEC's
 //!   "boundaries are honestly async" rule): each exported l4 operation pumps the link
 //!   — transmit what the stack queued, receive what the device has, let smoltcp
@@ -58,10 +67,11 @@ use eo9_guest::provider::ProviderState;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium};
-use smoltcp::socket::{tcp, udp};
+use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpAddress as SmolIpAddress, IpCidr, IpEndpoint, Ipv4Address,
+    DhcpRepr, EthernetAddress, HardwareAddress, IpAddress as SmolIpAddress, IpCidr, IpEndpoint,
+    Ipv4Address,
 };
 
 wit_bindgen::generate!({
@@ -74,6 +84,7 @@ wit_bindgen::generate!({
 
 use eo9::entropy::entropy;
 use eo9::net::l2;
+use eo9::text::text;
 use eo9::time::time;
 use exports::eo9::net::l4::{
     self, Buffer, IpAddress, L4Error, RecvResult, SendResult, SocketAddress,
@@ -114,15 +125,32 @@ impl Addressing {
     }
 }
 
-/// Set exactly once, by `configure`; absent for an unconfigured provider.
-static ADDRESSING: ProviderState<Addressing> = ProviderState::new();
+/// How the stack addresses its link: static IPv4 values (configured, or the documented
+/// QEMU user-net defaults), or a DHCP lease acquired from the network on first use.
+#[derive(Clone, Copy)]
+enum AddressMode {
+    Static(Addressing),
+    Dhcp,
+}
 
-/// The addressing in force: configured values when `configure` ran, the defaults otherwise.
-fn addressing() -> Addressing {
-    if ADDRESSING.is_set() {
-        ADDRESSING.with(|a| *a)
+/// Set exactly once, by `configure`; absent for an unconfigured provider.
+static MODE: ProviderState<AddressMode> = ProviderState::new();
+
+/// The addressing mode in force: the configured mode when `configure` ran, the static
+/// defaults otherwise (an unconfigured provider behaves exactly as it always has).
+fn mode() -> AddressMode {
+    if MODE.is_set() {
+        MODE.with(|m| *m)
     } else {
-        Addressing::defaults()
+        AddressMode::Static(Addressing::defaults())
+    }
+}
+
+/// The static addressing to bind at bring-up, `None` when DHCP acquires it instead.
+fn static_addressing() -> Option<Addressing> {
+    match mode() {
+        AddressMode::Static(addressing) => Some(addressing),
+        AddressMode::Dhcp => None,
     }
 }
 
@@ -172,6 +200,27 @@ const SEND_FLUSH_DEADLINE_NS: u64 = 1_500_000_000;
 /// Hard cap on pump rounds per operation, so a clock that never advances (a frozen test
 /// stub) still cannot make an operation loop forever.
 const MAX_PUMPS: u32 = 4096;
+
+/// Bounded window for acquiring a DHCP lease on first use: long enough for the full
+/// discover → offer → request → ack exchange plus one of smoltcp's discover
+/// retransmits (10 s apart by default — a first discover lost while a real link is
+/// still settling must not doom the acquisition).
+const DHCP_DEADLINE_NS: u64 = 20_000_000_000;
+/// Pump-round cap for the DHCP wait. The per-operation `MAX_PUMPS` is tuned for waits
+/// that resolve in single seconds; an empty receive poll is cheap (net.virtio's short
+/// poll is microseconds), so 4096 rounds can elapse well before the 20 s window has
+/// genuinely passed and the discover retransmit timer has had its chance. This cap
+/// keeps the frozen-clock guarantee (the wait is still finite) without cutting the
+/// wall-clock window short on a quiet link.
+const DHCP_MAX_PUMPS: u32 = 1_048_576;
+
+/// One best-effort console line (the net.virtio precedent: a diagnostic the operator
+/// needs to see on the machine console; the provider works identically without one).
+fn console(line: &str) {
+    let handle = text::default();
+    let _ = text::write(&handle, text::OutputStream::Out, line);
+    let _ = text::write(&handle, text::OutputStream::Out, "\n");
+}
 
 /// The l2 layer's own error, in l4 vocabulary: a refusal stays a refusal, everything
 /// else is a typed `io` error naming the layer.
@@ -263,7 +312,11 @@ async fn acquire() -> Result<LinkGuard, L4Error> {
         }
     });
     match view {
-        LinkView::Ready(link) => return Ok(LinkGuard(Some(link))),
+        LinkView::Ready(link) => {
+            let guard = LinkGuard(Some(link));
+            ensure_dhcp_bound(&guard).await?;
+            return Ok(guard);
+        }
         LinkView::Busy => {
             return Err(L4Error::Io(String::from(
                 "another l4 operation on this stack is in progress",
@@ -279,7 +332,43 @@ async fn acquire() -> Result<LinkGuard, L4Error> {
     let claim = BringUpClaim { armed: true };
     let opened = open_link().await?;
     claim.defuse();
+    // DHCP acquisition is gated here, after the claim is defused: a failed (or
+    // dropped) acquisition keeps the opened link in its slot and the next operation
+    // simply retries the wait — the link does not get re-opened.
+    ensure_dhcp_bound(&opened).await?;
     Ok(opened)
+}
+
+/// In DHCP mode, gate every operation behind a bound lease: pump the link through the
+/// discover → offer → request → ack exchange until the interface holds an address, or
+/// answer typed (never trap, never hang) when no lease arrives within the bounded
+/// window. Static mode — and an already-bound lease — returns immediately (the first
+/// `check` runs before any pump touches the link).
+async fn ensure_dhcp_bound(link: &LinkGuard) -> Result<(), L4Error> {
+    let waiting = with_net(|n| n.dhcp.is_some() && n.bound.is_none());
+    if !waiting {
+        return Ok(());
+    }
+    let outcome = wait_until_capped(link, DHCP_DEADLINE_NS, DHCP_MAX_PUMPS, || {
+        with_net(|n| n.bound.map(|_| Ok(())))
+    })
+    .await;
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(L4Error::TimedOut) => {
+            // The no-answer note, on the console for the operator (the acquired line's
+            // failure sibling) and typed to the caller.
+            console(&format!(
+                "net.l4.over-l2: dhcp no lease within {}s — check the link and the \
+                 network's DHCP service",
+                DHCP_DEADLINE_NS / 1_000_000_000
+            ));
+            Err(L4Error::Io(String::from(
+                "dhcp: no lease arrived within the acquisition window",
+            )))
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Releases the bring-up claim (`opened`) if the first-use open never completes; armed
@@ -408,6 +497,12 @@ struct NetState {
     /// established-but-not-yet-accepted is *not* in the `Listen` state, yet its port is
     /// still taken.
     listening_ports: Vec<u16>,
+    /// The DHCP client socket when `--address dhcp` selected acquisition; `None` in
+    /// static mode. Lives outside the `live` resource count: it is the stack's own.
+    dhcp: Option<SocketHandle>,
+    /// The IPv4 address/prefix currently bound on the interface: set at construction in
+    /// static mode, set (and re-set, and cleared on lease loss) by DHCP lease events.
+    bound: Option<(Ipv4Address, u8)>,
 }
 
 impl NetState {
@@ -420,22 +515,45 @@ impl NetState {
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = seed;
         let mut iface = Interface::new(config, &mut dev, smol_instant(now));
-        let bound = addressing();
-        iface.update_ip_addrs(|addrs| {
-            let _ = addrs.push(IpCidr::new(
-                SmolIpAddress::Ipv4(bound.address),
-                bound.prefix_len,
-            ));
-        });
-        let _ = iface.routes_mut().add_default_ipv4_route(bound.gateway);
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut bound = None;
+        let mut dhcp = None;
+        match static_addressing() {
+            Some(addressing) => {
+                iface.update_ip_addrs(|addrs| {
+                    let _ = addrs.push(IpCidr::new(
+                        SmolIpAddress::Ipv4(addressing.address),
+                        addressing.prefix_len,
+                    ));
+                });
+                let _ = iface
+                    .routes_mut()
+                    .add_default_ipv4_route(addressing.gateway);
+                bound = Some((addressing.address, addressing.prefix_len));
+            }
+            None => {
+                let mut socket = dhcpv4::Socket::new();
+                // Keep the raw ACK so the announced lease line can carry the lease
+                // duration (smoltcp's `Config` does not surface it; its own wire
+                // parser reads it back out of the packet). The buffer must outlive
+                // the `'static` socket set, hence the one-time leak: one 1536-byte
+                // allocation, exactly once, for the provider instance's lifetime.
+                socket.set_receive_packet_buffer(alloc::boxed::Box::leak(
+                    vec![0u8; UDP_PACKET_BYTES].into_boxed_slice(),
+                ));
+                dhcp = Some(sockets.add(socket));
+            }
+        }
         NetState {
             iface,
-            sockets: SocketSet::new(Vec::new()),
+            sockets,
             dev,
             ephemeral: 49152u16.wrapping_add((seed % 16000) as u16),
             closing: Vec::new(),
             live: 0,
             listening_ports: Vec::new(),
+            dhcp,
+            bound,
         }
     }
 
@@ -474,12 +592,77 @@ fn with_net<R>(f: impl FnOnce(&mut NetState) -> R) -> R {
     NET.with(f)
 }
 
-/// Advance the stack against the current frame queues.
+/// Advance the stack against the current frame queues, applying any DHCP lease event
+/// to the interface (address, prefix, default route) on the way. The lease announcement
+/// is printed *outside* the state borrow (`text::write` is an import call; the standing
+/// discipline keeps borrows away from the boundary).
 fn poll_stack(link: &Link) {
     let timestamp = smol_instant(now_ns(&link.clock));
-    with_net(|n| {
+    let announcement = with_net(|n| {
         let _ = n.iface.poll(timestamp, &mut n.dev, &mut n.sockets);
+        let handle = n.dhcp?;
+        match n.sockets.get_mut::<dhcpv4::Socket>(handle).poll()? {
+            dhcpv4::Event::Configured(lease) => {
+                // The lease duration comes from the raw ACK (smoltcp's `Config` does
+                // not carry it); best-effort — the announcement omits it if absent.
+                let lease_seconds = lease
+                    .packet
+                    .as_ref()
+                    .and_then(|packet| DhcpRepr::parse(packet).ok())
+                    .and_then(|repr| repr.lease_duration);
+                let address = lease.address.address();
+                let prefix = lease.address.prefix_len();
+                n.iface.update_ip_addrs(|addrs| {
+                    addrs.clear();
+                    let _ = addrs.push(IpCidr::Ipv4(lease.address));
+                });
+                match lease.router {
+                    Some(router) => {
+                        let _ = n.iface.routes_mut().add_default_ipv4_route(router);
+                    }
+                    None => {
+                        n.iface.routes_mut().remove_default_ipv4_route();
+                    }
+                }
+                n.bound = Some((address, prefix));
+
+                let mut line = format!("net.l4.over-l2: dhcp acquired {address}/{prefix}");
+                match lease.router {
+                    Some(router) => line.push_str(&format!(" gw {router}")),
+                    None => line.push_str(" gw none"),
+                }
+                if !lease.dns_servers.is_empty() {
+                    line.push_str(" dns");
+                    for server in lease.dns_servers.iter() {
+                        line.push_str(&format!(" {server}"));
+                    }
+                }
+                if let Some(seconds) = lease_seconds {
+                    line.push_str(&format!(" lease {seconds}s"));
+                }
+                Some(line)
+            }
+            dhcpv4::Event::Deconfigured => {
+                // The client starts deconfigured (its first poll always reports it);
+                // only a *lost* lease — expiry, or a NAKed renewal — is an event worth
+                // acting on: deconfigure honestly (the address may be reassigned) and
+                // let the next operation's acquisition gate re-acquire.
+                let lost = n.bound.take().is_some();
+                if lost {
+                    n.iface.update_ip_addrs(|addrs| addrs.clear());
+                    n.iface.routes_mut().remove_default_ipv4_route();
+                    Some(String::from(
+                        "net.l4.over-l2: dhcp lease lost; reacquiring on the next operation",
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
     });
+    if let Some(line) = announcement {
+        console(&line);
+    }
 }
 
 /// Hand everything the stack queued to the l2 provider.
@@ -542,6 +725,18 @@ async fn pump(link: &Link) -> Result<(), L4Error> {
 async fn wait_until<T>(
     link: &Link,
     deadline_ns: u64,
+    check: impl FnMut() -> Option<Result<T, L4Error>>,
+) -> Result<T, L4Error> {
+    wait_until_capped(link, deadline_ns, MAX_PUMPS, check).await
+}
+
+/// [`wait_until`] with an explicit pump-round cap: the DHCP acquisition wait needs more
+/// rounds than the per-operation default before its (longer) wall-clock window has
+/// honestly passed; everything else uses `MAX_PUMPS`.
+async fn wait_until_capped<T>(
+    link: &Link,
+    deadline_ns: u64,
+    max_pumps: u32,
     mut check: impl FnMut() -> Option<Result<T, L4Error>>,
 ) -> Result<T, L4Error> {
     let start = now_ns(&link.clock);
@@ -551,7 +746,7 @@ async fn wait_until<T>(
             return result;
         }
         let expired =
-            rounds >= MAX_PUMPS || now_ns(&link.clock).saturating_sub(start) >= deadline_ns;
+            rounds >= max_pumps || now_ns(&link.clock).saturating_sub(start) >= deadline_ns;
         if expired {
             // Wire truth beats the clock (user study 08, finding F3): before declaring
             // a timeout, pump once more and re-check, so frames that already reached
@@ -596,24 +791,50 @@ fn destination_v4(address: &IpAddress) -> Result<Ipv4Address, L4Error> {
     }
 }
 
-/// Is this an acceptable local bind address (unspecified or the bound address)?
+/// The interface's currently-bound IPv4 address and prefix: the static values once the
+/// stack exists (and, before it does, straight from the configuration), the lease in
+/// DHCP mode once acquired — `None` only in DHCP mode before (or between) leases.
+fn bound_address() -> Option<(Ipv4Address, u8)> {
+    if NET.is_set() {
+        with_net(|n| n.bound)
+    } else {
+        static_addressing().map(|a| (a.address, a.prefix_len))
+    }
+}
+
+/// Is this an acceptable local bind address (unspecified or the bound address)? In
+/// DHCP mode before a lease is bound only the unspecified address qualifies — a caller
+/// cannot know the leased address in advance, and the acquisition gate runs before any
+/// bind takes effect anyway.
 fn bindable(address: &IpAddress) -> bool {
     match address {
         IpAddress::V4(octets) => {
             *octets == (0, 0, 0, 0)
-                || Ipv4Address::new(octets.0, octets.1, octets.2, octets.3) == addressing().address
+                || bound_address().is_some_and(|(bound, _)| {
+                    Ipv4Address::new(octets.0, octets.1, octets.2, octets.3) == bound
+                })
         }
         IpAddress::V6(groups) => *groups == (0, 0, 0, 0, 0, 0, 0, 0),
     }
 }
 
-/// Our own address with `port`, in the WIT vocabulary.
-fn local_address(port: u16) -> SocketAddress {
-    let octets = addressing().address.octets();
+/// `bound` (the interface's address, if any) with `port`, in the WIT vocabulary. Takes
+/// the bound pair as a value so callers already inside the [`NET`] borrow can pass
+/// `n.bound` directly — [`bound_address`] re-enters the state and must not be called
+/// under it. (The unbound-DHCP fallback is the unspecified address; it is unreachable
+/// in practice — every caller runs behind the acquisition gate.)
+fn local_address_with(bound: Option<(Ipv4Address, u8)>, port: u16) -> SocketAddress {
+    let octets = bound.map_or([0, 0, 0, 0], |(address, _)| address.octets());
     SocketAddress {
         address: IpAddress::V4((octets[0], octets[1], octets[2], octets[3])),
         port,
     }
+}
+
+/// Our own address with `port`, in the WIT vocabulary. Only for callers *outside* the
+/// [`NET`] borrow.
+fn local_address(port: u16) -> SocketAddress {
+    local_address_with(bound_address(), port)
 }
 
 /// A smoltcp endpoint rendered back into the WIT vocabulary.
@@ -729,23 +950,45 @@ impl l4::GuestUdpSocket for Udp {}
 // ------------------------------------------------------------------------------------------
 
 impl l4_over_l2_config::Guest for Stub {
-    /// Bind the static IPv4 addressing the stack uses on its link. Validation happens
-    /// here, at compose time: a malformed address is a configure error, never a trap.
+    /// Bind the IPv4 addressing the stack uses on its link: a static dotted quad (with
+    /// a required gateway; the prefix length defaults to 24), or `dhcp` to acquire all
+    /// of it from the network on first use. Validation happens here, at compose time: a
+    /// malformed address, a static address without a gateway, or `dhcp` combined with
+    /// the static-only arguments is a configure error, never a trap (and never a silent
+    /// ignore — option C, plan/09 D14).
     fn configure(
         address: String,
-        prefix_length: u8,
-        gateway: String,
+        prefix_length: Option<u8>,
+        gateway: Option<String>,
     ) -> Result<l4::L4Impl, String> {
-        let address = parse_ipv4(&address)?;
+        if address == "dhcp" {
+            if prefix_length.is_some() || gateway.is_some() {
+                return Err(String::from(
+                    "--address dhcp acquires the prefix length and gateway from the \
+                     lease; do not combine it with --prefix-length or --gateway",
+                ));
+            }
+            MODE.set(AddressMode::Dhcp);
+            return Ok(l4::L4Impl::new(Root));
+        }
+        let address = parse_ipv4(&address)
+            .map_err(|err| format!("{err} (or `dhcp` to acquire addressing from the network)"))?;
+        let Some(gateway) = gateway else {
+            return Err(String::from(
+                "static addressing needs --gateway (or use `--address dhcp` to acquire \
+                 everything from the network)",
+            ));
+        };
         let gateway = parse_ipv4(&gateway)?;
+        let prefix_length = prefix_length.unwrap_or(PREFIX_LEN);
         if prefix_length > 32 {
             return Err(format!("prefix-length must be 0..=32, not {prefix_length}"));
         }
-        ADDRESSING.set(Addressing {
+        MODE.set(AddressMode::Static(Addressing {
             address,
             prefix_len: prefix_length,
             gateway,
-        });
+        }));
         Ok(l4::L4Impl::new(Root))
     }
 }
@@ -847,7 +1090,7 @@ impl l4::Guest for Stub {
             n.listening_ports.push(port);
             Ok(l4::TcpListener::new(Listener {
                 handle: Cell::new(handle),
-                local: local_address(port),
+                local: local_address_with(n.bound, port),
             }))
         })
     }
@@ -1046,7 +1289,7 @@ impl l4::Guest for Stub {
             n.live += 1;
             Ok(l4::UdpSocket::new(Udp {
                 handle,
-                local: local_address(port),
+                local: local_address_with(n.bound, port),
             }))
         })
     }

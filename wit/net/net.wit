@@ -294,15 +294,22 @@ interface l4-loopback-config {
 }
 
 /// Compose-time configuration entry for net.l4.over-l2 (the TCP/IP middleware): binds the
-/// static IPv4 addressing the stack uses on its link. Addresses are dotted-quad strings
-/// (`"10.0.2.15"`); a malformed address is a configure-time error, never a trap. An
+/// IPv4 addressing the stack uses on its link.
+///
+/// `address` is either a dotted-quad string (`"10.0.2.15"`) — static addressing, where
+/// `gateway` is then required and `prefix-length` defaults to 24 — or the word `"dhcp"`,
+/// which acquires the address, prefix length, and gateway from the network's DHCP
+/// service on first use (discover → offer → request → ack, smoltcp's built-in client).
+/// Combining `"dhcp"` with `prefix-length` or `gateway` is a configure-time error, as is
+/// a malformed address or a static address without a gateway — errors, never traps. An
 /// unconfigured provider keeps its documented default — QEMU user-mode networking's
 /// layout (10.0.2.15/24, gateway 10.0.2.2) — so plain composition still works. (A DNS
 /// server is deliberately not part of this configuration: the middleware itself sends no
-/// DNS queries — resolvers are programs or middleware *above* `l4`.)
+/// DNS queries — resolvers are programs or middleware *above* `l4`. DNS servers offered
+/// by a DHCP lease are logged on the console for the operator, nothing more.)
 interface l4-over-l2-config {
     use l4.{l4-impl};
-    configure: func(address: string, prefix-length: u8, gateway: string)
+    configure: func(address: string, prefix-length: option<u8>, gateway: option<string>)
         -> result<l4-impl, string>;
 }
 

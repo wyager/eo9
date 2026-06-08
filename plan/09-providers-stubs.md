@@ -1360,3 +1360,60 @@ Match the priority order above; (1)+(2) unblock I2.
     (`net.virtio $ l2check` → resolved) and C (typed refusal) matching the reviewer's
     transcripts; both board images rebuilt. Board burst-RX confirmation is the
     planner's post-merge run.
+
+47. **`net.l4.over-l2 --address dhcp` — DHCP acquisition in the TCP/IP middleware
+    (2026-06-08, branch area/13-dhcp; closes the "DHCP … deliberately off" remainder of
+    entry 18).** The engine is smoltcp's built-in DHCPv4 client socket (`socket-dhcpv4`
+    feature; nothing hand-rolled), wired into the existing lazy first-use binding: when
+    DHCP is selected, every l4 operation's `acquire` gates behind the lease — the pump
+    drives discover → offer → request → ack over the composed l2 exactly like any other
+    traffic, the acquired address/prefix/gateway are applied to the smoltcp interface
+    precisely where the static path applies its values, and no l4 operation is served
+    until the stack is addressed. No lease within the bounded window (20 s — one full
+    discover retransmit cycle) is a **typed** l4 `io` error plus a console note, never a
+    trap, never a hang (the wait keeps the frozen-clock pump cap, raised for this one
+    wait so the wall-clock window is honest).
+
+    *Config surface.* `l4-over-l2-config.configure` is now
+    `(address: string, prefix-length: option<u8>, gateway: option<string>)` — the
+    compose-time binder and the shell both handle options today (the entry-20 parking is
+    long resolved), so `(net.l4.over-l2 --address dhcp)` types cleanly at the prompt.
+    Rules, all configure-time errors (option C): `--address dhcp` must NOT be combined
+    with `--prefix-length`/`--gateway` (the lease supplies them); a static address
+    REQUIRES `--gateway` (prefix-length alone defaults to 24); a malformed address stays
+    the study-08 typed refusal (message now names `dhcp` as the alternative).
+    Unconfigured behavior is bit-for-bit unchanged (slirp static defaults).
+    `telnetd --address dhcp` passes through (its static address+gateway pairing rule
+    keeps dhcp exempt). DNS servers from the lease are logged, not stored — the
+    middleware sends no DNS queries; resolvers live above l4 (the config interface's
+    standing note).
+
+    *Console diagnostics (one-run-one-round).* The world now imports `eo9:text/text`
+    (the net.virtio precedent; the provider works identically without a console). One
+    line on acquisition — `net.l4.over-l2: dhcp acquired <addr>/<prefix> gw <gw>
+    [dns <…>] lease <secs>s` — and one on failure. The lease duration is parsed from the
+    raw ACK via smoltcp's own wire parser (`Config` does not surface it; the socket's
+    receive-packet buffer is a one-time 1536-byte leak, the socket set being `'static`).
+    **Board reality:** the bench LAN's DHCP server hands an arbitrary address — the
+    printed line is how the operator learns where to telnet; that is the line's job.
+
+    *Renewal, assessed for this executor model.* smoltcp's client handles T1/T2/expiry
+    internally **as long as it is polled**, and here the stack is only pumped while l4
+    operations are in flight — an idle stack does not renew. Sessions are short-lived
+    relative to any real lease, so this is documented, not over-engineered; a lease that
+    does expire mid-pump deconfigures honestly (addresses cleared, console note) and the
+    next operation's gate re-acquires.
+
+    Verified: full `cargo xtask ci`; the usermode pins (dhcp bakes + denied link still
+    the program's own typed failure; dhcp+static combination refused typed; static
+    without gateway refused typed; the existing malformed-address and merged-bind pins
+    updated for the option-typed signature); QEMU live via the new scripted gate `cargo
+    xtask check-dhcp` — `net.virtio $ (net.l4.over-l2 --address dhcp) $ l4check` printed
+    `dhcp acquired 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3 lease 86400s` and resolved, and
+    `telnetd --sessions 1 --address dhcp` served a session over the hostfwd —
+    `check-telnet` stays green (the static default path untouched). Board run is the
+    planner's (this lane never touches the serial port): the ladder gains
+    `net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address dhcp) $ l4check
+    --resolver 10.20.3.1 --tcp-target 10.20.3.1` and `telnetd --nic net.rtl8125
+    --advertise-max 1000 --address dhcp`, reading the leased address off the serial
+    console.

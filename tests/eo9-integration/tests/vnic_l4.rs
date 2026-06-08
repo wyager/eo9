@@ -28,6 +28,7 @@ use eo9_runtime::{NamedArg, Outcome, Providers};
 const COMPONENTS: &[&str] = &[
     "eo9-stub-entropy-seeded",
     "eo9-stub-time-monotonic-stub",
+    "eo9-stub-text-null",
     "eo9-stub-net-l2-echo",
     "eo9-stub-net-l2-switch",
     "eo9-stub-net-l4-over-l2",
@@ -43,8 +44,8 @@ fn transport(slot: &str, link: &str, configured_address: Option<&str>) -> Compon
             &guest::load_stub("net.l4.over-l2"),
             &[
                 ("address", format!("{address:?}").as_str()),
-                ("prefix-length", "24"),
-                ("gateway", "\"10.0.2.2\""),
+                ("prefix-length", "some(24)"),
+                ("gateway", "some(\"10.0.2.2\")"),
             ],
         )
         .expect("baking a syntactically-valid address succeeds")
@@ -75,7 +76,10 @@ fn two_stack_composition() -> Component {
     )
     .expect("baking the stub clock's numbers succeeds");
     let stack = compose(&clock, &stack).expect("time.monotonic-stub $ …");
-    compose(&guest::load_stub("entropy.seeded"), &stack).expect("entropy.seeded $ …")
+    let stack = compose(&guest::load_stub("entropy.seeded"), &stack).expect("entropy.seeded $ …");
+    // Both middlewares' console-diagnostic import (the DHCP lease announcement), sealed
+    // once for the pair so the composition runs against no host providers at all.
+    compose(&guest::load_stub("text.null"), &stack).expect("text.null $ …")
 }
 
 fn run_two_stacks() -> Outcome {
