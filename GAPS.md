@@ -405,3 +405,12 @@ fiber stacks, which share the property) is plain heap memory — an overflow cor
 the heap silently instead of faulting. 4× the 512 KiB main stack the compiles
 previously shared, so headroom is real, but a guard page (or a canary check at
 fiber exit) belongs in the kernel lane's queue.
+
+## Network-session poweroff no-ops silently (bench, 2026-06-08)
+`poweroff` typed in a telnet eosh session does nothing and prints nothing. If the
+session stack lacks the power capability, the honest behavior is a typed refusal
+("missing capability: power"), not silence. Silent no-op cost a bench recovery
+round (the operator assumed the command executed). eosh/session-stack lane: make
+the refusal explicit; decide whether network sessions should ever be grantable
+power (probably yes behind an explicit telnetd flag — remote reset is operationally
+valuable, as this same incident proved via the session-burn workaround).
