@@ -2,12 +2,15 @@
 //!
 //! Targets the `eo9-examples:l4check/l4check` world (see `wit/world.wit`): bind a UDP
 //! socket through the granted l4 capability, send a DNS query for `example.com` to the
-//! QEMU user-net resolver (10.0.2.3), and report what came back; then attempt a TCP
-//! connection to the gateway's discard port (10.0.2.2:9) and report its typed outcome.
-//! A DNS answer proves datagrams travel both ways through the composed transport stack
-//! (`net.virtio $ net.l4.over-l2` on metal); the TCP attempt proves a refused or
-//! ignored SYN comes back as a typed error, never a trap. The program imports only
-//! `eo9:net/l4` — what the resolver answered is carried in the program outcome itself.
+//! resolver, and report what came back; then attempt a TCP connection to the tcp-target
+//! host's discard port (:9) and report its typed outcome. A DNS answer proves
+//! datagrams travel both ways through the composed transport stack
+//! (`net.virtio $ net.l4.over-l2` on QEMU metal, `net.rtl8125 $ net.l4.over-l2` on the
+//! board); the TCP attempt proves a refused or ignored SYN comes back as a typed
+//! error, never a trap. The targets default to QEMU user-net's layout (resolver
+//! 10.0.2.3, tcp-target 10.0.2.2); `--resolver`/`--tcp-target` aim them at a real LAN's
+//! addresses. The program imports only `eo9:net/l4` — what the resolver answered is
+//! carried in the program outcome itself.
 
 #![no_std]
 
@@ -25,10 +28,12 @@ eo9_guest::bindings!({
     apis: [io, net_l4],
 });
 
-/// The DNS forwarder QEMU user-mode networking runs for its guest.
-const RESOLVER: l4::IpAddress = l4::IpAddress::V4((10, 0, 2, 3));
-/// The user-net gateway; nothing listens on its discard port, which is the point.
-const GATEWAY: l4::IpAddress = l4::IpAddress::V4((10, 0, 2, 2));
+/// The DNS forwarder QEMU user-mode networking runs for its guest (the default
+/// `--resolver`).
+const DEFAULT_RESOLVER: (u8, u8, u8, u8) = (10, 0, 2, 3);
+/// The user-net gateway; nothing listens on its discard port, which is the point
+/// (the default `--tcp-target`).
+const DEFAULT_TCP_TARGET: (u8, u8, u8, u8) = (10, 0, 2, 2);
 /// The name the query asks about.
 const QUERY_NAME: &[&str] = &["example", "com"];
 /// A fixed query id (the reply must echo it back).
@@ -131,8 +136,42 @@ fn parse_reply(packet: &[u8]) -> Option<Result<String, String>> {
     Some(Ok(format!("answered ({answers} records)")))
 }
 
+/// Parse a dotted quad (`--resolver 10.20.3.1`).
+fn parse_ip(text: &str) -> Result<(u8, u8, u8, u8), ProgramFailure> {
+    let mut octets = [0u8; 4];
+    let mut count = 0;
+    for part in text.split('.') {
+        if count == 4 {
+            return Err(ProgramFailure::BadArguments(format!(
+                "not a dotted quad: {text:?}"
+            )));
+        }
+        octets[count] = part
+            .parse::<u8>()
+            .map_err(|_| ProgramFailure::BadArguments(format!("not a dotted quad: {text:?}")))?;
+        count += 1;
+    }
+    if count != 4 {
+        return Err(ProgramFailure::BadArguments(format!(
+            "not a dotted quad: {text:?}"
+        )));
+    }
+    Ok((octets[0], octets[1], octets[2], octets[3]))
+}
+
 eo9_guest::main! {
-    async fn main() -> Result<ProgramSuccess, ProgramFailure> {
+    async fn main(
+        resolver: Option<String>,
+        tcp_target: Option<String>,
+    ) -> Result<ProgramSuccess, ProgramFailure> {
+        let resolver_ip = match &resolver {
+            Some(text) => parse_ip(text)?,
+            None => DEFAULT_RESOLVER,
+        };
+        let probe_ip = match &tcp_target {
+            Some(text) => parse_ip(text)?,
+            None => DEFAULT_TCP_TARGET,
+        };
         let root = l4::default();
 
         // --- UDP: ask the user-net resolver about example.com -----------------------
@@ -144,7 +183,7 @@ eo9_guest::main! {
         .map_err(net_failure)?;
 
         let query = buffer::from_bytes(&dns_query());
-        let resolver = l4::SocketAddress { address: RESOLVER, port: 53 };
+        let resolver = l4::SocketAddress { address: l4::IpAddress::V4(resolver_ip), port: 53 };
         let (_query, sent) = l4::send_to(&socket, resolver, query).await;
         sent.map_err(net_failure)?;
 
@@ -189,7 +228,7 @@ eo9_guest::main! {
         };
 
         // --- TCP: a connection attempt that should come back as a typed outcome -----
-        let gateway = l4::SocketAddress { address: GATEWAY, port: 9 };
+        let gateway = l4::SocketAddress { address: l4::IpAddress::V4(probe_ip), port: 9 };
         let tcp_outcome = match l4::connect(&root, gateway).await {
             Ok(connection) => {
                 let peer = l4::peer_address(&connection);
@@ -198,8 +237,9 @@ eo9_guest::main! {
             Err(err) => format!("{err:?}"),
         };
 
+        let (pa, pb, pc, pd) = probe_ip;
         Ok(ProgramSuccess::Resolved(format!(
-            "example.com is {answer}; tcp 10.0.2.2:9 -> {tcp_outcome}"
+            "example.com is {answer}; tcp {pa}.{pb}.{pc}.{pd}:9 -> {tcp_outcome}"
         )))
     }
 }

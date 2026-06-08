@@ -368,6 +368,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-rtl8125"
+version = "0.1.0"
+
+[[package]]
 name = "eo9-stub-disk-mem"
 version = "0.0.0"
 dependencies = [
@@ -598,6 +602,15 @@ name = "eo9-stub-net-policy-ports"
 version = "0.0.0"
 dependencies = [
  "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-net-rtl8125"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "eo9-rtl8125",
  "wit-bindgen",
 ]
 

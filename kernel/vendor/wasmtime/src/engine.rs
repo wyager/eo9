@@ -20,6 +20,44 @@ use wasmtime_environ::{FlagValue, ObjectKind, TripleExt, Tunables};
 
 mod serialization;
 
+/// A callback invoked once per unit of compilation work (one function, trampoline, or
+/// builtin) on the **sequential** compilation path — the path taken when the
+/// `parallel-compilation` feature is disabled or turned off, i.e. single-threaded
+/// embeddings (bare-metal/no_std kernels). Parallel (rayon) compilation does not invoke
+/// it: threaded embedders have preemption and need no cooperation point.
+///
+/// Embedders whose executor is cooperative use this as the compile pipeline's
+/// scheduling seam: the callback can account progress, pat a hardware watchdog, or —
+/// when the compilation runs on a fiber/coroutine — suspend the stack between units so
+/// the rest of the system keeps running. The callback runs after each completed unit,
+/// so an embedder that gates a watchdog on it keeps the "no forward progress = reset"
+/// property: a compilation stuck inside a single unit never fires it.
+///
+/// (Eo9 vendor addition — see vendor/README.md; upstream-shaped so it can become a PR.)
+static COMPILE_PROGRESS_CALLBACK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Register (or clear) the sequential-compilation progress callback. See
+/// [`COMPILE_PROGRESS_CALLBACK`]; the latest registration wins, process-wide.
+pub fn set_compile_progress_callback(callback: Option<fn()>) {
+    COMPILE_PROGRESS_CALLBACK.store(
+        callback.map_or(0, |f| f as usize),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Invoke the registered progress callback, if any (sequential compilation only).
+#[inline]
+pub(crate) fn compile_progress_tick() {
+    let raw = COMPILE_PROGRESS_CALLBACK.load(core::sync::atomic::Ordering::Relaxed);
+    if raw != 0 {
+        // SAFETY: the only writer is `set_compile_progress_callback`, which stores a
+        // valid `fn()` (or 0, excluded above); `fn()` round-trips through usize.
+        let callback: fn() = unsafe { core::mem::transmute(raw) };
+        callback();
+    }
+}
+
 /// An `Engine` which is a global context for compilation and management of wasm
 /// modules.
 ///
@@ -213,7 +251,11 @@ impl Engine {
         // was turned off dynamically fallback to the non-parallel version.
         input
             .into_iter()
-            .map(|a| f(a))
+            .map(|a| {
+                let result = f(a);
+                compile_progress_tick();
+                result
+            })
             .collect::<Result<Vec<B>, E>>()
     }
 
@@ -248,7 +290,14 @@ impl Engine {
         // In case the parallel-compilation feature is disabled or the
         // parallel_compilation config was turned off dynamically fallback to
         // the non-parallel version.
-        input.into_iter().map(|a| f(a)).collect::<Result<(), E>>()
+        input
+            .into_iter()
+            .map(|a| {
+                let result = f(a);
+                compile_progress_tick();
+                result
+            })
+            .collect::<Result<(), E>>()
     }
 
     /// Take a weak reference to this engine.

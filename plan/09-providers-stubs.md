@@ -1010,3 +1010,353 @@ Match the priority order above; (1)+(2) unblock I2.
     *Also fixed while validating:* the greeting is now PREPENDED to net.text's pending output at
     accept time, so it precedes the banner/prompt the shell buffered while no connection existed
     (first transcript had it after the prompt — wire order now reads greeting → banner → prompt).
+
+46. **`net.rtl8125` — the RTL8125 2.5GbE driver: the board's trained PCIe links carry real
+    packets (2026-06-08, branch area/09-rtl8125; the convergence lane of plan/12's Orange Pi 5
+    Plus bring-up).** A guest component importing `eo9:pci/pci` (+ text for one diagnostic
+    line), exporting `eo9:net/l2` — net.virtio's real-silicon sibling, with every discipline
+    carried over verbatim: the take/put driver slot + cancellation-safe guard, the bring-up
+    claim (D41), drain-before-reuse on the transmit ring (D34, the `tx_published`/`tx_consumed`
+    cursor pair), bounded polls everywhere (reset, PHY OCP, link wait, tx completion, the
+    study-08-F2 short receive poll), typed errors never traps, and the "empty result = nothing
+    waiting" receive contract.
+
+    *Device model (the citation rule, every constant sourced).* The driver follows mainline
+    Linux r8169 — which drives the RTL8125 family with the **legacy 16-byte descriptor rings**
+    (opts1/opts2/addr), not the vendor driver's 32-byte v3 format — cross-checked against
+    Realtek r8125 and OpenBSD rge(4) where the 8125 diverges (IMR/ISR at 0x38/0x3c dword,
+    TxPoll_8125 doorbell at 0x90, GPHY_OCP MDIO window at 0xb8, the 2.5G advertisement in PHY
+    OCP 0xa5d4 bit 7, PHYstatus 0x6c bit 10 for 2500M). All of that lives in
+    `crates/eo9-rtl8125`, a pure no_std crate in the host workspace: register map, descriptor
+    encode/decode, GPHY command words — 10 host unit tests pin the encodings (the
+    eofs/eosh-core precedent: the component is a thin I/O shell, the bit arithmetic is
+    host-tested). Rings are 32/32 in one `alloc-dma` page (256-byte alignment checked, typed);
+    receive slots are 32 × 2 KiB with `RxMaxSize` = slot size so frames never span slots;
+    transmit pads to the 60-byte minimum in its bounce buffer rather than trusting hardware
+    padding (the first acceptance frame is a 42-byte ARP). Bring-up: MAC read → soft reset →
+    IMR 0 + ISR ack (the polled driver's ISR-suppression discipline in this device's dialect:
+    with the mask clear the NIC never asserts INTx) → PHY autoneg (10/100 + 1000FD + 2500FD)
+    with a bounded link wait that does NOT fail bring-up — link state is typed
+    (`info.up`/`link-down`) and re-read by later operations, so a slow negotiation just means
+    a retried check. Promiscuous OFF; **multicast = none for v1** (recorded: ARP/IPv4 need
+    broadcast + unicast only; all-multi is one RxConfig bit away when IPv6 ND arrives).
+    Deliberately omitted, recorded as first suspects if board traffic misbehaves: the
+    reference drivers' MAC-OCP errata pokes / MCU patch tables / EEE tuning, and the 8125B's
+    RX_PAUSE_SLOT_ON.
+
+    *INTx assessment (the rk3588_pcie design-note follow-up): polled v1, demux deferred.*
+    Wiring SPIs 245/250 is not the small path: each DW controller folds all four pins onto ONE
+    edge-rising SPI demuxed by an APB status read (+ hiword mask register), so the kernel
+    would need per-(segment, line) mask/record state where the shared swizzle model carries
+    four global level-triggered gpex lines, an APB read in the IRQ path, and edge-ack
+    semantics the level-oriented mask/unmask contract does not express — a real kernel
+    sub-lane with QEMU-path regression risk (`pci_intx` stays `WIRED = false` on the board;
+    the provider answers `unsupported`; the QEMU INTx path is untouched — disk.virtio's
+    interrupt round-trip stays green). The driver is polled with honest bounds by design and
+    by measurement parity with net.virtio; the kernel INTx demux is the recorded follow-up
+    alongside D59's interrupt-receive conversion.
+
+    *What QEMU can and cannot validate.* QEMU has no RTL8125 model (rtl8139 is its newest
+    Realtek NIC), so emulated coverage is exactly: composition shape (l2 sealed, pci the
+    residual), `pci.deny` underneath surfacing as the consumer's typed failure (both pinned in
+    tests/eo9-integration/tests/net_rtl8125.rs), and the live metal probe — verified at the
+    QEMU aarch64 eosh prompt: `net.rtl8125 $ l2check` compiled on-target (9.3 s) and refused
+    typed, naming the identity (`no RTL8125 (10ec:8125) function is visible…`), prompt intact
+    after. Everything past the probe is board-validated by the planner (this lane never
+    touches the serial port).
+
+    *Board deliverables.* The opi5plus **minimal** store grows from {hello, lspci} to the
+    acceptance set {hello, lspci, net.rtl8125, l2check, net.l4.over-l2, l4check, net.text,
+    telnetd, eosh} — 9 components, 10.6 MiB store, 22.2 MiB image (the full image carries all
+    56). The acceptance compositions run at the serial eosh prompt (boot grant `pci` in
+    bootargs; the headless `program=` runner links only kernel root providers, so composed
+    stacks are the shell's job — same shape as check-telnet). Three examples grew the minimal
+    arguments the bench needs, defaults preserving QEMU behavior exactly: `l2check
+    --gateway <ip>` (ARP target, default 10.0.2.2), `l4check --resolver <ip> --probe <ip>`
+    (DNS server / TCP-probe host, defaults 10.0.2.3 / 10.0.2.2), `telnetd --nic <name>
+    --address <ip> --prefix-length <n> --gateway <ip>` (the NIC the session stack composes
+    over, default net.virtio, plus static addressing baked into net.l4.over-l2's configure;
+    address+gateway travel together, prefix defaults to 24). The bench ladder (owner's LAN:
+    board 10.20.3.70/24, gateway 10.20.3.1, Mac client 10.20.3.108):
+
+    * (a) link layer: `net.rtl8125 $ l2check --gateway 10.20.3.1` → the router's MAC.
+    * (b) transport: `net.rtl8125 $ (net.l4.over-l2 --address 10.20.3.70 --prefix-length 24
+      --gateway 10.20.3.1) $ l4check --resolver 10.20.3.1 --probe 10.20.3.1` → an A record
+      for example.com + a typed TCP outcome. (No DHCP exists anywhere in the stack — static
+      config is the design, not a gap.)
+    * (c) the prize: `telnetd --nic net.rtl8125 --address 10.20.3.70 --gateway 10.20.3.1`,
+      then `telnet 10.20.3.70` from the Mac (port 23; cleartext, trusted-LAN only per D44).
+
+    Also in this lane (bench tooling): the serial-loader sender's mid-transfer stall alarm now
+    fires on **no ack progress for >10 s regardless of which loop holds control** (one
+    progress clock checked on every pass of both loops, wall-clock so a host sleep trips it on
+    wake) plus a serial `write_timeout` so a post-sleep wedged port driver cannot hang the
+    sender inside `write()` — the 2026-06-07 incident was per-loop-entry deadlines being
+    re-armed forever (boards/opi5-serial-loader/tools/send_image.py).
+
+    Verified: full `cargo xtask ci` green per milestone; `cargo test -p eo9-rtl8125` (10 ring/
+    PHY-word tests); the two usermode composition tests; the QEMU typed-refusal probe; bundle
+    refreshed (77 components); both board images rebuilt. QEMU regression sweep, all green:
+    `check-telnet` (telnetd's bare invocation unchanged — two sessions, concurrent refusal,
+    clean closes), the three arch demos canonical (aarch64/riscv64/x86_64 `demo` boots run to
+    their power-off lines), and live at the QEMU metal prompt both `net.virtio $ l2check`
+    (bare — 10.0.2.2 resolved, net.virtio byte-identical in this lane) and
+    `net.virtio $ l2check --gateway 10.0.2.2` (the new typed option through eosh). Board
+    acceptance is the planner's bench run — recorded here as pending.
+
+    *Board round 1 (2026-06-08, planner bench) → the OOB ownership fix.* Wins: PCIe bring-up
+    clean, PHY autoneg completed (`link up 2500 Mb/s`), factory MAC read (c0:74:2b:f8:22:33),
+    rings programmed, the composed stack compiled on-target in 5.5 s. Blocker: transmit
+    descriptors were never consumed (typed `io` after the bounded poll) despite link-up and
+    bus mastering — the recorded first-suspect confirmed: **the RTL8125 powers up under its
+    embedded MCU's OOB/management ownership and ignores host descriptor rings until the
+    driver takes ownership.** The fix (every step cited in `crates/eo9-rtl8125`, references
+    fetched verbatim — mainline v6.12 `r8169_main.c` and OpenBSD `if_rge.c`, which agree on
+    every ownership register): RealWoW off (MAC OCP 0xc0bc=0x00ff), quiesce (accept bits
+    cleared, RXDV gate set — byte 0xf2 bit 3 == MISC bit 19, StopReq + FIFO-empty wait on
+    MCU 0xd3 bits 5/4), soft reset, `NOW_IS_OOB` cleared (MCU 0xd3 bit 7), the link-list
+    handover (0xe8de bit 14 cleared + LINK_LIST_RDY waits on MCU bit 1, the three link-list
+    parameters c0aa/c0a6/c01e), then `rtl_hw_start_8125(_common)`: coalescing off
+    (INT_CFG0/INT_CFG1 + the 0xa00 block), Rdy_to_L23 off, UPS off, **the
+    legacy-descriptor-format select (MAC OCP 0xeb58 bit 0 cleared — without it the chip
+    parses the rings as the vendor 32-byte format; the other prime TX suspect)**, the cited
+    tuning writes with the A-vs-B arms picked by XID (`(TxConfig>>20)&0xfcf`; 0x609=A,
+    0x641=B — the board parts), the 0xe098/0xe00e start handshake, RXDV gate released. Ring
+    bases now write the high dword first (the reference's in-tree ARM note). Still omitted,
+    recorded: EPHY (PCIe SerDes) tuning tables, EEE MAC config, CPlusCmd, firmware MCU patch
+    blobs. Settles are bounded dummy register reads (the component holds no time
+    capability). Core-crate tests grew to 13 (MAC OCP words, XID decode, ownership bits).
+
+    *Liveness backstop, first real hit (kernel-lane reproduction context).* During the
+    failed round-1 TX wait the kernel's stranded-runnable detector fired once
+    (`liveness: stranded runnable: a child or service was runnable across an entire idle
+    backstop (n=1)`). The driver-side wait pattern that produced it: `send-frame`'s
+    completion poll is a loop of **pure synchronous host calls** — `dma-read` of the
+    descriptor's opts1 dword, 50M iterations at the time — with no await that ever suspends
+    (bar/dma calls resolve inline in the kernel root, and first-poll-inline retires them on
+    first poll), so the executor had no interleave point for the entire bound while a
+    sibling stayed runnable. The driver now bounds TX polls at 2M calls (seconds, not a
+    minute; still ≫ the µs-scale consume time) — but the structural fact stands for the
+    kernel lane: a guest hot-spinning on synchronous host calls is invisible to cooperative
+    scheduling until its activation returns, and only preemption (plan/05) or a host-call
+    budget covers it. recv's empty poll has the same shape at 2k calls (~ms), below the
+    backstop's window.
+
+    *Board round 2 (2026-06-08) → the DMA-coherence fix (kernel-side).* The OOB fix held
+    (the new diagnostic printed `xid 0x641 8125B+ link up 2500 Mb/s`) but the typed TX
+    failure repeated. The planner's triage was right that the failure is INBOUND (outbound
+    config/MMIO provably worked); the root cause sits one layer below the bridge hypothesis:
+    **mainline `rk3588-base.dtsi` carries no `dma-coherent` on any pcie node — RK3588 PCIe
+    masters are not cache-coherent** — while the kernel's `alloc-dma` buffers are ordinary
+    cacheable heap with no maintenance. The driver's descriptor writes (OWN bits included)
+    sat in dirty D-cache lines; the NIC's ring fetches read stale DRAM zeros and never saw
+    a descriptor to consume — and RX would have failed the same way, silently. This was the
+    board's FIRST inbound DMA ever (lspci is config-only), i.e. the bringup-playbook §3
+    rule meeting a brand-new handoff: a bus-mastering device is an agent at the PoC.
+
+    The fix is in the shared pci provider, so every driver gets it: `arch::dma_coherence::
+    sync` (board: the existing `clean_invalidate_to_poc` civac sweep + `dsb sy`; QEMU/other
+    arches: no-op — emulated DMA is coherent) is applied (a) once at `alloc-dma` (evicting
+    the allocation memset's dirty lines, which could otherwise write back OVER
+    device-written bytes later), (b) after every `dma-write` (the device's next fetch reads
+    DRAM; the sweep's `dsb sy` doubles as the reference drivers' `dma_wmb()` — a doorbell
+    `bar-write` can no longer overtake the descriptor, closing the round-2 hypothesis-2
+    ordering question by construction), (c) before every `dma-read` (the invalidate drops
+    stale lines so completions and received frames are observed). Driver code unchanged —
+    the discipline that every CPU access goes through the dma accessors is what makes the
+    provider the single right place.
+
+    Also landed for the bench (round-2 hypothesis 1, instrumented + defended): a
+    board-only claim diagnostic — on `open` and on `set-bus-master(true)` the kernel
+    prints the endpoint's command register AND its segment's root-port command, bus
+    numbers, and type-1 memory window (`pci[claim] …` / `pci[busmaster] …` lines), so the
+    next transcript proves bridge forwarding on the wire; and `set_bus_master(enable)` on
+    the board now re-asserts MSE+BME on the root port if anything cleared them since
+    bring-up (rk3588_pcie sets 0x107 at init; nothing is known to clear it — the re-assert
+    prints loudly if it ever fires). Hypothesis 3 closed by reference: mainline
+    `pcie-dw-rockchip.c` programs no inbound ATU in RC mode — inbound requests pass
+    through untranslated, matching our setup.
+
+    Verified: full ci green; check-telnet green (net.virtio DMA through the modified
+    accessors); one QEMU session running both `net.rtl8125 $ l2check` (typed refusal) and
+    `net.virtio $ l2check` (ARP resolved); both board images rebuilt.
+
+    *Board round 4 (2026-06-08, wire truth) → the full rge(4) bring-up tables.* Host-side
+    tcpdump on the same VLAN proved BOTH directions dead between the MAC engine and the
+    wire — the ARP request never appeared on a busy VLAN (35k pkts/min) and the receiver
+    caught none of it — while link (2500 Mb/s), descriptors (consumed), and the bridge
+    diagnostics were all healthy. The link-up-MAC-speed-config hypothesis is REFUTED by
+    reference: rge(4)'s `rge_link_state` does NOTHING at link change (no MAC writes), so a
+    working 8125B driver carries no post-autoneg MAC speed programming. What rge carries
+    that this driver did not is the bring-up table set it loads unconditionally before any
+    traffic — and OpenBSD ships these IN-SOURCE (ISC-licensed, no firmware files), which
+    both proves external firmware is unnecessary AND makes them transcribable into this
+    MIT tree with attribution. Transcribed into `crates/eo9-rtl8125/src/r25b_tables.rs`
+    (provenance header; sizes + spot values pinned by host tests):
+
+    * `MAC_MCU` (138 pairs, rge `rtl8125b_mac_bps`): replayed after halting the MAC MCU
+      (break vector 0xfc48=0, break registers 0xfc28..0xfc46=0, settle, 0xfc26=0; ram
+      page 0 via 0xe446) — `rge_hw_init`'s MAC_R25B arm.
+    * `EPHY` (46 pairs, rge `mac_r25b_ephy`): PCIe SerDes tuning through EPHYAR 0x80,
+      rge's exact 7-bit address masking replayed.
+    * `PHY_MCU` (1447 pairs, rge `MAC_R25B_MCU`): the GPHY MCU patch, applied inside the
+      0xb820/0xb800 patch-mode bracket ONLY when the PHY's ram code version (OCP
+      0xa436=0x801e → 0xa438) is not 0x0b99, then stamped — `rge_phy_config_mcu`.
+
+    Bring-up now mirrors rge's `rge_chipinit` → `rge_phy_config` order: exit-OOB → MAC
+    MCU halt+patch → PHY power (PMCH 0x6f |= 0xc0, BMCR=AUTOEN, GPHY state 0xa420==3) →
+    second reset + IMR/ISR → EPHY table → advertise-nothing + PHY reset → ram-code check
+    + PHY MCU patch → the ~30 `rge_phy_config_mac_r25b` writes → 0xa5b4 fix → **EEE
+    disabled MAC- and PHY-side** (0xe040[1:0], 0xe052[0], the a432/a5d0/a6d4/a6d8/a428/
+    a4a2/a442/a430 bits — un-configured EEE is itself a known frame-blackhole shape) →
+    hw_start_8125 → advertise + autoneg → rings/enable. Bring-up diagnostic now also
+    prints the GPHY state machine, the MAC EEE bits, and the ram code version, so the
+    next transcript shows the datapath state either way. Omitted from rge, recorded:
+    ASPM/clkreq disable + the CSI 0x108 write (PCIe power management, not frame path);
+    8125A tables (the board is 8125B, xid 0x641 — an A part would skip the tables and
+    likely still need its own set). Core crate: 16 host tests. Licensing note: the tables
+    are transcribed from OpenBSD rge(4) (Copyright (c) 2019-2024 Kevin Lo, ISC license) —
+    register/value facts plus replay order, with the provenance header in the module.
+
+    *Board round 5 (2026-06-08) readings → round 6 instrumentation.* The one-run
+    diagnostics worked: bring-up showed `xid 0x641, link up 2500, phy-state 3, eee-mac 0x0,
+    ram-code 0x0000`; the rx diagnostic showed `tok+` with tally `tx 1` (TX provably leaves
+    the MAC) and `rok- rdu- rx 0 missed 0` with the RXDV gate open (RX stone dead at the
+    PHY→MAC boundary — the PHY delivered zero symbols on a VLAN carrying broadcast ARP).
+    IMPORTANT correction recorded: round 5's `ram-code` print was the PRE-patch read — on a
+    cold PHY 0x0000 proves the patch branch RAN, not that the load failed; whether it took
+    was unobservable. Round 6 closes that hole and adds discrimination:
+
+    * The GPHY ram code is RE-READ after the load and reported `before->after` in the
+      bring-up line; `after != 0x0b99` on an 8125B prints a hard WARNING line, and both
+      patch-mode handshakes (0xb820 bit 4 / 0xb800 bit 6) warn loudly on
+      non-acknowledgement instead of the reference's silent continue.
+    * Loopback self-tests at every bring-up, one line each: MAC loopback (TxConfig bit 17,
+      vendor r8125.h `TxMACLoopBack`) proves descriptors/DMA/receive engine inside the
+      chip; PHY PCS loopback (IEEE BMCR bit 14, forced 1000FD = 0x4140) proves the
+      MAC<->PHY datapath to the MDI. PASS on both + dead wire RX discriminates
+      cable/switch (e.g. 802.1X-style port policy) from silicon — the competing theory the
+      board side could not previously kill. The tests share the raw transmit path (no
+      link check) and park the one-shot rx diagnostic while running.
+    * Compose-time speed cap: `rtl8125-config.configure(advertise-max)` (2500 default |
+      1000 | 100; option-C unconfigured default, never traps). Bench triage:
+      `net.rtl8125 --advertise-max 1000 $ l2check --gateway …` — frames at 1000 but not
+      2500 pin the 2.5G datapath. Validated end-to-end under QEMU through eosh's
+      compose/configure machinery (the configured composition compiles, instantiates,
+      validates, probes, refuses typed).
+
+    Core crate: 17 host tests (+ the loopback words). Full ci green; QEMU bare and
+    configured refusal probes green; both board images rebuilt.
+
+    *Board round 6 (2026-06-08) results → round 7, the link probe.* The round-6
+    instrumentation resolved cleanly on silicon: `ram-code 0x0000->0x0b99` (the round-5
+    pre-read correction confirmed; warm re-claims show `0x0b99->0x0b99` and skip), both
+    loopback tests PASS every run at 2500 and 1000. The decisive split: **at 2500 wire RX
+    is totally dead; at `--advertise-max 1000` wire RX works end-to-end** (live-proven: a
+    ping burst from the bench Mac moved the broadcast tally in real time). So 2.5GBASE-T
+    is its own deferrable wire problem, and at 1000 the remaining symptom is TX-side:
+    the gateway never replies and the Mac never learns the board.
+
+    A confound found while building round 7 and recorded loudly: **every board ARP so
+    far carried sender protocol address 10.0.2.15** — l2check's hardcoded slirp source
+    survived the round-3 `--gateway` change. Consequences: (a) the bench evidence "the
+    Mac never learns 10.20.3.70" was expected EVEN WITH PERFECT TX, since the request
+    advertised 10.0.2.15; (b) an off-subnet sender is precisely what DAI-class ingress
+    filtering drops and what a cautious gateway declines to answer — the round-6 "TX
+    filtered" reading is unproven until the probe carries the right source. Round 7's
+    `--source` closes it.
+
+    l2check grows into a one-shot link probe (world: `gateway`/`source`/`beacon`
+    options, defaults preserve QEMU behavior bit-for-bit):
+
+    * ARP retransmitted through the whole window (~1 s cadence; single-shot was
+      indefensible into a lossy/filtered port), window widened to 2048 polls.
+    * ARP responder: any who-has for `source` is answered (so the bench Mac's ping
+      measures whether board ARP TX crosses the switch). telnetd needs no sibling
+      change — its stack's net.l4.over-l2/smoltcp already answers ARP for its
+      configured address.
+    * UDP broadcast beacon (`--beacon true`): `source`:19099 → 255.255.255.255:19099,
+      payload `eo9-beacon <seq>`, ~2/s, IPv4 header checksum verified independently;
+      Ethernet broadcast needs no ARP, so beacon-arrives-but-ARP-does-not = DAI-class
+      ARP filtering, nothing-arrives = MAC-level port security (`nc -ul 19099` on the
+      listener, no sudo).
+    * Counts line on every exit: `probes - arp sent N, who-has answered M, beacons
+      sent K` — with the driver's tally dump this makes every run advance a round.
+    * Pacing rides the poll cadence (the world imports no clock — recorded
+      approximation, ~ms per empty poll).
+
+    Round-7 bench line: `net.rtl8125 --advertise-max 1000 $ l2check --gateway 10.20.3.1
+    --source 10.20.3.70 --beacon true`. QEMU-validated live: bare `net.virtio $ l2check`
+    resolves with the counts line; the full board-flavor invocation resolves with
+    `beacon on, beacons sent ≥1` against slirp. Full ci green; both board images
+    rebuilt. The 2.5GBASE-T RX fault stays open as the lane's deferrable follow-up
+    (suspects: the omitted EPHY/ASPM items, cable class, switch 2.5G negotiation).
+
+    *Board round 7 (2026-06-08): CURED — the wire works.* With `--source 10.20.3.70` the
+    whole picture inverted: `ok: resolved("58:47:ca:7f:4e:2c")` (the gateway's true MAC),
+    the bench Mac learned `10.20.3.70 at c0:74:2b:f8:22:33` from the responder's reply,
+    and the unprivileged `nc -ul 19099` caught `eo9-beacon 6` — ARP, ARP-response, and
+    UDP broadcast all proven both directions through the office switch at 1000 Mb/s. No
+    DAI, no port security: the round-6 "TX blocked" story was entirely the hardcoded
+    slirp source address (the round-7 confound note above). **The deferred follow-up:**
+    2500 Mb/s RX stays dead — every board composition runs with
+    `net.rtl8125 --advertise-max 1000` until the 2.5GBASE-T datapath is solved
+    (suspects: the omitted EPHY/ASPM items, cable class, switch 2.5G interop).
+
+    *Round 8: the last rung before the prize.* Two parameterizations, defaults
+    bit-for-bit (check-telnet green): l4check's second option is renamed `--probe` →
+    `--tcp-target` (same default 10.0.2.2, same port-9 refusal semantics); telnetd
+    gains `--advertise-max`, forwarded to the NIC's own configure interface at compose
+    time (net.rtl8125's `rtl8125-config`) — a NIC without the interface (net.virtio)
+    answers with a clean typed configure error, never a trap (option-C discipline;
+    QEMU-verified live: `telnetd --advertise-max 1000` → `error: configure(…)`).
+    Also QEMU-verified live: `net.virtio $ net.l4.over-l2 $ l4check --resolver 10.0.2.3
+    --tcp-target 10.0.2.2` → `ok: resolved("example.com is …; tcp 10.0.2.2:9 ->
+    ConnectionRefused")`. The board ladder to the finish line:
+
+    * `net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address 10.20.3.70
+      --prefix-length 24 --gateway 10.20.3.1) $ l4check --resolver 10.20.3.1
+      --tcp-target 10.20.3.1`
+    * `telnetd --nic net.rtl8125 --advertise-max 1000 --address 10.20.3.70
+      --gateway 10.20.3.1 --sessions 4`, then `telnet 10.20.3.70` from the Mac.
+
+    *Board round 8/9 (2026-06-08): the ladder hit the kernel.* Round 8's parameterized
+    l4check line composed to a 486 KiB fusion; the board hardware-reset mid-compile —
+    bench-timed at codegen+18.2 s, exactly the 22.4 s DW-WDT period from the last
+    drive-loop pat. On-target codegen ran synchronously inside the exec `compile` host
+    call, starving the drive loop (no pats, no `hb`) for the whole compile. Fixed in the
+    kernel (plan/12, the sliced-codegen entry): `Component::new` now runs on a fiber that
+    yields every ~5 ms of compile work; between slices the drive loop pumps children,
+    services, the watchdog, and a throttled `codegen: still compiling` line. QEMU TCG
+    validation: the same l4check fusion compiled in 56 s across 1178 slices with liveness
+    lines every 5 s and resolved; check-telnet green through the sliced path (its
+    sessions compile the 4-component stack). The telnet prize ladder is unblocked.
+
+    *Round 10 (2026-06-08): the merge review's one blocker — the RX re-arm line-clobber —
+    fixed with lazy line-granularity re-arm.* The defect (review-verified): descriptors
+    are 16 bytes, the board's DMA cache maintenance is 64-byte-line granular, and the
+    ring base is line-aligned, so 4 RX descriptors share each line; `recv()`'s immediate
+    per-slot re-arm wrote back the CPU's stale snapshot of the 3 neighbors — racing a
+    completion the NIC stores in a neighbor between the poll's read and the sweep's
+    writeback. The writeback restores OWN=1 over the device's completion; the NIC never
+    rewrites it; the frame is lost and the ring stalls at that slot until wrap.
+    Microburst traffic lands in the µs-scale window; QEMU cannot reproduce (coherent,
+    sweeps no-op); TX was already safe (single in-flight + D34 drain).
+
+    The fix follows the reviewer's shape exactly (the code agreed — ring consumption is
+    strictly sequential, which makes the policy a one-liner): a line is re-armed only
+    when its LAST slot is consumed, at which point all 4 slots are OWN=0 and the device
+    provably owns nothing in the line (it never writes a descriptor it does not own);
+    one 64-byte dma-write re-posts the whole line. Costs at most 3 of 32 slots parked
+    unarmed. The invariant is documented in the core crate at the stride definition
+    (`DESC_BYTES`), the policy helpers (`rx_line_to_rearm`, `encode_rx_line`) are pure
+    and host-tested (20 tests now): a consumed/posted model over two ring wraps asserts
+    no re-post while any line slot is device-owned, the ≤3-slot backlog bound, and the
+    slots-28..31 wrap with EOR only on slot 31. Bench visibility: the counters
+    diagnostic line gains `consumed-slots N rearmed-lines M` (expect N ≈ 4M under
+    traffic). Also folded in (reviewer non-blocking #2): fibercompile's UNITS counter
+    is now per-compile across nesting; #1 (fiber guard page) is the kernel lane's
+    GAPS entry. Re-verified: crate tests, full ci, QEMU probes A
+    (`net.virtio $ l2check` → resolved) and C (typed refusal) matching the reviewer's
+    transcripts; both board images rebuilt. Board burst-RX confirmation is the
+    planner's post-merge run.

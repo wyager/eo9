@@ -50,9 +50,18 @@ CHUNK = 4096
 # enough that ack latency never starves the wire, shallow enough that a stub that stops
 # acking (or answers 'E'/'T') is noticed within a few seconds.
 WINDOW = 8 * ACK_INTERVAL
-# Mid-transfer alarm: abort if the window is full and no new ack arrives for this long
-# (the stub's own stall timeout is ~3 s, so 10 s of nothing means it is gone).
+# Mid-transfer alarm: abort if at least one ack is overdue and none arrives for this
+# long (the stub's own stall timeout is ~3 s, so 10 s of nothing means it is gone).
+# The alarm is checked on EVERY pass of EVERY loop — outer streaming loop included —
+# against the time of the last ack progress, not per-loop-entry deadlines: the
+# 2026-06-07 incident (a host sleep mid-transfer; the sender repainted 77% for 80+
+# minutes) was a deadline that kept being re-armed each time control re-entered the
+# window-block loop, so no single loop pass ever saw 10 quiet seconds.
 ACK_STALL_SECONDS = 10.0
+# A serial write that blocks longer than this means the OS driver wedged (post-sleep
+# USB-serial is the known case) — surface it as the same stall alarm instead of
+# hanging forever in write() where no alarm can run.
+WRITE_TIMEOUT_SECONDS = 15.0
 
 
 def selftest() -> None:
@@ -169,31 +178,62 @@ def main() -> None:
         f"x0=0x{args.x0:x}, crc {crc:08x}, ~{len(payload) / 150_000:.0f}s at 1.5 Mbaud"
     )
 
-    s = serial.Serial(args.port, args.baud, timeout=0.05)
+    s = serial.Serial(
+        args.port, args.baud, timeout=0.05, write_timeout=WRITE_TIMEOUT_SECONDS
+    )
     try:
         s.reset_input_buffer()
         s.write(MAGIC + struct.pack("<QQQ", args.load_addr, len(payload), args.x0))
 
         acks, start, last_paint = 0, time.time(), 0.0
+        # The single ack-progress clock the stall alarm reads: bumped ONLY when the
+        # ack count advances, checked on every loop pass (outer and window-block),
+        # so the alarm fires within ~10 s of the acks stopping no matter which loop
+        # holds control. Wall clock on purpose: a host sleep advances it, so the
+        # alarm fires immediately on wake instead of resuming a doomed transfer.
+        last_progress = time.time()
+
+        def note_progress(before: int, now: int) -> None:
+            nonlocal last_progress
+            if now != before:
+                last_progress = time.time()
+
+        def check_stall(sent: int) -> None:
+            # At least one ack overdue (the stub owes one per 64 KiB delivered) and
+            # nothing heard for the stall window: the stub is gone.
+            if (
+                sent - acks * ACK_INTERVAL >= ACK_INTERVAL
+                and time.time() - last_progress > ACK_STALL_SECONDS
+            ):
+                print(
+                    f"\nno ack progress for {ACK_STALL_SECONDS:g}s mid-transfer "
+                    f"(acked {acks * ACK_INTERVAL}/{len(payload)}) — stub gone? re-run",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
         for off in range(0, len(payload), CHUNK):
-            s.write(payload[off : off + CHUNK])
+            try:
+                s.write(payload[off : off + CHUNK])
+            except serial.SerialTimeoutException:
+                print(
+                    f"\nserial write blocked for {WRITE_TIMEOUT_SECONDS:g}s "
+                    "— port driver wedged (host slept?); re-run",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             sent = min(off + CHUNK, len(payload))
             # Poll acks without blocking; the wire sets the pace.
+            before = acks
             acks, term = drain_acks(s, acks, block=False)
+            note_progress(before, acks)
+            check_stall(sent)
             # Window flow control: block for acks only when too far ahead of the stub.
-            stall_deadline = time.time() + ACK_STALL_SECONDS
             while not term and sent - acks * ACK_INTERVAL > WINDOW:
                 before = acks
                 acks, term = drain_acks(s, acks)  # blocking slice (port timeout)
-                if acks != before:
-                    stall_deadline = time.time() + ACK_STALL_SECONDS
-                elif time.time() > stall_deadline:
-                    print(
-                        f"\nno ack progress for {ACK_STALL_SECONDS:g}s mid-transfer "
-                        "— stub gone? re-run",
-                        file=sys.stderr,
-                    )
-                    sys.exit(1)
+                note_progress(before, acks)
+                check_stall(sent)
             if term:
                 print(f"\nstub answered {term.decode()!r} mid-transfer", file=sys.stderr)
                 sys.exit(1)

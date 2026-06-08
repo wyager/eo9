@@ -23,6 +23,8 @@ pub mod async_demo;
 pub mod codegen;
 #[cfg(feature = "wasm-storedisk")]
 pub mod diskcache;
+#[cfg(all(feature = "wasm-codegen", feature = "wasm-store"))]
+pub mod fibercompile;
 #[cfg(feature = "wasm-hello")]
 pub mod hello;
 #[cfg(feature = "wasm-store")]
@@ -75,6 +77,12 @@ const NATIVE_TARGET: &str = "x86_64-unknown-none";
 /// rest of the defaults are computed identically on both sides because wasmtime derives
 /// them from the same bare-metal target ([`NATIVE_TARGET`]).
 pub fn new_engine() -> Result<Engine, wasmtime::Error> {
+    // Sliced on-target codegen (fibercompile): route the vendored compiler's
+    // per-function progress ticks to the fiber scheduler so long compiles yield to
+    // the drive loop (idempotent; process-wide).
+    #[cfg(all(feature = "wasm-codegen", feature = "wasm-store"))]
+    wasmtime::set_compile_progress_callback(Some(fibercompile::progress_tick));
+
     let mut config = Config::new();
     // With the compiler (`wasm-codegen`) linked in, wasmtime would otherwise try to infer
     // the host target through `cranelift-native`, which needs `std` and is disabled here.

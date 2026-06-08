@@ -78,6 +78,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-net-l4-none",
     "eo9-stub-net-l4-over-l2",
     "eo9-stub-net-policy-ports",
+    "eo9-stub-net-rtl8125",
     "eo9-stub-net-text",
     "eo9-stub-net-virtio",
     "eo9-stub-pci-admit-address",
@@ -187,6 +188,13 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // can compose `net.virtio $ l2check` and `net.virtio $ net.l4.over-l2 $ l4check`
     // against a QEMU user-mode NIC (boot with the `pci` grant and the xtask `net` flag).
     ("eo9-stub-net-virtio", "net.virtio"),
+    // The RTL8125 2.5GbE driver — net.virtio's real-silicon sibling for the Orange
+    // Pi 5 Plus's two onboard NICs (10ec:8125 behind the RK3588 DW root ports;
+    // plan/09 D46, plan/12 board lane). Under QEMU (no RTL8125 model) it refuses
+    // typed, naming what it probed; the same compositions swap in on the board:
+    //   net.rtl8125 $ l2check --gateway 192.168.1.1
+    //   net.rtl8125 $ (net.l4.over-l2 --address … --gateway …) $ l4check --resolver …
+    ("eo9-stub-net-rtl8125", "net.rtl8125"),
     ("eo9-example-l2check", "l2check"),
     // The virtual-NIC switch and its two-port check, so the single-owner-NIC sharing
     // demo runs at the metal prompt (one physical NIC, two isolated virtual MACs):
@@ -2053,11 +2061,24 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
         build_store_image_filtered(
             root,
             KERNEL_CHECK_TARGET,
-            // hello = the smoke program; lspci = the PCIe bring-up acceptance (the
-            // RTL8125s visible through the DW config shim — docs/board/rk3588-pcie.md).
+            // The board acceptance set (plan/09 D46): hello = the smoke program;
+            // lspci = the PCIe bring-up acceptance; then the RTL8125 network ladder —
+            // l2check (ARP over the real wire), l4check over the static-IP middleware,
+            // and the prize, telnetd's net.rtl8125 $ net.l4.over-l2 $ net.text $ eosh
+            // session served to the bench LAN. eosh doubles as the serial console the
+            // compositions are typed at (the boot falls back to the plain console
+            // when init is not baked — deliberate, the minimal image stays small for
+            // the serial loader).
             &[
                 ("eo9-example-hello", "hello"),
                 ("eo9-example-lspci", "lspci"),
+                ("eo9-stub-net-rtl8125", "net.rtl8125"),
+                ("eo9-example-l2check", "l2check"),
+                ("eo9-stub-net-l4-over-l2", "net.l4.over-l2"),
+                ("eo9-example-l4check", "l4check"),
+                ("eo9-stub-net-text", "net.text"),
+                ("eo9-example-telnetd", "telnetd"),
+                ("eosh", "eosh"),
             ],
             "store-opi5plus-min.img",
         )?

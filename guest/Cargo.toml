@@ -37,6 +37,10 @@ eo9-guest = { path = "eo9-guest" }
 # crate the host tests and the kernel use, consumed here by the fs.eofs provider. Its
 # own `workspace = true` pins (blake3, lz4_flex) resolve against the repo-root table.
 eo9-eofs = { path = "../crates/eo9-eofs" }
+# The RTL8125 device core (register map, descriptor ring encode/decode, GPHY OCP
+# command words) for the net.rtl8125 driver: no_std, host-tested in the root
+# workspace — the same shared-engine pattern as eo9-eofs.
+eo9-rtl8125 = { path = "../crates/eo9-rtl8125" }
 # The TCP/IP engine for the net.l4.over-l2 middleware provider (plan/09 Decision 18):
 # no_std + alloc, Ethernet + IPv4 + TCP + UDP only. Guest-workspace-only — it never
 # enters the host or kernel dependency tree.

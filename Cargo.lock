@@ -524,6 +524,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-rtl8125"
+version = "0.1.0"
+
+[[package]]
 name = "eo9-runtime"
 version = "0.1.0"
 dependencies = [

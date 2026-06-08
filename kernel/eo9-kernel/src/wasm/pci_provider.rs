@@ -160,11 +160,17 @@ impl DmaBuffer {
         } else {
             DMA_ALIGN - misalignment
         };
-        DmaBuffer {
+        let buffer = DmaBuffer {
             storage,
             offset,
             len,
-        }
+        };
+        // The zeroing above went through the (cacheable) heap mapping: push it to the
+        // PoC NOW, or those dirty lines could write back LATER — over bytes the device
+        // has DMA'd in the meantime (arch::dma_coherence docs; a no-op on coherent
+        // machines).
+        crate::arch::dma_coherence::sync(buffer.bus_address() as usize, len);
+        buffer
     }
 
     fn bus_address(&self) -> u64 {
@@ -177,6 +183,17 @@ impl DmaBuffer {
 
     fn bytes_mut(&mut self) -> &mut [u8] {
         &mut self.storage[self.offset..self.offset + self.len]
+    }
+
+    /// Cache-maintain `[start, end)` of the window around a CPU access — clean +
+    /// invalidate to the PoC, then barrier. Called BEFORE the copy on `dma-read` (drop
+    /// stale lines so the load sees what the device wrote) and AFTER the copy on
+    /// `dma-write` (the device's next fetch reads the bytes from DRAM; the sweep's
+    /// `dsb sy` is also the reference drivers' `dma_wmb()` — a doorbell written through
+    /// a later `bar-write` cannot overtake the descriptor). No-op where DMA is coherent
+    /// (QEMU); see `arch::dma_coherence`.
+    fn sync_range(&self, start: usize, end: usize) {
+        crate::arch::dma_coherence::sync(self.bus_address() as usize + start, end - start);
     }
 }
 
@@ -613,6 +630,10 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
                                     bus_master_enabled: false,
                                 },
                             );
+                            // Board bench evidence: the claimed function's command
+                            // register + its root port's command/buses/window (a no-op
+                            // print on QEMU builds).
+                            pci::claim_diagnostic(address, "claim");
                             Ok(Resource::new_own(rep))
                         }
                     }),
@@ -823,6 +844,11 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
                     if let Ok(open) = tables.device_mut(device.rep()) {
                         open.bus_master_enabled = enable;
                     }
+                    if enable {
+                        // Board bench evidence: the final command state of endpoint and
+                        // root port at the moment DMA is licensed.
+                        pci::claim_diagnostic(address, "busmaster");
+                    }
                     Ok(())
                 });
                 Ok((result,))
@@ -967,6 +993,9 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
          -> Result<(Vec<u8>,)> {
             let buffer = store.data_mut().pci_tables().buffer(buffer.rep())?;
             let (start, end) = dma_byte_range(buffer.len, offset, len)?;
+            // Invalidate before the read: the device may have DMA'd here since the
+            // CPU last looked (no-op on coherent machines).
+            buffer.sync_range(start, end);
             Ok((buffer.bytes()[start..end].to_vec(),))
         },
     )?;
@@ -979,6 +1008,10 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
             let buffer = store.data_mut().pci_tables().buffer_mut(buffer.rep())?;
             let (start, end) = dma_byte_range(buffer.len, offset, bytes.len() as u64)?;
             buffer.bytes_mut()[start..end].copy_from_slice(&bytes);
+            // Clean to the PoC after the write: the device's next fetch reads DRAM,
+            // and the sweep's barrier orders this ahead of any subsequent doorbell
+            // bar-write (no-op on coherent machines).
+            buffer.sync_range(start, end);
             Ok(())
         },
     )?;

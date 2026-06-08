@@ -2078,13 +2078,79 @@ link bring-up + enumeration.
   (root port + endpoints enumerate), `link DOWN … (ltssm …, debug …)` → ROOT_ONLY (config
   access still provable on the bench), DBI dead → disabled. Every step prints before
   first touch of a new block, all waits bounded, watchdog armed before any of it runs.
+* **DMA coherence** (2026-06-08, via area/09-rtl8125 board round 2): RK3588 PCIe masters
+  are NOT cache-coherent (no `dma-coherent` in mainline rk3588-base.dtsi), and the wasm
+  provider's DMA buffers are cacheable heap — the first inbound DMA on the board (the
+  RTL8125's ring fetch) read stale DRAM and saw no descriptors. The provider now brackets
+  every DMA-buffer access with `arch::dma_coherence::sync` (board: civac-to-PoC sweep +
+  `dsb sy`, the playbook §3 primitive; QEMU/riscv64/x86_64: no-op): at `alloc-dma`
+  (memset eviction), after `dma-write` (also the `dma_wmb()`-before-doorbell ordering),
+  before `dma-read`. Plus board claim diagnostics (`pci[claim]`/`pci[busmaster]` lines:
+  endpoint + root-port command/buses/mem-window) and a defensive root-port MSE+BME
+  re-assert when a downstream function gets bus mastering. Mainline pcie-dw-rockchip
+  confirms no inbound ATU is needed in RC mode (pass-through).
 * **INTx**: deferred by design — DW muxes all four pins on one SPI per controller
   (245/250, edge-rising) demuxed via PCIE_CLIENT_INTR_STATUS_LEGACY; per-(segment,line)
   state the swizzle model lacks. `pci_intx::WIRED = false` on the board (provider answers
   `unsupported`; lspci needs none); the demux design is in the module docs for the driver
-  lane.
+  lane. *Driver-lane assessment (2026-06-08, area/09-rtl8125, plan/09 D46): wiring the
+  demux is NOT small — per-(segment,line) mask/record state vs the four global gpex
+  lines, an APB status read in the IRQ path, and edge-ack semantics the level-oriented
+  mask/unmask contract does not express, with QEMU-path regression risk. The RTL8125
+  driver ships polled v1 (honest bounds, net.virtio parity); the kernel INTx demux stays
+  the recorded follow-up, to land together with the D59 interrupt-receive conversions.*
 * **Images**: minimal store gains `lspci`; bench = serial-loader path, bootargs
   `program=lspci pci`. Acceptance lines: two `pcie[…]: link …` prints, then lspci showing
   `0000:00:00.0 1d87:3588 … pci-bridge`, `0000:01:00.0 10ec:8125 … endpoint` (right) and
   the same pair on segment 0001 (left). Full ci + canonical aarch64/riscv64 demos +
-  `pci program=lspci` green; board images rebuilt.
+  `pci program=lspci` green; board images rebuilt. *Since area/09-rtl8125: the minimal
+  store is the 9-component acceptance set (hello, lspci, net.rtl8125, l2check,
+  net.l4.over-l2, l4check, net.text, telnetd, eosh — 22.2 MiB image, ~155 s at
+  1.5 Mbaud); the network acceptance ladder runs at the serial eosh prompt under a `pci`
+  boot grant — bench lines in plan/09 D46.*
+
+76. **Sliced on-target codegen — long compiles no longer starve the drive loop (2026-06-08,
+    branch area/09-rtl8125, board round 9; owner steer: "compilation should not block our
+    task loop").** WHERE CODEGEN RAN (the observation the round was opened to record):
+    `Component::new` executed synchronously inside the exec `compile` host call, i.e. on
+    the calling task's poll inside the session drive loop's root `call.poll()` — the
+    executor never saw it as anything but one long poll. For the whole compile no
+    drive-loop pass ran: no children/services pumped, no `wdt::pat()`, no `hb`. The board
+    DW-WDT (22.4 s) then reset the machine for any composition needing more Cranelift
+    time — bench-confirmed 2-for-2 on a 486 KiB 4-component fusion, reset at
+    codegen+18.2 s ≈ 22.4 s after the last pat. Same starvation family as the GAPS'd
+    stranded-runnable hits (a guest hot-spinning on sync host calls), but kernel-side.
+
+    The fix makes compilation cooperative without touching the WIT surface or guests:
+
+    * Vendored wasmtime grows a **sequential-pipeline progress callback**
+      (`set_compile_progress_callback`; ticks per compiled function/trampoline in
+      `run_maybe_parallel{,_mut}`'s non-rayon arms — vendor/README.md, upstream-shaped).
+    * `wasm/fibercompile.rs`: the compile runs on a `wasmtime_internal_fiber::Fiber` (the
+      same stack-switching primitive the CM-async machinery already uses on this target);
+      the callback suspends it after ~5 ms slices; between slices a pump runs one
+      scheduling pass — `drive_children()` + `drive_services()` + `wdt::pat()` +
+      `wake_idle()` + a 5 s-throttled `codegen: still compiling (N functions)` line. The
+      checkout discipline (`ChildSlot::Polling`/`SRun::Polling`) makes the nested pass
+      skip the task the compile runs inside (no re-entry); `CURRENT_PARENT` is
+      saved/restored around the nested pass; nested compiles get their own fiber with
+      ticks routed innermost, inner pumps pat-only. The fiber is always driven to
+      completion inside the host call (the no_std fiber cannot unwind a parked stack), so
+      cancellation semantics are unchanged.
+    * **The watchdog pat stays honest** (loop-safety doctrine): pats happen only in the
+      pump — only after a slice of real compilation completed AND a scheduling pass ran.
+      A compile wedged inside one function never completes a slice, never pats, and the
+      board still resets. No IRQ-side or unconditional patting. (Why `hb` stopped before:
+      the heartbeat rides `wdt::pat()`, whose call sites are drive-loop passes — timer
+      IRQs kept firing during compiles, but the pat correctly does not live there.)
+
+    Verified: QEMU TCG compiled the 442 KiB l4check fusion in 56 s across **1178 slices**
+    with `still compiling` lines every 5 s and a correct result; check-telnet green
+    through the sliced path; three arch demos canonical (the hook is a relaxed atomic
+    load per function when unregistered); full ci green. *Recorded follow-up (the full
+    upgrade):* make `eo9:exec/compile` WIT-async so the CALLER can also proceed —
+    ripples through the guest SDK, eosh, telnetd, the usermode runtime, and the /vm
+    blob; the fiber here is the mechanism it would reuse. *Also recorded:* the boot-time
+    codegen demo and `compile_component`-less paths still compile unsliced (tiny seeds);
+    pre/post-pipeline phases (validation, object emission) run between ticks and are
+    seconds-scale, inside the watchdog budget.

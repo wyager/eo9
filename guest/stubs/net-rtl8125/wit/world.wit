@@ -1,0 +1,40 @@
+/// eo9:net-rtl8125 — the RTL8125 2.5GbE driver world (plan/09; the board lane of
+/// plan/12's Orange Pi 5 Plus bring-up).
+///
+/// `net.rtl8125` is `net.virtio`'s real-silicon sibling: it imports the PCI capability
+/// (`eo9:pci/pci`), drives a Realtek RTL8125 PCIe NIC (the two onboard 2.5GbE ports of
+/// the Orange Pi 5 Plus enumerate as 10ec:8125 behind the RK3588's DW root ports)
+/// through configuration space, BAR registers, and DMA descriptor rings, and exports
+/// `eo9:net/l2` — interfaces, MAC addresses, whole Ethernet frames — so the existing
+/// link-layer stack (`l2check`, `net.l4.over-l2`, `net.text`, telnetd's session
+/// composition) runs over the physical wire by composition: `net.rtl8125 $ program`.
+///
+/// `eo9:text/text` is imported only for one diagnostic line on first use (the probed
+/// MAC address and negotiated link speed); the driver works identically without a
+/// console.
+///
+/// There is no configure interface: the documented default behaviour is to claim the
+/// first RTL8125 function visible through the granted PCI capability on first use
+/// (the option-C default-configuration rule, plan/09 Decision 14). Selecting one of
+/// the two board NICs is `pci.filtered`'s job, composed in front of the driver
+/// (`pci.admit-address` distinguishes them — both NICs share the 10ec:8125 identity,
+/// so the vendor policy cannot).
+package eo9:net-rtl8125@0.1.0;
+
+/// Compose-time configuration: `configure(advertise-max)` caps the speeds
+/// autonegotiation advertises (2500, 1000, or 100). Unconfigured, the driver
+/// advertises everything up to 2500BASE-T (the option-C default rule — plain
+/// composition never traps). The knob exists for bench triage: a link that moves
+/// frames at `--advertise-max 1000` but not at 2500 pins the 2.5G datapath.
+interface rtl8125-config {
+    use eo9:net/l2@0.1.0.{l2-impl};
+    configure: func(advertise-max: u16) -> result<l2-impl, string>;
+}
+
+world rtl8125-net {
+    import eo9:pci/pci@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    export eo9:net/l2@0.1.0;
+    export rtl8125-config;
+}
