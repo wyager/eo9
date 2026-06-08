@@ -30,6 +30,13 @@ linked_list_allocator = "0.10.5"
 # workspace only — the host workspaces keep using the unmodified registry crate.
 [patch.crates-io]
 wasmtime = { path = "vendor/wasmtime" }
+# The no_std fiber backend allocates stacks from the global allocator and only aligns the
+# *base* of the stack to 16 — the *top* (where execution starts) keeps the raw allocation's
+# end address, so a heap allocation ending on an 8-(not-16-)aligned address shifts every
+# frame pointer on the fiber stack by 8. The vendored copy aligns the top down to 16 as
+# well (src/nostd.rs; see vendor/README.md). Host/guest workspaces use std fibers (mmap,
+# page-aligned) and are unaffected.
+wasmtime-internal-fiber = { path = "vendor/wasmtime-fiber" }
 # On-target codegen (plan/12 Decisions 26–28): the kernel compiles components on the
 # machine via Cranelift, behind the off-by-default `wasm-codegen` feature. That needs the
 # wasmtime compile layers to build no_std+alloc; these two vendored crates carry the
