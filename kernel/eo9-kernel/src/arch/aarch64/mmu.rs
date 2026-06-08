@@ -60,13 +60,18 @@ const RAM_END: usize = RAM_BASE + RAM_SIZE;
 const RAM_L1_INDEX: usize = RAM_BASE >> 30;
 /// Level-1 entries mapped as 1 GiB Device-nGnRnE blocks. QEMU `virt`: the low gigabyte
 /// (UART/RTC/GIC/ECAM). Orange Pi 5 Plus: the fourth gigabyte (0xC000_0000..), which holds
-/// every RK3588 peripheral the kernel touches (UART2 0xfeb5_0000, GIC 0xfe6x_xxxx) plus
+/// every low RK3588 peripheral the kernel touches (UART2 0xfeb5_0000, GIC 0xfe6x_xxxx,
+/// the PCIe APB/config/mem windows 0xf0xx_xxxx-0xfeex_xxxx, CRU/GRF/PMU/GPIO) plus
 /// U-Boot's relocated remains and control FDT (read-only data reads through a Device
-/// mapping are fine; nothing is ever executed there).
+/// mapping are fine; nothing is ever executed there) — and the **42nd gigabyte**
+/// (0xa_4000_0000..0xa_8000_0000), where the RK3588 parks all five PCIe controllers'
+/// DBI blocks (rk3588-base.dtsi `reg` "dbi": 0xa_4000_0000..0xa_4140_0000; the DW
+/// config shim and the bring-up code read/write root-port config and iATU registers
+/// there). Reaching above 4 GiB is what forces the board's wider T0SZ below.
 #[cfg(not(feature = "board-opi5plus"))]
 const DEVICE_L1: &[usize] = &[0];
 #[cfg(feature = "board-opi5plus")]
-const DEVICE_L1: &[usize] = &[3];
+const DEVICE_L1: &[usize] = &[3, 41];
 /// First byte past the heap (src/heap.rs): the top of DRAM on this machine.
 pub(crate) const HEAP_END: usize = RAM_END;
 /// Number of 2 MiB level-2 entries needed to cover DRAM (= number of level-3 tables).
@@ -105,9 +110,19 @@ const T_RX_RO: u64 = NORMAL | AP_RO | UXN;
 // MAIR_EL1: attribute 0 = Device-nGnRnE (0x00), attribute 1 = Normal write-back R/W-allocate.
 const MAIR_VALUE: u64 = 0xFF << 8;
 
-// TCR_EL1: 32-bit VA from TTBR0 (T0SZ=32 → walk starts at level 1), 4 KiB granule, write-back
-// inner-shareable walks, TTBR1 disabled, 40-bit physical addresses.
-const TCR_VALUE: u64 = 32 | 0b01 << 8 | 0b01 << 10 | 0b11 << 12 | 1 << 23 | 0b010 << 32;
+// T0SZ (VA width from TTBR0). QEMU `virt`: 32 → 4 GiB, everything the kernel touches is
+// below 4 GiB (`highmem=off` pins the ECAM there). Orange Pi 5 Plus: 28 → 36-bit VA
+// (64 GiB), because the PCIe DBI blocks sit at 41 GiB (see DEVICE_L1). Both values keep
+// the walk starting at level 1 with the 4 KiB granule (T0SZ 25..33 → level 1, Arm ARM
+// D8.2.7), so the same single level-1 table serves either width (64 entries used at 28).
+#[cfg(not(feature = "board-opi5plus"))]
+const T0SZ: u64 = 32;
+#[cfg(feature = "board-opi5plus")]
+const T0SZ: u64 = 28;
+
+// TCR_EL1: T0SZ as above, 4 KiB granule, write-back inner-shareable walks, TTBR1
+// disabled, 40-bit physical addresses (IPS 0b010 — covers the 41 GiB DBI blocks).
+const TCR_VALUE: u64 = T0SZ | 0b01 << 8 | 0b01 << 10 | 0b11 << 12 | 1 << 23 | 0b010 << 32;
 
 const SCTLR_MMU: u64 = 1;
 const SCTLR_DCACHE: u64 = 1 << 2;

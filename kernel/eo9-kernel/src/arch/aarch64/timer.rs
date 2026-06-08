@@ -59,6 +59,23 @@ pub fn disable() {
     }
 }
 
+/// Busy-wait for `us` microseconds on the virtual counter (bounded by construction: the
+/// deadline is computed once). For the short hardware-mandated settle/reset delays of the
+/// board bring-up paths (RK3588 PCIe: iATU enable settle, PERST timing) — not a scheduling
+/// primitive; anything a program waits on goes through the executor's timer instead.
+#[allow(dead_code)] // board-profile bring-up paths only
+pub fn delay_us(us: u64) {
+    let frequency = frequency();
+    if frequency == 0 {
+        return;
+    }
+    let ticks = (u128::from(us) * u128::from(frequency) / 1_000_000) as u64;
+    let deadline = counter().saturating_add(ticks.max(1));
+    while counter() < deadline {
+        core::hint::spin_loop();
+    }
+}
+
 /// Nominal counter resolution in nanoseconds (at least 1).
 pub fn resolution_ns() -> u64 {
     let frequency = frequency();

@@ -18,31 +18,33 @@ pub(crate) const NAME: &str = "aarch64";
 /// it so the ECAM stays below 4 GiB, inside the identity-mapped device gigabyte). Consumed
 /// by the shared `src/pci.rs`, which is only built with the wasm-store feature.
 ///
-/// On the `board-opi5plus` profile the RK3588's DesignWare PCIe controllers have no plain
-/// ECAM (docs/board/rk3588-pcie.md — the config-access shim is its own bring-up session),
-/// so the bus count is zero: enumeration cleanly finds nothing (`lspci` → no devices)
-/// instead of dereferencing a QEMU-specific window that is plain DRAM on this board.
-#[cfg(feature = "wasm-store")]
+/// The `board-opi5plus` profile has no ECAM at all: the RK3588's DesignWare controllers
+/// are reached through the `ConfigAccess` shim's DW implementation, with the board
+/// constants and bring-up in [`rk3588_pcie`] (docs/board/rk3588-pcie.md) — this module is
+/// QEMU's.
+#[cfg(all(feature = "wasm-store", not(feature = "board-opi5plus")))]
 pub(crate) mod pci_map {
     /// ECAM (PCIe configuration space) base.
     pub(crate) const ECAM_BASE: usize = 0x3f00_0000;
     /// Buses covered by the 16 MiB low ECAM window (1 MiB per bus).
-    pub(crate) const ECAM_BUSES: u8 = if cfg!(feature = "board-opi5plus") {
-        0
-    } else {
-        16
-    };
+    pub(crate) const ECAM_BUSES: u8 = 16;
     /// 32-bit PCIe MMIO window: where unassigned memory BARs get placed.
     pub(crate) const MMIO_BASE: usize = 0x1000_0000;
     pub(crate) const MMIO_END: usize = 0x3eff_0000;
 }
+
+/// RK3588 DW-PCIe constants and bring-up for the Orange Pi 5 Plus (the controllers
+/// serving the two onboard RTL8125 NICs). Board profile only; `wasm-store` because the
+/// shared `src/pci.rs` it feeds is wasm-store-gated.
+#[cfg(all(feature = "wasm-store", feature = "board-opi5plus"))]
+pub(crate) mod rk3588_pcie;
 
 /// PCI INTx delivery on this machine: the gpex host bridge's four legacy interrupt lines
 /// land on GIC SPIs 35-38 (`virt`'s irqmap entry 3 + the SPI base 32), level-sensitive.
 /// The IRQ handler (`exceptions::kirq`) masks a fired line and records it via
 /// `crate::pci::intx_record`; the wasm provider's `wait` consumes the count and unmasks
 /// through these functions. Consumed by `src/wasm/pci_provider.rs` (wasm-store builds only).
-#[cfg(feature = "wasm-store")]
+#[cfg(all(feature = "wasm-store", not(feature = "board-opi5plus")))]
 pub(crate) mod pci_intx {
     /// GIC INTID of gpex line 0; lines 1-3 follow consecutively.
     pub(crate) const BASE_INTID: u32 = 35;
@@ -65,6 +67,23 @@ pub(crate) mod pci_intx {
     pub(crate) fn mask(line: usize) {
         super::gic::disable_intid(intid(line));
     }
+}
+
+/// PCI INTx delivery, board profile: not wired yet. The RK3588's DW controllers deliver
+/// all four INTx pins on ONE GIC SPI per controller (rk3588-base.dtsi: SPI 245 for
+/// pcie2x1l1, SPI 250 for pcie2x1l2, edge-rising), demuxed by reading the controller's
+/// `PCIE_CLIENT_INTR_STATUS_LEGACY` APB register — per-controller demux state the shared
+/// swizzle model does not carry yet. The provider answers `unsupported` to
+/// `enable-interrupts`, so drivers fall back to their polled paths (`rk3588_pcie` module
+/// docs sketch the wiring; the RTL8125 driver lane picks it up).
+#[cfg(all(feature = "wasm-store", feature = "board-opi5plus"))]
+pub(crate) mod pci_intx {
+    /// Whether this architecture routes PCI interrupts at all.
+    pub(crate) const WIRED: bool = false;
+
+    pub(crate) fn unmask(_line: usize) {}
+
+    pub(crate) fn mask(_line: usize) {}
 }
 
 /// Boot banner: machine identification, exception level, timer frequency, wall clock.
