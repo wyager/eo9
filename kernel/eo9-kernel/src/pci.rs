@@ -1,31 +1,44 @@
-//! Minimal PCI Express host support for the QEMU machines: ECAM configuration-space
-//! access, bus enumeration, BAR sizing/assignment, and bus-master control.
+//! Minimal PCI Express host support: configuration-space access behind the
+//! [`ConfigAccess`] shim, bus enumeration, BAR sizing/assignment, and bus-master control.
 //!
 //! This is the hardware half of the kernel's `eo9:pci` root provider
-//! (`src/wasm/pci_provider.rs`). It speaks raw ECAM only — no device-class knowledge, no
-//! interrupt routing yet — which is exactly the split the WIT draws: what registers *mean*
-//! is the wasm driver's business, this module just gets it to them safely.
+//! (`src/wasm/pci_provider.rs`). It has no device-class knowledge and no interrupt routing
+//! of its own — which is exactly the split the WIT draws: what registers *mean* is the
+//! wasm driver's business, this module just gets it to them safely.
 //!
-//! Where the ECAM and the 32-bit BAR window live differs per machine, so the addresses come
-//! from the per-architecture surface (`crate::arch::pci_map`): aarch64 `virt` with
-//! `highmem=off` (ECAM `0x3f00_0000`, BARs from `0x1000_0000..0x3eff_0000`), riscv64 `virt`
-//! (ECAM `0x3000_0000`, BARs from `0x4000_0000..0x8000_0000`), x86_64 `q35` (documented,
-//! not wired). Both verified machines keep these regions inside the identity map, so
-//! configuration space and assigned BARs are reachable without new page tables. The kernel
-//! boots without firmware BAR assignment on the `virt` machines; [`assign_bar`] hands out
-//! windows from the per-arch range with a bump allocator when a driver opens a BAR.
-//! Reading the ECAM base from the device tree instead is a noted follow-up (plan/12
-//! Decisions).
+//! **How config space is reached differs per machine** (docs/board/rk3588-pcie.md):
+//!
+//! * QEMU `virt`/`q35` expose **ECAM**: one flat window where `bus:dev:fn:offset` maps
+//!   linearly to an address. That is [`Ecam`].
+//! * The RK3588's controllers are Synopsys DesignWare cores with **no ECAM**: the root
+//!   port's config header lives in the controller's DBI block, and downstream devices are
+//!   reached by routing an outbound iATU window to CFG0/CFG1 TLPs. That is [`DwPcie`]
+//!   (board builds only).
+//!
+//! The shim is *address-mapping* shaped (`ConfigAccess::map` returns the CPU address an
+//! access of the given offset should hit — Linux's `pci_ops.map_bus` pattern) rather than
+//! the read32/write32 pair the design note sketched: deriving sub-word writes from a
+//! 32-bit read-modify-write would clobber write-1-to-clear neighbours (a Word write to
+//! Command at 0x04 must not write Status at 0x06 back). With `map`, every access width
+//! hits the bus exactly as it always has on ECAM — the refactor is bit-for-bit on QEMU.
+//!
+//! Each controller is one **PCI segment**: QEMU `virt` has a single ECAM segment 0; the
+//! board profile has one segment per DW controller (the two RTL8125 NIC ports). Every
+//! segment owns its 32-bit MMIO window for BAR assignment ([`assign_bar`] hands out
+//! windows with a per-segment bump allocator; the kernel boots without firmware BAR
+//! assignment). Where the windows live comes from the per-architecture surface
+//! (`crate::arch::pci_map`) on QEMU, and from the board profile's controller table
+//! (`crate::arch::rk3588_pcie`) on the Orange Pi 5 Plus.
 //!
 //! Buses behind PCI-to-PCI bridges are not visible: assigning secondary bus numbers is a
 //! firmware job this kernel does not do yet, and every QEMU `virt` device added with a
-//! plain `-device …-pci` flag lands directly on bus 0.
+//! plain `-device …-pci` flag lands directly on bus 0. (The DW root port *is* a bridge,
+//! but its secondary bus is programmed once at board bring-up — `arch::rk3588_pcie`.)
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::arch::pci_map::{
-    ECAM_BASE, ECAM_BUSES, MMIO_BASE as PCIE_MMIO_BASE, MMIO_END as PCIE_MMIO_END,
-};
+#[cfg(feature = "board-opi5plus")]
+use core::sync::atomic::{AtomicU8, AtomicU32};
 
 /// Configuration space per PCIe function (extended config space).
 const CONFIG_SPACE_SIZE: u32 = 4096;
@@ -40,6 +53,10 @@ const CONFIG_SPACE_SIZE: u32 = 4096;
 // consumes the count and re-arms (unmasks) the line on its next call, after the driver has
 // cleared the device-side cause. The counters are the only state shared between the two
 // sides, so they live in this arch-independent module.
+//
+// The board profile does not wire INTx yet (arch::pci_intx::WIRED = false there): the DW
+// controllers deliver all four INTx pins on ONE GIC SPI per controller, demuxed through
+// PCIE_CLIENT_INTR_STATUS_LEGACY — recorded follow-up (docs/board/rk3588-pcie.md).
 // -----------------------------------------------------------------------------------------
 
 /// Number of INTx lines on the host bridge (INTA..INTD; fixed by PCI).
@@ -56,6 +73,9 @@ static INTX_DELIVERIES: [AtomicU64; INTX_LINES] = [
 /// Record one INTx delivery on gpex line `line`. Called from the architecture's IRQ/trap
 /// handler with the line already masked at the interrupt controller (so the level-triggered
 /// source cannot storm while the driver has not yet cleared its cause).
+// The board profile has no caller yet: its per-controller INTx demux is the recorded
+// follow-up (arch/aarch64 `pci_intx` board docs), so the swizzle/record flow idles there.
+#[cfg_attr(feature = "board-opi5plus", allow(dead_code))]
 pub fn intx_record(line: usize) {
     INTX_DELIVERIES[line % INTX_LINES].fetch_add(1, Ordering::Release);
 }
@@ -99,13 +119,11 @@ pub fn enable_intx_output(address: FunctionAddress) -> bool {
     config_write(address, 0x04, AccessWidth::Word, command & !(1 << 10))
 }
 
-/// Bump pointer for BAR assignment (no firmware has placed anything, so the whole window
-/// is ours). Single core; the atomic is for soundness, not contention.
-static NEXT_BAR_ADDRESS: AtomicUsize = AtomicUsize::new(PCIE_MMIO_BASE);
-
-/// One PCI(e) function address on segment 0 (the only segment QEMU `virt` has).
+/// One PCI(e) function address. `segment` selects the controller (QEMU `virt` has a single
+/// ECAM segment 0; the board profile numbers its DW controllers 0, 1, …).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FunctionAddress {
+    pub segment: u16,
     pub bus: u8,
     pub device: u8,
     pub function: u8,
@@ -157,43 +175,347 @@ impl AccessWidth {
     }
 }
 
-/// The ECAM address of `offset` within `address`'s configuration space, or `None` when the
-/// address or offset is outside the window this kernel maps.
-fn ecam_address(address: FunctionAddress, offset: u32) -> Option<usize> {
-    if address.bus >= ECAM_BUSES
-        || address.device >= 32
-        || address.function >= 8
-        || offset >= CONFIG_SPACE_SIZE
-    {
+// -----------------------------------------------------------------------------------------
+// The ConfigAccess shim and its two implementations
+// -----------------------------------------------------------------------------------------
+
+/// How configuration space is reached on one controller (= one PCI segment).
+///
+/// `map` returns the CPU address where an access to `(bus, device, function, offset)`
+/// lands, or `None` when no function can exist at that address on this controller (the
+/// caller treats it exactly like an absent function). Implementations may have side
+/// effects (the DW shim reprograms its iATU window); the returned address is only valid
+/// until the next `map` call on the same controller.
+trait ConfigAccess {
+    fn map(&self, bus: u8, device: u8, function: u8, offset: u32) -> Option<usize>;
+    /// Buses this controller decodes (enumeration walks `0..buses`).
+    fn buses(&self) -> u8;
+}
+
+/// Flat ECAM (QEMU `virt`/`q35`): `bus:dev:fn:offset` maps linearly. The pre-shim
+/// behavior, verbatim — same address arithmetic, same bounds.
+#[cfg(not(feature = "board-opi5plus"))]
+struct Ecam {
+    base: usize,
+    buses: u8,
+}
+
+#[cfg(not(feature = "board-opi5plus"))]
+impl ConfigAccess for Ecam {
+    fn map(&self, bus: u8, device: u8, function: u8, offset: u32) -> Option<usize> {
+        if bus >= self.buses {
+            return None;
+        }
+        Some(
+            self.base
+                + ((bus as usize) << 20)
+                + ((device as usize) << 15)
+                + ((function as usize) << 12)
+                + offset as usize,
+        )
+    }
+
+    fn buses(&self) -> u8 {
+        self.buses
+    }
+}
+
+/// One Synopsys DesignWare PCIe root complex (RK3588), reached per
+/// docs/board/rk3588-pcie.md:
+///
+/// * **bus 0** (the root port itself): its type-1 config header is the DBI block — and the
+///   DW core implements *only* device 0, function 0 there. Every other device/function
+///   number must map to `None` instead of an address: the DBI decodes any offset, so
+///   without the guard enumeration would see 32 ghost copies of the root port.
+/// * **bus 1** (secondary — the device right below the root port): an outbound iATU region
+///   is routed to type-CFG0 TLPs with target `(bus << 24) | (dev << 19) | (fn << 16)`,
+///   then the access goes through the controller's config aperture. Only device 0 exists
+///   below a x1 root port (the link partner); other device numbers ghost on some DW
+///   revisions, so they are guarded to `None` — mainline's `dw_pcie_valid_device` does the
+///   same.
+/// * **deeper buses**: the same iATU dance with type CFG1 (routed through bridges).
+///
+/// iATU register block: "unrolled" layout (DW ≥ 4.80 — the RK3588's core) at
+/// `dbi + 0x30_0000`, outbound region `n` at stride `0x200` (Linux pcie-designware.h
+/// `PCIE_ATU_UNROLL_BASE`). After enabling a region the enable bit is read back until it
+/// sticks — the required settle check (mainline `dw_pcie_prog_outbound_atu` polls the
+/// same way).
+///
+/// A controller only answers once the board bring-up (`arch::rk3588_pcie`) has marked it
+/// usable: `DISABLED` (default) maps nothing, `ROOT_ONLY` (link training failed) maps just
+/// the root port so the bench still proves config access works, `FULL` maps everything.
+#[cfg(feature = "board-opi5plus")]
+pub(crate) struct DwPcie {
+    /// DBI block (root port config + port logic + unrolled iATU).
+    dbi: usize,
+    /// CPU-side base of the outbound config aperture (the DT node's "config" reg).
+    cfg_base: usize,
+    /// Aperture size (≥ 4 KiB; the shim only ever accesses the first 4 KiB).
+    cfg_size: usize,
+    /// Bring-up state: one of the `dw_state` values.
+    state: AtomicU8,
+    /// Last iATU target+type routed through outbound region 0 (cache: skip the reprogram
+    /// when the same function is accessed repeatedly). `u32::MAX` = nothing programmed.
+    last_target: AtomicU32,
+}
+
+/// [`DwPcie`] bring-up states, reported by `arch::rk3588_pcie::init`.
+#[cfg(feature = "board-opi5plus")]
+pub(crate) mod dw_state {
+    /// Bring-up has not run or failed before the DBI was usable: map nothing.
+    pub(crate) const DISABLED: u8 = 0;
+    /// DBI alive but link training failed: only the root port is visible.
+    pub(crate) const ROOT_ONLY: u8 = 1;
+    /// Link up: root port + downstream devices visible.
+    pub(crate) const FULL: u8 = 2;
+}
+
+/// Unrolled iATU outbound region 0 registers, relative to the DBI base (Linux
+/// pcie-designware.h: `PCIE_ATU_UNROLL_BASE(0, 0)` = `0x30_0000`, region stride `0x200`;
+/// field layouts per `dw_pcie_prog_outbound_atu`).
+#[cfg(feature = "board-opi5plus")]
+mod dw_regs {
+    pub(super) const ATU_OUTBOUND0: usize = 0x30_0000;
+    /// TYPE in bits [4:0].
+    pub(super) const ATU_REGION_CTRL_1: usize = ATU_OUTBOUND0;
+    /// Bit 31 = region enable.
+    pub(super) const ATU_REGION_CTRL_2: usize = ATU_OUTBOUND0 + 0x04;
+    pub(super) const ATU_LOWER_BASE: usize = ATU_OUTBOUND0 + 0x08;
+    pub(super) const ATU_UPPER_BASE: usize = ATU_OUTBOUND0 + 0x0c;
+    pub(super) const ATU_LIMIT: usize = ATU_OUTBOUND0 + 0x10;
+    pub(super) const ATU_LOWER_TARGET: usize = ATU_OUTBOUND0 + 0x14;
+    pub(super) const ATU_UPPER_TARGET: usize = ATU_OUTBOUND0 + 0x18;
+    pub(super) const ATU_ENABLE: u32 = 1 << 31;
+    /// Config TLP types (PCIe spec; Linux PCIE_ATU_TYPE_CFG0/CFG1).
+    pub(super) const TYPE_CFG0: u32 = 0x4;
+    pub(super) const TYPE_CFG1: u32 = 0x5;
+}
+
+#[cfg(feature = "board-opi5plus")]
+impl DwPcie {
+    pub(crate) const fn new(dbi: usize, cfg_base: usize, cfg_size: usize) -> DwPcie {
+        DwPcie {
+            dbi,
+            cfg_base,
+            cfg_size,
+            state: AtomicU8::new(dw_state::DISABLED),
+            last_target: AtomicU32::new(u32::MAX),
+        }
+    }
+
+    /// The DBI base (the board bring-up programs port-logic registers through it).
+    pub(crate) fn dbi(&self) -> usize {
+        self.dbi
+    }
+
+    /// Board bring-up reports the controller's outcome (a `dw_state` value).
+    pub(crate) fn set_state(&self, state: u8) {
+        // Force the first post-bring-up access to route the iATU from scratch.
+        self.last_target.store(u32::MAX, Ordering::Relaxed);
+        self.state.store(state, Ordering::Release);
+    }
+
+    /// Route outbound iATU region 0 at the config TLP target, settle-checked. Returns
+    /// `false` if the enable never reads back (controller clock/reset trouble) — the
+    /// access is then reported as an absent function rather than touching the aperture.
+    fn atu_route(&self, target: u32, tlp_type: u32) -> bool {
+        // The cache key packs the TLP type into the target's always-zero low bits
+        // (targets are `bus<<24 | dev<<19 | fn<<16`).
+        let key = target | tlp_type;
+        if self.last_target.load(Ordering::Acquire) == key {
+            return true;
+        }
+        // SAFETY: the iATU block lies inside the identity-mapped DBI window of a
+        // controller the board bring-up enabled; volatile dword accesses there are sound.
+        unsafe {
+            mmio::write_u32(self.dbi + dw_regs::ATU_LOWER_BASE, self.cfg_base as u32);
+            mmio::write_u32(
+                self.dbi + dw_regs::ATU_UPPER_BASE,
+                ((self.cfg_base as u64) >> 32) as u32,
+            );
+            // The region covers the whole aperture even though only the first 4 KiB is
+            // ever accessed — one less special case at the DT-given 1 MiB size.
+            mmio::write_u32(
+                self.dbi + dw_regs::ATU_LIMIT,
+                (self.cfg_base + self.cfg_size - 1) as u32,
+            );
+            mmio::write_u32(self.dbi + dw_regs::ATU_LOWER_TARGET, target);
+            mmio::write_u32(self.dbi + dw_regs::ATU_UPPER_TARGET, 0);
+            mmio::write_u32(self.dbi + dw_regs::ATU_REGION_CTRL_1, tlp_type);
+            mmio::write_u32(self.dbi + dw_regs::ATU_REGION_CTRL_2, dw_regs::ATU_ENABLE);
+        }
+        // Mainline waits up to 5 × 9 ms for the enable to stick (LINK_WAIT_MAX_IATU_RETRIES
+        // × LINK_WAIT_IATU); in practice it lands on the first read. Bounded either way.
+        for _ in 0..5 {
+            // SAFETY: as above.
+            let ctrl2 = unsafe { mmio::read_u32(self.dbi + dw_regs::ATU_REGION_CTRL_2) };
+            if ctrl2 & dw_regs::ATU_ENABLE != 0 {
+                self.last_target.store(key, Ordering::Release);
+                return true;
+            }
+            crate::arch::timer::delay_us(9_000);
+        }
+        self.last_target.store(u32::MAX, Ordering::Release);
+        false
+    }
+}
+
+#[cfg(feature = "board-opi5plus")]
+impl ConfigAccess for DwPcie {
+    fn map(&self, bus: u8, device: u8, function: u8, offset: u32) -> Option<usize> {
+        let state = self.state.load(Ordering::Acquire);
+        if state == dw_state::DISABLED || bus >= self.buses() {
+            return None;
+        }
+        if bus == 0 {
+            // The root port: DBI direct, device 0 function 0 only (ghost-device guard).
+            if device != 0 || function != 0 {
+                return None;
+            }
+            return Some(self.dbi + offset as usize);
+        }
+        if state != dw_state::FULL {
+            return None; // link never came up: nothing exists below the root port
+        }
+        if bus == 1 && device != 0 {
+            // Only the link partner exists right below a x1 root port (ghost guard).
+            return None;
+        }
+        let tlp_type = if bus == 1 {
+            dw_regs::TYPE_CFG0
+        } else {
+            dw_regs::TYPE_CFG1
+        };
+        let target =
+            (u32::from(bus) << 24) | (u32::from(device) << 19) | (u32::from(function) << 16);
+        if !self.atu_route(target, tlp_type) {
+            return None;
+        }
+        Some(self.cfg_base + offset as usize)
+    }
+
+    fn buses(&self) -> u8 {
+        // Root port (bus 0) + its secondary (bus 1). The DT gives each controller a
+        // 16-bus range, but reaching bus 2+ requires a PCI-to-PCI bridge below the root
+        // port with a programmed secondary bus — firmware work this kernel does not do
+        // (module docs) — so deeper bus numbers can never hold a reachable device.
+        // Walking them anyway would fire hundreds of UR-completing CFG1 probes per
+        // enumeration (and UR handling on untested silicon is an SError surface worth
+        // zero). The CFG1 arm in `map` stays for the bridge-programming follow-up.
+        2
+    }
+}
+
+// -----------------------------------------------------------------------------------------
+// The controller (segment) table
+// -----------------------------------------------------------------------------------------
+
+/// One PCI segment: a config-access implementation plus its 32-bit MMIO window for BAR
+/// assignment.
+struct Controller {
+    config: Access,
+    mmio_end: usize,
+    /// Bump pointer for BAR assignment (no firmware has placed anything, so the whole
+    /// window is ours). Single core; the atomic is for soundness, not contention.
+    next_bar: AtomicUsize,
+}
+
+enum Access {
+    #[cfg(not(feature = "board-opi5plus"))]
+    Ecam(Ecam),
+    #[cfg(feature = "board-opi5plus")]
+    Dw(&'static DwPcie),
+}
+
+impl Controller {
+    fn access(&self) -> &dyn ConfigAccess {
+        match &self.config {
+            #[cfg(not(feature = "board-opi5plus"))]
+            Access::Ecam(ecam) => ecam,
+            #[cfg(feature = "board-opi5plus")]
+            Access::Dw(dw) => *dw,
+        }
+    }
+}
+
+/// QEMU `virt`/`q35`: the one ECAM host bridge, segment 0, with the per-architecture
+/// window constants — exactly the pre-shim behavior.
+#[cfg(not(feature = "board-opi5plus"))]
+static CONTROLLERS: [Controller; 1] = {
+    use crate::arch::pci_map::{ECAM_BASE, ECAM_BUSES, MMIO_BASE, MMIO_END};
+    [Controller {
+        config: Access::Ecam(Ecam {
+            base: ECAM_BASE,
+            buses: ECAM_BUSES,
+        }),
+        mmio_end: MMIO_END,
+        next_bar: AtomicUsize::new(MMIO_BASE),
+    }]
+};
+
+/// Orange Pi 5 Plus: the two DW controllers serving the onboard RTL8125 NICs
+/// (segment 0 = pcie2x1l1, the right port; segment 1 = pcie2x1l2, the left port —
+/// rk3588-orangepi-5-plus.dts). Disabled until `arch::rk3588_pcie::init` brings them up;
+/// each segment's BAR window is its controller's 32-bit non-prefetchable range from
+/// rk3588-base.dtsi (the `ranges` 0x02000000 entries).
+#[cfg(feature = "board-opi5plus")]
+static CONTROLLERS: [Controller; 2] = {
+    use crate::arch::rk3588_pcie::{PCIE2X1L1, PCIE2X1L1_MEM, PCIE2X1L2, PCIE2X1L2_MEM};
+    [
+        Controller {
+            config: Access::Dw(&PCIE2X1L1),
+            mmio_end: PCIE2X1L1_MEM.1,
+            next_bar: AtomicUsize::new(PCIE2X1L1_MEM.0),
+        },
+        Controller {
+            config: Access::Dw(&PCIE2X1L2),
+            mmio_end: PCIE2X1L2_MEM.1,
+            next_bar: AtomicUsize::new(PCIE2X1L2_MEM.0),
+        },
+    ]
+};
+
+/// The controller serving `segment`, or `None` for segments this machine does not have.
+fn controller(segment: u16) -> Option<&'static Controller> {
+    CONTROLLERS.get(usize::from(segment))
+}
+
+/// The CPU address of `offset` within `address`'s configuration space, or `None` when the
+/// address or offset is outside what this machine's controllers decode.
+fn config_address(address: FunctionAddress, offset: u32) -> Option<usize> {
+    if address.device >= 32 || address.function >= 8 || offset >= CONFIG_SPACE_SIZE {
         return None;
     }
-    Some(
-        ECAM_BASE
-            + ((address.bus as usize) << 20)
-            + ((address.device as usize) << 15)
-            + ((address.function as usize) << 12)
-            + offset as usize,
-    )
+    controller(address.segment)?
+        .access()
+        .map(address.bus, address.device, address.function, offset)
 }
 
 /// Read from configuration space. Accesses must be naturally aligned and at most a dword
-/// (the ECAM region is not specified for 64-bit accesses); the value is zero-extended.
+/// (config space is not specified for 64-bit accesses); the value is zero-extended.
 /// `None` when the address, offset, alignment, or width is invalid.
 pub fn config_read(address: FunctionAddress, offset: u32, width: AccessWidth) -> Option<u64> {
     if width == AccessWidth::Qword || !offset.is_multiple_of(width.bytes()) {
         return None;
     }
-    let ecam = ecam_address(address, offset)?;
-    if offset + width.bytes() > CONFIG_SPACE_SIZE {
+    // Checked: `offset` comes straight from the wasm provider, so the bare add could
+    // overflow (a debug-build panic). Out of bounds either way → no bus access (and no
+    // DW iATU reprogram, which `config_address` would otherwise side-effect).
+    if offset
+        .checked_add(width.bytes())
+        .is_none_or(|end| end > CONFIG_SPACE_SIZE)
+    {
         return None;
     }
-    // SAFETY: `ecam` lies inside the identity-mapped ECAM window computed above; volatile,
-    // naturally aligned device reads of at most 32 bits are architecturally sound there.
+    let target = config_address(address, offset)?;
+    // SAFETY: `target` lies inside an identity-mapped config window (ECAM, DBI, or a
+    // routed DW aperture) computed above; volatile, naturally aligned device reads of at
+    // most 32 bits are architecturally sound there.
     let value = unsafe {
         match width {
-            AccessWidth::Byte => u64::from(mmio::read_u8(ecam)),
-            AccessWidth::Word => u64::from(mmio::read_u16(ecam)),
-            AccessWidth::Dword => u64::from(mmio::read_u32(ecam)),
+            AccessWidth::Byte => u64::from(mmio::read_u8(target)),
+            AccessWidth::Word => u64::from(mmio::read_u16(target)),
+            AccessWidth::Dword => u64::from(mmio::read_u32(target)),
             AccessWidth::Qword => unreachable!(),
         }
     };
@@ -206,18 +528,22 @@ pub fn config_write(address: FunctionAddress, offset: u32, width: AccessWidth, v
     if width == AccessWidth::Qword || !offset.is_multiple_of(width.bytes()) {
         return false;
     }
-    let Some(ecam) = ecam_address(address, offset) else {
-        return false;
-    };
-    if offset + width.bytes() > CONFIG_SPACE_SIZE {
+    // Checked add: see config_read.
+    if offset
+        .checked_add(width.bytes())
+        .is_none_or(|end| end > CONFIG_SPACE_SIZE)
+    {
         return false;
     }
-    // SAFETY: as in `config_read`; writes of at most 32 bits to the mapped ECAM window.
+    let Some(target) = config_address(address, offset) else {
+        return false;
+    };
+    // SAFETY: as in `config_read`; writes of at most 32 bits to a mapped config window.
     unsafe {
         match width {
-            AccessWidth::Byte => mmio::write_u8(ecam, value as u8),
-            AccessWidth::Word => mmio::write_u16(ecam, value as u16),
-            AccessWidth::Dword => mmio::write_u32(ecam, value as u32),
+            AccessWidth::Byte => mmio::write_u8(target, value as u8),
+            AccessWidth::Word => mmio::write_u16(target, value as u16),
+            AccessWidth::Dword => mmio::write_u32(target, value as u32),
             AccessWidth::Qword => unreachable!(),
         }
     }
@@ -246,32 +572,38 @@ fn probe_function(address: FunctionAddress) -> Option<FunctionInfo> {
     })
 }
 
-/// Walk the ECAM window and report every function that answers, in address order.
+/// Walk every controller's buses and report every function that answers, in
+/// segment-then-address order.
 ///
 /// Multi-function devices are walked through all eight functions; single-function devices
 /// only at function 0 (per the header-type multifunction bit).
 pub fn enumerate() -> alloc::vec::Vec<FunctionInfo> {
     let mut found = alloc::vec::Vec::new();
-    for bus in 0..ECAM_BUSES {
-        for device in 0..32u8 {
-            let function0 = FunctionAddress {
-                bus,
-                device,
-                function: 0,
-            };
-            if let Some(info) = probe_function(function0) {
-                let multifunction =
-                    config_read(function0, 0x0e, AccessWidth::Byte).unwrap_or(0) & 0x80 != 0;
-                found.push(info);
-                if multifunction {
-                    for function in 1..8u8 {
-                        let address = FunctionAddress {
-                            bus,
-                            device,
-                            function,
-                        };
-                        if let Some(info) = probe_function(address) {
-                            found.push(info);
+    for (index, ctrl) in CONTROLLERS.iter().enumerate() {
+        let segment = index as u16;
+        for bus in 0..ctrl.access().buses() {
+            for device in 0..32u8 {
+                let function0 = FunctionAddress {
+                    segment,
+                    bus,
+                    device,
+                    function: 0,
+                };
+                if let Some(info) = probe_function(function0) {
+                    let multifunction =
+                        config_read(function0, 0x0e, AccessWidth::Byte).unwrap_or(0) & 0x80 != 0;
+                    found.push(info);
+                    if multifunction {
+                        for function in 1..8u8 {
+                            let address = FunctionAddress {
+                                segment,
+                                bus,
+                                device,
+                                function,
+                            };
+                            if let Some(info) = probe_function(address) {
+                                found.push(info);
+                            }
                         }
                     }
                 }
@@ -349,15 +681,16 @@ pub fn describe_bars(address: FunctionAddress) -> alloc::vec::Vec<BarDescription
     bars
 }
 
-/// Make sure a memory BAR has a bus address, assigning one from the 32-bit PCIe MMIO
-/// window if firmware (which this kernel has none of) left it at zero, and enable memory
-/// decode on the function. Returns the CPU-visible base address (identity map: the same
-/// number the device decodes), or `None` for I/O-space BARs, exhausted window, or invalid
-/// BAR index.
+/// Make sure a memory BAR has a bus address, assigning one from the function's segment's
+/// 32-bit PCIe MMIO window if firmware (which this kernel has none of) left it at zero,
+/// and enable memory decode on the function. Returns the CPU-visible base address
+/// (identity map: the same number the device decodes), or `None` for I/O-space BARs,
+/// exhausted window, or invalid BAR index.
 pub fn assign_bar(address: FunctionAddress, bar: &BarDescription) -> Option<usize> {
     if bar.io_space || bar.size == 0 {
         return None;
     }
+    let ctrl = controller(address.segment)?;
     let offset = 0x10 + u32::from(bar.index) * 4;
     let low = config_read(address, offset, AccessWidth::Dword)? as u32;
     let high = if bar.wide {
@@ -373,13 +706,14 @@ pub fn assign_bar(address: FunctionAddress, bar: &BarDescription) -> Option<usiz
         let size = usize::try_from(bar.size).ok()?;
         let mut base;
         loop {
-            let next = NEXT_BAR_ADDRESS.load(Ordering::Relaxed);
+            let next = ctrl.next_bar.load(Ordering::Relaxed);
             base = next.checked_add(size - 1)? & !(size - 1);
             let end = base.checked_add(size)?;
-            if end > PCIE_MMIO_END {
+            if end > ctrl.mmio_end {
                 return None;
             }
-            if NEXT_BAR_ADDRESS
+            if ctrl
+                .next_bar
                 .compare_exchange(next, end, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {

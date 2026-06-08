@@ -122,6 +122,14 @@ extern "C" fn kmain(dtb: *const u8) -> ! {
     // instead of stranding the unattended dev loop (no-op on QEMU).
     wdt::arm_and_report();
 
+    // Board profile only: bring up the RK3588 PCIe controllers serving the onboard
+    // RTL8125 NICs (clocks/resets, combphy, PERST, link training — arch/aarch64/
+    // rk3588_pcie.rs), so the eo9:pci provider's enumeration sees them. After the
+    // watchdog: a wedged bus access during bring-up resets to U-Boot instead of hanging
+    // the bench. QEMU's ECAM needs no bring-up; this is a no-op there.
+    #[cfg(all(feature = "wasm-store", feature = "board-opi5plus"))]
+    arch::rk3588_pcie::init();
+
     // The kernel command line (QEMU -append) selects what to run: `program=<name>` runs a
     // store entry headless, `demo` runs the original demo sequence below, and nothing at
     // all boots to the interactive eosh shell.

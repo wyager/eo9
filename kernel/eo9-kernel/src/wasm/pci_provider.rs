@@ -476,12 +476,12 @@ enum WitPciError {
     Io(String),
 }
 
-/// The kernel only drives PCI segment 0 (the one PCIe host bridge QEMU `virt` has).
+/// Segments map one-to-one onto the kernel's controller table (`src/pci.rs`): QEMU `virt`
+/// has the single ECAM segment 0, the board profile one segment per DW controller. A
+/// segment the machine does not have simply resolves to no functions (`not-found`).
 fn function_address(address: WitDeviceAddress) -> Result<pci::FunctionAddress, WitPciError> {
-    if address.segment != 0 {
-        return Err(WitPciError::NotFound);
-    }
     Ok(pci::FunctionAddress {
+        segment: address.segment,
         bus: address.bus,
         device: address.device,
         function: address.function,
@@ -491,7 +491,7 @@ fn function_address(address: WitDeviceAddress) -> Result<pci::FunctionAddress, W
 fn device_info(info: &pci::FunctionInfo) -> WitDeviceInfo {
     WitDeviceInfo {
         address: WitDeviceAddress {
-            segment: 0,
+            segment: info.address.segment,
             bus: info.address.bus,
             device: info.address.device,
             function: info.address.function,

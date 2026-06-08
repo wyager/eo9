@@ -2053,7 +2053,12 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
         build_store_image_filtered(
             root,
             KERNEL_CHECK_TARGET,
-            &[("eo9-example-hello", "hello")],
+            // hello = the smoke program; lspci = the PCIe bring-up acceptance (the
+            // RTL8125s visible through the DW config shim — docs/board/rk3588-pcie.md).
+            &[
+                ("eo9-example-hello", "hello"),
+                ("eo9-example-lspci", "lspci"),
+            ],
             "store-opi5plus-min.img",
         )?
     } else {
