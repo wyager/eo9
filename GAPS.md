@@ -445,3 +445,9 @@ typed timeout has no committed pin — the reviewer's scratch shape (dhcp over
 net.l2.echo + stub clock, expect "no lease arrived", ~4.8s) should be adopted as a
 real usermode test; shape preserved in the review transcript (.review/ in the
 review-rtl worktree).
+
+## eosh session history is unbounded (restored entry, 2026-06-08)
+`Session::history` (eosh-core/src/session.rs:62,103) grows without bound per executed
+line. Believed GAPS'd earlier but the entry never landed (caught by the repl study's
+cross-check — the no-drop rule working). Fix folds into the incremental-parser M2
+editor work: the recall ring becomes a capped view (e.g. 64) of session history.
