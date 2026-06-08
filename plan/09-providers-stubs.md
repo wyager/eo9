@@ -1096,5 +1096,10 @@ Match the priority order above; (1)+(2) unblock I2.
 
     Verified: full `cargo xtask ci` green per milestone; `cargo test -p eo9-rtl8125` (10 ring/
     PHY-word tests); the two usermode composition tests; the QEMU typed-refusal probe; bundle
-    refreshed (77 components); both board images rebuilt. Board acceptance is the planner's
-    bench run — recorded here as pending.
+    refreshed (77 components); both board images rebuilt. QEMU regression sweep, all green:
+    `check-telnet` (telnetd's bare invocation unchanged — two sessions, concurrent refusal,
+    clean closes), the three arch demos canonical (aarch64/riscv64/x86_64 `demo` boots run to
+    their power-off lines), and live at the QEMU metal prompt both `net.virtio $ l2check`
+    (bare — 10.0.2.2 resolved, net.virtio byte-identical in this lane) and
+    `net.virtio $ l2check --gateway 10.0.2.2` (the new typed option through eosh). Board
+    acceptance is the planner's bench run — recorded here as pending.
