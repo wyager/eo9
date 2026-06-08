@@ -452,3 +452,34 @@ Shell precedence pin: `time.frozen $ hello` stays a composition (dotted words ar
 names); `time hello` is an invocation filling the component parameter positionally.
 `describe time` renders the component card with `--prog: component` (no API-card
 involvement — `time` has no colon).
+
+20. **The shell over the network: `telnetd` serves the unmodified eosh through `net.text`
+    (2026-06-07, branch area/09-telnetd; pairs with plan/09 D44).** Owner directive: "target
+    shell-over-network. Telnet is fine, no need for SSH yet." eosh itself is untouched — zero
+    eosh/eosh-core changes. The network shell is composition:
+
+        net.virtio $ net.l4.over-l2 $ net.text $ eosh
+
+    `telnetd` (guest/examples/telnetd) is the supervisor and an ordinary program: text (console
+    narration) + fs (the four /bin components) + exec (configure/compose/compile/spawn). It binds
+    `--port` (default 23) into net.text at compose time, compiles the fused session ONCE, and serves
+    sessions **sequentially** — spawn, wait, respawn the same image — because a live l4 connection
+    cannot cross task stores and one NIC is one task's claim (the plan/09 D44 finding; concurrent
+    sessions wait on the Message API). `--sessions N` bounds the run (cap 1000 unspecified, the init
+    console-restart number); session death — including a trap — is narrated and never telnetd's
+    death; kill telnetd and the in-flight session task dies with it (the task-resource cascade).
+
+    *Environment.* Each session's eosh is spawned bare onto the executor's standard child
+    environment — exactly what a console eosh child gets (fs /bin + /session, exec, time, entropy;
+    pci only when the boot granted it; svc only while the generation counter lasts) — except text,
+    which the composition seals to the socket. Recorded consequence (GAPS): programs the *session*
+    spawns (`hello`) are sibling tasks whose text falls through to the machine console — over the
+    socket you see eosh's own rendering (`ok: greeted`), while the child's stdout lands on serial.
+    The fix is per-task text brokering (Message API lane), not a shell change.
+
+    *Intents.* `exit` is intercepted by net.text (clean TCP close + EOF; eosh exits via its normal
+    end-of-input path). A remote `poweroff` propagates as the session outcome and telnetd REFUSES it
+    with narration — halting the machine is a console intent, never a network one.
+
+    **SECURITY (the WIT, the stubs, and plan/09 D44 all say it): cleartext, unauthenticated,
+    trusted-LAN/dev only; SSH explicitly deferred.**

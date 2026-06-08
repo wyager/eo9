@@ -1,0 +1,26 @@
+// eo9:net-text — the socket-backed text provider world (shell over the network).
+//
+// `net.text` turns a TCP connection into the standard text streams: it imports the
+// transport layer (`eo9:net/l4` — whichever provider is composed below it: the
+// smoltcp middleware over a real NIC on metal, `net.l4.loopback` in tests) and
+// exports `eo9:text/text`, so the unmodified shell becomes a network shell by
+// composition alone:
+//
+//   net.virtio $ net.l4.over-l2 $ net.text $ eosh
+//
+// `eo9:text/net-text-config.configure` binds the TCP port; the documented default —
+// used whenever the provider is composed without `configure` — is port 23, bound
+// lazily on the first read-line, so plain composition works and never traps.
+//
+// SECURITY: this is cleartext, unauthenticated telnet-style NVT. Whoever can reach
+// the port owns the composed session. Trusted-LAN/dev tool only; SSH is explicitly
+// deferred (owner ruling).
+package eo9:net-text@0.1.0;
+
+world net-text {
+    import eo9:net/l4@0.1.0;
+
+    export eo9:text/types@0.1.0;
+    export eo9:text/text@0.1.0;
+    export eo9:text/net-text-config@0.1.0;
+}

@@ -1,0 +1,65 @@
+// telnetd — the shell-over-network supervisor (plan/09 D44, plan/10).
+//
+// An ordinary Eo9 program with no private powers: it resolves the session stack's
+// four components from /bin (net.virtio, net.l4.over-l2, net.text, eosh), configures
+// net.text with the chosen port, composes
+//
+//   net.virtio $ net.l4.over-l2 $ net.text $ eosh
+//
+// compiles the fused session once, and then serves sessions SEQUENTIALLY: spawn, wait
+// for the session to end (the network peer leaving or `exit`), spawn again. One fused
+// task per session — a live l4 connection cannot cross task stores and one NIC is one
+// task's claim (the plan/09 D44 handle-transfer finding), so this supervisor is the
+// concurrency story until the Message API exists. While a session is live, additional
+// connection attempts are refused by the transport (TCP RST, from net.text's
+// dropped-listener posture); between sessions the stack is briefly down and clients
+// simply retry.
+//
+// Capability story: telnetd holds text (narration to the machine console), fs (the
+// /bin bytes of the four components), and exec (compose/compile/spawn). Each session's
+// eosh runs with the executor's standard child environment — exactly what a console
+// eosh child gets — except its text, which the composition seals to the socket. The
+// session does NOT get svc unless the executor's generation counter still grants it.
+//
+// SECURITY: the sessions are cleartext, unauthenticated telnet (see net.text).
+// Trusted-LAN/dev tool only; SSH is explicitly deferred (owner ruling). A remote
+// `poweroff` is refused: the session's poweroff-requested outcome ends that session
+// and is narrated, never honored — halting the machine is a console intent.
+package eo9-examples:telnetd@0.1.0;
+
+/// Serves shell sessions over TCP, sequentially, until `sessions` runs out (or the
+/// hard cap, 1000, when unspecified).
+///
+///   telnetd                      # port 23, serve until the cap
+///   telnetd --sessions 2         # serve exactly two sessions, then exit
+///   telnetd --port 2323
+world telnetd {
+    import eo9:text/text@0.1.0;
+    import eo9:fs/fs@0.1.0;
+    import eo9:exec/component-algebra@0.1.0;
+    import eo9:exec/compile@0.1.0;
+    import eo9:exec/task@0.1.0;
+
+    variant program-success {
+        /// telnetd finished; carries how many sessions it served.
+        served(u32),
+    }
+
+    variant program-failure {
+        /// An argument was unusable (e.g. `--sessions 0`).
+        bad-arguments(string),
+        /// A stack component could not be resolved from /bin.
+        resolve(string),
+        /// Configuring net.text failed.
+        configure(string),
+        /// Composing the session stack failed.
+        compose(string),
+        /// Compiling the fused session failed.
+        compile(string),
+        /// Spawning a session failed.
+        spawn(string),
+    }
+
+    export main: async func(port: option<u16>, sessions: option<u32>)
+        -> result<program-success, program-failure>;
+}

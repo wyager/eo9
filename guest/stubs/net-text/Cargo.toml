@@ -1,0 +1,17 @@
+# The socket-backed text provider: eo9:text served over an imported eo9:net/l4 TCP
+# connection (telnet-style NVT) — the shell-over-network middleware.
+[package]
+name = "eo9-stub-net-text"
+description = "Eo9 provider `net.text`: standard text streams served over a TCP connection — listens on a configured port (default 23), accepts one session, speaks minimal refuse-all telnet NVT (CRLF lines, IAC option refusal), and turns connection close into end of input. Cleartext and unauthenticated: a trusted-LAN/dev tool only (net.virtio $ net.l4.over-l2 $ net.text $ eosh)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

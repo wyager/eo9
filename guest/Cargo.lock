@@ -328,6 +328,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-example-telnetd"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-example-time"
 version = "0.0.0"
 dependencies = [
@@ -587,6 +595,14 @@ dependencies = [
 
 [[package]]
 name = "eo9-stub-net-policy-ports"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-net-text"
 version = "0.0.0"
 dependencies = [
  "eo9-guest",

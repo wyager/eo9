@@ -25,6 +25,21 @@ open:
   now exist (the l4 stack ships recv/connect/send-flush bounds); whether deadlines become *caller-supplied*
   in the WIT is still the open call.
 - **`io(string)` catch-alls** (F15): keep as the pragmatic escape hatch vs enumerate further typed cases.
+- **No graceful close in the l4 WIT** (plan/09 D44): dropping a `tcp-connection` queues the FIN but nothing
+  pumps it out — `net.text` must use a bounded throwaway `accept` to flush the close handshake after its
+  consumer's last operation. Wants `close: async func(tcp-connection)` as a first-class bounded await.
+  WIT addition; pairs naturally with the F8 caller-supplied-deadlines call.
+- **No authentication on the network shell** (plan/09 D44): `net.text` is cleartext, unauthenticated
+  telnet — whoever reaches the port owns the session. Deliberate for the dev bring-up lane (owner ruling:
+  SSH deferred), and contained today by the loopback-bound hostfwd (`tcp:127.0.0.1:5555-:23`); on any real
+  LAN (the RTL8125 board lane) this is a wide-open root shell until an authenticated transport exists.
+  Closing it is the SSH/authenticated-transport decision, not a tweak to net.text.
+- **Concurrent network shell sessions** (plan/09 D44, the handle-transfer finding): live l4 connections
+  cannot cross task stores and one NIC is one task's claim, so telnet sessions are sequential (one fused
+  task per session); the brief's bounded-concurrency-of-4 waits on the Message API or a host-side per-task
+  text broker. Same root cause as: a network session's *child* programs write to the machine console, not
+  the socket (text is satisfied per-task from the executor environment; only the fused session task carries
+  the socket text).
 
 **Website voice (study 10) — context was given 2026-06-01; the owner's wording is still owed:**
 - **Authoring statement** (#15): one paragraph on the front page ("programs are Rust today; the format is
