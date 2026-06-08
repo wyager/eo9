@@ -18,6 +18,11 @@ publish = false
 # 45.0.0 there; here it is taken without default features because the kernel is no_std).
 [workspace.dependencies]
 wasmtime = { version = "45.0.0", default-features = false }
+# The fiber/coroutine primitive (stack switching) the async machinery already uses on
+# this target; the kernel also drives on-target compiles on a fiber so they yield to the
+# drive loop between functions (plan/12; the [patch.crates-io] below redirects to the
+# vendored no_std copy).
+wasmtime-internal-fiber = { version = "45.0.0", default-features = false }
 # Small, well-known free-list allocator behind `#[global_allocator]` (plan/12-kernel.md
 # Decisions). Pulls only `lock_api`/`spinning_top`, which is fine on a single core with
 # interrupts masked.

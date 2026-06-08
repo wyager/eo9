@@ -2108,3 +2108,49 @@ link bring-up + enumeration.
   net.l4.over-l2, l4check, net.text, telnetd, eosh — 22.2 MiB image, ~155 s at
   1.5 Mbaud); the network acceptance ladder runs at the serial eosh prompt under a `pci`
   boot grant — bench lines in plan/09 D46.*
+
+76. **Sliced on-target codegen — long compiles no longer starve the drive loop (2026-06-08,
+    branch area/09-rtl8125, board round 9; owner steer: "compilation should not block our
+    task loop").** WHERE CODEGEN RAN (the observation the round was opened to record):
+    `Component::new` executed synchronously inside the exec `compile` host call, i.e. on
+    the calling task's poll inside the session drive loop's root `call.poll()` — the
+    executor never saw it as anything but one long poll. For the whole compile no
+    drive-loop pass ran: no children/services pumped, no `wdt::pat()`, no `hb`. The board
+    DW-WDT (22.4 s) then reset the machine for any composition needing more Cranelift
+    time — bench-confirmed 2-for-2 on a 486 KiB 4-component fusion, reset at
+    codegen+18.2 s ≈ 22.4 s after the last pat. Same starvation family as the GAPS'd
+    stranded-runnable hits (a guest hot-spinning on sync host calls), but kernel-side.
+
+    The fix makes compilation cooperative without touching the WIT surface or guests:
+
+    * Vendored wasmtime grows a **sequential-pipeline progress callback**
+      (`set_compile_progress_callback`; ticks per compiled function/trampoline in
+      `run_maybe_parallel{,_mut}`'s non-rayon arms — vendor/README.md, upstream-shaped).
+    * `wasm/fibercompile.rs`: the compile runs on a `wasmtime_internal_fiber::Fiber` (the
+      same stack-switching primitive the CM-async machinery already uses on this target);
+      the callback suspends it after ~5 ms slices; between slices a pump runs one
+      scheduling pass — `drive_children()` + `drive_services()` + `wdt::pat()` +
+      `wake_idle()` + a 5 s-throttled `codegen: still compiling (N functions)` line. The
+      checkout discipline (`ChildSlot::Polling`/`SRun::Polling`) makes the nested pass
+      skip the task the compile runs inside (no re-entry); `CURRENT_PARENT` is
+      saved/restored around the nested pass; nested compiles get their own fiber with
+      ticks routed innermost, inner pumps pat-only. The fiber is always driven to
+      completion inside the host call (the no_std fiber cannot unwind a parked stack), so
+      cancellation semantics are unchanged.
+    * **The watchdog pat stays honest** (loop-safety doctrine): pats happen only in the
+      pump — only after a slice of real compilation completed AND a scheduling pass ran.
+      A compile wedged inside one function never completes a slice, never pats, and the
+      board still resets. No IRQ-side or unconditional patting. (Why `hb` stopped before:
+      the heartbeat rides `wdt::pat()`, whose call sites are drive-loop passes — timer
+      IRQs kept firing during compiles, but the pat correctly does not live there.)
+
+    Verified: QEMU TCG compiled the 442 KiB l4check fusion in 56 s across **1178 slices**
+    with `still compiling` lines every 5 s and a correct result; check-telnet green
+    through the sliced path; three arch demos canonical (the hook is a relaxed atomic
+    load per function when unregistered); full ci green. *Recorded follow-up (the full
+    upgrade):* make `eo9:exec/compile` WIT-async so the CALLER can also proceed —
+    ripples through the guest SDK, eosh, telnetd, the usermode runtime, and the /vm
+    blob; the fiber here is the mechanism it would reuse. *Also recorded:* the boot-time
+    codegen demo and `compile_component`-less paths still compile unsliced (tiny seeds);
+    pre/post-pipeline phases (validation, object emission) run between ticks and are
+    seconds-scale, inside the watchdog budget.

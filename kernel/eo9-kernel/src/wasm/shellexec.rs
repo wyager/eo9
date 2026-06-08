@@ -421,6 +421,18 @@ static PARENTS: KLock<Vec<Option<u32>>> = KLock::new(Vec::new());
 /// `drive_children`).
 static CURRENT_PARENT: AtomicU32 = AtomicU32::new(u32::MAX);
 
+/// Save/restore the current-parent marker around a nested scheduling pass run from
+/// *inside* a child's poll (fibercompile's pump): the nested `drive_children` would
+/// otherwise reset the marker to "none" on its way out, and a spawn later in the
+/// interrupted poll would record the wrong parent for the kill cascade.
+pub(super) fn save_current_parent() -> u32 {
+    CURRENT_PARENT.load(Ordering::Acquire)
+}
+
+pub(super) fn restore_current_parent(value: u32) {
+    CURRENT_PARENT.store(value, Ordering::Release);
+}
+
 /// Whether the *root* program's own `task.wait` consumes Ctrl-C. True when the root is
 /// the console itself (`boot_to_eosh`, headless runs — today's behavior); false when the
 /// root is the boot supervisor (`boot_to_init`), whose wait on the console must NOT eat
@@ -1719,18 +1731,19 @@ pub(super) fn compile_component(
             let exec_bytes = eo9_component::Component::load(component.bytes.clone())
                 .map(|c| c.executable_bytes())
                 .unwrap_or_else(|_| component.bytes.clone());
-            // Codegen blocks the console; announce it so a long compile (a detach of a
-            // large composition) never reads as a frozen shell.
+            // Codegen is sliced (fibercompile): the drive loop keeps scheduling —
+            // and patting the board watchdog — between compile slices; announce the
+            // compile so the interleaved output is attributable.
             crate::kprintln!(
                 "codegen: compiling the composed component on-target ({} KiB) …",
                 exec_bytes.len() / 1024
             );
             let started = crate::timer::uptime_us();
-            let compiled = Component::new(engine, &exec_bytes)
-                .map_err(|err| format!("on-target compilation failed: {err:?}"));
+            let (compiled, slices) = super::fibercompile::compile(engine, &exec_bytes);
+            let compiled = compiled.map_err(|err| format!("on-target compilation failed: {err:?}"));
             if let Ok(image) = &compiled {
                 crate::kprintln!(
-                    "codegen: compiled in {} ms",
+                    "codegen: compiled in {} ms ({slices} slices)",
                     (crate::timer::uptime_us() - started) / 1000
                 );
                 exec.cache_compile(component.graph_hash, image.clone());
@@ -2290,17 +2303,20 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                     let image = match cached {
                         Some(component) => Ok(component),
                         None => {
-                            // The console is single-threaded and codegen blocks it for
-                            // seconds (much longer on a loaded host): say so *before* the
-                            // silence, so a long compile never reads as a frozen shell
-                            // (plan/12, the gfx freeze investigation).
+                            // Codegen is sliced (fibercompile): between compile slices
+                            // the drive loop schedules children/services and pats the
+                            // board watchdog, so a long compile starves nothing (and the
+                            // `hb` heartbeat keeps flowing on the bench). Announce it so
+                            // the interleaved output is attributable.
                             crate::kprintln!(
                                 "codegen: compiling the composed component on-target \
                                  ({} KiB) …",
                                 exec_bytes.len() / 1024
                             );
                             let compile_started = crate::timer::uptime_us();
-                            let compiled = Component::new(&engine, &exec_bytes).map_err(|err| {
+                            let (compiled, slices) =
+                                super::fibercompile::compile(&engine, &exec_bytes);
+                            let compiled = compiled.map_err(|err| {
                                 WitCompileError::Codegen(format!(
                                     "on-target compilation failed: {err:?}"
                                 ))
@@ -2308,7 +2324,9 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                             if compiled.is_ok() {
                                 let elapsed_ms =
                                     (crate::timer::uptime_us() - compile_started) / 1000;
-                                crate::kprintln!("codegen: compiled in {elapsed_ms} ms");
+                                crate::kprintln!(
+                                    "codegen: compiled in {elapsed_ms} ms ({slices} slices)"
+                                );
                             }
                             #[cfg(feature = "wasm-storedisk")]
                             if let Ok(component) = &compiled {

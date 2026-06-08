@@ -16,6 +16,13 @@ Decisions) so it can be turned into an upstream PR or dropped when upstream catc
 (async `main`/`configure`, async I/O operations). Upstream gates that machinery on `std`;
 the std surface it actually uses is small and mostly incidental. Changes, by file:
 
+- `src/engine.rs` — adds `set_compile_progress_callback(Option<fn()>)` + a per-unit
+  `compile_progress_tick()` in the **sequential** arms of `run_maybe_parallel{,_mut}`
+  (the path single-threaded/no_std embedders take; the rayon path is untouched). A
+  cooperative embedder uses it as the compile pipeline's scheduling seam — the Eo9
+  kernel suspends a compile fiber there so the drive loop keeps running (and keeps
+  patting the board watchdog) during long on-target compiles (plan/12, board round 9).
+  Upstream-shaped: a candidate PR as a general "compilation progress hook".
 - `Cargo.toml` — the `component-model-async` feature no longer requires `std` or
   `futures/std` (the `futures` items used — oneshot channels, `FuturesUnordered`,
   `StreamExt` — are all available with `futures/alloc`).

@@ -1319,3 +1319,15 @@ Match the priority order above; (1)+(2) unblock I2.
       --tcp-target 10.20.3.1`
     * `telnetd --nic net.rtl8125 --advertise-max 1000 --address 10.20.3.70
       --gateway 10.20.3.1 --sessions 4`, then `telnet 10.20.3.70` from the Mac.
+
+    *Board round 8/9 (2026-06-08): the ladder hit the kernel.* Round 8's parameterized
+    l4check line composed to a 486 KiB fusion; the board hardware-reset mid-compile —
+    bench-timed at codegen+18.2 s, exactly the 22.4 s DW-WDT period from the last
+    drive-loop pat. On-target codegen ran synchronously inside the exec `compile` host
+    call, starving the drive loop (no pats, no `hb`) for the whole compile. Fixed in the
+    kernel (plan/12, the sliced-codegen entry): `Component::new` now runs on a fiber that
+    yields every ~5 ms of compile work; between slices the drive loop pumps children,
+    services, the watchdog, and a throttled `codegen: still compiling` line. QEMU TCG
+    validation: the same l4check fusion compiled in 56 s across 1178 slices with liveness
+    lines every 5 s and resolved; check-telnet green through the sliced path (its
+    sessions compile the 4-component stack). The telnet prize ladder is unblocked.
