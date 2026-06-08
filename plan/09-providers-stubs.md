@@ -1247,3 +1247,47 @@ Match the priority order above; (1)+(2) unblock I2.
 
     Core crate: 17 host tests (+ the loopback words). Full ci green; QEMU bare and
     configured refusal probes green; both board images rebuilt.
+
+    *Board round 6 (2026-06-08) results → round 7, the link probe.* The round-6
+    instrumentation resolved cleanly on silicon: `ram-code 0x0000->0x0b99` (the round-5
+    pre-read correction confirmed; warm re-claims show `0x0b99->0x0b99` and skip), both
+    loopback tests PASS every run at 2500 and 1000. The decisive split: **at 2500 wire RX
+    is totally dead; at `--advertise-max 1000` wire RX works end-to-end** (live-proven: a
+    ping burst from the bench Mac moved the broadcast tally in real time). So 2.5GBASE-T
+    is its own deferrable wire problem, and at 1000 the remaining symptom is TX-side:
+    the gateway never replies and the Mac never learns the board.
+
+    A confound found while building round 7 and recorded loudly: **every board ARP so
+    far carried sender protocol address 10.0.2.15** — l2check's hardcoded slirp source
+    survived the round-3 `--gateway` change. Consequences: (a) the bench evidence "the
+    Mac never learns 10.20.3.70" was expected EVEN WITH PERFECT TX, since the request
+    advertised 10.0.2.15; (b) an off-subnet sender is precisely what DAI-class ingress
+    filtering drops and what a cautious gateway declines to answer — the round-6 "TX
+    filtered" reading is unproven until the probe carries the right source. Round 7's
+    `--source` closes it.
+
+    l2check grows into a one-shot link probe (world: `gateway`/`source`/`beacon`
+    options, defaults preserve QEMU behavior bit-for-bit):
+
+    * ARP retransmitted through the whole window (~1 s cadence; single-shot was
+      indefensible into a lossy/filtered port), window widened to 2048 polls.
+    * ARP responder: any who-has for `source` is answered (so the bench Mac's ping
+      measures whether board ARP TX crosses the switch). telnetd needs no sibling
+      change — its stack's net.l4.over-l2/smoltcp already answers ARP for its
+      configured address.
+    * UDP broadcast beacon (`--beacon true`): `source`:19099 → 255.255.255.255:19099,
+      payload `eo9-beacon <seq>`, ~2/s, IPv4 header checksum verified independently;
+      Ethernet broadcast needs no ARP, so beacon-arrives-but-ARP-does-not = DAI-class
+      ARP filtering, nothing-arrives = MAC-level port security (`nc -ul 19099` on the
+      listener, no sudo).
+    * Counts line on every exit: `probes - arp sent N, who-has answered M, beacons
+      sent K` — with the driver's tally dump this makes every run advance a round.
+    * Pacing rides the poll cadence (the world imports no clock — recorded
+      approximation, ~ms per empty poll).
+
+    Round-7 bench line: `net.rtl8125 --advertise-max 1000 $ l2check --gateway 10.20.3.1
+    --source 10.20.3.70 --beacon true`. QEMU-validated live: bare `net.virtio $ l2check`
+    resolves with the counts line; the full board-flavor invocation resolves with
+    `beacon on, beacons sent ≥1` against slirp. Full ci green; both board images
+    rebuilt. The 2.5GBASE-T RX fault stays open as the lane's deferrable follow-up
+    (suspects: the omitted EPHY/ASPM items, cable class, switch 2.5G negotiation).

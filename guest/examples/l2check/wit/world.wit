@@ -1,17 +1,28 @@
-// l2check — the link-layer (eo9:net/l2) example: open the provider's interface, send a
-// broadcast ARP request for the gateway, and wait for the reply. Getting one proves
-// whole frames move in both directions through whatever l2 provider the program is
-// composed with (`net.virtio` on QEMU metal, `net.rtl8125` on the board). Capabilities:
+// l2check — the link-layer (eo9:net/l2) example: open the provider's interface, ARP
+// for the gateway (retransmitting through the whole window), answer who-has requests
+// for our own address, optionally emit a UDP broadcast beacon, and report what
+// happened. A reply proves whole frames move in both directions through whatever l2
+// provider the program is composed with (`net.virtio` on QEMU metal, `net.rtl8125` on
+// the board); the responder + beacon turn the program into a one-shot link probe that
+// discriminates switch-side filtering (plan/09 D46 round 7). Capabilities:
 // eo9:net/l2, eo9:text.
 package eo9-examples:l2check@0.1.0;
 
 /// ARP-resolves the gateway over the granted link-layer capability and reports the MAC
-/// address that answered. The target defaults to 10.0.2.2 (the QEMU user-mode-networking
-/// gateway every slirp instance answers ARP for); `--gateway` points the probe at a real
-/// LAN's router when the link is physical.
+/// address that answered. Defaults match QEMU user-mode networking (gateway 10.0.2.2,
+/// source 10.0.2.15); the board bench passes its LAN addresses.
 ///
 ///   net.virtio $ l2check
-///   net.rtl8125 $ l2check --gateway 10.20.3.1     (board bench)
+///   net.rtl8125 $ l2check --gateway 10.20.3.1 --source 10.20.3.70 --beacon true
+///
+/// Throughout the receive window the program (a) re-sends the ARP request roughly
+/// once a second, (b) answers any who-has for `source` (so a peer pinging us measures
+/// whether our ARP transmit crosses the switch), and (c) with `--beacon true` sends a
+/// small UDP broadcast — `source`:19099 -> 255.255.255.255:19099, payload
+/// `eo9-beacon <seq>` — roughly twice a second (listen with `nc -ul 19099`; broadcast
+/// needs no ARP resolution, so beacon-arrives-but-ARP-does-not pins ARP-specific
+/// ingress filtering such as DAI, while nothing-arrives pins MAC-level port security).
+/// A final console line reports the probe counts either way.
 world l2check {
     import eo9:net/l2@0.1.0;
     import eo9:text/text@0.1.0;
@@ -35,6 +46,11 @@ world l2check {
     }
 
     /// `gateway`: the IPv4 address to ARP for, dotted quad (default 10.0.2.2).
-    export main: async func(gateway: option<string>)
-        -> result<program-success, program-failure>;
+    /// `source`: OUR IPv4 address — the ARP sender protocol address, the who-has
+    /// address the responder answers for, and the beacon's IP source (default
+    /// 10.0.2.15, the address slirp hands its guest; on a real LAN pass the board's
+    /// address — an off-subnet sender is exactly what DAI-class filtering drops).
+    /// `beacon`: emit the UDP broadcast beacon during the window (default false).
+    export main: async func(gateway: option<string>, source: option<string>,
+        beacon: option<bool>) -> result<program-success, program-failure>;
 }
