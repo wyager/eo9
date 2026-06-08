@@ -1,0 +1,19 @@
+# eo9-ohci is the pure, host-testable core of the `usb.ohci` / `usb.ohci-pci` guest
+# drivers (docs/board/usb-ohci-plan.md §2): the OHCI 1.0a register map, ED/TD
+# encode/decode, the HCCA layout, the done-queue walk, the enumeration state machine
+# (port-reset timing, SET_ADDRESS, the GET_DESCRIPTOR chain), USB descriptor parsing,
+# and HID boot-protocol report decode — everything about the device conversation that
+# is plain bit arithmetic, factored out of the wasm components so `cargo test`
+# exercises it on the host (the eo9-rtl8125 / eofs precedent: the component is a thin
+# I/O shell, the logic is host-tested).
+#
+# no_std claim is kept honest with: cargo check -p eo9-ohci --target aarch64-unknown-none
+[package]
+name = "eo9-ohci"
+description = "OHCI 1.0a register map, ED/TD encode/decode, HCCA layout, enumeration state machine, USB descriptor parsing, and HID boot-protocol decode: the pure core of Eo9's usb.ohci drivers."
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
