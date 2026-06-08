@@ -1,0 +1,124 @@
+# USB boot + the standalone demo (HDMI shell, USB keyboard, curl)
+
+Plan 2026-06-08. Demo: power on → Eo9 boots from a USB stick → eosh on HDMI →
+commands typed on the physical USB keyboard → `curl http://…` prints a real website.
+Companion plans: usb-ohci-plan.md (keyboard lanes M1-M4), hdmi-simplefb-plan.md.
+
+## Part A — USB boot, hands-free (CONFIRMED feasible with zero firmware changes)
+
+Live `printenv` capture (bench, 2026-06-08, log .claude/board-bringup/logs/uboot-env-*):
+- `boot_targets=mmc0 mmc1 nvme mtd2 mtd1 mtd0 usb0 pxe dhcp` — usb0 IS in the stock
+  distro scan chain; with no other media the chain reaches it (today's fail-through
+  to opi# proves the chain runs to its end).
+- `boot_scripts=boot.scr.uimg boot.scr`; `scan_dev_for_boot_part` honors -bootable
+  partitions else partition 1; `boot_a_script` loads + sources the script.
+So: FAT32 partition 1 on the stick + `/boot.scr` → power-on boots Eo9, no setenv, no
+saveenv, no typed commands; stick out = today's bench exactly.
+
+### Load path facts (from the serial loader + kernel entry sources)
+- The image is a flat arm64 Image linked run-in-place at 0x00200000, entry at offset 0.
+  `fatload usb …:1 0x00200000 EO9.IMG` + `go 0x00200000` — the 0x04000000 stub is not
+  involved. EL2 entry state identical to the serial path.
+- Cache: kernel `_board_entry` does its own dc civac sweep of the whole footprint —
+  no loader-side data sweep needed. Residual hazard: I-fetch of the first lines of
+  entry code; gate = crc32-after-fatload + beacon check (Round A1); mitigations
+  staged (cache-pressure crc32, dcache/icache cmds if present).
+- **x0 problem and the chosen fix**: `go` passes junk x0 (kernel tolerates → no
+  bootargs → no grants — fatal for the demo). Fix: kernel staged-bootargs fallback —
+  reserve a page at 0x00100000 (board profile, heap-excluded); fdt::bootargs() tries
+  x0 first (serial path unchanged), else sweeps + reads a plain text command line
+  (or valid FDT) from the staging page. The stick carries `BOOTARGS.TXT`; boot.scr
+  fatloads it to 0x00100000. Editing the demo composition = editing a text file.
+  Rejected: a second-stage shim (new artifact + coherency bootstrap + baked FDT
+  address); fdt-set games (control-FDT address stability + quoting); baked-in args.
+
+### boot.scr (mkimage -T script; xtask emits it with the image CRC baked)
+```
+fatload ${devtype} ${devnum}:${distro_bootpart} 0x00100000 BOOTARGS.TXT
+fatload ${devtype} ${devnum}:${distro_bootpart} 0x00200000 EO9.IMG
+if crc32 -v 0x00200000 ${filesize} <crc>; then go 0x00200000; else echo EO9: CRC mismatch; fi
+```
+(hush-if/crc32 -v availability = Round A0 recon; degrade to unconditional go + the
+serially-proven-images rule if absent.)
+
+### Stick + bench rules
+- MBR, one FAT32 partition marked active, 8.3 uppercase names: EO9.IMG (52 MiB full /
+  23 MiB min; structural cap 62 MiB before the stub home), BOOTARGS.TXT, BOOT.SCR.
+- Mac write: diskutil partitionDisk + fdisk -e active flag; mount-policy fallback =
+  mtools-built FAT image dd'd raw.
+- Stick goes in a USB 3.0 port (keyboard/mouse own the USB2-A ports); U-Boot owns the
+  stick only until `go`. A0 confirms vendor usb storage sees it there; fallback =
+  stick in one USB2-A, mouse omitted.
+- Dev loop STAYS serial; only serially-proven images get written to the stick (a
+  pre-G wild jump can hang → power cycle with stick pulled). Post-G panics watchdog-
+  reset back into the stick = self-healing demo appliance.
+- Rounds: A0 recon → A1 manual fatload+go → A2 staged bootargs (kernel+QEMU) → A3
+  hands-free power-on, stick in/out. ~4 bench rounds + 1-2 days dev.
+
+## Part B — demo gaps
+
+| Element | Status |
+|---|---|
+| USB boot | GAP — Part A |
+| gfx provider | DONE (area/15, merging) |
+| eosh on HDMI | GAP — fbcon kernel tee (below) |
+| USB kbd protocol | DONE on QEMU (area/14, merging) |
+| USB kbd silicon | GAP — M1→M3 (2-5 rounds, the critical path) |
+| keys → eosh | GAP — M4 console-sink (1+1 rounds) |
+| NIC/transport | DONE (merged; pin --advertise-max 1000) |
+| DHCP | DONE (area/13, merging) |
+| curl | GAP — new small example (below) |
+| TLS | OUT by decision (feasibility note below) |
+| boot composition | GAP — `station` config + fbcon token (small) |
+
+### fbcon: kernel console tee to the framebuffer (the demo console)
+8×16 blitter over the simplefb surface (100×30 cells, white-on-black = chroma-immune),
+scroll + cursor, teeing every console byte at the UART output chokepoint; new `fbcon`
+boot token, mutually exclusive with the `gfx` grant. Decisive arguments vs a gfx.text
+component for THIS demo: (1) keystroke echo lives in the kernel read-line future — a
+component console would not show typing until Enter; (2) boot banner / DHCP lease line
+/ codegen narration / panics are kprintln's, visible only below the provider layer;
+(3) init's `console =` takes a single program, no composition grammar exists. Output
+policy: tee, not switch (serial transcripts remain the bench instrument). The gfx.text
+component stays the principled follow-up on the gfx lane. ~300-500 kernel lines,
+host-tested blitter math, capture-stick acceptance.
+
+### curl (new example, l4check shape)
+`eo9:net/l4` + text; `main(url, resolver: option)`. http:// only (https refuses typed,
+naming the TLS decision); DNS via the l4check encoder factored into a shared module;
+GET → status + headers count + body (16 KiB cap, honest truncation); one 301/302 hop;
+typed failures; counts line. QEMU gate check-curl (python http.server fixture via
+slirp host alias). Board: `--resolver 10.20.3.1 http://example.com` (neverssl.com as
+anti-redirect fallback). Known caveats recorded: l4 graceful-close gap (harmless for
+GET); lease DNS is logged-not-stored → curl takes --resolver (surfacing lease DNS is
+a small net-lane follow-up).
+
+### TLS (deferred lane, honest note)
+embedded-tls (no_std TLS 1.3, RustCrypto) is the first candidate; rustls 0.23 no_std
+needs a RustCrypto provider. The hard parts on Eo9 are NOT the ciphers: root-store
+bytes are fine, but certificate validation needs WALL-CLOCK TIME (board RTC starts at
+epoch — everything "not yet valid" until PMIC RTC or NTP lands) and entropy
+provenance. Plan after the demo ships.
+
+### Boot composition
+BOOTARGS.TXT: `station pci platform console-sink fbcon`. `station` config:
+`keyboard = usb.kbd restart restart.always`, `console = eosh` (restart always).
+`usb.kbd` = one service component folding eo9-ohci + HID decode + console-sink
+(init lines are single-program; no composition grammar needed). New surface: ONE
+token (fbcon) + ONE config (station). The network is deliberately NOT auto-started:
+typing `net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address dhcp) $ curl …`
+on the physical keyboard IS the demo — capability composition performed live, with
+the sliced-codegen narration visible on HDMI during the fusion compile.
+
+### Dependency graph + order
+Merge train (13→14→15) blocks everything; then four parallel lanes: usb-boot (A0-A3),
+usb silicon (M1-M4 + usb.kbd; THE critical path, 2-5 rounds), fbcon, curl. `station`
+needs M4+fbcon+curl. Final: full-demo rehearsal over SERIAL first (same bootargs),
+then the stick, then 3 consecutive cold-boot dress rehearsals.
+Sizing: ~10-15 bench rounds total; dev ~5-7 days across lanes.
+
+### Demo-specific re-validation note
+A USB boot means vendor `usb start` ran (controllers touched, keyboard addressed,
+EHCI CONFIGFLAGs possibly set). The OHCI driver already clears CONFIGFLAGs and does
+its own port reset; each USB milestone adds a "after vendor usb start" arm (USB boot
+makes it the production arm).
