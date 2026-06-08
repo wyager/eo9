@@ -325,9 +325,9 @@ pub fn add_platform(linker: &mut Linker<KernelState>) -> Result<()> {
 
     interface.func_wrap(
         "default",
-        |_store: StoreContextMut<'_, KernelState>,
-         (): ()|
-         -> Result<(Resource<PlatformCap>,)> { Ok((Resource::new_own(0),)) },
+        |_store: StoreContextMut<'_, KernelState>, (): ()| -> Result<(Resource<PlatformCap>,)> {
+            Ok((Resource::new_own(0),))
+        },
     )?;
 
     // --- enumeration and claiming ---------------------------------------------------------

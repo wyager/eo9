@@ -95,7 +95,9 @@ enum State {
     AddressSettle,
     DeviceDescriptor,
     ConfigurationHead,
-    ConfigurationFull { total: u16 },
+    ConfigurationFull {
+        total: u16,
+    },
     Done,
 }
 
@@ -272,9 +274,7 @@ mod tests {
             crate::setup::get_descriptor(descriptor_type::DEVICE, 0, 8)
         );
         machine
-            .event(Event::ControlDone {
-                data: &DEVICE[..8],
-            })
+            .event(Event::ControlDone { data: &DEVICE[..8] })
             .unwrap();
 
         // 3. SET_ADDRESS still goes to address 0; then the 2 ms settle.
@@ -358,9 +358,7 @@ mod tests {
         machine.event(Event::PortResetComplete).unwrap();
         machine.event(Event::Waited).unwrap();
         assert_eq!(
-            machine.event(Event::ControlDone {
-                data: &[0u8; 8]
-            }),
+            machine.event(Event::ControlDone { data: &[0u8; 8] }),
             Err(EnumerationError::MalformedDescriptor)
         );
 
@@ -369,9 +367,7 @@ mod tests {
         machine.event(Event::PortResetComplete).unwrap();
         machine.event(Event::Waited).unwrap();
         machine
-            .event(Event::ControlDone {
-                data: &DEVICE[..8],
-            })
+            .event(Event::ControlDone { data: &DEVICE[..8] })
             .unwrap();
         machine.event(Event::ControlDone { data: &[] }).unwrap();
         machine.event(Event::Waited).unwrap();

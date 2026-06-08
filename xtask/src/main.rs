@@ -4058,10 +4058,7 @@ fn qmp_inject_keys(socket: &Path, keys: &[&str]) -> Result<(), String> {
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .map_err(|err| format!("check-usb: QMP socket timeout: {err}"))?;
 
-    fn read_until(
-        stream: &mut std::os::unix::net::UnixStream,
-        needle: &str,
-    ) -> Result<(), String> {
+    fn read_until(stream: &mut std::os::unix::net::UnixStream, needle: &str) -> Result<(), String> {
         let mut seen = String::new();
         let mut buf = [0u8; 512];
         loop {

@@ -230,10 +230,7 @@ impl<R: RegionIo> Ohci<R> {
             .write32(reg::HC_CONTROL_CURRENT_ED, 0)
             .await
             .map_err(io)?;
-        self.io
-            .write32(reg::HC_BULK_HEAD_ED, 0)
-            .await
-            .map_err(io)?;
+        self.io.write32(reg::HC_BULK_HEAD_ED, 0).await.map_err(io)?;
         self.io
             .write32(reg::HC_BULK_CURRENT_ED, 0)
             .await
@@ -382,7 +379,9 @@ impl<R: RegionIo> Ohci<R> {
         let io = |e| DriverError::Io(e);
         let base = self.io.dma_base();
         let in_length = if setup.is_in() {
-            (setup.length as usize).min(data_in.len()).min(arena::CONTROL_BUFFER_LEN as usize)
+            (setup.length as usize)
+                .min(data_in.len())
+                .min(arena::CONTROL_BUFFER_LEN as usize)
         } else {
             0
         };
@@ -497,9 +496,9 @@ impl<R: RegionIo> Ohci<R> {
             // A halted ED with a clean setup stage but an erroring data stage means
             // the device refused the data stage — judged typed here.
             let data = judge(read_td(&mut self.io, data_td))?;
-            let received =
-                data.bytes_transferred(base + arena::CONTROL_BUFFER as u32, in_length as u32)
-                    as usize;
+            let received = data
+                .bytes_transferred(base + arena::CONTROL_BUFFER as u32, in_length as u32)
+                as usize;
             self.io
                 .dma_read(arena::CONTROL_BUFFER, &mut data_in[..received]);
             received
@@ -531,7 +530,8 @@ impl<R: RegionIo> Ohci<R> {
     /// the next writeback can happen (§5.2.9). Returns the head pointer (0 = nothing).
     async fn consume_done_queue(&mut self) -> Result<u32, DriverError<R::Error>> {
         let mut head_bytes = [0u8; 4];
-        self.io.dma_read(arena::HCCA + hcca::DONE_HEAD, &mut head_bytes);
+        self.io
+            .dma_read(arena::HCCA + hcca::DONE_HEAD, &mut head_bytes);
         let head = u32::from_le_bytes(head_bytes);
         if head == 0 {
             return Ok(0);
@@ -718,7 +718,8 @@ impl<R: RegionIo> Ohci<R> {
             // Judge the halted TD for the typed cause, then re-arm cleanly below the
             // consumer's retry.
             let mut td_bytes = [0u8; 16];
-            self.io.dma_read(arena::td_slot(pending_slot), &mut td_bytes);
+            self.io
+                .dma_read(arena::td_slot(pending_slot), &mut td_bytes);
             let td = TransferDescriptor::decode(&td_bytes);
             return Err(match td.condition_code {
                 ConditionCode::Stall => DriverError::Stall,
@@ -731,7 +732,8 @@ impl<R: RegionIo> Ohci<R> {
 
         // Retired: judge, measure, copy out.
         let mut td_bytes = [0u8; 16];
-        self.io.dma_read(arena::td_slot(pending_slot), &mut td_bytes);
+        self.io
+            .dma_read(arena::td_slot(pending_slot), &mut td_bytes);
         let td = TransferDescriptor::decode(&td_bytes);
         match td.condition_code {
             ConditionCode::NoError => {}
@@ -739,10 +741,8 @@ impl<R: RegionIo> Ohci<R> {
             other => return Err(DriverError::Transfer(other)),
         }
         let report_len = u64::from(max_packet).min(arena::INTERRUPT_BUFFER_LEN);
-        let received = td.bytes_transferred(
-            base + arena::INTERRUPT_BUFFER as u32,
-            report_len as u32,
-        ) as usize;
+        let received =
+            td.bytes_transferred(base + arena::INTERRUPT_BUFFER as u32, report_len as u32) as usize;
         let copied = received.min(report.len());
         self.io
             .dma_read(arena::INTERRUPT_BUFFER, &mut report[..copied]);
@@ -758,9 +758,12 @@ impl<R: RegionIo> Ohci<R> {
             Some((base + arena::INTERRUPT_BUFFER as u32, report_len as u32)),
         );
         next.next = base + arena::td_slot(new_dummy) as u32;
+        self.io.dma_write(
+            arena::td_slot(new_dummy),
+            &TransferDescriptor::default().encode(),
+        );
         self.io
-            .dma_write(arena::td_slot(new_dummy), &TransferDescriptor::default().encode());
-        self.io.dma_write(arena::td_slot(new_pending), &next.encode());
+            .dma_write(arena::td_slot(new_pending), &next.encode());
         // Publish the new tail.
         let mut ed_bytes = [0u8; 16];
         self.io.dma_read(arena::INTERRUPT_ED, &mut ed_bytes);
@@ -902,10 +905,7 @@ mod tests {
         fn process_control_list(&mut self) {
             let ed_offset = (self.register(reg::HC_CONTROL_HEAD_ED) - self.dma_base) as u64;
             let mut ed_bytes = [0u8; 16];
-            ed_bytes.copy_from_slice(self.arena_slice(
-                self.dma_base + ed_offset as u32,
-                16,
-            ));
+            ed_bytes.copy_from_slice(self.arena_slice(self.dma_base + ed_offset as u32, 16));
             let mut ed = EndpointDescriptor::decode(&ed_bytes);
             let mut response: Vec<u8> = Vec::new();
             let mut done: Vec<u32> = Vec::new();
@@ -924,8 +924,7 @@ mod tests {
                     }
                     TdPid::In => {
                         if td.current_buffer != 0 {
-                            let capacity =
-                                (td.buffer_end - td.current_buffer + 1) as usize;
+                            let capacity = (td.buffer_end - td.current_buffer + 1) as usize;
                             let send = response.len().min(capacity);
                             let start = td.current_buffer;
                             let payload: Vec<u8> = response[..send].to_vec();
@@ -954,8 +953,7 @@ mod tests {
                 .copy_from_slice(&encoded_ed);
             if let Some(&newest) = done.first() {
                 let head_offset = (arena::HCCA + hcca::DONE_HEAD) as usize;
-                self.arena[head_offset..head_offset + 4]
-                    .copy_from_slice(&newest.to_le_bytes());
+                self.arena[head_offset..head_offset + 4].copy_from_slice(&newest.to_le_bytes());
             }
         }
     }
@@ -971,7 +969,7 @@ mod tests {
                 // The frame counter ticks once per few reads, so frame-counted waits
                 // terminate fast in tests but still exercise the polling shape.
                 self.frame_phase += 1;
-                if self.frame_phase % 2 == 0 {
+                if self.frame_phase.is_multiple_of(2) {
                     self.frame = (self.frame + 1) & 0xffff;
                 }
                 return Ok(self.frame);
@@ -1058,10 +1056,8 @@ mod tests {
         // THE gotcha: after the reset the driver must rewrite HcFmInterval with the
         // saved interval, the recomputed FSMPS, and a flipped FIT — leaving the
         // default in place is the classic OHCI bring-up bug.
-        let expected = fm_interval_restore(
-            bits::FM_INTERVAL_DEFAULT_FI,
-            bits::FM_INTERVAL_DEFAULT_FI,
-        );
+        let expected =
+            fm_interval_restore(bits::FM_INTERVAL_DEFAULT_FI, bits::FM_INTERVAL_DEFAULT_FI);
         assert_eq!(mock.register(reg::HC_FM_INTERVAL), expected);
         assert_eq!(
             mock.register(reg::HC_PERIODIC_START),

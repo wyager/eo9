@@ -23,12 +23,12 @@ pub mod async_demo;
 pub mod codegen;
 #[cfg(feature = "wasm-storedisk")]
 pub mod diskcache;
+#[cfg(feature = "wasm-store")]
+pub mod dma;
 #[cfg(all(feature = "wasm-codegen", feature = "wasm-store"))]
 pub mod fibercompile;
 #[cfg(feature = "wasm-hello")]
 pub mod hello;
-#[cfg(feature = "wasm-store")]
-pub mod dma;
 #[cfg(feature = "wasm-store")]
 pub mod pci_provider;
 #[cfg(feature = "wasm-store")]

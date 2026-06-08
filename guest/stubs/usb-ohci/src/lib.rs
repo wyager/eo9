@@ -164,16 +164,12 @@ fn map_driver_error(error: DriverError<platform::PlatformError>) -> UsbError {
         )),
         DriverError::Timeout(_) => UsbError::Timeout,
         DriverError::Stall => UsbError::Stall,
-        DriverError::Transfer(code) => {
-            UsbError::Io(format!("usb.ohci: transfer error: {code:?}"))
-        }
+        DriverError::Transfer(code) => UsbError::Io(format!("usb.ohci: transfer error: {code:?}")),
         DriverError::NoSuchPort | DriverError::NotConnected => UsbError::NotFound,
         DriverError::Enumeration(error) => {
             UsbError::Io(format!("usb.ohci: enumeration: {error:?}"))
         }
-        DriverError::DoneQueueCorrupt => {
-            UsbError::Io(String::from("usb.ohci: corrupt done queue"))
-        }
+        DriverError::DoneQueueCorrupt => UsbError::Io(String::from("usb.ohci: corrupt done queue")),
     }
 }
 

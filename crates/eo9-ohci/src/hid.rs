@@ -77,20 +77,86 @@ pub fn key_ascii(usage: u8, shift: bool) -> Option<char> {
             let index = (usage - 0x1e) as usize;
             if shift { SHIFTED[index] } else { PLAIN[index] }
         }
-        0x28 => '\n',  // Enter
-        0x2b => '\t',  // Tab
-        0x2c => ' ',   // Space
-        0x2d => if shift { '_' } else { '-' },
-        0x2e => if shift { '+' } else { '=' },
-        0x2f => if shift { '{' } else { '[' },
-        0x30 => if shift { '}' } else { ']' },
-        0x31 => if shift { '|' } else { '\\' },
-        0x33 => if shift { ':' } else { ';' },
-        0x34 => if shift { '"' } else { '\'' },
-        0x35 => if shift { '~' } else { '`' },
-        0x36 => if shift { '<' } else { ',' },
-        0x37 => if shift { '>' } else { '.' },
-        0x38 => if shift { '?' } else { '/' },
+        0x28 => '\n', // Enter
+        0x2b => '\t', // Tab
+        0x2c => ' ',  // Space
+        0x2d => {
+            if shift {
+                '_'
+            } else {
+                '-'
+            }
+        }
+        0x2e => {
+            if shift {
+                '+'
+            } else {
+                '='
+            }
+        }
+        0x2f => {
+            if shift {
+                '{'
+            } else {
+                '['
+            }
+        }
+        0x30 => {
+            if shift {
+                '}'
+            } else {
+                ']'
+            }
+        }
+        0x31 => {
+            if shift {
+                '|'
+            } else {
+                '\\'
+            }
+        }
+        0x33 => {
+            if shift {
+                ':'
+            } else {
+                ';'
+            }
+        }
+        0x34 => {
+            if shift {
+                '"'
+            } else {
+                '\''
+            }
+        }
+        0x35 => {
+            if shift {
+                '~'
+            } else {
+                '`'
+            }
+        }
+        0x36 => {
+            if shift {
+                '<'
+            } else {
+                ','
+            }
+        }
+        0x37 => {
+            if shift {
+                '>'
+            } else {
+                '.'
+            }
+        }
+        0x38 => {
+            if shift {
+                '?'
+            } else {
+                '/'
+            }
+        }
         _ => return None,
     })
 }

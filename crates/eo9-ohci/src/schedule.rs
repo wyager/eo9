@@ -65,9 +65,8 @@ impl EndpointDescriptor {
             | (u32::from(self.skip) << 14)
             | (u32::from(self.isochronous) << 15)
             | (u32::from(self.max_packet_size & 0x7ff) << 16);
-        let head = (self.head & !0xf)
-            | u32::from(self.halted)
-            | (u32::from(self.toggle_carry) << 1);
+        let head =
+            (self.head & !0xf) | u32::from(self.halted) | (u32::from(self.toggle_carry) << 1);
         encode_dwords([dword0, self.tail & !0xf, head, self.next & !0xf])
     }
 
@@ -191,7 +190,12 @@ impl TransferDescriptor {
             | (toggle << 24)
             | (u32::from(self.error_count & 0b11) << 26)
             | (condition << 28);
-        encode_dwords([dword0, self.current_buffer, self.next & !0xf, self.buffer_end])
+        encode_dwords([
+            dword0,
+            self.current_buffer,
+            self.next & !0xf,
+            self.buffer_end,
+        ])
     }
 
     /// Decode the controller's writeback.
