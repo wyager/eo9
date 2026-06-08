@@ -335,3 +335,9 @@ open:
 - Switch-over-switch stacking should be re-tested now that the chain genuinely awaits (the pre-conversion
   attempt hit the suspension wall; expected to just work).
 - The owner pushes master to GitHub (github.com:wyager/eo9); planner-side agents never push.
+
+## Composed-spawn PCI grant refusal (found 2026-06-07, pre-existing)
+`pci.filtered $ disk.virtio $ cancelcheck` is refused at instantiation ("boot did not
+grant PCI") even on a `pci` boot, while direct interactive `lspci` works — contradicts
+the earlier verified filtered-chain flow (plan/12). Needs a lane: the spawn-path grant
+propagation for composed pci chains vs the interactive path.
