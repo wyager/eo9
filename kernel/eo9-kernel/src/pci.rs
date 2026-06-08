@@ -498,7 +498,10 @@ pub fn config_read(address: FunctionAddress, offset: u32, width: AccessWidth) ->
     if width == AccessWidth::Qword || !offset.is_multiple_of(width.bytes()) {
         return None;
     }
-    if offset + width.bytes() > CONFIG_SPACE_SIZE {
+    // Checked: `offset` comes straight from the wasm provider, so the bare add could
+    // overflow (a debug-build panic). Out of bounds either way → no bus access (and no
+    // DW iATU reprogram, which `config_address` would otherwise side-effect).
+    if offset.checked_add(width.bytes()).is_none_or(|end| end > CONFIG_SPACE_SIZE) {
         return None;
     }
     let target = config_address(address, offset)?;
@@ -522,7 +525,8 @@ pub fn config_write(address: FunctionAddress, offset: u32, width: AccessWidth, v
     if width == AccessWidth::Qword || !offset.is_multiple_of(width.bytes()) {
         return false;
     }
-    if offset + width.bytes() > CONFIG_SPACE_SIZE {
+    // Checked add: see config_read.
+    if offset.checked_add(width.bytes()).is_none_or(|end| end > CONFIG_SPACE_SIZE) {
         return false;
     }
     let Some(target) = config_address(address, offset) else {

@@ -71,7 +71,7 @@
 //! | pipe taps: CLK_PIPEPHY0_PIPE_G g3, CLK_PIPEPHY2_PIPE_G g5, CLK_PCIE1L2_PIPE g13, CLK_PCIE1L1_PIPE g15 | GATE_CON38 `0x898` | 3,5,13,15 |
 //! | phy refclk: CLK_REF_PIPE_PHY0_PLL_SRC g3, CLK_REF_PIPE_PHY2_PLL_SRC g5 | GATE_CON77 `0x934` | 3,5 |
 //! | phy apb: PCLK_PCIE_COMBO_PIPE_PHY0 g5, _PHY2 g7 | PHP GATE_CON0 `0x8800` | 5,7 |
-//! | refclk divs: phy0 div bits[5:0] of SEL176 `0x5c0`; phy2 div bits[5:0], phy0 mux bit6, phy2 mux bit8 of SEL177 `0x5c4` | | div 10 (PPLL 1100 MHz / 11 = 100 MHz, DT `assigned-clock-rates`), mux 1 = pll src |
+//! | refclk divs: phy0 div bits[5:0] of SEL176 `0x5c0`; phy2 div bits[5:0], phy0 mux bit6, phy2 mux bit8 of SEL177 `0x5c4` | | div auto-derived from the decoded PPLL (1100 MHz → /11, the bench-observed 4400 MHz → /44; target 100 MHz per DT `assigned-clock-rates`), mux 1 = pll src |
 //! | controller resets: SRST_PCIE3_POWER_UP b0 (l1), SRST_PCIE4_POWER_UP b1 (l2), SRST_P_PCIE3 b15 (l1) | SOFTRST_CON33 `0xa84` | rst-rk3588.c 33,0 / 33,1 / 33,15 |
 //! | controller reset: SRST_P_PCIE4 b0 (l2) | SOFTRST_CON34 `0xa88` | rst-rk3588.c 34,0 |
 //! | phy resets: SRST_REF_PIPE_PHY0 b6, SRST_REF_PIPE_PHY2 b8 | SOFTRST_CON77 `0xb34` | rst-rk3588.c 77,6 / 77,8 |
@@ -344,27 +344,29 @@ pub(crate) fn init() {
     }
 
     // --- PPLL diagnostic --------------------------------------------------------------
-    // The 100 MHz combphy refclk divides PPLL; the divider below assumes the 1100 MHz
-    // vendor/mainline rate (rk3588_pll_rates: m=550 p=3 s=2 k=0 → 24 MHz·550/3/4). PPLL
-    // lives in the PHP CRU block: PLL_CON(128) = CRU + 0x8000 + 128·4 = +0x8200
-    // (clk-rk3588.c RK3588_PMU_PLL_CON), mode in MODE_CON0 (+0x280) bits [11:10]
-    // (1 = normal). rate = 24 MHz · m / p / 2^s (clk-pll.c rockchip_rk3588_pll).
-    let con0 = reg_read(CRU + 0x8200);
-    let con1 = reg_read(CRU + 0x8204);
+    // The 100 MHz combphy refclk divides PPLL. PPLL lives in the PHP CRU block:
+    // PLL_CON(128) = CRU + 0x8000 + 128·4 = +0x8200 (clk-rk3588.c RK3588_PMU_PLL_CON),
+    // mode in MODE_CON0 (+0x280) bits [11:10] (1 = normal). rate = 24 MHz · m / p / 2^s,
+    // fields m = con0 [9:0], p = con1 [5:0], s = con1 [8:6] (clk-pll.c
+    // RK3588_PLLCON0_M/PLLCON1_P/PLLCON1_S masks and shifts).
+    //
+    // Two PPLL states are known-good on this board, both delivering an exact 100 MHz
+    // refclk through the auto-derived divider below:
+    //  * m=550 p=3 s=2 → 1100 MHz, div 11 — the vendor/mainline rate
+    //    (clk-rk3588.c rk3588_pll_rates), what full U-Boot leaves behind;
+    //  * m=550 p=3 s=0 → 4400 MHz, div 44 — observed live on the bench
+    //    (.claude/board-bringup/logs/pcie-215042.log) booting via the serial loader,
+    //    whose boot path leaves the post-divider at 0.
+    let (ppll_hz, m, p, s) = ppll_decode();
     let mode = (reg_read(CRU + 0x280) >> 10) & 0x3;
-    let (m, p, s) = (con0 & 0x3ff, con1 & 0x3f, (con1 >> 8) & 0x3f);
-    let ppll_hz = if p != 0 {
-        ((24_000_000u64 * u64::from(m)) / u64::from(p)) >> s
-    } else {
-        0
-    };
     kprintln!(
         "pcie: ppll m={m} p={p} s={s} mode={mode} -> {ppll_hz} Hz, refclk div {}{}",
         refclk_div(),
-        if ppll_hz == 1_100_000_000 && mode == 1 {
+        if (ppll_hz == 1_100_000_000 || ppll_hz == 4_400_000_000) && mode == 1 {
             ""
         } else {
-            " (UNEXPECTED ppll — expected 1100 MHz in normal mode; check the div above)"
+            " (UNEXPECTED ppll — known-good states are 1100 MHz (s=2) and 4400 MHz \
+             (s=0) in normal mode; check the div above)"
         }
     );
 
@@ -388,17 +390,27 @@ pub(crate) fn init() {
     bring_up(&PORT_L2);
 }
 
+/// Decode PPLL: (rate in Hz, m, p, s). Field layout per clk-pll.c
+/// (RK3588_PLLCON0_M_MASK 0x3ff @0, RK3588_PLLCON1_P_MASK 0x3f @0,
+/// RK3588_PLLCON1_S_MASK 0x7 @6); rate = 24 MHz · m / p >> s.
+fn ppll_decode() -> (u64, u32, u32, u32) {
+    let con0 = reg_read(CRU + 0x8200);
+    let con1 = reg_read(CRU + 0x8204);
+    let (m, p, s) = (con0 & 0x3ff, con1 & 0x3f, (con1 >> 6) & 0x7);
+    let hz = if p != 0 {
+        ((24_000_000u64 * u64::from(m)) / u64::from(p)) >> s
+    } else {
+        0
+    };
+    (hz, m, p, s)
+}
+
 /// The PPLL→100 MHz refclk divider (1-based): exact division of the decoded PPLL rate
 /// when it has one within the 6-bit divider range, else the 1100 MHz default (/11).
 fn refclk_div() -> u32 {
-    let con0 = reg_read(CRU + 0x8200);
-    let con1 = reg_read(CRU + 0x8204);
-    let (m, p, s) = (con0 & 0x3ff, con1 & 0x3f, (con1 >> 8) & 0x3f);
-    if p != 0 {
-        let hz = ((24_000_000u64 * u64::from(m)) / u64::from(p)) >> s;
-        if hz != 0 && hz % 100_000_000 == 0 && (1..=64).contains(&(hz / 100_000_000)) {
-            return (hz / 100_000_000) as u32;
-        }
+    let (hz, ..) = ppll_decode();
+    if hz != 0 && hz % 100_000_000 == 0 && (1..=64).contains(&(hz / 100_000_000)) {
+        return (hz / 100_000_000) as u32;
     }
     11
 }
