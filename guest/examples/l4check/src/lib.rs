@@ -2,13 +2,13 @@
 //!
 //! Targets the `eo9-examples:l4check/l4check` world (see `wit/world.wit`): bind a UDP
 //! socket through the granted l4 capability, send a DNS query for `example.com` to the
-//! resolver, and report what came back; then attempt a TCP connection to the probe
+//! resolver, and report what came back; then attempt a TCP connection to the tcp-target
 //! host's discard port (:9) and report its typed outcome. A DNS answer proves
 //! datagrams travel both ways through the composed transport stack
 //! (`net.virtio $ net.l4.over-l2` on QEMU metal, `net.rtl8125 $ net.l4.over-l2` on the
 //! board); the TCP attempt proves a refused or ignored SYN comes back as a typed
 //! error, never a trap. The targets default to QEMU user-net's layout (resolver
-//! 10.0.2.3, probe 10.0.2.2); `--resolver`/`--probe` aim them at a real LAN's
+//! 10.0.2.3, tcp-target 10.0.2.2); `--resolver`/`--tcp-target` aim them at a real LAN's
 //! addresses. The program imports only `eo9:net/l4` — what the resolver answered is
 //! carried in the program outcome itself.
 
@@ -32,8 +32,8 @@ eo9_guest::bindings!({
 /// `--resolver`).
 const DEFAULT_RESOLVER: (u8, u8, u8, u8) = (10, 0, 2, 3);
 /// The user-net gateway; nothing listens on its discard port, which is the point
-/// (the default `--probe`).
-const DEFAULT_PROBE: (u8, u8, u8, u8) = (10, 0, 2, 2);
+/// (the default `--tcp-target`).
+const DEFAULT_TCP_TARGET: (u8, u8, u8, u8) = (10, 0, 2, 2);
 /// The name the query asks about.
 const QUERY_NAME: &[&str] = &["example", "com"];
 /// A fixed query id (the reply must echo it back).
@@ -162,15 +162,15 @@ fn parse_ip(text: &str) -> Result<(u8, u8, u8, u8), ProgramFailure> {
 eo9_guest::main! {
     async fn main(
         resolver: Option<String>,
-        probe: Option<String>,
+        tcp_target: Option<String>,
     ) -> Result<ProgramSuccess, ProgramFailure> {
         let resolver_ip = match &resolver {
             Some(text) => parse_ip(text)?,
             None => DEFAULT_RESOLVER,
         };
-        let probe_ip = match &probe {
+        let probe_ip = match &tcp_target {
             Some(text) => parse_ip(text)?,
-            None => DEFAULT_PROBE,
+            None => DEFAULT_TCP_TARGET,
         };
         let root = l4::default();
 

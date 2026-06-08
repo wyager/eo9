@@ -1291,3 +1291,31 @@ Match the priority order above; (1)+(2) unblock I2.
     `beacon on, beacons sent ≥1` against slirp. Full ci green; both board images
     rebuilt. The 2.5GBASE-T RX fault stays open as the lane's deferrable follow-up
     (suspects: the omitted EPHY/ASPM items, cable class, switch 2.5G negotiation).
+
+    *Board round 7 (2026-06-08): CURED — the wire works.* With `--source 10.20.3.70` the
+    whole picture inverted: `ok: resolved("58:47:ca:7f:4e:2c")` (the gateway's true MAC),
+    the bench Mac learned `10.20.3.70 at c0:74:2b:f8:22:33` from the responder's reply,
+    and the unprivileged `nc -ul 19099` caught `eo9-beacon 6` — ARP, ARP-response, and
+    UDP broadcast all proven both directions through the office switch at 1000 Mb/s. No
+    DAI, no port security: the round-6 "TX blocked" story was entirely the hardcoded
+    slirp source address (the round-7 confound note above). **The deferred follow-up:**
+    2500 Mb/s RX stays dead — every board composition runs with
+    `net.rtl8125 --advertise-max 1000` until the 2.5GBASE-T datapath is solved
+    (suspects: the omitted EPHY/ASPM items, cable class, switch 2.5G interop).
+
+    *Round 8: the last rung before the prize.* Two parameterizations, defaults
+    bit-for-bit (check-telnet green): l4check's second option is renamed `--probe` →
+    `--tcp-target` (same default 10.0.2.2, same port-9 refusal semantics); telnetd
+    gains `--advertise-max`, forwarded to the NIC's own configure interface at compose
+    time (net.rtl8125's `rtl8125-config`) — a NIC without the interface (net.virtio)
+    answers with a clean typed configure error, never a trap (option-C discipline;
+    QEMU-verified live: `telnetd --advertise-max 1000` → `error: configure(…)`).
+    Also QEMU-verified live: `net.virtio $ net.l4.over-l2 $ l4check --resolver 10.0.2.3
+    --tcp-target 10.0.2.2` → `ok: resolved("example.com is …; tcp 10.0.2.2:9 ->
+    ConnectionRefused")`. The board ladder to the finish line:
+
+    * `net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address 10.20.3.70
+      --prefix-length 24 --gateway 10.20.3.1) $ l4check --resolver 10.20.3.1
+      --tcp-target 10.20.3.1`
+    * `telnetd --nic net.rtl8125 --advertise-max 1000 --address 10.20.3.70
+      --gateway 10.20.3.1 --sessions 4`, then `telnet 10.20.3.70` from the Mac.

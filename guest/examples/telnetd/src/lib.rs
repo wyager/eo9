@@ -140,6 +140,7 @@ impl Guest for Telnetd {
         address: Option<String>,
         prefix_length: Option<u8>,
         gateway: Option<String>,
+        advertise_max: Option<u16>,
     ) -> Result<ProgramSuccess, ProgramFailure> {
         let out = Out::new();
         let port = port.unwrap_or(DEFAULT_PORT);
@@ -178,6 +179,23 @@ impl Guest for Telnetd {
         let nic = resolve(&fs_handle, nic_name)
             .await
             .map_err(ProgramFailure::Resolve)?;
+        // Forward the speed cap to the NIC's own configure interface when given
+        // (net.rtl8125's `rtl8125-config`). A NIC without such an interface (e.g.
+        // net.virtio) makes this a clean configure error — option-C discipline:
+        // refused typed at compose, never a trap.
+        let nic = match advertise_max {
+            Some(advertise_max) => algebra::configure(
+                nic,
+                &[algebra::NamedArg {
+                    name: String::from("advertise-max"),
+                    value: advertise_max.to_string(),
+                }],
+            )
+            .map_err(|err| {
+                ProgramFailure::Configure(format!("{nic_name} (advertise-max): {err:?}"))
+            })?,
+            None => nic,
+        };
         let tcp = resolve(&fs_handle, STACK_TCP)
             .await
             .map_err(ProgramFailure::Resolve)?;
