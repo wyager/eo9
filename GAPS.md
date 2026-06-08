@@ -364,3 +364,44 @@ entire idle backstop (n=1)`. Per the event-driven-liveness doctrine this is a
 high-priority bug (a wake edge is missing on some board-profile path the QEMU battery
 never exercised). Reproduction context: board profile, polled driver wait, l2check
 gateway ARP wait. Needs a kernel-lane investigation once the driver lane settles.
+
+## Board console input truncates at exactly 64 bytes (UART RX FIFO never drained by IRQ, 2026-06-08)
+Root-caused on the bench after four incidents: any console line longer than 64 bytes
+truncates at EXACTLY byte 64 (deterministic — two identical commands mangled at the
+same column; a 64-char command lost only its newline, byte 65). The DW-APB UART RX FIFO
+on RK3588 is 64 bytes deep, and the kernel's own backstop printed the mechanism:
+`stranded input: the idle backstop scavenged receive bytes the interrupt path missed
+(n=16)` — the RX interrupt path is NOT draining the FIFO on the board profile; input
+only reaches eosh when the idle backstop scavenges it. Between scavenges the FIFO
+overflows silently. QEMU never showed it (different console path). The heartbeat-
+collision theory from earlier today was wrong — the hb line in the echo was a bystander.
+Bench workaround in place (eosh_cmd.py types in 40-byte chunks with 6s scavenge pauses,
+plus a redundant trailing newline). Needs a kernel lane: enable/fix the DW-APB UART RX
+interrupt (or an adequate poll cadence) on the board profile so console input drains at
+line rate; the liveness backstop scavenge is currently the ONLY input path.
+
+## [FIXED pending area/09 merge — round 9 fiber-sliced codegen] Heartbeat (and possibly watchdog pat) starves during on-target codegen (board, 2026-06-08)
+During a 486 KiB composed-component compile on the Orange Pi the 5s `hb` heartbeat
+stopped for the whole compile (>12s) — the drive loop isn't running while codegen hogs
+the core. If the DW-WDT pat lives in the same loop, any composition that compiles
+longer than the 22.4s watchdog period will hardware-reset the board mid-compile.
+Today's images compile under that bound; a kernel lane should either pat from a path
+that survives long synchronous work or yield periodically inside codegen. (Also the
+liveness doctrine angle: a >12s scheduling gap for the drive loop is itself a
+starvation signal on a single-runnable workload.)
+
+## wait_until conflates the frozen-clock backstop with wall-clock windows (dhcp lane, 2026-06-08)
+The provider pump's `wait_until` bounds waits by ROUND COUNT (standing cap 4096), but
+empty receive polls complete in microseconds on fast paths — 4096 rounds elapse long
+before the intended wall-clock window (the DHCP lane needed ~20 s for smoltcp's 10 s
+discover retransmit and had to raise its cap to 2^20 rounds). Any other deadline built
+on the same helper may be silently round-limited rather than time-limited. Needs a
+real coarse time source in the wait path (or an explicit two-parameter bound:
+rounds AND ticks) — kernel/providers lane.
+
+## Compile-fiber stack has no guard page (review finding, 2026-06-08)
+The 2 MiB heap fiber that hosts sliced on-target codegen (and the existing async
+fiber stacks, which share the property) is plain heap memory — an overflow corrupts
+the heap silently instead of faulting. 4× the 512 KiB main stack the compiles
+previously shared, so headroom is real, but a guard page (or a canary check at
+fiber exit) belongs in the kernel lane's queue.
