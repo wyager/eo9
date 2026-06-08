@@ -436,3 +436,12 @@ like the serial-loader sender) rather than flat bounds. Third sighting same day 
 lane): three worktree batteries serialized on the single hard-coded 127.0.0.1:5555
 hostfwd — parallel lane batteries are now routine, so the gates want a per-worktree
 port (xtask --port or derive from the worktree path hash).
+
+## DHCP follow-ups from the merge review (2026-06-08)
+(a) check-dhcp's first probe requires upstream DNS (waits for `ok: resolved(`) — the
+gate fails offline even though the lease assertions are deterministic; accept the
+typed no-answer as an alternate marker or split the probe. (b) The no-DHCP-server
+typed timeout has no committed pin — the reviewer's scratch shape (dhcp over
+net.l2.echo + stub clock, expect "no lease arrived", ~4.8s) should be adopted as a
+real usermode test; shape preserved in the review transcript (.review/ in the
+review-rtl worktree).
