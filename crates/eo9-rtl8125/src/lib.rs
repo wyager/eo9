@@ -44,6 +44,40 @@ pub mod reg {
     /// multicast acceptance OFF (plan/09: multicast = none for v1), so both dwords are
     /// written 0 for determinism.
     pub const MAR0: u64 = 0x08;
+    /// `INT_CFG0_8125` — 8125 interrupt-configuration byte at 0x34; hw_start writes 0
+    /// (r8169 `enum rtl8125_registers` + `rtl_hw_start_8125`).
+    pub const INT_CFG0_8125: u64 = 0x34;
+    /// `Cfg9346` — the config-register write protect at 0x50: 0xc0 unlocks the
+    /// Config0..5 group, 0x00 re-locks (r8169 `rtl_unlock_config_regs` /
+    /// `rtl_lock_config_regs`).
+    pub const CFG9346: u64 = 0x50;
+    /// `Config1` at 0x52: hw_start_8125_common clears bit 4 (r8169:
+    /// `RTL_W8(tp, Config1, RTL_R8(tp, Config1) & ~0x10)`).
+    pub const CONFIG1: u64 = 0x52;
+    /// `Config3` at 0x54: bit 1 (`Rdy_to_L23`) cleared to keep the chip out of the
+    /// PCIe L2/L3 ready state (r8169 `rtl_pcie_state_l2l3_disable`).
+    pub const CONFIG3: u64 = 0x54;
+    /// `INT_CFG1_8125` — 16-bit interrupt configuration at 0x7a; hw_start writes 0 on
+    /// the 8125B and later (r8169 `rtl_hw_start_8125`, the VER_63+ arm).
+    pub const INT_CFG1_8125: u64 = 0x7a;
+    /// `OCPDR` — the MAC-side OCP window at 0xb0 (r8169 `__r8168_mac_ocp_write` /
+    /// `__r8168_mac_ocp_read`): same word encoding as `GPHY_OCP`, but transactions
+    /// complete immediately (the reference drivers never poll it).
+    pub const OCPDR: u64 = 0xb0;
+    /// `MCU` — the MCU command/status byte at 0xd3 (r8169 `enum
+    /// rtl8168_8101_registers` `MCU = 0xd3`; rge(4) `RGE_MCUCMD 0x00d3`): OOB
+    /// ownership, FIFO-empty, and link-list-ready all live here.
+    pub const MCU: u64 = 0xd3;
+    /// Byte 0xf2 carries the RXDV gate: bit 3 here is bit 19 (`RXDV_GATED_EN`) of the
+    /// 32-bit `MISC` register at 0xf0 (r8169 `rtl_enable_rxdvgate`; rge(4) sets the
+    /// same bit byte-wise: `RGE_SETBIT_1(sc, RGE_PPSW /* 0xf2 */, 0x08)`).
+    pub const RXDV_GATE_BYTE: u64 = 0xf2;
+    /// The 8125 per-queue interrupt-mitigation block at 0xa00: hw_start zeroes
+    /// `0xa00..0xb00` (8125A) or `0xa00..0xa80` + `INT_CFG1_8125 = 0` (8125B and
+    /// later) — "disable interrupt coalescing", r8169 `rtl_hw_start_8125`.
+    pub const INT_MITI_BASE_8125: u64 = 0xa00;
+    pub const INT_MITI_END_8125A: u64 = 0xb00;
+    pub const INT_MITI_END_8125B: u64 = 0xa80;
     /// `TxDescStartAddrLow`/`High` — normal-priority transmit ring base (r8169).
     pub const TX_DESC_ADDR_LOW: u64 = 0x20;
     pub const TX_DESC_ADDR_HIGH: u64 = 0x24;
@@ -79,10 +113,33 @@ pub mod reg {
 }
 
 pub mod bits {
-    /// `ChipCmd` bits (r8169 `enum rtl_register_content`).
+    /// `ChipCmd` bits (r8169 `enum rtl_register_content`; `StopReq` per rge(4)
+    /// `RGE_CMD_STOPREQ` and r8169's `RTL_W8(tp, ChipCmd, … | StopReq)` quiesce arm).
     pub const CMD_RESET: u64 = 0x10;
     pub const CMD_RX_ENABLE: u64 = 0x08;
     pub const CMD_TX_ENABLE: u64 = 0x04;
+    pub const CMD_STOP_REQ: u64 = 0x80;
+
+    /// `MCU` (0xd3) bits — r8169: `NOW_IS_OOB` (1<<7), `TX_EMPTY` (1<<5),
+    /// `RX_EMPTY` (1<<4), `LINK_LIST_RDY` (1<<1); rge(4) `RGE_MCUCMD_IS_OOB` /
+    /// `RGE_MCUCMD_TXFIFO_EMPTY` / `RGE_MCUCMD_RXFIFO_EMPTY` agree (its link-list
+    /// wait reads the same bit as word 0xd2 bit 9).
+    pub const MCU_NOW_IS_OOB: u64 = 1 << 7;
+    pub const MCU_TX_EMPTY: u64 = 1 << 5;
+    pub const MCU_RX_EMPTY: u64 = 1 << 4;
+    pub const MCU_LINK_LIST_RDY: u64 = 1 << 1;
+
+    /// The RXDV gate as seen through byte 0xf2 (bit 3 == `RXDV_GATED_EN` bit 19 of
+    /// dword `MISC` 0xf0; r8169 + rge(4), see `reg::RXDV_GATE_BYTE`).
+    pub const RXDV_GATE: u64 = 0x08;
+
+    /// `Cfg9346` values (r8169 `Cfg9346_Unlock` / `Cfg9346_Lock`).
+    pub const CFG9346_UNLOCK: u64 = 0xc0;
+    pub const CFG9346_LOCK: u64 = 0x00;
+    /// `Config1` bit hw_start_8125_common clears (r8169, unnamed `~0x10`).
+    pub const CONFIG1_SPEED_DOWN: u64 = 0x10;
+    /// `Config3.Rdy_to_L23` (1 << 1) — r8169 `rtl_pcie_state_l2l3_disable`.
+    pub const CONFIG3_RDY_TO_L23: u64 = 0x02;
 
     /// `TxConfig` value: unlimited DMA burst (7 << 8, `TX_DMA_BURST`) + the standard
     /// inter-frame gap (3 << 24, `InterFrameGap`) — r8169
@@ -91,9 +148,10 @@ pub mod bits {
 
     /// `RxConfig` base for the 8125: `RX_FETCH_DFLT_8125` (8 << 27) |
     /// `RX_DMA_BURST` (7 << 8) — r8169 `rtl_init_rxcfg`, the `RTL_GIGA_MAC_VER_61`
-    /// arm. (The 8125B arm adds `RX_PAUSE_SLOT_ON`; omitted — pause handling is not
-    /// configured anywhere in this driver, and the bit is reserved on the 8125A.)
+    /// arm; the 8125B-and-later arm adds `RX_PAUSE_SLOT_ON` (1 << 11, "8125b and
+    /// later") — use [`super::rx_config_base`] to pick by chip.
     pub const RX_CONFIG_BASE: u64 = (8 << 27) | (7 << 8);
+    pub const RX_PAUSE_SLOT_ON: u64 = 1 << 11;
     /// `RxConfig` accept bits (r8169 `rx_mode_bits`): this driver accepts broadcast +
     /// its own station address only — promiscuous (`AcceptAllPhys`) stays off, and
     /// multicast (`AcceptMulticast`) is off for v1 (recorded: multicast = none).
@@ -157,6 +215,94 @@ pub const fn gphy_read_result(gphy_ocp: u32) -> Option<u16> {
 /// Whether a `GPHY_OCP` write has completed (flag back low).
 pub const fn gphy_write_done(gphy_ocp: u32) -> bool {
     gphy_ocp & GPHY_OCP_FLAG == 0
+}
+
+// ------------------------------------------------------------------------------------
+// MAC OCP — the MAC-side OCP register space (reached through `OCPDR`), where the
+// embedded MCU's ownership and tuning knobs live. Same word layout as the GPHY
+// window; no completion flag to poll (r8169 `__r8168_mac_ocp_write` returns
+// immediately, `__r8168_mac_ocp_read` reads the data straight back).
+// ------------------------------------------------------------------------------------
+
+/// The `OCPDR` word that writes `value` to MAC OCP register `ocp_address`
+/// (r8169 `__r8168_mac_ocp_write`: `OCPAR_FLAG | (reg << 15) | data`).
+pub const fn mac_ocp_write_command(ocp_address: u16, value: u16) -> u32 {
+    GPHY_OCP_FLAG | ((ocp_address as u32) << 15) | value as u32
+}
+
+/// The `OCPDR` word that selects MAC OCP register `ocp_address` for the read that
+/// follows (r8169 `__r8168_mac_ocp_read`: `reg << 15`; the next `OCPDR` read returns
+/// the data in its low 16 bits).
+pub const fn mac_ocp_read_command(ocp_address: u16) -> u32 {
+    (ocp_address as u32) << 15
+}
+
+pub mod mac_ocp {
+    /// RealWoW disable: write 0x00ff (rge(4) `rge_exit_oob`: "Disable RealWoW";
+    /// the vendor r8125 `rtl8125_realwow_hw_init` does the same write).
+    pub const REALWOW_CTRL: u16 = 0xc0bc;
+    pub const REALWOW_DISABLE: u16 = 0x00ff;
+
+    /// The OOB-ownership handshake register: clearing bit 14 hands the link list to
+    /// the host (r8169 `rtl_hw_init_8125`: `r8168_mac_ocp_modify(tp, 0xe8de,
+    /// BIT(14), 0)`; rge(4) `RGE_MAC_CLRBIT(sc, 0xe8de, 0x4000)`).
+    pub const OOB_HANDSHAKE: u16 = 0xe8de;
+    pub const OOB_HANDSHAKE_BIT14: u16 = 1 << 14;
+
+    /// The three link-list parameter writes between the two link-list-ready waits
+    /// (r8169 `rtl_hw_init_8125`: c0aa = 0x07d0, c0a6 = 0x0150, c01e = 0x5555;
+    /// rge(4) writes the same registers — 0xc0a6 = 0x01b5 there, mainline's value
+    /// is used).
+    pub const LL_PARAM_A: (u16, u16) = (0xc0aa, 0x07d0);
+    pub const LL_PARAM_B: (u16, u16) = (0xc0a6, 0x0150);
+    pub const LL_PARAM_C: (u16, u16) = (0xc01e, 0x5555);
+
+    /// UPS disable: clear bit 4 of 0xd40a (r8169 `rtl_hw_start_8125_common`
+    /// "/* disable UPS */").
+    pub const UPS_CTRL: u16 = 0xd40a;
+    pub const UPS_BIT: u16 = 0x0010;
+
+    /// "Disable new tx descriptor format" — bit 0 of 0xeb58 cleared so the chip
+    /// parses the legacy 16-byte descriptors this driver writes (r8169
+    /// `rtl_hw_start_8125_common`; the prime suspect behind unconsumed transmit
+    /// descriptors if left in the MCU's state).
+    pub const TX_NEW_DESC_FORMAT: u16 = 0xeb58;
+    pub const TX_NEW_DESC_FORMAT_BIT: u16 = 0x0001;
+
+    /// The hw_start completion handshake: write 0xc302 to 0xe098, then wait for
+    /// 0xe00e bit 13 to go LOW (r8169 `rtl_hw_start_8125_common` tail:
+    /// `r8168_mac_ocp_write(tp, 0xe098, 0xc302)` +
+    /// `rtl_loop_wait_low(tp, &rtl_mac_ocp_e00e_cond, …)` where the cond is
+    /// `r8168_mac_ocp_read(tp, 0xe00e) & BIT(13)`).
+    pub const START_HANDSHAKE: (u16, u16) = (0xe098, 0xc302);
+    pub const START_HANDSHAKE_STATUS: u16 = 0xe00e;
+    pub const START_HANDSHAKE_BUSY: u16 = 1 << 13;
+}
+
+// ------------------------------------------------------------------------------------
+// Chip identification
+// ------------------------------------------------------------------------------------
+
+/// The XID identifying the exact 8125 variant: `(TxConfig >> 20) & 0xfcf` (r8169
+/// probe: `xid = (txconfig >> 20) & 0xfcf`).
+pub const fn xid_from_tx_config(tx_config: u32) -> u16 {
+    ((tx_config >> 20) & 0xfcf) as u16
+}
+
+/// Whether an XID is the first-generation RTL8125A (r8169 mac-version table:
+/// `{ 0x7cf, 0x609, RTL_GIGA_MAC_VER_61 }`; the Orange Pi 5 Plus NICs are 8125B —
+/// `{ 0x7cf, 0x641, RTL_GIGA_MAC_VER_63 }` — and anything newer follows the B arms).
+pub const fn xid_is_8125a(xid: u16) -> bool {
+    (xid & 0x7cf) == 0x609
+}
+
+/// The `RxConfig` base value for the chip (see `bits::RX_CONFIG_BASE`).
+pub const fn rx_config_base(is_8125a: bool) -> u64 {
+    if is_8125a {
+        bits::RX_CONFIG_BASE
+    } else {
+        bits::RX_CONFIG_BASE | bits::RX_PAUSE_SLOT_ON
+    }
 }
 
 pub mod phy {
@@ -424,7 +570,46 @@ mod tests {
     fn config_values_match_the_cited_compositions() {
         // TxConfig: (7 << 8) | (3 << 24) = 0x0300_0700 (rtl_set_tx_config_registers).
         assert_eq!(bits::TX_CONFIG_VALUE, 0x0300_0700);
-        // RxConfig base: (8 << 27) | (7 << 8) (rtl_init_rxcfg, VER_61 arm).
+        // RxConfig base: (8 << 27) | (7 << 8) (rtl_init_rxcfg, VER_61 arm); the B arm
+        // adds RX_PAUSE_SLOT_ON (bit 11).
         assert_eq!(bits::RX_CONFIG_BASE, 0x4000_0700);
+        assert_eq!(rx_config_base(true), 0x4000_0700);
+        assert_eq!(rx_config_base(false), 0x4000_0f00);
+    }
+
+    #[test]
+    fn mac_ocp_command_words_match_the_r8169_encoding() {
+        // Write 0xe8de: OCPAR_FLAG | (reg << 15) | data — same shape as the GPHY
+        // window (__r8168_mac_ocp_write).
+        assert_eq!(
+            mac_ocp_write_command(0xe8de, 0x1234),
+            0x8000_0000 | (0xe8de << 15) | 0x1234
+        );
+        // Read select: reg << 15, no flag (__r8168_mac_ocp_read).
+        assert_eq!(mac_ocp_read_command(0xc0bc), 0xc0bc << 15);
+    }
+
+    #[test]
+    fn xid_decode_matches_the_r8169_probe() {
+        // xid = (TxConfig >> 20) & 0xfcf; 8125A = 0x609 (VER_61), 8125B = 0x641
+        // (VER_63) under the table's 0x7cf mask.
+        assert_eq!(xid_from_tx_config(0x609 << 20), 0x609);
+        assert!(xid_is_8125a(0x609));
+        assert!(!xid_is_8125a(0x641));
+        // The mask strips the 10BASE-T-lite / fuzz bits the table ignores.
+        assert_eq!(xid_from_tx_config(0x641 << 20 | 0xfffff), 0x641);
+    }
+
+    #[test]
+    fn ownership_bits_match_the_cited_registers() {
+        // MCU (0xd3): NOW_IS_OOB bit 7, TX/RX_EMPTY bits 5/4, LINK_LIST_RDY bit 1
+        // (r8169; rge's word-0xd2 bit-9 link-list wait is the same physical bit).
+        assert_eq!(bits::MCU_NOW_IS_OOB, 0x80);
+        assert_eq!(bits::MCU_TX_EMPTY | bits::MCU_RX_EMPTY, 0x30);
+        assert_eq!(bits::MCU_LINK_LIST_RDY, 0x02);
+        // RXDV gate: byte 0xf2 bit 3 == MISC (0xf0) bit 19.
+        assert_eq!(reg::RXDV_GATE_BYTE, 0xf2);
+        assert_eq!(bits::RXDV_GATE, 0x08);
+        assert_eq!((reg::RXDV_GATE_BYTE - 0xf0) * 8 + 3, 19);
     }
 }

@@ -1103,3 +1103,41 @@ Match the priority order above; (1)+(2) unblock I2.
     (bare — 10.0.2.2 resolved, net.virtio byte-identical in this lane) and
     `net.virtio $ l2check --gateway 10.0.2.2` (the new typed option through eosh). Board
     acceptance is the planner's bench run — recorded here as pending.
+
+    *Board round 1 (2026-06-08, planner bench) → the OOB ownership fix.* Wins: PCIe bring-up
+    clean, PHY autoneg completed (`link up 2500 Mb/s`), factory MAC read (c0:74:2b:f8:22:33),
+    rings programmed, the composed stack compiled on-target in 5.5 s. Blocker: transmit
+    descriptors were never consumed (typed `io` after the bounded poll) despite link-up and
+    bus mastering — the recorded first-suspect confirmed: **the RTL8125 powers up under its
+    embedded MCU's OOB/management ownership and ignores host descriptor rings until the
+    driver takes ownership.** The fix (every step cited in `crates/eo9-rtl8125`, references
+    fetched verbatim — mainline v6.12 `r8169_main.c` and OpenBSD `if_rge.c`, which agree on
+    every ownership register): RealWoW off (MAC OCP 0xc0bc=0x00ff), quiesce (accept bits
+    cleared, RXDV gate set — byte 0xf2 bit 3 == MISC bit 19, StopReq + FIFO-empty wait on
+    MCU 0xd3 bits 5/4), soft reset, `NOW_IS_OOB` cleared (MCU 0xd3 bit 7), the link-list
+    handover (0xe8de bit 14 cleared + LINK_LIST_RDY waits on MCU bit 1, the three link-list
+    parameters c0aa/c0a6/c01e), then `rtl_hw_start_8125(_common)`: coalescing off
+    (INT_CFG0/INT_CFG1 + the 0xa00 block), Rdy_to_L23 off, UPS off, **the
+    legacy-descriptor-format select (MAC OCP 0xeb58 bit 0 cleared — without it the chip
+    parses the rings as the vendor 32-byte format; the other prime TX suspect)**, the cited
+    tuning writes with the A-vs-B arms picked by XID (`(TxConfig>>20)&0xfcf`; 0x609=A,
+    0x641=B — the board parts), the 0xe098/0xe00e start handshake, RXDV gate released. Ring
+    bases now write the high dword first (the reference's in-tree ARM note). Still omitted,
+    recorded: EPHY (PCIe SerDes) tuning tables, EEE MAC config, CPlusCmd, firmware MCU patch
+    blobs. Settles are bounded dummy register reads (the component holds no time
+    capability). Core-crate tests grew to 13 (MAC OCP words, XID decode, ownership bits).
+
+    *Liveness backstop, first real hit (kernel-lane reproduction context).* During the
+    failed round-1 TX wait the kernel's stranded-runnable detector fired once
+    (`liveness: stranded runnable: a child or service was runnable across an entire idle
+    backstop (n=1)`). The driver-side wait pattern that produced it: `send-frame`'s
+    completion poll is a loop of **pure synchronous host calls** — `dma-read` of the
+    descriptor's opts1 dword, 50M iterations at the time — with no await that ever suspends
+    (bar/dma calls resolve inline in the kernel root, and first-poll-inline retires them on
+    first poll), so the executor had no interleave point for the entire bound while a
+    sibling stayed runnable. The driver now bounds TX polls at 2M calls (seconds, not a
+    minute; still ≫ the µs-scale consume time) — but the structural fact stands for the
+    kernel lane: a guest hot-spinning on synchronous host calls is invisible to cooperative
+    scheduling until its activation returns, and only preemption (plan/05) or a host-call
+    budget covers it. recv's empty poll has the same shape at 2k calls (~ms), below the
+    backstop's window.

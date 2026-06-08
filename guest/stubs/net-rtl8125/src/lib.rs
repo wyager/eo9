@@ -24,14 +24,21 @@
 //! * **Probe.** Enumerate the capability's view of the bus, claim the first
 //!   10ec:8125 function, open the MAC register BAR (BAR 2 on every modern Realtek
 //!   part; first memory BAR as fallback), read the factory MAC from `MAC0`.
-//! * **Bring-up.** Soft reset (`ChipCmd.RST`, bounded wait), interrupts masked and
-//!   acknowledged once (`IMR_8125 = 0`, `ISR_8125 = ~0` — the polled driver's ISR
-//!   suppression discipline: with the mask clear the NIC never asserts the INTx line
-//!   that is unwired on the board anyway), PHY autoneg via the `GPHY_OCP` MDIO window
-//!   (advertise 10/100 + 1000FD + 2500FD, restart, bounded link wait — a link that is
-//!   still negotiating leaves the interface typed-down, not an error), descriptor
-//!   rings (32 receive + 32 transmit slots) in `alloc-dma` memory, `RxMaxSize`,
-//!   `TxConfig`/`RxConfig`, bus mastering, receiver + transmitter on.
+//! * **Bring-up.** First the OOB **ownership takeover**: the chip powers up under
+//!   its embedded MCU's out-of-band management and ignores host rings until the
+//!   driver exits OOB (board-confirmed: link up, transmit descriptors never
+//!   consumed) — RealWoW off, quiesce + RXDV gate + soft reset, `NOW_IS_OOB`
+//!   cleared, the link-list handover handshake (rge(4) `rge_exit_oob` ∪ mainline
+//!   `rtl_hw_init_8125`). Then the cited `rtl_hw_start_8125(_common)` MAC
+//!   configuration — interrupt coalescing off, the legacy-descriptor-format select
+//!   (MAC OCP 0xeb58), the tuning writes, the start handshake, RXDV gate released —
+//!   with interrupts masked and acknowledged once (`IMR_8125 = 0`, `ISR_8125 = ~0`,
+//!   the polled driver's ISR suppression discipline). Then PHY autoneg via the
+//!   `GPHY_OCP` MDIO window (advertise 10/100 + 1000FD + 2500FD, restart, bounded
+//!   link wait — a link still negotiating leaves the interface typed-down, not an
+//!   error), descriptor rings (32 receive + 32 transmit slots) in `alloc-dma`
+//!   memory, `RxMaxSize`, ring bases (high dword first — the reference's ARM note),
+//!   bus mastering, receiver + transmitter on, `RxConfig`/`TxConfig`.
 //! * **I/O.** Transmit copies the frame into a bounce buffer (zero-padded to the
 //!   60-byte Ethernet minimum), publishes one OWN'd descriptor, rings the
 //!   `TxPoll_8125` doorbell, and polls OWN-clear with the bounded-poll discipline.
@@ -66,7 +73,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use eo9_guest::provider::ProviderState;
-use eo9_rtl8125::{bits, phy, reg};
+use eo9_rtl8125::{bits, mac_ocp, phy, reg};
 
 wit_bindgen::generate!({
     world: "rtl8125-net",
@@ -114,6 +121,11 @@ const INTERFACE_NAME: &str = "rtl0";
 /// `ChipCmd.RST` in well under a millisecond (r8169 waits 100 × 100 µs); hitting
 /// this bound means the device is wedged or absent.
 const RESET_POLL_LIMIT: u64 = 100_000;
+/// Quiesce-wait bound for the FIFO-empty and link-list-ready handshakes during the
+/// ownership takeover (the references bound these at a few ms — rge(4) polls
+/// 3000 × 50 µs — and proceed without error on expiry; same posture here: the
+/// takeover waits are best effort, the soft reset behind them is the hard gate).
+const QUIESCE_POLL_LIMIT: u64 = 200_000;
 /// GPHY OCP completion bound: one MDIO transaction is tens of microseconds (r8169
 /// polls 25 µs × 10); generous because each poll here is a whole host call.
 const PHY_POLL_LIMIT: u64 = 100_000;
@@ -123,10 +135,16 @@ const PHY_POLL_LIMIT: u64 = 100_000;
 /// reports `up: false` (typed), `send-frame` answers `link-down`, and the next
 /// operation re-reads the live status, so a late negotiation is picked up.
 const LINK_WAIT_LIMIT: u64 = 2_000_000;
-/// Transmit-completion polling bound (net.virtio parity): the NIC consumes a
-/// published descriptor in microseconds once kicked, so hitting this means it is
-/// wedged — a typed error, never a hang.
-const TX_POLL_LIMIT: u64 = 50_000_000;
+/// Transmit-completion polling bound: the NIC consumes a published descriptor in
+/// microseconds once kicked, so hitting this means it is wedged — a typed error,
+/// never a hang. Deliberately SMALLER than net.virtio's 50M-call bound: this poll
+/// loop is pure synchronous host calls with no suspension point, so the executor
+/// cannot interleave anything while it spins (the board's liveness backstop flagged
+/// exactly that — a stranded-runnable sibling across a whole idle window — when the
+/// pre-ownership-fix driver burned its full 50M bound; plan/09 D46 board notes).
+/// Two million calls is still orders of magnitude above the device's microsecond
+/// consume time while keeping the failure mode seconds, not a minute.
+const TX_POLL_LIMIT: u64 = 2_000_000;
 /// Receive polling bound: how many descriptor reads `recv-frame` spends checking for
 /// a delivered frame before reporting "nothing waiting" (an empty result, not an
 /// error) — net.virtio's study-08-F2 calibration, a couple of milliseconds of host
@@ -186,6 +204,9 @@ struct Driver {
     rx_cursor: u16,
     mac: [u8; 6],
     link: Link,
+    /// The chip variant per `(TxConfig >> 20) & 0xfcf` (0x609 = 8125A, 0x641 =
+    /// 8125B — the Orange Pi 5 Plus parts; newer variants take the B arms).
+    xid: u16,
 }
 
 /// Failures of the link-layer operations, mapped to the WIT error variants by the
@@ -394,19 +415,34 @@ impl Driver {
             rx_cursor: 0,
             mac: [0; 6],
             link: Link::Down,
+            xid: 0,
         };
         driver.start().await?;
         Ok(driver)
     }
 
     /// The device side of bring-up, once the function is claimed and the DMA buffers
-    /// exist. Order follows the r8169 hw-start path (citations in eo9-rtl8125); the
-    /// reference drivers' chip-quirk tables (MAC OCP errata pokes, MCU patches, EEE
-    /// tuning) are deliberately omitted from v1 — recorded as the first suspect if
-    /// board traffic misbehaves.
+    /// exist. Three phases, each step cited in `eo9-rtl8125`:
+    ///
+    /// 1. **Ownership takeover (exit OOB)** — the chip powers up under its embedded
+    ///    MCU's out-of-band management ownership and ignores host descriptor rings
+    ///    until the driver takes over (confirmed live on the board: rings + link up,
+    ///    transmit descriptors never consumed). The sequence is rge(4)
+    ///    `rge_exit_oob` merged with mainline `rtl_hw_init_8125` (they agree on
+    ///    every register; mainline's link-list parameter values are used where rge
+    ///    differs).
+    /// 2. **MAC configuration** — `rtl_hw_start_8125` + `rtl_hw_start_8125_common`,
+    ///    including the legacy-descriptor-format select (MAC OCP 0xeb58 bit 0
+    ///    cleared — the chip otherwise parses the rings as the vendor driver's
+    ///    32-byte "new" format) and the RXDV-gate release. Omitted, recorded:
+    ///    EPHY (PCIe SerDes) tuning tables, EEE MAC config, `CPlusCmd`, and the
+    ///    firmware MCU patch blobs.
+    /// 3. **PHY autoneg, rings, enable** — in mainline `rtl_hw_start`'s order: max
+    ///    size → ring bases (high dword first, the in-tree ARM erratum note) →
+    ///    TE/RE → RxConfig/TxConfig → accept bits.
     async fn start(&mut self) -> Result<(), String> {
-        // The factory MAC, before reset (reset preserves it; reading first means the
-        // diagnostic line can name the port even if a later step fails).
+        // The factory MAC, before anything (the takeover preserves it; reading first
+        // means the diagnostic line can name the port even if a later step fails).
         let mut mac = [0u8; 6];
         for (index, byte) in mac.iter_mut().enumerate() {
             *byte = self
@@ -414,6 +450,50 @@ impl Driver {
                 .await? as u8;
         }
         self.mac = mac;
+        // Chip variant from TxConfig (r8169 probe): picks the A-vs-B register arms.
+        let tx_config = self.read(reg::TX_CONFIG, pci::AccessWidth::Dword).await? as u32;
+        self.xid = eo9_rtl8125::xid_from_tx_config(tx_config);
+        let is_8125a = eo9_rtl8125::xid_is_8125a(self.xid);
+
+        // ---- Phase 1: take ownership from the OOB MCU -----------------------------------
+
+        // Disable RealWoW first (rge_exit_oob leads with it; the vendor
+        // realwow_hw_init is the same single write on the 8125).
+        self.mac_ocp_write(mac_ocp::REALWOW_CTRL, mac_ocp::REALWOW_DISABLE)
+            .await?;
+
+        // Quiesce + reset (rge_reset, which mainline's enable_rxdvgate +
+        // wait_txrx_fifo_empty mirror): stop accepting packets, gate RXDV, ask the
+        // DMA engines to stop, wait for the FIFOs to drain, then soft reset.
+        let rx_config = self.read(reg::RX_CONFIG, pci::AccessWidth::Dword).await?;
+        self.write(reg::RX_CONFIG, pci::AccessWidth::Dword, rx_config & !0x3f)
+            .await?;
+        self.set_byte_bits(reg::RXDV_GATE_BYTE, bits::RXDV_GATE, true)
+            .await?;
+        self.settle(1_000).await?; // rtl_enable_rxdvgate's fsleep(2000)
+        let cmd = self.read(reg::CHIP_CMD, pci::AccessWidth::Byte).await?;
+        self.write(
+            reg::CHIP_CMD,
+            pci::AccessWidth::Byte,
+            cmd | bits::CMD_STOP_REQ,
+        )
+        .await?;
+        self.settle(100).await?; // rge_reset's DELAY(200)
+        let mut spins: u64 = 0;
+        loop {
+            let mcu = self.read(reg::MCU, pci::AccessWidth::Byte).await?;
+            if mcu & (bits::MCU_TX_EMPTY | bits::MCU_RX_EMPTY)
+                == (bits::MCU_TX_EMPTY | bits::MCU_RX_EMPTY)
+            {
+                break;
+            }
+            spins += 1;
+            if spins > QUIESCE_POLL_LIMIT {
+                break; // best effort, as the references: the reset below is the gate
+            }
+        }
+        // Drop StopReq and the enables before the reset (rge_reset: CMD &= TE|RE).
+        self.write(reg::CHIP_CMD, pci::AccessWidth::Byte, 0).await?;
 
         // Soft reset: ChipCmd.RST, bounded wait for the chip to clear it.
         self.write(reg::CHIP_CMD, pci::AccessWidth::Byte, bits::CMD_RESET)
@@ -428,6 +508,31 @@ impl Driver {
             }
         }
 
+        // The ownership bit itself: MCU.NOW_IS_OOB cleared (rtl_hw_init_8125 /
+        // rge_exit_oob's RGE_MCUCMD_IS_OOB clear).
+        let mcu = self.read(reg::MCU, pci::AccessWidth::Byte).await?;
+        self.write(
+            reg::MCU,
+            pci::AccessWidth::Byte,
+            mcu & !bits::MCU_NOW_IS_OOB,
+        )
+        .await?;
+
+        // Link-list handover: clear the handshake bit, wait for LINK_LIST_RDY, write
+        // the three link-list parameters, wait again (rtl_hw_init_8125; rge agrees on
+        // the registers, mainline's 0xc0a6 value is used).
+        self.mac_ocp_modify(mac_ocp::OOB_HANDSHAKE, mac_ocp::OOB_HANDSHAKE_BIT14, 0)
+            .await?;
+        self.wait_link_list_ready().await?;
+        for (register, value) in [
+            mac_ocp::LL_PARAM_A,
+            mac_ocp::LL_PARAM_B,
+            mac_ocp::LL_PARAM_C,
+        ] {
+            self.mac_ocp_write(register, value).await?;
+        }
+        self.wait_link_list_ready().await?;
+
         // Interrupts: mask everything, acknowledge anything pending, and leave the
         // mask clear for the driver's lifetime — the polled driver's suppression
         // discipline (no source ever asserts the INTx line, which is unwired on the
@@ -436,6 +541,101 @@ impl Driver {
             .await?;
         self.write(reg::INTR_STATUS_8125, pci::AccessWidth::Dword, 0xffff_ffff)
             .await?;
+
+        // ---- Phase 2: MAC configuration (rtl_hw_start_8125 + _common) --------------------
+
+        // INT_CFG0 = 0 and the per-queue interrupt mitigation block zeroed (the
+        // "disable interrupt coalescing" loop; range by chip arm).
+        self.write(reg::INT_CFG0_8125, pci::AccessWidth::Byte, 0)
+            .await?;
+        let miti_end = if is_8125a {
+            reg::INT_MITI_END_8125A
+        } else {
+            reg::INT_MITI_END_8125B
+        };
+        let mut offset = reg::INT_MITI_BASE_8125;
+        while offset < miti_end {
+            self.write(offset, pci::AccessWidth::Dword, 0).await?;
+            offset += 4;
+        }
+        if !is_8125a {
+            self.write(reg::INT_CFG1_8125, pci::AccessWidth::Word, 0)
+                .await?;
+        }
+
+        // hw_start_8125_common, in its order. Config1/Config3 sit behind the Cfg9346
+        // write protect (mainline holds the unlock across its hw_start).
+        self.write(reg::CFG9346, pci::AccessWidth::Byte, bits::CFG9346_UNLOCK)
+            .await?;
+        // Keep the chip out of the PCIe L2/L3 ready state (rtl_pcie_state_l2l3_disable).
+        self.set_byte_bits(reg::CONFIG3, bits::CONFIG3_RDY_TO_L23, false)
+            .await?;
+        self.write(0x382, pci::AccessWidth::Word, 0x221b).await?;
+        self.write(0x4500, pci::AccessWidth::Byte, 0).await?;
+        self.write(0x4800, pci::AccessWidth::Word, 0).await?;
+        // Disable UPS.
+        self.mac_ocp_modify(mac_ocp::UPS_CTRL, mac_ocp::UPS_BIT, 0)
+            .await?;
+        self.set_byte_bits(reg::CONFIG1, bits::CONFIG1_SPEED_DOWN, false)
+            .await?;
+        self.write(reg::CFG9346, pci::AccessWidth::Byte, bits::CFG9346_LOCK)
+            .await?;
+        self.mac_ocp_write(0xc140, 0xffff).await?;
+        self.mac_ocp_write(0xc142, 0xffff).await?;
+        self.mac_ocp_modify(0xd3e2, 0x0fff, 0x03a9).await?;
+        self.mac_ocp_modify(0xd3e4, 0x00ff, 0x0000).await?;
+        self.mac_ocp_modify(0xe860, 0x0000, 0x0080).await?;
+        // THE descriptor-format select: legacy 16-byte descriptors (the format this
+        // driver writes), not the vendor "new" 32-byte one.
+        self.mac_ocp_modify(
+            mac_ocp::TX_NEW_DESC_FORMAT,
+            mac_ocp::TX_NEW_DESC_FORMAT_BIT,
+            0,
+        )
+        .await?;
+        // The A-vs-B parameter arms (rtl_hw_start_8125_common; VER_61 vs VER_63).
+        if is_8125a {
+            self.mac_ocp_modify(0xe614, 0x0700, 0x0300).await?;
+            self.mac_ocp_modify(0xe63e, 0x0c30, 0x0020).await?;
+        } else {
+            self.mac_ocp_modify(0xe614, 0x0700, 0x0200).await?;
+            self.mac_ocp_modify(0xe63e, 0x0c30, 0x0000).await?;
+        }
+        self.mac_ocp_modify(0xc0b4, 0x0000, 0x000c).await?;
+        self.mac_ocp_modify(0xeb6a, 0x00ff, 0x0033).await?;
+        self.mac_ocp_modify(0xeb50, 0x03e0, 0x0040).await?;
+        self.mac_ocp_modify(0xe056, 0x00f0, 0x0030).await?;
+        self.mac_ocp_modify(0xe040, 0x1000, 0x0000).await?;
+        self.mac_ocp_modify(0xea1c, 0x0003, 0x0001).await?;
+        self.mac_ocp_modify(0xea1c, 0x0004, 0x0000).await?;
+        self.mac_ocp_modify(0xe0c0, 0x4f0f, 0x4403).await?;
+        self.mac_ocp_modify(0xe052, 0x0080, 0x0068).await?;
+        self.mac_ocp_modify(0xd430, 0x0fff, 0x047f).await?;
+        self.mac_ocp_modify(0xeb54, 0x0000, 0x0001).await?;
+        self.settle(10).await?; // udelay(1)
+        self.mac_ocp_modify(0xeb54, 0x0001, 0x0000).await?;
+        let w1880 = self.read(0x1880, pci::AccessWidth::Word).await?;
+        self.write(0x1880, pci::AccessWidth::Word, w1880 & !0x0030)
+            .await?;
+        // The start handshake: 0xe098 = 0xc302, then 0xe00e bit 13 low.
+        self.mac_ocp_write(mac_ocp::START_HANDSHAKE.0, mac_ocp::START_HANDSHAKE.1)
+            .await?;
+        let mut spins: u64 = 0;
+        loop {
+            let status = self.mac_ocp_read(mac_ocp::START_HANDSHAKE_STATUS).await?;
+            if status & mac_ocp::START_HANDSHAKE_BUSY == 0 {
+                break;
+            }
+            spins += 1;
+            if spins > QUIESCE_POLL_LIMIT {
+                break; // bounded as mainline (rtl_loop_wait_low, no hard failure)
+            }
+        }
+        // (EEE MAC config omitted — recorded.) Release the RXDV gate.
+        self.set_byte_bits(reg::RXDV_GATE_BYTE, bits::RXDV_GATE, false)
+            .await?;
+
+        // ---- Phase 3: PHY autoneg, rings, enable (rtl_hw_start order) --------------------
 
         // PHY: advertise 10/100 (ANAR), 1000FD (GBCR), 2500FD (the Realtek vendor
         // register), then restart autonegotiation.
@@ -449,15 +649,9 @@ impl Driver {
         self.phy_write(phy::MII_BMCR, phy::BMCR_START_AUTONEG)
             .await?;
 
-        // Receive limits and DMA configuration.
+        // Receive size limit.
         self.write(reg::RX_MAX_SIZE, pci::AccessWidth::Word, RX_SLOT_BYTES)
             .await?;
-        self.write(
-            reg::TX_CONFIG,
-            pci::AccessWidth::Dword,
-            bits::TX_CONFIG_VALUE,
-        )
-        .await?;
 
         // Multicast filter: both MAR dwords 0 — multicast acceptance is off (v1:
         // none), this just makes the filter state deterministic.
@@ -494,18 +688,27 @@ impl Driver {
         )
         .await?;
 
-        // Receiver + transmitter on, then the receive configuration (accept
-        // broadcast + our station address; promiscuous off, multicast none).
+        // Enable, then configure (mainline rtl_hw_start: ChipCmd = TE|RE first, the
+        // Rx/Tx configuration registers after, accept bits last via rx_mode).
         self.write(
             reg::CHIP_CMD,
             pci::AccessWidth::Byte,
             bits::CMD_RX_ENABLE | bits::CMD_TX_ENABLE,
         )
         .await?;
+        let rx_base = eo9_rtl8125::rx_config_base(is_8125a);
+        self.write(reg::RX_CONFIG, pci::AccessWidth::Dword, rx_base)
+            .await?;
+        self.write(
+            reg::TX_CONFIG,
+            pci::AccessWidth::Dword,
+            bits::TX_CONFIG_VALUE,
+        )
+        .await?;
         self.write(
             reg::RX_CONFIG,
             pci::AccessWidth::Dword,
-            bits::RX_CONFIG_BASE | bits::RX_ACCEPT_BROADCAST | bits::RX_ACCEPT_MY_PHYS,
+            rx_base | bits::RX_ACCEPT_BROADCAST | bits::RX_ACCEPT_MY_PHYS,
         )
         .await?;
 
@@ -525,15 +728,19 @@ impl Driver {
 
         // One best-effort diagnostic line so a metal session shows what was probed.
         let handle = text::default();
+        let chip = if is_8125a { "8125A" } else { "8125B+" };
         let line = match self.link {
             Link::Up(mbps) => format!(
-                "net.rtl8125: {} link up {mbps} Mb/s, rings rx/tx {RX_SLOTS}/{TX_SLOTS}\n",
-                format_mac(&self.mac)
+                "net.rtl8125: {} (xid {:#05x} {chip}) link up {mbps} Mb/s, rings rx/tx \
+                 {RX_SLOTS}/{TX_SLOTS}\n",
+                format_mac(&self.mac),
+                self.xid,
             ),
             Link::Down => format!(
-                "net.rtl8125: {} link DOWN after the bounded autoneg wait (cable? \
-                 negotiation still running? operations re-check)\n",
-                format_mac(&self.mac)
+                "net.rtl8125: {} (xid {:#05x} {chip}) link DOWN after the bounded autoneg \
+                 wait (cable? negotiation still running? operations re-check)\n",
+                format_mac(&self.mac),
+                self.xid,
             ),
         };
         let _ = text::write(&handle, text::OutputStream::Out, &line);
@@ -563,12 +770,80 @@ impl Driver {
         .await
     }
 
-    /// Write a 64-bit ring base as the two dword halves (`*_ADDR_LOW` then `+4`).
+    /// Write a 64-bit ring base as the two dword halves — HIGH first, then LOW
+    /// (r8169 `rtl_set_rx_tx_desc_registers`' in-tree note: an ARM board needed the
+    /// high register written before the low one; we are on ARM, follow it).
     async fn write_ring_address(&self, low_register: u64, address: u64) -> Result<(), String> {
-        self.write(low_register, pci::AccessWidth::Dword, address & 0xffff_ffff)
-            .await?;
         self.write(low_register + 4, pci::AccessWidth::Dword, address >> 32)
+            .await?;
+        self.write(low_register, pci::AccessWidth::Dword, address & 0xffff_ffff)
             .await
+    }
+
+    /// Set or clear bits in a byte register (read-modify-write; the references'
+    /// `RTL_W8(tp, r, RTL_R8(tp, r) | / & ~bits)` idiom).
+    async fn set_byte_bits(&self, register: u64, mask: u64, set: bool) -> Result<(), String> {
+        let value = self.read(register, pci::AccessWidth::Byte).await?;
+        let value = if set { value | mask } else { value & !mask };
+        self.write(register, pci::AccessWidth::Byte, value).await
+    }
+
+    /// A crude bounded settle: `reads` harmless register reads (this component has no
+    /// time capability — each host call costs on the order of a microsecond, which is
+    /// the scale of the references' udelay/fsleep settles; the values used are
+    /// generous multiples of the cited delays).
+    async fn settle(&self, reads: u64) -> Result<(), String> {
+        for _ in 0..reads {
+            let _ = self.read(reg::CHIP_CMD, pci::AccessWidth::Byte).await?;
+        }
+        Ok(())
+    }
+
+    // --- MAC OCP (the OCPDR window: the MCU's ownership and tuning registers) -------------
+
+    /// Write a MAC OCP register. No completion poll: the references treat the window
+    /// as immediate (`__r8168_mac_ocp_write` returns straight after the dword write).
+    async fn mac_ocp_write(&self, ocp_address: u16, value: u16) -> Result<(), String> {
+        self.write(
+            reg::OCPDR,
+            pci::AccessWidth::Dword,
+            u64::from(eo9_rtl8125::mac_ocp_write_command(ocp_address, value)),
+        )
+        .await
+    }
+
+    /// Read a MAC OCP register (`__r8168_mac_ocp_read`: select, then read back).
+    async fn mac_ocp_read(&self, ocp_address: u16) -> Result<u16, String> {
+        self.write(
+            reg::OCPDR,
+            pci::AccessWidth::Dword,
+            u64::from(eo9_rtl8125::mac_ocp_read_command(ocp_address)),
+        )
+        .await?;
+        Ok(self.read(reg::OCPDR, pci::AccessWidth::Dword).await? as u16)
+    }
+
+    /// Read-modify-write a MAC OCP register (`r8168_mac_ocp_modify`:
+    /// `(data & ~mask) | set`).
+    async fn mac_ocp_modify(&self, ocp_address: u16, mask: u16, set: u16) -> Result<(), String> {
+        let data = self.mac_ocp_read(ocp_address).await?;
+        self.mac_ocp_write(ocp_address, (data & !mask) | set).await
+    }
+
+    /// Bounded wait for `MCU.LINK_LIST_RDY` (r8169 `r8168g_wait_ll_share_fifo_ready`;
+    /// best effort like the reference — its loop is bounded and unconditional too).
+    async fn wait_link_list_ready(&self) -> Result<(), String> {
+        let mut spins: u64 = 0;
+        loop {
+            let mcu = self.read(reg::MCU, pci::AccessWidth::Byte).await?;
+            if mcu & bits::MCU_LINK_LIST_RDY != 0 {
+                return Ok(());
+            }
+            spins += 1;
+            if spins > QUIESCE_POLL_LIMIT {
+                return Ok(());
+            }
+        }
     }
 
     // --- PHY access (GPHY_OCP, the MAC's MDIO window) ---------------------------------------
