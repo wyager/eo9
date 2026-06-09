@@ -1890,7 +1890,10 @@ mod tests {
             out.contains("no manual for `hello`; showing describe"),
             "{out}"
         );
-        assert!(out.contains("kind: binary"), "the describe view follows: {out}");
+        assert!(
+            out.contains("kind: binary"),
+            "the describe view follows: {out}"
+        );
         assert!(out.contains("--name: option<string>"), "{out}");
     }
 
@@ -1933,7 +1936,10 @@ mod tests {
         session.backend.out.clear();
         assert_eq!(run(&mut session, "man man"), LineResult::Ok);
         let out = session.backend.out.join("\n");
-        assert!(out.contains("kind: builtin") && out.contains("manual"), "{out}");
+        assert!(
+            out.contains("kind: builtin") && out.contains("manual"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -1982,9 +1988,7 @@ mod tests {
             "the second man load()s the session-cached bytes: {tail:?}"
         );
         assert!(
-            !tail
-                .iter()
-                .any(|line| line.starts_with("resolve(telnetd)")),
+            !tail.iter().any(|line| line.starts_with("resolve(telnetd)")),
             "no filesystem re-read: {tail:?}"
         );
     }

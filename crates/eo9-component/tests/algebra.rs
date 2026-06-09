@@ -1075,8 +1075,7 @@ fn wac_nesting_buries_operand_manuals_below_the_man_scanners_reach() {
     // pins it so a wac upgrade cannot silently change `man`'s fallback.
     use eosh_core::manual::extract_manual;
 
-    const PROVIDER_MANUAL: &str =
-        "eo9-manual 1\nname: text-mock\nsynopsis: a text provider\nend\n";
+    const PROVIDER_MANUAL: &str = "eo9-manual 1\nname: text-mock\nsynopsis: a text provider\nend\n";
     const CONSUMER_MANUAL: &str = "eo9-manual 1\nname: hello\nsynopsis: say hello\nend\n";
 
     // Operands carrying manuals in the canonical place (a custom section of their core

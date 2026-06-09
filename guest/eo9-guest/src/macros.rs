@@ -318,22 +318,54 @@ macro_rules! __manual_arg {
     };
     ({ name: $n:literal, ty: $t:literal, required, doc: $d:literal, values: $v:literal $(,)? }) => {
         concat!(
-            "arg ", $n, " ", $t, " required\n  doc: ", $d, "\n  values: ", $v, "\n"
+            "arg ",
+            $n,
+            " ",
+            $t,
+            " required\n  doc: ",
+            $d,
+            "\n  values: ",
+            $v,
+            "\n"
         )
     };
     ({ name: $n:literal, ty: $t:literal, optional, doc: $d:literal, values: $v:literal $(,)? }) => {
         concat!(
-            "arg ", $n, " ", $t, " optional\n  doc: ", $d, "\n  values: ", $v, "\n"
+            "arg ",
+            $n,
+            " ",
+            $t,
+            " optional\n  doc: ",
+            $d,
+            "\n  values: ",
+            $v,
+            "\n"
         )
     };
     ({ name: $n:literal, ty: $t:literal, required, doc: $d:literal, kind: $k:literal $(,)? }) => {
         concat!(
-            "arg ", $n, " ", $t, " required\n  doc: ", $d, "\n  kind: ", $k, "\n"
+            "arg ",
+            $n,
+            " ",
+            $t,
+            " required\n  doc: ",
+            $d,
+            "\n  kind: ",
+            $k,
+            "\n"
         )
     };
     ({ name: $n:literal, ty: $t:literal, optional, doc: $d:literal, kind: $k:literal $(,)? }) => {
         concat!(
-            "arg ", $n, " ", $t, " optional\n  doc: ", $d, "\n  kind: ", $k, "\n"
+            "arg ",
+            $n,
+            " ",
+            $t,
+            " optional\n  doc: ",
+            $d,
+            "\n  kind: ",
+            $k,
+            "\n"
         )
     };
 }

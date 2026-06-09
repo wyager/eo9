@@ -233,7 +233,10 @@ impl fmt::Display for ManualError {
                 write!(f, "line {line} exceeds {MAX_LINE_BYTES} bytes")
             }
             ManualError::DuplicateHeader { line } => {
-                write!(f, "a second header at line {line} (two concatenated manuals)")
+                write!(
+                    f,
+                    "a second header at line {line} (two concatenated manuals)"
+                )
             }
             ManualError::TooManyArgs => write!(f, "more than {MAX_ARGS} args"),
             ManualError::TooManyExamples => write!(f, "more than {MAX_EXAMPLES} examples"),
@@ -306,9 +309,9 @@ pub fn parse_manual(payload: &[u8]) -> Result<Manual, ManualError> {
             // An indented line: attaches to the open block; unknown keys are skipped.
             let trimmed = line.trim_start();
             match block {
-                Block::Description => description.push(String::from(
-                    line.strip_prefix("  ").unwrap_or(trimmed),
-                )),
+                Block::Description => {
+                    description.push(String::from(line.strip_prefix("  ").unwrap_or(trimmed)))
+                }
                 Block::Arg => {
                     let arg = args.last_mut().expect("Block::Arg implies an open arg");
                     if let Some(doc) = trimmed.strip_prefix("doc: ") {
@@ -473,7 +476,10 @@ fn wrap_into(lines: &mut Vec<String>, prefix: &str, indent: &str, text: &str) {
 /// The `(T, required|optional)` shape of a WIT `ArgSpec.ty`, for the mismatch check:
 /// `option<T>` means optional-T, anything else required-itself.
 fn wit_shape(ty: &str) -> (&str, bool) {
-    match ty.strip_prefix("option<").and_then(|rest| rest.strip_suffix('>')) {
+    match ty
+        .strip_prefix("option<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
         Some(inner) => (inner, false),
         None => (ty, true),
     }
@@ -508,7 +514,12 @@ pub fn render_manual(manual: &Manual, wit_args: Option<&[ArgSpec]>) -> Vec<Strin
                 wrap_into(&mut lines, "      ", "      ", doc);
             }
             if let Some(values) = &arg.values {
-                wrap_into(&mut lines, "      ", "        ", &format!("values: {values}"));
+                wrap_into(
+                    &mut lines,
+                    "      ",
+                    "        ",
+                    &format!("values: {values}"),
+                );
             }
             if let Some(kind) = &arg.kind {
                 wrap_into(&mut lines, "      ", "        ", &format!("kind: {kind}"));
@@ -728,7 +739,10 @@ mod tests {
         assert_eq!(manual.args[0].name, "port");
         assert_eq!(manual.args[0].ty, "u16");
         assert!(!manual.args[0].required);
-        assert_eq!(manual.args[0].doc, vec!["TCP port to listen on (default 23)"]);
+        assert_eq!(
+            manual.args[0].doc,
+            vec!["TCP port to listen on (default 23)"]
+        );
         assert_eq!(manual.args[1].kind.as_deref(), Some("component-name"));
         assert_eq!(manual.args[2].values.as_deref(), Some("dhcp, static"));
         assert_eq!(manual.examples.len(), 1);
@@ -829,7 +843,10 @@ mod tests {
             Err(ManualError::TooLarge { .. })
         ));
         // An overlong line.
-        let long = format!("eo9-manual 1\nname: x\nsynopsis: {}\nend\n", "s".repeat(130));
+        let long = format!(
+            "eo9-manual 1\nname: x\nsynopsis: {}\nend\n",
+            "s".repeat(130)
+        );
         assert_eq!(
             parse_manual(long.as_bytes()),
             Err(ManualError::LineTooLong { line: 3 })
