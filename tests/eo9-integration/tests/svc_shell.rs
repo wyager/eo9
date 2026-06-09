@@ -15,6 +15,9 @@ use std::sync::Once;
 use eo9_integration::guest;
 
 /// The `eo9` binary built by this workspace (same locator as the CLI transcripts).
+/// The build always runs under the `Once` (cargo no-ops when the binary is fresh):
+/// an existing-but-stale binary must never be soaked against — the build-on-absence
+/// guard cost a review one invalid soak (flakes-merge carry-forward).
 fn eo9_binary() -> PathBuf {
     static BUILD: Once = Once::new();
     let profile_dir = std::env::current_exe()
@@ -25,20 +28,18 @@ fn eo9_binary() -> PathBuf {
         .expect("profile dir")
         .to_path_buf();
     let binary = profile_dir.join("eo9");
-    if !binary.exists() {
-        BUILD.call_once(|| {
-            let mut args = vec!["build", "-p", "eo9", "--bin", "eo9"];
-            if profile_dir.file_name().and_then(|n| n.to_str()) == Some("release") {
-                args.push("--release");
-            }
-            let status = Command::new("cargo")
-                .args(&args)
-                .current_dir(guest::repo_root())
-                .status()
-                .expect("failed to invoke cargo to build the eo9 binary");
-            assert!(status.success(), "building the eo9 binary failed");
-        });
-    }
+    BUILD.call_once(|| {
+        let mut args = vec!["build", "-p", "eo9", "--bin", "eo9"];
+        if profile_dir.file_name().and_then(|n| n.to_str()) == Some("release") {
+            args.push("--release");
+        }
+        let status = Command::new("cargo")
+            .args(&args)
+            .current_dir(guest::repo_root())
+            .status()
+            .expect("failed to invoke cargo to build the eo9 binary");
+        assert!(status.success(), "building the eo9 binary failed");
+    });
     assert!(
         binary.exists(),
         "eo9 binary is missing at {}",
