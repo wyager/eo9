@@ -36,6 +36,7 @@ fn fs_fail(path: &str, e: fs::FsError) -> ProgramFailure {
 fn io_fail(e: text::TextError) -> ProgramFailure {
     ProgramFailure::Io(match e {
         text::TextError::Closed => String::from("output closed"),
+        text::TextError::Unsupported => String::from("io: unsupported operation"),
         text::TextError::Io(m) => format!("io: {m}"),
     })
 }

@@ -29,7 +29,7 @@ const HELLO_WAT: &str = r#"
     (export "text-impl" (type $text-impl-eq (eq $text-impl)))
     (type $output-stream-def (enum "out" "err"))
     (export "output-stream" (type $output-stream (eq $output-stream-def)))
-    (type $text-error-def (variant (case "closed") (case "io" string)))
+    (type $text-error-def (variant (case "closed") (case "unsupported") (case "io" string)))
     (export "text-error" (type $text-error (eq $text-error-def)))
     (export "default" (func (result (own $text-impl-eq))))
     (export "write" (func

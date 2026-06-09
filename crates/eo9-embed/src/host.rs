@@ -196,6 +196,7 @@ impl TextProvider for StdioText {
 fn text_error(err: UnixTextError) -> TextError {
     match err {
         UnixTextError::Closed => TextError::Closed,
+        UnixTextError::Unsupported => TextError::Unsupported,
         UnixTextError::Io(message) => TextError::Io(message),
     }
 }

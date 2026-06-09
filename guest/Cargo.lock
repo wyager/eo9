@@ -872,6 +872,7 @@ version = "0.0.0"
 dependencies = [
  "eo9-guest",
  "eosh-core",
+ "eosh-inc",
  "wit-bindgen",
 ]
 

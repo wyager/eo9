@@ -24,6 +24,11 @@ interface text {
     variant text-error {
         /// The stream is closed (e.g. output was detached, or stdin hit end of input).
         closed,
+        /// The operation is not supported by this transport (today: `read-key` on a
+        /// line-only stream — piped stdin, net.text's NVT, a service's captured text).
+        /// A typed refusal, so a consumer can fall back to `read-line` instead of
+        /// guessing from an io string.
+        unsupported,
         io(string),
     }
 
@@ -33,11 +38,46 @@ interface text {
         err,
     }
 
+    /// One decoded keystroke (the payload of `read-key`). Transports own their wire
+    /// decoding — escape sequences, telnet negotiation, termios — and hand the consumer
+    /// semantics, so eosh's editor is transport-independent:
+    ///
+    /// * `char` is one byte of printable input (>= 0x20, not 0x7f). Multi-byte UTF-8
+    ///   characters arrive as their individual bytes, in order.
+    /// * `ctrl` carries the raw control byte (1..=26 are Ctrl-A..Ctrl-Z; e.g.
+    ///   `ctrl(3)` is Ctrl-C, `ctrl(4)` is Ctrl-D). Enter/backspace/tab have their own
+    ///   cases and are never reported as `ctrl`.
+    /// * `eof` is an explicit end-of-input keystroke on transports that decode one;
+    ///   transport end-of-input (the stream closing) is `read-key`'s `none` answer,
+    ///   mirroring `read-line`.
+    variant key {
+        %char(u8),
+        enter,
+        backspace,
+        tab,
+        up,
+        down,
+        left,
+        right,
+        ctrl(u8),
+        eof,
+    }
+
     /// Write UTF-8 text to stdout or stderr.
     write: func(t: borrow<text-impl>, to: output-stream, text: string) -> result<_, text-error>;
 
     /// Read one line from stdin (without the trailing newline); `none` at end of input.
     read-line: async func(t: borrow<text-impl>) -> result<option<string>, text-error>;
+
+    /// Read one decoded keystroke from stdin; `none` at end of input. The per-key
+    /// surface behind eosh's incremental editor (docs/study/incremental-repl-for-eosh.md
+    /// M2). **The provider must not echo** — the consumer owns the line image.
+    ///
+    /// Transports that cannot deliver single keystrokes (line-buffered pipes, net.text's
+    /// line-based NVT, captured service streams) answer `err(unsupported)`, and the
+    /// consumer falls back to `read-line`; a session is expected to probe once and stick
+    /// with the answer.
+    read-key: async func(t: borrow<text-impl>) -> result<option<key>, text-error>;
 }
 
 /// Optional flavor of `text` (hand-written for v0; see SPEC: The capability algebra).

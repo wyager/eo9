@@ -190,13 +190,46 @@ pub(super) enum WitOutputStream {
 
 #[derive(Clone, ComponentType, Lift, Lower)]
 #[component(variant)]
-// The error arms exist to satisfy the interface type; the serial console cannot fail.
+// Closed/Io exist to satisfy the interface type (the serial console cannot fail);
+// Unsupported is answered by surfaces with no per-key input (the svc capture text).
 #[allow(dead_code)]
 pub(super) enum WitTextError {
     #[component(name = "closed")]
     Closed,
+    #[component(name = "unsupported")]
+    Unsupported,
     #[component(name = "io")]
     Io(String),
+}
+
+/// `eo9:text/text.key` — one decoded keystroke (the `read-key` payload). Variant order
+/// matches the WIT declaration; mirrors `eo9-runtime::link`'s host type (this crate
+/// targets `aarch64-unknown-none` and mirrors shapes rather than reusing them).
+#[derive(Clone, Copy, ComponentType, Lift, Lower)]
+#[component(variant)]
+// Constructed host-side and lowered into the guest; `Lift` exists for shape symmetry.
+#[allow(dead_code)]
+pub(super) enum WitKey {
+    #[component(name = "char")]
+    Char(u8),
+    #[component(name = "enter")]
+    Enter,
+    #[component(name = "backspace")]
+    Backspace,
+    #[component(name = "tab")]
+    Tab,
+    #[component(name = "up")]
+    Up,
+    #[component(name = "down")]
+    Down,
+    #[component(name = "left")]
+    Left,
+    #[component(name = "right")]
+    Right,
+    #[component(name = "ctrl")]
+    Ctrl(u8),
+    #[component(name = "eof")]
+    Eof,
 }
 
 #[derive(Clone, Copy, ComponentType, Lift, Lower)]
@@ -373,6 +406,19 @@ fn add_text(linker: &mut Linker<KernelState>) -> Result<()> {
         },
     )?;
 
+    // Read one decoded keystroke (no echo — the consumer owns the line image): the
+    // per-key surface behind eosh's incremental editor. Shares the UART RX ring and
+    // the escape decoding with read-line; the serial stream never ends, so the future
+    // never resolves to `none`.
+    text.func_wrap_concurrent(
+        "read-key",
+        |_accessor: &Accessor<KernelState>,
+         (_cap,): (Resource<TextCap>,)|
+         -> ConcurrentFuture<'_, (Result<Option<WitKey>, WitTextError>,)> {
+            Box::pin(async move { Ok((Ok(Some(ReadKey::default().await)),)) })
+        },
+    )?;
+
     Ok(())
 }
 
@@ -451,9 +497,10 @@ const READ_HISTORY_CAP: usize = 32;
 static READ_HISTORY: super::shellexec::KLock<Vec<String>> =
     super::shellexec::KLock::new(Vec::new());
 
-/// Escape-sequence parser state for [`ReadLine`]: arrow keys (and friends) arrive over
-/// serial as `ESC [ <final>` / `ESC O <final>` sequences, with optional parameter bytes
-/// (`0x30..=0x3f`) and intermediates (`0x20..=0x2f`) before the final (`0x40..=0x7e`).
+/// Escape-sequence parser state for [`KeyDecoder`]: arrow keys (and friends) arrive
+/// over serial as `ESC [ <final>` / `ESC O <final>` sequences, with optional parameter
+/// bytes (`0x30..=0x3f`) and intermediates (`0x20..=0x2f`) before the final
+/// (`0x40..=0x7e`).
 #[derive(Default, Clone, Copy, PartialEq)]
 enum EscState {
     /// Not inside an escape sequence.
@@ -465,6 +512,123 @@ enum EscState {
     Csi,
 }
 
+/// One decoded keystroke from the console UART — the shared output of [`KeyDecoder`],
+/// consumed semantically by [`ReadKey`] (surfaced to the guest) and [`ReadLine`] (acted
+/// on by the kernel's own line discipline).
+#[derive(Clone, Copy, PartialEq)]
+enum KeyEvent {
+    /// A non-control byte: printable ASCII, or a UTF-8 lead/continuation byte.
+    Char(u8),
+    Enter,
+    Backspace,
+    Tab,
+    Up,
+    Down,
+    Left,
+    Right,
+    /// Any other control byte, raw (3 = Ctrl-C, 4 = Ctrl-D, …).
+    Ctrl(u8),
+}
+
+/// Escape-sequence decoder shared by [`ReadLine`] and [`ReadKey`]: raw UART bytes in,
+/// semantic [`KeyEvent`]s out. Arrows decode; unknown CSI finals are consumed silently
+/// (they no longer leak `[A`-style garbage into a line); a lone ESC is dropped and the
+/// byte after it decodes normally. Mirrors the usermode decoder in
+/// `eo9-providers-unix::text` (mirrored, not reused — this crate is `no_std` bare
+/// metal).
+#[derive(Default)]
+struct KeyDecoder {
+    state: EscState,
+}
+
+impl KeyDecoder {
+    /// Feed one byte; `Some(event)` when a complete keystroke decodes.
+    fn push(&mut self, byte: u8) -> Option<KeyEvent> {
+        match self.state {
+            EscState::Esc => {
+                if byte == b'[' || byte == b'O' {
+                    self.state = EscState::Csi;
+                    return None;
+                }
+                if byte == 0x1b {
+                    // ESC ESC: stay armed for a sequence.
+                    return None;
+                }
+                // A lone ESC: drop it, decode this byte normally.
+                self.state = EscState::Idle;
+                Self::plain(byte)
+            }
+            EscState::Csi => {
+                if (0x20..=0x3f).contains(&byte) {
+                    // Parameter / intermediate bytes.
+                    return None;
+                }
+                self.state = EscState::Idle;
+                match byte {
+                    b'A' => Some(KeyEvent::Up),
+                    b'B' => Some(KeyEvent::Down),
+                    b'C' => Some(KeyEvent::Right),
+                    b'D' => Some(KeyEvent::Left),
+                    // Home/End/Delete and other finals: consumed, ignored (v1).
+                    _ => None,
+                }
+            }
+            EscState::Idle => {
+                if byte == 0x1b {
+                    self.state = EscState::Esc;
+                    return None;
+                }
+                Self::plain(byte)
+            }
+        }
+    }
+
+    fn plain(byte: u8) -> Option<KeyEvent> {
+        Some(match byte {
+            b'\r' | b'\n' => KeyEvent::Enter,
+            0x08 | 0x7f => KeyEvent::Backspace,
+            b'\t' => KeyEvent::Tab,
+            0x00..=0x1f => KeyEvent::Ctrl(byte),
+            _ => KeyEvent::Char(byte),
+        })
+    }
+}
+
+/// Future that resolves with the next decoded keystroke from the console UART — the
+/// `read-key` payload (no echo: the consuming editor owns the line image). Each call
+/// is one fresh future; an escape sequence split across polls is held in the decoder
+/// until its final byte arrives, so a key never decodes partially.
+#[derive(Default)]
+struct ReadKey {
+    decoder: KeyDecoder,
+}
+
+impl Future for ReadKey {
+    type Output = WitKey;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<WitKey> {
+        let this = self.get_mut();
+        while let Some(byte) = crate::uart::ring_get_byte() {
+            if let Some(event) = this.decoder.push(byte) {
+                return Poll::Ready(match event {
+                    KeyEvent::Char(byte) => WitKey::Char(byte),
+                    KeyEvent::Enter => WitKey::Enter,
+                    KeyEvent::Backspace => WitKey::Backspace,
+                    KeyEvent::Tab => WitKey::Tab,
+                    KeyEvent::Up => WitKey::Up,
+                    KeyEvent::Down => WitKey::Down,
+                    KeyEvent::Left => WitKey::Left,
+                    KeyEvent::Right => WitKey::Right,
+                    KeyEvent::Ctrl(byte) => WitKey::Ctrl(byte),
+                });
+            }
+        }
+        // Same parking discipline as ReadLine below.
+        super::register_idle_waker(cx.waker());
+        Poll::Pending
+    }
+}
+
 /// Future that reads one line from the console UART, echoing input as it arrives.
 ///
 /// Resolves to `Some(line)` on CR/LF (without the terminator) and to `None` (end of
@@ -472,13 +636,14 @@ enum EscState {
 /// character. Up/Down arrows recall previously entered lines (the [`READ_HISTORY`]
 /// ring), and the recalled line is editable; editing it commits it as the fresh line
 /// (recall position and stash reset — the bash-like per-entry edit buffer is out of
-/// scope). Left/Right and other escape sequences are consumed and ignored (they no
-/// longer leak `[A`-style garbage into the line). Other control bytes are ignored.
+/// scope). Left/Right and other escape sequences are consumed and ignored. Other
+/// control bytes (including TAB) are ignored, exactly as before the decoder was
+/// shared with `read-key`.
 #[derive(Default)]
 struct ReadLine {
     line: String,
-    /// Escape-sequence parser state.
-    esc: EscState,
+    /// Escape-sequence decoding, shared with [`ReadKey`].
+    decoder: KeyDecoder,
     /// History browsing: `None` = typing a fresh line; `Some(i)` = showing entry `i`.
     recall: Option<usize>,
     /// The fresh line stashed when browsing began (restored by ↓ past the newest).
@@ -568,58 +733,39 @@ impl Future for ReadLine {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         // Consume from the interrupt-filled input ring (src/uart.rs): the UART RX interrupt
-        // moves bytes in and wakes the `wfi`, so this just drains what has arrived.
+        // moves bytes in and wakes the `wfi`, so this just drains what has arrived. The
+        // shared decoder turns raw bytes (and escape sequences) into keystrokes; this
+        // line discipline acts on them exactly as the pre-decoder code did.
         while let Some(byte) = crate::uart::ring_get_byte() {
-            // Escape sequences first: arrows recall history, everything else inside a
-            // sequence is consumed silently instead of leaking into the line.
-            match this.esc {
-                EscState::Esc => {
-                    if byte == b'[' || byte == b'O' {
-                        this.esc = EscState::Csi;
-                        continue;
-                    }
-                    // A lone ESC: drop it, handle this byte normally below.
-                    this.esc = EscState::Idle;
-                }
-                EscState::Csi => {
-                    if (0x20..=0x3f).contains(&byte) {
-                        // Parameter / intermediate bytes.
-                        continue;
-                    }
-                    this.esc = EscState::Idle;
-                    match byte {
-                        b'A' => this.recall_step(true),
-                        b'B' => this.recall_step(false),
-                        // Left/Right/Home/End/Delete finals: consumed, ignored (v1).
-                        _ => {}
-                    }
-                    continue;
-                }
-                EscState::Idle => {}
-            }
-            match byte {
-                0x1b => this.esc = EscState::Esc,
-                b'\r' | b'\n' => {
+            let Some(event) = this.decoder.push(byte) else {
+                continue;
+            };
+            match event {
+                KeyEvent::Up => this.recall_step(true),
+                KeyEvent::Down => this.recall_step(false),
+                KeyEvent::Enter => {
                     crate::kprint!("\n");
                     let line = core::mem::take(&mut this.line);
                     push_read_history(&line);
                     return Poll::Ready(Some(line));
                 }
                 // Ctrl-D on an empty line: end of input.
-                0x04 if this.line.is_empty() => return Poll::Ready(None),
-                // Backspace / DEL.
-                0x08 | 0x7f => {
+                KeyEvent::Ctrl(0x04) if this.line.is_empty() => return Poll::Ready(None),
+                KeyEvent::Backspace => {
                     if this.line.pop().is_some() {
                         this.commit_recall();
                         crate::kprint!("\u{8} \u{8}");
                     }
                 }
-                0x20..=0x7e if this.line.len() < MAX_READ_LINE_BYTES => {
+                // Printable ASCII only, as before (UTF-8 bytes pass through the decoder
+                // as Char but the kernel's own line editor keeps its ASCII-only policy).
+                KeyEvent::Char(byte @ 0x20..=0x7e) if this.line.len() < MAX_READ_LINE_BYTES => {
                     this.commit_recall();
                     let ch = char::from(byte);
                     this.line.push(ch);
                     crate::kprint!("{ch}");
                 }
+                // TAB, other control bytes, non-ASCII bytes, Left/Right: ignored (v1).
                 _ => {}
             }
         }

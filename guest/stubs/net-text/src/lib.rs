@@ -479,6 +479,14 @@ impl text::Guest for Stub {
         })
     }
 
+    /// Per-key input is not part of the NVT line discipline this provider speaks
+    /// (lines are assembled here, from a refuse-all negotiation — no ECHO, no SGA).
+    /// The typed refusal sends the consumer down its read-line path; telnet character
+    /// mode (WILL ECHO+SGA) is the recorded follow-on (study 19).
+    async fn read_key(_t: text::TextImplBorrow<'_>) -> Result<Option<text::Key>, TextError> {
+        Err(TextError::Unsupported)
+    }
+
     async fn read_line(_t: text::TextImplBorrow<'_>) -> Result<Option<String>, TextError> {
         match with_state(|s| s.phase) {
             Phase::Closed => return Ok(None),

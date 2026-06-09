@@ -24,6 +24,9 @@ use eosh_core::{
         ServiceInfo, WaveValue,
     },
 };
+use eosh_inc::editor::{Action, Editor, Key as EditorKey, Marker, RECALL_CAP};
+use eosh_inc::grammar::Vocab;
+use eosh_inc::inc::Tag;
 
 mod bindings {
     // The eo9:text / eo9:fs / eo9:io interfaces are mapped onto the shared SDK modules
@@ -675,32 +678,148 @@ impl Guest for Eosh {
                     LineResult::Error(rendered) => Err(ProgramFailure::NotRunnable(rendered)),
                 }
             }
-            // Interactive mode: read lines until end of input or `exit`.
+            // Interactive mode: read input until end of input or `exit`. The transport
+            // decides how: the first prompt goes out, then one `read-key` probe — a
+            // per-key transport (the kernel serial console, the interactive usermode
+            // terminal) blocks until the first keystroke and the in-shell editor takes
+            // over; a line-only transport (pipes, net.text, the web terminal) answers
+            // `unsupported` immediately and the classic read-line loop runs with the
+            // prompt already on screen. Zero regression on dumb transports.
             None => {
                 let text = text::default();
                 session.backend_mut().print(
                     "eosh — the Eo9 shell (type `help` to explore, `ls /bin` to see what's \
                          installed)",
                 );
-                loop {
-                    if text::write(&text, text::OutputStream::Out, "eosh> ").is_err() {
-                        return Err(ProgramFailure::Io("writing the prompt failed".to_string()));
-                    }
-                    let line = text::read_line(&text).await.map_err(|err| {
-                        ProgramFailure::Io(format!("reading a line failed: {err:?}"))
-                    })?;
-                    let Some(line) = line else {
-                        // End of input.
-                        return Ok(ProgramSuccess::Exited);
-                    };
-                    match session.execute_line(&line).await {
-                        LineResult::Exit => return Ok(ProgramSuccess::Exited),
-                        LineResult::Poweroff => return Ok(ProgramSuccess::PoweroffRequested),
-                        _ => {}
-                    }
+                write_prompt(&text)?;
+                match text::read_key(&text).await {
+                    Err(text::TextError::Unsupported) => read_line_loop(&mut session, &text).await,
+                    Err(err) => Err(ProgramFailure::Io(format!("reading a key failed: {err:?}"))),
+                    // End of input before the first key (e.g. text.null): a clean exit.
+                    Ok(None) => Ok(ProgramSuccess::Exited),
+                    Ok(Some(first)) => editor_loop(&mut session, &text, first).await,
                 }
             }
         }
+    }
+}
+
+/// The interactive prompt (also what the editor repaints after a candidate list).
+const PROMPT: &str = "eosh> ";
+
+fn write_prompt(text: &text::TextImpl) -> Result<(), ProgramFailure> {
+    text::write(text, text::OutputStream::Out, PROMPT)
+        .map_err(|_| ProgramFailure::Io("writing the prompt failed".to_string()))
+}
+
+/// The classic line loop — exactly the pre-editor behavior, used whenever the
+/// transport cannot deliver keystrokes. The caller has already written the first
+/// prompt (it had to be on screen for the probe).
+async fn read_line_loop(
+    session: &mut Session<WitBackend>,
+    text: &text::TextImpl,
+) -> Result<ProgramSuccess, ProgramFailure> {
+    loop {
+        let line = text::read_line(text)
+            .await
+            .map_err(|err| ProgramFailure::Io(format!("reading a line failed: {err:?}")))?;
+        let Some(line) = line else {
+            // End of input.
+            return Ok(ProgramSuccess::Exited);
+        };
+        match session.execute_line(&line).await {
+            LineResult::Exit => return Ok(ProgramSuccess::Exited),
+            LineResult::Poweroff => return Ok(ProgramSuccess::PoweroffRequested),
+            _ => {}
+        }
+        write_prompt(text)?;
+    }
+}
+
+/// The per-key editor loop (study 19 M2): one [`Editor`] per prompt over fresh
+/// vocabulary and history snapshots; keys in, echo/marker bytes out, lines executed
+/// through the very same `execute_line` as every other path.
+async fn editor_loop(
+    session: &mut Session<WitBackend>,
+    text: &text::TextImpl,
+    first: text::Key,
+) -> Result<ProgramSuccess, ProgramFailure> {
+    // The probe key arrives before the first editor exists; feed it in.
+    let mut pending = Some(first);
+    loop {
+        let vocab = snapshot_vocab(session).await;
+        let history = session.recall_view(RECALL_CAP);
+        let mut editor = Editor::new(PROMPT, vocab, history, Marker::RED);
+        let submitted = loop {
+            let key = match pending.take() {
+                Some(key) => editor_key(key),
+                None => match text::read_key(text).await {
+                    Ok(Some(key)) => editor_key(key),
+                    // Transport closed: Eof submits a typed line first (and ends the
+                    // session on the next, empty round).
+                    Ok(None) => EditorKey::Eof,
+                    Err(err) => {
+                        return Err(ProgramFailure::Io(format!("reading a key failed: {err:?}")));
+                    }
+                },
+            };
+            let action = editor.handle(key);
+            let output = editor.take_output();
+            if !output.is_empty() {
+                // Echo failures have nowhere to be reported but the stream that just
+                // failed; keep going (the same posture as the backend's print).
+                let _ = text::write(text, text::OutputStream::Out, &output);
+            }
+            match action {
+                Action::Pending => {}
+                Action::Submit(line) => break Some(line),
+                Action::EndOfInput => break None,
+            }
+        };
+        let Some(line) = submitted else {
+            return Ok(ProgramSuccess::Exited);
+        };
+        match session.execute_line(&line).await {
+            LineResult::Exit => return Ok(ProgramSuccess::Exited),
+            LineResult::Poweroff => return Ok(ProgramSuccess::PoweroffRequested),
+            _ => {}
+        }
+        write_prompt(text)?;
+    }
+}
+
+/// The per-prompt vocabulary snapshot: the store's `/bin` listing plus the session's
+/// `let` bindings (the grammar itself already offers builtins and keywords).
+async fn snapshot_vocab(session: &mut Session<WitBackend>) -> Vocab {
+    let mut entries: Vec<(String, Tag)> = session
+        .backend_mut()
+        .list_bin()
+        .await
+        .into_iter()
+        .map(|name| (name, Tag::Program))
+        .collect();
+    entries.extend(
+        session
+            .binding_names()
+            .into_iter()
+            .map(|name| (name, Tag::Binding)),
+    );
+    Vocab::new(entries)
+}
+
+/// The WIT keystroke, as the editor's key type.
+fn editor_key(key: text::Key) -> EditorKey {
+    match key {
+        text::Key::Char(byte) => EditorKey::Char(byte),
+        text::Key::Enter => EditorKey::Enter,
+        text::Key::Backspace => EditorKey::Backspace,
+        text::Key::Tab => EditorKey::Tab,
+        text::Key::Up => EditorKey::Up,
+        text::Key::Down => EditorKey::Down,
+        text::Key::Left => EditorKey::Left,
+        text::Key::Right => EditorKey::Right,
+        text::Key::Ctrl(byte) => EditorKey::Ctrl(byte),
+        text::Key::Eof => EditorKey::Eof,
     }
 }
 

@@ -36,8 +36,31 @@ pub enum OutputStream {
 pub enum TextError {
     /// The stream is closed (output detached, or stdin hit end of input).
     Closed,
+    /// The operation is not supported by this transport (today: `read_key` on a
+    /// line-only stream). A typed refusal so consumers can fall back to `read_line`.
+    Unsupported,
     /// Any other I/O failure.
     Io(String),
+}
+
+/// One decoded keystroke (`eo9:text/text.key`). The provider owns the wire decoding —
+/// escape sequences, termios, telnet negotiation — and hands consumers semantics:
+/// `Char` is one byte of printable input (multi-byte UTF-8 arrives byte by byte);
+/// `Ctrl` carries the raw control byte (3 = Ctrl-C, 4 = Ctrl-D); `Eof` is an explicit
+/// end-of-input keystroke where a transport decodes one (stream closure is `read_key`'s
+/// `Ok(None)` answer, mirroring `read_line`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Char(u8),
+    Enter,
+    Backspace,
+    Tab,
+    Up,
+    Down,
+    Left,
+    Right,
+    Ctrl(u8),
+    Eof,
 }
 
 /// Wall-clock time (`eo9:time/time.datetime`): seconds and nanoseconds since the Unix epoch.
@@ -54,6 +77,15 @@ pub trait TextProvider: Send + 'static {
 
     /// Read one line from stdin (without the trailing newline); `None` at end of input.
     fn read_line(&mut self) -> BoxOp<Result<Option<String>, TextError>>;
+
+    /// Read one decoded keystroke; `None` at end of input. The provider must not echo —
+    /// the consumer owns the line image. The default answers [`TextError::Unsupported`],
+    /// the contract for line-only transports (pipes, captured service streams,
+    /// in-memory test text): the consumer (eosh) probes once and falls back to
+    /// `read_line`.
+    fn read_key(&mut self) -> BoxOp<Result<Option<Key>, TextError>> {
+        Box::pin(std::future::ready(Err(TextError::Unsupported)))
+    }
 }
 
 /// Root provider for `eo9:time/time`.

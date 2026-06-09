@@ -12,5 +12,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 eosh-core = { path = "../eosh-core" }
+eosh-inc = { path = "../eosh-inc" }
 eo9-guest = { workspace = true }
 wit-bindgen = { workspace = true }
