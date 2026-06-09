@@ -234,10 +234,7 @@ fn commit_impl(len: u64, crc_expected: u32, bootargs: &str) -> WitKexecError {
             crate::mmu::BOOTARGS_PAGE_LEN - 1
         ));
     }
-    if bootargs
-        .bytes()
-        .any(|byte| !(0x20..=0x7e).contains(&byte))
-    {
+    if bootargs.bytes().any(|byte| !(0x20..=0x7e).contains(&byte)) {
         return WitKexecError::BadImage(
             "bootargs must be one printable-ASCII line (the staged-page format)".into(),
         );

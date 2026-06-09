@@ -55,8 +55,9 @@ const MAX_IMAGE: u64 = 64 * 1024 * 1024 - 64 * 1024;
 const MIN_SECRET: usize = 16;
 /// Authentication / framing attempts: one retry, then exit (no oracle loops).
 const MAX_SESSIONS: u32 = 2;
-/// Transfer recv chunk size.
-const CHUNK: u64 = 64 * 1024;
+/// Transfer receive-buffer size (one buffer, reused across the whole stream — see the
+/// allocation note at the streaming loop).
+const CHUNK: u64 = 256 * 1024;
 
 /// CRC-32 (IEEE, reflected) — must match send_image.py's binascii.crc32 and the
 /// kernel's commit-side check.
@@ -156,10 +157,7 @@ fn secret_matches(wire: &[u8], expected: &[u8]) -> bool {
 /// One accepted session up to (but not including) the payload: magic, secret frame,
 /// verdict byte. `Ok(true)` = authenticated, proceed on this connection;
 /// `Ok(false)` = refused (already answered 'E'), caller may retry once.
-async fn authenticate(
-    conn: &l4::TcpConnection,
-    secret: &str,
-) -> Result<bool, ProgramFailure> {
+async fn authenticate(conn: &l4::TcpConnection, secret: &str) -> Result<bool, ProgramFailure> {
     let Some(magic) = recv_exact(conn, MAGIC.len()).await? else {
         say("oskexec: peer closed before the magic");
         return Ok(false);
@@ -261,14 +259,26 @@ eo9_guest::main! {
         ));
 
         // Stream to stage(): CRC as we go, a 'k' per 64 KiB, narration per 4 MiB.
+        // The receive buffer and the ack byte's buffer are allocated ONCE and ride the
+        // owned-buffer round-trip (the pattern the io API is built around): allocating
+        // a fresh host buffer per chunk measurably decayed the transfer pace over a
+        // 60 MiB stream (the check-kexec gate's first runs — see GAPS, kexec entry).
+        // The reusable buffer is full-size; near the payload's end it is swapped for
+        // exact-remainder buffers so a recv can never swallow the trailing CRC bytes.
         let mut offset = 0u64;
         let mut crc = 0xFFFF_FFFFu32;
         let mut next_ack = ACK_INTERVAL;
         let mut next_progress = PROGRESS_INTERVAL;
+        let mut dst = buffer::with_capacity(CHUNK);
+        let mut dst_capacity = CHUNK;
         while offset < len {
-            let want = (len - offset).min(CHUNK);
-            let dst = buffer::with_capacity(want);
-            let (dst, received) = l4::recv(&conn, dst).await;
+            let remaining = len - offset;
+            if remaining < dst_capacity {
+                dst = buffer::with_capacity(remaining);
+                dst_capacity = remaining;
+            }
+            let (returned, received) = l4::recv(&conn, dst).await;
+            dst = returned;
             let result = received.map_err(net_failure)?;
             if result.bytes_received == 0 {
                 return Err(ProgramFailure::Protocol(format!(
@@ -283,9 +293,16 @@ eo9_guest::main! {
                 return Err(ProgramFailure::Refused(format!("stage: {error:?}")));
             }
             offset += staged_len;
+            // Batch every ack this chunk earned into ONE send ('k' per 64 KiB crossed;
+            // the host counts bytes, not segments) — transport calls are the expensive
+            // unit on this path, so one burst beats one send per boundary.
+            let mut due = 0usize;
             while offset >= next_ack {
-                send_all(&conn, b"k").await?;
+                due += 1;
                 next_ack += ACK_INTERVAL;
+            }
+            if due > 0 {
+                send_all(&conn, &alloc::vec![b'k'; due]).await?;
             }
             if offset >= next_progress || offset == len {
                 say(&format!("oskexec: staged {offset}/{len} bytes"));

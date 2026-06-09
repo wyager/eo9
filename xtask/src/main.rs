@@ -2419,15 +2419,23 @@ fn build_kernel_riscv64(root: &Path) -> Result<PathBuf, String> {
 }
 
 fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
-    build_kernel_aarch64_stamped(root, None)
+    build_kernel_aarch64_stamped(root, None, false)
 }
 
 /// [`build_kernel_aarch64`] with an optional banner build stamp (`EO9_BUILD_STAMP`,
-/// printed by `arch::banner`). `check-kexec` builds its second kernel with a stamp so
-/// the gate can tell the kexec'd image apart from the booted one on one serial stream;
-/// everything else passes `None` (no stamp, no banner line — and rustc's env tracking
-/// means flipping the stamp rebuilds only the kernel crate, not the artifacts).
-fn build_kernel_aarch64_stamped(root: &Path, stamp: Option<&str>) -> Result<PathBuf, String> {
+/// printed by `arch::banner`) and an optional minimal store. `check-kexec` builds its
+/// second kernel with a stamp so the gate can tell the kexec'd image apart from the
+/// booted one on one serial stream, and with the minimal store so the flat image is
+/// transfer-sized for the gate (the slirp+guest staging path under TCG paces at tens
+/// of KiB/s — see GAPS, kexec entry; the board flashes the full image at native
+/// speed). Everything else passes `(None, false)` — no stamp line, the standard
+/// store. rustc's env tracking means flipping the stamp/store env rebuilds only the
+/// kernel crate, not the artifacts.
+fn build_kernel_aarch64_stamped(
+    root: &Path,
+    stamp: Option<&str>,
+    minimal_store: bool,
+) -> Result<PathBuf, String> {
     // The seed canary, assembled from WAT.
     let seed_wat = root.join("kernel").join("seed").join("hello.wat");
     let seed_wasm = wat::parse_file(&seed_wat)
@@ -2491,8 +2499,19 @@ fn build_kernel_aarch64_stamped(root: &Path, stamp: Option<&str>) -> Result<Path
 
     // The read-only store image: every listed component plus its host-AOT artifact,
     // keyed by shell name, for the kernel's `program=<name>` selection (and, later,
-    // eosh's /bin view).
-    let store_image = build_store_image(root, KERNEL_CHECK_TARGET)?;
+    // eosh's /bin view). The minimal variant (check-kexec's kernel B) bakes just
+    // enough to boot to a live prompt — the gate asserts the banner + prompt, and a
+    // transfer-sized flat image keeps the slirp staging path in gate-time bounds.
+    let store_image = if minimal_store {
+        build_store_image_filtered(
+            root,
+            KERNEL_CHECK_TARGET,
+            &[("eo9-example-hello", "hello"), ("eosh", "eosh")],
+            "store-check-kexec-b.img",
+        )?
+    } else {
+        build_store_image(root, KERNEL_CHECK_TARGET)?
+    };
 
     // The MAC key for the persistent store disk's compile cache: artifacts read back from
     // the disk are only deserialized after their keyed-blake3 tag verifies against this
@@ -4368,14 +4387,7 @@ fn spawn_telnet_qemu(
     ),
     String,
 > {
-    spawn_net_qemu(
-        cmd,
-        root,
-        image,
-        "pci",
-        TELNET_HOST_PORT,
-        TELNET_GUEST_PORT,
-    )
+    spawn_net_qemu(cmd, root, image, "pci", TELNET_HOST_PORT, TELNET_GUEST_PORT)
 }
 
 /// The general form of [`spawn_telnet_qemu`]: any `-append` line and any slirp
@@ -4752,21 +4764,35 @@ const KEXEC_B_STAMP: &str = "kexec-B";
 fn check_kexec(root: &Path) -> Result<(), String> {
     // Kernel A: the plain build, copied aside so kernel B's build (same cargo output
     // path) cannot replace it underneath QEMU.
-    let a = build_kernel_aarch64_stamped(root, None)?;
+    let a = build_kernel_aarch64_stamped(root, None, false)?;
     let a_copy = root.join("kernel").join("target").join("check-kexec-a.elf");
     std::fs::copy(&a, &a_copy)
         .map_err(|err| format!("check-kexec: copying kernel A aside: {err}"))?;
 
-    // Kernel B: identical except the banner stamp, flattened to the raw image the wire
-    // carries (entry at offset 0 — `.text.boot` is first in the QEMU link).
-    let b = build_kernel_aarch64_stamped(root, Some(KEXEC_B_STAMP))?;
-    let b_bytes = std::fs::read(&b)
-        .map_err(|err| format!("check-kexec: reading kernel B ELF: {err}"))?;
+    // Kernel B: the same kernel with the banner stamp and the minimal store (a
+    // transfer-sized flat image — the slirp+guest staging path paces at tens of KiB/s
+    // under TCG, so the full ~60 MiB image would take ~20+ minutes; the board flashes
+    // the full image at native speed). Flattened to the raw bytes the wire carries
+    // (entry at offset 0 — `.text.boot` is first in the QEMU link). Stated, not
+    // silent: the size choice is narrated below. `EO9_CHECK_KEXEC_FULL=1` flips kernel
+    // B to the full store — the long-transfer soak arm (run when the staging path's
+    // pace or a byte-count-dependent suspicion needs a definitive answer).
+    let full_soak = std::env::var("EO9_CHECK_KEXEC_FULL").is_ok_and(|v| v == "1");
+    if full_soak {
+        println!(
+            "xtask: check-kexec — EO9_CHECK_KEXEC_FULL=1: kernel B carries the FULL \
+             store (soak arm; expect a 20+ minute transfer under TCG)"
+        );
+    }
+    let b = build_kernel_aarch64_stamped(root, Some(KEXEC_B_STAMP), !full_soak)?;
+    let b_bytes =
+        std::fs::read(&b).map_err(|err| format!("check-kexec: reading kernel B ELF: {err}"))?;
     let flat = flatten_kernel_elf(&b_bytes)?;
     let b_image = root.join("kernel").join("target").join("check-kexec-b.img");
     write_if_different(&b_image, &flat)?;
     println!(
-        "xtask: check-kexec — kernel A {} | kernel B {} ({:.1} MiB flat, stamp {KEXEC_B_STAMP})",
+        "xtask: check-kexec — kernel A {} | kernel B {} ({:.1} MiB flat, minimal store \
+         for gate-time transfer, stamp {KEXEC_B_STAMP})",
         a_copy.display(),
         b_image.display(),
         flat.len() as f64 / (1024.0 * 1024.0)
@@ -4790,12 +4816,22 @@ fn check_kexec(root: &Path) -> Result<(), String> {
         |marker: &str, what: &str| serial_wait_for("check-kexec", &receiver, marker, what);
 
     let drive = (|| -> Result<(), String> {
-        wait_for("kexec: GRANTED", "the boot's kexec grant line")?;
+        // Print the load-bearing serial moments (check-telnet's transcript practice):
+        // the trailing slice of each marker wait is the evidence a reader needs.
+        let tail = |text: &str, keep: usize| {
+            let start = text.len().saturating_sub(keep);
+            text[start..].to_string()
+        };
+
+        let granted = wait_for("kexec: GRANTED", "the boot's kexec grant line")?;
+        println!(
+            "\n----- check-kexec: kernel A boot (grant) -----\n{}",
+            tail(&granted, 700)
+        );
         wait_for("eosh>", "the eosh prompt")?;
 
-        let composition = format!(
-            "net.virtio $ net.l4.over-l2 $ oskexec --secret {KEXEC_SECRET} --bootargs pci"
-        );
+        let composition =
+            format!("net.virtio $ net.l4.over-l2 $ oskexec --secret {KEXEC_SECRET} --bootargs pci");
         console_type_line("check-kexec", &mut stdin, &composition)?;
         wait_for("--bootargs pci", "the command echo")?;
         // The one-time fused-session compile happens here (the long pole under TCG —
@@ -4807,7 +4843,10 @@ fn check_kexec(root: &Path) -> Result<(), String> {
 
         // Host side: stream kernel B through the slirp forward. The sender carries its
         // own ack-driven wall-clock stall alarm, so no extra timeout is wrapped here.
-        println!("xtask: check-kexec — sending {} over tcp:127.0.0.1:{host_port}", b_image.display());
+        println!(
+            "xtask: check-kexec — sending {} over tcp:127.0.0.1:{host_port}",
+            b_image.display()
+        );
         let status = Command::new("python3")
             .current_dir(root)
             .arg(
@@ -4830,15 +4869,23 @@ fn check_kexec(root: &Path) -> Result<(), String> {
         }
 
         // The same serial stream must now show the dying kernel's last line…
-        wait_for(
+        let jumping = wait_for(
             "kexec: jumping to the staged image",
             "kernel A's final kexec line",
         )?;
+        println!(
+            "\n----- check-kexec: kernel A's last words (quiesce + jump) -----\n{}",
+            tail(&jumping, 900)
+        );
         // …then kernel B's stamped banner…
-        wait_for(
+        let banner = wait_for(
             &format!("build stamp: {KEXEC_B_STAMP}"),
             "kernel B's stamped banner",
         )?;
+        println!(
+            "\n----- check-kexec: kernel B comes up (stamped banner) -----\n{}",
+            tail(&banner, 400)
+        );
         // …and a live prompt (kernel B reads the original DTB's bootargs — x0 was
         // deliberate junk, and on QEMU the RAM-base DTB fallback wins).
         wait_for("eosh>", "kernel B's console prompt")?;

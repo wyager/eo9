@@ -107,10 +107,13 @@ point: watchdog → U-Boot → serial loader (`go 0x04000000` + send_image.py ov
 
 ## QEMU gate
 
-`cargo xtask check-kexec`: kernel A (plain) boots with `pci kexec` and a derived-port
-slirp forward to :9909; kernel B (same tree, banner-stamped `kexec-B`) is flattened and
-sent with `send_image.py --tcp`; the gate asserts, on one serial stream: the grant
-line → oskexec listening → the transfer (sender ack-alarmed, guest narrating per
-4 MiB) → `kexec: jumping` → `build stamp: kexec-B` → a live prompt → clean exit.
-Under TCG the transfer paces at the guest recv loop (~16 min for a full image) — the
-board runs native and is bounded by the wire instead.
+`cargo xtask check-kexec`: kernel A (plain, full store) boots with `pci kexec` and a
+derived-port slirp forward to :9909; kernel B — the same tree, banner-stamped
+`kexec-B`, built with a minimal store so the flat image is transfer-sized — is
+flattened and sent with `send_image.py --tcp`; the gate asserts, on one serial
+stream: the grant line → oskexec listening → the transfer (sender ack-alarmed, guest
+narrating per 4 MiB) → `kexec: jumping` → `build stamp: kexec-B` → a live prompt →
+clean exit. The size choice is narrated by the gate, not silent: under TCG the
+slirp+guest staging path paces at tens of KiB/s (full image ≈ 20+ min — the recorded
+per-call pace observation, GAPS); the board flashes the full image at native speed
+and is bounded by the wire instead.

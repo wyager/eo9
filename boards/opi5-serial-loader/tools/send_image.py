@@ -181,6 +181,14 @@ def tcp_wait_byte(sock, wanted: bytes, deadline_seconds: float, what: str) -> by
     sys.exit(1)
 
 
+# TCP transport tuning: bigger writes (no UART pacing to respect), and a wider stall
+# window than the serial path's 10 s — the guest staging loop under QEMU TCG can
+# legitimately take seconds per 64 KiB ack late in a large stream, and this alarm only
+# needs to catch a DEAD peer, not a slow one.
+TCP_CHUNK = 64 * 1024
+TCP_ACK_STALL_SECONDS = 60.0
+
+
 def tcp_send(args, payload: bytes, crc: int) -> None:
     """The --tcp transport: authenticate, stream, verify, send the go-ahead."""
     import socket
@@ -221,23 +229,31 @@ def tcp_send(args, payload: bytes, crc: int) -> None:
                 last_progress = time.time()
 
         def check_stall(sent: int) -> None:
-            # Same wall-clock alarm as the serial path: at least one ack overdue and
-            # nothing heard for the window means the guest is gone (or the host slept).
+            # Same wall-clock alarm as the serial path (wider window — see
+            # TCP_ACK_STALL_SECONDS): at least one ack overdue and nothing heard for
+            # the window means the guest is gone (or the host slept).
             if (
                 sent - acks * ACK_INTERVAL >= ACK_INTERVAL
-                and time.time() - last_progress > ACK_STALL_SECONDS
+                and time.time() - last_progress > TCP_ACK_STALL_SECONDS
             ):
                 print(
-                    f"\nno ack progress for {ACK_STALL_SECONDS:g}s mid-transfer "
+                    f"\nno ack progress for {TCP_ACK_STALL_SECONDS:g}s mid-transfer "
                     f"(acked {acks * ACK_INTERVAL}/{len(payload)}) — oskexec gone? re-run",
                     file=sys.stderr,
                 )
                 sys.exit(1)
 
+        def send_blocking(data: bytes) -> None:
+            # tcp_recv_scan leaves the socket non-blocking (timeout 0.0) after its
+            # opportunistic drains; sends must block — with a bound, so a wedged peer
+            # surfaces as a timeout instead of a hang.
+            sock.settimeout(TCP_ACK_STALL_SECONDS)
+            sock.sendall(data)
+
         term = b""
-        for off in range(0, len(payload), CHUNK):
-            sock.sendall(payload[off : off + CHUNK])
-            sent = min(off + CHUNK, len(payload))
+        for off in range(0, len(payload), TCP_CHUNK):
+            send_blocking(payload[off : off + TCP_CHUNK])
+            sent = min(off + TCP_CHUNK, len(payload))
             before = acks
             acks, term = tcp_recv_scan(sock, acks, block=False)
             note_progress(before, acks)
@@ -259,7 +275,7 @@ def tcp_send(args, payload: bytes, crc: int) -> None:
                 )
                 sys.stdout.flush()
                 last_paint = now
-        sock.sendall(struct.pack("<I", crc))
+        send_blocking(struct.pack("<I", crc))
 
         # Drain the remaining acks + the verdict (generous: staging + CRC guest-side).
         deadline = time.time() + 120 + len(payload) / 1_000_000
@@ -271,7 +287,7 @@ def tcp_send(args, payload: bytes, crc: int) -> None:
                 break
         print()
         if verdict == b"K":
-            sock.sendall(b"G")
+            send_blocking(b"G")
             print(
                 f"K: verified ({acks} acks) — go-ahead sent; oskexec is committing. "
                 "Watch the board/QEMU serial console for the new kernel's banner."

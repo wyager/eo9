@@ -477,9 +477,17 @@ posture):
   can address it, but a bus-mastering PCI device could still DMA over it (the standing
   no-IOMMU posture). The `kexec` token is documented as the same total-authority class
   as `pci`; an IOMMU lane would close both.
-- **TCG transfer pace**: check-kexec's 62 MiB transfer paces at the guest recv loop
-  (~65 KiB/s steady-state under TCG, ~16 min; the rate also *decays* from ~2 MiB/s over
-  the first MBs — unexplained, possibly allocator or socket-buffer behavior in the
-  net.l4.over-l2 path, worth a look from the net lane). The board runs native and is
-  wire-bound. The gate is therefore not in `ci`; it is the lane's on-demand gate like
-  check-telnet/check-usb.
+- **TCG transfer pace decays — measured, no hard cap**: the TCP-staging path's rate
+  decays from ~2 MiB/s to ~30-65 KiB/s as bytes accumulate (reproduced on every run;
+  guest-side buffer reuse and ack batching in oskexec improved but did not remove it —
+  the per-64-KiB recv/stage/send call chain is the unit that slows). Ruled OUT by the
+  full-image soak (`EO9_CHECK_KEXEC_FULL=1 cargo xtask check-kexec`, 2026-06-08): a
+  cumulative round/handle cap — the full 62.5 MiB (953 ack intervals) staged, verified,
+  and kexec'd green in ~21 min, well past the ~654-ack point where an earlier run
+  tripped the (then 10 s, now 60 s) sender stall alarm. Remaining suspicion for the
+  net/runtime lanes: per-call accumulation in the async machinery or kernel-heap
+  free-list growth — a profile, not a guess, is the next step. Consequences encoded:
+  the default gate flashes a minimal-store kernel B (narrated, not silent; the soak
+  arm covers full size), send_image.py --tcp uses a 60 s stall window, and the gate is
+  on-demand like check-telnet/check-usb rather than in `ci`. The board runs native and
+  is wire-bound.
