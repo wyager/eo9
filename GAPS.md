@@ -416,8 +416,9 @@ power (probably yes behind an explicit telnetd flag — remote reset is operatio
 valuable, as this same incident proved via the session-burn workaround).
 
 ## svc_shell flaked once under parallel workspace test load (review, 2026-06-08)
-RESOLVED (flake lane, 2026-06-09) — three distinct causes, three commits on
-area/23-flake-fixes:
+RESOLVED (flake lane, 2026-06-09; cause 3 restated after a review block — the first
+mechanism only narrowed the window and failed the reviewer's 10-burner soak 1-in-10) —
+three distinct causes on area/23-flake-fixes:
 1. `restart_cycles_complete_while_the_foreground_is_quietly_blocked` (was
    svc_shell.rs:410): the test asserted the whole backoff lifecycle finished at the
    end of a fixed 600ms quiet gap, but each restart decision recompiles the policy
@@ -432,12 +433,19 @@ area/23-flake-fixes:
    before the completer runs (completion observed ⇒ that op's handle released).
    0/2000 solo, 0/4000 under load after.
 3. The load-16-36 "fails 3-of-3 on master" mode was the park backstop's liveness
-   detector, not the tests: `elapsed >= timeout` misattributed event wakes that got
-   the CPU back late as stranded work, tripping the suites' no-`liveness:` gate
-   (foreground=true). The ThreadWaker now records that it fired; findings require a
-   full quiet timeout with no wake. Restart deadlines crossing into dueness in the
-   post-park window are likewise excluded as time events. Full suite at load ~30+:
-   1/3 before, 20/20 green after. Genuine missed edges (no waker activity) still fire.
+   detector, not the tests: its foreground arm tripping the suites' no-`liveness:`
+   gate (foreground=true) on completions that were delivered but resumed late under
+   load. Final mechanism (per review): the foreground arm is REMOVED by category —
+   while the drive thread is parked, foreground runnability is defined as "doorbell
+   rang" (Task::is_runnable), so any parked-side poll that sees the foreground
+   runnable has proven delivery; a missed edge (completer never rings) is invisible
+   to that poll however gated, detectable only completer-side at the ring site
+   (documented in the detector). A fired-waker gate alone (first attempt) merely
+   narrowed the race and still failed a 10-burner soak 1-in-10. The services arm —
+   the detector's real value, state that can change without this thread's wake-set —
+   stays, with two time-shaped exclusions: fired waker (late resume) and a restart
+   deadline crossing into dueness during the park window. Acceptance soak: full
+   suite x20 under 10 burners (load ~14-28), 0 failures, 0 liveness findings.
 Residual (tracked, by design for now): restart-policy decisions recompile the policy
 per decision (docs/design/policy-components.md blesses precompile-and-cache as the
 upgrade); ~210ms/decision debug-build floor on restart-lifecycle latency.
