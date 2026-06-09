@@ -5,7 +5,10 @@
 //! literal IPv4 address (the shared `eo9-dns` wire core — the l4check encoder,
 //! factored out), send a single HTTP/1.1 GET with `Connection: close`, and print the
 //! status line, the header count, and the body (capped at [`BODY_CAP`], with an
-//! honest truncation note). At most ONE 301/302 redirect to another http:// URL is
+//! honest truncation note). A `Transfer-Encoding: chunked` body is de-framed before
+//! printing/counting (`eo9-curl-core::dechunk`, host-tested; the cap applies to the
+//! DECODED body) — real HTTP/1.1 servers answer chunked, as example.com did on the
+//! board bench; any other transfer-coding refuses typed. At most ONE 301/302 redirect to another http:// URL is
 //! followed; `https://` — typed in the URL or arriving as a redirect — is refused
 //! with a typed message naming the deferred-TLS decision (certificate validation
 //! needs wall-clock time and entropy provenance the hardware does not carry yet; the
@@ -122,6 +125,22 @@ fn redirect_failure(err: UrlError, location: &str) -> ProgramFailure {
     }
 }
 
+/// Chunked framing the server got wrong, as this world's failure variant.
+fn chunk_failure(err: eo9_curl_core::ChunkError) -> ProgramFailure {
+    match err {
+        eo9_curl_core::ChunkError::BadSizeLine(line) => ProgramFailure::Http(format!(
+            "malformed chunked framing: the chunk-size line {line:?} is not hexadecimal"
+        )),
+        eo9_curl_core::ChunkError::Oversize(size) => ProgramFailure::Http(format!(
+            "refused chunked framing: a chunk claims {size} bytes (limit {})",
+            eo9_curl_core::CHUNK_SIZE_LIMIT
+        )),
+        eo9_curl_core::ChunkError::MissingDataTerminator => ProgramFailure::Http(String::from(
+            "malformed chunked framing: a chunk's data is not followed by CRLF",
+        )),
+    }
+}
+
 /// `a.b.c.d`.
 fn format_ip(ip: (u8, u8, u8, u8)) -> String {
     format!("{}.{}.{}.{}", ip.0, ip.1, ip.2, ip.3)
@@ -209,10 +228,15 @@ struct Response {
     status: u16,
     header_count: usize,
     location: Option<String>,
-    /// The body prefix that gets printed (at most [`BODY_CAP`] bytes).
+    /// The stored body bytes, still in wire form (chunk framing included when the
+    /// server sent `Transfer-Encoding: chunked`); at most [`STORE_CAP`] minus the
+    /// head. Decoding and the print cap happen at the final-response report.
     body: Vec<u8>,
-    /// How many body bytes actually arrived.
+    /// How many raw body bytes actually arrived (wire form).
     body_total: usize,
+    /// The `Transfer-Encoding` header value, when present: `chunked` is decoded,
+    /// anything else refuses typed at the report (raw framing is never printed).
+    transfer_encoding: Option<String>,
     /// The receive loop stopped before the server's FIN (cap or idle limit).
     stopped_early: bool,
 }
@@ -335,22 +359,29 @@ async fn fetch(
 
     let mut header_count = 0usize;
     let mut location: Option<String> = None;
+    let mut transfer_encoding: Option<String> = None;
     for line in lines {
         if line.is_empty() {
             continue;
         }
         header_count += 1;
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("location")
-        {
-            location.get_or_insert_with(|| value.trim().to_string());
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("location") {
+                location.get_or_insert_with(|| value.trim().to_string());
+            }
+            // Carried for the final-response body handling: `chunked` is decoded
+            // (HTTP/1.1 servers answer our HTTP/1.1 request this way — example.com
+            // did on the board bench); anything else refuses typed rather than
+            // printing raw framing.
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                transfer_encoding.get_or_insert_with(|| value.trim().to_string());
+            }
         }
     }
 
     let body_start = head_end + 4;
     let body_total = received_total.saturating_sub(body_start);
-    let stored_body = &stored[body_start.min(stored.len())..];
-    let body = stored_body[..stored_body.len().min(BODY_CAP)].to_vec();
+    let body = stored[body_start.min(stored.len())..].to_vec();
 
     Ok(Response {
         status_line,
@@ -359,6 +390,7 @@ async fn fetch(
         location,
         body,
         body_total,
+        transfer_encoding,
         stopped_early,
     })
 }
@@ -425,20 +457,63 @@ async fn run(
             continue;
         }
 
-        // The final response: status line, header count, body (capped, honestly).
+        // The final response: status line, header count, body (decoded if chunked,
+        // capped, honestly).
         say(&response.status_line);
         say(&format!("curl: {} header(s)", response.header_count));
-        if !response.body.is_empty() {
-            let shown = String::from_utf8_lossy(&response.body);
-            let _ = text::write_out(&shown);
-            if !shown.ends_with('\n') {
+
+        // `Transfer-Encoding: chunked` is de-framed before printing/counting (raw
+        // chunk-size lines never reach the console — the board-round nit); any
+        // other coding refuses typed rather than printing wire framing.
+        let raw_kept = response.body.len();
+        let chunked = response
+            .transfer_encoding
+            .as_deref()
+            .is_some_and(|te| te.eq_ignore_ascii_case("chunked"));
+        let (body, body_count, framing_incomplete) = match &response.transfer_encoding {
+            Some(te) if te.eq_ignore_ascii_case("chunked") => {
+                let decoded = eo9_curl_core::dechunk(&response.body).map_err(chunk_failure)?;
+                let count = decoded.body.len();
+                // "The server closed mid-chunk" is only honest when WE did not cut
+                // the receive (no early stop, nothing discarded past the store cap).
+                let incomplete = !decoded.complete
+                    && !(response.stopped_early || response.body_total > raw_kept);
+                (decoded.body, count, incomplete)
+            }
+            Some(te) => {
+                return Err(ProgramFailure::Http(format!(
+                    "unsupported transfer-encoding {te:?} (only chunked is decoded)"
+                )));
+            }
+            None => {
+                let count = response.body_total;
+                (response.body, count, false)
+            }
+        };
+
+        let shown = &body[..body.len().min(BODY_CAP)];
+        if !shown.is_empty() {
+            let text_shown = String::from_utf8_lossy(shown);
+            let _ = text::write_out(&text_shown);
+            if !text_shown.ends_with('\n') {
                 let _ = text::write_out("\n");
             }
         }
-        if response.body_total > response.body.len() {
+        if body_count > shown.len() {
             say(&format!(
                 "curl: body truncated: {} of {} byte(s) shown",
-                response.body.len(),
+                shown.len(),
+                body_count
+            ));
+        }
+        if framing_incomplete {
+            say("curl: the server closed mid-chunk (the chunked framing never completed)");
+        }
+        if chunked && response.body_total > raw_kept {
+            // Chunked counting runs over what was stored: say so when raw bytes
+            // beyond the store bound were discarded (the decoded count is a floor).
+            say(&format!(
+                "curl: decoded from the first {raw_kept} of {} raw body byte(s)",
                 response.body_total
             ));
         }
@@ -447,7 +522,7 @@ async fn run(
         }
         return Ok(ProgramSuccess::Fetched(format!(
             "{}; {} header(s); {} body byte(s); {} redirect(s)",
-            response.status_line, response.header_count, response.body_total, counts.redirects
+            response.status_line, response.header_count, body_count, counts.redirects
         )));
     }
 }

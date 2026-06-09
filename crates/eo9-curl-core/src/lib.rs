@@ -1,6 +1,8 @@
 //! The pure URL core of the `curl` example: parse `http://host[:port][/path]`,
-//! resolve a redirect target, and refuse anything that could smuggle bytes into the
-//! HTTP request line.
+//! resolve a redirect target, refuse anything that could smuggle bytes into the
+//! HTTP request line — and decode `Transfer-Encoding: chunked` body framing
+//! ([`dechunk`]; real HTTP/1.1 servers answer our HTTP/1.1 request chunked, as
+//! example.com did on the board bench).
 //!
 //! Security rule (the reason this crate exists as a host-tested unit): the host and
 //! path feed `GET <path> HTTP/1.1\r\nHost: <host>\r\n…` verbatim, so **spaces and
@@ -150,6 +152,119 @@ pub fn redirect_target(current: &Url, location: &str) -> Result<Url, UrlError> {
     parse(location)
 }
 
+/// The largest chunk size a single chunk may claim (16 MiB). Far above anything the
+/// example will ever keep (its caller stores tens of KiB), so a size past this is a
+/// hostile or corrupt framing — refused typed, never trusted arithmetic.
+pub const CHUNK_SIZE_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Why chunked framing could not be decoded (both are server-side faults).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkError {
+    /// A chunk-size line is not hexadecimal; carries the offending line (lossily,
+    /// trimmed) for the message.
+    BadSizeLine(String),
+    /// A chunk's size claim exceeds [`CHUNK_SIZE_LIMIT`].
+    Oversize(u64),
+    /// The CRLF that must follow a chunk's data is not there.
+    MissingDataTerminator,
+}
+
+/// A decoded chunked body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dechunked {
+    /// The de-framed body bytes.
+    pub body: alloc::vec::Vec<u8>,
+    /// The terminating 0-size chunk was seen (trailers, if any, are ignored). When
+    /// `false`, `raw` ended mid-framing — the caller truncated its receive or the
+    /// server cut the stream — and `body` carries what decoded so far.
+    pub complete: bool,
+}
+
+/// First position of `needle` in `haystack`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Decode `Transfer-Encoding: chunked` framing (RFC 9112 §7.1): repeated
+/// `<hex size>[;ext]\r\n<data>\r\n`, terminated by a 0-size chunk; trailers are
+/// ignored. A truncated input is NOT an error — the caller bounds what it stores —
+/// it yields `complete: false` with everything decoded so far. Malformed or
+/// oversize framing IS an error (typed by the caller, never a trap).
+pub fn dechunk(raw: &[u8]) -> Result<Dechunked, ChunkError> {
+    let mut body = alloc::vec::Vec::new();
+    let mut at = 0usize;
+    loop {
+        // The size line. No CRLF yet means the input ended mid-line: incomplete.
+        let Some(line_len) = find(&raw[at..], b"\r\n") else {
+            return Ok(Dechunked {
+                body,
+                complete: false,
+            });
+        };
+        let line = &raw[at..at + line_len];
+        // Chunk extensions (`;name=value`) are allowed and ignored.
+        let size_text = match line.iter().position(|&b| b == b';') {
+            Some(semi) => &line[..semi],
+            None => line,
+        };
+        let size_text = size_text.trim_ascii();
+        if size_text.is_empty() {
+            return Err(ChunkError::BadSizeLine(
+                String::from_utf8_lossy(line).into_owned(),
+            ));
+        }
+        let mut size: u64 = 0;
+        for &byte in size_text {
+            let digit = match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                b'A'..=b'F' => byte - b'A' + 10,
+                _ => {
+                    return Err(ChunkError::BadSizeLine(
+                        String::from_utf8_lossy(line).into_owned(),
+                    ));
+                }
+            };
+            size = size * 16 + u64::from(digit);
+            if size > CHUNK_SIZE_LIMIT {
+                return Err(ChunkError::Oversize(size));
+            }
+        }
+        if size == 0 {
+            // The last chunk; trailers (if any) are deliberately ignored.
+            return Ok(Dechunked {
+                body,
+                complete: true,
+            });
+        }
+        let data_start = at + line_len + 2;
+        let available = raw.len().saturating_sub(data_start);
+        if (size as usize) > available {
+            // The input ends inside this chunk's data: incomplete, keep the prefix.
+            body.extend_from_slice(&raw[data_start.min(raw.len())..]);
+            return Ok(Dechunked {
+                body,
+                complete: false,
+            });
+        }
+        let data_end = data_start + size as usize;
+        body.extend_from_slice(&raw[data_start..data_end]);
+        if raw.len() < data_end + 2 {
+            // The CRLF after the data did not arrive: incomplete.
+            return Ok(Dechunked {
+                body,
+                complete: false,
+            });
+        }
+        if &raw[data_end..data_end + 2] != b"\r\n" {
+            return Err(ChunkError::MissingDataTerminator);
+        }
+        at = data_end + 2;
+    }
+}
+
 /// A strict dotted quad, or `None` (the host then goes to DNS).
 pub fn parse_ipv4(text: &str) -> Option<(u8, u8, u8, u8)> {
     let mut octets = [0u8; 4];
@@ -287,6 +402,93 @@ mod tests {
             redirect_target(&current, "new.html"),
             Err(UrlError::NotHttp)
         );
+    }
+
+    // --- chunked-framing decode (the board round's example.com answered chunked) --
+
+    #[test]
+    fn dechunk_decodes_an_exact_body() {
+        // Two chunks + terminator: the de-framed body, byte for byte, complete.
+        let raw = b"5\r\nhello\r\n8\r\n, world\n\r\n0\r\n\r\n";
+        assert_eq!(
+            dechunk(raw),
+            Ok(Dechunked {
+                body: b"hello, world\n".to_vec(),
+                complete: true,
+            })
+        );
+        // Hex sizes (upper and lower case) and chunk extensions are honored; the
+        // body may itself contain CRLF (framing is by count, not by delimiter).
+        let raw = b"A;ext=1\r\n0123456789\r\n1F\r\nabcdefghijklmnopqrstuvwxyz\r\n123\r\n0\r\n\r\n";
+        let decoded = dechunk(raw).expect("valid framing");
+        assert!(decoded.complete);
+        assert_eq!(decoded.body.len(), 10 + 31);
+        assert!(decoded.body.starts_with(b"0123456789abcdef"));
+        // Trailers after the 0 chunk are ignored.
+        let raw = b"3\r\nabc\r\n0\r\nExpires: never\r\n\r\n";
+        assert_eq!(
+            dechunk(raw),
+            Ok(Dechunked {
+                body: b"abc".to_vec(),
+                complete: true,
+            })
+        );
+    }
+
+    #[test]
+    fn dechunk_reports_truncation_honestly() {
+        // Cut mid-data: the prefix decodes, complete stays false.
+        let raw = b"10\r\nonly-seven";
+        assert_eq!(
+            dechunk(raw),
+            Ok(Dechunked {
+                body: b"only-seven".to_vec(),
+                complete: false,
+            })
+        );
+        // Cut mid-size-line, and cut between the data and its CRLF.
+        assert!(!dechunk(b"3\r\nabc\r\n1A").unwrap().complete);
+        assert!(!dechunk(b"3\r\nabc").unwrap().complete);
+        assert_eq!(
+            dechunk(b"").unwrap(),
+            Dechunked {
+                body: alloc::vec::Vec::new(),
+                complete: false
+            }
+        );
+    }
+
+    #[test]
+    fn dechunk_refuses_malformed_and_oversize_framing() {
+        // A size line that is not hex (e.g. a Content-Length-style decimal would
+        // pass — hex digits — but letters past 'f' cannot).
+        assert_eq!(
+            dechunk(b"zz\r\ndata\r\n0\r\n\r\n"),
+            Err(ChunkError::BadSizeLine(String::from("zz")))
+        );
+        // An empty size line.
+        assert_eq!(
+            dechunk(b"\r\nabc\r\n0\r\n\r\n"),
+            Err(ChunkError::BadSizeLine(String::new()))
+        );
+        // The byte after a chunk's data must be CRLF.
+        assert_eq!(
+            dechunk(b"3\r\nabcXX0\r\n\r\n"),
+            Err(ChunkError::MissingDataTerminator)
+        );
+        // A size claim past the 16 MiB limit is refused, not trusted (the check
+        // runs during accumulation, so huge claims trip on their first excess
+        // digit and can never overflow).
+        assert_eq!(
+            dechunk(b"1000001\r\n"),
+            Err(ChunkError::Oversize(0x100_0001))
+        );
+        assert_eq!(
+            dechunk(b"FFFFFFFFFFFFFFFFFF\r\n"),
+            Err(ChunkError::Oversize(0xFFF_FFFF))
+        );
+        // ...and the limit itself is fine as a claim (truncated input, not error).
+        assert!(!dechunk(b"1000000\r\nx").unwrap().complete);
     }
 
     #[test]
