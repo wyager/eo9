@@ -601,3 +601,17 @@ typed foreground commands. Posture recorded in SPEC ("Services and detachment"),
 executor-model.md (the kernel refinement + the intersect-with-the-detaching-session
 rule any future narrower detach-holding session must apply), and svc.rs. The
 usermode registry is unchanged (composed-only).
+
+## init config grammar: `$` in a flag-value position parses as the value
+(review train, 2026-06-09) `kbd = usb.ohci --region $ usb.kbd` eats the `$` as the
+`--region` value and refuses with a confusing-but-typed error rather than naming the
+likely mistake (a missing flag value before a chain separator). Operator-authored
+input, hinted by the error text — cosmetic. Lane: teach the config parser to refuse
+`$` (and `=`) as a bare flag value with a "did you forget the value?" message.
+
+## Battery gates: unbounded `child.wait()` after `poweroff`
+(review train, 2026-06-09) Several QEMU gates (check-station and siblings) end with
+an unbounded `child.wait()` after issuing `poweroff` — a guest that wedges during
+shutdown hangs the gate instead of failing it. Shared pattern across gates. Lane:
+a bounded wait (generous, e.g. 60s) with a loud timeout failure, applied to the
+shared gate helper rather than per-gate.
