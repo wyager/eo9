@@ -208,19 +208,22 @@ eo9_guest::main! {
         for usage in current.pressed_since(&previous) {
             if ctrl_held {
                 // v1 ctrl handling: only ctrl+c, as the raw ETX byte the kernel's
-                // existing ring scan recognizes; other chords drop silently.
+                // existing ring scan recognizes; other chords drop silently
+                // (ctrl+arrow included — the plain-or-nothing v1 contract).
                 if usage == USAGE_C {
                     bytes.push(0x03);
                 }
                 continue;
             }
-            match hid::key_ascii(usage, current.shift()) {
-                Some(ch) => bytes.push(ch as u8),
-                // Backspace as a serial terminal sends it; everything else
-                // (arrows, F-keys, …) drops silently in v1.
-                None if usage == 0x2a => bytes.push(0x7f),
-                None => {}
-            }
+            // The host-tested keymap (eo9_ohci::hid::key_console_bytes): printables
+            // with shift, backspace 0x7f, and the ANSI CSI sequences for
+            // arrows/Home/End/Delete — exactly what a serial terminal would send,
+            // so the kernel KeyDecoder gives USB input the same history recall and
+            // line editing as serial input. Multi-byte sequences ride the same
+            // per-report inject below (one host call per report, ≪ the 4096 cap).
+            let mut seq = [0u8; 4];
+            let length = hid::key_console_bytes(usage, current.shift(), &mut seq);
+            bytes.extend_from_slice(&seq[..length]);
         }
         previous = current;
         if bytes.is_empty() {

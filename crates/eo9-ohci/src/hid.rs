@@ -161,6 +161,47 @@ pub fn key_ascii(usage: u8, shift: bool) -> Option<char> {
     })
 }
 
+/// Console byte sequence for a keyboard usage — what a serial terminal would send
+/// for the same key, so injected USB input is indistinguishable from typed serial
+/// input downstream (the M4 sink design). Fills `out` and returns the length
+/// (0 = the key has no v1 console mapping and drops silently).
+///
+/// * printables / enter / tab: [`key_ascii`] (US layout, shift honored);
+/// * backspace: 0x7f (what a serial terminal sends);
+/// * arrows: the ANSI CSI sequences the kernel `KeyDecoder` parses —
+///   `ESC [ A/B/C/D` for up/down/right/left (HUT 1.12 §10 usages 0x52/0x51/0x4f/0x50);
+/// * Home `ESC [ H`, End `ESC [ F`, Delete `ESC [ 3 ~` — the decoder consumes
+///   unknown CSI finals silently (verified: its post-parameter `_ => None` arm), so
+///   these are forward-compatible no-ops until the editor learns them;
+/// * arrows/Home/End/Delete with shift held: the PLAIN sequence regardless (this
+///   keymap's only modifier input is `shift`; v1 — modified-arrow CSI variants are a
+///   follow-up with their first consumer). Ctrl chords never reach this keymap:
+///   usb.kbd's v1 ctrl handling forwards ctrl+c only and drops everything else
+///   before the key lookup.
+pub fn key_console_bytes(usage: u8, shift: bool, out: &mut [u8; 4]) -> usize {
+    const CSI: u8 = b'[';
+    const ESC: u8 = 0x1b;
+    let seq: &[u8] = match usage {
+        0x2a => &[0x7f],                 // backspace
+        0x52 => &[ESC, CSI, b'A'],       // up
+        0x51 => &[ESC, CSI, b'B'],       // down
+        0x4f => &[ESC, CSI, b'C'],       // right
+        0x50 => &[ESC, CSI, b'D'],       // left
+        0x4a => &[ESC, CSI, b'H'],       // home (consumed-ignored by the v1 decoder)
+        0x4d => &[ESC, CSI, b'F'],       // end (consumed-ignored)
+        0x4c => &[ESC, CSI, b'3', b'~'], // delete (consumed-ignored)
+        _ => match key_ascii(usage, shift) {
+            Some(ch) => {
+                out[0] = ch as u8;
+                return 1;
+            }
+            None => return 0,
+        },
+    };
+    out[..seq.len()].copy_from_slice(seq);
+    seq.len()
+}
+
 /// Diagnostic name for the common non-printing keys.
 pub fn key_name(usage: u8) -> Option<&'static str> {
     Some(match usage {
@@ -219,6 +260,44 @@ mod tests {
         assert_eq!(key_name(0x29), Some("escape"));
         // Short buffers refuse.
         assert_eq!(KeyboardReport::parse(&[0, 0, 0x04]), None);
+    }
+
+    #[test]
+    fn console_bytes_cover_printables_arrows_and_editing_keys() {
+        let mut out = [0u8; 4];
+        // Printables ride key_ascii (shift honored).
+        assert_eq!(key_console_bytes(0x04, false, &mut out), 1);
+        assert_eq!(out[0], b'a');
+        assert_eq!(key_console_bytes(0x04, true, &mut out), 1);
+        assert_eq!(out[0], b'A');
+        assert_eq!(key_console_bytes(0x28, false, &mut out), 1);
+        assert_eq!(out[0], b'\n');
+        // Backspace as a serial terminal sends it.
+        assert_eq!(key_console_bytes(0x2a, false, &mut out), 1);
+        assert_eq!(out[0], 0x7f);
+        // Arrows: the exact CSI finals the kernel KeyDecoder maps to
+        // Up/Down/Right/Left (providers.rs).
+        for (usage, final_byte) in [(0x52u8, b'A'), (0x51, b'B'), (0x4f, b'C'), (0x50, b'D')] {
+            assert_eq!(
+                key_console_bytes(usage, false, &mut out),
+                3,
+                "usage {usage:#x}"
+            );
+            assert_eq!(&out[..3], &[0x1b, b'[', final_byte], "usage {usage:#x}");
+            // Shift held: the plain sequence regardless (the v1 contract).
+            assert_eq!(key_console_bytes(usage, true, &mut out), 3);
+            assert_eq!(&out[..3], &[0x1b, b'[', final_byte]);
+        }
+        // Home / End / Delete: emitted now, consumed-ignored by the v1 decoder.
+        assert_eq!(key_console_bytes(0x4a, false, &mut out), 3);
+        assert_eq!(&out[..3], &[0x1b, b'[', b'H']);
+        assert_eq!(key_console_bytes(0x4d, false, &mut out), 3);
+        assert_eq!(&out[..3], &[0x1b, b'[', b'F']);
+        assert_eq!(key_console_bytes(0x4c, false, &mut out), 4);
+        assert_eq!(&out[..4], &[0x1b, b'[', b'3', b'~']);
+        // Unmapped keys (escape, F1) drop silently.
+        assert_eq!(key_console_bytes(0x29, false, &mut out), 0);
+        assert_eq!(key_console_bytes(0x3a, false, &mut out), 0);
     }
 
     #[test]
