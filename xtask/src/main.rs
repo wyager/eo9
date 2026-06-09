@@ -4650,19 +4650,27 @@ fn check_usb_hub(root: &Path) -> Result<(), String> {
         wait_for(&receiver, "eosh>", "the prompt after the injected command")?;
 
         // Step 3: the whole chain — QMP keystrokes typed on the emulated keyboard
-        // come out as an executed eosh command.
+        // come out as an executed eosh command, and an up-arrow recalls it from the
+        // history ring (the kernel KeyDecoder serving USB input: `up` becomes
+        // ESC [ A through usb.kbd's keymap, the editor recalls `hello`, the second
+        // enter re-runs it — 5 + 1 + 3 + 1 = 10 forwarded bytes, two greetings).
         type_line(&mut stdin, "usb.ohci-pci $ usb.kbd --window-ms 15000")?;
         wait_for(
             &receiver,
             "usb.kbd: forwarding boot-protocol keystrokes",
             "the usb.kbd banner",
         )?;
-        qmp_inject_keys(&qmp_path, &["h", "e", "l", "l", "o", "ret"])?;
-        wait_for(&receiver, "ok: forwarded(6)", "usb.kbd's window close")?;
+        qmp_inject_keys(&qmp_path, &["h", "e", "l", "l", "o", "ret", "up", "ret"])?;
+        wait_for(&receiver, "ok: forwarded(10)", "usb.kbd's window close")?;
         wait_for(
             &receiver,
             "ok: greeted",
             "the keyboard-typed `hello` executing at the prompt",
+        )?;
+        wait_for(
+            &receiver,
+            "ok: greeted",
+            "the up-arrow-recalled `hello` executing again (history over USB)",
         )?;
 
         type_line(&mut stdin, "exit")?;
@@ -4678,7 +4686,8 @@ fn check_usb_hub(root: &Path) -> Result<(), String> {
     println!(
         "xtask: check-usb-hub ok — hub traversal enumerated the keyboard, decoded QMP \
          keystrokes through the boot protocol, the console sink executed an injected line, \
-         and usb.kbd turned emulated-keyboard typing into an executed eosh command"
+         and usb.kbd turned emulated-keyboard typing into an executed eosh command \
+         recalled and re-run via up-arrow history"
     );
     Ok(())
 }
