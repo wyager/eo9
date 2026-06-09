@@ -517,102 +517,10 @@ const READ_HISTORY_CAP: usize = 32;
 static READ_HISTORY: super::shellexec::KLock<Vec<String>> =
     super::shellexec::KLock::new(Vec::new());
 
-/// Escape-sequence parser state for [`KeyDecoder`]: arrow keys (and friends) arrive
-/// over serial as `ESC [ <final>` / `ESC O <final>` sequences, with optional parameter
-/// bytes (`0x30..=0x3f`) and intermediates (`0x20..=0x2f`) before the final
-/// (`0x40..=0x7e`).
-#[derive(Default, Clone, Copy, PartialEq)]
-enum EscState {
-    /// Not inside an escape sequence.
-    #[default]
-    Idle,
-    /// Saw ESC; deciding whether a CSI/SS3 sequence follows.
-    Esc,
-    /// Inside `ESC [` / `ESC O`; consuming until the final byte.
-    Csi,
-}
-
-/// One decoded keystroke from the console UART — the shared output of [`KeyDecoder`],
-/// consumed semantically by [`ReadKey`] (surfaced to the guest) and [`ReadLine`] (acted
-/// on by the kernel's own line discipline).
-#[derive(Clone, Copy, PartialEq)]
-enum KeyEvent {
-    /// A non-control byte: printable ASCII, or a UTF-8 lead/continuation byte.
-    Char(u8),
-    Enter,
-    Backspace,
-    Tab,
-    Up,
-    Down,
-    Left,
-    Right,
-    /// Any other control byte, raw (3 = Ctrl-C, 4 = Ctrl-D, …).
-    Ctrl(u8),
-}
-
-/// Escape-sequence decoder shared by [`ReadLine`] and [`ReadKey`]: raw UART bytes in,
-/// semantic [`KeyEvent`]s out. Arrows decode; unknown CSI finals are consumed silently
-/// (they no longer leak `[A`-style garbage into a line); a lone ESC is dropped and the
-/// byte after it decodes normally. Mirrors the usermode decoder in
-/// `eo9-providers-unix::text` (mirrored, not reused — this crate is `no_std` bare
-/// metal).
-#[derive(Default)]
-struct KeyDecoder {
-    state: EscState,
-}
-
-impl KeyDecoder {
-    /// Feed one byte; `Some(event)` when a complete keystroke decodes.
-    fn push(&mut self, byte: u8) -> Option<KeyEvent> {
-        match self.state {
-            EscState::Esc => {
-                if byte == b'[' || byte == b'O' {
-                    self.state = EscState::Csi;
-                    return None;
-                }
-                if byte == 0x1b {
-                    // ESC ESC: stay armed for a sequence.
-                    return None;
-                }
-                // A lone ESC: drop it, decode this byte normally.
-                self.state = EscState::Idle;
-                Self::plain(byte)
-            }
-            EscState::Csi => {
-                if (0x20..=0x3f).contains(&byte) {
-                    // Parameter / intermediate bytes.
-                    return None;
-                }
-                self.state = EscState::Idle;
-                match byte {
-                    b'A' => Some(KeyEvent::Up),
-                    b'B' => Some(KeyEvent::Down),
-                    b'C' => Some(KeyEvent::Right),
-                    b'D' => Some(KeyEvent::Left),
-                    // Home/End/Delete and other finals: consumed, ignored (v1).
-                    _ => None,
-                }
-            }
-            EscState::Idle => {
-                if byte == 0x1b {
-                    self.state = EscState::Esc;
-                    return None;
-                }
-                Self::plain(byte)
-            }
-        }
-    }
-
-    fn plain(byte: u8) -> Option<KeyEvent> {
-        Some(match byte {
-            b'\r' | b'\n' => KeyEvent::Enter,
-            0x08 | 0x7f => KeyEvent::Backspace,
-            b'\t' => KeyEvent::Tab,
-            0x00..=0x1f => KeyEvent::Ctrl(byte),
-            _ => KeyEvent::Char(byte),
-        })
-    }
-}
+// The escape-sequence decoder (EscState/KeyEvent/KeyDecoder) lives in
+// `crate::keydecoder` — a wasmtime-free crate-root module (the fbcon pattern) so its
+// state machine stays host-testable under the featureless `cargo test` pass.
+use crate::keydecoder::{KeyDecoder, KeyEvent};
 
 /// Future that resolves with the next decoded keystroke from the console UART — the
 /// `read-key` payload (no echo: the consuming editor owns the line image). Each call

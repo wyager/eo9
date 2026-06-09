@@ -62,6 +62,17 @@ mod gfxfb;
 mod fbcon;
 #[cfg(target_os = "none")]
 mod heap;
+// The console escape-sequence decoder shared by the wasm providers' read-line/read-key
+// (raw UART bytes in, semantic keystrokes out). A crate-root module rather than a
+// `wasm/` one so `test` can join the cfg: it is wasmtime-free, and its state machine
+// is host-tested (the fbcon pattern) while `mod wasm` stays bare-metal-only.
+#[cfg(any(
+    test,
+    feature = "wasm-hello",
+    feature = "wasm-async",
+    feature = "wasm-store"
+))]
+mod keydecoder;
 // aarch64 always (UART/GIC/RTC route through it); other arches only alongside the
 // `wasm-store`-gated pci module, their sole consumer (feature-less builds stay lean).
 #[cfg(any(target_arch = "aarch64", feature = "wasm-store"))]

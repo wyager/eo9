@@ -173,8 +173,11 @@ pub fn key_ascii(usage: u8, shift: bool) -> Option<char> {
 /// * Home `ESC [ H`, End `ESC [ F`, Delete `ESC [ 3 ~` — the decoder consumes
 ///   unknown CSI finals silently (verified: its post-parameter `_ => None` arm), so
 ///   these are forward-compatible no-ops until the editor learns them;
-/// * arrows/Home/End/Delete with shift or ctrl held: the PLAIN sequence regardless
-///   (v1 — modified-arrow CSI variants are a follow-up with their first consumer).
+/// * arrows/Home/End/Delete with shift held: the PLAIN sequence regardless (this
+///   keymap's only modifier input is `shift`; v1 — modified-arrow CSI variants are a
+///   follow-up with their first consumer). Ctrl chords never reach this keymap:
+///   usb.kbd's v1 ctrl handling forwards ctrl+c only and drops everything else
+///   before the key lookup.
 pub fn key_console_bytes(usage: u8, shift: bool, out: &mut [u8; 4]) -> usize {
     const CSI: u8 = b'[';
     const ESC: u8 = 0x1b;
