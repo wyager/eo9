@@ -21,7 +21,9 @@ use crate::{block_on, engine, host};
 /// table rather than reflecting the component's type — these are the demo programs the
 /// site serves; anything else is reported as unknown.)
 const PROGRAMS: &[(&str, &[ArgKind])] = &[
-    ("hello", &[ArgKind::Text, ArgKind::Flag]),
+    // hello's main takes component-typed *optional* arguments (`name: option<string>`,
+    // `excited: option<bool>`); the store path binds them positionally, omitted tail = none.
+    ("hello", &[ArgKind::OptText, ArgKind::OptFlag]),
     ("cruncher", &[ArgKind::Number, ArgKind::Number]),
     ("outcomes", &[ArgKind::Text, ArgKind::Text]),
     ("readwrite", &[ArgKind::Text, ArgKind::Text]),
@@ -46,11 +48,20 @@ const PROGRAMS: &[(&str, &[ArgKind])] = &[
 #[derive(Clone, Copy)]
 enum ArgKind {
     Text,
-    Flag,
     Number,
+    /// `option<string>` bound positionally; may be omitted from the tail (-> `none`).
+    OptText,
+    /// `option<bool>` bound positionally; may be omitted from the tail (-> `none`).
+    OptFlag,
     /// A trailing variadic `list<string>` parameter: collects every remaining field (zero
     /// or more), mirroring the host binder's empty-tail default so bare `ls` works here too.
     TextList,
+}
+
+impl ArgKind {
+    fn optional(self) -> bool {
+        matches!(self, ArgKind::OptText | ArgKind::OptFlag)
+    }
 }
 
 fn parse_args(kinds: &[ArgKind], raw: &[&str]) -> Result<Vec<Val>, String> {
@@ -60,21 +71,39 @@ fn parse_args(kinds: &[ArgKind], raw: &[&str]) -> Result<Vec<Val>, String> {
     } else {
         kinds.len()
     };
-    if raw.len() < fixed || (!variadic_tail && raw.len() != kinds.len()) {
+    // Optional parameters may only be omitted from the tail (the table keeps required
+    // parameters first), so the minimum is the length of the non-optional prefix.
+    let required = kinds[..fixed]
+        .iter()
+        .take_while(|kind| !kind.optional())
+        .count();
+    if raw.len() < required || (!variadic_tail && raw.len() > kinds.len()) {
         return Err(format!(
-            "expected {}{} argument(s), got {}",
-            fixed,
-            if variadic_tail { " or more" } else { "" },
+            "expected {required}{} argument(s), got {}",
+            if variadic_tail || required < fixed {
+                " or more"
+            } else {
+                ""
+            },
             raw.len()
         ));
     }
     let mut vals = Vec::with_capacity(kinds.len());
-    for (kind, value) in kinds[..fixed].iter().zip(raw) {
+    for (position, kind) in kinds[..fixed].iter().enumerate() {
+        let Some(value) = raw.get(position) else {
+            // Past the supplied fields: only optional parameters may be missing.
+            if kind.optional() {
+                vals.push(Val::Option(None));
+                continue;
+            }
+            return Err(format!("missing required argument {}", position + 1));
+        };
         let val = match kind {
             ArgKind::Text => Val::String(value.to_string()),
-            ArgKind::Flag => match *value {
-                "true" => Val::Bool(true),
-                "false" => Val::Bool(false),
+            ArgKind::OptText => Val::Option(Some(Box::new(Val::String(value.to_string())))),
+            ArgKind::OptFlag => match *value {
+                "true" => Val::Option(Some(Box::new(Val::Bool(true)))),
+                "false" => Val::Option(Some(Box::new(Val::Bool(false)))),
                 other => return Err(format!("`{other}` is not a bool (use true/false)")),
             },
             ArgKind::Number => value

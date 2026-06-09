@@ -81,6 +81,11 @@ async function run(name, args) {
 // The path-taking tools take a trailing variadic list of paths (positional, like the native
 // CLI): `cat` reads several files, a *bare* `ls` lists `/` (the missing tail defaults to []).
 const cases = [
+  // hello's main takes *optional* typed arguments (option<string>, option<bool>): the store
+  // runner binds them positionally and an omitted tail becomes `none` (regression cover for
+  // the option-typed binding — the browser selftest caught this drifting once).
+  ["hello", ["selftest", "true"], (o) => /Hello, selftest!/.test(o) && /success\(greeted\)/.test(o)],
+  ["hello", [], (o) => /Hello, world\./.test(o) && /success\(greeted\)/.test(o)],
   ["echo", ["hello from the web VM"], (o) => /hello from the web VM/.test(o)],
   ["rng", ["5"], (o) => (o.match(/\d{2,}/g) || []).length >= 5],
   ["cat", ["/welcome.txt"], (o) => /Hello from the Eo9 web VM filesystem/.test(o)],
