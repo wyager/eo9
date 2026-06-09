@@ -22,8 +22,10 @@
 //! reimplemented on `alloc` (`Box<dyn …>` + `Rc` closures) instead of audio2's
 //! monomorphized no-alloc sums.
 //!
-//! This is milestone M1: the crate lands and soaks alone. No eosh behavior changes;
-//! wiring the editor in (read-key WIT, red marking, TAB) is M2.
+//! Milestone M1 landed the parser core alone; M2 adds [`editor`] — the per-keystroke
+//! line editor built on it (fed by the `eo9:text` `read-key` operation, emitting the
+//! echo/marker byte stream) — which the eosh component drives when its transport
+//! supports per-key input, falling back to the classic read-line loop when not.
 
 #![no_std]
 
@@ -34,6 +36,7 @@ extern crate std;
 
 pub mod charset;
 pub mod comb;
+pub mod editor;
 pub mod grammar;
 pub mod inc;
 pub mod input;
