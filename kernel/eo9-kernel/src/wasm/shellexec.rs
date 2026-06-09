@@ -866,21 +866,39 @@ pub(super) fn bind_args(
 /// nested `eosh` is a full peer that can resolve `/bin`, spawn, and compose.
 /// The one spawn `Linker`, built lazily on first use and reused for every spawn (the
 /// host-function set is boot-constant: the only conditional registrations are `eo9:pci`
-/// and `eo9:platform`, gated by the boot command line's `pci`/`platform` tokens, which
-/// never change after boot). The stored bools are those grant bits — re-checked on
+/// `eo9:platform`, and `eo9:gfx`, gated by the `pci`/`platform`/`gfx` tokens, which
+/// never change after boot). The stored [`GrantShape`] is those grant bits — re-checked on
 /// every reuse as the grant-shape guard (security review of the spawn-cache design): a
 /// linker built under one grant shape can never serve a spawn under another. Per-spawn
 /// capability state (svc generations, the session fs, buffer tables) lives in the
 /// per-spawn `Store`, not the linker, so reuse shares no authority between spawns.
-static SPAWN_LINKER: KLock<Option<((bool, bool), Arc<Linker<KernelState>>)>> = KLock::new(None);
+static SPAWN_LINKER: KLock<Option<(GrantShape, Arc<Linker<KernelState>>)>> = KLock::new(None);
+
+/// The boot-constant grant bits a cached spawn linker was built under: (pci, platform, gfx).
+type GrantShape = (bool, bool, bool);
+
+/// The boot's gfx grant (the `gfx` token). Only the Orange Pi 5 Plus board profile has
+/// the gfx.simplefb root provider; everywhere else the bit is constantly `false` and
+/// the refusal below tells the capability story.
+fn gfx_granted() -> bool {
+    #[cfg(feature = "board-opi5plus")]
+    {
+        super::gfx_provider::granted()
+    }
+    #[cfg(not(feature = "board-opi5plus"))]
+    {
+        false
+    }
+}
 
 fn spawn_linker(engine: &Engine) -> Result<Arc<Linker<KernelState>>, wasmtime::Error> {
-    let granted = (
+    let shape: GrantShape = (
         super::pci_provider::granted(),
         super::platform_provider::granted(),
+        gfx_granted(),
     );
     if let Some(linker) = SPAWN_LINKER.with(|slot| match slot {
-        Some((shape, linker)) if *shape == granted => Some(linker.clone()),
+        Some((cached, linker)) if *cached == shape => Some(linker.clone()),
         _ => None,
     }) {
         return Ok(linker);
@@ -894,14 +912,20 @@ fn spawn_linker(engine: &Engine) -> Result<Arc<Linker<KernelState>>, wasmtime::E
     // command line carried the `pci` token — and even then the loader rule applies, so
     // only a child that imports `eo9:pci/pci` actually links it. `eo9:platform` is the
     // same posture under its own token (MMIO + DMA without an IOMMU).
-    if granted.0 {
+    if shape.0 {
         super::pci_provider::add_pci(&mut linker)?;
     }
-    if granted.1 {
+    if shape.1 {
         super::platform_provider::add_platform(&mut linker)?;
     }
+    // The board framebuffer follows the same opt-in rule (the `gfx` token; raw scanout
+    // memory is an operator grant, never a default).
+    #[cfg(feature = "board-opi5plus")]
+    if shape.2 {
+        super::gfx_provider::add_gfx(&mut linker)?;
+    }
     let linker = Arc::new(linker);
-    SPAWN_LINKER.with(|slot| *slot = Some((granted, linker.clone())));
+    SPAWN_LINKER.with(|slot| *slot = Some((shape, linker.clone())));
     Ok(linker)
 }
 
@@ -2577,6 +2601,8 @@ fn missing_capability(text: &str) -> Option<String> {
     } else if text.contains("eo9:platform/") {
         "platform device access, which this boot did not grant (add the `platform` token \
          — or `platform=<region>,…` for specific regions — to the kernel command line)"
+    } else if text.contains("eo9:gfx/") {
+        GFX_REFUSAL
     } else {
         return None;
     };
@@ -2584,3 +2610,15 @@ fn missing_capability(text: &str) -> Option<String> {
         "the program requires {capability} (refused at instantiation)"
     ))
 }
+
+/// The `eo9:gfx` arm of [`missing_capability`]: on the board the capability exists and
+/// the story is the missing grant token; everywhere else the kernel has no display root
+/// provider at all and the story is the stub composition.
+#[cfg(feature = "board-opi5plus")]
+const GFX_REFUSAL: &str = "a display, which this boot did not grant (add the `gfx` token \
+     to the kernel command line to provide the board framebuffer, or compose a provider \
+     — `gfx.mem $ draw`)";
+#[cfg(not(feature = "board-opi5plus"))]
+const GFX_REFUSAL: &str = "a display, which this kernel does not provide (gfx.simplefb \
+     is the Orange Pi 5 Plus board profile's root provider; compose a provider — \
+     `gfx.mem $ draw`)";

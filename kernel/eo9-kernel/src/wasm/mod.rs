@@ -29,6 +29,11 @@ pub mod dma;
 pub mod fibercompile;
 #[cfg(feature = "wasm-hello")]
 pub mod hello;
+// The gfx.simplefb root provider exists only where its framebuffer does: the Orange Pi
+// 5 Plus board profile. QEMU builds stay provider-absent (gfx.mem is the composition
+// there) and refuse `eo9:gfx` imports with the capability story.
+#[cfg(all(feature = "wasm-store", feature = "board-opi5plus"))]
+pub mod gfx_provider;
 #[cfg(feature = "wasm-store")]
 pub mod pci_provider;
 #[cfg(feature = "wasm-store")]

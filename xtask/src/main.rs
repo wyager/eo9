@@ -2123,6 +2123,10 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
                 ("eo9-example-l4check", "l4check"),
                 ("eo9-stub-net-text", "net.text"),
                 ("eo9-example-telnetd", "telnetd"),
+                // The HDMI acceptance (plan M2): `draw` run with the boot's `gfx`
+                // grant against the kernel's gfx.simplefb root provider — the test
+                // pattern on the monitor plus the canonical checksum over serial.
+                ("eo9-example-draw", "draw"),
                 ("eosh", "eosh"),
             ],
             "store-opi5plus-min.img",

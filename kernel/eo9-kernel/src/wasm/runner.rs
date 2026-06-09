@@ -77,6 +77,20 @@ pub fn boot(bootargs: Option<&str>) -> bool {
     // is refused at instantiation with the capability story (PCI implies DMA, so it is
     // never linked by default; see `pci_provider` and `shellexec::missing_capability`).
     super::pci_provider::set_granted(tokenize(bootargs).iter().any(|token| token == "pci"));
+    // The bare `gfx` token grants the `gfx.simplefb` root provider (the board's
+    // firmware framebuffer) for this boot — the same grammar and never-by-default rule
+    // as `pci`; raw physical scanout memory is an operator grant, not a default. On
+    // kernels without the board framebuffer the token names what is missing instead of
+    // being silently swallowed.
+    #[cfg(feature = "board-opi5plus")]
+    super::gfx_provider::set_granted(tokenize(bootargs).iter().any(|token| token == "gfx"));
+    #[cfg(not(feature = "board-opi5plus"))]
+    if tokenize(bootargs).iter().any(|token| token == "gfx") {
+        crate::kprintln!(
+            "gfx: this kernel has no display root provider (gfx.simplefb is the Orange Pi \
+             5 Plus board profile's); the `gfx` token is ignored — compose `gfx.mem $ …` instead"
+        );
+    }
     // The `platform` token is the same idea for memory-mapped (non-PCI) devices —
     // never linked by default; `platform=<name>,…` narrows the grant to exactly those
     // regions of the machine's table (see `platform_provider`).
@@ -244,6 +258,11 @@ fn try_run(entry: &StoreEntry, args: &[(String, String)]) -> Result<String, wasm
     }
     if super::platform_provider::granted() {
         super::platform_provider::add_platform(&mut linker)?;
+    }
+    // The gfx.simplefb root provider follows the same opt-in rule (the `gfx` token).
+    #[cfg(feature = "board-opi5plus")]
+    if super::gfx_provider::granted() {
+        super::gfx_provider::add_gfx(&mut linker)?;
     }
 
     let mut store = Store::new(&engine, KernelState::new());
