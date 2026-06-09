@@ -23,6 +23,10 @@
 //! corrupt it (each writer allocates from the same frontier and commits over the other);
 //! the second opener is refused up front with a clear error instead (study 07, S7-7). The
 //! lock is released when the provider (and every clone of its file handle) is dropped.
+//! Each in-flight operation holds one such clone on its pool thread and releases it
+//! *before* its completion is delivered, so a caller that has observed every completion
+//! it issued and then drops the provider is guaranteed the lock is released — there is
+//! no window where an already-completed operation still pins the lock.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -262,6 +266,12 @@ impl DiskHost for DiskProvider {
                 }),
                 Err(err) => Err(io_to_read_error(&err)),
             };
+            // Release this operation's file-handle clone *before* the completion is
+            // delivered: a caller that has observed every completion it was owed may
+            // drop the provider and rely on the advisory lock being released (see the
+            // module's locking notes). Dropping after `complete` would let the lock
+            // outlive the observable end of the operation.
+            drop(file);
             complete((dst, result));
         });
     }
@@ -283,6 +293,8 @@ impl DiskHost for DiskProvider {
                 }),
                 Err(err) => Err(WriteError::Io(err.to_string())),
             };
+            // See `read`: the clone is dropped before the completion is observable.
+            drop(file);
             complete((src, result));
         });
     }
