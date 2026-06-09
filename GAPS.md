@@ -470,3 +470,13 @@ teardown must gain a device-aware quiesce hook (for OHCI: HcControl -> reset, wh
 halts all schedule DMA) or an equivalent containment story. Also recorded there: the
 PCI provider's claim exclusivity is still per-task while platform's is machine-wide —
 converge PCI on the machine-wide discipline (its recorded follow-up).
+
+## RTL8125 PHY degrades across kexec + repeated claims (bench, 2026-06-08 night)
+After a kexec jump plus several claim/release cycles in one boot, the NIC degraded:
+first DHCP windows with zero wire RX (link reported up), then hard LinkDown on later
+claims — while switch/device LEDs looked normal. A full reset (SYSTEM_RESET → U-Boot
+→ fresh boot) recovered it completely (ARP resolved first try). Suspects: the kexec
+quiesce path leaving PHY state the next claim's warm re-init (ram-code skip path)
+doesn't recover, or cumulative u2/PHY state across rapid claims. Driver lane: consider
+a full PHY reset on claim when the previous owner was quiesced-by-kexec, or always.
+Bench rule meanwhile: if LinkDown appears, cold-cycle rather than retrying claims.
