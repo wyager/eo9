@@ -251,20 +251,22 @@ pub(crate) fn banner() {
 /// (draining UART input into the ring); every other exception stays fatal.
 pub(crate) fn interrupts_init() {
     gic::init();
-    // The generic-timer PPI family everywhere; the console UART's SPI only where it is
-    // known (QEMU `virt`: PL011 on SPI 33). The board profile leaves the UART SPI unwired
-    // for day one — input arrives through the executor's idle-path scavenger poll instead
-    // (src/arch/aarch64/uart.rs module docs; wiring UART2's SPI is a recorded follow-up).
-    #[cfg(not(feature = "board-opi5plus"))]
-    const INTIDS: [u32; 5] = [26, 27, 29, 30, 33];
-    #[cfg(feature = "board-opi5plus")]
-    const INTIDS: [u32; 4] = [26, 27, 29, 30];
+    // The generic-timer PPI family plus the console UART's SPI (uart.rs `RX_INTID`:
+    // PL011 SPI 33 on QEMU `virt`; the RK3588 UART2's SPI 333 → INTID 365 on the board
+    // profile, verified from the vendor control FDT). The executor's idle-path scavenger
+    // poll stays behind the interrupt path as the belt-and-braces backstop.
+    const INTIDS: [u32; 5] = [26, 27, 29, 30, uart::RX_INTID];
+    // The UART's RX interrupt is level-sensitive on both machines (the vendor FDT says
+    // level-high for UART2; `virt`'s PL011 likewise): program the trigger explicitly
+    // rather than trusting the distributor's reset default.
+    gic::configure_level_spi(uart::RX_INTID);
     for intid in INTIDS {
         gic::configure_intid(intid);
         gic::enable_intid(intid);
     }
-    // Unmask the UART receive interrupt so an arriving byte asserts its line (a no-op on
-    // the board profile, where the line is left exactly as U-Boot programmed it).
+    // Unmask the UART receive interrupt at the device so an arriving byte asserts its
+    // line (the PL011's IMSC on QEMU; the DW-APB's IER.ERBFI on the board — the one
+    // register the board's line keeps from U-Boot's programming that this kernel writes).
     uart::enable_rx_interrupt();
     // SAFETY: clearing PSTATE.I (DAIF.I) enables IRQ delivery; the IRQ vector is installed.
     unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };

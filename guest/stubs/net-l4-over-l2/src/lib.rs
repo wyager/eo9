@@ -39,12 +39,14 @@
 //!   abstraction runs over in-memory frame queues ([`QueueDevice`]), and all I/O
 //!   happens between `poll`s in the pump — so the sync stack core and the async link
 //!   never meet on one call stack. Nothing here blocks forever: every wait is bounded
-//!   by its operation deadline plus the pump-round cap.
+//!   by its operation's wall-clock deadline plus the frozen-clock backstop.
 //! * **Bounds.** At most 16 sockets (TCP + UDP combined), 16 KiB TCP buffers per
 //!   direction, 8 × 1536 B received / 4 × 1536 B queued UDP datagrams per socket, a
-//!   32-frame receive queue, and per-operation deadlines (4 s receive, 6 s connect,
-//!   1.5 s send-flush) backed by a hard cap on pump rounds so even a frozen test clock
-//!   cannot loop forever.
+//!   32-frame receive queue, and per-operation wall-clock deadlines (4 s receive, 6 s
+//!   connect, 1.5 s send-flush, 20 s DHCP acquisition) — honestly time-bounded (the
+//!   clock is read every pump round; a round count never cuts a window short), with a
+//!   consecutive-rounds-without-clock-movement backstop so even a frozen test clock
+//!   cannot loop forever ([`FROZEN_CLOCK_ROUNDS`]).
 //! * **Errors.** The l2 layer refusing (`denied`) surfaces as the l4 `denied`; every
 //!   other link or stack problem is a typed l4 error (`timed-out`,
 //!   `connection-refused`, `io(...)`, …) — never a trap, regardless of what arrives on
@@ -231,22 +233,23 @@ const RECV_DEADLINE_NS: u64 = 4_000_000_000;
 const CONNECT_DEADLINE_NS: u64 = 6_000_000_000;
 /// Deadline for flushing queued sends out of the stack.
 const SEND_FLUSH_DEADLINE_NS: u64 = 1_500_000_000;
-/// Hard cap on pump rounds per operation, so a clock that never advances (a frozen test
-/// stub) still cannot make an operation loop forever.
-const MAX_PUMPS: u32 = 4096;
+/// Frozen-clock backstop for [`wait_until`]: how many CONSECUTIVE pump rounds with zero
+/// observed clock movement before the wait gives up. Every operation's wait is bounded
+/// by its wall-clock deadline (the clock is read every round); this round bound exists
+/// ONLY for a clock that genuinely never advances (a frozen test stub, where the
+/// deadline can never expire), so it counts rounds *since the clock last moved* and
+/// resets on every observed tick — with any advancing clock it never fires, and a round
+/// count can no longer silently cut a wall-clock window short (the conflation bug the
+/// DHCP lane hit: empty receive polls complete in microseconds, so a flat 4096-round cap
+/// elapsed long before the intended window had honestly passed).
+const FROZEN_CLOCK_ROUNDS: u32 = 4096;
 
 /// Bounded window for acquiring a DHCP lease on first use: long enough for the full
 /// discover → offer → request → ack exchange plus one of smoltcp's discover
 /// retransmits (10 s apart by default — a first discover lost while a real link is
-/// still settling must not doom the acquisition).
+/// still settling must not doom the acquisition). An honest wall-clock window: the wait
+/// is time-bounded (plus the frozen-clock backstop), never round-limited.
 const DHCP_DEADLINE_NS: u64 = 20_000_000_000;
-/// Pump-round cap for the DHCP wait. The per-operation `MAX_PUMPS` is tuned for waits
-/// that resolve in single seconds; an empty receive poll is cheap (net.virtio's short
-/// poll is microseconds), so 4096 rounds can elapse well before the 20 s window has
-/// genuinely passed and the discover retransmit timer has had its chance. This cap
-/// keeps the frozen-clock guarantee (the wait is still finite) without cutting the
-/// wall-clock window short on a quiet link.
-const DHCP_MAX_PUMPS: u32 = 1_048_576;
 
 /// One best-effort console line (the net.virtio precedent: a diagnostic the operator
 /// needs to see on the machine console; the provider works identically without one).
@@ -383,7 +386,7 @@ async fn ensure_dhcp_bound(link: &LinkGuard) -> Result<(), L4Error> {
     if !waiting {
         return Ok(());
     }
-    let outcome = wait_until_capped(link, DHCP_DEADLINE_NS, DHCP_MAX_PUMPS, || {
+    let outcome = wait_until(link, DHCP_DEADLINE_NS, || {
         with_net(|n| n.bound.map(|_| Ok(())))
     })
     .await;
@@ -753,34 +756,37 @@ async fn pump(link: &Link) -> Result<(), L4Error> {
     Ok(())
 }
 
-/// Pump the link until `check` reports a result, the deadline passes, or the pump-round
-/// cap is hit. `check` runs before the first pump, so already-satisfiable operations
-/// never touch the link.
+/// Pump the link until `check` reports a result or the wall-clock deadline passes.
+/// `check` runs before the first pump, so already-satisfiable operations never touch
+/// the link.
+///
+/// The bound is honestly time-shaped: the clock is read every round and only the
+/// deadline (or the result) ends the wait — a round count never cuts a wall-clock
+/// window short, however cheap the empty receive polls are. The one round-shaped bound
+/// left is the [`FROZEN_CLOCK_ROUNDS`] backstop, which fires only after that many
+/// consecutive rounds with zero observed clock movement (a frozen test clock, where the
+/// deadline can never expire) and keeps the wait finite even then.
 async fn wait_until<T>(
     link: &Link,
     deadline_ns: u64,
-    check: impl FnMut() -> Option<Result<T, L4Error>>,
-) -> Result<T, L4Error> {
-    wait_until_capped(link, deadline_ns, MAX_PUMPS, check).await
-}
-
-/// [`wait_until`] with an explicit pump-round cap: the DHCP acquisition wait needs more
-/// rounds than the per-operation default before its (longer) wall-clock window has
-/// honestly passed; everything else uses `MAX_PUMPS`.
-async fn wait_until_capped<T>(
-    link: &Link,
-    deadline_ns: u64,
-    max_pumps: u32,
     mut check: impl FnMut() -> Option<Result<T, L4Error>>,
 ) -> Result<T, L4Error> {
     let start = now_ns(&link.clock);
-    let mut rounds: u32 = 0;
+    let mut last_now = start;
+    let mut frozen_rounds: u32 = 0;
     loop {
         if let Some(result) = check() {
             return result;
         }
+        let now = now_ns(&link.clock);
+        if now == last_now {
+            frozen_rounds += 1;
+        } else {
+            last_now = now;
+            frozen_rounds = 0;
+        }
         let expired =
-            rounds >= max_pumps || now_ns(&link.clock).saturating_sub(start) >= deadline_ns;
+            now.saturating_sub(start) >= deadline_ns || frozen_rounds >= FROZEN_CLOCK_ROUNDS;
         if expired {
             // Wire truth beats the clock (user study 08, finding F3): before declaring
             // a timeout, pump once more and re-check, so frames that already reached
@@ -795,7 +801,6 @@ async fn wait_until_capped<T>(
             return Err(L4Error::TimedOut);
         }
         pump(link).await?;
-        rounds += 1;
     }
 }
 

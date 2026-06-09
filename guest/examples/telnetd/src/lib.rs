@@ -11,11 +11,28 @@
 //! fused task per session (the plan/09 D44 handle-transfer finding: a live l4
 //! connection cannot cross task stores, and one NIC is one task's claim). Session
 //! death is never telnetd's death: every outcome, including a trap, is narrated to the
-//! machine console and the next session is served. A remote `poweroff` is refused —
-//! the outcome ends that session and is narrated, never honored.
+//! machine console and the next session is served.
+//!
+//! A remote `poweroff` is refused by default, and refused *visibly*: each session's
+//! eosh is spawned with the power capability withheld (`power = some(false)`), so the
+//! command answers a typed refusal at the remote prompt instead of silently no-opping
+//! (the silent no-op cost a bench recovery round — GAPS 2026-06-08); a session outcome
+//! that still claims the intent is narrated here and dropped. `--allow-poweroff`
+//! (default OFF) grants the capability to the sessions and honors the intent: telnetd
+//! ends with its own `poweroff-requested` outcome so the typed intent keeps flowing up
+//! the supervision tree (the shell that ran telnetd forwards it; under init the
+//! machine halts).
 //!
 //! **SECURITY: sessions are cleartext, unauthenticated telnet (see net.text). Trusted
-//! LAN / dev use only; SSH is explicitly deferred (owner ruling).**
+//! LAN / dev use only; SSH is explicitly deferred (owner ruling). With
+//! `--allow-poweroff` set, ANY host that can open a TCP connection to the port can
+//! power the machine off — there is no authentication at any layer, so the flag is a
+//! single operator-time switch, not a per-caller grant. A session is already a full
+//! remote shell, so the flag extends existing session authority to machine
+//! availability rather than creating a new code path for strangers — but treat it as
+//! bench/trusted-LAN only, with network-layer restriction (VLAN/firewall) as the
+//! compensating control. Remote reset is operationally valuable on a trusted bench
+//! (the session-burn incident is why this escape hatch exists).**
 
 #![no_std]
 
@@ -184,6 +201,7 @@ impl Guest for Telnetd {
         prefix_length: Option<u8>,
         gateway: Option<String>,
         advertise_max: Option<u16>,
+        allow_poweroff: Option<bool>,
     ) -> Result<ProgramSuccess, ProgramFailure> {
         let out = Out::new();
         let port = port.unwrap_or(DEFAULT_PORT);
@@ -325,16 +343,33 @@ impl Guest for Telnetd {
             .map_err(|err| ProgramFailure::Compile(format!("{err:?}")))?;
 
         // ----- serve sessions, sequentially ---------------------------------------------
+        let allow_poweroff = allow_poweroff.unwrap_or(false);
         out.say(&format!(
             "serving up to {limit} session(s) on port {port} — cleartext telnet, \
-             unauthenticated; trusted networks only"
+             unauthenticated; trusted networks only{}",
+            if allow_poweroff {
+                " (--allow-poweroff: any connecting host may halt this machine)"
+            } else {
+                ""
+            }
         ));
+        // The session's power-capability marker (eosh's `power` argument): withheld by
+        // default — a remote `poweroff` then answers a typed refusal at the remote
+        // prompt — and granted under --allow-poweroff (see the SECURITY note).
+        let session_args = [task::NamedArg {
+            name: String::from("power"),
+            value: String::from(if allow_poweroff {
+                "some(true)"
+            } else {
+                "some(false)"
+            }),
+        }];
         let mut served: u32 = 0;
         while served < limit {
             let number = served + 1;
             out.say(&format!("session {number}: waiting for a connection"));
             let limits = task::SpawnLimits { max_memory: None };
-            let session_task = task::spawn(&image, &[], Vec::new(), limits)
+            let session_task = task::spawn(&image, &session_args, Vec::new(), limits)
                 .map_err(|err| ProgramFailure::Spawn(format!("session {number}: {err:?}")))?;
             let outcome = task::wait(&session_task).await;
             served += 1;
@@ -343,12 +378,23 @@ impl Guest for Telnetd {
                 outcome_text(&outcome)
             ));
 
-            // A remote poweroff is refused: halting the machine is a console intent,
-            // not a network one (the session has already ended either way).
+            // A session's typed poweroff intent. With --allow-poweroff it is honored:
+            // telnetd ends with its own poweroff-requested outcome so the intent keeps
+            // flowing up the supervision tree (the spawning shell forwards it; under
+            // init the machine halts). Without the flag it is refused and narrated —
+            // belt-and-braces: the session's eosh already refused at the prompt, so
+            // this arm only fires for a stack whose shell predates the power marker.
             if let task::ProgramOutcome::Success(value) = &outcome
                 && value.value == "poweroff-requested"
             {
-                out.say("refusing a remote poweroff request (console intent only)");
+                if allow_poweroff {
+                    out.say(&format!(
+                        "session {number} requested poweroff; honoring it (--allow-poweroff) — \
+                         served {served} session(s)"
+                    ));
+                    return Ok(ProgramSuccess::PoweroffRequested);
+                }
+                out.say("refusing a remote poweroff request (--allow-poweroff not set)");
             }
         }
         out.say(&format!("served {served} session(s); exiting"));

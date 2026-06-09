@@ -13,6 +13,18 @@ package eo9-eosh:eosh@0.1.0;
 ///
 ///   eosh
 ///   eosh --command "net.none $ browser --url https://example.com"
+///
+/// `power` is the session's power-capability marker, set by whoever composes and spawns
+/// the session (the executor-model rule: poweroff is a typed intent honored up the
+/// supervision tree, so the supervisor decides whether this session may raise it):
+///
+///   * `none` (the default -- init's console, the CLI, the browser, a nested `eosh`):
+///     `poweroff` ends the session with the `poweroff-requested` outcome, exactly as
+///     before; whether anything halts is the embedder's call.
+///   * `some(false)` (what telnetd passes for its sessions unless `--allow-poweroff`):
+///     `poweroff` prints a typed refusal naming the missing capability and the session
+///     stays open -- never a silent no-op.
+///   * `some(true)` (telnetd under `--allow-poweroff`): as `none`, recorded explicitly.
 world eosh {
     import eo9:exec/component-algebra@0.1.0;
     import eo9:exec/compile@0.1.0;
@@ -60,5 +72,6 @@ world eosh {
         not-runnable(string),
     }
 
-    export main: async func(command: option<string>) -> result<program-success, program-failure>;
+    export main: async func(command: option<string>, power: option<bool>)
+        -> result<program-success, program-failure>;
 }

@@ -84,17 +84,19 @@ draft sketched.
   kernel console tee, area/17) → USB keyboard → `curl http://…` (area/16) prints a
   real website. usb-boot-demo-plan.md Part B.
 * **Deferred, recorded**: 2.5GBASE-T RX (everything pins 1000), the kernel INTx demux
-  for the DW controllers (drivers are polled v1), true-color HDMI (the link
-  colorspace fix), and the UART RX FIFO kernel fix (next section).
+  for the DW controllers (drivers are polled v1), and true-color HDMI (the link
+  colorspace fix). The UART RX FIFO kernel fix has landed (next section).
 
 ## Console reality (bench-critical)
 
-Board console input truncates at exactly **64 bytes** per line: the DW-APB UART RX
-FIFO is 64 bytes deep and the board profile's RX interrupt path never drains it —
-input reaches eosh only when the kernel's idle backstop scavenges the FIFO; between
-scavenges it overflows silently. GAPS'd for a kernel lane; until then the bench types
-in chunks (eosh_cmd.py: 40-byte chunks, scavenge pauses, a redundant trailing
-newline). Details and the doctrine in playbook §7.1.
+The exactly-64-byte input truncation (the DW-APB RX FIFO is 64 bytes deep; the RX
+interrupt path never drained it, so input only arrived via the idle backstop
+scavenge) is **fixed in the kernel**: UART2's GIC SPI 333 (INTID 365, from the
+vendor control FDT) is forwarded and the DW-APB receive interrupt (IER.ERBFI)
+unmasked, so the IRQ handler drains the FIFO at line rate; the scavenge stays as a
+belt-and-braces backstop. Bench acceptance: type a raw >64-byte line at the serial
+prompt — it must survive un-truncated; eosh_cmd.py's 40-byte chunking can then be
+retired. History and the doctrine in playbook §7.1.
 
 ## The network: policy facts the bench learned the hard way
 

@@ -306,9 +306,11 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
         .get_func(&mut store, "main")
         .ok_or_else(|| wasmtime::Error::msg("eosh does not export `main`"))?;
 
-    // eosh's single argument is `command: option<string>`: absent means the interactive
-    // read–eval loop on the serial console.
-    let params = [Val::Option(None)];
+    // eosh's arguments: `command: option<string>` (absent means the interactive
+    // read–eval loop on the serial console) and `power: option<bool>` (absent keeps the
+    // machine console's historical poweroff behavior — this direct-eosh boot IS the
+    // console, so the caller honors the halt intent either way).
+    let params = [Val::Option(None), Val::Option(None)];
     let mut results = vec![Val::Bool(false)];
 
     // The session drive loop: poll eosh, and between polls give every running child a

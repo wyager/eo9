@@ -93,8 +93,11 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
         }
     );
 
-    // eosh's single argument: `command: option<string>` — interactive REPL when absent,
-    // one-shot command when present.
+    // eosh's `command: option<string>` — interactive REPL when absent, one-shot command
+    // when present. Its other argument (`power: option<bool>`, the session
+    // power-capability marker) is left unsupplied and binds to `none`: a CLI shell's
+    // `poweroff` keeps behaving like `exit` (the process ends), as documented in
+    // eosh's world.
     let command_value = match &command {
         Some(line) => format!("some({})", run::wave_string(line)),
         None => "none".to_string(),
