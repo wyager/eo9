@@ -494,6 +494,19 @@ doesn't recover, or cumulative u2/PHY state across rapid claims. Driver lane: co
 a full PHY reset on claim when the previous owner was quiesced-by-kexec, or always.
 Bench rule meanwhile: if LinkDown appears, cold-cycle rather than retrying claims.
 
+## svc_shell flake has WIDENED to a 3-of-3 CI blocker on master (usb rebase round, 2026-06-08 night)
+On pristine master 24c8578 (fresh detached worktree, no branch changes), `cargo test
+-p eo9-integration --test svc_shell` failed 3 of 3 consecutive runs, 1-2 tests each,
+rotating among: restart_cycles_complete_while_the_foreground_is_quietly_blocked (the
+original specimen), soundness_a_detached_child_cannot_use_what_its_detacher_did_not_compose,
+detach_list_stop_clear_lifecycle, services_die_with_the_process — several with
+"liveness: the park backstop found stranded work (foreground=true, services=false,
+n=1)" in the transcript. Host was under multi-agent load (runtimes 17s-59s), which
+the original entries predicted would worsen it, but solo-on-idle failures were
+already recorded. This now BLOCKS any branch's `cargo xtask ci` from exiting 0
+reliably; the graduated bug-hunt lane is urgent. The usb branch documents it as the
+sole ci failure with this master baseline as proof.
+
 ## Bundle checkout-dependence is a CLASS, not one component (kernhyg lane, 2026-06-08)
 The fs-eofs path-dep byte-churn applies to EVERY component consuming an
 out-of-workspace path dep (-C metadata hash): now curl, l4check, hidcheck, usbcheck,
