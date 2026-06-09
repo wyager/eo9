@@ -463,3 +463,23 @@ teardown must gain a device-aware quiesce hook (for OHCI: HcControl -> reset, wh
 halts all schedule DMA) or an equivalent containment story. Also recorded there: the
 PCI provider's claim exclusivity is still per-task while platform's is machine-wide —
 converge PCI on the machine-wide discipline (its recorded follow-up).
+
+## Network kexec residuals (area/21-kexec, 2026-06-08)
+The lane shipped with three recorded residuals (docs/board/net-kexec.md has the full
+posture):
+- **Cleartext preshared secret**: oskexec's mandatory >=16-byte secret gates the TCP
+  peer, but it travels cleartext on the LAN — a passive sniffer who also wins the race
+  inside the one-shot window could replay it. Same class as the net.text telnet entry
+  above, but with an actual gate in front because the authority is total. Upgrade
+  path: a challenge-response handshake, which needs a real hash (blake3 is already in
+  the tree) reachable from the guest world — deliberately NOT hand-rolled in the lane.
+- **kexec + granted PCI DMA**: the staging region is heap-external so no capability
+  can address it, but a bus-mastering PCI device could still DMA over it (the standing
+  no-IOMMU posture). The `kexec` token is documented as the same total-authority class
+  as `pci`; an IOMMU lane would close both.
+- **TCG transfer pace**: check-kexec's 62 MiB transfer paces at the guest recv loop
+  (~65 KiB/s steady-state under TCG, ~16 min; the rate also *decays* from ~2 MiB/s over
+  the first MBs — unexplained, possibly allocator or socket-buffer behavior in the
+  net.l4.over-l2 path, worth a look from the net lane). The board runs native and is
+  wire-bound. The gate is therefore not in `ci`; it is the lane's on-demand gate like
+  check-telnet/check-usb.
