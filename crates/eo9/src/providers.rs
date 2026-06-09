@@ -1235,30 +1235,38 @@ pub fn park_until_progress(
     std::thread::park_timeout(timeout);
 
     // Liveness detector (SPEC: a backstop firing that discovers actionable work no event
-    // delivered is a high-priority bug). The discriminator is the waker's `fired` flag,
-    // NOT elapsed time: under CPU load an event-driven wake routinely gets the CPU back
-    // only after the (10ms) backstop has already elapsed, so `elapsed >= timeout` alone
-    // misattributes correctly-delivered completions as stranded work (measured doing
-    // exactly that for stdin read-line completions at load ~30). A wake that fired —
-    // before, during, or right after the park — means the edge worked; only a full
-    // cap-rated timeout with NO wake fired and runnable work discovered afterwards
-    // means an edge was genuinely missed.
+    // delivered is a high-priority bug), SERVICES ONLY — by category, not by tuning:
+    //
+    // * The FOREGROUND task is never polled for a finding. While this thread is parked,
+    //   the foreground's runnability is *defined* as "its doorbell rang"
+    //   (`Task::is_runnable`: `!parked || doorbell.is_rung()`), so observing it
+    //   runnable from here PROVES the completion was delivered — possibly resumed late
+    //   under CPU load, but delivered. A genuinely missed foreground edge is a
+    //   completer that never rings at all, which leaves the task un-runnable and is
+    //   therefore invisible to any parked-side poll however it is gated: the ring IS
+    //   the edge, and a missing ring can only be detected at the ring site. If
+    //   foreground missed-edge detection is ever wanted, it must live completer-side
+    //   (providers accounting "completed but never rang" at delivery time), not here.
+    //   Any fg arm in this detector can only ever report delivered-late events — a
+    //   permanently unfalsifiable false-positive source (measured tripping the suites'
+    //   no-`liveness:` gate at load ~15-30 via stdin completions landing between this
+    //   thread's gates and its readiness poll).
+    //
+    // * The SERVICES check keeps the detector's genuine value: registry state can
+    //   become runnable without ringing this thread's registered wake-set, so finding
+    //   it runnable after a full quiet backstop is evidence of a missing wake edge.
+    //   Two time-shaped exclusions apply. A wake that fired (`waker_state.fired`) —
+    //   before, during, or right after the park — means an edge worked and this thread
+    //   is merely resuming late under load. A pending restart deadline that crossed
+    //   into dueness while this thread slept (or waited for the CPU afterwards)
+    //   explains readiness as a time event: deadlines have no wake edge to miss.
     if cap_rated
         && parked_at.elapsed() >= timeout
         && !waker_state.fired.load(std::sync::atomic::Ordering::SeqCst)
     {
-        let fg = {
-            let runnable = task.runnable();
-            let runnable = std::pin::pin!(runnable);
-            runnable.poll(&mut context).is_ready()
-        };
-        // A pending restart deadline that crossed into dueness while this thread slept
-        // (or waited for the CPU afterwards) explains service readiness as a time event:
-        // deadlines have no wake edge to miss, so they are excluded from the finding.
         let restart_now_due = restart_due.is_some_and(|due| due <= std::time::Instant::now());
-        let services = !restart_now_due && registry.lock().unwrap().any_runnable();
-        if fg || services {
-            liveness_backstop_finding(fg, services);
+        if !restart_now_due && registry.lock().unwrap().any_runnable() {
+            liveness_backstop_finding();
         }
     }
 }
@@ -1268,13 +1276,10 @@ pub fn park_until_progress(
 /// captured transcript — and the suites' no-`liveness:` assertions — see it.
 static LIVENESS_PARK_FINDINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn liveness_backstop_finding(fg: bool, services: bool) {
+fn liveness_backstop_finding() {
     let n = LIVENESS_PARK_FINDINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if n == 1 || n.is_multiple_of(16) {
-        eprintln!(
-            "liveness: the park backstop found stranded work (foreground={fg}, \
-             services={services}, n={n})"
-        );
+        eprintln!("liveness: the park backstop found stranded service work (n={n})");
     }
 }
 
