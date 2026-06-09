@@ -641,8 +641,19 @@ fn service_info_from_wit(info: svc_services_api::ServiceInfo) -> ServiceInfo {
 struct Eosh;
 
 impl Guest for Eosh {
-    async fn main(command: Option<String>) -> Result<ProgramSuccess, ProgramFailure> {
+    async fn main(
+        command: Option<String>,
+        power: Option<bool>,
+    ) -> Result<ProgramSuccess, ProgramFailure> {
         let mut session = Session::new(WitBackend::new());
+        // The supervisor's power-capability marker (world.wit): `some(false)` means this
+        // session may not halt the machine — `poweroff` (and a child's typed poweroff
+        // intent) becomes a printed, typed refusal instead of the session's outcome.
+        // `none` keeps the historical behavior for every embedder that passes no
+        // arguments (init's console, the CLI, the browser, nested shells).
+        if power == Some(false) {
+            session.refuse_poweroff();
+        }
 
         match command {
             // One-shot mode: run the single command line and report its result as the

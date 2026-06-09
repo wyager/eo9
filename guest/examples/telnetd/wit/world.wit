@@ -23,8 +23,20 @@
 //
 // SECURITY: the sessions are cleartext, unauthenticated telnet (see net.text).
 // Trusted-LAN/dev tool only; SSH is explicitly deferred (owner ruling). A remote
-// `poweroff` is refused: the session's poweroff-requested outcome ends that session
-// and is narrated, never honored — halting the machine is a console intent.
+// `poweroff` is refused by default: each session's eosh is spawned with the power
+// capability withheld (`power: some(false)`), so the command answers with a typed
+// refusal at the remote prompt instead of silently no-opping, and even a session
+// outcome that does claim the intent is narrated and dropped here. `--allow-poweroff`
+// (default OFF) grants the capability to every session this telnetd serves and honors
+// the intent by ending with telnetd's own poweroff-requested outcome — the typed
+// intent then flows up the supervision tree (the spawning shell forwards it; under
+// init the machine halts). BE AWARE what that means on this transport: there is no
+// authentication of any kind, so with the flag set, ANY host that can open a TCP
+// connection to the port can power the machine off (a session is already a full
+// remote shell — the flag extends that to machine availability). Bench/trusted-LAN
+// only, with network-layer restriction (VLAN/firewall) as the compensating control;
+// remote reset is operationally valuable on a trusted bench (the session-burn
+// incident), which is why the escape hatch exists at all.
 package eo9-examples:telnetd@0.1.0;
 
 /// Serves shell sessions over TCP, sequentially, until `sessions` runs out (or the
@@ -48,6 +60,10 @@ world telnetd {
     variant program-success {
         /// telnetd finished; carries how many sessions it served.
         served(u32),
+        /// A session requested poweroff and `--allow-poweroff` was set: telnetd ends
+        /// with the same typed intent so it keeps flowing up the supervision tree
+        /// (the shell that ran telnetd forwards it; under init the machine halts).
+        poweroff-requested,
     }
 
     variant program-failure {
@@ -74,9 +90,12 @@ world telnetd {
     /// argument error); omitted entirely = the middleware's documented QEMU user-net
     /// default. `advertise-max`: forwarded to the NIC's own configure interface when
     /// given (net.rtl8125's autoneg speed cap); a NIC with no such interface answers
-    /// with a clean configure error, never a trap.
+    /// with a clean configure error, never a trap. `allow-poweroff` (default OFF)
+    /// grants the power capability to every served session and honors a session's
+    /// poweroff intent — see the SECURITY note above before setting it.
     export main: async func(port: option<u16>, sessions: option<u32>,
         nic: option<string>, address: option<string>, prefix-length: option<u8>,
-        gateway: option<string>, advertise-max: option<u16>)
+        gateway: option<string>, advertise-max: option<u16>,
+        allow-poweroff: option<bool>)
         -> result<program-success, program-failure>;
 }

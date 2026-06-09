@@ -4481,6 +4481,29 @@ fn check_telnet(root: &Path) -> Result<(), String> {
         // text gap, plan/10 entry 20) — verify it arrived there.
         wait_for("Hello, world.", "hello's stdout on the serial console")?;
 
+        // ----- a remote `poweroff` is refused, visibly, and the session survives ------
+        // telnetd spawns its sessions with the power capability withheld (no
+        // --allow-poweroff here), so the command must answer a typed refusal naming the
+        // missing capability at the remote prompt — never a silent no-op (the bench
+        // incident) and never a closed session.
+        s1.write_all(b"poweroff\r\n")
+            .map_err(|err| format!("check-telnet: writing `poweroff` to the socket: {err}"))?;
+        let poweroff_out = read_until(
+            &mut s1,
+            "eosh> ",
+            TELNET_STEP_TIMEOUT,
+            "the prompt after the refused `poweroff`",
+        )?;
+        if !poweroff_out.contains("missing capability: power") {
+            return Err(format!(
+                "check-telnet: a remote `poweroff` must print the typed power-capability \
+                 refusal: {poweroff_out:?}"
+            ));
+        }
+        println!(
+            "----- check-telnet: session 1 transcript (poweroff refused) -----\n{poweroff_out}"
+        );
+
         // ----- a concurrent second connection is refused ------------------------------
         // net.text dropped its listener after accepting, so the transport answers the
         // SYN with a RST and slirp closes the host side. Nothing of a session may appear.
@@ -4562,7 +4585,8 @@ fn check_telnet(root: &Path) -> Result<(), String> {
     println!(
         "xtask: check-telnet ok — two sequential sessions served over \
          localhost:{TELNET_HOST_PORT} (greeting + eosh banner + prompt, `hello` → \
-         `ok: greeted`, concurrent connection refused, `exit` closed both cleanly)"
+         `ok: greeted`, remote `poweroff` refused typed, concurrent connection refused, \
+         `exit` closed both cleanly)"
     );
     Ok(())
 }

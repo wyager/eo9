@@ -53,6 +53,13 @@ pub enum LineResult {
     Poweroff,
 }
 
+/// The typed refusal `poweroff` prints in a session whose supervisor withheld the power
+/// capability (a network session: telnetd grants it only behind `--allow-poweroff`).
+/// Named here so the unit tests and the embedders pin one string.
+pub const POWEROFF_REFUSAL: &str = "error: poweroff: missing capability: power — this \
+session's supervisor withheld machine halt (a telnet session can only poweroff when \
+telnetd was started with --allow-poweroff)";
+
 /// One shell session: the backend plus everything the user has built up in it.
 pub struct Session<B: Backend> {
     backend: B,
@@ -65,6 +72,12 @@ pub struct Session<B: Backend> {
     /// a `-c` invocation's standard output carries only the program's own output — matching
     /// `eo9 run`, whose outcome line is on stderr by default.
     outcome_on_stderr: bool,
+    /// Whether this session's supervisor withheld the power capability (the embedder
+    /// calls [`Session::refuse_poweroff`]). When set, `poweroff` — and a child program's
+    /// typed poweroff intent — prints [`POWEROFF_REFUSAL`] instead of ending the session,
+    /// so the refusal is visible to whoever typed the command (the silent no-op cost a
+    /// bench recovery round; GAPS 2026-06-08).
+    power_refused: bool,
 }
 
 impl<B: Backend> Session<B> {
@@ -76,6 +89,7 @@ impl<B: Backend> Session<B> {
             cache: SessionCache::new(),
             history: Vec::new(),
             outcome_on_stderr: false,
+            power_refused: false,
         }
     }
 
@@ -83,6 +97,15 @@ impl<B: Backend> Session<B> {
     /// (used by one-shot `--command` mode so pipes carry only program output).
     pub fn route_outcome_to_stderr(&mut self) {
         self.outcome_on_stderr = true;
+    }
+
+    /// Mark this session as lacking the power capability: `poweroff` becomes a typed,
+    /// printed refusal ([`POWEROFF_REFUSAL`]) and the session continues, instead of the
+    /// intent flowing up as the shell's own outcome. Called by the embedding `main` when
+    /// its supervisor said so (eosh's `power: option<bool>` argument bound to
+    /// `some(false)` — what telnetd passes for its sessions unless `--allow-poweroff`).
+    pub fn refuse_poweroff(&mut self) {
+        self.power_refused = true;
     }
 
     /// Hand the shell its granted environment (an environment value possessed by the
@@ -129,7 +152,7 @@ impl<B: Backend> Session<B> {
             Command::Env => self.run_env().await,
             Command::EnvOf(expr) => self.run_env_of(&expr).await,
             Command::Exit => LineResult::Exit,
-            Command::Poweroff => LineResult::Poweroff,
+            Command::Poweroff => self.run_poweroff(),
             Command::Let { name, expr } => self.run_let(name, &expr).await,
             Command::Save { name, expr } => self.run_save(name, &expr).await,
             Command::Detach { name, expr, policy } => self.run_detach(name, &expr, &policy).await,
@@ -711,6 +734,17 @@ impl<B: Backend> Session<B> {
         self.finish_run(outcome)
     }
 
+    /// The `poweroff` builtin: end the session with the typed halt intent — unless this
+    /// session's supervisor withheld the power capability, in which case the refusal is
+    /// printed (never silent) and the session continues.
+    fn run_poweroff(&mut self) -> LineResult {
+        if self.power_refused {
+            self.backend.print_error(POWEROFF_REFUSAL);
+            return LineResult::Error(String::from(POWEROFF_REFUSAL));
+        }
+        LineResult::Poweroff
+    }
+
     /// Render and classify a finished run's outcome (shared by the cached-image fast
     /// path and the full path).
     fn finish_run(&mut self, outcome: Outcome) -> LineResult {
@@ -721,6 +755,13 @@ impl<B: Backend> Session<B> {
             self.backend.print(&rendered);
         }
         match outcome {
+            // A child program's own typed poweroff intent (the convention init and
+            // telnetd already match on): the intent flows up the supervision tree, so a
+            // shell that holds power forwards it as its own — `telnetd --allow-poweroff`
+            // ending with poweroff-requested at the console must reach init — and a
+            // shell whose supervisor withheld power refuses it exactly like the typed
+            // builtin (visibly, never a silent swallow).
+            Outcome::Success(value) if value.value == "poweroff-requested" => self.run_poweroff(),
             Outcome::Success(_) => LineResult::Ok,
             Outcome::Failure(_) => LineResult::ProgramFailed(CommandClass::Failed, rendered),
             Outcome::Abnormal(AbnormalExit::Trapped(_)) => {
@@ -1127,6 +1168,53 @@ mod tests {
         assert!(matches!(result, LineResult::Error(_)));
         let err = session.backend.err.join("\n");
         assert!(err.contains("component-typed"), "got: {err}");
+    }
+
+    // -- poweroff and the power capability ------------------------------------------
+
+    #[test]
+    fn poweroff_without_the_power_capability_is_a_typed_printed_refusal() {
+        let mut session = session_with(&[]);
+        session.refuse_poweroff();
+        let result = run(&mut session, "poweroff");
+        // Typed, printed, names the missing capability — and the session continues
+        // (the silent no-op cost a bench recovery round; GAPS 2026-06-08).
+        assert_eq!(result, LineResult::Error(POWEROFF_REFUSAL.to_string()));
+        let err = session.backend.err.join("\n");
+        assert!(err.contains("missing capability: power"), "got: {err}");
+        assert!(err.contains("--allow-poweroff"), "got: {err}");
+        // The session is still usable afterwards.
+        assert_eq!(run(&mut session, "help"), LineResult::Ok);
+    }
+
+    #[test]
+    fn a_childs_typed_poweroff_intent_is_forwarded_when_power_is_held() {
+        // The intent flows up the supervision tree: a program ending with the typed
+        // poweroff-requested outcome (telnetd --allow-poweroff honoring a remote
+        // poweroff) ends this session with the shell's own halt intent.
+        let mut session = session_with(&[("telnetd", binary(&[]))]);
+        session.backend.outcome = Outcome::Success(WaveValue {
+            ty: "program-success".to_string(),
+            value: "poweroff-requested".to_string(),
+        });
+        let result = run(&mut session, "telnetd");
+        assert_eq!(result, LineResult::Poweroff);
+        // The outcome line still printed before the forward.
+        assert_eq!(session.backend.out, vec!["ok: poweroff-requested"]);
+    }
+
+    #[test]
+    fn a_childs_typed_poweroff_intent_is_refused_like_the_builtin_without_power() {
+        let mut session = session_with(&[("telnetd", binary(&[]))]);
+        session.refuse_poweroff();
+        session.backend.outcome = Outcome::Success(WaveValue {
+            ty: "program-success".to_string(),
+            value: "poweroff-requested".to_string(),
+        });
+        let result = run(&mut session, "telnetd");
+        assert_eq!(result, LineResult::Error(POWEROFF_REFUSAL.to_string()));
+        let err = session.backend.err.join("\n");
+        assert!(err.contains("missing capability: power"), "got: {err}");
     }
 
     #[test]

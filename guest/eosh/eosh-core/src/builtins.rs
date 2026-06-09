@@ -164,7 +164,9 @@ pub const BUILTIN_DOCS: &[BuiltinDoc] = &[
         summary: &[
             "Ends the session AND asks the embedder to halt: the intent flows up as the shell's own typed",
             "outcome, so under init the machine powers off even while services are running (plain `exit`",
-            "would restart the console instead). Without init it behaves like `exit`.",
+            "would restart the console instead). Without init it behaves like `exit`. A session whose",
+            "supervisor withheld the power capability (a telnet session, unless telnetd was started with",
+            "--allow-poweroff) gets a typed refusal naming the missing capability, and stays open.",
         ],
         usage: &["poweroff", "e.g. poweroff"],
         related: "exit, svc",

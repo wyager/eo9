@@ -1229,9 +1229,14 @@ fn run_eosh(command: Option<String>) -> Result<()> {
     let outcome = block_on(
         "eosh main",
         store.run_concurrent(async move |accessor| -> Result<Val> {
-            let arg = Val::Option(command.map(|c| std::boxed::Box::new(Val::String(c))));
+            let command = Val::Option(command.map(|c| std::boxed::Box::new(Val::String(c))));
+            // eosh's second argument (`power: option<bool>`, the session
+            // power-capability marker) stays `none` in the browser: `poweroff` ends
+            // the page session like `exit`, exactly as eosh's world documents.
+            let power = Val::Option(None);
             let mut result = [Val::Bool(false)];
-            main.call_concurrent(accessor, &[arg], &mut result).await?;
+            main.call_concurrent(accessor, &[command, power], &mut result)
+                .await?;
             Ok(result[0].clone())
         }),
     )???;
