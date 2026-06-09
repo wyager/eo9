@@ -416,18 +416,31 @@ power (probably yes behind an explicit telnetd flag — remote reset is operatio
 valuable, as this same incident proved via the session-burn workaround).
 
 ## svc_shell flaked once under parallel workspace test load (review, 2026-06-08)
-During the area/09 merge review, `svc_shell` failed once (exit 101) in the parallel
-`cargo test --workspace` run, then passed 8/8 solo and the full ci re-ran green. The
-branch under review does not touch svc/shell paths — smells like load-sensitive
-timing in the service-restart tests. IDENTIFIED (usb lane, 2026-06-08 late):
-`svc_shell::restart_cycles_complete_while_the_foreground_is_quietly_blocked`
-(assert at svc_shell.rs:410), failing ~1-of-3 SOLO on an idle machine — a real
-service-registry timing bug, not load sensitivity. SECOND SPECIMEN (curl merge
-review, teed per protocol): `disk::tests::read_only_opens_share_the_image`
-(crates/eo9-providers-unix/src/disk.rs:483), passes solo, failed under concurrent
-lane batteries — likely BlockingPool timing under CPU starvation; distinct bug from
-the svc_shell one. The hunt lane should take both: run each under artificial load +
-solo loops, with logs retained.
+RESOLVED (flake lane, 2026-06-09) — three distinct causes, three commits on
+area/23-flake-fixes:
+1. `restart_cycles_complete_while_the_foreground_is_quietly_blocked` (was
+   svc_shell.rs:410): the test asserted the whole backoff lifecycle finished at the
+   end of a fixed 600ms quiet gap, but each restart decision recompiles the policy
+   component (~210ms/decision in debug; instrumented), so three decisions + 120ms of
+   delays exceed the window — 16/200 solo, 10/10 at load ~30. The park machinery is
+   precise (respawns 0–1ms after due). Test now polls `svc list` for the terminal
+   state; lifecycle-shape asserts unchanged. 0/501 solo, 0/505 under load after.
+2. `disk::tests::read_only_opens_share_the_image` (disk.rs:483): the pool worker
+   delivered a completion while still holding its Arc<File> clone, so the exclusive
+   flock could outlive the observed write completion and the provider drop; the next
+   open got WouldBlock. 2/1000 solo, 2/2000 at load ~30. Fixed: the clone is dropped
+   before the completer runs (completion observed ⇒ that op's handle released).
+   0/2000 solo, 0/4000 under load after.
+3. The load-16-36 "fails 3-of-3 on master" mode was the park backstop's liveness
+   detector, not the tests: `elapsed >= timeout` misattributed event wakes that got
+   the CPU back late as stranded work, tripping the suites' no-`liveness:` gate
+   (foreground=true). The ThreadWaker now records that it fired; findings require a
+   full quiet timeout with no wake. Restart deadlines crossing into dueness in the
+   post-park window are likewise excluded as time events. Full suite at load ~30+:
+   1/3 before, 20/20 green after. Genuine missed edges (no waker activity) still fire.
+Residual (tracked, by design for now): restart-policy decisions recompile the policy
+per decision (docs/design/policy-components.md blesses precompile-and-cache as the
+upgrade); ~210ms/decision debug-build floor on restart-lifecycle latency.
 
 ## Check gates can leak the QEMU on the failure path (dhcp lane, 2026-06-08)
 A failed check gate (kill()+wait on error) left its qemu-system-aarch64 alive holding
