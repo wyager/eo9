@@ -419,8 +419,11 @@ valuable, as this same incident proved via the session-burn workaround).
 During the area/09 merge review, `svc_shell` failed once (exit 101) in the parallel
 `cargo test --workspace` run, then passed 8/8 solo and the full ci re-ran green. The
 branch under review does not touch svc/shell paths — smells like load-sensitive
-timing in the service-restart tests. Watch item: if it recurs, it graduates to a
-real bug hunt (record the failing test name and seed next time).
+timing in the service-restart tests. SECOND SIGHTING same day (curl lane, parallel
+workspace tests under load; test identity lost to tail-filtering again). GRADUATED:
+the next battery runner that hits a workspace-test failure must retain the full log
+and record the test name — and a small bug-hunt lane should run the suite under
+artificial load (e.g. 4 parallel instances) to force it deterministically.
 
 ## Check gates can leak the QEMU on the failure path (dhcp lane, 2026-06-08)
 A failed check gate (kill()+wait on error) left its qemu-system-aarch64 alive holding
