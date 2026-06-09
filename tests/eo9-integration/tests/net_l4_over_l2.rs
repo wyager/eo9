@@ -347,3 +347,96 @@ fn a_static_address_without_a_gateway_is_a_typed_refusal() {
         other => panic!("expected ConfigurationRefused, got: {other}"),
     }
 }
+
+/// The committed pin for the DHCP no-server typed timeout (GAPS, the dhcp merge-review
+/// follow-up): `--address dhcp` over a link with no DHCP service anywhere — the echo
+/// fixture reflects frames but never answers as a server — must end in the middleware's
+/// own typed no-lease error within the **wall-clock** acquisition window, never a hang
+/// and never a trap.
+///
+/// This is also the regression pin for the wait_until time-honesty fix: the stub clock
+/// advances a fixed step per observation, so the 20 s window takes far more pump rounds
+/// than the old flat 4096-round cap — under the old conflated bound this wait was
+/// round-limited long before the window (the bug the DHCP lane worked around with a
+/// 2^20-round cap); under the time-shaped bound the deadline alone decides.
+#[test]
+fn dhcp_with_no_server_is_a_typed_timeout_after_the_honest_wall_clock_window() {
+    guest::ensure_components(&[
+        "eo9-stub-entropy-seeded",
+        "eo9-stub-time-monotonic-stub",
+        "eo9-stub-text-null",
+        "eo9-stub-net-l2-echo",
+        "eo9-stub-net-l4-over-l2",
+        "eo9-example-l4check",
+    ]);
+
+    let configured = configure(
+        &guest::load_stub("net.l4.over-l2"),
+        &[
+            ("address", "\"dhcp\""),
+            ("prefix-length", "none"),
+            ("gateway", "none"),
+        ],
+    )
+    .expect("configure(net.l4.over-l2, --address dhcp) must bake");
+    let stack =
+        compose(&configured, &guest::load_example("l4check")).expect("net.l4.over-l2 $ l4check");
+    let stack = compose(&guest::load_stub("net.l2.echo"), &stack).expect("net.l2.echo $ …");
+    let stack =
+        compose(&guest::load_stub("time.monotonic-stub"), &stack).expect("time.monotonic-stub $ …");
+    let stack = compose(&guest::load_stub("entropy.seeded"), &stack).expect("entropy.seeded $ …");
+    let stack = compose(&guest::load_stub("text.null"), &stack).expect("text.null $ …");
+
+    let outcome = run::run_component(&stack, &[], Providers::none());
+    match outcome {
+        Outcome::Failure(failure) => assert!(
+            failure.value.contains("no lease arrived"),
+            "expected the middleware's typed no-lease error: {}",
+            failure.value
+        ),
+        other => panic!("expected the program's own typed failure, got {other:?}"),
+    }
+}
+
+/// A clock that never advances cannot hang the DHCP wait: the wall-clock deadline can
+/// never expire under `time.frozen`, so the frozen-clock backstop (consecutive rounds
+/// with zero observed clock movement) must end the wait with the same typed no-lease
+/// error. This pins the one round-shaped bound that legitimately remains after the
+/// time-honesty fix.
+#[test]
+fn a_frozen_clock_cannot_hang_the_dhcp_wait() {
+    guest::ensure_components(&[
+        "eo9-stub-entropy-seeded",
+        "eo9-stub-time-frozen",
+        "eo9-stub-text-null",
+        "eo9-stub-net-l2-echo",
+        "eo9-stub-net-l4-over-l2",
+        "eo9-example-l4check",
+    ]);
+
+    let configured = configure(
+        &guest::load_stub("net.l4.over-l2"),
+        &[
+            ("address", "\"dhcp\""),
+            ("prefix-length", "none"),
+            ("gateway", "none"),
+        ],
+    )
+    .expect("configure(net.l4.over-l2, --address dhcp) must bake");
+    let stack =
+        compose(&configured, &guest::load_example("l4check")).expect("net.l4.over-l2 $ l4check");
+    let stack = compose(&guest::load_stub("net.l2.echo"), &stack).expect("net.l2.echo $ …");
+    let stack = compose(&guest::load_stub("time.frozen"), &stack).expect("time.frozen $ …");
+    let stack = compose(&guest::load_stub("entropy.seeded"), &stack).expect("entropy.seeded $ …");
+    let stack = compose(&guest::load_stub("text.null"), &stack).expect("text.null $ …");
+
+    let outcome = run::run_component(&stack, &[], Providers::none());
+    match outcome {
+        Outcome::Failure(failure) => assert!(
+            failure.value.contains("no lease arrived"),
+            "expected the middleware's typed no-lease error under a frozen clock: {}",
+            failure.value
+        ),
+        other => panic!("expected the program's own typed failure, got {other:?}"),
+    }
+}
