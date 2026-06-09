@@ -19,6 +19,11 @@
 //! handshake late or never. Harmless for a GET client — the server has already sent
 //! its FIN (`Connection: close`) and every peer times a half-open close out — but
 //! every l4 consumer carries this until the WIT grows `close: async func`.
+//!
+//! Security note: the host and path feed the request line verbatim, so URLs (and
+//! server-supplied `Location` redirect targets — exactly as untrusted) are refused
+//! typed when they carry spaces or control bytes. The rule lives, host-tested, in
+//! `eo9-curl-core` (the request-injection refusal).
 
 #![no_std]
 
@@ -28,6 +33,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use eo9_curl_core::{Url, UrlError};
 use eo9_guest::api::net::l4;
 use eo9_guest::buffer;
 use eo9_guest::text;
@@ -40,8 +46,6 @@ eo9_guest::bindings!({
 /// The DNS forwarder QEMU user-mode networking runs for its guest (the default
 /// `--resolver`; on the bench LAN pass the router, `--resolver 10.20.3.1`).
 const DEFAULT_RESOLVER: (u8, u8, u8, u8) = (10, 0, 2, 3);
-/// The default URL port (http).
-const DEFAULT_PORT: u16 = 80;
 /// A fixed DNS query id (the reply must echo it back; the l4check convention).
 const QUERY_ID: u16 = 0xe09;
 /// How many datagrams to inspect before giving up on the DNS answer.
@@ -76,106 +80,46 @@ fn say(line: &str) {
     let _ = text::write_out_line(line);
 }
 
-/// A parsed `http://` URL: host (name or literal), port, absolute path.
-struct Url {
-    host: String,
-    port: u16,
-    path: String,
+/// The one https refusal message (the deferred-TLS decision, named).
+fn https_refused() -> ProgramFailure {
+    ProgramFailure::Unsupported(String::from(
+        "https:// is refused: TLS is deferred by decision (certificate validation \
+         needs wall-clock time and entropy provenance the hardware does not carry \
+         yet; docs/board/usb-boot-demo-plan.md) — use an http:// URL",
+    ))
 }
 
-impl Url {
-    /// The `Host:` header value: the authority, port included only when it is not
-    /// the default (RFC 7230 §5.4 shape).
-    fn host_header(&self) -> String {
-        if self.port == DEFAULT_PORT {
-            self.host.clone()
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
-    }
-
-    fn display(&self) -> String {
-        format!("http://{}{}", self.host_header(), self.path)
-    }
-}
-
-/// Parse `http://host[:port][/path]`. `https://` is refused typed, naming the
-/// deferred-TLS decision; anything else that is not `http://` is bad arguments.
-fn parse_url(url: &str) -> Result<Url, ProgramFailure> {
-    let bytes = url.as_bytes();
-    if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
-        return Err(ProgramFailure::Unsupported(String::from(
-            "https:// is refused: TLS is deferred by decision (certificate validation \
-             needs wall-clock time and entropy provenance the hardware does not carry \
-             yet; docs/board/usb-boot-demo-plan.md) — use an http:// URL",
-        )));
-    }
-    if !(bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://")) {
-        return Err(ProgramFailure::BadArguments(format!(
-            "not an http:// URL: {url:?}"
-        )));
-    }
-    let rest = &url[7..];
-    let (authority, path) = match rest.find('/') {
-        Some(slash) => (&rest[..slash], &rest[slash..]),
-        None => (rest, "/"),
-    };
-    if authority.contains('@') {
-        return Err(ProgramFailure::BadArguments(String::from(
+/// A user-supplied URL the core refused, as this world's failure variant.
+fn url_failure(err: UrlError, url: &str) -> ProgramFailure {
+    match err {
+        UrlError::Https => https_refused(),
+        UrlError::NotHttp => ProgramFailure::BadArguments(format!("not an http:// URL: {url:?}")),
+        UrlError::ForbiddenByte => ProgramFailure::BadArguments(format!(
+            "spaces and control bytes in a URL are refused (they would reach the \
+             request line — percent-encode them): {url:?}"
+        )),
+        UrlError::Userinfo => ProgramFailure::BadArguments(String::from(
             "userinfo (user@host) in the URL is not supported",
-        )));
-    }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port_text)) => {
-            if host.contains(':') {
-                return Err(ProgramFailure::BadArguments(String::from(
-                    "IPv6 literals in the URL are not supported",
-                )));
-            }
-            let port = port_text
-                .parse::<u16>()
-                .ok()
-                .filter(|&port| port != 0)
-                .ok_or_else(|| {
-                    ProgramFailure::BadArguments(format!("not a port: {port_text:?}"))
-                })?;
-            (host, port)
+        )),
+        UrlError::Ipv6Literal => {
+            ProgramFailure::BadArguments(String::from("IPv6 literals in the URL are not supported"))
         }
-        None => (authority, DEFAULT_PORT),
-    };
-    if host.is_empty() {
-        return Err(ProgramFailure::BadArguments(format!(
-            "the URL has no host: {url:?}"
-        )));
+        UrlError::BadPort(port) => ProgramFailure::BadArguments(format!("not a port: {port:?}")),
+        UrlError::NoHost => ProgramFailure::BadArguments(format!("the URL has no host: {url:?}")),
     }
-    // A fragment never travels on the wire; drop it.
-    let path = match path.find('#') {
-        Some(hash) => &path[..hash],
-        None => path,
-    };
-    let path = if path.is_empty() { "/" } else { path };
-    Ok(Url {
-        host: host.to_string(),
-        port,
-        path: path.to_string(),
-    })
 }
 
-/// A strict dotted quad, or `None` (the host then goes to DNS).
-fn parse_ipv4(text: &str) -> Option<(u8, u8, u8, u8)> {
-    let mut octets = [0u8; 4];
-    let mut count = 0;
-    for part in text.split('.') {
-        if count == 4 {
-            return None;
-        }
-        octets[count] = part.parse::<u8>().ok()?;
-        count += 1;
+/// A server-supplied `Location` the core refused: https stays the typed TLS
+/// refusal; everything else is the server's fault (`http`), not the caller's.
+fn redirect_failure(err: UrlError, location: &str) -> ProgramFailure {
+    match err {
+        UrlError::Https => https_refused(),
+        UrlError::ForbiddenByte => ProgramFailure::Http(format!(
+            "the redirect target carries spaces or control bytes (refused — \
+             request injection): {location:?}"
+        )),
+        other => ProgramFailure::Http(format!("unusable redirect target {location:?}: {other:?}")),
     }
-    if count != 4 {
-        return None;
-    }
-    Some((octets[0], octets[1], octets[2], octets[3]))
 }
 
 /// `a.b.c.d`.
@@ -419,19 +363,6 @@ async fn fetch(
     })
 }
 
-/// The redirect target: an absolute http:// URL, or a server-relative path on the
-/// same authority. (https:// targets are refused typed inside [`parse_url`].)
-fn redirect_target(current: &Url, location: &str) -> Result<Url, ProgramFailure> {
-    if location.starts_with('/') {
-        return Ok(Url {
-            host: current.host.clone(),
-            port: current.port,
-            path: location.to_string(),
-        });
-    }
-    parse_url(location)
-}
-
 /// The transfer counters behind the exit counts line.
 struct Counts {
     received: usize,
@@ -445,15 +376,15 @@ async fn run(
     counts: &mut Counts,
 ) -> Result<ProgramSuccess, ProgramFailure> {
     let resolver = match resolver_text {
-        Some(text) => parse_ipv4(text)
+        Some(text) => eo9_curl_core::parse_ipv4(text)
             .ok_or_else(|| ProgramFailure::BadArguments(format!("not a dotted quad: {text:?}")))?,
         None => DEFAULT_RESOLVER,
     };
     let root = l4::default();
-    let mut url = parse_url(url_text)?;
+    let mut url = eo9_curl_core::parse(url_text).map_err(|err| url_failure(err, url_text))?;
 
     loop {
-        let address = match parse_ipv4(&url.host) {
+        let address = match eo9_curl_core::parse_ipv4(&url.host) {
             Some(literal) => literal,
             None => {
                 let address = resolve(&root, &url.host, resolver).await?;
@@ -481,7 +412,10 @@ async fn run(
                     response.status
                 )));
             }
-            url = redirect_target(&url, &location)?;
+            // The Location value is server-supplied: same refusals as a user URL
+            // (https typed, control bytes/spaces refused) before any connection.
+            url = eo9_curl_core::redirect_target(&url, &location)
+                .map_err(|err| redirect_failure(err, &location))?;
             counts.redirects += 1;
             say(&format!(
                 "curl: {} redirect; following {}",

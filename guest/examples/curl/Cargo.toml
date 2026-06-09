@@ -13,4 +13,5 @@ crate-type = ["cdylib"]
 [dependencies]
 eo9-guest = { workspace = true }
 eo9-dns = { workspace = true }
+eo9-curl-core = { workspace = true }
 wit-bindgen = { workspace = true }

@@ -232,6 +232,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-curl-core"
+version = "0.1.0"
+
+[[package]]
 name = "eo9-dns"
 version = "0.1.0"
 
@@ -271,6 +275,7 @@ dependencies = [
 name = "eo9-example-curl"
 version = "0.0.0"
 dependencies = [
+ "eo9-curl-core",
  "eo9-dns",
  "eo9-guest",
  "wit-bindgen",
