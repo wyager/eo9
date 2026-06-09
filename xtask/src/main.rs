@@ -409,6 +409,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("check-gpu", rest)?;
             check_gpu(&root)
         }
+        "check-repl" => {
+            expect_no_args("check-repl", rest)?;
+            check_repl(&root)
+        }
         "check-telnet" => {
             expect_no_args("check-telnet", rest)?;
             check_telnet(&root)
@@ -544,6 +548,12 @@ COMMANDS:
                          feature-less image (boot/serial/heap/timer/interrupts so far)
     qemu <arch>          Build the kernel image and boot it under QEMU with serial on stdio
                          (aarch64 or riscv64; exits when the kernel powers off, Ctrl-A X to quit)
+    check-repl           Boot the aarch64 kernel under QEMU and drive the eosh per-key editor
+                         with raw console bytes at the serial prompt: TAB completion (the
+                         candidate list and the unique-completion forms), the SGR 31
+                         inadmissible-input marker on a dead character with the SGR 0 reset on
+                         backspace rewind, Ctrl-C cancel, up-arrow recall, and a command
+                         executed through the editor end to end
     check-gpu            Boot the aarch64 kernel under QEMU with a virtio-gpu (pci gpu), drive
                          `gpu.virtio $ draw` (one frame, then the two-frame partial-damage run)
                          at the serial eosh prompt, screendump the scanout over QMP after each,
@@ -3858,6 +3868,163 @@ fn check_gpu(root: &Path) -> Result<(), String> {
     println!(
         "xtask: check-gpu ok — both screendumps match the expected pattern pixel-for-pixel \
          ({GPU_XRES}x{GPU_YRES}, frame 1 and the frame-2 partial-damage composite)"
+    );
+    Ok(())
+}
+
+/// Boot the kernel to the eosh prompt and drive the per-keystroke editor (read-key M2)
+/// with raw console bytes: TAB completion (candidate list and unique-completion forms),
+/// the SGR 31 inadmissible-input marker on a deliberately invalid character, the SGR 0
+/// reset when backspace rewinds past it, Ctrl-C line cancel, and a command executed
+/// through the editor end to end.
+fn check_repl(root: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::sync::mpsc;
+
+    let arch = "aarch64";
+    let image = build_kernel(root, arch)?;
+
+    println!(
+        "xtask: check-repl — booting {} and driving the eosh per-key editor with raw \
+         console bytes (TAB, an invalid char, backspace, Ctrl-C)",
+        image.display()
+    );
+
+    let mut command = Command::new(format!("qemu-system-{arch}"));
+    command
+        .current_dir(root)
+        .args(["-M", "virt,gic-version=2,highmem=off", "-cpu", "max"])
+        .args(["-device", "virtio-rng-pci"])
+        .args(["-smp", "1", "-m", KERNEL_QEMU_MEMORY, "-nographic"])
+        .arg("-kernel")
+        .arg(&image)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("check-repl: failed to spawn qemu-system-{arch}: {err}"))?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+
+    // Reader thread: forward serial bytes over a channel so waits can time out.
+    let (sender, receiver) = mpsc::channel::<u8>();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut stdout = stdout;
+        let mut byte = [0u8; 1];
+        while let Ok(n) = stdout.read(&mut byte) {
+            if n == 0 || sender.send(byte[0]).is_err() {
+                break;
+            }
+        }
+    });
+
+    /// Accumulate serial output until `marker` appears, or time out. Each call starts
+    /// a fresh buffer, so a sequence of waits asserts ordering on the stream.
+    fn wait_for(receiver: &mpsc::Receiver<u8>, marker: &str, what: &str) -> Result<String, String> {
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + GPU_STEP_TIMEOUT;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| {
+                    format!(
+                        "check-repl: timed out waiting for {what} (last output: …{:?})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    )
+                })?;
+            match receiver.recv_timeout(remaining) {
+                Ok(byte) => {
+                    seen.push(byte as char);
+                    if seen.contains(marker) {
+                        return Ok(seen);
+                    }
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "check-repl: the serial stream ended or timed out waiting for {what} \
+                         (last output: …{:?})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Send raw bytes at human pace (the editor is per-keystroke; pacing also keeps the
+    /// echo assertions readable in the transcript). No newline is appended — the bytes
+    /// ARE the keystrokes, control bytes included.
+    fn send_bytes(stdin: &mut std::process::ChildStdin, bytes: &[u8]) -> Result<(), String> {
+        for byte in bytes {
+            stdin
+                .write_all(core::slice::from_ref(byte))
+                .map_err(|err| format!("check-repl: writing to the console: {err}"))?;
+            stdin
+                .flush()
+                .map_err(|err| format!("check-repl: flushing the console: {err}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        Ok(())
+    }
+
+    let drive = (|| -> Result<(), String> {
+        wait_for(&receiver, "eosh> ", "the eosh prompt")?;
+
+        // 1. Ambiguous TAB: `hel` matches the program `hello` and the builtin `help`
+        //    — the editor lists the candidates on their own line and repaints.
+        send_bytes(&mut stdin, b"hel\t")?;
+        wait_for(&receiver, "hello  help", "the TAB candidate list")?;
+        wait_for(&receiver, "eosh> hel", "the prompt+line repaint after the list")?;
+
+        // 2. Finish the word and execute through the editor: the line runs through
+        //    the same execute_line as every other path.
+        send_bytes(&mut stdin, b"lo --name m2\r")?;
+        wait_for(&receiver, "Hello, m2.", "the program output")?;
+        wait_for(&receiver, "ok:", "the command outcome")?;
+        wait_for(&receiver, "eosh> ", "the prompt after the run")?;
+
+        // 3. Unique TAB completion: `time.fr` can only be `time.frozen` — the editor
+        //    appends `ozen ` (completion plus the trailing space)…
+        send_bytes(&mut stdin, b"time.fr\t")?;
+        wait_for(&receiver, "time.frozen ", "the unique completion")?;
+        //    …and Ctrl-C cancels the line (the editor's ^C echo, then a fresh prompt).
+        send_bytes(&mut stdin, &[0x03])?;
+        wait_for(&receiver, "^C", "the Ctrl-C echo")?;
+        wait_for(&receiver, "eosh> ", "the prompt after Ctrl-C")?;
+
+        // 4. The inadmissible-input marker: `help` takes no arguments, so the `x`
+        //    after `help ` has no viable parse — SGR 31 opens exactly before its echo.
+        send_bytes(&mut stdin, b"help x")?;
+        wait_for(&receiver, "\u{1b}[31mx", "the SGR 31 marker on the dead char")?;
+        //    Backspace rewinds to the red boundary: erase + SGR 0.
+        send_bytes(&mut stdin, &[0x7f])?;
+        wait_for(&receiver, "\u{8} \u{8}\u{1b}[0m", "the SGR 0 reset on rewind")?;
+        //    The surviving `help ` (one more backspace tidies the space) executes.
+        send_bytes(&mut stdin, &[0x7f, b'\r'])?;
+        wait_for(&receiver, "builtins:", "the help text")?;
+        wait_for(&receiver, "eosh> ", "the prompt after help")?;
+
+        // 5. Up-arrow recall: ESC [ A recalls the newest history entry (`help`).
+        send_bytes(&mut stdin, &[0x1b, b'[', b'A'])?;
+        wait_for(&receiver, "help", "the recalled line")?;
+        send_bytes(&mut stdin, &[0x03])?;
+        wait_for(&receiver, "eosh> ", "the prompt after cancelling the recall")?;
+
+        send_bytes(&mut stdin, b"exit\r")?;
+        Ok(())
+    })();
+    if let Err(err) = drive {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    let _ = child.wait();
+
+    println!(
+        "xtask: check-repl ok — TAB candidate list and unique completion, the SGR 31/0 \
+         inadmissible marker round-trip, Ctrl-C, ↑ recall, and an editor-typed command \
+         executed at the kernel console"
     );
     Ok(())
 }
