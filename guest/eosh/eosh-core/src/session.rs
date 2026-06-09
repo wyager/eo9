@@ -2174,7 +2174,11 @@ mod tests {
         let before = resolves(&session.backend.log);
         let again = block_on_ready(session.arg_hints("telnetd")).expect("memo hit");
         assert_eq!(again, hints);
-        assert_eq!(resolves(&session.backend.log), before, "memo hit re-resolved");
+        assert_eq!(
+            resolves(&session.backend.log),
+            before,
+            "memo hit re-resolved"
+        );
     }
 
     #[test]

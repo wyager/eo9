@@ -311,12 +311,7 @@ fn arg_known(cx: &Cx, program: &ProgramSlots) -> BoxP<()> {
 
 /// [`value`] plus a flag's candidate words, when it has any.
 fn value_hinted(cx: &Cx, hints: Option<Rc<Vec<HintEntry>>>) -> BoxP<()> {
-    let mut branches = vec![
-        bare_word(RESERVED),
-        compound(),
-        quoted(),
-        paren_expr(cx),
-    ];
+    let mut branches = vec![bare_word(RESERVED), compound(), quoted(), paren_expr(cx)];
     if let Some(hints) = hints {
         branches.push(hint_words(hints));
     }
@@ -331,9 +326,7 @@ fn app_from(head: BoxP<()>, cx: &Cx) -> BoxP<()> {
 
 fn app(cx: &Cx, pos: Pos) -> BoxP<()> {
     let cx2 = cx.clone();
-    bind(cap_primary(cx, pos), move |name| {
-        star_args_for(&cx2, &name)
-    })
+    bind(cap_primary(cx, pos), move |name| star_args_for(&cx2, &name))
 }
 
 fn star_amp(cx: &Cx) -> BoxP<()> {
@@ -765,9 +758,12 @@ mod tests {
         );
         // A name that is NOT in entries but carries args: harmless (the head bind
         // looks it up only when the captured word matches).
-        vocab
-            .programs
-            .insert("ghost".to_string(), ProgramArgs { flags: vec![flag("x", "bool")] });
+        vocab.programs.insert(
+            "ghost".to_string(),
+            ProgramArgs {
+                flags: vec![flag("x", "bool")],
+            },
+        );
         vocab
     }
 
@@ -1222,8 +1218,24 @@ mod tests {
         // reserved/flag/compound/multi-word/control-byte/non-ASCII flag names and
         // values, every kind tag including garbage.
         let hostile_values = [
-            "as", "let", "only", "rename", "with", "--x", "-", "[{", "{", "a b c", "", " ",
-            "\u{1b}[31m", "é", "\"q\"", "$", "5", "dhcp",
+            "as",
+            "let",
+            "only",
+            "rename",
+            "with",
+            "--x",
+            "-",
+            "[{",
+            "{",
+            "a b c",
+            "",
+            " ",
+            "\u{1b}[31m",
+            "é",
+            "\"q\"",
+            "$",
+            "5",
+            "dhcp",
         ];
         let kinds = [
             None,
@@ -1239,7 +1251,11 @@ mod tests {
             .entries
             .iter()
             .map(|(word, _)| word.clone())
-            .chain(["echo", "app", "x", "a", "tool", "interpret"].iter().map(|s| s.to_string()))
+            .chain(
+                ["echo", "app", "x", "a", "tool", "interpret"]
+                    .iter()
+                    .map(|s| s.to_string()),
+            )
             .collect();
         for (index, name) in heads.iter().enumerate() {
             let mut flags: Vec<FlagSpec> = Vec::new();
@@ -1253,7 +1269,10 @@ mod tests {
                 });
             }
             // And ordinary-looking flags carrying the hostile values/kinds.
-            for (offset, real) in ["url", "rounds", "text", "mode", "allow"].iter().enumerate() {
+            for (offset, real) in ["url", "rounds", "text", "mode", "allow"]
+                .iter()
+                .enumerate()
+            {
                 flags.push(FlagSpec {
                     name: real.to_string(),
                     ty: ["bool", "option<bool>", "u32", "string", "list<u8>"][offset].to_string(),
@@ -1280,9 +1299,29 @@ mod tests {
         }
         // Token soup biased toward flag/value shapes.
         const TOKENS: &[&str] = &[
-            "hello", "browser", "cruncher", "echo", "--url", "--rounds", "--as", "--x", "as",
-            "only", "dhcp", "5", "[{a: 1}]", "\"quoted\"", "$", "&", "(", ")", "=", "x",
-            "--verbose", "true", "é",
+            "hello",
+            "browser",
+            "cruncher",
+            "echo",
+            "--url",
+            "--rounds",
+            "--as",
+            "--x",
+            "as",
+            "only",
+            "dhcp",
+            "5",
+            "[{a: 1}]",
+            "\"quoted\"",
+            "$",
+            "&",
+            "(",
+            ")",
+            "=",
+            "x",
+            "--verbose",
+            "true",
+            "é",
         ];
         let mut rng = Rng(0x1357_9BDF_2468_ACE0);
         for _ in 0..3000 {

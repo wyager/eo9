@@ -556,8 +556,11 @@ COMMANDS:
                          with raw console bytes at the serial prompt: TAB completion (the
                          candidate list and the unique-completion forms), the SGR 31
                          inadmissible-input marker on a dead character with the SGR 0 reset on
-                         backspace rewind, Ctrl-C cancel, up-arrow recall, and a command
-                         executed through the editor end to end
+                         backspace rewind (parse-dead `help x` AND name-dead `net.x` — the M3
+                         vocabulary mark), Ctrl-C cancel, up-arrow recall, a command executed
+                         through the editor end to end, and the M3 argument completion
+                         (`net.l4.over-l2 --a` TAB → `--address`; TAB in the value position
+                         lists the manual's `dhcp`)
     check-gpu            Boot the aarch64 kernel under QEMU with a virtio-gpu (pci gpu), drive
                          `gpu.virtio $ draw` (one frame, then the two-frame partial-damage run)
                          at the serial eosh prompt, screendump the scanout over QMP after each,
@@ -4053,6 +4056,48 @@ fn check_repl(root: &Path) -> Result<(), String> {
             "the prompt after cancelling the recall",
         )?;
 
+        // 6. Vocabulary-aware marking (repl M3): `net.x` cannot prefix-extend to any
+        //    /bin name (net.virtio, net.l4.over-l2, …) — the parser stays loose but
+        //    the editor knows resolution must fail: SGR 31 opens exactly at the `x`,
+        //    and backspace to the dead point closes it (SGR 0).
+        send_bytes(&mut stdin, b"net.x")?;
+        wait_for(
+            &receiver,
+            "\u{1b}[31mx",
+            "the name-dead SGR 31 marker on the x",
+        )?;
+        send_bytes(&mut stdin, &[0x7f])?;
+        wait_for(
+            &receiver,
+            "\u{8} \u{8}\u{1b}[0m",
+            "the SGR 0 reset on the name-dead rewind",
+        )?;
+        send_bytes(&mut stdin, &[0x03])?;
+        wait_for(&receiver, "eosh> ", "the prompt after cancelling net.")?;
+
+        // 7. Argument completion (repl M3): the space after the program name resolves
+        //    it into the session's argument memo (describe + the eo9-manual section);
+        //    `--a` TAB completes the flag from the signature, TAB in the value
+        //    position lists the manual's additive candidate, and a typed prefix of it
+        //    completes normally.
+        send_bytes(&mut stdin, b"net.l4.over-l2 --a\t")?;
+        wait_for(&receiver, "ddress ", "the flag completion --a -> --address")?;
+        send_bytes(&mut stdin, b"\t")?;
+        wait_for(&receiver, "dhcp", "the manual's value candidate listed")?;
+        wait_for(
+            &receiver,
+            "eosh> net.l4.over-l2 --address ",
+            "the repaint after the value list",
+        )?;
+        send_bytes(&mut stdin, b"dh\t")?;
+        wait_for(&receiver, "cp ", "the typed-prefix value completion")?;
+        send_bytes(&mut stdin, &[0x03])?;
+        wait_for(
+            &receiver,
+            "eosh> ",
+            "the prompt after cancelling the completion line",
+        )?;
+
         send_bytes(&mut stdin, b"exit\r")?;
         Ok(())
     })();
@@ -4065,8 +4110,10 @@ fn check_repl(root: &Path) -> Result<(), String> {
 
     println!(
         "xtask: check-repl ok — TAB candidate list and unique completion, the SGR 31/0 \
-         inadmissible marker round-trip, Ctrl-C, ↑ recall, and an editor-typed command \
-         executed at the kernel console"
+         inadmissible marker round-trip (parse-dead AND the M3 name-dead `net.x`), \
+         Ctrl-C, ↑ recall, an editor-typed command executed at the kernel console, and \
+         the M3 argument completion (`net.l4.over-l2 --a` → `--address`, the manual's \
+         `dhcp` value candidate)"
     );
     Ok(())
 }

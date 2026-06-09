@@ -267,9 +267,7 @@ impl Editor {
                 .entries
                 .iter()
                 .any(|(entry, tag)| *tag == Tag::Program && entry == word);
-            if known
-                && !self.vocab.programs.contains_key(word)
-                && !wanted.iter().any(|w| w == word)
+            if known && !self.vocab.programs.contains_key(word) && !wanted.iter().any(|w| w == word)
             {
                 wanted.push(String::from(word));
             }
@@ -1443,7 +1441,10 @@ mod tests {
         ed.take_output();
         // Nothing typed: the typed candidates list (never auto-filled).
         ed.handle(Key::Tab);
-        assert_eq!(ed.take_output(), "\r\nfalse  true\r\neosh> hello --verbose ");
+        assert_eq!(
+            ed.take_output(),
+            "\r\nfalse  true\r\neosh> hello --verbose "
+        );
         // A typed prefix completes.
         type_text(&mut ed, "t");
         ed.take_output();
@@ -1558,9 +1559,15 @@ mod tests {
         fresh.line = ed.line.clone();
         fresh.rebuild();
         let line = String::from_utf8_lossy(&ed.line);
-        assert_eq!(ed.red_from, fresh.red_from, "red_from at {context} ({line:?})");
+        assert_eq!(
+            ed.red_from, fresh.red_from,
+            "red_from at {context} ({line:?})"
+        );
         assert_eq!(ed.in_word, fresh.in_word, "in_word at {context} ({line:?})");
-        assert_eq!(ed.tracking, fresh.tracking, "tracking at {context} ({line:?})");
+        assert_eq!(
+            ed.tracking, fresh.tracking,
+            "tracking at {context} ({line:?})"
+        );
         assert_eq!(
             ed.stack.len(),
             fresh.stack.len(),
@@ -1574,7 +1581,9 @@ mod tests {
         let comps = |state: &BoxP<()>| {
             let mut out = Vec::new();
             state.completions(&mut out);
-            out.sort_by(|a: &crate::inc::Completion, b| (&a.word, a.matched).cmp(&(&b.word, b.matched)));
+            out.sort_by(|a: &crate::inc::Completion, b| {
+                (&a.word, a.matched).cmp(&(&b.word, b.matched))
+            });
             out
         };
         assert_eq!(
