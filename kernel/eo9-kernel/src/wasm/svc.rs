@@ -397,6 +397,24 @@ fn service_linker(
             Box::pin(async move { Ok((Ok(None),)) })
         },
     )?;
+    text.func_wrap_concurrent(
+        "read-key",
+        |_accessor: &Accessor<KernelState>,
+         (_cap,): (Resource<ServiceTextCap>,)|
+         -> ConcurrentFuture<
+            '_,
+            (
+                core::result::Result<
+                    Option<super::providers::WitKey>,
+                    super::providers::WitTextError,
+                >,
+            ),
+        > {
+            // The typed refusal: a captured stream has no keystrokes; a detached eosh
+            // probes this once and falls back to read-line (which answers end of input).
+            Box::pin(async move { Ok((Err(super::providers::WitTextError::Unsupported),)) })
+        },
+    )?;
 
     // The rt riders: the panic-message sink (carries no authority).
     super::providers::add_diagnostics(&mut linker)?;

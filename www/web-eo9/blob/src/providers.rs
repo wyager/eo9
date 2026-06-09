@@ -211,12 +211,46 @@ enum WitOutputStream {
 
 #[derive(Clone, ComponentType, Lift, Lower)]
 #[component(variant)]
-#[allow(dead_code)] // the page terminal cannot fail; the arms satisfy the interface type
+// The page terminal cannot fail (Closed/Io satisfy the interface type); Unsupported is
+// the `read-key` answer — the page input box is line-based, so eosh falls back to its
+// read-line loop here.
+#[allow(dead_code)]
 enum WitTextError {
     #[component(name = "closed")]
     Closed,
+    #[component(name = "unsupported")]
+    Unsupported,
     #[component(name = "io")]
     Io(String),
+}
+
+/// `eo9:text/text.key` — the `read-key` payload. Never constructed here (the page
+/// terminal is line-based and `read-key` answers `unsupported`); the type exists so the
+/// host function's signature matches the interface.
+#[derive(Clone, Copy, ComponentType, Lift, Lower)]
+#[component(variant)]
+#[allow(dead_code)]
+enum WitKey {
+    #[component(name = "char")]
+    Char(u8),
+    #[component(name = "enter")]
+    Enter,
+    #[component(name = "backspace")]
+    Backspace,
+    #[component(name = "tab")]
+    Tab,
+    #[component(name = "up")]
+    Up,
+    #[component(name = "down")]
+    Down,
+    #[component(name = "left")]
+    Left,
+    #[component(name = "right")]
+    Right,
+    #[component(name = "ctrl")]
+    Ctrl(u8),
+    #[component(name = "eof")]
+    Eof,
 }
 
 #[derive(Clone, Copy, ComponentType, Lift, Lower)]
@@ -443,6 +477,18 @@ fn add_text(linker: &mut Linker<WebState>) -> Result<()> {
                 accessor.with(|mut access| access.data_mut().flush_partial_lines());
                 Ok((Ok(host::read_line(MAX_READ_LINE_BYTES)),))
             })
+        },
+    )?;
+
+    // Per-key input: the page terminal's input box is line-based (the browser owns its
+    // editing), so the typed refusal sends eosh down its read-line path. Wiring real
+    // keydown events through JSPI is a possible follow-up.
+    text.func_wrap_concurrent(
+        "read-key",
+        |_accessor: &Accessor<WebState>,
+         (_cap,): (Resource<TextCap>,)|
+         -> ConcurrentFuture<'_, (core::result::Result<Option<WitKey>, WitTextError>,)> {
+            Box::pin(async move { Ok((Err(WitTextError::Unsupported),)) })
         },
     )?;
 

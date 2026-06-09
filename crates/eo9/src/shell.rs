@@ -27,8 +27,6 @@ use eo9_store::{Name, Store};
 
 use crate::cli::{Config, vlog};
 use crate::compile;
-use crate::complete::ShellCompleter;
-use crate::interactive::InteractiveText;
 use crate::providers;
 use crate::run;
 use crate::seed;
@@ -50,7 +48,7 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
     }
 
     let eosh = resolve_eosh(cfg, &store)?;
-    let (session_root, session_names) = materialize_session(cfg, &store)?;
+    let (session_root, _session_names) = materialize_session(cfg, &store)?;
 
     // The session manifest: what this session holds and what children receive, written
     // where eosh can read it with its own fs capability (the `env` builtin renders it).
@@ -62,13 +60,14 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
         eprintln!("eo9: warning: cannot write the session manifest (`env` will say less): {err}");
     }
 
-    // Interactive sessions on a real terminal get the line editor (history + tab
-    // completion over the session's names); piped input and `-c` keep the plain
-    // provider so transcripts behave exactly as before.
+    // Interactive sessions on a real terminal get the raw-capable text provider: its
+    // `read-key` makes eosh run its own in-shell line editor (history, grammar-aware
+    // tab completion, the inadmissible-input marker — one editor for every transport).
+    // Piped input and `-c` keep the plain provider, whose `read-key` answers
+    // `unsupported`, so eosh falls back to the read-line loop and transcripts behave
+    // exactly as before.
     let interactive =
         command.is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let editor = interactive
-        .then(|| InteractiveText::new(ShellCompleter::new(session_names, cfg.fs_root.clone())));
 
     let loaded = compile::load_image(cfg, &store, &eosh)?;
 
@@ -77,8 +76,13 @@ pub fn cmd_shell(cfg: &Config, command: Option<String>) -> Result<u8, String> {
     let registry = cfg
         .svc
         .then(|| eo9_runtime::ServiceRegistry::new(loaded.image.engine()));
-    let shell_providers =
-        providers::shell_providers(cfg, &session_root, &loaded.image, editor, registry.as_ref())?;
+    let shell_providers = providers::shell_providers(
+        cfg,
+        &session_root,
+        &loaded.image,
+        interactive,
+        registry.as_ref(),
+    )?;
 
     // Spawn-time visibility of what children inherit (user-study finding #8): the full
     // picture is in the session manifest that `env` renders, but a `-v` line states it up
@@ -227,7 +231,8 @@ fn resolve_eosh(cfg: &Config, store: &Store) -> Result<ProgramSource, String> {
 /// the next start.
 ///
 /// Returns the session directory and the program names placed into the bin view (the
-/// names eosh can resolve — also the shell's tab-completion candidates).
+/// names eosh can resolve; eosh's editor reads them back through `ls /bin` for its own
+/// tab completion).
 pub(crate) fn materialize_session(
     cfg: &Config,
     store: &Store,

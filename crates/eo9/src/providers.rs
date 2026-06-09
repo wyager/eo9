@@ -27,8 +27,8 @@ use eo9_providers_unix::fs::{
     FsProvider as UnixFs, ImmutableHost, NodeKind as UnixNodeKind, OpenFlags as UnixOpenFlags,
 };
 use eo9_providers_unix::text::{
-    OutputStream as UnixOutputStream, ReadLineCompletion, TextError as UnixTextError, TextHost,
-    TextProvider as UnixText,
+    KeyEvent as UnixKeyEvent, OutputStream as UnixOutputStream, ReadKeyCompletion,
+    ReadLineCompletion, TextError as UnixTextError, TextHost, TextProvider as UnixText,
 };
 use eo9_providers_unix::time::{TimeHost, TimeProvider as UnixTime};
 use eo9_providers_unix::{BlockingPool, OwnedBuffer, completer};
@@ -36,7 +36,7 @@ use eo9_runtime::providers::{
     BoxOp, DiskError, DiskProvider, FsError, FsHandle, FsProvider, NodeKind, NodeStat, OpenFlags,
 };
 use eo9_runtime::{
-    ChildPolicy, Datetime, EntropyProvider, ExecProvider, Image, OutputStream, Providers,
+    ChildPolicy, Datetime, EntropyProvider, ExecProvider, Image, Key, OutputStream, Providers,
     SharedRegistry, SvcGrant, Task, TextError, TextProvider, TimeProvider,
 };
 
@@ -74,7 +74,6 @@ impl<T: Send + 'static> Future for Oneshot<T> {
 /// A one-shot operation: the [`BoxOp`] future the runtime polls, and the completion
 /// closure handed to the provider. The unix providers guarantee exactly-once completion
 /// (on the success and error path alike), so the future can never be left dangling.
-/// (Also used by the interactive shell's text provider in `interactive.rs`.)
 pub(crate) fn oneshot<T: Send + 'static>() -> (BoxOp<T>, impl FnOnce(T) + Send + 'static) {
     let state = Arc::new(Mutex::new(OneshotState {
         value: None,
@@ -98,7 +97,12 @@ pub(crate) fn oneshot<T: Send + 'static>() -> (BoxOp<T>, impl FnOnce(T) + Send +
 // Provider adapters
 // ---------------------------------------------------------------------------------------
 
-/// `eo9:text/text` backed by the process's standard streams.
+/// `eo9:text/text` backed by the process's standard streams. With the plain
+/// `UnixText::stdio()` inside, `read_key` answers `Unsupported` and eosh falls back to
+/// its classic read-line loop; with `UnixText::stdio_interactive()` (the shell's
+/// interactive sessions), `read_key` serves decoded keystrokes from the raw terminal
+/// and eosh runs its own in-shell editor — the host-side line editor this replaces
+/// lived in the retired `editor.rs`/`complete.rs`/`interactive.rs`.
 struct StdioText {
     inner: UnixText,
 }
@@ -120,11 +124,37 @@ impl TextProvider for StdioText {
             }));
         op
     }
+
+    fn read_key(&mut self) -> BoxOp<Result<Option<Key>, TextError>> {
+        let (op, complete) = oneshot();
+        self.inner
+            .read_key(completer(move |result: ReadKeyCompletion| {
+                complete(result.map(|key| key.map(key_event)).map_err(text_error));
+            }));
+        op
+    }
+}
+
+/// The unix provider's decoded keystroke, as the runtime's `Key`.
+fn key_event(event: UnixKeyEvent) -> Key {
+    match event {
+        UnixKeyEvent::Char(byte) => Key::Char(byte),
+        UnixKeyEvent::Enter => Key::Enter,
+        UnixKeyEvent::Backspace => Key::Backspace,
+        UnixKeyEvent::Tab => Key::Tab,
+        UnixKeyEvent::Up => Key::Up,
+        UnixKeyEvent::Down => Key::Down,
+        UnixKeyEvent::Left => Key::Left,
+        UnixKeyEvent::Right => Key::Right,
+        UnixKeyEvent::Ctrl(byte) => Key::Ctrl(byte),
+        UnixKeyEvent::Eof => Key::Eof,
+    }
 }
 
 fn text_error(err: UnixTextError) -> TextError {
     match err {
         UnixTextError::Closed => TextError::Closed,
+        UnixTextError::Unsupported => TextError::Unsupported,
         UnixTextError::Io(message) => TextError::Io(message),
     }
 }
@@ -923,21 +953,30 @@ fn session_overlay_fs(
 /// `only eo9:text/text $ prog` strips exec and fs, and a program that cannot run without
 /// a sealed required capability is refused before it starts.
 ///
-/// `editor` replaces the plain stdio text provider with the interactive line editor
-/// (history + tab completion) when the session is interactive; it changes how the shell's
-/// input is typed, not what is granted (children always get the plain stdio text
-/// provider).
+/// `interactive` swaps the shell's own text provider for the raw-capable one
+/// (`UnixText::stdio_interactive()`): its `read-key` serves decoded keystrokes, which
+/// makes eosh run its in-shell editor (history + grammar-aware tab completion + the
+/// inadmissible-input marker) instead of the read-line loop. It changes how the
+/// shell's input is typed, not what is granted — children always get the plain stdio
+/// text provider, whose `read-key` answers `unsupported`.
 pub fn shell_providers(
     cfg: &Config,
     session_root: &Path,
     image: &Image,
-    editor: Option<crate::interactive::InteractiveText>,
+    interactive: bool,
     registry: Option<&SharedRegistry>,
 ) -> Result<Providers, String> {
     // `--svc` grants the shell itself (one generation); children never inherit it
     // (owner ruling B: detaching is an explicit grant).
     let svc_generations = if registry.is_some() { 1 } else { 0 };
-    session_providers(cfg, session_root, image, editor, registry, svc_generations)
+    session_providers(
+        cfg,
+        session_root,
+        image,
+        interactive,
+        registry,
+        svc_generations,
+    )
 }
 
 /// The providers granted to the `init` task (`eo9 init`): the same session environment
@@ -951,7 +990,7 @@ pub fn init_providers(
     image: &Image,
     registry: &SharedRegistry,
 ) -> Result<Providers, String> {
-    session_providers(cfg, session_root, image, None, Some(registry), 2)
+    session_providers(cfg, session_root, image, false, Some(registry), 2)
 }
 
 /// The generalized session-environment factory behind [`shell_providers`] and
@@ -962,7 +1001,7 @@ fn session_providers(
     cfg: &Config,
     session_root: &Path,
     image: &Image,
-    editor: Option<crate::interactive::InteractiveText>,
+    interactive: bool,
     registry: Option<&SharedRegistry>,
     svc_generations: u32,
 ) -> Result<Providers, String> {
@@ -1046,8 +1085,10 @@ fn session_providers(
     *slot.lock().unwrap() = Some(Arc::clone(&make));
 
     let mut providers = make(svc_generations);
-    if let Some(editor) = editor {
-        providers.text = Some(Box::new(editor));
+    if interactive {
+        providers.text = Some(Box::new(StdioText {
+            inner: UnixText::stdio_interactive(),
+        }));
     }
     Ok(providers)
 }

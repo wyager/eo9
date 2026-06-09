@@ -22,11 +22,8 @@
 
 mod cli;
 mod compile;
-mod complete;
 mod describe;
-mod editor;
 mod initcmd;
-mod interactive;
 mod mkfs;
 mod providers;
 mod run;

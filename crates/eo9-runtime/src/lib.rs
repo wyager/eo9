@@ -32,7 +32,7 @@ pub use exec::{ChildPolicy, ExecProvider};
 pub use image::{CompileError, Image};
 pub use outcome::{Outcome, WaveValue};
 pub use providers::{
-    Datetime, DiskError, DiskProvider, EntropyProvider, FsError, FsHandle, FsProvider, MemFs,
+    Datetime, DiskError, DiskProvider, EntropyProvider, FsError, FsHandle, FsProvider, Key, MemFs,
     NodeKind, NodeStat, OpenFlags, OutputStream, Providers, TextError, TextProvider, TimeProvider,
 };
 pub use svc::{

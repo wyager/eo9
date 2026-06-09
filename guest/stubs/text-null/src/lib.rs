@@ -57,6 +57,11 @@ impl text::Guest for Stub {
     async fn read_line(_t: text::TextImplBorrow<'_>) -> Result<Option<String>, TextError> {
         Ok(None)
     }
+
+    /// Per-key input mirrors read-line: stdin is permanently at end of input.
+    async fn read_key(_t: text::TextImplBorrow<'_>) -> Result<Option<text::Key>, TextError> {
+        Ok(None)
+    }
 }
 
 export!(Stub);

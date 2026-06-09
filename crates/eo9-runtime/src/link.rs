@@ -32,7 +32,8 @@ use wasmtime::component::{
 use wasmtime::{Result, StoreContextMut};
 
 use crate::providers::{
-    Datetime, DiskError, FsError, NodeKind, OpenFlags, OutputStream, Providers, TextError,
+    Datetime, DiskError, FsError, Key as ProviderKey, NodeKind, OpenFlags, OutputStream, Providers,
+    TextError,
 };
 use crate::task::TaskState;
 
@@ -149,6 +150,8 @@ impl From<WitOutputStream> for OutputStream {
 enum WitTextError {
     #[component(name = "closed")]
     Closed,
+    #[component(name = "unsupported")]
+    Unsupported,
     #[component(name = "io")]
     Io(String),
 }
@@ -157,7 +160,54 @@ impl From<TextError> for WitTextError {
     fn from(value: TextError) -> Self {
         match value {
             TextError::Closed => WitTextError::Closed,
+            TextError::Unsupported => WitTextError::Unsupported,
             TextError::Io(message) => WitTextError::Io(message),
+        }
+    }
+}
+
+/// `eo9:text/text.key` — one decoded keystroke. Variant order matches the WIT
+/// declaration.
+#[derive(Clone, Copy, ComponentType, Lift, Lower)]
+#[component(variant)]
+// Constructed host-side and lowered into the guest; `Lift` exists for shape symmetry.
+#[allow(dead_code)]
+enum WitKey {
+    #[component(name = "char")]
+    Char(u8),
+    #[component(name = "enter")]
+    Enter,
+    #[component(name = "backspace")]
+    Backspace,
+    #[component(name = "tab")]
+    Tab,
+    #[component(name = "up")]
+    Up,
+    #[component(name = "down")]
+    Down,
+    #[component(name = "left")]
+    Left,
+    #[component(name = "right")]
+    Right,
+    #[component(name = "ctrl")]
+    Ctrl(u8),
+    #[component(name = "eof")]
+    Eof,
+}
+
+impl From<ProviderKey> for WitKey {
+    fn from(value: ProviderKey) -> Self {
+        match value {
+            ProviderKey::Char(byte) => WitKey::Char(byte),
+            ProviderKey::Enter => WitKey::Enter,
+            ProviderKey::Backspace => WitKey::Backspace,
+            ProviderKey::Tab => WitKey::Tab,
+            ProviderKey::Up => WitKey::Up,
+            ProviderKey::Down => WitKey::Down,
+            ProviderKey::Left => WitKey::Left,
+            ProviderKey::Right => WitKey::Right,
+            ProviderKey::Ctrl(byte) => WitKey::Ctrl(byte),
+            ProviderKey::Eof => WitKey::Eof,
         }
     }
 }
@@ -338,6 +388,8 @@ impl From<DiskError> for WitDiskWriteError {
 
 /// The payload of `eo9:text/text.read-line`.
 type ReadLineItem = Result<Option<String>, WitTextError>;
+/// The payload of `eo9:text/text.read-key`.
+type ReadKeyItem = Result<Option<WitKey>, WitTextError>;
 /// The return value of the owned-buffer fs reads (`read` / `exec-read`).
 type FsReadReturn = (Resource<BufferRes>, Result<WitReadResult, WitFsError>);
 /// The return value of the owned-buffer fs write.
@@ -542,6 +594,23 @@ fn add_text(linker: &mut Linker<TaskState>) -> Result<()> {
                     Ok(access.data_mut().text_provider()?.read_line())
                 })?;
                 Ok((op.await.map_err(WitTextError::from),))
+            })
+        },
+    )?;
+
+    text.func_wrap_concurrent(
+        "read-key",
+        |accessor: &Accessor<TaskState>,
+         (_cap,): (Resource<TextCap>,)|
+         -> ConcurrentFuture<'_, (ReadKeyItem,)> {
+            Box::pin(async move {
+                let op = accessor.with(|mut access| -> Result<_> {
+                    Ok(access.data_mut().text_provider()?.read_key())
+                })?;
+                Ok((op
+                    .await
+                    .map(|key| key.map(WitKey::from))
+                    .map_err(WitTextError::from),))
             })
         },
     )?;
