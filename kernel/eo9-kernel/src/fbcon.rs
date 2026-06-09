@@ -469,12 +469,23 @@ mod tee {
         crate::kprintln!("fbcon: active {COLS}x{ROWS}");
     }
 
+    /// Serial-only print window: bytes printed while muted skip the framebuffer
+    /// (serial carries them). Used for periodic chatter — the watchdog heartbeat —
+    /// that would otherwise scroll the HDMI console forever.
+    static MUTED: AtomicBool = AtomicBool::new(false);
+
+    /// Mute or unmute the framebuffer tee around a serial-only print (single boot
+    /// core: callers bracket one print, so no nesting bookkeeping is needed).
+    pub fn set_tee_mute(muted: bool) {
+        MUTED.store(muted, Ordering::Relaxed);
+    }
+
     /// The per-byte tee, called from the console TX chokepoint (`uart::put_byte`).
     /// Inactive cost: one relaxed load. Never blocks: re-entry (an exception or panic
     /// printing while a tee is in progress) skips the framebuffer for those bytes —
     /// serial still carries them.
     pub fn tee_byte(byte: u8) {
-        if !ACTIVE.load(Ordering::Relaxed) {
+        if !ACTIVE.load(Ordering::Relaxed) || MUTED.load(Ordering::Relaxed) {
             return;
         }
         if BUSY.swap(true, Ordering::Acquire) {
@@ -496,7 +507,15 @@ mod tee {
     target_arch = "aarch64",
     feature = "board-opi5plus"
 ))]
-pub use tee::{activate, tee_byte};
+pub use tee::{activate, set_tee_mute, tee_byte};
+
+#[cfg(not(all(
+    target_os = "none",
+    target_arch = "aarch64",
+    feature = "board-opi5plus"
+)))]
+#[allow(dead_code)]
+pub fn set_tee_mute(_muted: bool) {}
 
 // -------------------------------------------------------------------------------------
 // Host tests

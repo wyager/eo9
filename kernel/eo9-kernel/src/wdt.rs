@@ -142,7 +142,11 @@ fn heartbeat() {
     let now = crate::timer::uptime_ns();
     if now >= NEXT_HB_NS.load(Ordering::Relaxed) {
         NEXT_HB_NS.store(now + HB_PERIOD_NS, Ordering::Relaxed);
+        // Serial-only: the heartbeat is bench liveness chatter — on the HDMI
+        // console it would scroll real content away every five seconds.
+        crate::fbcon::set_tee_mute(true);
         crate::kprintln!("hb {}", now / 1_000_000);
+        crate::fbcon::set_tee_mute(false);
     }
 }
 
