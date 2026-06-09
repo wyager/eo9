@@ -47,6 +47,32 @@ banner = echo --text hello-from-a-service restart restart.never
 console = eosh
 ";
 
+/// The demo-station config (the `station` boot token; docs/board/usb-boot-demo-plan.md
+/// part B): the always-on USB keyboard service plus the console. The service line is a
+/// composition — init's config grammar folds the `$` chain with the component algebra —
+/// and the registry links the boot-granted operator roots into the service (svc.rs:
+/// operator-authored config lines are console-equivalent trust), so the keyboard is
+/// live at the prompt with zero typed commands. Boot it with the grants the line
+/// needs: `station platform console-sink` on the board (plus pci/kexec/fbcon as the
+/// demo wants them).
+#[cfg(feature = "board-opi5plus")]
+const STATION_SERVICES_CONFIG: &str = "\
+# the demo station (the `station` boot token): the USB keyboard service + the console.
+kbd = usb.ohci --region usb-host0-ohci $ usb.kbd restart restart.always
+console = eosh
+";
+
+/// The QEMU shape of the station: the same chain over the PCI OHCI shell — QEMU's
+/// platform table carries no OHCI region, and `usb.ohci-pci` is the byte-identical
+/// protocol core's claim path against `-device pci-ohci`. Boot it with
+/// `station pci console-sink` (the check-station gate's exact arm).
+#[cfg(not(feature = "board-opi5plus"))]
+const STATION_SERVICES_CONFIG: &str = "\
+# the demo station (the `station` boot token): the USB keyboard service + the console.
+kbd = usb.ohci-pci $ usb.kbd restart restart.always
+console = eosh
+";
+
 /// Parse the boot arguments and run what they select. Returns `true` when the boot was
 /// handled here (a headless program or the shell ran), `false` when the caller should run
 /// the default demo sequence instead (the `demo` token, or a store image that fails to
@@ -165,7 +191,9 @@ pub fn boot(bootargs: Option<&str>) -> bool {
         // token swaps in the baked demo config (a worker under restart.always and a
         // one-shot banner) to demonstrate the service registry.
         None => {
-            let config = if tokenize(bootargs).iter().any(|token| token == "svcdemo") {
+            let config = if tokenize(bootargs).iter().any(|token| token == "station") {
+                STATION_SERVICES_CONFIG
+            } else if tokenize(bootargs).iter().any(|token| token == "svcdemo") {
                 DEMO_SERVICES_CONFIG
             } else {
                 DEFAULT_SERVICES_CONFIG

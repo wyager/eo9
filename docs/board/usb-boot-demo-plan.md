@@ -100,12 +100,18 @@ bytes are fine, but certificate validation needs WALL-CLOCK TIME (board RTC star
 epoch — everything "not yet valid" until PMIC RTC or NTP lands) and entropy
 provenance. Plan after the demo ships.
 
-### Boot composition
-BOOTARGS.TXT: `station pci platform console-sink fbcon`. `station` config:
-`keyboard = usb.kbd restart restart.always`, `console = eosh` (restart always).
-`usb.kbd` = one service component folding eo9-ohci + HID decode + console-sink
-(init lines are single-program; no composition grammar needed). New surface: ONE
-token (fbcon) + ONE config (station). The network is deliberately NOT auto-started:
+### Boot composition (LANDED 2026-06-09, area/29-svc-grants — fbcon still a gap)
+BOOTARGS.TXT: `station pci platform console-sink fbcon kexec`. The `station` boot
+token bakes the config: `kbd = usb.ohci --region usb-host0-ohci $ usb.kbd restart
+restart.always` + `console = eosh` (restart always; the QEMU build's variant chains
+`usb.ohci-pci` — no OHCI platform region there). What landed to enable it: init's
+config grammar accepts `$` chains (names + `--flag value` + `$`, nothing richer),
+and the kernel service registry links the boot-granted operator roots
+(pci/platform/gfx/kexec/console-sink) plus ambient time/entropy into services —
+operator-authored services are console-equivalent trust (SPEC "Services and
+detachment", executor-model.md "kernel refinement"). Acceptance gate:
+`cargo xtask check-station` (boot with the station token, zero typed commands,
+QMP keys execute at the prompt). The network is deliberately NOT auto-started:
 typing `net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address dhcp) $ curl …`
 on the physical keyboard IS the demo — capability composition performed live, with
 the sliced-codegen narration visible on HDMI during the fusion compile.
