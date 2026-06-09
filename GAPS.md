@@ -659,3 +659,51 @@ self-heal, but any direct `-kernel` use of the stale path bites. Lane: per-profi
 artifact paths (e.g. a `--target-dir` or renamed output per board profile) so the two
 binaries can never shadow each other; until then, sequence board builds AFTER QEMU
 gates in any battery.
+
+## USB HID input rides a 2 ms poll over a masked, already-acked interrupt (timer-crutch audit A1, 2026-06-09)
+Keystroke forwarding is a poll cadence end to end: `usb.kbd` sleeps `POLL_PACE_NS` =
+2 ms between empty `usb::read` polls (guest/stubs/usb-kbd/src/lib.rs:43,193-198) and
+the shared OHCI core masks ALL controller interrupts at bring-up ("the polled
+driver's suppression discipline", crates/eo9-ohci/src/driver.rs:243-244) — while the
+done-queue path already takes and ACKS WritebackDoneHead (driver.rs:540-553), so the
+event exists and is thrown away. Per the event-driven-liveness doctrine this is a
+class-A crutch. Cost: ≤2 ms added key latency (minor) but the always-on station kbd
+service wakes the core every 2 ms forever — the 1 s idle backstop is unreachable and
+the station config can never idle. Fix shape: unmask INT_WDH (+RHSC for the
+port-connect watch, today a 50 ms sweep) behind a wait surface; `usb::read` = arm TD,
+await interrupt, drain; keep the short poll as the fallback where interrupt waits
+answer `unsupported`. QEMU leg reachable TODAY (`usb.ohci-pci` rides eo9:pci, whose
+enable-interrupts/wait is proven by disk.virtio) — size M. Board leg blocked on
+eo9:platform interrupt routing (usb-ohci-plan risk 7, GIC SPIs 216/219) — size L.
+Full inventory: docs/study/timer-crutch-audit.md.
+
+## Idle network listeners busy-pump the core at 100% — net receive has no interrupt arm (timer-crutch audit A2, elevates plan/12 D59, 2026-06-09)
+`net.l4.over-l2`'s `wait_until` pumps with ZERO pacing between rounds
+(guest/stubs/net-l4-over-l2/src/lib.rs:769-805) and `net.text`'s accept loop retries
+4 s timed-out accepts forever (guest/stubs/net-text/src/lib.rs:395-401), so an idle
+telnetd/oskexec listener is a permanently runnable child: the kernel drive loop never
+reaches `idle_wait`, the core never sleeps, tens of thousands of host calls/s at the
+bare "waiting for a connection" state. The event exists: virtio-net RX INTx — the
+recorded D59 follow-up, stated in net-virtio's own header ("disk.virtio waits on
+them — but this driver still polls"). Doctrine elevation: this is a class-A bug, not
+a nice-to-have. Fix shape: `net.virtio` recv-frame gains an interrupt-wait arm
+(unmask RX, await INTx via the proven IntxWait path, ack ISR; poll fallback where
+unsupported); the l4 pump then parks naturally per round, no consumer changes. QEMU
+leg size M. Board leg (rtl8125) blocked on rk3588 PCIe INTx
+(arch::pci_intx::WIRED = false, deferral recorded in rk3588_pcie.rs:93) — size L;
+likely the workload class behind the board's first stranded-runnable detector hit
+(GAPS 2026-06-08). Full inventory: docs/study/timer-crutch-audit.md.
+
+## Usermode service drive loop carries a hard-coded 10 ms ambient park backstop (timer-crutch audit A3, 2026-06-09)
+`drive_with_services` parks with `Duration::from_millis(10)`
+(crates/eo9/src/run.rs:170-175) although every known wake source is already
+registered (foreground doorbell, every parked service's doorbell, the earliest
+restart deadline — providers.rs:1239-1276); the cap exists for "a wake source this
+function does not know about", which is definitionally a crutch under the doctrine.
+Cost: an idle `eo9 shell` with any detached service wakes 100×/s instead of ~1×/s.
+The event-pure shape already exists in the same file: the foreground-only
+`wait_until_runnable` parks indefinitely. Fix: mirror area/34's kernel cap
+restructure — lengthen to detector-grade (~1 s) or delete the cap and trust the
+registered wake set + the existing park-backstop liveness detector. Size S;
+SEQUENCE AFTER area/34 lands so both executors keep one doctrine shape.
+Full inventory: docs/study/timer-crutch-audit.md.
