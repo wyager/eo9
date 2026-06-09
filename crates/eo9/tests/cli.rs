@@ -983,9 +983,12 @@ fn shell_interactive_transcript_with_let_bindings() {
 
 /// Regression test for the duplicated interactive prompt: pressing Enter on a line that
 /// produces no stdout (an empty line, a parse error) must not make the next repaint show
-/// `eosh> eosh> …`. The interactive path needs a real terminal, so the shell is run
-/// inside a pseudo-terminal via script(1); the BSD invocation used here is macOS-only
-/// (which is also the only place `cargo xtask ci` runs today).
+/// `eosh> eosh> …`. Since the read-key migration this also covers the in-shell per-key
+/// editor end to end on the usermode path (raw-mode keystrokes, the SGR 31 marker on a
+/// dead character, execution through the editor). The interactive path needs a real
+/// terminal, so the shell is run inside a pseudo-terminal via script(1); the BSD
+/// invocation used here is macOS-only (which is also the only place `cargo xtask ci`
+/// runs today).
 #[test]
 #[cfg(target_os = "macos")]
 fn shell_interactive_pty_prompt_is_not_duplicated() {
@@ -1037,13 +1040,20 @@ fn shell_interactive_pty_prompt_is_not_duplicated() {
         .expect("script(1) session did not finish");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 
-    // The interactive editor ran (prompt repaints use clear-line escapes)…
+    // The in-shell per-key editor ran: `badsyntax )` opens the inadmissible-input
+    // marker (SGR 31) exactly at the `)` — the editor's signature output (the retired
+    // host editor repainted with `ESC[2K` instead; the in-eosh editor echoes
+    // incrementally and never clears the line).
     assert!(stdout.contains("eosh>"), "no prompt seen: {stdout:?}");
     assert!(
-        stdout.contains("\u{1b}[2K"),
-        "the interactive editor did not run (no repaints): {stdout:?}"
+        stdout.contains("\u{1b}[31m)"),
+        "the per-key editor did not run (no inadmissible marker on `)`): {stdout:?}"
     );
-    // …and no repaint ever stacked one prompt onto another.
+    // The program ran through the editor path…
+    assert!(stdout.contains("Hello, pty!"), "{stdout:?}");
+    // …and no prompt was ever stacked onto another (the original regression: an
+    // output-less line — empty Enter, a parse error — must not make the next prompt
+    // render as `eosh> eosh>`).
     assert!(
         !stdout.contains("eosh> eosh>"),
         "duplicated prompt in the interactive session: {stdout:?}"
