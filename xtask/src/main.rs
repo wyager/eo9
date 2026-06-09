@@ -18,6 +18,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-cruncher",
     "eo9-example-readwrite",
     "eo9-example-draw",
+    "eo9-example-sinkcheck",
     "eo9-example-sockcheck",
     "eo9-example-lspci",
     "eo9-example-platcheck",
@@ -105,6 +106,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-time-fuzzy",
     "eo9-stub-time-monotonic-stub",
     "eo9-stub-time-none",
+    "eo9-stub-usb-kbd",
     "eo9-stub-usb-ohci",
     "eo9-stub-usb-ohci-pci",
 ];
@@ -208,6 +210,12 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-example-usbcheck", "usbcheck"),
     ("eo9-example-hidcheck", "hidcheck"),
     ("eo9-example-platcheck", "platcheck"),
+    // The M4 console-input chain: the keyboard service and the sink injector
+    // (boot grant `console-sink`):
+    //   usb.ohci $ usb.kbd            (keystrokes -> the eosh prompt)
+    //   sinkcheck --text hello        (the fake-HID mechanics probe)
+    ("eo9-stub-usb-kbd", "usb.kbd"),
+    ("eo9-example-sinkcheck", "sinkcheck"),
     // The network stack for real hardware: the virtio-net driver, its link-layer
     // check, the TCP/IP middleware, and its transport-layer check, so the metal shell
     // can compose `net.virtio $ l2check` and `net.virtio $ net.l4.over-l2 $ l4check`
@@ -392,6 +400,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("check-usb", rest)?;
             check_usb(&root)
         }
+        "check-usb-hub" => {
+            expect_no_args("check-usb-hub", rest)?;
+            check_usb_hub(&root)
+        }
         "check-dhcp" => {
             expect_no_args("check-dhcp", rest)?;
             check_dhcp(&root)
@@ -528,6 +540,13 @@ COMMANDS:
                          QEMU keyboard, 0627:0001), `usb.ohci $ usbcheck` (typed no-controller
                          — no OHCI region on QEMU), and `usb.ohci-pci $ hidcheck` with QMP
                          input-send-event key injection (decoded boot-protocol keystrokes)
+    check-usb-hub        Boot the aarch64 kernel under QEMU with the keyboard BEHIND a hub
+                         (-device usb-hub + usb-kbd on its port 1) plus the console-sink
+                         grant, and drive the full M4 keyboard chain: hidcheck through the
+                         hub traversal (QMP-injected keys decoded), sinkcheck (an injected
+                         line executes at the next prompt), and `usb.ohci-pci $ usb.kbd`
+                         end to end — QMP keystrokes typed on the emulated keyboard come
+                         out as an executed eosh command
     check-telnet         Boot the aarch64 kernel under QEMU with a user-mode NIC and a slirp
                          host-forward (pci net telnet), drive `telnetd --sessions 2` at the
                          serial eosh prompt, and validate the shell-over-network end to end
@@ -2190,6 +2209,11 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
                 ("eo9-stub-usb-ohci", "usb.ohci"),
                 ("eo9-example-usbcheck", "usbcheck"),
                 ("eo9-example-hidcheck", "hidcheck"),
+                // The M4 keyboard chain (boot grants: platform + console-sink):
+                //   usb.ohci $ usb.kbd          (keystrokes -> the eosh prompt)
+                //   sinkcheck --text hello      (sink mechanics without a keyboard)
+                ("eo9-stub-usb-kbd", "usb.kbd"),
+                ("eo9-example-sinkcheck", "sinkcheck"),
                 ("eosh", "eosh"),
             ],
             "store-opi5plus-min.img",
@@ -4208,6 +4232,191 @@ fn qmp_inject_keys(socket: &Path, keys: &[&str]) -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
     }
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------------------
+// check-usb-hub: the M4 keyboard chain behind a hub (docs/board/usb-ohci-plan.md §3 M4 +
+// the hub mini-driver) — the QEMU topology mirroring the bench (keyboard behind its own
+// FS hub): -device usb-hub on root port 1, -device usb-kbd on the hub's port 1, the
+// console-sink boot grant alongside pci/platform.
+//
+//   1. `usb.ohci-pci $ hidcheck --reports 6` — the hub traversal (attach -> class 09 ->
+//      attach-child) feeding decoded QMP keystrokes through the boot protocol.
+//   2. `sinkcheck --text hello` — the console-sink mechanics: the injected line executes
+//      at the NEXT prompt (`ok: greeted`), proving ring -> read-line -> spawn.
+//   3. `usb.ohci-pci $ usb.kbd --window-ms 15000` — the whole demo chain: QMP keys typed
+//      on the emulated keyboard are decoded by the service, injected into the console
+//      ring, and EXECUTE as an eosh command once the window closes.
+// ----------------------------------------------------------------------------------------
+
+fn usb_hub_qmp_socket(root: &Path) -> PathBuf {
+    root.join("kernel")
+        .join("target")
+        .join("eo9-usb-hub-qmp.sock")
+}
+
+fn check_usb_hub(root: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::sync::mpsc;
+
+    let arch = "aarch64";
+    let image = build_kernel(root, arch)?;
+    let qmp_path = usb_hub_qmp_socket(root);
+    let _ = std::fs::remove_file(&qmp_path);
+
+    println!(
+        "xtask: check-usb-hub — booting {} with usb-kbd BEHIND usb-hub, driving the hub \
+         traversal, the console sink, and the usb.kbd service end to end",
+        image.display()
+    );
+
+    let mut command = Command::new(format!("qemu-system-{arch}"));
+    command
+        .current_dir(root)
+        .args(["-M", "virt,gic-version=2,highmem=off", "-cpu", "max"])
+        .args(["-device", "virtio-rng-pci"])
+        .args(["-smp", "1", "-m", KERNEL_QEMU_MEMORY, "-nographic"])
+        .arg("-kernel")
+        .arg(&image)
+        .args(["-append", "pci platform=pl031-rtc console-sink"])
+        .args(["-device", "pci-ohci,id=eo9ohci"])
+        .args(["-device", "usb-hub,bus=eo9ohci.0,port=1"])
+        .args(["-device", "usb-kbd,bus=eo9ohci.0,port=1.1"])
+        .arg("-qmp")
+        .arg(format!("unix:{},server=on,wait=off", qmp_path.display()))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("check-usb-hub: failed to spawn qemu-system-{arch}: {err}"))?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+
+    let (sender, receiver) = mpsc::channel::<u8>();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut stdout = stdout;
+        let mut byte = [0u8; 1];
+        while let Ok(n) = stdout.read(&mut byte) {
+            if n == 0 || sender.send(byte[0]).is_err() {
+                break;
+            }
+        }
+    });
+
+    fn wait_for(receiver: &mpsc::Receiver<u8>, marker: &str, what: &str) -> Result<String, String> {
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + USB_STEP_TIMEOUT;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| {
+                    format!(
+                        "check-usb-hub: timed out waiting for {what} (last output: …{})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    )
+                })?;
+            match receiver.recv_timeout(remaining) {
+                Ok(byte) => {
+                    seen.push(byte as char);
+                    if seen.contains(marker) {
+                        return Ok(seen);
+                    }
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "check-usb-hub: the serial stream ended or timed out waiting for \
+                         {what} (last output: …{})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    ));
+                }
+            }
+        }
+    }
+
+    fn type_line(stdin: &mut std::process::ChildStdin, line: &str) -> Result<(), String> {
+        for byte in line.as_bytes() {
+            stdin
+                .write_all(core::slice::from_ref(byte))
+                .map_err(|err| format!("check-usb-hub: writing to the console: {err}"))?;
+            stdin
+                .flush()
+                .map_err(|err| format!("check-usb-hub: flushing the console: {err}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        stdin
+            .write_all(b"\n")
+            .and_then(|()| stdin.flush())
+            .map_err(|err| format!("check-usb-hub: writing to the console: {err}"))
+    }
+
+    let drive = (|| -> Result<(), String> {
+        wait_for(&receiver, "eosh>", "the eosh prompt")?;
+
+        // Step 1: HID decode through the hub traversal.
+        type_line(&mut stdin, "usb.ohci-pci $ hidcheck --reports 6")?;
+        wait_for(
+            &receiver,
+            "the device is a hub - traversing",
+            "the hub traversal line",
+        )?;
+        wait_for(&receiver, "hidcheck: polling", "hidcheck's polling banner")?;
+        qmp_inject_keys(&qmp_path, &["h", "i", "ret"])?;
+        let output = wait_for(&receiver, "ok: reports(6)", "hidcheck's six reports")?;
+        for needle in ["'h'", "'i'", "<enter>"] {
+            if !output.contains(needle) {
+                return Err(format!(
+                    "check-usb-hub: hidcheck finished but its transcript is missing \
+                     `{needle}`"
+                ));
+            }
+        }
+        wait_for(&receiver, "eosh>", "the prompt after hidcheck")?;
+
+        // Step 2: the sink mechanics — the injected line executes at the next prompt.
+        type_line(&mut stdin, "sinkcheck --text hello")?;
+        wait_for(&receiver, "ok: injected(6)", "sinkcheck's accepted count")?;
+        wait_for(
+            &receiver,
+            "ok: greeted",
+            "the injected `hello` executing at the next prompt",
+        )?;
+        wait_for(&receiver, "eosh>", "the prompt after the injected command")?;
+
+        // Step 3: the whole chain — QMP keystrokes typed on the emulated keyboard
+        // come out as an executed eosh command.
+        type_line(&mut stdin, "usb.ohci-pci $ usb.kbd --window-ms 15000")?;
+        wait_for(
+            &receiver,
+            "usb.kbd: forwarding boot-protocol keystrokes",
+            "the usb.kbd banner",
+        )?;
+        qmp_inject_keys(&qmp_path, &["h", "e", "l", "l", "o", "ret"])?;
+        wait_for(&receiver, "ok: forwarded(6)", "usb.kbd's window close")?;
+        wait_for(
+            &receiver,
+            "ok: greeted",
+            "the keyboard-typed `hello` executing at the prompt",
+        )?;
+
+        type_line(&mut stdin, "exit")?;
+        Ok(())
+    })();
+    if let Err(err) = drive {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    let _ = child.wait();
+
+    println!(
+        "xtask: check-usb-hub ok — hub traversal enumerated the keyboard, decoded QMP \
+         keystrokes through the boot protocol, the console sink executed an injected line, \
+         and usb.kbd turned emulated-keyboard typing into an executed eosh command"
+    );
     Ok(())
 }
 

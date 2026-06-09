@@ -23,5 +23,6 @@ world sdk {
     import eo9:pci/pci@0.1.0;
     import eo9:platform/platform@0.1.0;
     import eo9:usb/usb@0.1.0;
-    import eo9:kexec/kexec@0.1.0;
+import eo9:kexec/kexec@0.1.0;
+    import eo9:console-sink/sink@0.1.0;
 }

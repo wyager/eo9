@@ -218,6 +218,9 @@ fn map_driver_error(error: DriverError<platform::PlatformError>) -> UsbError {
         DriverError::Stall => UsbError::Stall,
         DriverError::Transfer(code) => UsbError::Io(format!("usb.ohci: transfer error: {code:?}")),
         DriverError::NoSuchPort | DriverError::NotConnected => UsbError::NotFound,
+        DriverError::Hub(limitation) => {
+            UsbError::Io(format!("usb.ohci: hub traversal: {limitation}"))
+        }
         DriverError::Enumeration(error) => {
             UsbError::Io(format!("usb.ohci: enumeration: {error:?}"))
         }
@@ -369,11 +372,14 @@ struct Shell;
 /// The root-handle resource: a token — the state lives in the driver slot.
 struct UsbRoot;
 
-/// An attached device: what control transfers need to address it.
+/// An attached device: what control transfers need to address it, plus what the
+/// hub-traversal path needs (class + the configuration blob attach validated).
 struct ShellDevice {
     address: u8,
     max_packet: u8,
     low_speed: bool,
+    class: u8,
+    config: Vec<u8>,
 }
 
 /// The opened interrupt-IN endpoint (one per controller in v1 — the core owns its
@@ -426,7 +432,7 @@ impl usb::Guest for Shell {
     async fn attach(_u: types::UsbImplBorrow<'_>, port: u8) -> Result<usb::Device, UsbError> {
         let mut guard = acquire().await?;
         let mut config = [0u8; eo9_ohci::enumerate::MAX_CONFIG_BYTES];
-        let (attached, _config_len) = guard
+        let (attached, config_len) = guard
             .attach(port, &mut config)
             .await
             .map_err(map_driver_error)?;
@@ -434,6 +440,39 @@ impl usb::Guest for Shell {
             address: attached.enumerated.address,
             max_packet: attached.enumerated.max_packet_ep0,
             low_speed: attached.low_speed,
+            class: attached.enumerated.device.class,
+            config: config[..config_len].to_vec(),
+        }))
+    }
+
+    async fn attach_child(d: usb::DeviceBorrow<'_>) -> Result<usb::Device, UsbError> {
+        let hub = d.get::<ShellDevice>();
+        let (address, max_packet, low_speed, class, hub_config) = (
+            hub.address,
+            hub.max_packet,
+            hub.low_speed,
+            hub.class,
+            hub.config.clone(),
+        );
+        let mut guard = acquire().await?;
+        let mut config = [0u8; eo9_ohci::enumerate::MAX_CONFIG_BYTES];
+        let (child, config_len) = guard
+            .attach_hub_child(
+                address,
+                max_packet,
+                low_speed,
+                class,
+                &hub_config,
+                &mut config,
+            )
+            .await
+            .map_err(map_driver_error)?;
+        Ok(usb::Device::new(ShellDevice {
+            address: child.enumerated.address,
+            max_packet: child.enumerated.max_packet_ep0,
+            low_speed: child.low_speed,
+            class: child.enumerated.device.class,
+            config: config[..config_len].to_vec(),
         }))
     }
 

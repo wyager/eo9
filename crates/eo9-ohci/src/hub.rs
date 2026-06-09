@@ -15,6 +15,15 @@ pub const DESCRIPTOR_HUB: u8 = 0x29;
 /// PORT_POWER feature selector (USB 2.0 table 11-17).
 pub const FEATURE_PORT_POWER: u16 = 8;
 
+/// PORT_RESET feature selector (USB 2.0 table 11-17).
+pub const FEATURE_PORT_RESET: u16 = 4;
+
+/// C_PORT_RESET change-clear selector (USB 2.0 table 11-17).
+pub const FEATURE_C_PORT_RESET: u16 = 20;
+
+/// C_PORT_CONNECTION change-clear selector (USB 2.0 table 11-17).
+pub const FEATURE_C_PORT_CONNECTION: u16 = 16;
+
 /// GET_DESCRIPTOR(hub) — class request to the device (USB 2.0 §11.24.2.5:
 /// bmRequestType 1010_0000b, descriptor type in the high byte of wValue).
 pub fn get_hub_descriptor(length: u16) -> SetupPacket {
@@ -34,6 +43,30 @@ pub fn set_port_power(port: u8) -> SetupPacket {
         request_type: 0x23,
         request: 3, // SET_FEATURE (USB 2.0 table 9-4)
         value: FEATURE_PORT_POWER,
+        index: u16::from(port),
+        length: 0,
+    }
+}
+
+/// SET_FEATURE(PORT_RESET, port) — start the hub-timed port reset (USB 2.0
+/// §11.24.2.13/§11.5.1.5: the hub drives reset signaling for 10-20 ms and reports
+/// completion in C_PORT_RESET).
+pub fn set_port_reset(port: u8) -> SetupPacket {
+    SetupPacket {
+        request_type: 0x23,
+        request: 3, // SET_FEATURE
+        value: FEATURE_PORT_RESET,
+        index: u16::from(port),
+        length: 0,
+    }
+}
+
+/// CLEAR_FEATURE(selector, port) — acknowledge a port change bit (USB 2.0 §11.24.2.2).
+pub fn clear_port_feature(port: u8, feature: u16) -> SetupPacket {
+    SetupPacket {
+        request_type: 0x23,
+        request: 1, // CLEAR_FEATURE (USB 2.0 table 9-4)
+        value: feature,
         index: u16::from(port),
         length: 0,
     }
@@ -88,7 +121,7 @@ pub struct HubPortStatus {
     pub suspended: bool,
     pub powered: bool,
     pub speed: PortSpeed,
-    /// wPortChange (table 11-22): connect change in bit 0, …
+    /// wPortChange (table 11-22): connect change in bit 0, reset change in bit 4, …
     pub change: u16,
     /// The raw wPortStatus, for transcripts.
     pub raw: u16,
@@ -104,6 +137,11 @@ pub enum PortSpeed {
 }
 
 impl HubPortStatus {
+    /// C_PORT_RESET (wPortChange bit 4): the hub-timed reset completed.
+    pub fn reset_complete(&self) -> bool {
+        self.change & (1 << 4) != 0
+    }
+
     /// Decode a 4-byte GET_STATUS(port) response (wPortStatus + wPortChange, LE).
     pub fn parse(bytes: &[u8]) -> Option<HubPortStatus> {
         if bytes.len() < 4 {
@@ -150,6 +188,16 @@ mod tests {
             get_port_status(1).encode(),
             [0xa3, 0x00, 0x00, 0x00, 0x01, 0x00, 0x04, 0x00]
         );
+        // SET_FEATURE(PORT_RESET, port 1): 23 03 04 00 01 00 00 00.
+        assert_eq!(
+            set_port_reset(1).encode(),
+            [0x23, 0x03, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00]
+        );
+        // CLEAR_FEATURE(C_PORT_RESET, port 1): 23 01 14 00 01 00 00 00.
+        assert_eq!(
+            clear_port_feature(1, FEATURE_C_PORT_RESET).encode(),
+            [0x23, 0x01, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00]
+        );
     }
 
     #[test]
@@ -176,6 +224,10 @@ mod tests {
         assert!(low.connected && low.enabled && low.powered);
         assert_eq!(low.speed, PortSpeed::Low);
         assert_eq!(low.change, 1);
+        assert!(!low.reset_complete());
+        // Reset-complete: wPortChange bit 4.
+        let reset = HubPortStatus::parse(&[0x03, 0x01, 0x10, 0x00]).unwrap();
+        assert!(reset.reset_complete());
 
         // Full-speed: neither bit 9 nor 10.
         let full = HubPortStatus::parse(&[0x03, 0x01, 0x00, 0x00]).unwrap();

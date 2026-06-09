@@ -203,6 +203,12 @@ macro_rules! __bindings_with {
             with [$($acc)*
                 "eo9:kexec/types@0.1.0": eo9_guest::api::kexec::types,
                 "eo9:kexec/kexec@0.1.0": eo9_guest::api::kexec::kexec,
+    (apis [console_sink $($rest:ident)*] with [$($acc:tt)*] $($tail:tt)*) => {
+        $crate::__bindings_with!(
+            apis [$($rest)*]
+            with [$($acc)*
+                "eo9:console-sink/types@0.1.0": eo9_guest::api::console_sink::types,
+                "eo9:console-sink/sink@0.1.0": eo9_guest::api::console_sink::sink,
             ]
             $($tail)*
         );

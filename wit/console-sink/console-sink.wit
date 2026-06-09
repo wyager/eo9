@@ -1,0 +1,69 @@
+/// eo9:console-sink — inject bytes into the kernel console's input ring: the narrow
+/// capability that lets a USB HID keyboard service feed the serial eosh prompt
+/// (docs/board/usb-ohci-plan.md M4).
+///
+/// This is a ROOT capability with one operation and deliberate non-properties: it
+/// cannot read input, cannot observe what else is in the ring, and cannot bypass the
+/// kernel's Ctrl-C handling — an injected 0x03 is scanned exactly like a serial one
+/// (that IS the design: a USB keyboard's Ctrl-C must interrupt like the serial key).
+/// Injected bytes interleave with serial input in the one ring; ring-full injections
+/// are dropped with a kernel-side counter, never blocking (the UART FIFO is not in
+/// this path, so >64-byte lines survive where the board serial console truncates).
+///
+/// Never linked by default: writing to the console's input is the authority to TYPE
+/// AS THE OPERATOR — granted per boot by its own `console-sink` kernel command-line
+/// token (the same posture as `pci`/`platform`).
+package eo9:console-sink@0.1.0;
+
+/// Root-handle type (types-only interface — see plan/02-wit.md Decisions).
+interface types {
+    /// The sink's root handle.
+    resource sink-impl;
+}
+
+/// The one operation.
+interface sink {
+    use types.{sink-impl};
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> sink-impl;
+
+    variant sink-error {
+        /// Refused by policy.
+        denied,
+        io(string),
+    }
+
+    /// Inject bytes into the console input ring. Returns how many were accepted;
+    /// bytes beyond the ring's free space are dropped (counted kernel-side, like
+    /// paste overflow on the serial path — the console never blocks on its feeder).
+    /// Synchronous: a ring push completes inline.
+    inject: func(s: borrow<sink-impl>, bytes: list<u8>) -> result<u32, sink-error>;
+}
+
+/// console-sink.none — absence: exports an optional flavor answering `none`.
+world none {
+    export types;
+    export sink-optional;
+}
+
+/// Optional flavor (hand-written for v0; see SPEC: The capability algebra).
+interface sink-optional {
+    use types.{sink-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<sink-impl>;
+}
+
+/// console-sink.deny — refusal: exports `sink` with `inject` failing with `denied`.
+world deny {
+    export types;
+    export sink;
+    export deny-config;
+}
+
+/// Compose-time configuration entry for console-sink.deny.
+interface deny-config {
+    use types.{sink-impl};
+    configure: func() -> result<sink-impl, string>;
+}

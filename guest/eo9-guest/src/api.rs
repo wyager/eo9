@@ -63,3 +63,7 @@ pub mod usb {
 pub mod kexec {
     pub use crate::bindings::eo9::kexec::{kexec, types};
 }
+
+pub mod console_sink {
+    pub use crate::bindings::eo9::console_sink::{sink, types};
+}

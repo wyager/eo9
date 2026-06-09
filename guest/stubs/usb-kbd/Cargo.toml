@@ -1,0 +1,17 @@
+[package]
+name = "eo9-stub-usb-kbd"
+description = "Eo9 service `usb.kbd`: finds a boot-protocol USB keyboard through the composed eo9:usb provider (directly or behind one hub level), decodes reports, and forwards keystrokes into the kernel console input ring via eo9:console-sink - the M4 keyboard-to-eosh chain."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+# Descriptor parsing + HID boot decode (the host-tested core).
+eo9-ohci = { workspace = true }
+wit-bindgen = { workspace = true }

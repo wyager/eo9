@@ -222,6 +222,42 @@ pub fn take_ctrl_c() -> bool {
     false
 }
 
+/// Inject bytes into the console input ring as a SECOND producer — the M4 console-sink
+/// path (docs/board/usb-ohci-plan.md): a USB HID keyboard service feeds the same ring
+/// serial input lands in, so injected bytes interleave with serial bytes, the existing
+/// Ctrl-C scan catches an injected 0x03 exactly like a serial one, and >64-byte lines
+/// survive (no UART FIFO in this path). Returns how many bytes were accepted; ring-full
+/// bytes are dropped and counted (`INJECT_DROPPED`), never blocking the injector.
+///
+/// Producer discipline: the IRQ handler is the ring's usual producer; this runs in
+/// thread context with interrupts masked for the few stores (the same exclusion
+/// `scavenge_rx` uses), so the single-producer invariant holds throughout.
+#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
+pub fn inject_input(bytes: &[u8]) -> usize {
+    static INJECT_DROPPED: AtomicUsize = AtomicUsize::new(0);
+    // SAFETY: mask/unmask around a few ring stores, no stack or register effects.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+    let mut accepted = 0;
+    for &byte in bytes {
+        let head = RX_RING.head.load(Ordering::Relaxed);
+        let next = (head + 1) % RX_RING_CAP;
+        // Drop the byte if the ring is full rather than overwrite unread input
+        // (the serial producer's policy, applied to this producer too).
+        if next != RX_RING.tail.load(Ordering::Acquire) {
+            // SAFETY: interrupts are masked, so this thread is the sole producer;
+            // the slot is at `head`, ahead of the consumer's `tail`.
+            unsafe { (*RX_RING.buf.get())[head] = byte };
+            RX_RING.head.store(next, Ordering::Release);
+            accepted += 1;
+        } else {
+            INJECT_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    // SAFETY: restore interrupt delivery.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+    accepted
+}
+
 /// Non-destructively check whether a Ctrl-C is waiting in the input ring, without consuming
 /// it (or anything before it). The wasm `eo9:pci` provider's interrupt `wait` peeks this so a
 /// console interrupt aborts a blocked device wait promptly; the *consuming* check (and the

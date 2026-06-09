@@ -21,6 +21,8 @@
 pub mod async_demo;
 #[cfg(feature = "wasm-codegen")]
 pub mod codegen;
+#[cfg(feature = "wasm-store")]
+pub mod console_sink_provider;
 #[cfg(feature = "wasm-storedisk")]
 pub mod diskcache;
 #[cfg(feature = "wasm-store")]

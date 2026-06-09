@@ -364,6 +364,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-example-sinkcheck"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-example-sockcheck"
 version = "0.0.0"
 dependencies = [
@@ -828,6 +836,15 @@ name = "eo9-stub-time-none"
 version = "0.0.0"
 dependencies = [
  "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-usb-kbd"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "eo9-ohci",
  "wit-bindgen",
 ]
 

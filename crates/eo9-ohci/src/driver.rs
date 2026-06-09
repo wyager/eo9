@@ -11,6 +11,7 @@
 //! HcFmNumber, the controller's own 1 ms frame counter (OHCI 1.0a §7.3.3).
 
 use crate::enumerate::{Action, Enumerated, Enumeration, EnumerationError, Event};
+use crate::hub::{self, HubDescriptor, HubPortStatus};
 use crate::schedule::{
     EdDirection, EndpointDescriptor, TdPid, TdToggle, TransferDescriptor, arena, hcca,
     walk_done_queue,
@@ -66,6 +67,9 @@ pub enum DriverError<E> {
     NotConnected,
     /// The enumeration protocol failed (malformed descriptors, oversized config).
     Enumeration(EnumerationError),
+    /// The hub-traversal path refused; the literal names the demo-scope limitation
+    /// (multiple connected ports, a low-speed child, a hubless device).
+    Hub(&'static str),
     /// The done queue's pointer chain exceeded its walk bound (corrupt DMA memory).
     DoneQueueCorrupt,
 }
@@ -623,6 +627,212 @@ impl<R: RegionIo> Ohci<R> {
         ))
     }
 
+    /// Traverse ONE hub level to the single device behind it — the demo-scope hub
+    /// mini-driver (the bench keyboard sits on port 1 of its own built-in 3-port FS
+    /// hub). `hub` is the already-attached hub (class 09, full speed); the method
+    /// configures it, powers its ports, finds exactly ONE connected full-speed
+    /// child, runs the hub-timed PORT_RESET (USB 2.0 §11.5.1.5, completion via
+    /// C_PORT_RESET), and enumerates the child with the standard machine — the same
+    /// SET_ADDRESS/GET_DESCRIPTOR chain, reset mediated by hub-class requests
+    /// instead of the root-hub register.
+    ///
+    /// Deliberately NOT hub support: one level deep, one child, FS-behind-FS only
+    /// (no low-speed children — that needs nothing OHCI-side but is untested
+    /// hardware territory; refused typed until a bench device needs it), and
+    /// port-change detection is CONTROL POLLING on the caller's cadence — the hub's
+    /// status-change interrupt endpoint (255 ms on the bench hub) buys nothing for
+    /// a one-shot traversal and would occupy the one interrupt ED the schedule
+    /// carries (the HID endpoint's slot).
+    ///
+    /// The child's address is `hub address + 16` (root devices are addressed by
+    /// port number 1..=15, so 17..=31 is collision-free for one hub level).
+    pub async fn attach_hub_child(
+        &mut self,
+        hub_address: u8,
+        hub_mps: u8,
+        hub_low_speed: bool,
+        hub_class: u8,
+        hub_config: &[u8],
+        config_out: &mut [u8],
+    ) -> Result<(Attached, usize), DriverError<R::Error>> {
+        if hub_class != hub::CLASS_HUB {
+            return Err(DriverError::Hub("the attached device is not a hub"));
+        }
+        if hub_low_speed {
+            return Err(DriverError::Hub("a low-speed hub is not a USB device"));
+        }
+
+        // The hub must be configured before any port operation (USB 2.0 §11.24).
+        // Its configuration value comes from the blob the caller kept from attach().
+        let configuration = crate::descriptor::ConfigurationDescriptor::parse(hub_config)
+            .map(|c| c.configuration_value)
+            .unwrap_or(1);
+        let mut scratch = [0u8; 16];
+        self.control(
+            hub_address,
+            hub_mps,
+            hub_low_speed,
+            crate::setup::set_configuration(configuration),
+            &mut [],
+        )
+        .await?;
+
+        // Hub descriptor head: port count + power-good time.
+        let received = self
+            .control(
+                hub_address,
+                hub_mps,
+                hub_low_speed,
+                hub::get_hub_descriptor(9),
+                &mut scratch[..9],
+            )
+            .await?;
+        let descriptor = HubDescriptor::parse(&scratch[..received])
+            .ok_or(DriverError::Hub("the hub descriptor did not parse"))?;
+
+        // Power every port, wait the hub's own declared power-good time (+ slack).
+        for port in 1..=descriptor.ports {
+            self.control(
+                hub_address,
+                hub_mps,
+                hub_low_speed,
+                hub::set_port_power(port),
+                &mut [],
+            )
+            .await?;
+        }
+        self.wait_ms(u32::from(descriptor.power_on_to_power_good_2ms) * 2 + 10)
+            .await?;
+
+        // Exactly one connected child (the demo scope), full speed only.
+        let mut connected_port = None;
+        for port in 1..=descriptor.ports {
+            let received = self
+                .control(
+                    hub_address,
+                    hub_mps,
+                    hub_low_speed,
+                    hub::get_port_status(port),
+                    &mut scratch[..4],
+                )
+                .await?;
+            let Some(status) = HubPortStatus::parse(&scratch[..received]) else {
+                continue;
+            };
+            if status.connected {
+                if connected_port.is_some() {
+                    return Err(DriverError::Hub(
+                        "multiple devices behind the hub (one-child demo scope)",
+                    ));
+                }
+                if status.speed == hub::PortSpeed::Low {
+                    return Err(DriverError::Hub(
+                        "a low-speed child behind the hub (FS-behind-FS demo scope)",
+                    ));
+                }
+                connected_port = Some(port);
+            }
+        }
+        let child_port =
+            connected_port.ok_or(DriverError::Hub("no device connected behind the hub"))?;
+
+        // Enumerate the child: the standard machine, with the port reset mediated by
+        // hub-class requests (PORT_RESET / C_PORT_RESET) instead of root-hub bits.
+        let child_address = hub_address + 16;
+        let mut machine = Enumeration::new(child_address);
+        loop {
+            match machine.next_action() {
+                Action::ResetPort => {
+                    self.hub_port_reset(hub_address, hub_mps, hub_low_speed, child_port)
+                        .await?;
+                    machine.event(Event::PortResetComplete)?;
+                }
+                Action::WaitMs(ms) => {
+                    self.wait_ms(ms).await?;
+                    machine.event(Event::Waited)?;
+                }
+                Action::Control {
+                    address,
+                    max_packet,
+                    setup,
+                } => {
+                    let mut buffer = [0u8; crate::enumerate::MAX_CONFIG_BYTES];
+                    let received = self
+                        .control(address, max_packet, false, setup, &mut buffer)
+                        .await?;
+                    machine.event(Event::ControlDone {
+                        data: &buffer[..received],
+                    })?;
+                }
+                Action::Done => break,
+            }
+        }
+        let enumerated = machine
+            .result()
+            .ok_or(DriverError::Enumeration(EnumerationError::ProtocolMismatch))?;
+        let configuration_blob = machine.configuration();
+        let length = configuration_blob.len().min(config_out.len());
+        config_out[..length].copy_from_slice(&configuration_blob[..length]);
+        Ok((
+            Attached {
+                enumerated,
+                low_speed: false,
+            },
+            length,
+        ))
+    }
+
+    /// One hub-timed port reset: SET_FEATURE(PORT_RESET), poll GET_STATUS for
+    /// C_PORT_RESET (bounded — the hub drives 10-20 ms of reset signaling,
+    /// USB 2.0 §11.5.1.5), acknowledge the change bit.
+    async fn hub_port_reset(
+        &mut self,
+        hub_address: u8,
+        hub_mps: u8,
+        hub_low_speed: bool,
+        port: u8,
+    ) -> Result<(), DriverError<R::Error>> {
+        self.control(
+            hub_address,
+            hub_mps,
+            hub_low_speed,
+            hub::set_port_reset(port),
+            &mut [],
+        )
+        .await?;
+        let mut scratch = [0u8; 4];
+        let mut polls = 0u32;
+        loop {
+            self.wait_ms(2).await?;
+            let received = self
+                .control(
+                    hub_address,
+                    hub_mps,
+                    hub_low_speed,
+                    hub::get_port_status(port),
+                    &mut scratch,
+                )
+                .await?;
+            if let Some(status) = HubPortStatus::parse(&scratch[..received])
+                && status.reset_complete()
+            {
+                self.control(
+                    hub_address,
+                    hub_mps,
+                    hub_low_speed,
+                    hub::clear_port_feature(port, hub::FEATURE_C_PORT_RESET),
+                    &mut [],
+                )
+                .await?;
+                return Ok(());
+            }
+            polls += 1;
+            if polls > 100 {
+                return Err(DriverError::Timeout("hub port reset"));
+            }
+        }
+    }
+
     /// Put an interrupt-IN endpoint on the periodic schedule. `interval_ms` places the
     /// ED at power-of-two-spaced interrupt-table entries (OHCI 1.0a §5.2.7.2); one
     /// pending TD at a time, re-armed by [`poll_interrupt`](Self::poll_interrupt).
@@ -836,6 +1046,19 @@ mod tests {
         fm_interval_at_reset: Vec<u32>,
         /// Interrupt-IN reports the mock device has queued (one per periodic visit).
         pending_reports: std::collections::VecDeque<Vec<u8>>,
+        /// Hub topology mode: the root device is a 3-port FS hub (the bench
+        /// keyboard's shape) with the keyboard behind `hub_child_port`s.
+        hub_topology: bool,
+        /// Which hub ports report a connected (full-speed) device.
+        hub_ports_connected: [bool; 3],
+        /// Assigned addresses (0 = not yet addressed).
+        hub_address: u8,
+        child_address: u8,
+        /// The child answers on address 0 after its hub port reset (USB §9.2.6.3).
+        child_at_zero: bool,
+        /// A PORT_RESET was issued; the next GET_STATUS reports C_PORT_RESET.
+        hub_reset_pending: Option<u8>,
+        hub_reset_change: Option<u8>,
         /// The internal HcDoneHead accumulator: retired TDs chain here and are only
         /// written back to HccaDoneHead at a frame tick when WDH is clear — the
         /// silicon-faithful gating QEMU does not model.
@@ -844,6 +1067,25 @@ mod tests {
     }
 
     const DMA_BASE: u32 = 0x4000_0000;
+
+    /// A 3-port full-speed hub's device descriptor (class 09, the bench keyboard's
+    /// built-in hub shape; VID 0409 like the NEC silicon on the bench).
+    const HUB_DEVICE: [u8; 18] = [
+        18, 1, 0x10, 0x01, 9, 0, 0, 8, 0x09, 0x04, 0x5a, 0x00, 0x00, 0x01, 0, 0, 0, 1,
+    ];
+
+    /// The hub's configuration: config(9) + interface(9, class 09) + status-change
+    /// interrupt endpoint(7), total 25.
+    fn hub_config() -> [u8; 25] {
+        let mut blob = [0u8; 25];
+        blob[..9].copy_from_slice(&[9, 2, 25, 0, 1, 1, 0, 0xe0, 0]);
+        blob[9..18].copy_from_slice(&[9, 4, 0, 0, 1, 9, 0, 0, 0]);
+        blob[18..25].copy_from_slice(&[7, 5, 0x81, 3, 2, 0, 255]);
+        blob
+    }
+
+    /// The hub class descriptor: 3 ports, power-good 2*2 = 4 ms (fast tests).
+    const HUB_CLASS_DESCRIPTOR: [u8; 9] = [9, 0x29, 3, 0x0d, 0x00, 2, 100, 0x00, 0xff];
 
     const DEVICE: [u8; 18] = [
         18, 1, 0x00, 0x02, 0, 0, 0, 8, 0x27, 0x06, 0x01, 0x00, 0x00, 0x00, 1, 4, 5, 1,
@@ -878,6 +1120,13 @@ mod tests {
                 reset_count: 0,
                 fm_interval_at_reset: Vec::new(),
                 pending_reports: std::collections::VecDeque::new(),
+                hub_topology: false,
+                hub_ports_connected: [true, false, false],
+                hub_address: 0,
+                child_address: 0,
+                child_at_zero: false,
+                hub_reset_pending: None,
+                hub_reset_change: None,
                 done_head: 0,
                 wdh: false,
             }
@@ -897,13 +1146,93 @@ mod tests {
         /// the next stage): HID SET_IDLE, which is optional for mice (HID 1.11
         /// §7.2.4) and which the M3 board's G500 stalls — QEMU's usb-hid accepts it,
         /// which is exactly the QEMU-tolerance this mock must not share.
-        fn answer(&mut self, setup_bytes: [u8; 8], buffer: &mut Vec<u8>) -> bool {
+        fn answer(
+            &mut self,
+            function_address: u8,
+            setup_bytes: [u8; 8],
+            buffer: &mut Vec<u8>,
+        ) -> bool {
             let request_type = setup_bytes[0];
             let request = setup_bytes[1];
             let value = u16::from_le_bytes([setup_bytes[2], setup_bytes[3]]);
+            let index = u16::from_le_bytes([setup_bytes[4], setup_bytes[5]]);
             let length = u16::from_le_bytes([setup_bytes[6], setup_bytes[7]]) as usize;
             self.requests.push((request_type, request, value));
             buffer.clear();
+
+            // Which device is being addressed (hub topology routes by function
+            // address; address 0 is whoever is unaddressed — the hub before its
+            // SET_ADDRESS, the child after its hub-port reset).
+            let target_is_hub = self.hub_topology
+                && (function_address == self.hub_address
+                    && !(function_address == 0 && self.child_at_zero));
+
+            if target_is_hub {
+                match (request_type, request) {
+                    (0x80, setup::request::GET_DESCRIPTOR) => {
+                        let payload: &[u8] = match (value >> 8) as u8 {
+                            setup::descriptor_type::DEVICE => &HUB_DEVICE,
+                            setup::descriptor_type::CONFIGURATION => &hub_config(),
+                            _ => &[],
+                        };
+                        buffer.extend_from_slice(&payload[..length.min(payload.len())]);
+                    }
+                    (0x00, setup::request::SET_ADDRESS) => {
+                        self.hub_address = value as u8;
+                    }
+                    (0x00, setup::request::SET_CONFIGURATION) => {}
+                    (0xa0, setup::request::GET_DESCRIPTOR) => {
+                        // Hub class descriptor.
+                        buffer.extend_from_slice(
+                            &HUB_CLASS_DESCRIPTOR[..length.min(HUB_CLASS_DESCRIPTOR.len())],
+                        );
+                    }
+                    (0x23, 3) => {
+                        // SET_FEATURE(port): PORT_POWER accepted silently; PORT_RESET
+                        // arms the change bit and surfaces the child at address 0.
+                        if value == hub::FEATURE_PORT_RESET {
+                            self.hub_reset_pending = Some(index as u8);
+                        }
+                    }
+                    (0x23, 1) => {
+                        // CLEAR_FEATURE(C_PORT_RESET).
+                        if value == hub::FEATURE_C_PORT_RESET {
+                            self.hub_reset_change = None;
+                        }
+                    }
+                    (0xa3, 0) => {
+                        // GET_STATUS(port): connected per the test topology, FS,
+                        // powered; C_PORT_RESET after a pending reset matured.
+                        let port = index as usize;
+                        let connected = self
+                            .hub_ports_connected
+                            .get(port.wrapping_sub(1))
+                            .copied()
+                            .unwrap_or(false);
+                        if self.hub_reset_pending == Some(port as u8) {
+                            self.hub_reset_pending = None;
+                            self.hub_reset_change = Some(port as u8);
+                            self.child_at_zero = true;
+                        }
+                        let mut status: u16 = 1 << 8; // powered
+                        if connected {
+                            status |= 1 << 0;
+                        }
+                        let mut change: u16 = 0;
+                        if self.hub_reset_change == Some(port as u8) {
+                            status |= 1 << 1; // enabled after reset
+                            change |= 1 << 4; // C_PORT_RESET
+                        }
+                        buffer.extend_from_slice(&status.to_le_bytes());
+                        buffer.extend_from_slice(&change.to_le_bytes());
+                        buffer.truncate(length);
+                    }
+                    _ => {}
+                }
+                return true;
+            }
+
+            // The keyboard (the only device in flat mode; the child in hub mode).
             match (request_type, request) {
                 (0x80, setup::request::GET_DESCRIPTOR) => {
                     let payload: &[u8] = match (value >> 8) as u8 {
@@ -914,7 +1243,12 @@ mod tests {
                     buffer.extend_from_slice(&payload[..length.min(payload.len())]);
                 }
                 (0x00, setup::request::SET_ADDRESS) => {
-                    self.device_address = value as u8;
+                    if self.hub_topology {
+                        self.child_address = value as u8;
+                        self.child_at_zero = false;
+                    } else {
+                        self.device_address = value as u8;
+                    }
                 }
                 (0x21, setup::request::HID_SET_IDLE) => return false,
                 _ => {}
@@ -942,7 +1276,7 @@ mod tests {
                         let mut setup_bytes = [0u8; 8];
                         setup_bytes.copy_from_slice(self.arena_slice(td.current_buffer, 8));
                         let mut answered = Vec::new();
-                        refused = !self.answer(setup_bytes, &mut answered);
+                        refused = !self.answer(ed.function_address, setup_bytes, &mut answered);
                         response = answered;
                         td.condition_code = ConditionCode::NoError;
                     }
@@ -1362,6 +1696,113 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(received, 18);
+    }
+
+    #[test]
+    fn hub_traversal_enumerates_the_child_keyboard() {
+        // The demo chain (bench facts: keyboard at FULL speed on port 1 of its own
+        // 3-port FS hub): attach the root device -> it is a hub -> traverse one
+        // level -> the child enumerates with the standard machine at hub+16, and
+        // its config parses down to the boot keyboard endpoint.
+        let mut mock = MockOhci::new();
+        mock.hub_topology = true;
+        let mut driver = Ohci::new(mock);
+        run(driver.bring_up()).unwrap();
+
+        let mut hub_config_blob = [0u8; 256];
+        let (hub_attached, hub_len) = run(driver.attach(1, &mut hub_config_blob)).unwrap();
+        assert_eq!(hub_attached.enumerated.device.class, hub::CLASS_HUB);
+        assert_eq!(hub_attached.enumerated.address, 1);
+
+        let mut child_config = [0u8; 256];
+        let (child, child_len) = run(driver.attach_hub_child(
+            hub_attached.enumerated.address,
+            hub_attached.enumerated.max_packet_ep0,
+            hub_attached.low_speed,
+            hub_attached.enumerated.device.class,
+            &hub_config_blob[..hub_len],
+            &mut child_config,
+        ))
+        .unwrap();
+        assert_eq!(child.enumerated.address, 17); // hub address + 16
+        assert!(!child.low_speed);
+        assert_eq!(child.enumerated.device.vendor_id, 0x0627);
+        let boot = crate::descriptor::find_boot_interface(&child_config[..child_len]).unwrap();
+        assert_eq!(boot.endpoint.address, 0x81);
+
+        // The hub conversation happened in chapter-11 vocabulary: configuration,
+        // class descriptor, three port powers, a port reset + its acknowledge.
+        let mock = driver.io();
+        assert_eq!(mock.hub_address, 1);
+        assert_eq!(mock.child_address, 17);
+        assert!(mock.requests.contains(&(0xa0, 6, 0x2900))); // hub descriptor
+        assert!(mock.requests.contains(&(0x23, 3, hub::FEATURE_PORT_POWER)));
+        assert!(mock.requests.contains(&(0x23, 3, hub::FEATURE_PORT_RESET)));
+        assert!(
+            mock.requests
+                .contains(&(0x23, 1, hub::FEATURE_C_PORT_RESET))
+        );
+    }
+
+    #[test]
+    fn hub_traversal_refusals_are_typed() {
+        // No child connected: typed, names the situation.
+        let mut mock = MockOhci::new();
+        mock.hub_topology = true;
+        mock.hub_ports_connected = [false, false, false];
+        let mut driver = Ohci::new(mock);
+        run(driver.bring_up()).unwrap();
+        let mut blob = [0u8; 256];
+        let (hub_attached, hub_len) = run(driver.attach(1, &mut blob)).unwrap();
+        let mut child_config = [0u8; 256];
+        assert_eq!(
+            run(driver.attach_hub_child(
+                hub_attached.enumerated.address,
+                hub_attached.enumerated.max_packet_ep0,
+                hub_attached.low_speed,
+                hub_attached.enumerated.device.class,
+                &blob[..hub_len],
+                &mut child_config,
+            )),
+            Err(DriverError::Hub("no device connected behind the hub"))
+        );
+
+        // Two children: the one-child demo scope refuses typed.
+        let mut mock = MockOhci::new();
+        mock.hub_topology = true;
+        mock.hub_ports_connected = [true, true, false];
+        let mut driver = Ohci::new(mock);
+        run(driver.bring_up()).unwrap();
+        let (hub_attached, hub_len) = run(driver.attach(1, &mut blob)).unwrap();
+        assert_eq!(
+            run(driver.attach_hub_child(
+                hub_attached.enumerated.address,
+                hub_attached.enumerated.max_packet_ep0,
+                hub_attached.low_speed,
+                hub_attached.enumerated.device.class,
+                &blob[..hub_len],
+                &mut child_config,
+            )),
+            Err(DriverError::Hub(
+                "multiple devices behind the hub (one-child demo scope)"
+            ))
+        );
+
+        // A non-hub device refuses immediately.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        let (kbd, kbd_len) = run(driver.attach(1, &mut blob)).unwrap();
+        assert_eq!(
+            run(driver.attach_hub_child(
+                kbd.enumerated.address,
+                kbd.enumerated.max_packet_ep0,
+                kbd.low_speed,
+                kbd.enumerated.device.class,
+                &blob[..kbd_len],
+                &mut child_config,
+            )),
+            Err(DriverError::Hub("the attached device is not a hub"))
+        );
     }
 
     #[test]

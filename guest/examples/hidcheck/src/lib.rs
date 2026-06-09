@@ -75,7 +75,22 @@ eo9_guest::main! {
                 "no device connected on any root-hub port",
             )));
         };
-        let device = usb::attach(&root, port).await.map_err(usb_failure)?;
+        let mut device = usb::attach(&root, port).await.map_err(usb_failure)?;
+
+        // One hub level (the bench keyboard sits behind its own built-in FS hub):
+        // when the attached device is a hub (class 09), traverse to the child and
+        // continue against it — the demo-scope hub mini-driver in the shell.
+        let head = usb::control_in(&device, 0x80, 6, 0x0100, 0, 18)
+            .await
+            .map_err(usb_failure)?;
+        if head.get(4).copied() == Some(0x09) {
+            text::write_out_line("hidcheck: the device is a hub - traversing to its child")
+                .map_err(io_failure)?;
+            device = usb::attach_child(&device).await.map_err(|err| match err {
+                usb::UsbError::Io(text) => ProgramFailure::NoHid(text),
+                other => usb_failure(other),
+            })?;
+        }
 
         // The configuration blob, parsed down to the boot interface + endpoint.
         let head = usb::control_in(
