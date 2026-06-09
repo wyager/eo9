@@ -17,8 +17,14 @@ package eo9-init:init@0.1.0;
 ///
 /// Config format (one entry per line; `#` comments):
 ///
-///   <name> = <program> [--flag value …] restart <policy> [--flag value …]
+///   <name> = <program> [--flag value …] [$ <program> [--flag value …] …]
+///            restart <policy> [--flag value …]
 ///   console = <program>                        (default: eosh)
+///
+/// `$` is eosh's composition operator (right-associative): every segment but the
+/// last is a provider, configured with its flags at compose time; the last is the
+/// binary whose flags become `main` arguments. Names, flags, and `$` are the whole
+/// grammar — anything richer is `save`d first and referenced by name.
 world init {
     import eo9:exec/component-algebra@0.1.0;
     import eo9:exec/compile@0.1.0;

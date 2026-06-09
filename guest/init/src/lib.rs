@@ -11,15 +11,30 @@
 //! Config format (one entry per line; `#` starts a comment):
 //!
 //! ```text
-//! # services: <name> = <program> [--flag value …] restart <policy> [--flag value …]
-//! worker  = cruncher --seed 7 --rounds 900000000 restart restart.always
-//! greeter = hello-closed restart restart.never
+//! # services: <name> = <chain> restart <policy> [--flag value …]
+//! # where <chain> is `<program> [--flag value …]` segments joined by `$`:
+//! worker = cruncher --seed 7 --rounds 900000000 restart restart.always
+//! kbd    = usb.ohci --region usb-host0-ohci $ usb.kbd restart restart.always
 //! # the console (optional; default `console = eosh`):
 //! console = eosh
 //! ```
 //!
-//! Programs are referenced by their `/bin` names; a composition can be detached by
-//! `save`-ing it under a name first (in a `--svc` shell) and referencing that name.
+//! Programs are referenced by their `/bin` names. A `$` chain is eosh's composition
+//! operator, right-associative: every segment but the last is a provider (configured
+//! with its `--flag value` arguments at compose time), the last is the binary whose
+//! flags become its `main` arguments. The grammar is deliberately this small — names,
+//! flags, `$` — and nothing more (no parentheses, no `&`/`only`/`rename`/`with`, no
+//! `let`); anything richer is `save`d under a name first (in a `--svc` shell) and
+//! referenced by that name. The console entry stays a single program: keystroke echo
+//! and boot narration live below the provider layer (the fbcon decision,
+//! docs/board/usb-boot-demo-plan.md).
+//!
+//! Trust posture: a config is operator-authored, so its service lines carry
+//! console-equivalent trust — the registry links the boot-granted root capabilities
+//! into each service exactly as the console session's own spawns would receive them
+//! (see the kernel registry's docs; the usermode registry keeps its composed-only
+//! rule). A config line can do exactly what a console line can do: same operator,
+//! same authority.
 
 #![no_std]
 
@@ -60,13 +75,33 @@ struct Flag {
     value: String,
 }
 
-/// One service entry: `<name> = <program> [flags…] restart <policy> [flags…]`.
+/// One segment of a service's `$` chain: `<program> [--flag value …]`. Every segment
+/// but the last is a provider whose flags are compose-time `configure` arguments; the
+/// last is the binary whose flags are `main` arguments bound at detach.
+struct Stage {
+    program: String,
+    flags: Vec<Flag>,
+}
+
+/// One service entry: `<name> = <stage> [$ <stage> …] restart <policy> [flags…]`.
 struct ServiceEntry {
     name: String,
-    program: String,
-    args: Vec<Flag>,
+    /// The `$` chain, left to right as written; never empty.
+    chain: Vec<Stage>,
     policy: String,
     policy_args: Vec<Flag>,
+}
+
+impl ServiceEntry {
+    /// The chain as written (`usb.ohci $ usb.kbd`), for messages.
+    fn chain_text(&self) -> String {
+        let names: Vec<&str> = self
+            .chain
+            .iter()
+            .map(|stage| stage.program.as_str())
+            .collect();
+        names.join(" $ ")
+    }
 }
 
 /// What to do when the console exits while services are still running.
@@ -173,7 +208,7 @@ fn parse_config(config: &str) -> Result<Config, String> {
             continue;
         }
 
-        // A service line: program [flags…] restart policy [flags…]. Split at the LAST
+        // A service line: stage [$ stage …] restart policy [flags…]. Split at the LAST
         // bare `restart` word (so a program named `restart` still works).
         let split = tokens
             .iter()
@@ -194,12 +229,33 @@ fn parse_config(config: &str) -> Result<Config, String> {
             return Err(context("`restart` must be followed by a policy name"));
         }
 
-        let program = program_part[0].to_string();
-        let (args, consumed) = collect_flags(&program_part[1..]).map_err(|err| context(&err))?;
-        if consumed != program_part.len() - 1 {
-            return Err(context(
-                "unexpected token after the program's `--flag value` arguments",
-            ));
+        // The `$` chain: `<program> [--flag value …]` segments. Composition is the
+        // whole grammar — no parentheses, no other operators (the module docs).
+        let mut chain: Vec<Stage> = Vec::new();
+        let mut rest = program_part;
+        loop {
+            let Some((first, after)) = rest.split_first() else {
+                return Err(context("`$` must be followed by a program name"));
+            };
+            if *first == "$" || first.starts_with("--") {
+                return Err(context("expected a program name before `$`/`--` here"));
+            }
+            let (flags, consumed) = collect_flags(after).map_err(|err| context(&err))?;
+            chain.push(Stage {
+                program: (*first).to_string(),
+                flags,
+            });
+            rest = &after[consumed..];
+            match rest.split_first() {
+                None => break,
+                Some((token, after_op)) if *token == "$" => rest = after_op,
+                Some((token, _)) => {
+                    return Err(context(&format!(
+                        "unexpected token `{token}` after the program's `--flag value` \
+                         arguments (chain programs with `$`)"
+                    )));
+                }
+            }
         }
 
         let policy = policy_part[0].to_string();
@@ -213,8 +269,7 @@ fn parse_config(config: &str) -> Result<Config, String> {
 
         services.push(ServiceEntry {
             name: name.to_string(),
-            program,
-            args,
+            chain,
             policy,
             policy_args,
         });
@@ -390,8 +445,9 @@ fn detach_error_text(err: &svc_detach::DetachError) -> String {
     use svc_detach::DetachError as E;
     match err {
         E::NotClosed(needs) => format!(
-            "it still requires {} (compose those in and `save` the result, then reference \
-             the saved name)",
+            "it still requires {} (compose a provider in with `$` on the config line, or \
+             `save` a composition in a shell and reference the saved name; a root \
+             capability this boot did not grant cannot be supplied at all)",
             needs.join(", ")
         ),
         E::NotABinary => String::from("it is a provider, not a runnable program"),
@@ -433,7 +489,9 @@ impl Guest for Init {
                 Ok(()) => {
                     out.say(&format!(
                         "started `{}` ({} under {})",
-                        entry.name, entry.program, entry.policy
+                        entry.name,
+                        entry.chain_text(),
+                        entry.policy
                     ));
                     started += 1;
                 }
@@ -527,16 +585,48 @@ impl Guest for Init {
     }
 }
 
-/// Resolve, bind, and detach one service entry.
+/// Resolve, compose, bind, and detach one service entry.
 async fn start_service(
     fs_handle: &fs::FsImpl,
     detach_handle: &svc_detach::DetachImpl,
     entry: &ServiceEntry,
 ) -> Result<(), String> {
-    // The program and its arguments.
-    let program = resolve(fs_handle, &entry.program).await?;
+    // The `$` chain, folded right to left (`a $ b $ c` = `a $ (b $ c)` — eosh's
+    // right-associativity): the last stage is the binary, every earlier stage a
+    // provider, configured with its flags at compose time.
+    let (consumer, providers) = entry
+        .chain
+        .split_last()
+        .expect("the parser never admits an empty chain");
+    let mut program = resolve(fs_handle, &consumer.program).await?;
+    for stage in providers.iter().rev() {
+        let mut provider = resolve(fs_handle, &stage.program).await?;
+        if !stage.flags.is_empty() {
+            let provider_info = algebra::describe(&provider);
+            let configure_args: Vec<algebra::NamedArg> = bind_args(&provider_info, &stage.flags)?
+                .into_iter()
+                .map(|arg| algebra::NamedArg {
+                    name: arg.name,
+                    value: arg.value,
+                })
+                .collect();
+            provider = algebra::configure(provider, &configure_args)
+                .map_err(|err| format!("configuring `{}` failed: {err:?}", stage.program))?;
+        }
+        program = algebra::compose(provider, program).map_err(|err| match err {
+            algebra::ComposeError::NotAProvider => format!(
+                "`{}` is not a provider (only the last program of a `$` chain may be a \
+                 binary)",
+                stage.program
+            ),
+            other => format!("composing `{} $ …` failed: {other:?}", stage.program),
+        })?;
+    }
+
+    // The binary's arguments, bound against the composed program's signature
+    // (composition never changes `main`'s signature).
     let info = algebra::describe(&program);
-    let args = bind_args(&info, &entry.args)?;
+    let args = bind_args(&info, &consumer.flags)?;
 
     // The restart policy (configured when the entry gives policy flags).
     let mut policy = resolve(fs_handle, &entry.policy).await?;
