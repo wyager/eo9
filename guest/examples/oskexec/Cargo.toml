@@ -1,0 +1,15 @@
+[package]
+name = "eo9-example-oskexec"
+description = "Eo9 example program: receive a new kernel image over TCP (the serial-loader framing plus a preshared-secret frame) and kexec into it via eo9:kexec — one-shot, typed refusals, the network flash path for the board dev loop (targets the eo9-examples:oskexec/oskexec world: text + net l4 + kexec + io)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

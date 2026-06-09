@@ -72,8 +72,50 @@ const RAM_L1_INDEX: usize = RAM_BASE >> 30;
 const DEVICE_L1: &[usize] = &[0];
 #[cfg(feature = "board-opi5plus")]
 const DEVICE_L1: &[usize] = &[3, 41];
-/// First byte past the heap (src/heap.rs): the top of DRAM on this machine.
-pub(crate) const HEAP_END: usize = RAM_END;
+/// The kexec reservation: the top 64 MiB of the DRAM window is carved out of the heap
+/// for the `eo9:kexec` staging machinery (src/wasm/kexec_provider.rs) — a relocation-stub
+/// slot followed by the image staging region. Reserved unconditionally (the heap simply
+/// ends 64 MiB lower) so the region is **never reachable by any other capability**: it is
+/// outside the allocator, so no heap allocation, DMA buffer, or JIT code page can ever
+/// land in it, and the only writer is the kexec root provider behind the `kexec` boot
+/// token. Explicit in the memory map exactly like the staged-bootargs page below.
+///
+///   QEMU `virt`:        stub 0x5C00_0000..0x5C01_0000, staging 0x5C01_0000..0x6000_0000
+///   Orange Pi 5 Plus:   stub 0x1D00_0000..0x1D01_0000, staging 0x1D01_0000..0x2100_0000
+///
+/// Staging capacity (64 MiB − 64 KiB ≈ 63.9 MiB) exceeds the largest bootable image
+/// (the board's structural cap is 62 MiB — image at 0x0020_0000 below the serial-loader
+/// stub home at 0x0400_0000; the full image is ~52 MiB today).
+pub(crate) const KEXEC_RESERVED_BYTES: usize = 64 * 1024 * 1024;
+/// The relocation-stub slot: the first 64 KiB of the reservation (the stub itself is a
+/// few dozen instructions; the slot is generously aligned).
+// The kexec constants' only consumer is the wasm-store-gated kexec provider; the
+// featureless CI build still reserves the region (HEAP_END below) but reads no name.
+#[allow(dead_code)]
+pub(crate) const KEXEC_STUB_BASE: usize = RAM_END - KEXEC_RESERVED_BYTES;
+#[allow(dead_code)]
+pub(crate) const KEXEC_STUB_LEN: usize = 64 * 1024;
+/// The image staging region: the rest of the reservation.
+#[allow(dead_code)]
+pub(crate) const KEXEC_STAGING_BASE: usize = KEXEC_STUB_BASE + KEXEC_STUB_LEN;
+#[allow(dead_code)]
+pub(crate) const KEXEC_STAGING_LEN: usize = KEXEC_RESERVED_BYTES - KEXEC_STUB_LEN;
+
+/// The staged-bootargs page (docs/board/usb-boot-demo-plan.md Part A, Option 1): one
+/// page at RAM base + 1 MiB, below the kernel image, holding a single printable
+/// NUL-terminated command line for boots whose x0 carries no device tree (USB `go`,
+/// the kexec jump). The board's `fdt::bootargs` falls back to it when every
+/// FDT/cmdline candidate fails; a valid x0 always wins (the serial path is unchanged).
+/// On QEMU it is written for the dance's symmetry but never read — the original DTB at
+/// the RAM base survives the kexec copy (the image links 2 MiB in) and wins first.
+#[allow(dead_code)]
+pub(crate) const BOOTARGS_PAGE: usize = RAM_BASE + 0x10_0000;
+#[allow(dead_code)]
+pub(crate) const BOOTARGS_PAGE_LEN: usize = 4096;
+
+/// First byte past the heap (src/heap.rs): the top of DRAM on this machine, minus the
+/// kexec reservation above.
+pub(crate) const HEAP_END: usize = RAM_END - KEXEC_RESERVED_BYTES;
 /// Number of 2 MiB level-2 entries needed to cover DRAM (= number of level-3 tables).
 const DRAM_L2_ENTRIES: usize = RAM_SIZE / (2 * 1024 * 1024); // 256
 
@@ -337,7 +379,12 @@ pub unsafe fn flush_code_range(ptr: *const u8, len: usize) {
 /// board, 2026-06-07: `bootargs` vanished until those lines were forced out). After the
 /// `civac` the line is in DRAM and out of every cache level, so a subsequent non-cacheable
 /// read observes the written-back bytes.
-#[cfg(feature = "board-opi5plus")]
+///
+/// Compiled wherever a consumer exists: the board profile (the control-FDT shadow and the
+/// staged-bootargs page in src/fdt.rs) and any wasm-store build (the kexec dance sweeps
+/// the staged image, stub, and bootargs page to PoC before translation goes off — on QEMU
+/// TCG the ops are coherency no-ops but the sequence stays identical to silicon).
+#[cfg(any(feature = "board-opi5plus", feature = "wasm-store"))]
 pub(crate) fn clean_invalidate_to_poc(start: usize, len: usize) {
     if len == 0 {
         return;

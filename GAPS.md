@@ -488,3 +488,31 @@ net.rtl8125, usb.ohci, usb.ohci-pci via eo9-dns/eo9-ohci/eo9-rtl8125/eo9-curl-co
 Standing rule unchanged (refresh from the main checkout post-merge) but the reviewer
 checklist should treat ANY bundle diff from a worktree as suspect-residue first.
 Real fix candidates: workspace-ize the shared crates or pin metadata hashing.
+
+## Network kexec residuals (area/21-kexec, 2026-06-08)
+The lane shipped with three recorded residuals (docs/board/net-kexec.md has the full
+posture):
+- **Cleartext preshared secret**: oskexec's mandatory >=16-byte secret gates the TCP
+  peer, but it travels cleartext on the LAN — a passive sniffer who also wins the race
+  inside the one-shot window could replay it. Same class as the net.text telnet entry
+  above, but with an actual gate in front because the authority is total. Upgrade
+  path: a challenge-response handshake, which needs a real hash (blake3 is already in
+  the tree) reachable from the guest world — deliberately NOT hand-rolled in the lane.
+- **kexec + granted PCI DMA**: the staging region is heap-external so no capability
+  can address it, but a bus-mastering PCI device could still DMA over it (the standing
+  no-IOMMU posture). The `kexec` token is documented as the same total-authority class
+  as `pci`; an IOMMU lane would close both.
+- **TCG transfer pace decays — measured, no hard cap**: the TCP-staging path's rate
+  decays from ~2 MiB/s to ~30-65 KiB/s as bytes accumulate (reproduced on every run;
+  guest-side buffer reuse and ack batching in oskexec improved but did not remove it —
+  the per-64-KiB recv/stage/send call chain is the unit that slows). Ruled OUT by the
+  full-image soak (`EO9_CHECK_KEXEC_FULL=1 cargo xtask check-kexec`, 2026-06-08): a
+  cumulative round/handle cap — the full 62.5 MiB (953 ack intervals) staged, verified,
+  and kexec'd green in ~21 min, well past the ~654-ack point where an earlier run
+  tripped the (then 10 s, now 60 s) sender stall alarm. Remaining suspicion for the
+  net/runtime lanes: per-call accumulation in the async machinery or kernel-heap
+  free-list growth — a profile, not a guess, is the next step. Consequences encoded:
+  the default gate flashes a minimal-store kernel B (narrated, not silent; the soak
+  arm covers full size), send_image.py --tcp uses a 60 s stall window, and the gate is
+  on-demand like check-telnet/check-usb rather than in `ci`. The board runs native and
+  is wire-bound.

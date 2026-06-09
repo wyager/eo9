@@ -147,7 +147,14 @@ constants, the SMC PSCI conduit, the 24 MHz timer, DTB intake — landed in full
 item that outgrew its sketch: DTB intake is no longer "print `x0` and defer" — the
 kernel PoC-sweeps and parses the control FDT for bootargs (playbook §3, incident b),
 and the USB-boot lane adds a staged-bootargs fallback for `go`-without-`x0`
-(usb-boot-demo-plan.md).
+(usb-boot-demo-plan.md) — landed with the kexec lane: the page at `0x0010_0000` is
+reserved in the memory map (kernel mmu.rs) and `fdt::bootargs` reads it last (a valid
+`x0` always wins, so the serial path is unchanged).
+
+Memory-map addition from the kexec lane (net-kexec.md): the top 64 MiB of the DRAM
+window (`0x1D00_0000..0x2100_0000`) is reserved out of the heap for the `eo9:kexec`
+staging region (relocation-stub slot + staged image) — flash the next image over TCP
+and jump without a power cycle; the serial loader demotes to recovery.
 
 ## SD card layout (Rockchip standard)
 

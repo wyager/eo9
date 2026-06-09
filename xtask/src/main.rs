@@ -252,6 +252,12 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     //   net.virtio $ net.l4.over-l2 $ net.text $ eosh   (what telnetd composes)
     ("eo9-stub-net-text", "net.text"),
     ("eo9-example-telnetd", "telnetd"),
+    // Network kexec (wit/kexec): receive a new kernel image over TCP and jump into it.
+    // The composition is the flash path for the board dev loop (and check-kexec's QEMU
+    // gate); the eo9:kexec import links only on a boot whose command line carried the
+    // `kexec` token:
+    //   net.virtio $ net.l4.over-l2 $ oskexec --secret <16+ bytes> --bootargs "pci"
+    ("eo9-example-oskexec", "oskexec"),
     // The two-stack transport check, so the full shared-link payoff runs at the metal
     // prompt — two l4 stacks, each riding its own switch port, each resolving real DNS
     // (one physical NIC, two virtual MACs, two IP stacks; plan/09 D31):
@@ -389,6 +395,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         "check-dhcp" => {
             expect_no_args("check-dhcp", rest)?;
             check_dhcp(&root)
+        }
+        "check-kexec" => {
+            expect_no_args("check-kexec", rest)?;
+            check_kexec(&root)
         }
         "check-curl" => {
             expect_no_args("check-curl", rest)?;
@@ -532,6 +542,13 @@ COMMANDS:
                          serial console and still resolve, and
                          `telnetd --sessions 1 --address dhcp` must serve a session over
                          the host-forward exactly like the static path
+    check-kexec          Boot the aarch64 kernel with the `kexec` grant and a slirp
+                         host-forward (derived host port) to oskexec's :9909, build a
+                         second, banner-stamped kernel, flash it over TCP with
+                         send_image.py --tcp (preshared-secret handshake, serial-loader
+                         framing, ack-driven progress), and assert the `kexec: jumping`
+                         line followed by kernel B's stamped banner and a live prompt on
+                         the same serial stream
     check-curl           Boot the same machine (no host-forward needed: the guest dials
                          out), serve a fixture file from a loopback-bound
                          `python3 -m http.server` on an OS-assigned port, drive
@@ -2155,6 +2172,11 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
                 ("eo9-example-curl", "curl"),
                 ("eo9-stub-net-text", "net.text"),
                 ("eo9-example-telnetd", "telnetd"),
+                // Network kexec: flash the next image over TCP at ethernet speed
+                // (the serial loader demotes to recovery) — bench composition:
+                //   net.rtl8125 $ (net.l4.over-l2 --address …) $ oskexec
+                //     --secret <16+ bytes> --bootargs "…"
+                ("eo9-example-oskexec", "oskexec"),
                 // The HDMI acceptance (plan M2): `draw` run with the boot's `gfx`
                 // grant against the kernel's gfx.simplefb root provider — the test
                 // pattern on the monitor plus the canonical checksum over serial.
@@ -2429,6 +2451,23 @@ fn build_kernel_riscv64(root: &Path) -> Result<PathBuf, String> {
 }
 
 fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
+    build_kernel_aarch64_stamped(root, None, false)
+}
+
+/// [`build_kernel_aarch64`] with an optional banner build stamp (`EO9_BUILD_STAMP`,
+/// printed by `arch::banner`) and an optional minimal store. `check-kexec` builds its
+/// second kernel with a stamp so the gate can tell the kexec'd image apart from the
+/// booted one on one serial stream, and with the minimal store so the flat image is
+/// transfer-sized for the gate (the slirp+guest staging path under TCG paces at tens
+/// of KiB/s — see GAPS, kexec entry; the board flashes the full image at native
+/// speed). Everything else passes `(None, false)` — no stamp line, the standard
+/// store. rustc's env tracking means flipping the stamp/store env rebuilds only the
+/// kernel crate, not the artifacts.
+fn build_kernel_aarch64_stamped(
+    root: &Path,
+    stamp: Option<&str>,
+    minimal_store: bool,
+) -> Result<PathBuf, String> {
     // The seed canary, assembled from WAT.
     let seed_wat = root.join("kernel").join("seed").join("hello.wat");
     let seed_wasm = wat::parse_file(&seed_wat)
@@ -2492,8 +2531,19 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
 
     // The read-only store image: every listed component plus its host-AOT artifact,
     // keyed by shell name, for the kernel's `program=<name>` selection (and, later,
-    // eosh's /bin view).
-    let store_image = build_store_image(root, KERNEL_CHECK_TARGET)?;
+    // eosh's /bin view). The minimal variant (check-kexec's kernel B) bakes just
+    // enough to boot to a live prompt — the gate asserts the banner + prompt, and a
+    // transfer-sized flat image keeps the slirp staging path in gate-time bounds.
+    let store_image = if minimal_store {
+        build_store_image_filtered(
+            root,
+            KERNEL_CHECK_TARGET,
+            &[("eo9-example-hello", "hello"), ("eosh", "eosh")],
+            "store-check-kexec-b.img",
+        )?
+    } else {
+        build_store_image(root, KERNEL_CHECK_TARGET)?
+    };
 
     // The MAC key for the persistent store disk's compile cache: artifacts read back from
     // the disk are only deserialized after their keyed-blake3 tag verifies against this
@@ -2502,6 +2552,18 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
     let mac_key = ensure_storedisk_mac_key(root)?;
 
     let kernel_dir = root.join("kernel");
+    let mut env: Vec<(&str, &OsStr)> = vec![
+        ("EO9_SEED_CWASM", seed.as_os_str()),
+        ("EO9_SEED_WASM", seed_wasm_path.as_os_str()),
+        ("EO9_HELLO_CWASM", hello.as_os_str()),
+        ("EO9_SLEEPY_CWASM", sleepy.as_os_str()),
+        ("EO9_ENTROPY_SEEDED_CWASM", entropy.as_os_str()),
+        ("EO9_STORE_IMAGE", store_image.as_os_str()),
+        ("EO9_STOREDISK_MAC_KEY", mac_key.as_os_str()),
+    ];
+    if let Some(stamp) = stamp {
+        env.push(("EO9_BUILD_STAMP", OsStr::new(stamp)));
+    }
     run_with_env(
         &kernel_dir,
         "cargo",
@@ -2521,15 +2583,7 @@ fn build_kernel_aarch64(root: &Path) -> Result<PathBuf, String> {
             )
             .as_str(),
         ],
-        &[
-            ("EO9_SEED_CWASM", seed.as_os_str()),
-            ("EO9_SEED_WASM", seed_wasm_path.as_os_str()),
-            ("EO9_HELLO_CWASM", hello.as_os_str()),
-            ("EO9_SLEEPY_CWASM", sleepy.as_os_str()),
-            ("EO9_ENTROPY_SEEDED_CWASM", entropy.as_os_str()),
-            ("EO9_STORE_IMAGE", store_image.as_os_str()),
-            ("EO9_STOREDISK_MAC_KEY", mac_key.as_os_str()),
-        ],
+        &env,
     )?;
 
     let image = kernel_dir
@@ -4355,14 +4409,16 @@ fn telnet_netdev() -> String {
     format!("user,id=eo9net,hostfwd=tcp:127.0.0.1:{TELNET_HOST_PORT}-:{TELNET_GUEST_PORT}")
 }
 
-/// Boot the aarch64 kernel under QEMU with a user-mode NIC (`netdev` chooses the
-/// slirp shape: check-telnet/check-dhcp forward a host port, check-curl needs none —
-/// the guest dials out through slirp's 10.0.2.2 host alias), with stdio piped for
+/// Boot the aarch64 kernel under QEMU with a user-mode NIC, any `-append` line, and
+/// any slirp netdev shape (check-telnet/check-dhcp forward the telnet host port,
+/// check-curl forwards nothing — the guest dials out, check-kexec derives a free host
+/// port at runtime instead of claiming a second fixed one), with stdio piped for
 /// scripting. Returns the child, its piped stdin, and the serial-byte channel.
 fn spawn_net_qemu(
     cmd: &str,
     root: &Path,
     image: &Path,
+    append: &str,
     netdev: &str,
 ) -> Result<
     (
@@ -4382,7 +4438,7 @@ fn spawn_net_qemu(
         .args(["-smp", "1", "-m", KERNEL_QEMU_MEMORY, "-nographic"])
         .arg("-kernel")
         .arg(image)
-        .args(["-append", "pci"])
+        .args(["-append", append])
         .args(["-netdev", netdev])
         .args(["-device", "virtio-net-pci,netdev=eo9net,disable-legacy=on"])
         .stdin(std::process::Stdio::piped())
@@ -4424,7 +4480,7 @@ fn check_telnet(root: &Path) -> Result<(), String> {
     );
 
     let (mut child, mut stdin, receiver) =
-        spawn_net_qemu("check-telnet", root, &image, &telnet_netdev())?;
+        spawn_net_qemu("check-telnet", root, &image, "pci", &telnet_netdev())?;
     let wait_for =
         |marker: &str, what: &str| serial_wait_for("check-telnet", &receiver, marker, what);
     let type_line = |stdin: &mut std::process::ChildStdin, line: &str| {
@@ -4594,7 +4650,7 @@ fn check_dhcp(root: &Path) -> Result<(), String> {
     );
 
     let (mut child, mut stdin, receiver) =
-        spawn_net_qemu("check-dhcp", root, &image, &telnet_netdev())?;
+        spawn_net_qemu("check-dhcp", root, &image, "pci", &telnet_netdev())?;
     let wait_for =
         |marker: &str, what: &str| serial_wait_for("check-dhcp", &receiver, marker, what);
 
@@ -4699,6 +4755,172 @@ fn check_dhcp(root: &Path) -> Result<(), String> {
          (10.0.2.15/24, gw 10.0.2.2, dns, lease duration) and resolved, and \
          `telnetd --sessions 1 --address dhcp` served a session over \
          localhost:{TELNET_HOST_PORT}"
+    );
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------------------
+// check-kexec: headless verification of network kexec (wit/kexec, the kexec_provider
+// dance, oskexec, send_image.py --tcp). Boot kernel A with the `kexec` grant and a slirp
+// host-forward to oskexec's :9909; flash a SECOND kernel build — stamped so its banner is
+// distinguishable — over TCP; assert, on the same serial stream, the final
+// `kexec: jumping…` line followed by kernel B's stamped banner and a live prompt.
+// Gate lessons applied: the host port is OS-derived (no second fixed 5555-style port),
+// the transfer is progress-aware on both sides (the sender's ack-driven stall alarm, the
+// guest's per-4-MiB narration under the 600 s per-step serial waits), and QEMU is killed
+// on every failure path.
+// ----------------------------------------------------------------------------------------
+
+/// oskexec's default listen port inside the guest.
+const KEXEC_GUEST_PORT: u16 = 9909;
+/// The gate's preshared secret (>= 16 bytes; a fixture value — the gate exercises the
+/// handshake, not the secrecy).
+const KEXEC_SECRET: &str = "check-kexec-preshared-secret";
+/// The stamp baked into kernel B's banner.
+const KEXEC_B_STAMP: &str = "kexec-B";
+
+/// Boot kernel A, flash kernel B over TCP, assert B's banner on the same serial stream.
+fn check_kexec(root: &Path) -> Result<(), String> {
+    // Kernel A: the plain build, copied aside so kernel B's build (same cargo output
+    // path) cannot replace it underneath QEMU.
+    let a = build_kernel_aarch64_stamped(root, None, false)?;
+    let a_copy = root.join("kernel").join("target").join("check-kexec-a.elf");
+    std::fs::copy(&a, &a_copy)
+        .map_err(|err| format!("check-kexec: copying kernel A aside: {err}"))?;
+
+    // Kernel B: the same kernel with the banner stamp and the minimal store (a
+    // transfer-sized flat image — the slirp+guest staging path paces at tens of KiB/s
+    // under TCG, so the full ~60 MiB image would take ~20+ minutes; the board flashes
+    // the full image at native speed). Flattened to the raw bytes the wire carries
+    // (entry at offset 0 — `.text.boot` is first in the QEMU link). Stated, not
+    // silent: the size choice is narrated below. `EO9_CHECK_KEXEC_FULL=1` flips kernel
+    // B to the full store — the long-transfer soak arm (run when the staging path's
+    // pace or a byte-count-dependent suspicion needs a definitive answer).
+    let full_soak = std::env::var("EO9_CHECK_KEXEC_FULL").is_ok_and(|v| v == "1");
+    if full_soak {
+        println!(
+            "xtask: check-kexec — EO9_CHECK_KEXEC_FULL=1: kernel B carries the FULL \
+             store (soak arm; expect a 20+ minute transfer under TCG)"
+        );
+    }
+    let b = build_kernel_aarch64_stamped(root, Some(KEXEC_B_STAMP), !full_soak)?;
+    let b_bytes =
+        std::fs::read(&b).map_err(|err| format!("check-kexec: reading kernel B ELF: {err}"))?;
+    let flat = flatten_kernel_elf(&b_bytes)?;
+    let b_image = root.join("kernel").join("target").join("check-kexec-b.img");
+    write_if_different(&b_image, &flat)?;
+    println!(
+        "xtask: check-kexec — kernel A {} | kernel B {} ({:.1} MiB flat, minimal store \
+         for gate-time transfer, stamp {KEXEC_B_STAMP})",
+        a_copy.display(),
+        b_image.display(),
+        flat.len() as f64 / (1024.0 * 1024.0)
+    );
+
+    // Derive a free host port (gate lesson: never a second fixed port).
+    let host_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .map_err(|err| format!("check-kexec: deriving a free host port: {err}"))?
+        .port();
+
+    let (mut child, mut stdin, receiver) = spawn_net_qemu(
+        "check-kexec",
+        root,
+        &a_copy,
+        "pci kexec",
+        &format!("user,id=eo9net,hostfwd=tcp:127.0.0.1:{host_port}-:{KEXEC_GUEST_PORT}"),
+    )?;
+    let wait_for =
+        |marker: &str, what: &str| serial_wait_for("check-kexec", &receiver, marker, what);
+
+    let drive = (|| -> Result<(), String> {
+        // Print the load-bearing serial moments (check-telnet's transcript practice):
+        // the trailing slice of each marker wait is the evidence a reader needs.
+        let tail = |text: &str, keep: usize| {
+            let start = text.len().saturating_sub(keep);
+            text[start..].to_string()
+        };
+
+        let granted = wait_for("kexec: GRANTED", "the boot's kexec grant line")?;
+        println!(
+            "\n----- check-kexec: kernel A boot (grant) -----\n{}",
+            tail(&granted, 700)
+        );
+        wait_for("eosh>", "the eosh prompt")?;
+
+        let composition =
+            format!("net.virtio $ net.l4.over-l2 $ oskexec --secret {KEXEC_SECRET} --bootargs pci");
+        console_type_line("check-kexec", &mut stdin, &composition)?;
+        wait_for("--bootargs pci", "the command echo")?;
+        // The one-time fused-session compile happens here (the long pole under TCG —
+        // sliced codegen narrates within the per-step window).
+        wait_for(
+            &format!("oskexec: listening on :{KEXEC_GUEST_PORT}"),
+            "oskexec to start listening",
+        )?;
+
+        // Host side: stream kernel B through the slirp forward. The sender carries its
+        // own ack-driven wall-clock stall alarm, so no extra timeout is wrapped here.
+        println!(
+            "xtask: check-kexec — sending {} over tcp:127.0.0.1:{host_port}",
+            b_image.display()
+        );
+        let status = Command::new("python3")
+            .current_dir(root)
+            .arg(
+                root.join("boards")
+                    .join("opi5-serial-loader")
+                    .join("tools")
+                    .join("send_image.py"),
+            )
+            .arg(&b_image)
+            .arg("--tcp")
+            .arg(format!("127.0.0.1:{host_port}"))
+            .arg("--secret")
+            .arg(KEXEC_SECRET)
+            .status()
+            .map_err(|err| format!("check-kexec: running send_image.py: {err}"))?;
+        if !status.success() {
+            return Err(format!(
+                "check-kexec: send_image.py --tcp failed ({status}) — see its output above"
+            ));
+        }
+
+        // The same serial stream must now show the dying kernel's last line…
+        let jumping = wait_for(
+            "kexec: jumping to the staged image",
+            "kernel A's final kexec line",
+        )?;
+        println!(
+            "\n----- check-kexec: kernel A's last words (quiesce + jump) -----\n{}",
+            tail(&jumping, 900)
+        );
+        // …then kernel B's stamped banner…
+        let banner = wait_for(
+            &format!("build stamp: {KEXEC_B_STAMP}"),
+            "kernel B's stamped banner",
+        )?;
+        println!(
+            "\n----- check-kexec: kernel B comes up (stamped banner) -----\n{}",
+            tail(&banner, 400)
+        );
+        // …and a live prompt (kernel B reads the original DTB's bootargs — x0 was
+        // deliberate junk, and on QEMU the RAM-base DTB fallback wins).
+        wait_for("eosh>", "kernel B's console prompt")?;
+        console_type_line("check-kexec", &mut stdin, "exit")?;
+        Ok(())
+    })();
+    if let Err(err) = drive {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    let _ = child.wait();
+
+    println!(
+        "xtask: check-kexec ok — kernel A granted kexec, oskexec authenticated and \
+         staged kernel B over tcp:127.0.0.1:{host_port}, the dance jumped, and kernel \
+         B's `{KEXEC_B_STAMP}` banner came up on the same serial stream"
     );
     Ok(())
 }
@@ -4869,7 +5091,7 @@ fn check_curl(root: &Path) -> Result<(), String> {
 
     let outcome = (|| -> Result<(), String> {
         let (mut child, mut stdin, receiver) =
-            spawn_net_qemu("check-curl", root, &image, "user,id=eo9net")?;
+            spawn_net_qemu("check-curl", root, &image, "pci", "user,id=eo9net")?;
         let wait_for = |marker: &str, what: &str| {
             serial_wait_for_progress("check-curl", &receiver, marker, what)
         };

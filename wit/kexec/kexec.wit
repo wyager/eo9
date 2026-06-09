@@ -1,0 +1,88 @@
+/// eo9:kexec — stage a new kernel image in RAM and jump into it (network kexec).
+///
+/// ** THIS CAPABILITY IS TOTAL AUTHORITY OVER THE MACHINE. ** A holder stages
+/// arbitrary bytes into a reserved RAM region and, on a successful `commit`, the
+/// running kernel quiesces the hardware and transfers the CPU to those bytes: the
+/// staged image *becomes* the machine. There is no narrower grant than "replace the
+/// operating system" — no attenuator can make it safe, only absent. The kernel root
+/// provider is therefore **never linked by default**: it exists only behind the
+/// `kexec` boot token (the `pci`/`platform`/`gfx` grant grammar), and the staging
+/// region is reserved out of the kernel heap so no other capability — allocation,
+/// DMA-buffer placement, gfx, platform regions — can ever reach the staged bytes.
+///
+/// The CRC in `commit` is an *integrity* check (did the bytes arrive whole), not an
+/// authenticity check: the caller supplies both the bytes and the CRC. Authenticating
+/// WHO may stage an image is the granting boot's problem (the token) and the serving
+/// program's problem (oskexec's preshared-secret handshake) — see the residual-risk
+/// note on the `oskexec` example: the secret travels cleartext on the LAN; a
+/// challenge-response upgrade is the recorded follow-up.
+///
+/// Failure posture: every refusal is typed and leaves the running system untouched —
+/// a bad offset, an oversize image, a CRC mismatch, or malformed bootargs simply
+/// return an error; nothing has been quiesced and nothing jumps. Only a fully
+/// verified `commit` is a point of no return (it never returns at all).
+package eo9:kexec@0.1.0;
+
+/// Root-handle type, shared by the required and `-optional` flavors. (Types-only
+/// interface — see plan/02-wit.md Decisions.)
+interface types {
+    /// The kexec capability's root handle.
+    resource kexec-impl;
+}
+
+/// Stage-and-jump. The provider owns a reserved staging region (boot-profile
+/// constant, ≥ the largest bootable image); `stage` writes are bounds-checked
+/// against it, and `commit` verifies the staged bytes before the jump.
+interface kexec {
+    use types.{kexec-impl};
+
+    /// The capability's root handle (see SPEC: The capability algebra).
+    default: func() -> kexec-impl;
+
+    variant kexec-error {
+        /// Refused by policy (the absent-grant story; the root provider itself never
+        /// answers this — without the boot token it is not linked at all).
+        denied,
+        /// A `stage` write falls outside the staging region, or `commit`'s length
+        /// exceeds it (or the jump target's capacity). Carries the bounds story.
+        out-of-range(string),
+        /// `commit`'s CRC-32 does not match the staged bytes. Carries both values;
+        /// the system keeps running untouched and the staging region stays as
+        /// written (re-stage or re-commit freely).
+        crc-mismatch(string),
+        /// The image or bootargs are structurally unusable (zero length, bootargs
+        /// that the staged-page format cannot carry).
+        bad-image(string),
+        /// The machine cannot kexec (non-aarch64 ports answer this until their
+        /// dance exists).
+        unsupported,
+        io(string),
+    }
+
+    /// Write `chunk` at `offset` within the staging region. Bounds-checked: the
+    /// write must fall entirely inside the region or nothing is written.
+    stage: async func(k: borrow<kexec-impl>, offset: u64, chunk: list<u8>)
+        -> result<_, kexec-error>;
+
+    /// Verify the first `len` staged bytes against `crc32` (IEEE, reflected — the
+    /// serial-loader protocol's CRC) and, on a match, perform the kexec dance:
+    /// print the final `kexec: jumping…` line, clear bus mastering on every PCI
+    /// function, write `bootargs` to the staged-bootargs page (the USB-boot
+    /// Option-1 format: one printable line, NUL-terminated), mask interrupts,
+    /// sweep the staged bytes to the point of coherency, switch translation off,
+    /// and jump through a relocation stub that copies the image to the boot
+    /// address and enters it with x0 = 0 (the new kernel falls back to the staged
+    /// bootargs page). **On success this call never returns** — the next thing on
+    /// the console is the new kernel's banner. On any verification failure it
+    /// returns the typed error and the running system is untouched.
+    commit: async func(k: borrow<kexec-impl>, len: u64, crc32: u32, bootargs: string)
+        -> result<_, kexec-error>;
+}
+
+/// Optional flavor of `kexec` (hand-written for v0; see SPEC: The capability algebra).
+interface kexec-optional {
+    use types.{kexec-impl};
+
+    /// `none` when the capability was not granted.
+    default: func() -> option<kexec-impl>;
+}
