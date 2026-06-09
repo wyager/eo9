@@ -422,8 +422,12 @@ branch under review does not touch svc/shell paths — smells like load-sensitiv
 timing in the service-restart tests. IDENTIFIED (usb lane, 2026-06-08 late):
 `svc_shell::restart_cycles_complete_while_the_foreground_is_quietly_blocked`
 (assert at svc_shell.rs:410), failing ~1-of-3 SOLO on an idle machine — a real
-service-registry timing bug, not load sensitivity. Needs a dedicated hunt lane;
-until then expect occasional battery re-runs.
+service-registry timing bug, not load sensitivity. SECOND SPECIMEN (curl merge
+review, teed per protocol): `disk::tests::read_only_opens_share_the_image`
+(crates/eo9-providers-unix/src/disk.rs:483), passes solo, failed under concurrent
+lane batteries — likely BlockingPool timing under CPU starvation; distinct bug from
+the svc_shell one. The hunt lane should take both: run each under artificial load +
+solo loops, with logs retained.
 
 ## Check gates can leak the QEMU on the failure path (dhcp lane, 2026-06-08)
 A failed check gate (kill()+wait on error) left its qemu-system-aarch64 alive holding
