@@ -480,3 +480,11 @@ quiesce path leaving PHY state the next claim's warm re-init (ram-code skip path
 doesn't recover, or cumulative u2/PHY state across rapid claims. Driver lane: consider
 a full PHY reset on claim when the previous owner was quiesced-by-kexec, or always.
 Bench rule meanwhile: if LinkDown appears, cold-cycle rather than retrying claims.
+
+## Bundle checkout-dependence is a CLASS, not one component (kernhyg lane, 2026-06-08)
+The fs-eofs path-dep byte-churn applies to EVERY component consuming an
+out-of-workspace path dep (-C metadata hash): now curl, l4check, hidcheck, usbcheck,
+net.rtl8125, usb.ohci, usb.ohci-pci via eo9-dns/eo9-ohci/eo9-rtl8125/eo9-curl-core.
+Standing rule unchanged (refresh from the main checkout post-merge) but the reviewer
+checklist should treat ANY bundle diff from a worktree as suspect-residue first.
+Real fix candidates: workspace-ize the shared crates or pin metadata hashing.
