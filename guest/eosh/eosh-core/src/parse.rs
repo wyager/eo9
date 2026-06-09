@@ -21,8 +21,8 @@
 //! Keyword-first forms (`let`, `only`, `rename`, `with`, `… as …`) are parsed from the
 //! left, as the spec requires; `let`, `only`, `rename`, `with`, and `as` are reserved
 //! words and must be quoted to be used as literal argument values. Builtin names
-//! (`help`, `env`, `history`, `exit`, `quit`, `describe`, `imports`) are only special as
-//! the first word of a command.
+//! (`help`, `env`, `history`, `exit`, `quit`, `describe`, `imports`, `man`) are only
+//! special as the first word of a command.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -62,6 +62,8 @@ pub enum ParseError {
     DetachNeedsRestart,
     /// `svc` with an unknown subcommand.
     UnknownSvcCommand { found: String },
+    /// `man` with anything other than a single bare name.
+    ManNeedsBareWord,
 }
 
 impl fmt::Display for ParseError {
@@ -104,6 +106,11 @@ impl fmt::Display for ParseError {
                 f,
                 "unknown `svc` subcommand `{found}`; expected `svc` (or `svc list`), \
                  `svc log <name>`, `svc stop <name>`, or `svc clear <name>`"
+            ),
+            ParseError::ManNeedsBareWord => write!(
+                f,
+                "`man` takes a single name (a program in /bin, a shell word, or an OS \
+                 API); a composition has no manual of its own — use `describe <expr>`"
             ),
         }
     }
@@ -277,6 +284,26 @@ impl Parser {
                 "imports" => {
                     self.next();
                     return Ok(Command::Imports(self.expr()?));
+                }
+                "man" => {
+                    self.next();
+                    // `man <word>`: exactly one bare word — a program name, a shell
+                    // word (reserved words included: `man let`, `man $`), or an OS API
+                    // name. Anything longer is an expression, and a composition has no
+                    // manual of its own (`describe <expr>` is the tool for those).
+                    let word = match (self.tokens.len() - self.pos, self.peek()) {
+                        (1, Some(Token::Word(word))) => word.clone(),
+                        (1, Some(Token::Dollar)) => String::from("$"),
+                        (1, Some(Token::Amp)) => String::from("&"),
+                        (0, _) => {
+                            return Err(ParseError::UnexpectedEnd {
+                                expected: "a name after `man` (e.g. `man telnetd`)",
+                            });
+                        }
+                        _ => return Err(ParseError::ManNeedsBareWord),
+                    };
+                    self.next();
+                    return Ok(Command::Man(word));
                 }
                 _ => {}
             }
@@ -1180,6 +1207,60 @@ mod tests {
                 )
             ))
         );
+    }
+
+    #[test]
+    fn man_takes_exactly_one_bare_word() {
+        assert_eq!(
+            parse_command("man telnetd").expect("parses"),
+            Command::Man("telnetd".to_string())
+        );
+        assert_eq!(
+            parse_command("man net.l4.over-l2").expect("parses"),
+            Command::Man("net.l4.over-l2".to_string())
+        );
+        // Shell words — reserved ones and operators included — are fine: they have
+        // builtin cards, same as `describe`.
+        assert_eq!(
+            parse_command("man let").expect("parses"),
+            Command::Man("let".to_string())
+        );
+        assert_eq!(
+            parse_command("man $").expect("parses"),
+            Command::Man("$".to_string())
+        );
+        // OS API names route through the same word (the session dispatches on the colon).
+        assert_eq!(
+            parse_command("man eo9:fs/fs").expect("parses"),
+            Command::Man("eo9:fs/fs".to_string())
+        );
+    }
+
+    #[test]
+    fn man_refuses_expressions_and_emptiness() {
+        // Expressions have no manual of their own; the message points at `describe`.
+        assert_eq!(
+            parse_command("man net.virtio $ l2check"),
+            Err(ParseError::ManNeedsBareWord)
+        );
+        assert_eq!(parse_command("man a b"), Err(ParseError::ManNeedsBareWord));
+        assert_eq!(
+            parse_command("man (hello)"),
+            Err(ParseError::ManNeedsBareWord)
+        );
+        assert_eq!(
+            parse_command("man hello --flag x"),
+            Err(ParseError::ManNeedsBareWord)
+        );
+        assert_eq!(
+            parse_command("man"),
+            Err(ParseError::UnexpectedEnd {
+                expected: "a name after `man` (e.g. `man telnetd`)"
+            })
+        );
+        // The rendered message tells the user what to do instead.
+        let message = alloc::format!("{}", ParseError::ManNeedsBareWord);
+        assert!(message.contains("describe"), "got: {message}");
     }
 
     #[test]

@@ -62,6 +62,18 @@ pub const BUILTIN_DOCS: &[BuiltinDoc] = &[
         related: "imports, env, help",
     },
     BuiltinDoc {
+        names: &["man"],
+        kind: BUILTIN,
+        summary: &[
+            "Shows a program's own manual — the user-facing page its author embedded in the component",
+            "(synopsis, what it does, each argument with its values, examples). Falls back to `describe`",
+            "when there is no manual. The manual is the author's prose; `describe` stays the mechanical",
+            "truth, and `man` flags any disagreement. Shell words and OS APIs get their describe cards.",
+        ],
+        usage: &["man <name>", "e.g. man telnetd"],
+        related: "describe, help",
+    },
+    BuiltinDoc {
         names: &["imports"],
         kind: BUILTIN,
         summary: &[
@@ -274,8 +286,8 @@ mod tests {
     /// `parse.rs`'s command match and the expression grammar — the point of this list is
     /// that adding a word THERE without a card HERE fails the test below.
     pub const SHELL_WORDS: &[&str] = &[
-        "help", "describe", "imports", "env", "history", "let", "save", "detach", "svc", "exit",
-        "quit", "poweroff", "$", "&", "only", "rename", "with", "compose", "extend",
+        "help", "describe", "man", "imports", "env", "history", "let", "save", "detach", "svc",
+        "exit", "quit", "poweroff", "$", "&", "only", "rename", "with", "compose", "extend",
     ];
 
     #[test]

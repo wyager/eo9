@@ -42,6 +42,7 @@ pub mod cache;
 pub mod envinfo;
 pub mod eval;
 pub mod lex;
+pub mod manual;
 pub mod parse;
 pub mod render;
 pub mod session;

@@ -96,6 +96,12 @@ pub enum Command {
     DescribeApi(String),
     /// `imports <expr>` — print the residual imports.
     Imports(Expr),
+    /// `man <name>` — render the named artifact's self-described manual (the
+    /// `eo9-manual` custom section), with the dispatch ladder of
+    /// docs/design/component-manuals.md: builtin/operator card, OS API card, the
+    /// manual of `/bin/<name>.wasm`, or "no manual; showing describe". Bare word only:
+    /// no expression evaluation, no part-chasing, no `let` bindings.
+    Man(String),
     /// `env` — show the session's capability picture (what the shell holds, what
     /// children receive) and the granted environment, if any.
     Env,
