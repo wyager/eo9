@@ -405,6 +405,9 @@ pub fn text_sink_provider() -> Component {
     (i32.const 64))
   (func (export "eo9:text/text@0.1.0#read-line") (param i32) (result i32)
     ;; not exercised by the fixtures
+    unreachable)
+  (func (export "eo9:text/text@0.1.0#read-key") (param i32) (result i32)
+    ;; not exercised by the fixtures
     unreachable))
 "#
     );
