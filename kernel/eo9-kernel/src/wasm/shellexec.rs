@@ -881,7 +881,7 @@ type GrantShape = (bool, bool, bool, bool, bool);
 /// The boot's gfx grant (the `gfx` token). Only the Orange Pi 5 Plus board profile has
 /// the gfx.simplefb root provider; everywhere else the bit is constantly `false` and
 /// the refusal below tells the capability story.
-fn gfx_granted() -> bool {
+pub(super) fn gfx_granted() -> bool {
     #[cfg(feature = "board-opi5plus")]
     {
         super::gfx_provider::granted()
@@ -895,7 +895,7 @@ fn gfx_granted() -> bool {
 /// The boot's kexec grant (the `kexec` token). aarch64 only — the other ports have no
 /// kexec dance yet, so the bit is constantly `false` and the refusal below tells the
 /// capability story.
-fn kexec_granted() -> bool {
+pub(super) fn kexec_granted() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
         super::kexec_provider::granted()

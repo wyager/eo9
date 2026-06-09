@@ -348,6 +348,26 @@ pub(super) fn add_diagnostics(linker: &mut Linker<KernelState>) -> Result<()> {
     Ok(())
 }
 
+/// The ambient time/entropy roots for the *service* environment (`super::svc`): exactly
+/// the providers every console child links unconditionally, minus text — a service's
+/// text is the registry's log ring, never the serial console. Registered together with
+/// their types-interfaces here so svc.rs needs no access to the private capability
+/// marker types.
+pub(super) fn add_time_entropy(linker: &mut Linker<KernelState>) -> Result<()> {
+    linker.instance("eo9:time/types@0.1.0")?.resource(
+        "time-impl",
+        ResourceType::host::<TimeCap>(),
+        |_, _| Ok(()),
+    )?;
+    linker.instance("eo9:entropy/types@0.1.0")?.resource(
+        "entropy-impl",
+        ResourceType::host::<EntropyCap>(),
+        |_, _| Ok(()),
+    )?;
+    add_time(linker)?;
+    add_entropy(linker)
+}
+
 /// The types-only interfaces: root-handle resources with no-op destructors.
 fn add_types(linker: &mut Linker<KernelState>) -> Result<()> {
     linker.instance("eo9:text/types@0.1.0")?.resource(

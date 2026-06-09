@@ -588,3 +588,16 @@ boot grant tokens like the console session does. Lane: the svc registry's spawn
 path should link root providers per the same boot grants (operator-authored config
 = console-equivalent trust), and init's config grammar needs either composition
 support or saved-composition references for multi-component services.
+RESOLVED (svc-grants lane, 2026-06-09, area/29-svc-grants): the kernel registry now
+links the boot-granted operator roots (pci/platform/gfx/kexec/console-sink — the
+same boot-constant bits as the console's spawn linker) plus the ambient time/entropy
+roots into every service; detach's typed not-closed refusal stays for anything this
+boot cannot satisfy (fs/exec/svc/net/unknown interfaces, or an ungranted root).
+init's config grammar gained `$` chains (provider flags = configure args; the last
+segment is the binary); the `station` boot token bakes the demo config (the
+usb.ohci-pci variant under QEMU, where the platform table has no OHCI); the new
+`check-station` gate proves the always-on keyboard service end to end with zero
+typed foreground commands. Posture recorded in SPEC ("Services and detachment"),
+executor-model.md (the kernel refinement + the intersect-with-the-detaching-session
+rule any future narrower detach-holding session must apply), and svc.rs. The
+usermode registry is unchanged (composed-only).

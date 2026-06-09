@@ -7,14 +7,32 @@
 //! registry's lifetime is the boot (owner ruling E: the kernel binds it to the machine);
 //! `poweroff`/init-exit stops everything that is still running.
 //!
-//! # Capability soundness (the load-bearing rule, identical to usermode)
+//! # Capability soundness and the operator-trust posture
 //!
-//! A detached child runs with **exactly what its detacher composed into it**, plus the
-//! registry's log capture and the `eo9:rt/*` riders — never the session's authority.
-//! Detach refuses (typed `not-closed`) any composition whose residual *required* imports
-//! fall outside text/rt/io, and the service linker registers nothing else: no fs, no
-//! exec, no time, no entropy, no pci, no svc. The kernel session's inherit-everything
-//! default applies to *foreground children only*; a service gets the short list.
+//! A detached child runs with what its detacher composed into it, plus the registry's
+//! log capture, the `eo9:rt/*` riders, the ambient kernel roots every console child
+//! links unconditionally (time, entropy, io buffers), and the **boot-granted operator
+//! roots** — pci/platform/gfx/kexec/console-sink, gated by exactly the same boot
+//! tokens that gate the console session's own spawn linker (`shellexec::spawn_linker`).
+//! Detach still refuses (typed `not-closed`) any residual *required* import outside
+//! that set: no fs, no exec, no svc, no net — a service can never resolve programs,
+//! spawn, or detach, and an import this boot cannot satisfy (`eo9:nosuch`, or a root
+//! whose token was not given) refuses typed at detach, before anything runs.
+//!
+//! **The posture, plainly (SPEC "Services and detachment"):** operator-authored
+//! services — an init config line or a session `detach` — are console-equivalent
+//! trust. Granting the boot roots to services widens what a config line can do to
+//! exactly what a console line can do: same operator, same authority. The soundness
+//! invariant is unchanged in spirit — a detached child never holds more than its
+//! detacher could have run in the foreground — because the linked set IS the
+//! foreground set. SECURITY: the only holders of the detach capability are the boot
+//! supervisor's chain (init → console, the `svc_generations` count), and that chain's
+//! spawn linker carries these exact grant bits; the bits are boot-constant, so there
+//! is no narrower-session escalation path today. If a session shape with a reduced
+//! grant set ever holds detach (network sessions are the candidate — today they hold
+//! generation 0 and cannot), this linking MUST first intersect with the *detaching
+//! session's* own grant shape, not the boot's. (The usermode registry keeps the
+//! composed-only short list — its roots are ambient unix providers, not boot grants.)
 //!
 //! # Restart policies are programs
 //!
@@ -327,13 +345,26 @@ fn valid_service_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
 }
 
-/// The interfaces a detached composition may still (require-)import: the registry's log
-/// capture satisfies text, and the rt riders are runtime contract everywhere. Identical
-/// to the usermode rule.
+/// The interfaces a detached composition may still (require-)import. Three tiers (the
+/// module header's posture): the registry's own contributions (text = the log ring, the
+/// rt riders, io buffers); the ambient kernel roots every console child holds
+/// unconditionally (time, entropy); and the boot-granted operator roots, admitted only
+/// when this boot's token actually granted them — the same bits, read from the same
+/// providers, as the console session's spawn linker. The grant bits are boot-constant
+/// (set once in `runner::boot`), so this check at detach time and the linking at every
+/// (re)spawn can never disagree. Everything else — fs, exec, svc, net, unknown
+/// interfaces — still refuses typed at detach.
 fn import_allowed_for_service(interface: &str) -> bool {
     interface.starts_with("eo9:text/")
         || interface.starts_with("eo9:rt/")
         || interface.starts_with("eo9:io/")
+        || interface.starts_with("eo9:time/")
+        || interface.starts_with("eo9:entropy/")
+        || (interface.starts_with("eo9:pci/") && super::pci_provider::granted())
+        || (interface.starts_with("eo9:platform/") && super::platform_provider::granted())
+        || (interface.starts_with("eo9:gfx/") && shellexec::gfx_granted())
+        || (interface.starts_with("eo9:kexec/") && shellexec::kexec_granted())
+        || (interface.starts_with("eo9:console-sink/") && super::console_sink_provider::granted())
 }
 
 /// The interfaces a *pure policy* may import: types and runtime-contract riders only.
@@ -346,9 +377,17 @@ fn import_allowed_for_policy(interface: &str) -> bool {
 // -----------------------------------------------------------------------------------------
 
 /// Build the linker a service instantiates against: text (the log ring), the rt
-/// diagnostics rider, io buffers, and nothing else. No fs, no exec, no time, no
-/// entropy, no pci, no svc — capability soundness is structural, exactly as in
-/// usermode (`Service::providers` there builds from `Providers::none()`).
+/// diagnostics rider, io buffers, the ambient time/entropy roots, and the boot-granted
+/// operator roots (pci/platform/gfx/kexec/console-sink) — exactly the conditional set
+/// `shellexec::spawn_linker` gives the console session's children, gated by the same
+/// boot-constant grant bits. No fs, no exec, no svc — capability soundness stays
+/// structural: nothing here lets a service resolve programs, spawn, or detach. The
+/// loader rule keeps the wide registration honest, as it does for foreground children:
+/// a service only links the interfaces its composition actually imports, so the grants
+/// are inert for services that never asked for them. See the module header for why
+/// linking the boot roots is sound (operator-authored services are console-equivalent
+/// trust) and for the intersect-with-the-session rule any future narrower session must
+/// apply.
 fn service_linker(
     engine: &wasmtime::Engine,
     ring: Option<SharedRing>,
@@ -422,6 +461,35 @@ fn service_linker(
     // io buffers: authority-free data plumbing (the usermode allow-list includes io).
     super::shellfs::add_buffers(&mut linker)?;
 
+    // The ambient kernel roots every console child links unconditionally (time for
+    // device pacing and sleeps, entropy) — minus text, which the log ring owns above.
+    super::providers::add_time_entropy(&mut linker)?;
+
+    // The boot-granted operator roots: the same registrations, under the same
+    // boot-constant grant bits, as the console session's spawn linker
+    // (`shellexec::spawn_linker`). Linking these here is what makes the `station`
+    // config's always-on keyboard service (`usb.ohci … $ usb.kbd`) possible at all;
+    // the soundness argument lives in the module header. `import_allowed_for_service`
+    // admitted only granted interfaces at detach, so an ungranted root can never be
+    // demanded by a registered service in the first place.
+    if super::pci_provider::granted() {
+        super::pci_provider::add_pci(&mut linker)?;
+    }
+    if super::platform_provider::granted() {
+        super::platform_provider::add_platform(&mut linker)?;
+    }
+    #[cfg(feature = "board-opi5plus")]
+    if shellexec::gfx_granted() {
+        super::gfx_provider::add_gfx(&mut linker)?;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if shellexec::kexec_granted() {
+        super::kexec_provider::add_kexec(&mut linker)?;
+    }
+    if super::console_sink_provider::granted() {
+        super::console_sink_provider::add_console_sink(&mut linker)?;
+    }
+
     Ok(linker)
 }
 
@@ -440,7 +508,9 @@ fn spawn_service_run(
 
     // The service's store: a ShellState is present so the io buffer table works, but no
     // fs/exec/svc functions are registered on the linker, so nothing beyond buffers is
-    // reachable through it.
+    // reachable through it. (The granted operator roots keep their tables — pci,
+    // platform, dma — on the KernelState itself, torn down when the store drops, the
+    // same lifecycle as a foreground child's.)
     let mut state = KernelState::new();
     state.shell = Some(Box::new(super::shell::ShellState {
         fs: super::shellfs::ShellFs::new(entries, String::new()),

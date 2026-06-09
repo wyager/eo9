@@ -153,6 +153,27 @@ explicit `detach-with-env(c, args, env: component, …)` where the parent passes
 *value* it owns — SPEC already defines environments as passable data — but v1 keeps the
 simplest sound rule: close it yourself, then hand it over.)
 
+**The kernel refinement (operator trust, the station lane).** The kernel registry widens the
+short list in one principled way: it also satisfies the ambient kernel roots every console
+child links unconditionally (time, entropy, io buffers) and the **boot-granted operator
+roots** — pci/platform/gfx/kexec/console-sink, gated by exactly the boot tokens that gate the
+console session's spawn linker. The rationale is the invariant itself, stated in its real
+form: *a service never holds more than its detacher could run in the foreground.* On the
+kernel, the only detach holders are the boot supervisor's chain (init → console), and that
+chain's foreground spawns already link precisely this conditional set — so an init config
+line or a console `detach` linking it to a service escalates nothing. It does mean a config
+line can do exactly what a console line can do (same operator, same authority — say it
+plainly: a `station` config with the `kexec` token hands the keyboard service nothing, but a
+config line naming a kexec-importing program would hold total authority, exactly as typing it
+at the prompt would). fs, exec, svc, and net stay off the list on both targets — a service
+can never resolve programs, spawn, or detach. The usermode registry keeps the composed-only
+rule unchanged: its roots are ambient unix providers, not per-boot operator grants, so there
+is no token-shaped "what the operator granted this boot" to mirror. If the kernel ever grows
+a session shape with a narrower grant set that still holds detach (network sessions are the
+candidate; today they hold generation 0 and cannot detach), the registry must intersect the
+linked set with the *detaching session's* grants, not the boot's — recorded beside the
+linking code in `kernel/eo9-kernel/src/wasm/svc.rs`.
+
 Two consequences worth stating:
 
 * **Determinism/inspection carries over.** The detached component is a value; its wiring tree

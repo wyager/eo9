@@ -109,7 +109,11 @@ interface detach {
         /// The composition still requires capabilities the registry will not supply,
         /// named. Compose them in before detaching: a detached child runs with exactly
         /// what its detacher composed, plus log capture — never the registry's own
-        /// authority (capability soundness; see the design doc).
+        /// authority (capability soundness; see the design doc). The kernel registry
+        /// also satisfies the ambient kernel roots (time, entropy, io) and the
+        /// boot-granted operator roots, exactly as a foreground spawn would — the
+        /// design doc's kernel refinement: operator-authored services are
+        /// console-equivalent trust.
         not-closed(list<string>),
         /// The child is a provider, not a binary.
         not-a-binary,
