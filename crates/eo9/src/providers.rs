@@ -1142,16 +1142,33 @@ fn assemble(
 // Blocking until a task is runnable again
 // ---------------------------------------------------------------------------------------
 
-/// Wakes the driving thread when the task's doorbell rings.
-struct ThreadWaker(std::thread::Thread);
+/// Wakes the driving thread when the task's doorbell rings. `fired` records that an
+/// event wake happened at all: under CPU load the woken thread may get the CPU back
+/// only *after* the park timeout has already elapsed, so "did an event wake us?"
+/// cannot be inferred from elapsed time — only from this flag (see the liveness
+/// detector in [`park_until_progress`]).
+struct ThreadWaker {
+    thread: std::thread::Thread,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl ThreadWaker {
+    fn for_current_thread() -> Arc<Self> {
+        Arc::new(ThreadWaker {
+            thread: std::thread::current(),
+            fired: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
 
 impl Wake for ThreadWaker {
     fn wake(self: Arc<Self>) {
-        self.0.unpark();
+        self.wake_by_ref();
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        self.0.unpark();
+        self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.thread.unpark();
     }
 }
 
@@ -1159,7 +1176,7 @@ impl Wake for ThreadWaker {
 /// provider completion rings its doorbell. Used by the built-in drive loop whenever
 /// `resume` reports the task blocked on I/O.
 pub fn wait_until_runnable(task: &Task) {
-    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let waker = Waker::from(ThreadWaker::for_current_thread());
     let mut context = Context::from_waker(&waker);
     let runnable = task.runnable();
     let mut runnable = std::pin::pin!(runnable);
@@ -1183,7 +1200,8 @@ pub fn park_until_progress(
     registry: &eo9_runtime::SharedRegistry,
     backstop: std::time::Duration,
 ) {
-    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let waker_state = ThreadWaker::for_current_thread();
+    let waker = Waker::from(Arc::clone(&waker_state));
     let mut context = Context::from_waker(&waker);
 
     // Foreground readiness (and registration) first: poll_edge semantics.
@@ -1195,8 +1213,10 @@ pub fn park_until_progress(
 
     // Service readiness + registration, and the restart-deadline bound, under one lock.
     // `cap_rated`: the unconditional backstop, not a restart deadline, set the timeout —
-    // a deadline-bounded park is the legitimate "the event is time" case.
-    let (timeout, cap_rated) = {
+    // a deadline-bounded park is the legitimate "the event is time" case. The deadline
+    // itself is kept for the detector below: a restart falling due is also a time event,
+    // never a missed wake edge.
+    let (timeout, cap_rated, restart_due) = {
         let registry = registry.lock().unwrap();
         if registry.park_ready(&waker) {
             return;
@@ -1204,9 +1224,9 @@ pub fn park_until_progress(
         match registry.next_restart_due() {
             Some(due) => {
                 let until_due = due.saturating_duration_since(std::time::Instant::now());
-                (until_due.min(backstop), until_due > backstop)
+                (until_due.min(backstop), until_due > backstop, Some(due))
             }
-            None => (backstop, true),
+            None => (backstop, true, None),
         }
     };
 
@@ -1215,17 +1235,28 @@ pub fn park_until_progress(
     std::thread::park_timeout(timeout);
 
     // Liveness detector (SPEC: a backstop firing that discovers actionable work no event
-    // delivered is a high-priority bug). An early return is an unpark — event-driven,
-    // never a finding (spurious unparks land here too: conservative). A full cap-rated
-    // timeout that then finds runnable work means the work's wake edge was missed while
-    // this thread slept the entire backstop.
-    if cap_rated && parked_at.elapsed() >= timeout {
+    // delivered is a high-priority bug). The discriminator is the waker's `fired` flag,
+    // NOT elapsed time: under CPU load an event-driven wake routinely gets the CPU back
+    // only after the (10ms) backstop has already elapsed, so `elapsed >= timeout` alone
+    // misattributes correctly-delivered completions as stranded work (measured doing
+    // exactly that for stdin read-line completions at load ~30). A wake that fired —
+    // before, during, or right after the park — means the edge worked; only a full
+    // cap-rated timeout with NO wake fired and runnable work discovered afterwards
+    // means an edge was genuinely missed.
+    if cap_rated
+        && parked_at.elapsed() >= timeout
+        && !waker_state.fired.load(std::sync::atomic::Ordering::SeqCst)
+    {
         let fg = {
             let runnable = task.runnable();
             let runnable = std::pin::pin!(runnable);
             runnable.poll(&mut context).is_ready()
         };
-        let services = registry.lock().unwrap().any_runnable();
+        // A pending restart deadline that crossed into dueness while this thread slept
+        // (or waited for the CPU afterwards) explains service readiness as a time event:
+        // deadlines have no wake edge to miss, so they are excluded from the finding.
+        let restart_now_due = restart_due.is_some_and(|due| due <= std::time::Instant::now());
+        let services = !restart_now_due && registry.lock().unwrap().any_runnable();
         if fg || services {
             liveness_backstop_finding(fg, services);
         }
@@ -1276,7 +1307,7 @@ mod tests {
     fn oneshot_completed_before_first_poll_is_immediately_ready() {
         let (mut op, complete) = oneshot::<&'static str>();
         complete("done");
-        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let waker = Waker::from(ThreadWaker::for_current_thread());
         let mut context = Context::from_waker(&waker);
         assert_eq!(op.as_mut().poll(&mut context), Poll::Ready("done"));
     }
@@ -1443,7 +1474,7 @@ mod tests {
 
     /// Drive a provider operation to completion on the test thread.
     fn block_on<T>(op: BoxOp<T>) -> T {
-        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let waker = Waker::from(ThreadWaker::for_current_thread());
         let mut context = Context::from_waker(&waker);
         let mut op = op;
         loop {
