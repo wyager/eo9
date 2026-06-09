@@ -1,26 +1,26 @@
 {
-  "blob": "/vm/web-eo9.8d140ca1b95acef6.wasm",
+  "blob": "/vm/web-eo9.bb8cd6771ebf1619.wasm",
   "page": {
     "vm.js": "/vm/vm.3363de7463cd0276.js",
     "vm.css": "/vm/vm.b7c2d1b49a4561f0.css"
   },
   "store": {
-    "cat": "/vm/store/cat.b553c2b74362328a.cwasm",
-    "cp": "/vm/store/cp.bce3d00824d3172c.cwasm",
+    "cat": "/vm/store/cat.18cebc42a6634805.cwasm",
+    "cp": "/vm/store/cp.0b466bf461dd0ed8.cwasm",
     "cruncher": "/vm/store/cruncher.c3273c1f590587dd.cwasm",
-    "echo": "/vm/store/echo.ac306d81d2066aaa.cwasm",
-    "find": "/vm/store/find.efad8afd32cbff6e.cwasm",
-    "head": "/vm/store/head.37800aeff7f9bcdb.cwasm",
-    "hello": "/vm/store/hello.93e3830ced7e8d69.cwasm",
-    "ls": "/vm/store/ls.ec64da53095f14c2.cwasm",
-    "mkdir": "/vm/store/mkdir.d571ce6d8be6515b.cwasm",
-    "outcomes": "/vm/store/outcomes.6af9e839839e1ff3.cwasm",
-    "readwrite": "/vm/store/readwrite.6679a4c582e6409d.cwasm",
-    "rm": "/vm/store/rm.ccdede7ca69e19ba.cwasm",
-    "rng": "/vm/store/rng.db22914545d42df7.cwasm",
+    "echo": "/vm/store/echo.59075845e73d2f81.cwasm",
+    "find": "/vm/store/find.5e58229db345b67a.cwasm",
+    "head": "/vm/store/head.351a7e9a9048fcd5.cwasm",
+    "hello": "/vm/store/hello.0f0c65d20a015ca9.cwasm",
+    "ls": "/vm/store/ls.9cf47c6916c782e2.cwasm",
+    "mkdir": "/vm/store/mkdir.f75b449b02f6626a.cwasm",
+    "outcomes": "/vm/store/outcomes.c7d55c9813d13874.cwasm",
+    "readwrite": "/vm/store/readwrite.37c513855c6c83ff.cwasm",
+    "rm": "/vm/store/rm.158244f50577f306.cwasm",
+    "rng": "/vm/store/rng.7c0386643808fbea.cwasm",
     "sleepy": "/vm/store/sleepy.0f0fafc8b008d00f.cwasm",
-    "stat": "/vm/store/stat.34223454afcd7748.cwasm",
-    "touch": "/vm/store/touch.6c73881d29e8c4ea.cwasm",
-    "wc": "/vm/store/wc.4eae426e6f60a408.cwasm"
+    "stat": "/vm/store/stat.cbbb0cde6379115f.cwasm",
+    "touch": "/vm/store/touch.23dc8d4ef5ea2576.cwasm",
+    "wc": "/vm/store/wc.fdabb18933a6c479.cwasm"
   }
 }
