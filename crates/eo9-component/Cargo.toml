@@ -72,3 +72,10 @@ std = [
 # prebuilt guest artifacts are needed (area 07 is built in parallel and is not a
 # dependency of this crate).
 wit-component = { workspace = true, features = ["dummy-module"] }
+# The eosh-side eo9-manual section scanner, for the wac-nesting pin test: composing two
+# manual-carrying operands must bury their manuals out of the scanner's two-level reach
+# (a fused artifact answers `man` with the describe fallback, not one part's prose). A
+# wac upgrade that changed how operands nest would silently change that fallback; the
+# pin test here is what catches it (docs/design/component-manuals.md, workaround 2).
+# Path-only (no version): stripped by `cargo package`, so publishing is unaffected.
+eosh-core = { path = "../../guest/eosh/eosh-core" }

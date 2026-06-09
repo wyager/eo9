@@ -982,3 +982,143 @@ fn configured_components_carry_the_bind_entrypoint_through_composition() {
         .count();
     assert_eq!(riders, 1, "exactly one merged entrypoint");
 }
+
+// ---------------------------------------------------------------------------
+// Component manuals: the wac-nesting pin (docs/design/component-manuals.md, workaround 2)
+// ---------------------------------------------------------------------------
+
+/// Unsigned LEB128 (the only encoding the section frames use).
+fn leb(mut value: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+    out
+}
+
+/// An encoded custom section (id 0) with the given name and data.
+fn custom_section(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut payload = leb(name.len() as u32);
+    payload.extend_from_slice(name.as_bytes());
+    payload.extend_from_slice(data);
+    let mut out = vec![0u8];
+    out.extend(leb(payload.len() as u32));
+    out.extend(payload);
+    out
+}
+
+/// Append an OUTER custom section to a component (custom sections are legal anywhere
+/// after the preamble; the end is the cheapest spot).
+fn append_custom_section(mut bytes: Vec<u8>, name: &str, data: &[u8]) -> Vec<u8> {
+    bytes.extend(custom_section(name, data));
+    bytes
+}
+
+/// Inject a custom section into a component's FIRST depth-1 core module — the canonical
+/// place the guest SDK's `#[link_section]` static lands. Walks the outer sections,
+/// re-frames the module section around the grown module, leaves everything else as is.
+fn inject_core_module_custom(bytes: Vec<u8>, name: &str, data: &[u8]) -> Vec<u8> {
+    fn read_leb(bytes: &[u8], pos: &mut usize) -> u32 {
+        let mut result = 0u32;
+        let mut shift = 0;
+        loop {
+            let byte = bytes[*pos];
+            *pos += 1;
+            result |= u32::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return result;
+            }
+            shift += 7;
+        }
+    }
+    assert_eq!(&bytes[0..4], b"\0asm", "a wasm container");
+    assert_eq!(bytes[6], 1, "a component (layer 1)");
+    let mut out = bytes[..8].to_vec();
+    let mut pos = 8usize;
+    let mut injected = false;
+    while pos < bytes.len() {
+        let id = bytes[pos];
+        pos += 1;
+        let mut size_pos = pos;
+        let size = read_leb(&bytes, &mut size_pos) as usize;
+        let payload = &bytes[size_pos..size_pos + size];
+        if id == 1 && !injected {
+            // The first core module: append the custom section inside it and re-frame.
+            let mut module = payload.to_vec();
+            module.extend(custom_section(name, data));
+            out.push(1);
+            out.extend(leb(module.len() as u32));
+            out.extend(module);
+            injected = true;
+        } else {
+            out.extend_from_slice(&bytes[pos - 1..size_pos + size]);
+        }
+        pos = size_pos + size;
+    }
+    assert!(injected, "the component carries a core module");
+    out
+}
+
+#[test]
+fn wac_nesting_buries_operand_manuals_below_the_man_scanners_reach() {
+    // The fused-artifact rule (component-manuals design, section 1): a saved
+    // composition has no top-level manual — `man` falls back to `describe`, which is
+    // honest, because a composition's behavior is the algebra's, not one part's prose.
+    // That rests on a wac-graph behavior: operands nest as components, putting their
+    // core modules at depth 2, below the scanner's outer + depth-1 reach. This test
+    // pins it so a wac upgrade cannot silently change `man`'s fallback.
+    use eosh_core::manual::extract_manual;
+
+    const PROVIDER_MANUAL: &str =
+        "eo9-manual 1\nname: text-mock\nsynopsis: a text provider\nend\n";
+    const CONSUMER_MANUAL: &str = "eo9-manual 1\nname: hello\nsynopsis: say hello\nend\n";
+
+    // Operands carrying manuals in the canonical place (a custom section of their core
+    // module, where the guest SDK's link_section static lands)…
+    let provider_bytes = inject_core_module_custom(
+        eo9_fixture("text-mock").save(),
+        "eo9-manual",
+        PROVIDER_MANUAL.as_bytes(),
+    );
+    let consumer_bytes = inject_core_module_custom(
+        eo9_fixture("hello").save(),
+        "eo9-manual",
+        CONSUMER_MANUAL.as_bytes(),
+    );
+    // …are found there before composition (this is `man <operand>` working).
+    assert_eq!(
+        extract_manual(&provider_bytes),
+        Some(PROVIDER_MANUAL.as_bytes())
+    );
+    assert_eq!(
+        extract_manual(&consumer_bytes),
+        Some(CONSUMER_MANUAL.as_bytes())
+    );
+
+    let provider = Component::load(provider_bytes).expect("the operand still loads");
+    let consumer = Component::load(consumer_bytes).expect("the operand still loads");
+    let fused = compose(&provider, &consumer).expect("composes");
+    assert_eq!(
+        extract_manual(&fused.save()),
+        None,
+        "a fused artifact must answer `man` with the describe fallback, never one \
+         operand's manual — wac's nesting (or the scanner's depth rule) changed"
+    );
+
+    // The outer-custom variant (the design's contingency location) is buried the same way.
+    let outer = append_custom_section(
+        eo9_fixture("text-mock").save(),
+        "eo9-manual",
+        b"outer manual",
+    );
+    assert_eq!(extract_manual(&outer), Some(&b"outer manual"[..]));
+    let outer = Component::load(outer).expect("an appended custom section still loads");
+    let fused = compose(&outer, &eo9_fixture("hello")).expect("composes");
+    assert_eq!(extract_manual(&fused.save()), None);
+}

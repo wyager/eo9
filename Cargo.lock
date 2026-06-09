@@ -474,6 +474,7 @@ version = "0.1.0"
 name = "eo9-component"
 version = "0.1.0"
 dependencies = [
+ "eosh-core",
  "wac-graph",
  "wasm-encoder 0.250.0",
  "wasm-wave 0.250.0",
