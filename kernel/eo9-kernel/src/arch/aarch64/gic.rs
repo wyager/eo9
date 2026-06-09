@@ -338,6 +338,20 @@ pub fn configure_intid(intid: u32) {
     unsafe { crate::mmio::write_u8(base + prio_reg, 0x80) };
 }
 
+/// Program an SPI's trigger mode to level-sensitive. `GICD_ICFGR<n>` carries 2 bits per
+/// INTID; the odd bit selects edge (1) vs level (0). The reset value is implementation
+/// defined for SPIs, so the console UART's level-high RX line (PL011 on `virt`, DW-APB
+/// UART2 on the board — both level per their device trees) is programmed explicitly
+/// rather than trusted to the default. SPIs only (INTID ≥ 32): PPI trigger modes are
+/// fixed by the implementation and their ICFGR fields are read-only.
+pub fn configure_level_spi(intid: u32) {
+    debug_assert!(intid >= 32, "configure_level_spi is for SPIs only");
+    let register = 0xC00 + (intid as usize / 16) * 4;
+    let edge_bit = 1u32 << ((intid as usize % 16) * 2 + 1);
+    let value = gicd_read(register) & !edge_bit;
+    gicd_write(register, value);
+}
+
 /// Enable forwarding of a single interrupt ID (e.g. INTID 27, the EL1 virtual timer PPI).
 /// On GICv3, SGI/PPI enables live in the redistributor, and enabled SPIs are additionally
 /// routed to this PE (affinity 0.0.0.0) via `GICD_IROUTER<n>`.

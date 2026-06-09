@@ -359,11 +359,16 @@ RX interrupt path never drains it: input reaches the shell only when the kernel'
 idle backstop scavenges the FIFO — the backstop's own `stranded input` line named the
 mechanism (accountability lines earn their keep). Between scavenges the FIFO
 overflows silently. QEMU never showed it: the emulated console path has no FIFO
-reality. Bench workaround: type in sub-FIFO chunks with pauses long enough for a
-scavenge (eosh_cmd.py: 40-byte chunks, 6 s pauses, a redundant trailing newline).
-Real fix (GAPS'd, kernel lane): drain the FIFO from the RX interrupt (or an adequate
-poll cadence) so the backstop goes back to being a detector, not the input path. The
-lesson: **an emulator's console is not your UART** — FIFO depths and drain paths
+reality. Bench workaround while it was open: type in sub-FIFO chunks with pauses long
+enough for a scavenge (eosh_cmd.py: 40-byte chunks, 6 s pauses, a redundant trailing
+newline). **FIXED (kernel lane, 2026-06-08):** UART2's RX interrupt is wired — GIC
+SPI 333 (INTID 365, verified from the vendor control FDT's `serial@feb50000` node)
+forwarded like the QEMU PL011's SPI 33, the DW-APB's IER.ERBFI unmasked (the one
+register written; LCR/divisor/FCR stay exactly as U-Boot programmed them) — so the
+IRQ handler drains the FIFO at line rate and the backstop scavenge is back to being a
+detector, not the input path. Bench acceptance: a raw >64-byte line at the serial
+prompt survives un-truncated; eosh_cmd.py's chunking can then be retired. The lesson
+stands: **an emulator's console is not your UART** — FIFO depths and drain paths
 exist only on silicon, so "type a long line" is a real bring-up test.
 
 ### 7.2 Long synchronous kernel work starves the drive loop — and the watchdog

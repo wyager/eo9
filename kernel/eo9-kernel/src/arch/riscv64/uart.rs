@@ -7,9 +7,8 @@
 //! bytes into a small ring so the executor can halt in `wfi` and be woken by a keystroke
 //! instead of polling — see src/arch/aarch64/uart.rs for the ring's design notes.
 
-use core::cell::UnsafeCell;
 use core::fmt;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::Ordering;
 
 /// NS16550A base address on the QEMU riscv64 `virt` machine.
 const UART_BASE: usize = 0x1000_0000;
@@ -71,30 +70,7 @@ pub fn try_get_byte() -> Option<u8> {
 // sufficient and a level-style receive condition is fully drained before the claim is
 // completed.
 
-/// RX ring capacity (power of two; one slot is left empty to distinguish full from empty).
-/// Sized to hold the longest line the shell accepts (`MAX_READ_LINE_BYTES`, 4096) so a
-/// pasted command line of any accepted length survives even if the consumer is slow to
-/// drain — paste robustness, plan/12.
-const RX_RING_CAP: usize = 4096;
-
-/// Single-producer (trap handler) / single-consumer (boot hart) byte ring for received input.
-struct RxRing {
-    buf: UnsafeCell<[u8; RX_RING_CAP]>,
-    /// Next index the producer (trap handler) will write.
-    head: AtomicUsize,
-    /// Next index the consumer (read-line) will read.
-    tail: AtomicUsize,
-}
-
-// SAFETY: the only producer is the trap handler and the only consumer is the boot hart's
-// read-line poll; access is coordinated through `head`/`tail` with acquire/release ordering.
-unsafe impl Sync for RxRing {}
-
-static RX_RING: RxRing = RxRing {
-    buf: UnsafeCell::new([0; RX_RING_CAP]),
-    head: AtomicUsize::new(0),
-    tail: AtomicUsize::new(0),
-};
+static RX_RING: crate::rxring::RxRing = crate::rxring::RxRing::new();
 
 /// Enable the receive interrupt so an arriving byte asserts the UART's PLIC line. Call once
 /// during boot after the PLIC forwards source 10 (src/arch/riscv64/mod.rs).
@@ -109,31 +85,23 @@ pub fn enable_rx_interrupt() {
     mmio_write(IER, IER_ERBFI);
 }
 
-/// Interrupt handler body: drain every waiting RX byte into [`RX_RING`]. Called from the
-/// external-interrupt trap path (src/arch/riscv64/traps.rs) when PLIC source 10 fires;
-/// emptying the receive buffer deasserts the UART's interrupt line.
-#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
 /// Move every byte waiting in the receive FIFO into [`RX_RING`]; returns how many moved.
 /// Caller must be the sole producer: the trap handler, or thread context with interrupts
 /// masked ([`scavenge_rx`]).
+#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
 fn fifo_to_ring() -> usize {
-    let mut moved = 0;
-    while mmio_read(LSR) & LSR_DR != 0 {
-        let byte = mmio_read(RBR_THR);
-        moved += 1;
-        let head = RX_RING.head.load(Ordering::Relaxed);
-        let next = (head + 1) % RX_RING_CAP;
-        // Drop the byte if the ring is full rather than overwrite unread input.
-        if next != RX_RING.tail.load(Ordering::Acquire) {
-            // SAFETY: the caller is the sole producer; this slot is not being read
-            // (it is at/after `head`, ahead of the consumer's `tail`).
-            unsafe { (*RX_RING.buf.get())[head] = byte };
-            RX_RING.head.store(next, Ordering::Release);
+    RX_RING.drain(|| {
+        if mmio_read(LSR) & LSR_DR == 0 {
+            None
+        } else {
+            Some(mmio_read(RBR_THR))
         }
-    }
-    moved
+    })
 }
 
+/// Interrupt handler body: drain every waiting RX byte into [`RX_RING`]. Called from the
+/// external-interrupt trap path (src/arch/riscv64/traps.rs) when PLIC source 10 fires;
+/// emptying the receive buffer deasserts the UART's interrupt line.
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
 pub fn drain_rx() {
     fifo_to_ring();
@@ -155,7 +123,7 @@ pub fn scavenge_rx(now_ns: u64) -> usize {
     // the duration; mask/unmask of sstatus.SIE has no stack or register effects.
     unsafe { core::arch::asm!("csrci sstatus, 2", options(nomem, nostack, preserves_flags)) };
     let moved = fifo_to_ring();
-    let ring_busy = RX_RING.head.load(Ordering::Relaxed) != RX_RING.tail.load(Ordering::Relaxed);
+    let ring_busy = RX_RING.is_busy();
     if moved > 0 || ring_busy {
         LAST_ACTIVITY_NS.store(now_ns, Ordering::Relaxed);
     } else {
@@ -178,22 +146,12 @@ pub fn scavenge_rx(now_ns: u64) -> usize {
 /// Consume one received byte from the interrupt-filled ring, or `None` if none is waiting.
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
 pub fn ring_get_byte() -> Option<u8> {
-    let tail = RX_RING.tail.load(Ordering::Relaxed);
-    if tail == RX_RING.head.load(Ordering::Acquire) {
-        return None;
-    }
-    // SAFETY: the boot hart is the sole consumer; this slot was published by the producer
-    // (head moved past it with release ordering, observed by the acquire load above).
-    let byte = unsafe { (*RX_RING.buf.get())[tail] };
-    RX_RING
-        .tail
-        .store((tail + 1) % RX_RING_CAP, Ordering::Release);
-    Some(byte)
+    RX_RING.get_byte()
 }
 
 /// ETX (Ctrl-C) — the interrupt key.
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
-pub const CTRL_C: u8 = 0x03;
+pub const CTRL_C: u8 = crate::rxring::CTRL_C;
 
 /// Non-destructively scan the waiting input for a Ctrl-C and, if present, consume the ring up
 /// to and including it (flushing pending input through the interrupt, the usual terminal
@@ -202,21 +160,7 @@ pub const CTRL_C: u8 = 0x03;
 /// never concurrently, so reading `tail..head` and advancing `tail` here is sound.
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
 pub fn take_ctrl_c() -> bool {
-    let head = RX_RING.head.load(Ordering::Acquire);
-    let mut i = RX_RING.tail.load(Ordering::Relaxed);
-    while i != head {
-        // SAFETY: the boot hart is the sole consumer; this slot is published (it is before
-        // `head`, which was loaded with acquire ordering).
-        let byte = unsafe { (*RX_RING.buf.get())[i] };
-        let next = (i + 1) % RX_RING_CAP;
-        if byte == CTRL_C {
-            // Discard everything up to and including the Ctrl-C.
-            RX_RING.tail.store(next, Ordering::Release);
-            return true;
-        }
-        i = next;
-    }
-    false
+    RX_RING.take_ctrl_c()
 }
 
 /// Non-destructively check whether a Ctrl-C is waiting in the input ring, without consuming
@@ -225,18 +169,7 @@ pub fn take_ctrl_c() -> bool {
 /// resulting kill) stays the shell's job (`take_ctrl_c` above).
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
 pub fn ctrl_c_pending() -> bool {
-    let head = RX_RING.head.load(Ordering::Acquire);
-    let mut i = RX_RING.tail.load(Ordering::Relaxed);
-    while i != head {
-        // SAFETY: the boot hart is the sole consumer; this slot is published (it is before
-        // `head`, which was loaded with acquire ordering).
-        let byte = unsafe { (*RX_RING.buf.get())[i] };
-        if byte == CTRL_C {
-            return true;
-        }
-        i = (i + 1) % RX_RING_CAP;
-    }
-    false
+    RX_RING.ctrl_c_pending()
 }
 
 /// Zero-sized serial console handle; `core::fmt::Write` goes straight to the hardware.

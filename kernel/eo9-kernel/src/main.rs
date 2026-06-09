@@ -20,6 +20,12 @@
 
 mod ticks;
 
+// The console receive ring (single-producer/single-consumer), shared by every
+// architecture's UART driver. Hardware-free, so its unit tests — including the
+// FIFO-overflow model behind the board's 64-byte console truncation — run on the host
+// triple (the `ticks` pattern).
+mod rxring;
+
 #[cfg(target_os = "none")]
 extern crate alloc;
 

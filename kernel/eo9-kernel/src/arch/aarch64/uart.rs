@@ -3,19 +3,21 @@
 //! U-Boot programmed it — divisor untouched, per docs/board/orange-pi-5-plus.md).
 //!
 //! The register layer lives in the cfg-selected `hw` module below; everything above it —
-//! the RX ring, Ctrl-C scanning, the console writer — is shared. Transmit is "poll the
-//! ready flag, write the data register" on both parts. The console is stateless (every
-//! write goes straight to the MMIO registers), so no global state or locking is required
-//! on the single boot core.
+//! the RX ring (src/rxring.rs), Ctrl-C scanning, the console writer — is shared. Transmit
+//! is "poll the ready flag, write the data register" on both parts. The console is
+//! stateless (every write goes straight to the MMIO registers), so no global state or
+//! locking is required on the single boot core.
 //!
-//! Board receive path, day one: the UART's GIC SPI is not wired yet (the interrupt number
-//! is board-DTB territory), so `enable_rx_interrupt`/`drain_rx` are inert there and input
-//! flows through the executor's idle-path [`scavenge_rx`] poll instead — bytes land in the
-//! same ring with at most the idle-wake latency. Wiring the SPI is a recorded follow-up.
+//! Board receive path: UART2's GIC SPI (333, [`RX_INTID`] 365) is forwarded like the
+//! PL011's on `virt`, and `enable_rx_interrupt` unmasks the DW-APB receive interrupt, so
+//! [`drain_rx`] empties the 64-byte RX FIFO at line rate. Day one shipped without the SPI
+//! wired — input then reached the ring only through the idle-path [`scavenge_rx`] poll,
+//! and anything past 64 bytes between scavenges overflowed the FIFO silently (the
+//! exactly-64-byte console truncation, GAPS 2026-06-08). The scavenger stays as the
+//! belt-and-braces backstop behind the interrupt path on both profiles.
 
-use core::cell::UnsafeCell;
 use core::fmt;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::Ordering;
 
 /// PL011 register layer (QEMU `virt`).
 #[cfg(not(feature = "board-opi5plus"))]
@@ -125,8 +127,16 @@ mod hw {
     const UART_BASE: usize = 0xfeb5_0000;
     /// Receive buffer (read) / transmit holding (write) register, reg 0 at stride 4.
     const DW_RBR_THR: usize = 0x00;
+    /// Interrupt enable register, reg 1 at stride 4 (LCR.DLAB is clear — U-Boot leaves
+    /// the divisor latched away once the line is up, or THR/RBR could not work).
+    const DW_IER: usize = 0x04;
     /// Line status register, reg 5 at stride 4.
     const DW_LSR: usize = 0x14;
+    /// IER: received-data-available interrupt (ERBFI). With the FIFOs on (as U-Boot
+    /// leaves them — the 64-byte truncation proved it) this also covers the 16550
+    /// character-timeout condition, so a lone keystroke below the RX trigger level
+    /// still raises the interrupt after four character times.
+    const DW_IER_ERBFI: u32 = 1 << 0;
     /// LSR: data ready.
     const DW_LSR_DR: u32 = 1 << 0;
     /// LSR: transmit holding register empty.
@@ -173,11 +183,18 @@ mod hw {
     #[allow(dead_code)]
     pub(super) fn irq_ack() {}
 
-    /// Day-one no-op: the UART's GIC SPI is not wired yet, so no interrupt is unmasked
-    /// (input flows through the idle-path scavenger's poll), and the line itself is left
-    /// exactly as U-Boot programmed it.
+    /// Unmask the receive interrupt (ERBFI — received data available + character
+    /// timeout) so an arriving byte asserts UART2's GIC SPI and [`super::drain_rx`]
+    /// empties the 64-byte RX FIFO at line rate (the exactly-64-byte truncation fix,
+    /// GAPS 2026-06-08). Everything else about the line — LCR, the divisor, FCR —
+    /// stays exactly as U-Boot programmed it (1.5 Mbaud 8n1, FIFOs on): reprogramming
+    /// a live line is banned bench doctrine, and IER is the one register the fix needs.
+    /// The transmit (ETBEI) and line-status (ELSI) interrupts stay masked — transmit
+    /// polls, and a line error simply reads as data the shell ignores.
     #[allow(dead_code)]
-    pub(super) fn line_init() {}
+    pub(super) fn line_init() {
+        mmio_write(DW_IER, DW_IER_ERBFI);
+    }
 
     /// Everything transmitted is on the wire (FIFO and shift register both empty).
     pub(super) fn tx_idle() -> bool {
@@ -244,42 +261,36 @@ pub fn try_get_byte() -> Option<u8> {
 
 // --- Interrupt-driven receive -------------------------------------------------------------
 //
-// The PL011 raises its interrupt (routed through the GIC as SPI 33 on `virt`) when receive
-// data arrives. The handler drains the RX FIFO into a small single-producer/single-consumer
-// ring: the interrupt context is the only producer and the read-line provider on the boot
-// core is the only consumer, so head/tail atomics are sufficient (no lock). This decouples
-// "a byte arrived" (wakes `wfi`) from "the shell consumed it" and keeps a level-sensitive
-// RX interrupt from re-firing — the handler empties the FIFO before returning.
+// The UART raises its interrupt (routed through the GIC as an SPI — [`RX_INTID`]) when
+// receive data arrives. The handler drains the RX FIFO into a small single-producer/
+// single-consumer ring (src/rxring.rs): the interrupt context is the only producer and the
+// read-line provider on the boot core is the only consumer, so head/tail atomics are
+// sufficient (no lock). This decouples "a byte arrived" (wakes `wfi`) from "the shell
+// consumed it" and keeps a level-sensitive RX interrupt from re-firing — the handler
+// empties the FIFO before returning.
 
-/// RX ring capacity (power of two; one slot is left empty to distinguish full from empty).
-/// Sized to hold the longest line the shell accepts (`MAX_READ_LINE_BYTES`, 4096) so a
-/// pasted command line of any accepted length survives even if the consumer is slow to
-/// drain — paste robustness, plan/12.
-const RX_RING_CAP: usize = 4096;
-
-/// Single-producer (IRQ) / single-consumer (boot core) byte ring for received input.
-struct RxRing {
-    buf: UnsafeCell<[u8; RX_RING_CAP]>,
-    /// Next index the producer (IRQ) will write.
-    head: AtomicUsize,
-    /// Next index the consumer (read-line) will read.
-    tail: AtomicUsize,
-}
-
-// SAFETY: the only producer is the IRQ handler and the only consumer is the boot core's
-// read-line poll; access is coordinated through `head`/`tail` with acquire/release ordering.
-unsafe impl Sync for RxRing {}
-
-static RX_RING: RxRing = RxRing {
-    buf: UnsafeCell::new([0; RX_RING_CAP]),
-    head: AtomicUsize::new(0),
-    tail: AtomicUsize::new(0),
-};
-
-/// Enable the PL011 receive (and receive-timeout) interrupt so an arriving byte asserts the
-/// UART's GIC line. Call once during boot after the GIC forwards UART SPI 33 (src/main.rs).
+/// GIC INTID of the console UART's receive interrupt, dispatched in `exceptions::kirq`
+/// and forwarded in `mod.rs::interrupts_init`:
 ///
-/// Also programs the line for interactive use: 8-bit words with the 16-byte FIFOs enabled.
+/// * QEMU `virt`: the PL011 on SPI 33 (the machine's fixed irqmap).
+/// * `board-opi5plus`: the RK3588's UART2 (DW-APB at `0xfeb5_0000`) on **GIC SPI 333**,
+///   INTID 32 + 333 = **365**, level-high — verified from the live board's vendor
+///   control FDT (`.claude/board-bringup/vendor-control-fdt.dtb`, node
+///   `serial@feb50000`: `interrupts = <0x00 0x14d 0x04>`); mainline
+///   `rk3588-base.dtsi`'s uart2 carries the same triple.
+#[cfg(not(feature = "board-opi5plus"))]
+pub const RX_INTID: u32 = 33;
+#[cfg(feature = "board-opi5plus")]
+pub const RX_INTID: u32 = 365;
+
+static RX_RING: crate::rxring::RxRing = crate::rxring::RxRing::new();
+
+/// Enable the UART's receive (and, on the PL011, receive-timeout) interrupt so an arriving
+/// byte asserts the UART's GIC line ([`RX_INTID`]). Call once during boot after the GIC
+/// forwards that SPI (`mod.rs::interrupts_init`). On the board profile this is the one-IER
+/// write that fixed the 64-byte console truncation (see the board `hw::line_init`).
+///
+/// On QEMU it also programs the line for interactive use: 8-bit words, 16-byte FIFOs.
 /// The FIFO matters for paste robustness — QEMU paces its character feed by the device's
 /// free FIFO space (`pl011_can_receive` returns `depth - read_count`), and with FIFOs off
 /// the depth is 1, so *every byte* stalls the host-side feed until the guest completes a
@@ -297,26 +308,18 @@ pub fn enable_rx_interrupt() {
 /// console never goes deaf). Caller must be the sole producer at the time of the call:
 /// either the IRQ handler, or thread context with IRQs masked ([`scavenge_rx`]).
 fn fifo_to_ring() -> usize {
-    let mut moved = 0;
-    while !hw::rx_empty() {
-        let byte = (hw::rx_read() & 0xff) as u8;
-        moved += 1;
-        let head = RX_RING.head.load(Ordering::Relaxed);
-        let next = (head + 1) % RX_RING_CAP;
-        // Drop the byte if the ring is full rather than overwrite unread input.
-        if next != RX_RING.tail.load(Ordering::Acquire) {
-            // SAFETY: the caller is the sole producer; this slot is not being read
-            // (it is at/after `head`, ahead of the consumer's `tail`).
-            unsafe { (*RX_RING.buf.get())[head] = byte };
-            RX_RING.head.store(next, Ordering::Release);
+    RX_RING.drain(|| {
+        if hw::rx_empty() {
+            None
+        } else {
+            Some((hw::rx_read() & 0xff) as u8)
         }
-    }
-    moved
+    })
 }
 
 /// Interrupt handler body: clear the UART's RX/RT interrupt sources, then drain every
 /// waiting byte into [`RX_RING`]. Called from the GIC IRQ dispatch (src/exceptions.rs)
-/// when UART SPI 33 fires.
+/// when the UART's SPI ([`RX_INTID`]) fires.
 ///
 /// The order is acknowledge-then-drain, and it is load-bearing on QEMU: its PL011 model
 /// latches the receive interrupt on the empty-to-occupied FIFO transition and `UARTICR`
@@ -364,7 +367,7 @@ pub fn scavenge_rx(now_ns: u64) -> usize {
     // SAFETY: mask/unmask of DAIF.I around a few MMIO reads, no stack or register effects.
     unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags)) };
     let moved = fifo_to_ring();
-    let ring_busy = RX_RING.head.load(Ordering::Relaxed) != RX_RING.tail.load(Ordering::Relaxed);
+    let ring_busy = RX_RING.is_busy();
     if moved > 0 || ring_busy {
         LAST_ACTIVITY_NS.store(now_ns, Ordering::Relaxed);
     } else {
@@ -389,44 +392,20 @@ pub fn scavenge_rx(now_ns: u64) -> usize {
 /// Consume one received byte from the interrupt-filled ring, or `None` if none is waiting.
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
 pub fn ring_get_byte() -> Option<u8> {
-    let tail = RX_RING.tail.load(Ordering::Relaxed);
-    if tail == RX_RING.head.load(Ordering::Acquire) {
-        return None;
-    }
-    // SAFETY: the boot core is the sole consumer; this slot was published by the producer
-    // (head moved past it with release ordering, observed by the acquire load above).
-    let byte = unsafe { (*RX_RING.buf.get())[tail] };
-    RX_RING
-        .tail
-        .store((tail + 1) % RX_RING_CAP, Ordering::Release);
-    Some(byte)
+    RX_RING.get_byte()
 }
 
 /// ETX (Ctrl-C) — the interrupt key.
-pub const CTRL_C: u8 = 0x03;
+#[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
+pub const CTRL_C: u8 = crate::rxring::CTRL_C;
 
 /// Non-destructively scan the waiting input for a Ctrl-C and, if present, consume the ring up
 /// to and including it (flushing pending input through the interrupt, the usual terminal
 /// behaviour) and return `true`. If no Ctrl-C is waiting the ring is left untouched and this
-/// returns `false`. Single-consumer-safe: only the boot core calls this and `ring_get_byte`,
-/// never concurrently, so reading `tail..head` and advancing `tail` here is sound.
+/// returns `false` (src/rxring.rs `take_ctrl_c`).
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
 pub fn take_ctrl_c() -> bool {
-    let head = RX_RING.head.load(Ordering::Acquire);
-    let mut i = RX_RING.tail.load(Ordering::Relaxed);
-    while i != head {
-        // SAFETY: the boot core is the sole consumer; this slot is published (it is before
-        // `head`, which was loaded with acquire ordering).
-        let byte = unsafe { (*RX_RING.buf.get())[i] };
-        let next = (i + 1) % RX_RING_CAP;
-        if byte == CTRL_C {
-            // Discard everything up to and including the Ctrl-C.
-            RX_RING.tail.store(next, Ordering::Release);
-            return true;
-        }
-        i = next;
-    }
-    false
+    RX_RING.take_ctrl_c()
 }
 
 /// Non-destructively check whether a Ctrl-C is waiting in the input ring, without consuming
@@ -435,18 +414,7 @@ pub fn take_ctrl_c() -> bool {
 /// resulting kill) stays the shell's job (`take_ctrl_c` above).
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
 pub fn ctrl_c_pending() -> bool {
-    let head = RX_RING.head.load(Ordering::Acquire);
-    let mut i = RX_RING.tail.load(Ordering::Relaxed);
-    while i != head {
-        // SAFETY: the boot core is the sole consumer; this slot is published (it is before
-        // `head`, which was loaded with acquire ordering).
-        let byte = unsafe { (*RX_RING.buf.get())[i] };
-        if byte == CTRL_C {
-            return true;
-        }
-        i = (i + 1) % RX_RING_CAP;
-    }
-    false
+    RX_RING.ctrl_c_pending()
 }
 
 /// Zero-sized serial console handle; `core::fmt::Write` goes straight to the hardware.

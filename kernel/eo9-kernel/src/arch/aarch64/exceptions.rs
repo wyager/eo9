@@ -45,10 +45,11 @@ extern "C" fn kirq() {
     if matches!(intid, 26 | 27 | 29 | 30) {
         crate::timer::disable();
     }
-    // PL011 UART (SPI 33 on `virt`): drain received bytes into the input ring and clear the
-    // UART's interrupt sources, so the keystroke that woke the core is captured and the
-    // level-sensitive line deasserts before the EOI.
-    if intid == 33 {
+    // The console UART (PL011 SPI 33 on `virt`; the RK3588 UART2's SPI 333 → INTID 365 on
+    // the board profile — uart.rs `RX_INTID`): drain received bytes into the input ring and
+    // clear the UART's interrupt sources, so the keystroke that woke the core is captured
+    // and the level-sensitive line deasserts before the EOI.
+    if intid == crate::uart::RX_INTID {
         crate::uart::drain_rx();
     }
     // PCIe INTx (gpex SPIs 35-38 on `virt`): mask the level-sensitive line at the GIC — the
