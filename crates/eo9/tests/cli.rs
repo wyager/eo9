@@ -1041,13 +1041,15 @@ fn shell_interactive_pty_prompt_is_not_duplicated() {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 
     // The in-shell per-key editor ran: `badsyntax )` opens the inadmissible-input
-    // marker (SGR 31) exactly at the `)` — the editor's signature output (the retired
-    // host editor repainted with `ESC[2K` instead; the in-eosh editor echoes
-    // incrementally and never clears the line).
+    // marker (SGR 31) — since the M3 vocabulary mark, at the first character where
+    // `badsyntax` stops prefix-extending to any /bin name (name-dead beats the later
+    // parse-dead `)`), and SGR 0 closes it at Enter. This is the editor's signature
+    // output (the retired host editor repainted with `ESC[2K` instead; the in-eosh
+    // editor echoes incrementally and never clears the line).
     assert!(stdout.contains("eosh>"), "no prompt seen: {stdout:?}");
     assert!(
-        stdout.contains("\u{1b}[31m)"),
-        "the per-key editor did not run (no inadmissible marker on `)`): {stdout:?}"
+        stdout.contains("\u{1b}[31m") && stdout.contains(")\u{1b}[0m"),
+        "the per-key editor did not run (no inadmissible marker on `badsyntax )`): {stdout:?}"
     );
     // The program ran through the editor path…
     assert!(stdout.contains("Hello, pty!"), "{stdout:?}");

@@ -5,24 +5,66 @@
 //! ([`Editor::take_output`]); nothing here does I/O, so the whole behavior is
 //! host-testable with key vectors against the emitted byte sequences.
 //!
-//! Behavior (the study's design, refined by the M2 brief):
+//! Behavior (the study's design, refined by the M2 brief; M3 adds the vocabulary mark
+//! and argument completion):
 //!
 //! * **Accept-and-mark, never refuse.** Every printable character is taken into the
-//!   line. While the line is viable (some parse of the [`crate::grammar`] continues
-//!   through it), characters echo plainly; the first character with no viable
-//!   continuation sets `red_from`, emits the marker-begin sequence once (SGR 31 by
-//!   default — see [`Marker`]), and everything from there on echoes inside the marked
-//!   region. The grammar's superset rule guarantees the mark is honest: red means the
-//!   real parser *will* reject, green only means it still might accept.
-//! * **Backspace** erases one character (`\b \b` — one column) and, when it rewinds to
-//!   or below `red_from`, emits marker-end and reparses the line from the start
-//!   (microseconds at the 4096-byte line cap; the study's measured trade).
+//!   line. While the line is viable, characters echo plainly; the first dead character
+//!   sets `red_from`, emits the marker-begin sequence once (SGR 31 by default — see
+//!   [`Marker`]; the style is that one constant), and everything from there on echoes
+//!   inside the marked region. A character is dead in either of two ways, and red
+//!   means exactly "**this line will not execute successfully**":
+//!
+//!   - **parse-dead**: no parse of the [`crate::grammar`] continues through it — the
+//!     real parser *will* reject the line (the grammar's superset rule);
+//!   - **name-dead** (M3, editor-layer only): in a NAME position — one whose
+//!     completions carry name tags ([`crate::inc::Tag::is_name`]): the command head,
+//!     post-`$`/`&`/`(`/`=` component positions — the word can no longer
+//!     prefix-extend to ANY entry of the per-prompt vocabulary (builtins ∪ reserved ∪
+//!     session bindings ∪ /bin, all present as completion sources), so resolution is
+//!     guaranteed to fail at run time.
+//!
+//!   Both marks are honest — neither ever marks a line that would run; green only
+//!   means the line still might. The parser itself stays loose: name-marking lives
+//!   entirely here in the editor, so the differential superset gate (which tests the
+//!   PARSER) is unaffected. Free-text positions (`let`/`save` names, service names,
+//!   flag names, flag values, gate slots, quoted/compound/comment interiors) carry no
+//!   name-tagged completions and are never name-marked; M3's argument candidates are
+//!   tagged `Flag`/`Value` precisely so they cannot make a value position look like a
+//!   name position. Words containing non-ASCII text are never name-marked either (the
+//!   vocabulary is ASCII-filtered, so the editor cannot tell a typo from a real
+//!   non-ASCII program name).
+//! * **Backspace** erases one character (`\b \b` — one column) in O(1): the editor
+//!   keeps a snapshot stack of parser states, one per green character (forward typing
+//!   already produces the predecessor state — it is *moved* to the stack instead of
+//!   dropped, so typing cost is unchanged), and backspace pops it. Dead characters
+//!   were never committed to the parser, so erasing back to `red_from` just closes
+//!   the marker and restores the saved word-tracker — no replay either way. This is
+//!   the study's snapshot-per-char fallback, adopted after the board bench measured
+//!   ~50 ms per parser step on target (a reparse-from-start backspace cost seconds on
+//!   long lines). Memory: one state per line character, bounded by [`MAX_LINE_BYTES`].
+//!   Wholesale line replacement (history recall, [`Editor::provide_args`]) rebuilds
+//!   the stack in one O(N) replay; every backspace after it is O(1). Name-dead marks
+//!   clear exactly like parse-dead ones.
 //! * **TAB**: in a red line, just the bell — completion cannot help input the parser
 //!   already rejects. Otherwise the forced-prefix walk first (bytes the grammar forces,
 //!   e.g. `svc lo` → `g`), then `completions()`: a unique candidate completes the word
-//!   plus a space; several extend to their longest common prefix; no progress prints the
-//!   candidate list on its own line and repaints the prompt + line (the shape of the
-//!   retired host editor, crates/eo9/src/editor.rs).
+//!   plus a space (no space for `glue` candidates — canned prefixes like `http://`);
+//!   several extend to their longest common prefix; no progress prints the candidate
+//!   list on its own line — with the per-candidate description column when any
+//!   candidate has one (M3: manual doc lines) — and repaints the prompt + line (the
+//!   shape of the retired host editor, crates/eo9/src/editor.rs). When candidates from
+//!   different word positions coexist (a completed flag name and the next value's
+//!   candidates), the most-typed group wins — finish the word in progress first. One
+//!   M3 guard: in a value position with nothing typed yet (all candidates
+//!   `Value`-tagged), TAB always lists instead of auto-filling — values stay
+//!   free-form, and a unique manual hint must not put words in the user's mouth.
+//! * **Argument completion** (M3): the embedder drives the async edge. After a word
+//!   ends (or on TAB), it asks [`Editor::wanted_args`] which typed /bin programs lack
+//!   argument data, resolves them through the session's memo (describe + manual), and
+//!   hands the result to [`Editor::provide_args`] — which re-arms the grammar with the
+//!   program's flag and value candidates (never changing acceptance; the manuals
+//!   design's additive-hints rule). Until then the generic v1 grammar applies.
 //! * **Enter** always submits — the editor never blocks a line; `parse_command`'s
 //!   curated errors are the user-facing diagnosis for red lines (feeding `Eof` to decide
 //!   otherwise would only duplicate that verdict). The marker is closed first so the
@@ -54,11 +96,13 @@
 //! an empty line), history recall, TAB completion, and the candidate-list rendering
 //! carry over exactly.
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::grammar::{Vocab, command_line};
-use crate::inc::{BoxP, Completion, Step, forced_prefix};
+use crate::comb::is_word_byte;
+use crate::grammar::{ProgramArgs, Vocab, command_line};
+use crate::inc::{BoxP, Completion, Step, Tag, forced_prefix};
 use crate::input::Input;
 
 /// One decoded keystroke, mirroring the WIT `eo9:text/text.key` variant. The transport
@@ -122,6 +166,14 @@ pub const RECALL_CAP: usize = 64;
 /// it are dropped (not echoed) until something is erased.
 pub const MAX_LINE_BYTES: usize = 4096;
 
+/// One green character's snapshot: the parser state and word tracker as they were
+/// BEFORE the character was committed — what backspace restores in O(1).
+struct Snap {
+    state: BoxP<()>,
+    in_word: bool,
+    tracking: bool,
+}
+
 /// The editor for one prompt. Build it fresh per prompt (vocabulary and history are
 /// per-prompt snapshots), feed keys, drain output after every call.
 pub struct Editor {
@@ -132,8 +184,23 @@ pub struct Editor {
     line: Vec<u8>,
     /// Parser state covering `line[..red_from.unwrap_or(line.len())]`.
     state: BoxP<()>,
-    /// First byte index with no viable parse, if the line has gone red.
+    /// One snapshot per GREEN character of `line` (dead characters are never
+    /// committed to the parser): `stack[k]` is the state/tracker before character
+    /// k+1. INVARIANT (pinned by the differential editor test): `stack.len()` equals
+    /// the number of characters in `line[..red_from.unwrap_or(line.len())]`.
+    stack: Vec<Snap>,
+    /// First dead byte index (parse-dead or name-dead — module docs), if the line has
+    /// gone red.
     red_from: Option<usize>,
+    /// The word tracker as it was before the character at `red_from` — restored when
+    /// backspace rewinds the mark away (meaningful only while `red_from` is set).
+    red_tracker: (bool, bool),
+    /// Whether the last (green) line byte was a word byte — the word-boundary tracker
+    /// behind the name-dead mark.
+    in_word: bool,
+    /// Whether the word in progress started at a name position and is still
+    /// prefix-viable against the vocabulary (meaningful only while `in_word`).
+    tracking: bool,
     /// Bytes of a multi-byte UTF-8 character still being assembled.
     utf8_pending: Vec<u8>,
     /// Recall view, oldest first (at most [`RECALL_CAP`] entries; extra are dropped
@@ -162,7 +229,11 @@ impl Editor {
             marker,
             line: Vec::new(),
             state,
+            stack: Vec::new(),
             red_from: None,
+            red_tracker: (false, false),
+            in_word: false,
+            tracking: false,
             utf8_pending: Vec::new(),
             history,
             recall: None,
@@ -174,6 +245,44 @@ impl Editor {
     /// Drain everything the editor wants written to the terminal.
     pub fn take_output(&mut self) -> String {
         core::mem::take(&mut self.out)
+    }
+
+    /// The typed words that are /bin programs (per the vocabulary snapshot) and still
+    /// lack argument data — what the embedder should resolve (memoized session-side)
+    /// and hand back through [`Editor::provide_args`]. The embedder asks on word-end
+    /// or TAB keys (the M3 "first TAB-or-word-end after a name resolves" trigger);
+    /// asking is cheap and an empty answer means nothing to do.
+    pub fn wanted_args(&self) -> Vec<String> {
+        let mut wanted: Vec<String> = Vec::new();
+        for word in self
+            .line
+            .split(|&byte| byte < 0x80 && !is_word_byte(byte))
+            .filter(|word| !word.is_empty())
+        {
+            let Ok(word) = core::str::from_utf8(word) else {
+                continue;
+            };
+            let known = self
+                .vocab
+                .entries
+                .iter()
+                .any(|(entry, tag)| *tag == Tag::Program && entry == word);
+            if known && !self.vocab.programs.contains_key(word) && !wanted.iter().any(|w| w == word)
+            {
+                wanted.push(String::from(word));
+            }
+        }
+        wanted
+    }
+
+    /// Provide one resolved program's argument data (or an empty [`ProgramArgs`] when
+    /// resolution failed or the program takes none — either way the name stops being
+    /// wanted). The grammar re-arms with the program's flag and value candidates;
+    /// acceptance, and therefore the marker, cannot change (the additive-hints rule),
+    /// so this never emits anything.
+    pub fn provide_args(&mut self, name: &str, args: ProgramArgs) {
+        self.vocab.programs.insert(String::from(name), args);
+        self.rebuild();
     }
 
     /// Feed one key.
@@ -282,47 +391,93 @@ impl Editor {
         }
     }
 
+    /// Advance the word tracker for the first byte of an incoming character, BEFORE
+    /// the parser steps it (the arming query reads the pre-character state). The
+    /// name-mark arms only on a word that starts at a name position (a strong
+    /// name-tagged completion source is alive) with a byte the vocabulary could start
+    /// with: not non-ASCII (the vocabulary is ASCII-filtered — module docs) and not a
+    /// compound opener (`let [a] = x` makes `[a]` a real, resolvable binding name).
+    fn arm_tracker(&mut self, first: u8) {
+        if first >= 0x80 || is_word_byte(first) {
+            if !self.in_word {
+                self.in_word = true;
+                self.tracking = first < 0x80
+                    && first != b'['
+                    && first != b'{'
+                    && name_completions(&self.state).strong;
+            }
+            if first >= 0x80 {
+                // Non-ASCII words are never name-marked (module docs).
+                self.tracking = false;
+            }
+        } else {
+            self.in_word = false;
+            self.tracking = false;
+        }
+    }
+
     /// Insert one complete character (1..=4 bytes, already validated): step the parser
-    /// unless the line is red, mark red on the first inadmissible position, echo.
+    /// unless the line is red, mark red on the first dead position (parse-dead or
+    /// name-dead — module docs), echo. A committed (green) character pushes its
+    /// predecessor state onto the snapshot stack — the state is moved, not cloned, so
+    /// this costs nothing beyond the step itself.
+    /// The stack invariant (struct docs): one snapshot per green CHARACTER of the
+    /// line. Checked in debug builds after every mutation of line/stack/red_from —
+    /// every host test runs it on every key; release builds (the shipped guest)
+    /// compile it out. The differential tests additionally pin pop == reparse.
+    #[inline]
+    fn debug_check_stack(&self) {
+        if cfg!(debug_assertions) {
+            let green_end = self.red_from.unwrap_or(self.line.len());
+            let green_chars = self.line[..green_end]
+                .iter()
+                .filter(|&&byte| !(0x80..=0xbf).contains(&byte))
+                .count();
+            debug_assert_eq!(
+                self.stack.len(),
+                green_chars,
+                "snapshot stack out of step with the green prefix"
+            );
+        }
+    }
+
     fn insert_char(&mut self, bytes: &[u8]) {
         if self.line.len() + bytes.len() > MAX_LINE_BYTES {
             // The kernel console's policy at the cap: drop, no echo.
             return;
         }
         self.commit_recall();
-        if self.red_from.is_none() && !self.step_state(bytes) {
-            self.red_from = Some(self.line.len());
-            self.emit(self.marker.begin);
+        if self.red_from.is_none() {
+            let pre = (self.in_word, self.tracking);
+            self.arm_tracker(bytes[0]);
+            let next = try_step(&self.state, bytes).filter(|next| {
+                // Name-dead: the word can no longer prefix-extend to any vocabulary
+                // entry — treat like a failed step (the parser state stays at the
+                // green prefix; the parse itself would have continued).
+                !(self.tracking && !name_completions(next).any)
+            });
+            match next {
+                Some(next) => {
+                    let prev = core::mem::replace(&mut self.state, next);
+                    self.stack.push(Snap {
+                        state: prev,
+                        in_word: pre.0,
+                        tracking: pre.1,
+                    });
+                }
+                None => {
+                    self.red_from = Some(self.line.len());
+                    self.red_tracker = pre;
+                    self.emit(self.marker.begin);
+                }
+            }
         }
         self.line.extend_from_slice(bytes);
         // `bytes` is one valid UTF-8 character by construction.
         if let Ok(text) = core::str::from_utf8(bytes) {
             self.emit(text);
         }
-    }
-
-    /// Try to advance the live parser state over `bytes` (one character), applying the
-    /// `feed_bytes` non-ASCII policy so the editor's verdicts agree with a reparse.
-    /// Returns false (state unchanged) when no parse continues.
-    fn step_state(&mut self, bytes: &[u8]) -> bool {
-        let mut state = self.state.clone();
-        for &byte in bytes {
-            let input = match Input::byte(byte) {
-                Some(input) => input,
-                None => {
-                    if !state.admissible().non_ascii_ok {
-                        return false;
-                    }
-                    Input::byte(b'x').expect("ascii")
-                }
-            };
-            state = match state.step(input).and_then(Step::cont) {
-                Some(next) => next,
-                None => return false,
-            };
-        }
-        self.state = state;
-        true
+        self.debug_check_stack();
     }
 
     // -- backspace ---------------------------------------------------------------------
@@ -342,43 +497,80 @@ impl Editor {
         self.emit("\u{8} \u{8}");
         match self.red_from {
             Some(red) if self.line.len() <= red => {
-                // Rewound to (or below) the first red byte: the line is green again.
+                // Rewound to the first dead byte: green again. Dead characters were
+                // never committed to the parser, so the state already covers exactly
+                // the surviving prefix — close the marker, restore the word tracker
+                // saved when the mark opened. O(1), no replay (the board measured
+                // ~50 ms per parser step; a reparse here cost seconds on long lines).
                 self.emit(self.marker.end);
                 self.red_from = None;
-                self.reparse();
+                let (in_word, tracking) = self.red_tracker;
+                self.in_word = in_word;
+                self.tracking = tracking;
             }
             Some(_) => {
                 // Still red beyond `red_from`: the green prefix (and its state) is
                 // untouched, nothing to recompute.
             }
-            None => self.reparse(),
-        }
-    }
-
-    /// Recompute the parser state (and `red_from`) from the line — the study's
-    /// backspace-is-reparse-from-start policy. Emits nothing.
-    fn reparse(&mut self) {
-        let mut state = command_line(&self.vocab);
-        let mut red_from = None;
-        for (index, &byte) in self.line.iter().enumerate() {
-            let input = match Input::byte(byte) {
-                Some(input) => input,
-                None if state.admissible().non_ascii_ok => Input::byte(b'x').expect("ascii"),
-                None => {
-                    red_from = Some(index);
-                    break;
-                }
-            };
-            match state.step(input).and_then(Step::cont) {
-                Some(next) => state = next,
-                None => {
-                    red_from = Some(index);
-                    break;
+            None => {
+                // Green: pop the erased character's snapshot — O(1).
+                match self.stack.pop() {
+                    Some(snap) => {
+                        self.state = snap.state;
+                        self.in_word = snap.in_word;
+                        self.tracking = snap.tracking;
+                    }
+                    // Unreachable under the stack invariant; rebuild defensively.
+                    None => self.rebuild(),
                 }
             }
         }
-        self.state = state;
-        self.red_from = red_from;
+        self.debug_check_stack();
+    }
+
+    /// Recompute everything from the line — parser state, snapshot stack, `red_from`
+    /// (parse-dead or name-dead), word tracker — character by character, identical to
+    /// the incremental path in [`Editor::insert_char`]. The one O(N) path, used only
+    /// for wholesale line replacement (history recall, [`Editor::provide_args`]);
+    /// backspace pops snapshots instead. Emits nothing.
+    fn rebuild(&mut self) {
+        self.stack.clear();
+        self.state = command_line(&self.vocab);
+        self.red_from = None;
+        self.red_tracker = (false, false);
+        self.in_word = false;
+        self.tracking = false;
+        let line = core::mem::take(&mut self.line);
+        let mut index = 0;
+        while index < line.len() {
+            // One whole character: the lead byte plus its continuations.
+            let mut end = index + 1;
+            while end < line.len() && (0x80..=0xbf).contains(&line[end]) {
+                end += 1;
+            }
+            let pre = (self.in_word, self.tracking);
+            self.arm_tracker(line[index]);
+            let next = try_step(&self.state, &line[index..end])
+                .filter(|next| !(self.tracking && !name_completions(next).any));
+            match next {
+                Some(next) => {
+                    let prev = core::mem::replace(&mut self.state, next);
+                    self.stack.push(Snap {
+                        state: prev,
+                        in_word: pre.0,
+                        tracking: pre.1,
+                    });
+                }
+                None => {
+                    self.red_from = Some(index);
+                    self.red_tracker = pre;
+                    break;
+                }
+            }
+            index = end;
+        }
+        self.line = line;
+        self.debug_check_stack();
     }
 
     // -- TAB --------------------------------------------------------------------------
@@ -404,32 +596,65 @@ impl Editor {
             }
             return;
         }
-        let matched = completions[0].matched;
-        let mut words: Vec<String> = completions.into_iter().map(|c| c.word).collect();
-        words.sort();
-        words.dedup();
-        if words.len() == 1 {
-            let rest: Vec<u8> = words[0].as_bytes()[matched..].to_vec();
-            self.append_completion_bytes(&rest);
-            self.append_completion_bytes(b" ");
-            return;
-        }
-        let prefix = longest_common_prefix(&words);
-        if prefix.len() > matched {
-            let rest: Vec<u8> = prefix.as_bytes()[matched..].to_vec();
-            if self.append_completion_bytes(&rest) {
+        // Candidates from different word positions can coexist (a just-completed flag
+        // name and the next value's candidates): the most-typed group is the word in
+        // progress — finish that first.
+        let matched = completions
+            .iter()
+            .map(|c| c.matched)
+            .max()
+            .expect("non-empty");
+        let mut candidates: Vec<Completion> = completions
+            .into_iter()
+            .filter(|c| c.matched == matched)
+            .collect();
+        candidates.sort_by(|a, b| a.word.cmp(&b.word));
+        candidates.dedup_by(|a, b| a.word == b.word);
+        // The M3 value guard: in a value position with nothing typed yet (every
+        // candidate Value-tagged), always list — values stay free-form, and a unique
+        // manual hint must not be auto-typed into the user's line.
+        let value_menu = matched == 0 && candidates.iter().all(|c| c.tag == Tag::Value);
+        if !value_menu {
+            if candidates.len() == 1 {
+                let rest: Vec<u8> = candidates[0].word.as_bytes()[matched..].to_vec();
+                self.append_completion_bytes(&rest);
+                if !candidates[0].glue {
+                    self.append_completion_bytes(b" ");
+                }
                 return;
+            }
+            let words: Vec<String> = candidates.iter().map(|c| c.word.clone()).collect();
+            let prefix = longest_common_prefix(&words);
+            if prefix.len() > matched {
+                let rest: Vec<u8> = prefix.as_bytes()[matched..].to_vec();
+                if self.append_completion_bytes(&rest) {
+                    return;
+                }
             }
         }
         if progressed {
             return;
         }
         // No further progress: list the candidates, then repaint prompt + line (which
-        // is green here — red lines bailed to the bell above).
+        // is green here — red lines bailed to the bell above). Flags display with
+        // their `--`; a description column appears when any candidate has one.
         self.emit("\r\n");
-        let list = words.join("  ");
-        self.emit(&list);
-        self.emit("\r\n");
+        let shown: Vec<String> = candidates.iter().map(display_word).collect();
+        if candidates.iter().any(|c| c.desc.is_some()) {
+            let width = shown.iter().map(|w| w.chars().count()).max().unwrap_or(0);
+            for (cand, word) in candidates.iter().zip(&shown) {
+                let line = match &cand.desc {
+                    Some(desc) => format!("{word:<width$}  {desc}"),
+                    None => word.clone(),
+                };
+                self.emit(&line);
+                self.emit("\r\n");
+            }
+        } else {
+            let list = shown.join("  ");
+            self.emit(&list);
+            self.emit("\r\n");
+        }
         let prompt = self.prompt.clone();
         self.emit(&prompt);
         let end = self.line.len();
@@ -440,16 +665,41 @@ impl Editor {
     /// push, echo. Stops at the first byte the parser refuses (defensive — completion
     /// bytes come from the grammar's own offers, so this should not trigger) or at the
     /// line cap. Returns whether anything was appended.
+    ///
+    /// The word tracker and snapshot stack are maintained exactly like typing would
+    /// (so a character typed — or erased — right after a completion behaves
+    /// correctly), but appended bytes never *mark*: they are the grammar's own
+    /// offers, viable by construction.
     fn append_completion_bytes(&mut self, bytes: &[u8]) -> bool {
         let mut appended = false;
         for &byte in bytes {
-            if self.line.len() >= MAX_LINE_BYTES || !self.step_state(&[byte]) {
+            if self.line.len() >= MAX_LINE_BYTES {
                 break;
+            }
+            let pre = (self.in_word, self.tracking);
+            self.arm_tracker(byte);
+            match try_step(&self.state, &[byte]) {
+                Some(next) => {
+                    let prev = core::mem::replace(&mut self.state, next);
+                    self.stack.push(Snap {
+                        state: prev,
+                        in_word: pre.0,
+                        tracking: pre.1,
+                    });
+                }
+                None => {
+                    // Defensive (grammar offers step by construction): undo the
+                    // tracker advance for the byte we are not taking.
+                    self.in_word = pre.0;
+                    self.tracking = pre.1;
+                    break;
+                }
             }
             self.line.push(byte);
             self.out.push(char::from(byte));
             appended = true;
         }
+        self.debug_check_stack();
         appended
     }
 
@@ -500,7 +750,7 @@ impl Editor {
         self.close_marker();
         let old = core::mem::replace(&mut self.line, text);
         self.utf8_pending.clear();
-        self.reparse();
+        self.rebuild();
         let (begin, red_from) = (self.marker.begin, self.red_from);
         match red_from {
             Some(red) => {
@@ -560,6 +810,65 @@ impl Editor {
     }
 }
 
+/// Step one character's bytes from `state` WITHOUT mutating it, applying the
+/// `feed_bytes` non-ASCII substitution policy so the editor's verdicts agree exactly
+/// with a from-scratch reparse. `None` when no parse continues; on success the caller
+/// owns the new state (and can move the predecessor onto the snapshot stack).
+fn try_step(state: &BoxP<()>, bytes: &[u8]) -> Option<BoxP<()>> {
+    let mut current: Option<BoxP<()>> = None;
+    for &byte in bytes {
+        let at: &BoxP<()> = current.as_ref().unwrap_or(state);
+        let input = match Input::byte(byte) {
+            Some(input) => input,
+            None => {
+                if !at.admissible().non_ascii_ok {
+                    return None;
+                }
+                Input::byte(b'x').expect("ascii")
+            }
+        };
+        current = Some(at.step(input).and_then(Step::cont)?);
+    }
+    current
+}
+
+/// What the name-marking oracle sees at a parser state (module docs, "name-dead").
+struct NameCompletions {
+    /// Any name-tagged completion alive ([`Tag::is_name`]) — the word can still
+    /// prefix-extend to a vocabulary entry (keywords count: `wit…` is heading to
+    /// `with`).
+    any: bool,
+    /// Any STRONG name-tagged completion alive (name tags minus `Keyword`) — the
+    /// position resolves a name, so a word here is worth tracking. Keyword-only
+    /// positions (`… as …` slots) also admit free positional words and must not arm
+    /// the mark.
+    strong: bool,
+}
+
+fn name_completions(state: &BoxP<()>) -> NameCompletions {
+    let mut completions: Vec<Completion> = Vec::new();
+    state.completions(&mut completions);
+    let mut any = false;
+    let mut strong = false;
+    for completion in &completions {
+        if completion.tag.is_name() {
+            any = true;
+            if completion.tag != Tag::Keyword {
+                strong = true;
+            }
+        }
+    }
+    NameCompletions { any, strong }
+}
+
+/// How a candidate displays in the TAB list: flag names carry their `--`.
+fn display_word(completion: &Completion) -> String {
+    match completion.tag {
+        Tag::Flag => format!("--{}", completion.word),
+        _ => completion.word.clone(),
+    }
+}
+
 /// Characters (not bytes) in a UTF-8 buffer — the erase-column count.
 fn char_count(bytes: &[u8]) -> usize {
     bytes
@@ -594,6 +903,7 @@ fn longest_common_prefix(words: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grammar::FlagSpec;
     use crate::inc::Tag;
     use alloc::borrow::ToOwned;
     use alloc::format;
@@ -608,6 +918,9 @@ mod tests {
                 ("time.frozen", Tag::Program),
                 ("time.fuzzy", Tag::Program),
                 ("browser", Tag::Program),
+                ("draft", Tag::Program),
+                ("net.l4.over-l2", Tag::Program),
+                ("net.text", Tag::Program),
                 ("det", Tag::Binding),
             ]
             .into_iter()
@@ -764,13 +1077,14 @@ mod tests {
     #[test]
     fn forced_prefix_walks_before_completion() {
         let mut ed = editor();
-        // After `svc lo` only `svc log` continues: the `g` is forced; the service-name
-        // position that follows has no vocabulary, so the walk is all TAB does.
+        // After `svc lo` only `svc log` continues: the `g` is forced; the now-complete
+        // keyword is the unique candidate, so TAB also appends the separating space
+        // (the service name that follows is free).
         type_text(&mut ed, "svc lo");
         ed.take_output();
         ed.handle(Key::Tab);
-        assert_eq!(ed.take_output(), "g");
-        assert_eq!(submit(&mut ed), "svc log");
+        assert_eq!(ed.take_output(), "g ");
+        assert_eq!(submit(&mut ed), "svc log ");
     }
 
     #[test]
@@ -871,10 +1185,17 @@ mod tests {
     #[test]
     fn ctrl_c_cancels_the_line() {
         let mut ed = editor();
-        type_text(&mut ed, "oops");
+        // A viable prefix (of `browser`) — the green-line cancel shape.
+        type_text(&mut ed, "brows");
         ed.take_output();
         assert_eq!(ed.handle(Key::Ctrl(3)), Action::Submit(String::new()));
         assert_eq!(ed.take_output(), "^C\r\n");
+        // On a red line the marker closes before the ^C echo.
+        let mut ed = editor();
+        type_text(&mut ed, "oops");
+        ed.take_output();
+        assert_eq!(ed.handle(Key::Ctrl(3)), Action::Submit(String::new()));
+        assert_eq!(ed.take_output(), "\u{1b}[0m^C\r\n");
     }
 
     #[test]
@@ -924,6 +1245,473 @@ mod tests {
         assert_eq!(ed.history.len(), RECALL_CAP);
         assert_eq!(ed.history[0], "line36");
         assert_eq!(ed.history.last().unwrap(), "line99");
+    }
+
+    // -- vocabulary-aware marking (M3 deliverable 1) ---------------------------------
+
+    #[test]
+    fn name_dead_word_marks_at_the_first_dead_character() {
+        // The owner's flagship: `net.x` cannot prefix-extend to any vocabulary entry
+        // (net.l4.over-l2, net.text) — the `x` marks, the viable `net.` does not.
+        let mut ed = editor();
+        type_text(&mut ed, "net.x");
+        assert_eq!(ed.take_output(), "net.\u{1b}[31mx");
+        // Further input stays inside the marked region without re-emitting the marker.
+        type_text(&mut ed, "yz");
+        assert_eq!(ed.take_output(), "yz");
+        // Enter closes the marker and still submits (accept-and-mark, never refuse).
+        assert_eq!(submit(&mut ed), "net.xyz");
+        assert_eq!(ed.take_output(), "\u{1b}[0m\r\n");
+    }
+
+    #[test]
+    fn backspace_clears_a_name_dead_mark_exactly_like_parse_dead() {
+        let mut ed = editor();
+        type_text(&mut ed, "net.x");
+        ed.take_output();
+        // Erase the dead `x`: rewinds to red_from → marker-end, green again.
+        ed.handle(Key::Backspace);
+        assert_eq!(ed.take_output(), "\u{8} \u{8}\u{1b}[0m");
+        // …and completing to a LONGER valid name stays green end to end.
+        type_text(&mut ed, "l4.over-l2");
+        let out = ed.take_output();
+        assert!(!out.contains("\u{1b}[31m"), "{out:?}");
+        assert_eq!(submit(&mut ed), "net.l4.over-l2");
+        assert_eq!(ed.take_output(), "\r\n");
+    }
+
+    #[test]
+    fn vocabulary_names_and_bindings_never_mark() {
+        // A /bin name, a session binding, and a builtin — fully typed, with boundary,
+        // in head and post-$ positions: never marked.
+        for line in [
+            "net.l4.over-l2 ",
+            "det ",
+            "help",
+            "history",
+            "time.frozen $ hello",
+            "time.frozen & net.text $ browser",
+            "(net.text) $ hello",
+            "let x = det",
+        ] {
+            let mut ed = editor();
+            type_text(&mut ed, line);
+            let out = ed.take_output();
+            assert!(!out.contains("\u{1b}[31m"), "{line:?} marked: {out:?}");
+        }
+    }
+
+    #[test]
+    fn a_session_binding_in_the_snapshot_does_not_mark() {
+        // The let-binding case: the per-prompt snapshot carries bindings created this
+        // session (the embedder's snapshot_vocab), so typing one at the next prompt
+        // stays green — here `det`, present as Tag::Binding.
+        let mut ed = editor();
+        type_text(&mut ed, "det");
+        assert_eq!(ed.take_output(), "det");
+        assert_eq!(submit(&mut ed), "det");
+    }
+
+    #[test]
+    fn name_dead_marks_in_post_compose_positions_too() {
+        let mut ed = editor();
+        type_text(&mut ed, "time.frozen $ net.q");
+        let out = ed.take_output();
+        assert!(out.ends_with("\u{1b}[31mq"), "{out:?}");
+        // And inside parens (a name position behind `(`).
+        let mut ed = editor();
+        type_text(&mut ed, "hello --p (net.q");
+        let out = ed.take_output();
+        assert!(out.ends_with("\u{1b}[31mq"), "{out:?}");
+    }
+
+    #[test]
+    fn free_text_positions_never_name_mark() {
+        // let/save names, service names, flag names, flag values, positional words,
+        // gate slots, quoted and comment interiors: all free text — no vocabulary, no
+        // mark, even though none of these words are in the vocabulary.
+        for line in [
+            "let zzz = det",
+            "save qq = det",
+            "svc log ghostname",
+            "hello --zzz freeform",
+            "hello plainarg",
+            "only eo9:zzz $ hello",
+            "rename aa bb $ hello",
+            "hello # zzz comment",
+            "hello \"zzz text\"",
+            "with hello as zz $ det",
+        ] {
+            let mut ed = editor();
+            type_text(&mut ed, line);
+            let out = ed.take_output();
+            assert!(!out.contains("\u{1b}[31m"), "{line:?} marked: {out:?}");
+        }
+    }
+
+    #[test]
+    fn keyword_only_positions_do_not_arm_the_mark() {
+        // After `with hello `, the grammar offers only the keyword `as` — but a free
+        // positional word is also viable there (`with hello az as x $ y` parses, `az`
+        // is an argument), so the mark must not arm on keyword-only evidence.
+        let mut ed = editor();
+        type_text(&mut ed, "with hello az");
+        let out = ed.take_output();
+        assert!(!out.contains("\u{1b}[31m"), "{out:?}");
+    }
+
+    #[test]
+    fn marking_is_per_prompt_vocabulary_not_hardcoded() {
+        // An empty vocabulary still tracks at the head (builtins are alive there):
+        // a word that is no builtin prefix marks.
+        let mut ed = Editor::new("eosh> ", Vocab::default(), Vec::new(), Marker::RED);
+        type_text(&mut ed, "zq");
+        let out = ed.take_output();
+        assert!(out.contains("\u{1b}[31m"), "{out:?}");
+        // `h` extends to builtins (help, history): green until it dies.
+        let mut ed = Editor::new("eosh> ", Vocab::default(), Vec::new(), Marker::RED);
+        type_text(&mut ed, "help");
+        assert_eq!(ed.take_output(), "help");
+    }
+
+    // -- argument completion (M3 deliverable 2) ----------------------------------------
+
+    /// The flagship program args: net.l4.over-l2's signature dressed with its manual
+    /// (docs/design/component-manuals.md §2's example, the v2 acceptance case).
+    fn l4_args() -> ProgramArgs {
+        ProgramArgs {
+            flags: vec![
+                FlagSpec {
+                    name: "address".to_string(),
+                    ty: "string".to_string(),
+                    doc: Some("IPv4 acquisition mode".to_string()),
+                    values: vec!["dhcp".to_string()],
+                    kind: None,
+                },
+                FlagSpec {
+                    name: "prefix-length".to_string(),
+                    ty: "option<u8>".to_string(),
+                    doc: Some("subnet prefix length".to_string()),
+                    values: Vec::new(),
+                    kind: None,
+                },
+                FlagSpec {
+                    name: "gateway".to_string(),
+                    ty: "option<string>".to_string(),
+                    doc: None,
+                    values: Vec::new(),
+                    kind: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn flag_completion_from_the_provided_signature() {
+        // `net.l4.over-l2 --a<TAB>` → `--address` (the flagship).
+        let mut ed = editor();
+        ed.provide_args("net.l4.over-l2", l4_args());
+        type_text(&mut ed, "net.l4.over-l2 --a");
+        ed.take_output();
+        ed.handle(Key::Tab);
+        assert_eq!(ed.take_output(), "ddress ");
+        // `--address <TAB>` → the manual's `dhcp`, LISTED (values stay free-form —
+        // a unique hint is never auto-typed), then the prompt+line repaint.
+        ed.handle(Key::Tab);
+        assert_eq!(
+            ed.take_output(),
+            "\r\ndhcp\r\neosh> net.l4.over-l2 --address "
+        );
+        // Typing a prefix of the hint completes normally.
+        type_text(&mut ed, "dh");
+        ed.take_output();
+        ed.handle(Key::Tab);
+        assert_eq!(ed.take_output(), "cp ");
+        assert_eq!(submit(&mut ed), "net.l4.over-l2 --address dhcp ");
+    }
+
+    #[test]
+    fn flag_list_shows_descriptions_from_the_manual() {
+        let mut ed = editor();
+        ed.provide_args("net.l4.over-l2", l4_args());
+        type_text(&mut ed, "net.l4.over-l2 --");
+        ed.take_output();
+        ed.handle(Key::Tab);
+        let out = ed.take_output();
+        assert!(out.contains("--address"), "{out:?}");
+        assert!(out.contains("IPv4 acquisition mode"), "{out:?}");
+        assert!(out.contains("--prefix-length"), "{out:?}");
+        // `gateway` has no doc line: shown without a description.
+        assert!(out.contains("--gateway"), "{out:?}");
+        assert!(out.ends_with("eosh> net.l4.over-l2 --"), "{out:?}");
+    }
+
+    #[test]
+    fn bool_flags_complete_true_false() {
+        let mut ed = editor();
+        ed.provide_args(
+            "hello",
+            ProgramArgs {
+                flags: vec![FlagSpec {
+                    name: "verbose".to_string(),
+                    ty: "option<bool>".to_string(),
+                    doc: None,
+                    values: Vec::new(),
+                    kind: None,
+                }],
+            },
+        );
+        type_text(&mut ed, "hello --verbose ");
+        ed.take_output();
+        // Nothing typed: the typed candidates list (never auto-filled).
+        ed.handle(Key::Tab);
+        assert_eq!(
+            ed.take_output(),
+            "\r\nfalse  true\r\neosh> hello --verbose "
+        );
+        // A typed prefix completes.
+        type_text(&mut ed, "t");
+        ed.take_output();
+        ed.handle(Key::Tab);
+        assert_eq!(ed.take_output(), "rue ");
+        assert_eq!(submit(&mut ed), "hello --verbose true ");
+    }
+
+    #[test]
+    fn kind_url_offers_the_canned_prefix_without_a_trailing_space() {
+        let mut ed = editor();
+        ed.provide_args(
+            "browser",
+            ProgramArgs {
+                flags: vec![FlagSpec {
+                    name: "url".to_string(),
+                    ty: "string".to_string(),
+                    doc: None,
+                    values: Vec::new(),
+                    kind: Some("url".to_string()),
+                }],
+            },
+        );
+        type_text(&mut ed, "browser --url ");
+        ed.take_output();
+        // Listed with its kind label…
+        ed.handle(Key::Tab);
+        let out = ed.take_output();
+        assert!(out.contains("http://  url"), "{out:?}");
+        // …and a typed prefix completes WITHOUT the trailing space (glue): the URL
+        // continues right after.
+        type_text(&mut ed, "h");
+        ed.take_output();
+        ed.handle(Key::Tab);
+        assert_eq!(ed.take_output(), "ttp://");
+        type_text(&mut ed, "x");
+        assert_eq!(ed.take_output(), "x");
+        assert_eq!(submit(&mut ed), "browser --url http://x");
+    }
+
+    #[test]
+    fn an_unprovided_name_keeps_the_generic_argument_grammar() {
+        // `hello` is in the vocabulary but no argument data was provided (unresolved /
+        // still resolving): TAB after `--a` has nothing to offer — the bell, exactly
+        // the pre-M3 behavior.
+        let mut ed = editor();
+        type_text(&mut ed, "hello --a");
+        ed.take_output();
+        ed.handle(Key::Tab);
+        assert_eq!(ed.take_output(), "\u{7}");
+    }
+
+    #[test]
+    fn provided_argument_candidates_never_arm_the_name_mark() {
+        // Flag and value positions carry Flag/Value-tagged candidates once provided —
+        // the name-mark oracle must ignore them: unknown flags and free-form values
+        // stay green (additive, never restrictive).
+        let mut ed = editor();
+        ed.provide_args("net.l4.over-l2", l4_args());
+        type_text(&mut ed, "net.l4.over-l2 --bogus freeform --address static9");
+        let out = ed.take_output();
+        assert!(!out.contains("\u{1b}[31m"), "{out:?}");
+    }
+
+    #[test]
+    fn wanted_args_reports_typed_vocabulary_programs_lacking_data() {
+        let mut ed = editor();
+        assert!(ed.wanted_args().is_empty());
+        type_text(&mut ed, "net.l4.over-l2 ");
+        assert_eq!(ed.wanted_args(), vec!["net.l4.over-l2".to_string()]);
+        // Bindings and unknown words are never wanted (the memo is keyed by resolved
+        // program name); providing data — even empty — retires the want.
+        type_text(&mut ed, "det zzz ");
+        assert_eq!(ed.wanted_args(), vec!["net.l4.over-l2".to_string()]);
+        ed.provide_args("net.l4.over-l2", ProgramArgs::default());
+        assert!(ed.wanted_args().is_empty());
+    }
+
+    #[test]
+    fn provide_args_mid_line_rearms_completion_without_visible_change() {
+        // The async edge: the name resolves only after `--a` was already typed; the
+        // provide re-parses (no output) and the same TAB now completes.
+        let mut ed = editor();
+        type_text(&mut ed, "net.l4.over-l2 --a");
+        ed.take_output();
+        ed.provide_args("net.l4.over-l2", l4_args());
+        assert_eq!(ed.take_output(), "");
+        ed.handle(Key::Tab);
+        assert_eq!(ed.take_output(), "ddress ");
+    }
+
+    // -- the O(1)-backspace snapshot stack ---------------------------------------------
+
+    /// The state restored by a backspace pop must be indistinguishable from a
+    /// from-scratch reparse: same dead point, same word tracker, same stack depth,
+    /// and the same parser verdicts (admissibility, completions, finishability).
+    fn assert_consistent(ed: &Editor, context: &str) {
+        // The stack invariant: one snapshot per green character.
+        let green_end = ed.red_from.unwrap_or(ed.line.len());
+        let green_chars = ed.line[..green_end]
+            .iter()
+            .filter(|&&byte| !(0x80..=0xbf).contains(&byte))
+            .count();
+        assert_eq!(
+            ed.stack.len(),
+            green_chars,
+            "stack depth != green chars at {context} (line {:?})",
+            String::from_utf8_lossy(&ed.line)
+        );
+        // The differential: rebuild the same line from scratch and compare.
+        let mut fresh = Editor::new(&ed.prompt, ed.vocab.clone(), Vec::new(), ed.marker);
+        fresh.line = ed.line.clone();
+        fresh.rebuild();
+        let line = String::from_utf8_lossy(&ed.line);
+        assert_eq!(
+            ed.red_from, fresh.red_from,
+            "red_from at {context} ({line:?})"
+        );
+        assert_eq!(ed.in_word, fresh.in_word, "in_word at {context} ({line:?})");
+        assert_eq!(
+            ed.tracking, fresh.tracking,
+            "tracking at {context} ({line:?})"
+        );
+        assert_eq!(
+            ed.stack.len(),
+            fresh.stack.len(),
+            "stack depth at {context} ({line:?})"
+        );
+        assert_eq!(
+            ed.state.admissible(),
+            fresh.state.admissible(),
+            "admissibility at {context} ({line:?})"
+        );
+        let comps = |state: &BoxP<()>| {
+            let mut out = Vec::new();
+            state.completions(&mut out);
+            out.sort_by(|a: &crate::inc::Completion, b| {
+                (&a.word, a.matched).cmp(&(&b.word, b.matched))
+            });
+            out
+        };
+        assert_eq!(
+            comps(&ed.state),
+            comps(&fresh.state),
+            "completions at {context} ({line:?})"
+        );
+        let finishes = |state: &BoxP<()>| state.step(Input::Eof).and_then(Step::value).is_some();
+        assert_eq!(
+            finishes(&ed.state),
+            finishes(&fresh.state),
+            "finishability at {context} ({line:?})"
+        );
+    }
+
+    #[test]
+    fn backspace_pop_equals_reparse_scripted() {
+        // The shapes that exercise every stack path: green typing, parse-dead and
+        // name-dead marks, the red→green transition, TAB-appended bytes, recall
+        // replacement, provide_args rebuild, UTF-8 multi-byte characters.
+        let mut ed = editor_with_history(&["net.l4.over-l2 --address dhcp", "help x"]);
+        ed.provide_args("net.l4.over-l2", l4_args());
+        let script: &[Key] = &[
+            Key::Char(b'n'),
+            Key::Char(b'e'),
+            Key::Char(b't'),
+            Key::Char(b'.'),
+            Key::Char(b'x'), // name-dead
+            Key::Char(b'y'), // deeper red
+            Key::Backspace,  // still red
+            Key::Backspace,  // red→green transition
+            Key::Char(b'l'),
+            Key::Tab, // completes net.l4.over-l2 (unique from `net.l`)
+            Key::Char(b'-'),
+            Key::Char(b'-'),
+            Key::Char(b'a'),
+            Key::Tab, // completes --address
+            Key::Char(b'd'),
+            Key::Backspace,
+            Key::Backspace, // erases through the TAB-appended space
+            Key::Up,        // recall: help x (red repaint)
+            Key::Backspace, // red→green on the recalled line
+            Key::Down,      // back to the stash
+            Key::Char(b' '),
+            Key::Char(b'('),
+            Key::Char(b'h'),
+            Key::Backspace,
+            Key::Backspace,
+            Key::Backspace,
+        ];
+        for (step, &key) in script.iter().enumerate() {
+            ed.handle(key);
+            ed.take_output();
+            assert_consistent(&ed, &format!("script step {step} ({key:?})"));
+        }
+        // Multi-byte characters: é assembles, then erases as one column.
+        let mut ed = editor();
+        for &byte in "h\u{e9}llo \u{201c}q".as_bytes() {
+            ed.handle(Key::Char(byte));
+        }
+        assert_consistent(&ed, "utf8 typed");
+        for _ in 0..8 {
+            ed.handle(Key::Backspace);
+            assert_consistent(&ed, "utf8 backspace");
+        }
+    }
+
+    #[test]
+    fn backspace_pop_equals_reparse_fuzzed() {
+        // Deterministic xorshift64* (no Date/rand), the grammar tests' generator.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+        const BYTES: &[u8] = b"net.l4ovrhlpsvco $&()=,\"#[]-x\t";
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_1234);
+        for round in 0..60 {
+            let mut ed = editor_with_history(&["net.l4.over-l2 --address dhcp", "zzz qq"]);
+            if round % 2 == 0 {
+                ed.provide_args("net.l4.over-l2", l4_args());
+            }
+            for step in 0..40 {
+                let key = match rng.below(10) {
+                    0 => Key::Backspace,
+                    1 => Key::Tab,
+                    2 => Key::Up,
+                    3 => Key::Down,
+                    _ => Key::Char(BYTES[rng.below(BYTES.len())]),
+                };
+                ed.handle(key);
+                ed.take_output();
+                assert_consistent(&ed, &format!("round {round} step {step} ({key:?})"));
+            }
+        }
     }
 
     #[test]

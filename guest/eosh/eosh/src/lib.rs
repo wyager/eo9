@@ -24,8 +24,9 @@ use eosh_core::{
         ServiceInfo, WaveValue,
     },
 };
+use eosh_inc::comb::is_boundary_byte;
 use eosh_inc::editor::{Action, Editor, Key as EditorKey, Marker, RECALL_CAP};
-use eosh_inc::grammar::Vocab;
+use eosh_inc::grammar::{FlagSpec, ProgramArgs, Vocab};
 use eosh_inc::inc::Tag;
 
 mod bindings {
@@ -763,6 +764,24 @@ async fn editor_loop(
                     }
                 },
             };
+            // Argument completion's async edge (repl M3): on a word-ending key — a
+            // boundary character or TAB — resolve any typed /bin program that still
+            // lacks argument data through the session's memo (describe + manual;
+            // memoized, so repeats are free) and re-arm the editor BEFORE the key is
+            // handled, so the very TAB that asked benefits. Resolution failures
+            // provide the empty data — the name stops being asked about this prompt,
+            // and the generic grammar simply stays (hints are additive only).
+            let word_end = matches!(key, EditorKey::Tab)
+                || matches!(key, EditorKey::Char(byte) if is_boundary_byte(byte));
+            if word_end {
+                for name in editor.wanted_args() {
+                    let args = match session.arg_hints(&name).await {
+                        Some(hints) => program_args(hints),
+                        None => ProgramArgs::default(),
+                    };
+                    editor.provide_args(&name, args);
+                }
+            }
             let action = editor.handle(key);
             let output = editor.take_output();
             if !output.is_empty() {
@@ -805,6 +824,24 @@ async fn snapshot_vocab(session: &mut Session<WitBackend>) -> Vocab {
             .map(|name| (name, Tag::Binding)),
     );
     Vocab::new(entries)
+}
+
+/// The session's merged argument hints, as the editor grammar's argument data — a
+/// field-for-field move (eosh-core sanitized every manual-supplied string already).
+fn program_args(hints: eosh_core::ArgHints) -> ProgramArgs {
+    ProgramArgs {
+        flags: hints
+            .args
+            .into_iter()
+            .map(|arg| FlagSpec {
+                name: arg.name,
+                ty: arg.ty,
+                doc: arg.doc,
+                values: arg.values,
+                kind: arg.kind,
+            })
+            .collect(),
+    }
 }
 
 /// The WIT keystroke, as the editor's key type.

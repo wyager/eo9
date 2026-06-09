@@ -615,3 +615,20 @@ an unbounded `child.wait()` after issuing `poweroff` — a guest that wedges dur
 shutdown hangs the gate instead of failing it. Shared pattern across gates. Lane:
 a bounded wait (generous, e.g. 60s) with a loud timeout failure, applied to the
 shared gate helper rather than per-gate.
+
+## Editor parser step costs ~50 ms on target — needs its own study lane (bench, 2026-06-09)
+The bench root-caused multi-second backspace on the Orange Pi to `eosh-inc`'s
+combinator step cost: ~50 ms per `state.step()` ON TARGET (host-side the same step is
+microseconds), measured as ~52 ms/char forward-echo latency and a backspace slope of
+~54 ms/char while `on_backspace` still replayed the whole line. The replay is FIXED
+(repl-m3 lane: snapshot-per-char state stack, backspace is O(1), differential tests
+pin pop == reparse), but the underlying per-step cost is the real anomaly and is NOT
+fixed — suspects: per-step combinator clone/alloc churn (`Box<dyn>`/`Rc` trees) under
+the target allocator, possibly scaling with vocabulary breadth (~38 /bin components in
+the head alternation). The M3 layer adds up to two `completions()` walks per typed
+word character (the name-mark oracle) and per-flag candidate `Words` branches — cheap
+on host, unprofiled on target; the same lane should measure them (the oracle can drop
+its String allocations via a dedicated non-allocating trait query if it shows).
+Follow-up lane: profile a single step on the board (alloc counters first), then either
+arena-allocate or shrink-clone the combinator states or precompile the grammar's static skeleton.
+Until then per-key feel on the board is bounded by ~50 ms/char echo.

@@ -38,7 +38,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::ast::{Arg, ArgValue, Expr};
-use crate::backend::NamedArg;
+use crate::backend::{ComponentInfo, NamedArg};
+use crate::manual::Manual;
 
 /// Bytes-cache bounds: entries and total byte budget (components run tens to a few
 /// hundred KiB; the budget keeps the browser blob comfortable).
@@ -50,6 +51,20 @@ const BYTES_MAX_TOTAL: usize = 4 * 1024 * 1024;
 /// (usermode `MAX_IMAGES` is 16, shared with detached services' respawn churn).
 /// 4 keeps the repeated-prompt-line win while leaving the table mostly free.
 const IMAGES_MAX_ENTRIES: usize = 4;
+
+/// Argument-memo bound (entries are a `ComponentInfo` plus a parsed manual — a few
+/// KiB each at most; 32 comfortably covers a session's working set of program names).
+const ARGS_MAX_ENTRIES: usize = 32;
+
+/// One memoized argument-completion entry (the repl M3 lazy memo,
+/// docs/design/component-manuals.md §4): what `describe` reported and, when the
+/// component carries one, its parsed manual — both derived from the same bytes the
+/// [`BytesCache`] holds, so the entry lives and dies by the same structural rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgMemoEntry {
+    pub info: ComponentInfo,
+    pub manual: Option<Manual>,
+}
 
 /// The bytes half: name → component bytes, LRU, eagerly invalidated.
 pub struct BytesCache {
@@ -125,6 +140,9 @@ struct ImageEntry<I> {
 pub struct SessionCache<I> {
     pub bytes: BytesCache,
     images: Vec<ImageEntry<I>>,
+    /// The argument-completion memo (name → describe + manual), LRU like the bytes
+    /// half and invalidated by exactly the same structural events.
+    args: Vec<(String, ArgMemoEntry)>,
     /// Bumped when any program that *could* have written `/bin` ran.
     global_gen: u64,
     /// Per-name bumps from this session's own `save`s.
@@ -141,6 +159,7 @@ impl<I> SessionCache<I> {
         SessionCache {
             bytes: BytesCache::new(),
             images: Vec::new(),
+            args: Vec::new(),
             global_gen: 0,
             name_gens: BTreeMap::new(),
             binding_keys: BTreeMap::new(),
@@ -204,19 +223,51 @@ impl<I> SessionCache<I> {
         }
     }
 
+    /// The memoized argument-completion entry for `name`, refreshing its LRU position.
+    pub fn args_get(&mut self, name: &str) -> Option<&ArgMemoEntry> {
+        if self.disabled {
+            return None;
+        }
+        let index = self.args.iter().position(|(n, _)| n == name)?;
+        let entry = self.args.remove(index);
+        self.args.push(entry);
+        self.args.last().map(|(_, entry)| entry)
+    }
+
+    /// Memoize one argument-completion entry (evicting least-recently-used past the
+    /// bound).
+    pub fn args_insert(&mut self, name: &str, entry: ArgMemoEntry) {
+        if self.disabled {
+            return;
+        }
+        if let Some(index) = self.args.iter().position(|(n, _)| n == name) {
+            self.args.remove(index);
+        }
+        self.args.push((String::from(name), entry));
+        while self.args.len() > ARGS_MAX_ENTRIES {
+            self.args.remove(0);
+        }
+    }
+
     /// This session wrote `/bin/<name>.wasm` (`save`): that leaf's keys change; its
-    /// bytes entry drops. Unrelated entries are untouched (structural invalidation).
+    /// bytes entry drops — and so does its argument memo (same bytes, same rules).
+    /// Unrelated entries are untouched (structural invalidation).
     pub fn note_bin_write(&mut self, name: &str) {
         *self.name_gens.entry(String::from(name)).or_insert(0) += 1;
         self.bytes.remove(name);
+        if let Some(index) = self.args.iter().position(|(n, _)| n == name) {
+            self.args.remove(index);
+        }
     }
 
     /// A program that imports `eo9:fs` finished running: it could have rewritten any
     /// `/bin` entry, and the filesystem gives us no content identity to check — so
-    /// every `/bin` leaf's keys change and the bytes cache clears.
+    /// every `/bin` leaf's keys change, the bytes cache clears, and the argument memo
+    /// clears with it.
     pub fn note_fs_run(&mut self) {
         self.global_gen += 1;
         self.bytes.clear();
+        self.args.clear();
     }
 
     /// A detached service that imports `eo9:fs` is now a *concurrent* potential writer:
@@ -224,6 +275,7 @@ impl<I> SessionCache<I> {
     pub fn disable(&mut self) {
         self.disabled = true;
         self.images.clear();
+        self.args.clear();
         self.bytes.disable();
     }
 
@@ -392,6 +444,44 @@ mod tests {
         }
         assert!(cache.get("n0").is_none());
         assert!(cache.get("n2").is_some());
+    }
+
+    fn memo_entry() -> ArgMemoEntry {
+        ArgMemoEntry {
+            info: ComponentInfo {
+                kind: crate::backend::ComponentKind::Binary,
+                imports: Vec::new(),
+                exports: Vec::new(),
+                args: Vec::new(),
+            },
+            manual: None,
+        }
+    }
+
+    #[test]
+    fn args_memo_is_bounded_and_follows_the_structural_rules() {
+        let mut cache = cache();
+        cache.args_insert("telnetd", memo_entry());
+        cache.args_insert("hello", memo_entry());
+        assert!(cache.args_get("telnetd").is_some());
+        // `save telnetd` drops exactly that entry.
+        cache.note_bin_write("telnetd");
+        assert!(cache.args_get("telnetd").is_none());
+        assert!(cache.args_get("hello").is_some());
+        // An fs-importing run clears the memo wholesale.
+        cache.note_fs_run();
+        assert!(cache.args_get("hello").is_none());
+        // Bounded, LRU.
+        for index in 0..40 {
+            cache.args_insert(&format!("p{index}"), memo_entry());
+        }
+        assert!(cache.args_get("p0").is_none());
+        assert!(cache.args_get("p39").is_some());
+        // Disable turns it off entirely.
+        cache.disable();
+        assert!(cache.args_get("p39").is_none());
+        cache.args_insert("late", memo_entry());
+        assert!(cache.args_get("late").is_none());
     }
 
     #[test]

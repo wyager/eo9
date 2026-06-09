@@ -145,7 +145,10 @@ impl<T> Step<T> {
     }
 }
 
-/// What kind of word a completion is — the editor's menu annotation.
+/// What kind of word a completion is — the editor's menu annotation, and the editor's
+/// name-marking oracle: the NAME tags ([`Tag::is_name`]) say "this position resolves a
+/// name", while [`Tag::Flag`]/[`Tag::Value`] candidates (the M3 argument grammars) are
+/// completion-only and never make a position name-marked.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Tag {
     /// A shell builtin (`help`, `describe`, `svc list`, …).
@@ -158,15 +161,36 @@ pub enum Tag {
     Binding,
     /// Anything else a vocabulary provider wants to offer.
     Other,
+    /// A `--flag` name from a resolved program's argument signature (M3). Free flag
+    /// names stay admissible; this only powers TAB.
+    Flag,
+    /// A typed/hinted candidate in a flag-value position (M3): `true`/`false` for a
+    /// bool, a manual's `values:` literals, a `kind:` canned prefix. ADDITIVE only —
+    /// values stay free-form; this only powers TAB.
+    Value,
+}
+
+impl Tag {
+    /// Is a candidate with this tag evidence that the position names something the
+    /// shell will resolve (head/program/provider positions)? Flag and value candidates
+    /// are not: their positions take free text.
+    pub fn is_name(self) -> bool {
+        !matches!(self, Tag::Flag | Tag::Value)
+    }
 }
 
 /// One completion candidate: the full word, how many of its bytes are already typed,
-/// and what kind of thing it is.
+/// and what kind of thing it is. `desc` is an optional one-line annotation for the
+/// candidate list (M3: a manual's per-arg doc first line); `glue` marks a candidate
+/// that is a *prefix* to keep typing into (M3 `kind:` canned prefixes like `http://`),
+/// so a unique completion does not append the usual trailing space.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
     pub word: String,
     pub matched: usize,
     pub tag: Tag,
+    pub desc: Option<String>,
+    pub glue: bool,
 }
 
 /// An incremental parser state. States are immutable: `step` returns the successor
