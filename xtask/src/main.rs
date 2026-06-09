@@ -2181,13 +2181,15 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
                 // grant against the kernel's gfx.simplefb root provider — the test
                 // pattern on the monitor plus the canonical checksum over serial.
                 ("eo9-example-draw", "draw"),
-                // The USB M1 acceptance pair (docs/board/usb-ohci-plan.md §3 M1):
-                //   usb.ohci $ usbcheck
-                //   usb.ohci --region usb-host0-ohci $ usbcheck
+                // The USB M1-M3 acceptance set (docs/board/usb-ohci-plan.md §3):
+                //   usb.ohci $ usbcheck                                  (M1/M2)
+                //   usb.ohci --region usb-host0-ohci $ usbcheck --hub-peek true
                 //   usb.ohci $ usbcheck --watch-ms 20000   (plug/unplug rounds)
+                //   usb.ohci $ hidcheck --reports 500 --quiet true       (M3)
                 // with the `platform` boot grant alongside `pci`.
                 ("eo9-stub-usb-ohci", "usb.ohci"),
                 ("eo9-example-usbcheck", "usbcheck"),
+                ("eo9-example-hidcheck", "hidcheck"),
                 ("eosh", "eosh"),
             ],
             "store-opi5plus-min.img",

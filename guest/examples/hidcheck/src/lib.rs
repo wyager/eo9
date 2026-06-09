@@ -37,6 +37,7 @@ eo9_guest::main! {
     async fn main(
         reports: Option<u32>,
         window_ms: Option<u32>,
+        quiet: Option<bool>,
     ) -> Result<ProgramSuccess, ProgramFailure> {
         let io_failure = |err: text::TextError| ProgramFailure::Io(format!("{err:?}"));
         let usb_failure = |err: usb::UsbError| match err {
@@ -52,6 +53,7 @@ eo9_guest::main! {
             None => 5,
         };
         let window_ns = u64::from(window_ms.unwrap_or(30_000)) * 1_000_000;
+        let quiet = quiet.unwrap_or(false);
 
         let root = usb::default();
         let time = time_api::default();
@@ -166,8 +168,14 @@ eo9_guest::main! {
             if first_report_at.is_none() {
                 first_report_at = Some(now);
             }
-            let raw: Vec<String> =
-                report.iter().map(|byte| format!("{byte:02x}")).collect();
+            // Quiet mode: only the first three reports go to the console; the
+            // counting (and the keyboard previous-state tracking) continues.
+            let printing = !quiet || count <= 3;
+            let raw: Vec<String> = if printing {
+                report.iter().map(|byte| format!("{byte:02x}")).collect()
+            } else {
+                Vec::new()
+            };
             let decoded = match interface.protocol {
                 descriptor::PROTOCOL_KEYBOARD => match KeyboardReport::parse(&report) {
                     Some(current) if current.is_rollover_error() => {
@@ -215,11 +223,20 @@ eo9_guest::main! {
                 },
                 _ => String::from("(unknown protocol)"),
             };
-            text::write_out_line(&format!(
-                "hidcheck: report {count} [{}] {decoded}",
-                raw.join(" "),
-            ))
-            .map_err(io_failure)?;
+            if printing {
+                text::write_out_line(&format!(
+                    "hidcheck: report {count} [{}] {decoded}",
+                    raw.join(" "),
+                ))
+                .map_err(io_failure)?;
+                if quiet && count == 3 {
+                    text::write_out_line(&format!(
+                        "hidcheck: (quiet — counting the remaining {} silently)",
+                        target_reports - count,
+                    ))
+                    .map_err(io_failure)?;
+                }
+            }
             if count >= target_reports {
                 break;
             }

@@ -36,6 +36,7 @@ pub mod descriptor;
 pub mod driver;
 pub mod enumerate;
 pub mod hid;
+pub mod hub;
 pub mod schedule;
 pub mod setup;
 

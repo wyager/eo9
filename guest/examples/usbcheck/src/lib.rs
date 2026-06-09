@@ -18,6 +18,7 @@ use eo9_guest::api::time::time as time_api;
 use eo9_guest::api::usb::usb;
 use eo9_guest::text;
 use eo9_ohci::descriptor::{self, Descriptor, DeviceDescriptor};
+use eo9_ohci::hub;
 use eo9_ohci::setup::descriptor_type;
 
 eo9_guest::bindings!({
@@ -35,7 +36,10 @@ const WATCH_SWEEPS: u32 = 25;
 const WATCH_PACE_NS: u64 = 100_000_000;
 
 eo9_guest::main! {
-    async fn main(watch_ms: Option<u32>) -> Result<ProgramSuccess, ProgramFailure> {
+    async fn main(
+        watch_ms: Option<u32>,
+        hub_peek: Option<bool>,
+    ) -> Result<ProgramSuccess, ProgramFailure> {
         let io_failure = |err: text::TextError| ProgramFailure::Io(format!("{err:?}"));
         let usb_failure = |err: usb::UsbError| match err {
             usb::UsbError::Denied => ProgramFailure::Denied,
@@ -242,6 +246,120 @@ eo9_guest::main! {
             .map_err(io_failure)?;
         }
 
+        // The hub peek (USB 2.0 chapter 11; eo9_ohci::hub): configure, power the
+        // downstream ports, wait bPwrOn2PwrGood, and print what is behind the hub —
+        // the where-does-the-keyboard-sit diagnostic, not hub support.
+        if hub_peek.unwrap_or(false) {
+            if parsed.class == hub::CLASS_HUB {
+                peek_hub(&device, &blob).await?;
+            } else {
+                text::write_out_line(&format!(
+                    "usbcheck: --hub-peek: device class {:02x} is not a hub (09); nothing to peek",
+                    parsed.class,
+                ))
+                .map_err(io_failure)?;
+            }
+        }
+
         Ok(ProgramSuccess::Enumerated(port))
     }
+}
+
+/// Configure the hub, power every downstream port, and print each port's decoded
+/// status (USB 2.0 §11.24 class requests, all through the ordinary eo9:usb control
+/// surface; request words and decode pinned in `eo9_ohci::hub`).
+async fn peek_hub(device: &usb::Device, config_blob: &[u8]) -> Result<(), ProgramFailure> {
+    let io_failure = |err: text::TextError| ProgramFailure::Io(format!("{err:?}"));
+    let usb_failure = |err: usb::UsbError| ProgramFailure::Io(format!("hub-peek: {err:?}"));
+    let control_in = |setup: eo9_ohci::setup::SetupPacket| {
+        usb::control_in(
+            device,
+            setup.request_type,
+            setup.request,
+            setup.value,
+            setup.index,
+            setup.length,
+        )
+    };
+    let control_out = |setup: eo9_ohci::setup::SetupPacket| {
+        usb::control_out(
+            device,
+            setup.request_type,
+            setup.request,
+            setup.value,
+            setup.index,
+            alloc::vec::Vec::new(),
+        )
+    };
+
+    // A hub's port operations need it configured first (§11.24: class requests to an
+    // unconfigured hub are request errors).
+    let configuration = descriptor::ConfigurationDescriptor::parse(config_blob)
+        .map(|c| c.configuration_value)
+        .unwrap_or(1);
+    control_out(eo9_ohci::setup::set_configuration(configuration))
+        .await
+        .map_err(usb_failure)?;
+
+    // The hub descriptor head: port count + power-good time.
+    let bytes = control_in(hub::get_hub_descriptor(9))
+        .await
+        .map_err(usb_failure)?;
+    let descriptor = hub::HubDescriptor::parse(&bytes).ok_or_else(|| {
+        ProgramFailure::Io(String::from("hub-peek: the hub descriptor did not parse"))
+    })?;
+    text::write_out_line(&format!(
+        "usbcheck: hub: {} port(s), power-good {} ms, characteristics {:#06x}",
+        descriptor.ports,
+        u32::from(descriptor.power_on_to_power_good_2ms) * 2,
+        descriptor.characteristics,
+    ))
+    .map_err(io_failure)?;
+
+    // Power every port, then wait the hub's own declared power-good time (+ slack).
+    for port in 1..=descriptor.ports {
+        control_out(hub::set_port_power(port))
+            .await
+            .map_err(usb_failure)?;
+    }
+    let time = time_api::default();
+    let settle_ns = (u64::from(descriptor.power_on_to_power_good_2ms) * 2 + 50) * 1_000_000;
+    time_api::sleep(&time, settle_ns).await;
+
+    // One status line per port: connection + decoded speed = where the keyboard is.
+    for port in 1..=descriptor.ports {
+        let bytes = control_in(hub::get_port_status(port))
+            .await
+            .map_err(usb_failure)?;
+        let Some(status) = hub::HubPortStatus::parse(&bytes) else {
+            text::write_out_line(&format!(
+                "usbcheck: hub port {port}: status did not parse ({} byte(s))",
+                bytes.len(),
+            ))
+            .map_err(io_failure)?;
+            continue;
+        };
+        text::write_out_line(&format!(
+            "usbcheck: hub port {port}: connected={} enabled={} powered={} speed={} \
+             (status {:#06x} change {:#06x})",
+            status.connected,
+            status.enabled,
+            status.powered,
+            // The speed bits are only meaningful while a device is connected
+            // (USB 2.0 table 11-21).
+            if !status.connected {
+                "-"
+            } else {
+                match status.speed {
+                    hub::PortSpeed::Low => "low",
+                    hub::PortSpeed::Full => "full",
+                    hub::PortSpeed::High => "high",
+                }
+            },
+            status.raw,
+            status.change,
+        ))
+        .map_err(io_failure)?;
+    }
+    Ok(())
 }

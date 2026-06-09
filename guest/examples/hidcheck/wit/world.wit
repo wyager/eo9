@@ -39,6 +39,10 @@ world hidcheck {
     /// `reports`: stop after this many reports (default 5).
     /// `window-ms`: give up after this much wall time without reaching the count
     /// (default 30000 — enough for scripted key injection to land).
-    export main: async func(reports: option<u32>, window-ms: option<u32>)
+    /// `quiet`: print only the first three reports in full, then count silently —
+    /// for rate measurement (a 1 ms full-speed mouse outruns per-report console
+    /// lines; the closing reports/s figure is the honest number either way, this
+    /// just removes the printing from the path being measured).
+    export main: async func(reports: option<u32>, window-ms: option<u32>, quiet: option<bool>)
         -> result<program-success, program-failure>;
 }

@@ -41,5 +41,11 @@ world usbcheck {
     /// connect-change/CSC, enabled, low-speed/LSDA), paced at ~100 ms sweeps. The
     /// M1 bench's plug/unplug acceptance: a plug must flip CCS+CSC on exactly one
     /// controller, with LSDA recording the device speed.
-    export main: async func(watch-ms: option<u32>) -> result<program-success, program-failure>;
+    /// `hub-peek`: when the enumerated device is a hub (class 09), additionally
+    /// configure it, power its downstream ports, and print each port's status and
+    /// device speed via hub-class control transfers — a DIAGNOSTIC (where does the
+    /// keyboard sit, at what speed), not hub support; devices behind the hub are
+    /// not enumerated.
+    export main: async func(watch-ms: option<u32>, hub-peek: option<bool>)
+        -> result<program-success, program-failure>;
 }
