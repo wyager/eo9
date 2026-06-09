@@ -425,6 +425,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("check-usb-hub", rest)?;
             check_usb_hub(&root)
         }
+        "check-station" => {
+            expect_no_args("check-station", rest)?;
+            check_station(&root)
+        }
         "check-dhcp" => {
             expect_no_args("check-dhcp", rest)?;
             check_dhcp(&root)
@@ -574,6 +578,16 @@ COMMANDS:
                          line executes at the next prompt), and `usb.ohci-pci $ usb.kbd`
                          end to end — QMP keystrokes typed on the emulated keyboard come
                          out as an executed eosh command
+    check-station        Boot the aarch64 kernel under QEMU with the `station` boot token
+                         (the demo's always-on keyboard service: init's `$`-chain config
+                         line `kbd = usb.ohci-pci $ usb.kbd restart restart.always`) plus
+                         the pci and console-sink grants and the hub topology, and prove
+                         the service-spawn root-grant linking end to end: the service comes
+                         up at boot with ZERO typed commands, QMP keystrokes typed on the
+                         emulated keyboard execute at the console eosh prompt, `svc list`
+                         shows the service running, and the same chain `detach`ed from the
+                         session (`detach kbd2 = usb.ohci-pci $ usb.kbd restart
+                         restart.always`) forwards keys identically
     check-telnet         Boot the aarch64 kernel under QEMU with a user-mode NIC and a slirp
                          host-forward (pci net telnet), drive `telnetd --sessions 2` at the
                          serial eosh prompt, and validate the shell-over-network end to end
@@ -4665,6 +4679,245 @@ fn check_usb_hub(root: &Path) -> Result<(), String> {
         "xtask: check-usb-hub ok — hub traversal enumerated the keyboard, decoded QMP \
          keystrokes through the boot protocol, the console sink executed an injected line, \
          and usb.kbd turned emulated-keyboard typing into an executed eosh command"
+    );
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------------------
+// check-station: the always-on keyboard service (docs/board/usb-boot-demo-plan.md part B,
+// GAPS "Service spawns carry no root capability grants") — the `station` boot token's
+// baked config (`kbd = usb.ohci-pci $ usb.kbd restart restart.always`, init's `$`-chain
+// grammar) brought up by init at boot, with the service registry linking the boot-granted
+// roots (pci + console-sink here). What's under test beyond check-usb-hub: the
+// service-spawn grant linking and the config-line composition — the sink/forwarding
+// mechanics are check-usb-hub's. Acceptance: NO foreground usb.kbd run, no typed setup of
+// any kind; QMP keystrokes typed on the emulated keyboard execute at the console prompt.
+//
+//   1. init reports `started `kbd`` and the console prompt arrives.
+//   2. `svc log kbd` (an inspection command, not setup) is polled until the service's
+//      banner shows it is forwarding — i.e. enumeration through the hub finished.
+//   3. QMP-injected h-e-l-l-o-Enter executes `hello` at the prompt (`ok: greeted`).
+//   4. `svc list` shows the service still running.
+//   5. The session arm of the same acceptance: `svc stop kbd` releases the controller,
+//      `detach kbd2 = usb.ohci-pci $ usb.kbd restart restart.always` typed at the
+//      prompt registers the same chain from the session (the grants link there too),
+//      and injected keys execute again; `poweroff` ends the boot cleanly.
+// ----------------------------------------------------------------------------------------
+
+fn station_qmp_socket(root: &Path) -> PathBuf {
+    root.join("kernel")
+        .join("target")
+        .join("eo9-station-qmp.sock")
+}
+
+fn check_station(root: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::sync::mpsc;
+
+    let arch = "aarch64";
+    let image = build_kernel(root, arch)?;
+    let qmp_path = station_qmp_socket(root);
+    let _ = std::fs::remove_file(&qmp_path);
+
+    println!(
+        "xtask: check-station — booting {} with the `station` token (init detaches \
+         `kbd = usb.ohci-pci $ usb.kbd restart restart.always` with the boot's root \
+         grants linked), then typing on the emulated keyboard only",
+        image.display()
+    );
+
+    // The bench topology (keyboard behind its own hub, as in check-usb-hub) and the
+    // grants the station's QEMU config line needs: pci (the OHCI claim path) and
+    // console-sink (typing as the operator is the service's purpose).
+    let mut command = Command::new(format!("qemu-system-{arch}"));
+    command
+        .current_dir(root)
+        .args(["-M", "virt,gic-version=2,highmem=off", "-cpu", "max"])
+        .args(["-device", "virtio-rng-pci"])
+        .args(["-smp", "1", "-m", KERNEL_QEMU_MEMORY, "-nographic"])
+        .arg("-kernel")
+        .arg(&image)
+        .args(["-append", "station pci console-sink"])
+        .args(["-device", "pci-ohci,id=eo9ohci"])
+        .args(["-device", "usb-hub,bus=eo9ohci.0,port=1"])
+        .args(["-device", "usb-kbd,bus=eo9ohci.0,port=1.1"])
+        .arg("-qmp")
+        .arg(format!("unix:{},server=on,wait=off", qmp_path.display()))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("check-station: failed to spawn qemu-system-{arch}: {err}"))?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+
+    let (sender, receiver) = mpsc::channel::<u8>();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut stdout = stdout;
+        let mut byte = [0u8; 1];
+        while let Ok(n) = stdout.read(&mut byte) {
+            if n == 0 || sender.send(byte[0]).is_err() {
+                break;
+            }
+        }
+    });
+
+    fn wait_for(receiver: &mpsc::Receiver<u8>, marker: &str, what: &str) -> Result<String, String> {
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + USB_STEP_TIMEOUT;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| {
+                    format!(
+                        "check-station: timed out waiting for {what} (last output: …{})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    )
+                })?;
+            match receiver.recv_timeout(remaining) {
+                Ok(byte) => {
+                    seen.push(byte as char);
+                    if seen.contains(marker) {
+                        return Ok(seen);
+                    }
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "check-station: the serial stream ended or timed out waiting for \
+                         {what} (last output: …{})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    ));
+                }
+            }
+        }
+    }
+
+    fn type_line(stdin: &mut std::process::ChildStdin, line: &str) -> Result<(), String> {
+        for byte in line.as_bytes() {
+            stdin
+                .write_all(core::slice::from_ref(byte))
+                .map_err(|err| format!("check-station: writing to the console: {err}"))?;
+            stdin
+                .flush()
+                .map_err(|err| format!("check-station: flushing the console: {err}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        stdin
+            .write_all(b"\n")
+            .and_then(|()| stdin.flush())
+            .map_err(|err| format!("check-station: writing to the console: {err}"))
+    }
+
+    let drive = (|| -> Result<(), String> {
+        // 1. The boot itself is the setup: init detaches the chain (the on-target fuse
+        // compile of usb.ohci-pci $ usb.kbd happens inside the detach) and reports it,
+        // then the console comes up. Nothing is typed before the prompt.
+        wait_for(
+            &receiver,
+            "started `kbd` (usb.ohci-pci $ usb.kbd under restart.always)",
+            "init's `kbd` service start line",
+        )?;
+        wait_for(&receiver, "eosh>", "the eosh prompt")?;
+
+        // 2. Wait for the service to reach its forwarding state (hub traversal +
+        // boot-protocol configuration run inside the service; its banner lands in the
+        // captured log, not on serial). `svc log` is inspection, not setup — the
+        // acceptance "no typed commands" means no foreground keyboard run and no
+        // composition typed at the prompt.
+        fn wait_forwarding(
+            stdin: &mut std::process::ChildStdin,
+            receiver: &mpsc::Receiver<u8>,
+            name: &str,
+        ) -> Result<(), String> {
+            for _ in 0..60 {
+                type_line(stdin, &format!("svc log {name}"))?;
+                let output = wait_for(receiver, "eosh>", "the prompt after `svc log`")?;
+                if output.contains("forwarding boot-protocol keystrokes") {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            Err(format!(
+                "check-station: the {name} service never reported it was forwarding \
+                 keystrokes (see `svc log {name}` output above)"
+            ))
+        }
+        wait_forwarding(&mut stdin, &receiver, "kbd")?;
+
+        // 3. The acceptance: keys typed on the emulated keyboard — decoded by the
+        // SERVICE, injected through its console-sink grant — execute at the prompt.
+        qmp_inject_keys(&qmp_path, &["h", "e", "l", "l", "o", "ret"])?;
+        wait_for(
+            &receiver,
+            "ok: greeted",
+            "the keyboard-typed `hello` executing at the prompt",
+        )?;
+        wait_for(
+            &receiver,
+            "eosh>",
+            "the prompt after the keyboard-typed command",
+        )?;
+
+        // 4. The service is still up (restart.always + an unbounded run).
+        type_line(&mut stdin, "svc list")?;
+        let output = wait_for(&receiver, "eosh>", "the prompt after `svc list`")?;
+        if !output.contains("kbd") || !output.contains("running") {
+            return Err(format!(
+                "check-station: `svc list` does not show the kbd service running \
+                 (output: …{})",
+                &output[output.len().saturating_sub(400)..]
+            ));
+        }
+
+        // 5. The session arm: the SAME chain detached from the console prompt links the
+        // same grants (svc.rs: a session detach is the other operator-authored path).
+        // The config service owns the controller, so stop it first — the claim
+        // releases and the controller quiesces with the service's store.
+        type_line(&mut stdin, "svc stop kbd")?;
+        wait_for(&receiver, "stopped: kbd", "the config service stopping")?;
+        wait_for(&receiver, "eosh>", "the prompt after `svc stop kbd`")?;
+        type_line(
+            &mut stdin,
+            "detach kbd2 = usb.ohci-pci $ usb.kbd restart restart.always",
+        )?;
+        wait_for(
+            &receiver,
+            "detached: kbd2",
+            "the session detach registering",
+        )?;
+        wait_for(&receiver, "eosh>", "the prompt after the session detach")?;
+        wait_forwarding(&mut stdin, &receiver, "kbd2")?;
+        qmp_inject_keys(&qmp_path, &["h", "e", "l", "l", "o", "ret"])?;
+        wait_for(
+            &receiver,
+            "ok: greeted",
+            "the keyboard-typed `hello` through the session-detached service",
+        )?;
+        wait_for(
+            &receiver,
+            "eosh>",
+            "the prompt after the second keyboard-typed command",
+        )?;
+
+        // The boot ends cleanly through init's poweroff path.
+        type_line(&mut stdin, "poweroff")?;
+        Ok(())
+    })();
+    if let Err(err) = drive {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    let _ = child.wait();
+
+    println!(
+        "xtask: check-station ok — the station boot brought the keyboard service up by \
+         itself (config `$` chain + service root grants), emulated-keyboard typing \
+         executed at the console with zero foreground commands, the service stayed \
+         running, and the same chain re-detached from the session worked identically"
     );
     Ok(())
 }
