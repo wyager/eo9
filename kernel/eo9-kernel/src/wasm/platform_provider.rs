@@ -29,11 +29,13 @@
 //! **Interrupts** answer `unsupported` in v1 — drivers poll with honest bounds (the
 //! same posture as the board's PCI INTx; the OHCI plan's risk 7 records the follow-up).
 //!
-//! **Teardown.** DMA buffers free on handle drop / task teardown exactly like PCI's —
-//! but a platform device has no bus-master bit to revoke, so the provider cannot
-//! generically quiesce a device that is still fetching descriptors (GAPS: the M1 board
-//! lane must pair region teardown with a device-specific quiesce hook before any real
-//! DMA master joins the table; the v1 QEMU test regions do not master the bus).
+//! **Teardown.** DMA buffers free on handle drop / task teardown exactly like PCI's.
+//! A platform device has no bus-master bit, so containment is the region table's
+//! per-device `quiesce` hook (`RegionDef::quiesce`), run when a claim releases —
+//! before any of the task's DMA buffers return to the heap. The board's OHCI regions
+//! drop the controller to UsbReset (no SOF, no HCCA writes); regions that never
+//! master the bus carry `None`. (The M3 board idle-reset incident was this gap live:
+//! an operational OHCI kept writing HccaFrameNumber into the freed arena.)
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -197,6 +199,13 @@ impl PlatformTables {
         if let Some(slot) = self.regions.get_mut(rep as usize)
             && let Some(region) = slot.take()
         {
+            // Quiesce BEFORE the claim releases: from this point the task's DMA
+            // buffers may drop in any order, and the device must already be unable
+            // to master the bus into them (study 09 finding 6 — the platform
+            // analogue of PCI's bus-master clear; see `RegionDef::quiesce`).
+            if let Some(quiesce) = region.quiesce {
+                quiesce(region.base);
+            }
             release_claim(region.name);
         }
     }
@@ -215,6 +224,12 @@ impl Drop for PlatformTables {
     /// docs and GAPS; the v1 region tables carry no bus-mastering device.)
     fn drop(&mut self) {
         for region in self.regions.iter().flatten() {
+            // Same ordering as `close_region`: the Drop body runs before the
+            // `buffers` field drops, so every claimed device is quiesced before any
+            // of this task's DMA memory returns to the heap.
+            if let Some(quiesce) = region.quiesce {
+                quiesce(region.base);
+            }
             release_claim(region.name);
         }
     }

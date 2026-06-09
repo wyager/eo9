@@ -290,6 +290,20 @@ pub(crate) fn init() {
     }
 }
 
+/// Quiesce one OHCI register block when its platform-region claim is released:
+/// HcControl = 0 puts the functional state to UsbReset — no list processing, no SOF,
+/// no HCCA frame-number/done-head DMA (OHCI 1.0a §6.1.1) — so the controller can
+/// never write into DMA memory the kernel has reclaimed (the platform provider's
+/// quiesce-before-free, study 09 finding 6; PCI's analogue is the bus-master clear).
+/// The next claim's bring-up does a full software reset anyway, so dropping to
+/// UsbReset costs the next driver nothing.
+pub(crate) fn ohci_quiesce(base: usize) {
+    // SAFETY: `base` comes from the board region table — a mapped OHCI register
+    // block; HcControl is the dword at +0x04.
+    unsafe { mmio::write_u32(base + 0x04, 0) };
+    kprintln!("usb: quiesced the OHCI at {base:#x} (HcControl -> UsbReset) on claim release");
+}
+
 /// One phy's host-port bring-up: APB reset off, the cited rk3588_usb2phy_tuning
 /// sequence (SIDDQ → reset pulse → suspend cfg → HS tuning), clkout on, port
 /// un-suspended, line state printed.

@@ -119,12 +119,14 @@ pub(crate) mod platform_regions {
             base: 0x0901_0000,
             size: 0x1000,
             has_irq: false,
+            quiesce: None, // no DMA master behind it
         },
         RegionDef {
             name: "pl061-gpio",
             base: 0x0903_0000,
             size: 0x1000,
             has_irq: false,
+            quiesce: None, // no DMA master behind it
         },
     ];
 }
@@ -151,24 +153,30 @@ pub(crate) mod platform_regions {
             base: rk3588_usb::USB_HOST1_OHCI,
             size: rk3588_usb::USB_HOST_REGION_SIZE,
             has_irq: true, // GIC SPI 219
+            // An operational OHCI DMA-writes the HCCA every millisecond; the claim
+            // release must drop it to UsbReset BEFORE the arena returns to the heap.
+            quiesce: Some(rk3588_usb::ohci_quiesce),
         },
         RegionDef {
             name: "usb-host0-ohci",
             base: rk3588_usb::USB_HOST0_OHCI,
             size: rk3588_usb::USB_HOST_REGION_SIZE,
             has_irq: true, // GIC SPI 216
+            quiesce: Some(rk3588_usb::ohci_quiesce),
         },
         RegionDef {
             name: "usb-host1-ehci",
             base: rk3588_usb::USB_HOST1_EHCI,
             size: rk3588_usb::USB_HOST_REGION_SIZE,
             has_irq: true, // GIC SPI 218
+            quiesce: None, // never DMA-armed: claimed only for the CONFIGFLAG write
         },
         RegionDef {
             name: "usb-host0-ehci",
             base: rk3588_usb::USB_HOST0_EHCI,
             size: rk3588_usb::USB_HOST_REGION_SIZE,
             has_irq: true, // GIC SPI 215
+            quiesce: None, // never DMA-armed: claimed only for the CONFIGFLAG write
         },
     ];
 }

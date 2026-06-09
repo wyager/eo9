@@ -128,9 +128,27 @@ eo9_guest::main! {
         usb::control_out(&device, 0x21, 0x0b, 0, u16::from(interface.interface_number), Vec::new())
             .await
             .map_err(class_failure)?;
-        usb::control_out(&device, 0x21, 0x0a, 0, u16::from(interface.interface_number), Vec::new())
-            .await
-            .map_err(class_failure)?;
+        // SET_IDLE is REQUIRED for keyboards but OPTIONAL for mice (HID 1.11 §7.2.4)
+        // — real mice routinely STALL it (the M3 board round's G500; Linux usbhid
+        // ignores SET_IDLE failures for the same reason). A refusal costs nothing:
+        // the device just reports at its default idle rate, and the keyboard
+        // previous-state diff dedupes repeats anyway.
+        if let Err(error) = usb::control_out(
+            &device,
+            0x21,
+            0x0a,
+            0,
+            u16::from(interface.interface_number),
+            Vec::new(),
+        )
+        .await
+        {
+            text::write_out_line(&format!(
+                "hidcheck: SET_IDLE refused ({error:?}) - optional for mice (HID 1.11 \
+                 §7.2.4), continuing"
+            ))
+            .map_err(io_failure)?;
+        }
 
         let opened = usb::open_interrupt_in(
             &device,

@@ -491,10 +491,15 @@ impl<R: RegionIo> Ohci<R> {
                 other => Err(DriverError::Transfer(other)),
             }
         };
+        // Judge in PIPELINE order — setup, data, status — so the first stage that
+        // errored reports its REAL condition code. A halted ED stops the pipeline at
+        // the erroring TD; the stages behind it read back NotAccessed, so checking
+        // the halt flag before judging every stage would mask the actual failure
+        // behind a meaningless `NotAccessed` (the M3 board lesson: a device that
+        // STALLs the status stage of a no-data request — e.g. the optional-for-mice
+        // HID SET_IDLE — must surface as `Stall`, not as schedule-never-ran).
         judge(read_td(&mut self.io, setup_td))?;
         let received = if has_data {
-            // A halted ED with a clean setup stage but an erroring data stage means
-            // the device refused the data stage — judged typed here.
             let data = judge(read_td(&mut self.io, data_td))?;
             let received = data
                 .bytes_transferred(base + arena::CONTROL_BUFFER as u32, in_length as u32)
@@ -505,11 +510,13 @@ impl<R: RegionIo> Ohci<R> {
         } else {
             0
         };
+        judge(read_td(&mut self.io, status_td))?;
         if halted {
-            // Halted but every TD we judged was clean: surface the strangeness typed.
+            // Halted yet every stage judged clean: genuinely anomalous (a writeback
+            // the controller never made) — the one case NotAccessed is the honest
+            // answer.
             return Err(DriverError::Transfer(ConditionCode::NotAccessed));
         }
-        judge(read_td(&mut self.io, status_td))?;
         Ok(received)
     }
 
@@ -827,6 +834,13 @@ mod tests {
         requests: Vec<(u8, u8, u16)>,
         reset_count: u32,
         fm_interval_at_reset: Vec<u32>,
+        /// Interrupt-IN reports the mock device has queued (one per periodic visit).
+        pending_reports: std::collections::VecDeque<Vec<u8>>,
+        /// The internal HcDoneHead accumulator: retired TDs chain here and are only
+        /// written back to HccaDoneHead at a frame tick when WDH is clear — the
+        /// silicon-faithful gating QEMU does not model.
+        done_head: u32,
+        wdh: bool,
     }
 
     const DMA_BASE: u32 = 0x4000_0000;
@@ -863,6 +877,9 @@ mod tests {
                 requests: Vec::new(),
                 reset_count: 0,
                 fm_interval_at_reset: Vec::new(),
+                pending_reports: std::collections::VecDeque::new(),
+                done_head: 0,
+                wdh: false,
             }
         }
 
@@ -875,8 +892,12 @@ mod tests {
             &mut self.arena[start..start + len]
         }
 
-        /// Answer a setup packet the way QEMU's usb-kbd does for the v1 request set.
-        fn answer(&mut self, setup_bytes: [u8; 8], buffer: &mut Vec<u8>) {
+        /// Answer a setup packet the way a real boot device does for the v1 request
+        /// set. Returns `false` for requests the device REFUSES (a protocol STALL of
+        /// the next stage): HID SET_IDLE, which is optional for mice (HID 1.11
+        /// §7.2.4) and which the M3 board's G500 stalls — QEMU's usb-hid accepts it,
+        /// which is exactly the QEMU-tolerance this mock must not share.
+        fn answer(&mut self, setup_bytes: [u8; 8], buffer: &mut Vec<u8>) -> bool {
             let request_type = setup_bytes[0];
             let request = setup_bytes[1];
             let value = u16::from_le_bytes([setup_bytes[2], setup_bytes[3]]);
@@ -895,8 +916,10 @@ mod tests {
                 (0x00, setup::request::SET_ADDRESS) => {
                     self.device_address = value as u8;
                 }
+                (0x21, setup::request::HID_SET_IDLE) => return false,
                 _ => {}
             }
+            true
         }
 
         /// Process the control list: walk the ED's TD chain to its tail, answering
@@ -908,7 +931,7 @@ mod tests {
             ed_bytes.copy_from_slice(self.arena_slice(self.dma_base + ed_offset as u32, 16));
             let mut ed = EndpointDescriptor::decode(&ed_bytes);
             let mut response: Vec<u8> = Vec::new();
-            let mut done: Vec<u32> = Vec::new();
+            let mut refused = false;
             while ed.head != ed.tail {
                 let td_address = ed.head;
                 let mut td_bytes = [0u8; 16];
@@ -919,8 +942,16 @@ mod tests {
                         let mut setup_bytes = [0u8; 8];
                         setup_bytes.copy_from_slice(self.arena_slice(td.current_buffer, 8));
                         let mut answered = Vec::new();
-                        self.answer(setup_bytes, &mut answered);
+                        refused = !self.answer(setup_bytes, &mut answered);
                         response = answered;
+                        td.condition_code = ConditionCode::NoError;
+                    }
+                    TdPid::In | TdPid::Out if refused => {
+                        // The device refuses the request with a protocol STALL of the
+                        // next stage (USB 2.0 §8.5.3.4): retire this TD with the Stall
+                        // condition, halt the ED, stop processing its list.
+                        td.condition_code = ConditionCode::Stall;
+                        ed.halted = true;
                     }
                     TdPid::In => {
                         if td.current_buffer != 0 {
@@ -936,25 +967,116 @@ mod tests {
                                 td.current_buffer + send as u32
                             };
                         }
+                        td.condition_code = ConditionCode::NoError;
                     }
-                    TdPid::Out => {}
+                    TdPid::Out => {
+                        td.condition_code = ConditionCode::NoError;
+                    }
                 }
-                td.condition_code = ConditionCode::NoError;
                 ed.head = td.next & !0xf;
-                // Push on the done queue (newest first).
-                let previous_head = done.first().copied().unwrap_or(0);
-                td.next = previous_head;
+                // Retire onto the internal done accumulator (newest first); the
+                // writeback to HccaDoneHead happens at a frame tick, WDH permitting
+                // (`flush_done`) — the silicon timing, not QEMU's instant one.
+                td.next = self.done_head;
                 let encoded = td.encode();
                 self.arena_slice(td_address, 16).copy_from_slice(&encoded);
-                done.insert(0, td_address);
+                self.done_head = td_address;
+                if ed.halted {
+                    break;
+                }
             }
             let encoded_ed = ed.encode();
             self.arena_slice(self.dma_base + ed_offset as u32, 16)
                 .copy_from_slice(&encoded_ed);
-            if let Some(&newest) = done.first() {
-                let head_offset = (arena::HCCA + hcca::DONE_HEAD) as usize;
-                self.arena[head_offset..head_offset + 4].copy_from_slice(&newest.to_le_bytes());
+        }
+
+        /// One frame tick: advance HcFmNumber, run the periodic schedule, attempt the
+        /// done-queue writeback. Called from register AND dma accesses (the driver's
+        /// polls are its only clock against this mock, as against silicon).
+        fn tick(&mut self) {
+            self.frame_phase += 1;
+            if !self.frame_phase.is_multiple_of(4) {
+                return;
             }
+            self.frame = (self.frame + 1) & 0xffff;
+            self.process_periodic();
+            self.flush_done();
+        }
+
+        /// The periodic schedule, STRICT the way silicon is and QEMU is not: it runs
+        /// only when PeriodicListEnable is set AND HcPeriodicStart is non-zero (a
+        /// zero PeriodicStart means the periodic region of the frame never begins —
+        /// OHCI 1.0a §7.3.4; QEMU's model famously ignores the register, which is
+        /// exactly how a missing write survives the QEMU lane) AND the HCCA pointer
+        /// and the frame's interrupt-table entry are programmed.
+        fn process_periodic(&mut self) {
+            let control = self.register(reg::HC_CONTROL);
+            if control & bits::CONTROL_PLE == 0 {
+                return;
+            }
+            if self.register(reg::HC_PERIODIC_START) == 0 {
+                return; // the strict check: no PeriodicStart, no periodic traffic
+            }
+            let hcca = self.register(reg::HC_HCCA);
+            if hcca == 0 {
+                return;
+            }
+            let entry_offset = (hcca - self.dma_base) as usize
+                + hcca::interrupt_table_entry(u64::from(self.frame)) as usize;
+            let ed_address = u32::from_le_bytes(
+                self.arena[entry_offset..entry_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            if ed_address == 0 {
+                return;
+            }
+            let mut ed_bytes = [0u8; 16];
+            ed_bytes.copy_from_slice(self.arena_slice(ed_address, 16));
+            let mut ed = EndpointDescriptor::decode(&ed_bytes);
+            if ed.skip || ed.halted || ed.head == ed.tail {
+                return;
+            }
+            // The device NAKs when it has nothing to report.
+            let Some(report) = self.pending_reports.pop_front() else {
+                return;
+            };
+            let td_address = ed.head;
+            let mut td_bytes = [0u8; 16];
+            td_bytes.copy_from_slice(self.arena_slice(td_address, 16));
+            let mut td = TransferDescriptor::decode(&td_bytes);
+            let capacity = (td.buffer_end - td.current_buffer + 1) as usize;
+            let send = report.len().min(capacity);
+            let start = td.current_buffer;
+            self.arena_slice(start, send)
+                .copy_from_slice(&report[..send]);
+            td.current_buffer = if send == capacity {
+                0
+            } else {
+                td.current_buffer + send as u32
+            };
+            td.condition_code = ConditionCode::NoError;
+            ed.head = td.next & !0xf;
+            ed.toggle_carry = !ed.toggle_carry;
+            td.next = self.done_head;
+            let encoded = td.encode();
+            self.arena_slice(td_address, 16).copy_from_slice(&encoded);
+            self.done_head = td_address;
+            let encoded_ed = ed.encode();
+            self.arena_slice(ed_address, 16)
+                .copy_from_slice(&encoded_ed);
+        }
+
+        /// HccaDoneHead writeback, gated on WDH exactly as §5.2.9 describes: the HC
+        /// only writes when the driver has acknowledged the previous batch.
+        fn flush_done(&mut self) {
+            if self.wdh || self.done_head == 0 {
+                return;
+            }
+            let head_offset = (arena::HCCA + hcca::DONE_HEAD) as usize;
+            self.arena[head_offset..head_offset + 4].copy_from_slice(&self.done_head.to_le_bytes());
+            self.done_head = 0;
+            self.wdh = true;
         }
     }
 
@@ -965,13 +1087,11 @@ mod tests {
         type Error = NoError;
 
         async fn read32(&mut self, offset: u64) -> Result<u32, NoError> {
+            // Every register access is a tick: the frame counter advances, periodic
+            // processing and the done writeback get their chances — the driver's
+            // polls are its only clock, against this mock as against silicon.
+            self.tick();
             if offset == reg::HC_FM_NUMBER {
-                // The frame counter ticks once per few reads, so frame-counted waits
-                // terminate fast in tests but still exercise the polling shape.
-                self.frame_phase += 1;
-                if self.frame_phase.is_multiple_of(2) {
-                    self.frame = (self.frame + 1) & 0xffff;
-                }
                 return Ok(self.frame);
             }
             Ok(self.register(offset))
@@ -994,7 +1114,11 @@ mod tests {
                     }
                 }
                 reg::HC_INTERRUPT_STATUS => {
-                    // Write-1-to-clear; nothing modelled needs the bits kept.
+                    // Write-1-to-clear: acknowledging WDH re-permits the done-queue
+                    // writeback (§5.2.9).
+                    if value & bits::INT_WDH != 0 {
+                        self.wdh = false;
+                    }
                 }
                 offset if offset == reg::rh_port_status(1) => {
                     let mut status = self.register(offset);
@@ -1025,6 +1149,10 @@ mod tests {
         }
 
         fn dma_read(&mut self, offset: u64, buf: &mut [u8]) {
+            // DMA polls tick the frame too: poll_interrupt never reads HcFmNumber,
+            // so without this the periodic schedule would only run during register
+            // waits — and the round-trip test below could never retire a TD.
+            self.tick();
             let start = offset as usize;
             buf.copy_from_slice(&self.arena[start..start + buf.len()]);
         }
@@ -1138,6 +1266,102 @@ mod tests {
             run(driver.attach(1, &mut config)),
             Err(DriverError::NotConnected)
         );
+    }
+
+    #[test]
+    fn bring_up_programs_periodic_start_and_the_mock_enforces_it() {
+        // The M3-fix hardening (board round: NotAccessed masked the real failure and
+        // pointed suspicion at the periodic plumbing): pin that bring_up programs
+        // HcPeriodicStart, that open_interrupt_in sets PLE, and that the mock is
+        // STRICT — PeriodicStart=0 means NO periodic traffic, so a regression that
+        // QEMU would tolerate fails loudly here.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        let expected = periodic_start(bits::FM_INTERVAL_DEFAULT_FI);
+        assert_eq!(driver.io().register(reg::HC_PERIODIC_START), expected);
+
+        run(driver.open_interrupt_in(1, false, 1, 8, 1)).unwrap();
+        assert_ne!(
+            driver.io().register(reg::HC_CONTROL) & bits::CONTROL_PLE,
+            0,
+            "open_interrupt_in must set PeriodicListEnable"
+        );
+
+        // Sabotage PeriodicStart: the queued report must NOT flow.
+        driver.io().registers.insert(reg::HC_PERIODIC_START, 0);
+        driver.io().pending_reports.push_back(vec![0, 3, 0xfe, 0]);
+        let mut report = [0u8; 8];
+        for _ in 0..200 {
+            assert_eq!(
+                run(driver.poll_interrupt(&mut report)).unwrap(),
+                None,
+                "the strict mock must refuse periodic traffic with PeriodicStart=0"
+            );
+        }
+
+        // Restore the register: the same queued report flows through.
+        driver
+            .io()
+            .registers
+            .insert(reg::HC_PERIODIC_START, expected);
+        let mut received = None;
+        for _ in 0..200 {
+            if let Some(length) = run(driver.poll_interrupt(&mut report)).unwrap() {
+                received = Some(length);
+                break;
+            }
+        }
+        assert_eq!(received, Some(4));
+        assert_eq!(&report[..4], &[0, 3, 0xfe, 0]);
+    }
+
+    #[test]
+    fn interrupt_round_trip_rearms_and_streams() {
+        // The re-arm path (ping-pong TD slots, tail publish) was QEMU-only before
+        // this round: stream two distinct mouse reports through the mock's periodic
+        // schedule and verify both arrive in order through the re-armed endpoint.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.open_interrupt_in(1, false, 1, 8, 1)).unwrap();
+
+        let mut report = [0u8; 8];
+        for (expected, label) in [([0u8, 3, 0xfe, 0], "first"), ([1u8, 0xff, 2, 0], "second")] {
+            driver.io().pending_reports.push_back(expected.to_vec());
+            let mut received = None;
+            for _ in 0..200 {
+                if let Some(length) = run(driver.poll_interrupt(&mut report)).unwrap() {
+                    received = Some(length);
+                    break;
+                }
+            }
+            assert_eq!(received, Some(4), "{label} report must arrive");
+            assert_eq!(&report[..4], &expected, "{label} report content");
+        }
+    }
+
+    #[test]
+    fn a_stalled_set_idle_reports_stall_not_not_accessed() {
+        // The M3 board bug, pinned: the mock device STALLs HID SET_IDLE (optional
+        // for mice, HID 1.11 §7.2.4 — the G500 does exactly this); the driver must
+        // judge the status stage's REAL condition code, not mask the halt as
+        // NotAccessed. This test fails against the pre-fix judge order.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        let result = run(driver.control(0, 8, false, setup::hid_set_idle_indefinite(0), &mut []));
+        assert_eq!(result, Err(DriverError::Stall));
+
+        // And the next transfer on the rebuilt ED works — a protocol stall does not
+        // wedge endpoint zero.
+        let mut data = [0u8; 18];
+        let received = run(driver.control(
+            0,
+            8,
+            false,
+            setup::get_descriptor(setup::descriptor_type::DEVICE, 0, 18),
+            &mut data,
+        ))
+        .unwrap();
+        assert_eq!(received, 18);
     }
 
     #[test]

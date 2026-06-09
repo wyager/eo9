@@ -30,6 +30,15 @@ pub struct RegionDef {
     /// Whether the region has an interrupt line the provider could route (v1 answers
     /// `unsupported` either way; the flag keeps `enumerate` honest).
     pub has_irq: bool,
+    /// Device-aware quiesce, run when the region's claim is released (handle drop or
+    /// task teardown) and BEFORE any of the task's DMA buffers return to the heap.
+    /// A platform device has no bus-master bit to revoke, so containment is per
+    /// device class: the OHCI hook drops the controller to UsbReset (no list
+    /// processing, no SOF, **no HCCA writes** — OHCI 1.0a §6.1.1), closing the
+    /// freed-arena DMA window that PCI closes with its bus-master clear (study 09
+    /// finding 6; the M3 board's idle-reset incident is this window hit live).
+    /// `None` for regions that never master the bus.
+    pub quiesce: Option<fn(usize)>,
 }
 
 /// The machine's region table.
