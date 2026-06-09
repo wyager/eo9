@@ -52,9 +52,57 @@ const FALLBACK_DTB: *const u8 = core::ptr::null();
 pub fn bootargs(dtb: *const u8) -> Option<&'static str> {
     #[cfg(feature = "board-opi5plus")]
     let dtb = shadow_device_fdt(dtb);
-    bootargs_at(dtb)
+    let found = bootargs_at(dtb)
         .or_else(|| bootargs_at(FALLBACK_DTB))
-        .or_else(|| cmdline_at(dtb))
+        .or_else(|| cmdline_at(dtb));
+    // Board profile: the staged-bootargs page fallback (usb-boot-demo-plan.md Part A,
+    // Option 1) — LAST, so a valid x0 device tree always wins (the serial path is
+    // unchanged). Only an x0 that yielded nothing (USB `go`'s junk argc, the kexec
+    // jump's deliberate 0) reaches the page.
+    #[cfg(feature = "board-opi5plus")]
+    let found = found.or_else(staged_bootargs);
+    found
+}
+
+/// Board profile: read the staged-bootargs page at 0x0010_0000 (the
+/// `mmu::BOOTARGS_PAGE` reservation, below the image). Format: one printable-ASCII
+/// command line, terminated by NUL or newline, bounded by the page — the bounded
+/// first-line parse defends against warm-reset DRAM residue (random bytes fail the
+/// printable check; an empty line yields `None`). The page is swept to the point of
+/// coherency first: the writer may have been U-Boot's `fatload` (DMA, already at PoC)
+/// or the previous kernel's cached stores (the kexec dance sweeps too — this is the
+/// reader's matching belt-and-braces half).
+#[cfg(feature = "board-opi5plus")]
+fn staged_bootargs() -> Option<&'static str> {
+    use crate::mmu::{BOOTARGS_PAGE, BOOTARGS_PAGE_LEN};
+    crate::mmu::clean_invalidate_to_poc(BOOTARGS_PAGE, BOOTARGS_PAGE_LEN);
+    let page = BOOTARGS_PAGE as *const u8;
+    let mut len = 0;
+    while len < BOOTARGS_PAGE_LEN {
+        // SAFETY: the page is identity-mapped Normal RAM inside the DRAM window,
+        // reserved below the image (mmu.rs); bounded byte-volatile reads only.
+        let byte = unsafe { core::ptr::read_volatile(page.add(len)) };
+        if byte == 0 || byte == b'\n' {
+            break;
+        }
+        if !(0x20..=0x7e).contains(&byte) {
+            return None;
+        }
+        len += 1;
+    }
+    if len == 0 || len >= BOOTARGS_PAGE_LEN {
+        return None;
+    }
+    // Copy out of the page (it may be rewritten by a later kexec staging) and leak the
+    // copy — the same one-time boot cost as the control-FDT shadow above.
+    let mut copy = alloc::vec::Vec::with_capacity(len);
+    for i in 0..len {
+        // SAFETY: as above; `i < len < BOOTARGS_PAGE_LEN`.
+        copy.push(unsafe { core::ptr::read_volatile(page.add(i)) });
+    }
+    let leaked: &'static [u8] = alloc::boxed::Box::leak(copy.into_boxed_slice());
+    // Printable ASCII (checked above) is valid UTF-8.
+    core::str::from_utf8(leaked).ok()
 }
 
 /// Board profile: if the FDT pointer lands outside the identity-mapped Normal-RAM window

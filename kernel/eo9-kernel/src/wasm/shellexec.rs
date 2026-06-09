@@ -874,8 +874,9 @@ pub(super) fn bind_args(
 /// per-spawn `Store`, not the linker, so reuse shares no authority between spawns.
 static SPAWN_LINKER: KLock<Option<(GrantShape, Arc<Linker<KernelState>>)>> = KLock::new(None);
 
-/// The boot-constant grant bits a cached spawn linker was built under: (pci, platform, gfx).
-type GrantShape = (bool, bool, bool);
+/// The boot-constant grant bits a cached spawn linker was built under:
+/// (pci, platform, gfx, kexec).
+type GrantShape = (bool, bool, bool, bool);
 
 /// The boot's gfx grant (the `gfx` token). Only the Orange Pi 5 Plus board profile has
 /// the gfx.simplefb root provider; everywhere else the bit is constantly `false` and
@@ -891,11 +892,26 @@ fn gfx_granted() -> bool {
     }
 }
 
+/// The boot's kexec grant (the `kexec` token). aarch64 only — the other ports have no
+/// kexec dance yet, so the bit is constantly `false` and the refusal below tells the
+/// capability story.
+fn kexec_granted() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::kexec_provider::granted()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
 fn spawn_linker(engine: &Engine) -> Result<Arc<Linker<KernelState>>, wasmtime::Error> {
     let shape: GrantShape = (
         super::pci_provider::granted(),
         super::platform_provider::granted(),
         gfx_granted(),
+        kexec_granted(),
     );
     if let Some(linker) = SPAWN_LINKER.with(|slot| match slot {
         Some((cached, linker)) if *cached == shape => Some(linker.clone()),
@@ -923,6 +939,12 @@ fn spawn_linker(engine: &Engine) -> Result<Arc<Linker<KernelState>>, wasmtime::E
     #[cfg(feature = "board-opi5plus")]
     if shape.2 {
         super::gfx_provider::add_gfx(&mut linker)?;
+    }
+    // The kexec capability follows the same opt-in rule (the `kexec` token) and is the
+    // strongest of the grants — the holder replaces the running kernel. Never a default.
+    #[cfg(target_arch = "aarch64")]
+    if shape.3 {
+        super::kexec_provider::add_kexec(&mut linker)?;
     }
     let linker = Arc::new(linker);
     SPAWN_LINKER.with(|slot| *slot = Some((shape, linker.clone())));
@@ -2603,6 +2625,8 @@ fn missing_capability(text: &str) -> Option<String> {
          — or `platform=<region>,…` for specific regions — to the kernel command line)"
     } else if text.contains("eo9:gfx/") {
         GFX_REFUSAL
+    } else if text.contains("eo9:kexec/") {
+        KEXEC_REFUSAL
     } else {
         return None;
     };
@@ -2622,3 +2646,14 @@ const GFX_REFUSAL: &str = "a display, which this boot did not grant (add the `gf
 const GFX_REFUSAL: &str = "a display, which this kernel does not provide (gfx.simplefb \
      is the Orange Pi 5 Plus board profile's root provider; compose a provider — \
      `gfx.mem $ draw`)";
+
+/// The `eo9:kexec` arm of [`missing_capability`]: on aarch64 the capability exists and
+/// the story is the missing grant token (deliberately loud about what the grant means);
+/// the other ports have no kexec dance yet.
+#[cfg(target_arch = "aarch64")]
+const KEXEC_REFUSAL: &str = "the kexec capability, which this boot did not grant (the \
+     `kexec` token on the kernel command line provides it — TOTAL AUTHORITY: the holder \
+     can replace the running kernel)";
+#[cfg(not(target_arch = "aarch64"))]
+const KEXEC_REFUSAL: &str = "the kexec capability, which this port does not provide \
+     (the kexec dance exists on aarch64 only)";

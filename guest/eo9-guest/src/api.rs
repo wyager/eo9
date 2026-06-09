@@ -59,3 +59,7 @@ pub mod platform {
 pub mod usb {
     pub use crate::bindings::eo9::usb::{types, usb};
 }
+
+pub mod kexec {
+    pub use crate::bindings::eo9::kexec::{kexec, types};
+}

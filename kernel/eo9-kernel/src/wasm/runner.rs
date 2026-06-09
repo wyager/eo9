@@ -97,6 +97,29 @@ pub fn boot(bootargs: Option<&str>) -> bool {
     super::platform_provider::set_granted_from_tokens(
         tokenize(bootargs).iter().map(String::as_str),
     );
+    // The bare `kexec` token grants the `eo9:kexec` root provider — stage a new kernel
+    // image and jump into it. TOTAL AUTHORITY (the staged image becomes the machine),
+    // so the same never-by-default rule as `pci`, and the loudest of the grants. Ports
+    // without the kexec dance name what is missing instead of silently swallowing the
+    // token.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let granted = tokenize(bootargs).iter().any(|token| token == "kexec");
+        if granted {
+            crate::kprintln!(
+                "kexec: GRANTED for this boot — a program importing eo9:kexec can replace \
+                 the running kernel (total authority; see wit/kexec)"
+            );
+        }
+        super::kexec_provider::set_granted(granted);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    if tokenize(bootargs).iter().any(|token| token == "kexec") {
+        crate::kprintln!(
+            "kexec: this port has no kexec dance yet (aarch64 only); the `kexec` token \
+             is ignored"
+        );
+    }
     // The bare `storedisk` token claims a virtio-blk function for the kernel's own
     // persistent store: a disk-backed cache of on-target compile results (and nothing
     // else); see `diskcache`. Independent of the guest-facing `pci` grant above.
@@ -263,6 +286,12 @@ fn try_run(entry: &StoreEntry, args: &[(String, String)]) -> Result<String, wasm
     #[cfg(feature = "board-opi5plus")]
     if super::gfx_provider::granted() {
         super::gfx_provider::add_gfx(&mut linker)?;
+    }
+    // The kexec root provider follows the same opt-in rule (the `kexec` token; total
+    // authority — never a default grant).
+    #[cfg(target_arch = "aarch64")]
+    if super::kexec_provider::granted() {
+        super::kexec_provider::add_kexec(&mut linker)?;
     }
 
     let mut store = Store::new(&engine, KernelState::new());

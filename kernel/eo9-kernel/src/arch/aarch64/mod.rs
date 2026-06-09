@@ -169,6 +169,13 @@ pub(crate) fn banner() {
     crate::kprintln!("Eo9 kernel — aarch64 (Orange Pi 5 Plus, RK3588)");
     #[cfg(not(feature = "board-opi5plus"))]
     crate::kprintln!("Eo9 kernel — aarch64 (QEMU virt)");
+    // An optional build stamp baked in at compile time (`EO9_BUILD_STAMP=… cargo build`).
+    // Plain builds set nothing and print nothing; `cargo xtask check-kexec` stamps its
+    // second kernel so the gate can tell the kexec'd image apart from the booted one on
+    // the same serial stream.
+    if let Some(stamp) = option_env!("EO9_BUILD_STAMP") {
+        crate::kprintln!("  build stamp: {stamp}");
+    }
     crate::kprintln!("  exception level: EL{}", current_el());
     crate::kprintln!("  counter-timer frequency: {} Hz", timer::frequency());
     // The board profile has no PL031 (rtc.rs: the RK3588's RTC lives on the PMIC, unread

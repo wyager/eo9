@@ -34,6 +34,11 @@ pub mod hello;
 // there) and refuse `eo9:gfx` imports with the capability story.
 #[cfg(all(feature = "wasm-store", feature = "board-opi5plus"))]
 pub mod gfx_provider;
+// The kexec root provider (network kexec): aarch64 only — the dance is aarch64 cache
+// maintenance + a relocation stub. Other ports answer the `kexec` token with the
+// missing-machinery story (runner::boot) until their dance exists.
+#[cfg(all(feature = "wasm-store", target_arch = "aarch64"))]
+pub mod kexec_provider;
 #[cfg(feature = "wasm-store")]
 pub mod pci_provider;
 #[cfg(feature = "wasm-store")]

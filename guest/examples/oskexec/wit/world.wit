@@ -1,0 +1,75 @@
+// oskexec — receive a new Eo9 image over TCP and kexec into it (the network flash
+// path: board iteration at ethernet speed; the serial loader demotes to recovery).
+//
+// An ordinary Eo9 program: it holds text (narration to the machine console), one
+// transport capability (eo9:net/l4 — composed, e.g. `net.virtio $ net.l4.over-l2 $
+// oskexec` on QEMU, `net.rtl8125 $ (net.l4.over-l2 --address …) $ oskexec` on the
+// board), and eo9:kexec (the kernel root, linked only when the boot carried the
+// `kexec` token — TOTAL AUTHORITY, see wit/kexec).
+//
+// Wire protocol (the serial-loader framing plus an authentication frame; the host
+// side is boards/opi5-serial-loader/tools/send_image.py --tcp):
+//
+//   "EO9L"                       magic (4 bytes)
+//   <H secret-len> <secret>      preshared secret (little-endian u16 length + bytes)
+//   --> 'A'                      authenticated (or 'E' + close: refused)
+//   <Q load-addr> <Q len> <Q x0> header — load-addr/x0 are carried for framing parity
+//                                with the serial wire but IGNORED here (the kernel's
+//                                kexec dance owns the addresses); len is enforced
+//   <payload>                    len bytes, streamed to kexec.stage()
+//   <-- 'k'                      per full 64 KiB received (progress)
+//   <I crc32>                    CRC-32 (IEEE) of the payload
+//   --> 'K'                      crc verified guest-side  (or 'E': mismatch, refused)
+//   <-- 'G'                      host go-ahead (confirms 'K' arrived; only then commit)
+//
+// SECURITY: the `kexec` boot token gates WHICH programs may reach the kernel's
+// stage/commit; this program gates WHICH NETWORK PEER may drive it, with a mandatory
+// preshared secret (>= 16 bytes, full-length compare, one retry then exit). It is a
+// ONE-SHOT service: it serves exactly one successful flash (or two failed
+// authentications) and exits — the listener is open only for the seconds an operator
+// is actively flashing, never resident. RESIDUAL RISK, stated loudly: the secret
+// travels CLEARTEXT on the LAN (the telnet posture, but with a gate because the
+// authority is total) — a passive sniffer who also wins the race within the one-shot
+// window could replay it. Trusted-LAN/bench tool only. The upgrade path is a
+// challenge-response handshake (needs a real hash in the guest world); recorded as a
+// follow-up, deliberately not hand-rolled here.
+package eo9-examples:oskexec@0.1.0;
+
+/// Serves exactly one image flash over TCP, then commits (never returns) or exits.
+///
+///   net.virtio $ net.l4.over-l2 $ oskexec --secret <16+ bytes> --bootargs "pci"
+///   net.rtl8125 $ (net.l4.over-l2 --address …) $ oskexec --port 9909
+///       --secret <16+ bytes> --bootargs "pci platform console-sink"
+world oskexec {
+    import eo9:text/text@0.1.0;
+    import eo9:net/l4@0.1.0;
+    import eo9:kexec/kexec@0.1.0;
+
+    variant program-success {
+        /// Unreachable in practice: a verified commit never returns (the staged image
+        /// becomes the machine). Present so the world has an honest success shape.
+        committed(string),
+    }
+
+    variant program-failure {
+        /// An argument was unusable (e.g. a secret shorter than 16 bytes).
+        bad-arguments(string),
+        /// The transport capability refused (e.g. composed over net.l2.deny).
+        denied,
+        /// A transport operation failed, carrying the l4 API's own error.
+        net(string),
+        /// The peer broke the framing (bad magic, short header, oversize image,
+        /// failed authentication after the one retry).
+        protocol(string),
+        /// The image was refused — guest-side CRC mismatch, or the kernel's typed
+        /// kexec error. The running system is untouched.
+        refused(string),
+    }
+
+    /// `port`: TCP listen port (default 9909). `secret`: the preshared authentication
+    /// secret (>= 16 bytes; the operator passes the same value to send_image.py
+    /// --tcp). `bootargs`: the command line handed to the new kernel via the staged
+    /// bootargs page.
+    export main: async func(port: option<u16>, secret: string, bootargs: string)
+        -> result<program-success, program-failure>;
+}

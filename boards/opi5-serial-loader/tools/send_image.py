@@ -1,13 +1,31 @@
 #!/usr/bin/env python3
-"""Send a kernel image to the serial-loader stub and watch it boot.
+"""Send a kernel image to the serial-loader stub (UART) or to oskexec (TCP kexec).
 
     python3 send_image.py kernel/target/eo9-opi5plus-min.img \
         --load-addr 0x00200000 --x0 0xeb9f6c38
 
-Protocol (must match src/lib.rs, pinned by --selftest):
+    python3 send_image.py kernel/target/eo9-opi5plus-min.img \
+        --tcp 10.20.3.70:9909 --secret "$EO9_KEXEC_SECRET"
+
+Serial protocol (must match src/lib.rs, pinned by --selftest):
   "EO9L" + <Q load_addr> + <Q length> + <Q x0_value> + payload + <I crc32(payload)>
 The stub answers 'k' per 64 KiB (progress), then 'K' (verified, jumping) or 'E'
 (CRC mismatch — it re-arms, just re-run) or 'T' (3 s stall — re-run).
+
+TCP protocol (must match guest/examples/oskexec — the serial framing plus an
+authentication frame and a commit go-ahead):
+  "EO9L" + <H len(secret)> + secret        -> 'A' (authenticated) or 'E' (refused)
+  <Q load_addr> + <Q length> + <Q x0>      (load_addr/x0 carried for parity, ignored)
+  payload                                  <- 'k' per 64 KiB
+  <I crc32(payload)>                       -> 'K' (verified) or 'E' (mismatch)
+  "G"                                      go-ahead: only after our 'K' arrived does
+                                           oskexec commit (so the verdict can't be
+                                           lost when the machine jumps)
+The secret comes from --secret or the EO9_KEXEC_SECRET environment variable (the env
+form keeps it out of bench command lines); >= 16 bytes, REQUIRED for --tcp. It travels
+CLEARTEXT — trusted-LAN/bench tool only (see guest/examples/oskexec/wit/world.wit).
+After 'G' the connection simply dies with the old kernel; the new kernel's banner
+appears on the board's serial console (the planner's console, not this script).
 
 Why streaming is safe AND fast: the stub services one byte in well under 1 µs (a
 couple of MMIO polls) against the line's 6.7 µs/byte at 1.5 Mbaud, so the UART's
@@ -126,13 +144,171 @@ def console(s, tail_seconds: float) -> None:
         print("\n--- detached ---")
 
 
+def tcp_recv_scan(sock, seen: int, block: bool) -> tuple[int, bytes]:
+    """Read whatever the socket has (one bounded recv); count 'k's, return any verdict."""
+    import socket as socketlib
+
+    try:
+        sock.settimeout(0.05 if block else 0.0)
+        data = sock.recv(4096)
+    except (BlockingIOError, socketlib.timeout, TimeoutError):
+        return seen, b""
+    if not data:
+        print("\nconnection closed by oskexec mid-transfer — re-run", file=sys.stderr)
+        sys.exit(1)
+    return scan_stub_bytes(data, seen)
+
+
+def tcp_wait_byte(sock, wanted: bytes, deadline_seconds: float, what: str) -> bytes:
+    """Block until one byte of `wanted` arrives (other bytes are protocol errors)."""
+    import socket as socketlib
+
+    deadline = time.time() + deadline_seconds
+    while time.time() < deadline:
+        try:
+            sock.settimeout(0.2)
+            data = sock.recv(1)
+        except (socketlib.timeout, TimeoutError):
+            continue
+        if not data:
+            print(f"\nconnection closed waiting for {what}", file=sys.stderr)
+            sys.exit(1)
+        if data in wanted:
+            return data
+        print(f"\nunexpected byte {data!r} waiting for {what}", file=sys.stderr)
+        sys.exit(1)
+    print(f"\ntimed out waiting for {what}", file=sys.stderr)
+    sys.exit(1)
+
+
+def tcp_send(args, payload: bytes, crc: int) -> None:
+    """The --tcp transport: authenticate, stream, verify, send the go-ahead."""
+    import socket
+
+    host, _, port_text = args.tcp.rpartition(":")
+    if not host or not port_text.isdigit():
+        print(f"--tcp expects host:port (got {args.tcp!r})", file=sys.stderr)
+        sys.exit(2)
+    secret = (args.secret or "").encode()
+    if len(secret) < 16:
+        print(
+            "--tcp needs a preshared secret of >= 16 bytes (--secret or the "
+            "EO9_KEXEC_SECRET environment variable)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    print(
+        f"{args.image}: {len(payload)} bytes -> tcp {host}:{port_text} "
+        f"(kexec), crc {crc:08x}"
+    )
+    sock = socket.create_connection((host, int(port_text)), timeout=30)
+    try:
+        sock.sendall(MAGIC + struct.pack("<H", len(secret)) + secret)
+        verdict = tcp_wait_byte(sock, b"AE", 30, "the authentication verdict")
+        if verdict == b"E":
+            print("oskexec refused the secret — re-run (it allows ONE retry, then exits)",
+                  file=sys.stderr)
+            sys.exit(1)
+        sock.sendall(struct.pack("<QQQ", args.load_addr, len(payload), args.x0))
+
+        acks, start, last_paint = 0, time.time(), 0.0
+        last_progress = time.time()
+
+        def note_progress(before: int, now: int) -> None:
+            nonlocal last_progress
+            if now != before:
+                last_progress = time.time()
+
+        def check_stall(sent: int) -> None:
+            # Same wall-clock alarm as the serial path: at least one ack overdue and
+            # nothing heard for the window means the guest is gone (or the host slept).
+            if (
+                sent - acks * ACK_INTERVAL >= ACK_INTERVAL
+                and time.time() - last_progress > ACK_STALL_SECONDS
+            ):
+                print(
+                    f"\nno ack progress for {ACK_STALL_SECONDS:g}s mid-transfer "
+                    f"(acked {acks * ACK_INTERVAL}/{len(payload)}) — oskexec gone? re-run",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+        term = b""
+        for off in range(0, len(payload), CHUNK):
+            sock.sendall(payload[off : off + CHUNK])
+            sent = min(off + CHUNK, len(payload))
+            before = acks
+            acks, term = tcp_recv_scan(sock, acks, block=False)
+            note_progress(before, acks)
+            check_stall(sent)
+            while not term and sent - acks * ACK_INTERVAL > WINDOW:
+                before = acks
+                acks, term = tcp_recv_scan(sock, acks, block=True)
+                note_progress(before, acks)
+                check_stall(sent)
+            if term:
+                print(f"\noskexec answered {term.decode()!r} mid-transfer", file=sys.stderr)
+                sys.exit(1)
+            now = time.time()
+            if now - last_paint >= 0.5 or sent == len(payload):
+                done = acks * ACK_INTERVAL
+                sys.stdout.write(
+                    f"\racked {done}/{len(payload)} bytes "
+                    f"({100 * done / len(payload):.0f}%) {now - start:.0f}s"
+                )
+                sys.stdout.flush()
+                last_paint = now
+        sock.sendall(struct.pack("<I", crc))
+
+        # Drain the remaining acks + the verdict (generous: staging + CRC guest-side).
+        deadline = time.time() + 120 + len(payload) / 1_000_000
+        verdict = b""
+        while time.time() < deadline:
+            acks, term = tcp_recv_scan(sock, acks, block=True)
+            if term:
+                verdict = term
+                break
+        print()
+        if verdict == b"K":
+            sock.sendall(b"G")
+            print(
+                f"K: verified ({acks} acks) — go-ahead sent; oskexec is committing. "
+                "Watch the board/QEMU serial console for the new kernel's banner."
+            )
+        elif verdict == b"E":
+            print("E: oskexec refused (crc/stage) — system untouched; re-run", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print("no verdict (timeout) — check oskexec is still running; re-run",
+                  file=sys.stderr)
+            sys.exit(1)
+    finally:
+        sock.close()
+
+
 def main() -> None:
+    import os
+
     ap = argparse.ArgumentParser()
     ap.add_argument("image", nargs="?")
     ap.add_argument("--load-addr", type=lambda v: int(v, 0), default=0x0020_0000)
     ap.add_argument("--x0", type=lambda v: int(v, 0), default=0)
     ap.add_argument("--port", default=PORT)
     ap.add_argument("--baud", type=int, default=BAUD)
+    ap.add_argument(
+        "--tcp",
+        default=None,
+        metavar="HOST:PORT",
+        help="send over TCP to a listening oskexec (network kexec) instead of the "
+        "serial stub; requires --secret / EO9_KEXEC_SECRET",
+    )
+    ap.add_argument(
+        "--secret",
+        default=os.environ.get("EO9_KEXEC_SECRET"),
+        help="preshared secret for --tcp (>= 16 bytes; defaults to EO9_KEXEC_SECRET "
+        "so bench scripts keep it out of command lines)",
+    )
     ap.add_argument("--no-console", action="store_true")
     ap.add_argument(
         "--tail-seconds",
@@ -168,10 +344,15 @@ def main() -> None:
 
         sys.stdout = _Tee(sys.stdout, logf)
 
-    import serial
-
     payload = open(args.image, "rb").read()
     crc = binascii.crc32(payload) & 0xFFFFFFFF
+
+    if args.tcp:
+        tcp_send(args, payload, crc)
+        return
+
+    import serial
+
     expected_acks = len(payload) // ACK_INTERVAL
     print(
         f"{args.image}: {len(payload)} bytes -> 0x{args.load_addr:08x}, "
