@@ -867,11 +867,11 @@ impl<B: Backend> Session<B> {
         // backend otherwise (caching what it hands back).
         let Session { backend, cache, .. } = self;
         let mut resolved: Option<(B::Component, Option<Vec<u8>>)> = None;
-        if let Some(bytes) = cache.bytes.get(name) {
-            if let Ok(component) = backend.load(bytes) {
-                let bytes = bytes.to_vec();
-                resolved = Some((component, Some(bytes)));
-            }
+        if let Some(bytes) = cache.bytes.get(name)
+            && let Ok(component) = backend.load(bytes)
+        {
+            let bytes = bytes.to_vec();
+            resolved = Some((component, Some(bytes)));
         }
         let (component, bytes) = match resolved {
             Some(resolved) => resolved,
