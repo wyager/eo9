@@ -560,6 +560,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "eosh-core"
+version = "0.0.0"
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2406,6 +2410,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "eo9-component",
+ "eosh-core",
  "wasmtime",
  "wat",
 ]

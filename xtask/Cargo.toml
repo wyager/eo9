@@ -14,6 +14,11 @@ publish.workspace = true
 [dependencies]
 blake3 = { workspace = true }
 eo9-component = { path = "../crates/eo9-component" }
+# The eo9-manual section scanner/parser (a dependency-free no_std library from the
+# guest workspace): componentize-time validation runs the SAME code the eosh `man`
+# builtin runs, so the build gate and the on-target reader cannot drift
+# (docs/design/component-manuals.md, workaround 5 — one parser, two consumers).
+eosh-core = { path = "../guest/eosh/eosh-core" }
 wasmtime = { workspace = true, features = ["cranelift", "component-model"] }
 wat = { workspace = true }
 

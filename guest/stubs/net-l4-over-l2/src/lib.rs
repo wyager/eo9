@@ -82,6 +82,40 @@ wit_bindgen::generate!({
     generate_all,
 });
 
+// The user-facing manual, embedded as the `eo9-manual` custom section and rendered by
+// `man net.l4.over-l2` in eosh (docs/design/component-manuals.md).
+eo9_guest::manual! {
+    name: "net.l4.over-l2",
+    synopsis: "TCP and UDP over any link-layer provider — the TCP/IP stack as middleware",
+    description: [
+        "A whole TCP/IP stack (Ethernet + IPv4 + TCP + UDP) as ordinary provider middleware: compose it",
+        "over a link-layer provider and a program that speaks only transport sockets gets working TCP",
+        "and UDP. Unconfigured, it binds QEMU user networking's layout — 10.0.2.15/24, gateway 10.0.2.2 —",
+        "lazily on first use, so plain composition always works. With --address dhcp it leases address,",
+        "prefix, and gateway from the network on first use and announces the lease in one console line;",
+        "on a real LAN that line is where to reach the stack. No lease within the bounded window is a",
+        "typed error, never a hang.",
+    ],
+    args: [
+        { name: "address", ty: "string", required,
+          doc: "`dhcp` to lease addressing from the network on first use, or a static dotted quad",
+          values: "dhcp" },
+        { name: "prefix-length", ty: "u8", optional,
+          doc: "subnet prefix length for a static address (default 24)" },
+        { name: "gateway", ty: "string", optional,
+          doc: "IPv4 gateway for a static address, dotted quad" },
+    ],
+    examples: [
+        { line: "net.virtio $ net.l4.over-l2 $ l4check",
+          doc: "QEMU: the default user-net addressing, no configuration" },
+        { line: "net.virtio $ (net.l4.over-l2 --address dhcp) $ l4check",
+          doc: "lease addressing from the network's DHCP service" },
+        { line: "net.rtl8125 $ (net.l4.over-l2 --address 10.20.3.70 --gateway 10.20.3.1) $ l4check",
+          doc: "the board: static LAN addressing over the real NIC" },
+    ],
+    see_also: "net.virtio, net.rtl8125, l4check, telnetd",
+}
+
 use eo9::entropy::entropy;
 use eo9::net::l2;
 use eo9::text::text;
