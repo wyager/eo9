@@ -12,6 +12,12 @@ use core::panic::PanicInfo;
 
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
+    // A panic can fire inside a serial-only print window (the watchdog heartbeat mutes
+    // the fbcon tee around its `hb` line, and nothing on that path would ever unmute).
+    // Serial-only is the window's property, never the panic's: clear the mute first so
+    // the report below also reaches the HDMI console.
+    #[cfg(feature = "board-opi5plus")]
+    crate::fbcon::set_tee_mute(false);
     crate::kprintln!();
     crate::kprintln!("KERNEL PANIC: {info}");
     #[cfg(feature = "board-opi5plus")]
