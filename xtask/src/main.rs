@@ -3975,7 +3975,11 @@ fn check_repl(root: &Path) -> Result<(), String> {
         //    — the editor lists the candidates on their own line and repaints.
         send_bytes(&mut stdin, b"hel\t")?;
         wait_for(&receiver, "hello  help", "the TAB candidate list")?;
-        wait_for(&receiver, "eosh> hel", "the prompt+line repaint after the list")?;
+        wait_for(
+            &receiver,
+            "eosh> hel",
+            "the prompt+line repaint after the list",
+        )?;
 
         // 2. Finish the word and execute through the editor: the line runs through
         //    the same execute_line as every other path.
@@ -3996,10 +4000,18 @@ fn check_repl(root: &Path) -> Result<(), String> {
         // 4. The inadmissible-input marker: `help` takes no arguments, so the `x`
         //    after `help ` has no viable parse — SGR 31 opens exactly before its echo.
         send_bytes(&mut stdin, b"help x")?;
-        wait_for(&receiver, "\u{1b}[31mx", "the SGR 31 marker on the dead char")?;
+        wait_for(
+            &receiver,
+            "\u{1b}[31mx",
+            "the SGR 31 marker on the dead char",
+        )?;
         //    Backspace rewinds to the red boundary: erase + SGR 0.
         send_bytes(&mut stdin, &[0x7f])?;
-        wait_for(&receiver, "\u{8} \u{8}\u{1b}[0m", "the SGR 0 reset on rewind")?;
+        wait_for(
+            &receiver,
+            "\u{8} \u{8}\u{1b}[0m",
+            "the SGR 0 reset on rewind",
+        )?;
         //    The surviving `help ` (one more backspace tidies the space) executes.
         send_bytes(&mut stdin, &[0x7f, b'\r'])?;
         wait_for(&receiver, "builtins:", "the help text")?;
@@ -4009,7 +4021,11 @@ fn check_repl(root: &Path) -> Result<(), String> {
         send_bytes(&mut stdin, &[0x1b, b'[', b'A'])?;
         wait_for(&receiver, "help", "the recalled line")?;
         send_bytes(&mut stdin, &[0x03])?;
-        wait_for(&receiver, "eosh> ", "the prompt after cancelling the recall")?;
+        wait_for(
+            &receiver,
+            "eosh> ",
+            "the prompt after cancelling the recall",
+        )?;
 
         send_bytes(&mut stdin, b"exit\r")?;
         Ok(())
