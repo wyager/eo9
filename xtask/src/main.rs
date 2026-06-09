@@ -5113,6 +5113,14 @@ fn check_kexec(root: &Path) -> Result<(), String> {
             "\n----- check-kexec: kernel A's last words (quiesce + jump) -----\n{}",
             tail(&jumping, 900)
         );
+        // …its full quiesce dance — the PCI walk AND the platform-region walk (the
+        // USB lane's OHCI hooks; 0 on QEMU where no region carries a hook, 2 on the
+        // board — what is assertable here is that the walk runs, in order, without
+        // error, between the jump announcement and the staged copy)…
+        wait_for(
+            "kexec: quiesced 0 platform region(s)",
+            "the platform-region quiesce walk before the staged copy",
+        )?;
         // …then kernel B's stamped banner…
         let banner = wait_for(
             &format!("build stamp: {KEXEC_B_STAMP}"),

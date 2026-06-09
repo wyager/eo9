@@ -135,6 +135,24 @@ fn release_claim(name: &'static str) {
     CLAIMED.with(|claimed| claimed.retain(|&existing| existing != name));
 }
 
+/// Machine-wide platform quiesce: run EVERY region's quiesce hook, claimed or not —
+/// the platform half of the kexec pre-jump dance (kexec_provider::commit_impl), with
+/// the same posture as its PCI walk (which clears bus mastering on every function,
+/// not just claimed ones): the staged copy must not race any device DMA, hooks are
+/// idempotent one-register writes, and an unclaimed-but-somehow-armed controller
+/// costs nothing extra to silence. Returns how many hooks ran (the QEMU table has
+/// none; the board's two OHCIs make it 2).
+pub fn quiesce_all_regions() -> usize {
+    let mut ran = 0;
+    for region in crate::platform::regions() {
+        if let Some(quiesce) = region.quiesce {
+            quiesce(region.base);
+            ran += 1;
+        }
+    }
+    ran
+}
+
 // -----------------------------------------------------------------------------------------
 // Host resource representations and per-store state
 // -----------------------------------------------------------------------------------------
