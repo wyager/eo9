@@ -911,7 +911,7 @@ fn spawn_linker(engine: &Engine) -> Result<Arc<Linker<KernelState>>, wasmtime::E
         super::pci_provider::granted(),
         super::platform_provider::granted(),
         gfx_granted(),
-kexec_granted(),
+        kexec_granted(),
         super::console_sink_provider::granted(),
     );
     if let Some(linker) = SPAWN_LINKER.with(|slot| match slot {
@@ -941,7 +941,7 @@ kexec_granted(),
     if shape.2 {
         super::gfx_provider::add_gfx(&mut linker)?;
     }
-// The kexec capability follows the same opt-in rule (the `kexec` token) and is the
+    // The kexec capability follows the same opt-in rule (the `kexec` token) and is the
     // strongest of the grants — the holder replaces the running kernel. Never a default.
     #[cfg(target_arch = "aarch64")]
     if shape.3 {
