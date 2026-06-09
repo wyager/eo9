@@ -210,11 +210,20 @@ pub fn beacon_raw(c: u8) {
 }
 
 /// Write one byte, spinning while the transmitter is busy.
+///
+/// This is the console TX chokepoint — every `kprintln!`/`kprint!`, shell echo, boot
+/// beacon and panic report funnels through here — so the board profile's fbcon tee
+/// hangs off it: after the byte is handed to the UART it is also fed to the HDMI
+/// console when fbcon is active (one relaxed load when it is not; nothing at all on
+/// non-board builds). Serial first: the transcript is the bench instrument, fbcon is
+/// the tee.
 pub fn put_byte(byte: u8) {
     while hw::tx_busy() {
         core::hint::spin_loop();
     }
     hw::tx_write(byte);
+    #[cfg(feature = "board-opi5plus")]
+    crate::fbcon::tee_byte(byte);
 }
 
 /// Read one received byte if one is waiting (non-blocking; QEMU feeds the RX FIFO from

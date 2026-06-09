@@ -81,14 +81,26 @@ pub fn boot(bootargs: Option<&str>) -> bool {
     // firmware framebuffer) for this boot — the same grammar and never-by-default rule
     // as `pci`; raw physical scanout memory is an operator grant, not a default. On
     // kernels without the board framebuffer the token names what is missing instead of
-    // being silently swallowed.
+    // being silently swallowed. `gfx` is mutually exclusive with the `fbcon` console
+    // tee — one owner of the scanout per boot — so both tokens together withhold the
+    // grant here (kmain prints the loud refusal and keeps fbcon off too).
     #[cfg(feature = "board-opi5plus")]
-    super::gfx_provider::set_granted(tokenize(bootargs).iter().any(|token| token == "gfx"));
+    super::gfx_provider::set_granted(
+        tokenize(bootargs).iter().any(|token| token == "gfx")
+            && !tokenize(bootargs).iter().any(|token| token == "fbcon"),
+    );
     #[cfg(not(feature = "board-opi5plus"))]
     if tokenize(bootargs).iter().any(|token| token == "gfx") {
         crate::kprintln!(
             "gfx: this kernel has no display root provider (gfx.simplefb is the Orange Pi \
              5 Plus board profile's); the `gfx` token is ignored — compose `gfx.mem $ …` instead"
+        );
+    }
+    #[cfg(not(feature = "board-opi5plus"))]
+    if tokenize(bootargs).iter().any(|token| token == "fbcon") {
+        crate::kprintln!(
+            "fbcon: this kernel has no board framebuffer (the console tee is the Orange Pi \
+             5 Plus board profile's); the `fbcon` token is ignored"
         );
     }
     // The `platform` token is the same idea for memory-mapped (non-PCI) devices —

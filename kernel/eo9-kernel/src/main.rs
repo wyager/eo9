@@ -49,6 +49,11 @@ mod fdt;
 // consumers are (the board profile's probe and gfx.simplefb provider).
 #[cfg(any(test, feature = "board-opi5plus"))]
 mod gfxfb;
+// The fbcon console tee (the `fbcon` boot token): a host-tested 100×30 blitter core
+// over the board framebuffer plus, on the board profile only, the per-byte tee at the
+// console TX chokepoint (uart.rs `put_byte`). Non-board kernels compile none of it.
+#[cfg(any(test, feature = "board-opi5plus"))]
+mod fbcon;
 #[cfg(target_os = "none")]
 mod heap;
 // aarch64 always (UART/GIC/RTC route through it); other arches only alongside the
@@ -169,6 +174,29 @@ extern "C" fn kmain(dtb: *const u8) -> ! {
         .unwrap_or(false)
     {
         simplefb::probe();
+    }
+    // Board profile: the `fbcon` boot token tees every console byte onto the firmware
+    // framebuffer from here on (the demo's HDMI console — docs/board/usb-boot-demo-plan.md
+    // Part B). Mutually exclusive with the `gfx` guest grant: the scanout has one owner
+    // per boot, so both tokens together refuse loudly and enable neither (runner.rs
+    // withholds the gfx grant under the same rule).
+    #[cfg(all(target_arch = "aarch64", feature = "board-opi5plus"))]
+    {
+        let has_token = |wanted: &str| {
+            bootargs
+                .map(|args| args.split_ascii_whitespace().any(|token| token == wanted))
+                .unwrap_or(false)
+        };
+        if has_token("fbcon") {
+            if has_token("gfx") {
+                kprintln!(
+                    "fbcon: REFUSED - `fbcon` and `gfx` both claim the scanout (one owner \
+                     per boot); neither is enabled"
+                );
+            } else {
+                fbcon::activate();
+            }
+        }
     }
     #[cfg(feature = "wasm-store")]
     let handled = wasm::runner::boot(bootargs);
