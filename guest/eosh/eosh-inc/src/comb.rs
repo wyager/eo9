@@ -648,13 +648,17 @@ impl IncParse<()> for Kw {
     }
 
     fn completions(&self, out: &mut Vec<Completion>) {
-        if self.pos < self.word.len() {
-            out.push(Completion {
-                word: String::from(self.word),
-                matched: self.pos,
-                tag: self.tag,
-            });
-        }
+        // A COMPLETE keyword still reports itself (matched == len, nothing left to
+        // type), like [`Words`] does: the editor's name-marking oracle reads "some
+        // name-tagged completion is alive" as "this word still names something", and
+        // a fully typed `help` must stay green. TAB on it just appends the space.
+        out.push(Completion {
+            word: String::from(self.word),
+            matched: self.pos,
+            tag: self.tag,
+            desc: None,
+            glue: false,
+        });
     }
 
     fn clone_box(&self) -> BoxP<()> {
@@ -671,23 +675,47 @@ pub fn kw(word: &'static str, tag: Tag) -> BoxP<()> {
 // Words — the runtime vocabulary primitive
 // ---------------------------------------------------------------------------
 
+/// One vocabulary entry for [`Words`]: the word, its menu tag, and the optional
+/// candidate-list annotations (M3 — see [`Completion`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HintEntry {
+    pub word: String,
+    pub tag: Tag,
+    pub desc: Option<String>,
+    pub glue: bool,
+}
+
+impl HintEntry {
+    pub fn plain(word: String, tag: Tag) -> Self {
+        HintEntry {
+            word,
+            tag,
+            desc: None,
+            glue: false,
+        }
+    }
+}
+
 /// A set of tagged vocabulary words (builtins ∪ session bindings ∪ /bin listing,
-/// snapshotted per prompt), matched like [`Kw`]: an alive entry completes only at a
-/// word boundary, mirroring the lexer's maximal munch (`time` does not finish inside
-/// `time.frozen`). This is the completion source for name positions.
+/// snapshotted per prompt; M3 adds flag-name and value-hint sets), matched like
+/// [`Kw`]: an alive entry completes only at a word boundary, mirroring the lexer's
+/// maximal munch (`time` does not finish inside `time.frozen`). This is the
+/// completion source for name positions.
 ///
 /// Construction drops entries that are not lexable as one plain word — bytes outside
 /// the word set, a leading `[`/`{` (the lexer reads those as compound literals), a
 /// leading `--` (a flag token) — because matching them here would diverge from the
-/// real lexer.
+/// real lexer. The filter is also the M3 soundness backstop: every surviving entry's
+/// language is a subset of the free bare word's, so adding a `Words` branch to an
+/// alternation never changes what is admissible — only what completes.
 pub struct Words {
-    vocab: Rc<Vec<(String, Tag)>>,
+    vocab: Rc<Vec<HintEntry>>,
     alive: Vec<u32>,
     pos: usize,
 }
 
 impl Words {
-    fn entry_is_word(entry: &str) -> bool {
+    pub fn entry_is_word(entry: &str) -> bool {
         !entry.is_empty()
             && entry.bytes().all(is_word_byte)
             && !entry.starts_with('[')
@@ -701,7 +729,7 @@ impl IncParse<()> for Words {
         let complete = |pos: usize| {
             self.alive
                 .iter()
-                .any(|&i| self.vocab[i as usize].0.len() == pos)
+                .any(|&i| self.vocab[i as usize].word.len() == pos)
         };
         match input {
             Input::Eof => {
@@ -730,7 +758,9 @@ impl IncParse<()> for Words {
                         .alive
                         .iter()
                         .copied()
-                        .filter(|&i| self.vocab[i as usize].0.as_bytes().get(self.pos) == Some(&b))
+                        .filter(|&i| {
+                            self.vocab[i as usize].word.as_bytes().get(self.pos) == Some(&b)
+                        })
                         .collect();
                     if alive.is_empty() {
                         None
@@ -750,7 +780,7 @@ impl IncParse<()> for Words {
         let mut charset = Charset::empty();
         let mut any_complete = false;
         for &i in &self.alive {
-            let entry = self.vocab[i as usize].0.as_bytes();
+            let entry = self.vocab[i as usize].word.as_bytes();
             match entry.get(self.pos) {
                 Some(&b) => charset.add(b),
                 None => any_complete = true,
@@ -761,11 +791,13 @@ impl IncParse<()> for Words {
 
     fn completions(&self, out: &mut Vec<Completion>) {
         for &i in &self.alive {
-            let (word, tag) = &self.vocab[i as usize];
+            let entry = &self.vocab[i as usize];
             out.push(Completion {
-                word: word.clone(),
+                word: entry.word.clone(),
                 matched: self.pos,
-                tag: *tag,
+                tag: entry.tag,
+                desc: entry.desc.clone(),
+                glue: entry.glue,
             });
         }
     }
@@ -781,11 +813,11 @@ impl IncParse<()> for Words {
 
 /// The vocabulary parser over a shared entry list (see [`Words`]). Entries that are
 /// not single plain words are skipped.
-pub fn words(vocab: Rc<Vec<(String, Tag)>>) -> BoxP<()> {
+pub fn hint_words(vocab: Rc<Vec<HintEntry>>) -> BoxP<()> {
     let alive: Vec<u32> = vocab
         .iter()
         .enumerate()
-        .filter(|(_, (entry, _))| Words::entry_is_word(entry))
+        .filter(|(_, entry)| Words::entry_is_word(&entry.word))
         .map(|(i, _)| i as u32)
         .collect();
     Box::new(Words {
@@ -793,6 +825,15 @@ pub fn words(vocab: Rc<Vec<(String, Tag)>>) -> BoxP<()> {
         alive,
         pos: 0,
     })
+}
+
+/// [`hint_words`] over plain `(word, tag)` pairs (no descriptions, no glue).
+pub fn words(vocab: Rc<Vec<(String, Tag)>>) -> BoxP<()> {
+    let entries: Vec<HintEntry> = vocab
+        .iter()
+        .map(|(word, tag)| HintEntry::plain(word.clone(), *tag))
+        .collect();
+    hint_words(Rc::new(entries))
 }
 
 // ---------------------------------------------------------------------------
@@ -821,6 +862,17 @@ pub struct Word {
     excl_alive: u32,
 }
 
+/// What one word byte does to a [`Word`] state (shared between the plain and the
+/// capturing wrappers).
+enum WordStep {
+    /// A boundary byte (or Eof) and the word is complete: finish, hand the input back.
+    Finish,
+    /// No parse continues through this byte.
+    Fail,
+    /// The byte extends the word.
+    Advance(Word),
+}
+
 impl Word {
     fn finishable(&self) -> bool {
         self.len > 0
@@ -830,31 +882,31 @@ impl Word {
                 .enumerate()
                 .any(|(i, word)| self.excl_alive & (1 << i) != 0 && word.len() == self.len)
     }
-}
 
-impl IncParse<()> for Word {
-    fn step(&self, input: Input) -> Option<Step<()>> {
+    fn step_core(&self, input: Input) -> WordStep {
         let byte = match input {
             Input::Eof => {
-                return self.finishable().then_some(Step::Done {
-                    value: (),
-                    rejected: input,
-                });
+                return if self.finishable() {
+                    WordStep::Finish
+                } else {
+                    WordStep::Fail
+                };
             }
             Input::Byte(byte) => byte.get(),
         };
         if is_boundary_byte(byte) {
-            return self.finishable().then_some(Step::Done {
-                value: (),
-                rejected: input,
-            });
+            return if self.finishable() {
+                WordStep::Finish
+            } else {
+                WordStep::Fail
+            };
         }
         if self.bare {
             if self.len == 0 && (byte == b'[' || byte == b'{') {
-                return None;
+                return WordStep::Fail;
             }
             if self.dash1 && byte == b'-' {
-                return None;
+                return WordStep::Fail;
             }
         }
         let mut excl_alive = 0u32;
@@ -863,16 +915,16 @@ impl IncParse<()> for Word {
                 excl_alive |= 1 << i;
             }
         }
-        Some(Step::Continue(Box::new(Word {
+        WordStep::Advance(Word {
             excluded: self.excluded,
             bare: self.bare,
             len: self.len + 1,
             dash1: self.bare && self.len == 0 && byte == b'-',
             excl_alive,
-        })))
+        })
     }
 
-    fn admissible(&self) -> Admissible {
+    fn admissible_core(&self) -> Admissible {
         let mut charset = WORD_CHARSET;
         if self.bare {
             if self.len == 0 {
@@ -885,32 +937,104 @@ impl IncParse<()> for Word {
         }
         Admissible::new(charset, !self.finishable(), true)
     }
+}
+
+impl IncParse<()> for Word {
+    fn step(&self, input: Input) -> Option<Step<()>> {
+        match self.step_core(input) {
+            WordStep::Fail => None,
+            WordStep::Finish => Some(Step::Done {
+                value: (),
+                rejected: input,
+            }),
+            WordStep::Advance(next) => Some(Step::Continue(Box::new(next))),
+        }
+    }
+
+    fn admissible(&self) -> Admissible {
+        self.admissible_core()
+    }
 
     fn clone_box(&self) -> BoxP<()> {
         Box::new(self.clone())
     }
 }
 
-/// A bare word excluding the given exact words (see [`Word`]).
-pub fn bare_word(excluded: &'static [&'static str]) -> BoxP<()> {
+/// [`Word`] plus the consumed text: finishes with the word it read. The grammar's M3
+/// argument layer binds on the captured name to look up that program's (or that
+/// flag's) completion data — acceptance is identical to the plain [`Word`].
+///
+/// The captured text is what was *stepped*: the editor substitutes the representative
+/// byte for non-ASCII input (see `feed_bytes`), so a word containing non-ASCII text
+/// captures mangled — which only makes the M3 lookup miss and fall back to the generic
+/// grammar, never changes acceptance.
+#[derive(Clone)]
+pub struct CapWord {
+    word: Word,
+    text: String,
+}
+
+impl IncParse<String> for CapWord {
+    fn step(&self, input: Input) -> Option<Step<String>> {
+        match self.word.step_core(input) {
+            WordStep::Fail => None,
+            WordStep::Finish => Some(Step::Done {
+                value: self.text.clone(),
+                rejected: input,
+            }),
+            WordStep::Advance(next) => {
+                let mut text = self.text.clone();
+                if let Input::Byte(byte) = input {
+                    text.push(char::from(byte.get()));
+                }
+                Some(Step::Continue(Box::new(CapWord { word: next, text })))
+            }
+        }
+    }
+
+    fn admissible(&self) -> Admissible {
+        self.word.admissible_core()
+    }
+
+    fn clone_box(&self) -> BoxP<String> {
+        Box::new(self.clone())
+    }
+}
+
+fn word_state(excluded: &'static [&'static str], bare: bool) -> Word {
     assert!(excluded.len() <= 32, "exclusion mask is 32 bits");
-    Box::new(Word {
+    Word {
         excluded,
-        bare: true,
+        bare,
         len: 0,
         dash1: false,
         excl_alive: u32::MAX >> (32 - excluded.len().max(1)),
+    }
+}
+
+/// A bare word excluding the given exact words (see [`Word`]).
+pub fn bare_word(excluded: &'static [&'static str]) -> BoxP<()> {
+    Box::new(word_state(excluded, true))
+}
+
+/// [`bare_word`], capturing the consumed text (see [`CapWord`]).
+pub fn cap_bare_word(excluded: &'static [&'static str]) -> BoxP<String> {
+    Box::new(CapWord {
+        word: word_state(excluded, true),
+        text: String::new(),
     })
 }
 
 /// A flag name: a nonempty run of word bytes after `--`, no carve-outs.
 pub fn flag_name() -> BoxP<()> {
-    Box::new(Word {
-        excluded: &[],
-        bare: false,
-        len: 0,
-        dash1: false,
-        excl_alive: 0,
+    Box::new(word_state(&[], false))
+}
+
+/// [`flag_name`], capturing the consumed text (see [`CapWord`]).
+pub fn cap_flag_name() -> BoxP<String> {
+    Box::new(CapWord {
+        word: word_state(&[], false),
+        text: String::new(),
     })
 }
 

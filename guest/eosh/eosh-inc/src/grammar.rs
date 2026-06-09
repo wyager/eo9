@@ -32,6 +32,22 @@
 //! vocabulary — acceptance is unchanged (the free word already covers every vocabulary
 //! word), it exists to power `completions()`; soundness never depends on the vocabulary.
 //!
+//! ARGUMENT COMPLETION (M3, docs/design/component-manuals.md §3–4): when the embedder
+//! has provided a resolved program's argument data ([`Vocab::programs`]), the
+//! application grammar captures the head name and binds the matching argument layer in:
+//! flag-name positions additionally alternate the program's `--flag` names (from the
+//! WIT `describe` signature, with the manual's per-arg doc line as the menu
+//! description), and each flag's value position additionally alternates its typed
+//! candidates — `union(wit_grammar(ty), words(hint_literals))`. THE HARD RULE (the
+//! manuals design's §3): hints are ADDITIVE, NEVER RESTRICTIVE — every added `Words`
+//! branch's language is a subset of the free word it alternates with (the entry filter
+//! in [`crate::comb::Words`] plus the reserved-word filter below guarantee it), so the
+//! WIT-derived/free branch is unconditionally present and a lying manual can produce a
+//! false green (a candidate eosh later refuses), never a false red. The manual-fuzzing
+//! arm of the differential test pins acceptance EQUAL with and without argument data.
+//! Names with no provided data (unresolved, still resolving, or argument-less) keep
+//! the generic v1 argument grammar unchanged.
+//!
 //! DELIBERATE LOOSENESS (the superset rule tolerates false green, never false red):
 //!
 //! * `detach <name> = <expr>` does not require eosh's `restart <policy>` clause: in the
@@ -48,14 +64,15 @@
 //! no-argument builtins reject arguments, reserved words are refused in name/value
 //! positions, flags require values.
 
+use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::comb::{
-    alt, bare_word, bind, comment_rest, compound, flag_name, kw, lazy, lit, lit_byte, map, pure,
-    quoted, rep, star, words, ws,
+    HintEntry, Words, alt, bare_word, bind, cap_bare_word, cap_flag_name, comment_rest, compound,
+    flag_name, hint_words, kw, lazy, lit, lit_byte, map, pure, quoted, rep, star, words, ws,
 };
 use crate::inc::{BoxP, Tag};
 
@@ -79,15 +96,51 @@ const DESCRIBE_RESERVED_DOC_WORDS: &[&str] = &["let", "only", "rename", "with"];
 /// The dynamic vocabulary for name positions: builtins are spoken for by the grammar's
 /// own keyword branches; entries here are the store's /bin listing, session bindings,
 /// and anything else the embedder wants completable. Snapshotted per prompt (M2).
+///
+/// `programs` is the M3 argument-completion layer: per resolved program name, the
+/// argument data the embedder pulled from `describe` (and the component's manual,
+/// when present). Lazily populated — the editor asks for names as they complete
+/// ([`crate::editor::Editor::wanted_args`]) and the embedder fills entries in as
+/// resolution finishes; absent names simply keep the generic argument grammar.
 #[derive(Debug, Clone, Default)]
 pub struct Vocab {
     pub entries: Vec<(String, Tag)>,
+    pub programs: BTreeMap<String, ProgramArgs>,
 }
 
 impl Vocab {
     pub fn new(entries: Vec<(String, Tag)>) -> Self {
-        Vocab { entries }
+        Vocab {
+            entries,
+            programs: BTreeMap::new(),
+        }
     }
+}
+
+/// One resolved program's argument data (M3): the flags of its `main`/`configure`
+/// signature, dressed with whatever the manual added. The WIT signature is the
+/// mechanical truth — the embedder builds one [`FlagSpec`] per `describe` ArgSpec and
+/// only *annotates* it from the manual (doc line, `values:` literals, `kind:` tag);
+/// manual-only flags never appear here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProgramArgs {
+    pub flags: Vec<FlagSpec>,
+}
+
+/// One flag of a resolved program's signature, plus its (additive) completion hints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlagSpec {
+    /// The flag name, without the `--`.
+    pub name: String,
+    /// The WIT type text (`bool`, `option<string>`, …) — drives the typed candidates.
+    pub ty: String,
+    /// The manual's per-arg doc first line, shown as the candidate-list description.
+    pub doc: Option<String>,
+    /// The manual's `values:` literals — ADDITIVE candidates only.
+    pub values: Vec<String>,
+    /// The manual's `kind:` tag (url, path, component-name, …) — a candidate SOURCE,
+    /// never a constraint.
+    pub kind: Option<String>,
 }
 
 /// Where a name sits: the head of a run-command excludes the dispatch words.
@@ -97,11 +150,22 @@ enum Pos {
     Normal,
 }
 
-/// The grammar's shared context: the vocabulary, pre-filtered per position.
+/// One program's argument data converted to ready-to-alternate `Words` entries
+/// (computed once per [`command_line`] build, shared by `Rc` through every lazy
+/// grammar rebuild): the flag-name vocabulary and, per flag, its value candidates.
+#[derive(Clone)]
+struct ProgramSlots {
+    flags: Rc<Vec<HintEntry>>,
+    values: Rc<BTreeMap<String, Rc<Vec<HintEntry>>>>,
+}
+
+/// The grammar's shared context: the vocabulary, pre-filtered per position, and the
+/// per-program argument slots (M3).
 #[derive(Clone)]
 struct Cx {
-    head_vocab: Rc<Vec<(String, Tag)>>,
-    vocab: Rc<Vec<(String, Tag)>>,
+    head_vocab: Rc<Vec<HintEntry>>,
+    vocab: Rc<Vec<HintEntry>>,
+    programs: Rc<BTreeMap<String, ProgramSlots>>,
 }
 
 /// Sequence two parsers, keeping the first's laziness discipline: the second is built
@@ -147,9 +211,14 @@ fn paren_expr(cx: &Cx) -> BoxP<()> {
 
 // -- expressions -------------------------------------------------------------------
 
-/// A name in `primary` position: free word (position-appropriate exclusions),
-/// compound, or a vocabulary word (completions only — see module docs).
-fn primary(cx: &Cx, pos: Pos) -> BoxP<()> {
+/// A name in `primary` position, captured: free word (position-appropriate
+/// exclusions), compound, or a vocabulary word (completions only — see module docs).
+/// The captured value is the consumed word for the word-shaped branches and `""` for
+/// the structural ones. The capturing branch sits FIRST deliberately: every word the
+/// vocabulary branch finishes, the free word finishes too (the vocabulary survives
+/// [`Words`]' entry filter, so its language is a subset), and `Alt`'s first-finisher
+/// rule then always yields the real name to the argument-layer bind.
+fn cap_primary(cx: &Cx, pos: Pos) -> BoxP<String> {
     let (excluded, vocab) = match pos {
         Pos::Head => (CMD_HEAD_EXCLUDED, cx.head_vocab.clone()),
         Pos::Normal => (RESERVED, cx.vocab.clone()),
@@ -157,15 +226,15 @@ fn primary(cx: &Cx, pos: Pos) -> BoxP<()> {
     then(
         ws(),
         alt(vec![
-            bare_word(excluded),
-            compound(),
-            words(vocab),
-            paren_expr(cx),
+            cap_bare_word(excluded),
+            map(hint_words(vocab), |()| String::new()),
+            map(compound(), |()| String::new()),
+            map(paren_expr(cx), |()| String::new()),
         ]),
     )
 }
 
-/// A flag-or-positional application argument.
+/// A flag-or-positional application argument (the generic v1 layer — no program data).
 fn arg(cx: &Cx) -> BoxP<()> {
     then(
         ws(),
@@ -199,6 +268,61 @@ fn star_args(cx: &Cx) -> BoxP<()> {
     star(move || arg(&cx))
 }
 
+/// The argument list for a captured head name (M3): the program's slots when the
+/// embedder provided them, the generic layer otherwise. Identical acceptance either
+/// way — the slots only add completion branches (module docs, the hard rule).
+fn star_args_for(cx: &Cx, name: &str) -> BoxP<()> {
+    match cx.programs.get(name) {
+        Some(program) => {
+            let cx = cx.clone();
+            let program = program.clone();
+            star(move || arg_known(&cx, &program))
+        }
+        None => star_args(cx),
+    }
+}
+
+/// [`arg`] with one program's slots alternated in: the flag token captures its name
+/// (offering the program's flags alongside), and the bound value position offers that
+/// flag's typed candidates alongside the free forms.
+fn arg_known(cx: &Cx, program: &ProgramSlots) -> BoxP<()> {
+    let flag = alt(vec![
+        cap_flag_name(),
+        map(hint_words(program.flags.clone()), |()| String::new()),
+    ]);
+    let value_cx = cx.clone();
+    let values = program.values.clone();
+    then(
+        ws(),
+        alt(vec![
+            then(
+                lit(b"--"),
+                bind(flag, move |name| {
+                    value_hinted(&value_cx, values.get(&name).cloned())
+                }),
+            ),
+            bare_word(RESERVED),
+            compound(),
+            quoted(),
+            paren_expr(cx),
+        ]),
+    )
+}
+
+/// [`value`] plus a flag's candidate words, when it has any.
+fn value_hinted(cx: &Cx, hints: Option<Rc<Vec<HintEntry>>>) -> BoxP<()> {
+    let mut branches = vec![
+        bare_word(RESERVED),
+        compound(),
+        quoted(),
+        paren_expr(cx),
+    ];
+    if let Some(hints) = hints {
+        branches.push(hint_words(hints));
+    }
+    then(ws(), alt(branches))
+}
+
 /// `app-expr := primary arg*`, with the head parser supplied (the `with`-item path
 /// needs a non-paren head).
 fn app_from(head: BoxP<()>, cx: &Cx) -> BoxP<()> {
@@ -206,7 +330,10 @@ fn app_from(head: BoxP<()>, cx: &Cx) -> BoxP<()> {
 }
 
 fn app(cx: &Cx, pos: Pos) -> BoxP<()> {
-    app_from(primary(cx, pos), cx)
+    let cx2 = cx.clone();
+    bind(cap_primary(cx, pos), move |name| {
+        star_args_for(&cx2, &name)
+    })
 }
 
 fn star_amp(cx: &Cx) -> BoxP<()> {
@@ -296,7 +423,7 @@ fn with_item(cx: &Cx) -> BoxP<()> {
                         alt(vec![
                             bare_word(RESERVED),
                             compound(),
-                            words(cx.vocab.clone()),
+                            hint_words(cx.vocab.clone()),
                         ]),
                     ),
                     cx,
@@ -394,23 +521,120 @@ fn trailing() -> BoxP<()> {
     )
 }
 
+/// The typed value candidates the WIT type text alone yields: `bool` (under any
+/// `option<…>` nesting) offers its two literals. Everything else is free-form at the
+/// grammar's level — richer typing is the callee's job.
+fn wit_value_entries(ty: &str) -> Vec<HintEntry> {
+    let mut inner = ty.trim();
+    while let Some(stripped) = inner
+        .strip_prefix("option<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        inner = stripped.trim();
+    }
+    match inner {
+        "bool" => ["false", "true"]
+            .iter()
+            .map(|word| HintEntry::plain(String::from(*word), Tag::Value))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The candidate entries for one flag's value position: the WIT-derived words, the
+/// manual's `values:` literals, and the `kind:` tag's candidate source. Every entry is
+/// filtered to the plain-word subset AND against the reserved words, so the added
+/// `Words` branch never widens (or narrows) what the generic value position accepts —
+/// hints are completion-only (module docs, the hard rule).
+fn value_entries(spec: &FlagSpec, vocab: &[HintEntry]) -> Vec<HintEntry> {
+    let mut entries = wit_value_entries(&spec.ty);
+    for value in &spec.values {
+        let word = value.trim();
+        if Words::entry_is_word(word) && !RESERVED.contains(&word) {
+            entries.push(HintEntry::plain(String::from(word), Tag::Value));
+        }
+    }
+    match spec.kind.as_deref() {
+        // A canned prefix to keep typing into (`glue`: no trailing space on a unique
+        // completion) plus the kind as its label.
+        Some("url") => entries.push(HintEntry {
+            word: String::from("http://"),
+            tag: Tag::Value,
+            desc: Some(String::from("url")),
+            glue: true,
+        }),
+        Some("path") => entries.push(HintEntry {
+            word: String::from("/"),
+            tag: Tag::Value,
+            desc: Some(String::from("path")),
+            glue: true,
+        }),
+        // The per-prompt dynamic vocabulary as candidates — retagged Value: a value
+        // position takes free text, so its candidates must never read as evidence of
+        // a name position (the editor's name-marking oracle keys on the tag).
+        Some("component-name") => entries.extend(vocab.iter().map(|entry| HintEntry {
+            word: entry.word.clone(),
+            tag: Tag::Value,
+            desc: None,
+            glue: false,
+        })),
+        // port, interface-name, unknown kinds: display text in `man` only.
+        _ => {}
+    }
+    entries
+}
+
+/// Convert one program's [`ProgramArgs`] into ready-to-alternate slots.
+fn build_slots(program: &ProgramArgs, vocab: &[HintEntry]) -> ProgramSlots {
+    let flags: Vec<HintEntry> = program
+        .flags
+        .iter()
+        .filter(|spec| Words::entry_is_word(&spec.name))
+        .map(|spec| HintEntry {
+            word: spec.name.clone(),
+            tag: Tag::Flag,
+            desc: spec.doc.clone(),
+            glue: false,
+        })
+        .collect();
+    let mut values: BTreeMap<String, Rc<Vec<HintEntry>>> = BTreeMap::new();
+    for spec in &program.flags {
+        let entries = value_entries(spec, vocab);
+        if !entries.is_empty() {
+            values.insert(spec.name.clone(), Rc::new(entries));
+        }
+    }
+    ProgramSlots {
+        flags: Rc::new(flags),
+        values: Rc::new(values),
+    }
+}
+
 /// The whole-line parser: feed it the line's bytes (via [`crate::inc::feed_bytes`])
 /// and `Eof`; it finishes exactly on lines whose language is a superset of
 /// `eosh_core::parse::parse_command`'s.
 pub fn command_line(vocab: &Vocab) -> BoxP<()> {
-    let filter = |excluded: &'static [&'static str]| -> Rc<Vec<(String, Tag)>> {
+    let filter = |excluded: &'static [&'static str]| -> Rc<Vec<HintEntry>> {
         Rc::new(
             vocab
                 .entries
                 .iter()
                 .filter(|(word, _)| !excluded.contains(&word.as_str()))
-                .cloned()
+                .map(|(word, tag)| HintEntry::plain(word.clone(), *tag))
                 .collect(),
         )
     };
+    let normal = filter(RESERVED);
+    let programs: BTreeMap<String, ProgramSlots> = vocab
+        .programs
+        .iter()
+        .filter(|(_, program)| !program.flags.is_empty())
+        .map(|(name, program)| (name.clone(), build_slots(program, &normal)))
+        .collect();
     let cx = Cx {
         head_vocab: filter(CMD_HEAD_EXCLUDED),
-        vocab: filter(RESERVED),
+        vocab: normal,
+        programs: Rc::new(programs),
     };
     then(command(&cx), trailing())
 }
@@ -425,6 +649,16 @@ mod tests {
     use alloc::string::ToString;
     use eosh_core::parse::{ParseError, parse_command};
     use std::println;
+
+    fn flag(name: &str, ty: &str) -> FlagSpec {
+        FlagSpec {
+            name: name.to_string(),
+            ty: ty.to_string(),
+            doc: None,
+            values: Vec::new(),
+            kind: None,
+        }
+    }
 
     fn fake_vocab() -> Vocab {
         let programs = [
@@ -454,7 +688,87 @@ mod tests {
         entries.push(("help".to_string(), Tag::Program));
         entries.push(("--flag".to_string(), Tag::Program));
         entries.push(("[odd".to_string(), Tag::Program));
-        Vocab::new(entries)
+        let mut vocab = Vocab::new(entries);
+        // Argument data for several corpus heads, so EVERY standing gate (the
+        // differential superset, the fuzzed differential, the admissibility checker,
+        // the looseness pin) also exercises the M3 argument layer — including
+        // hostile pieces the build-time filters must neutralize.
+        vocab.programs.insert(
+            "hello".to_string(),
+            ProgramArgs {
+                flags: vec![
+                    FlagSpec {
+                        name: "name".to_string(),
+                        ty: "string".to_string(),
+                        doc: Some("who to greet".to_string()),
+                        values: vec!["world".to_string()],
+                        kind: None,
+                    },
+                    flag("verbose", "option<bool>"),
+                ],
+            },
+        );
+        vocab.programs.insert(
+            "browser".to_string(),
+            ProgramArgs {
+                flags: vec![FlagSpec {
+                    name: "url".to_string(),
+                    ty: "string".to_string(),
+                    doc: None,
+                    values: Vec::new(),
+                    kind: Some("url".to_string()),
+                }],
+            },
+        );
+        vocab.programs.insert(
+            "cruncher".to_string(),
+            ProgramArgs {
+                flags: vec![
+                    // Hostile: a flag named a reserved word (free flag names make it
+                    // harmless), unlexable flag names (filtered at build), and a
+                    // values: list full of words the value position must not start
+                    // accepting (reserved, flag-shaped, compound-shaped, multi-word).
+                    flag("as", "string"),
+                    flag("--weird", "string"),
+                    flag("two words", "string"),
+                    flag("", "string"),
+                    FlagSpec {
+                        name: "rounds".to_string(),
+                        ty: "u32".to_string(),
+                        doc: Some("how many rounds".to_string()),
+                        values: vec![
+                            "only".to_string(),
+                            "as".to_string(),
+                            "--x".to_string(),
+                            "[odd".to_string(),
+                            "two words".to_string(),
+                            String::new(),
+                            "fast".to_string(),
+                            "5".to_string(),
+                        ],
+                        kind: None,
+                    },
+                ],
+            },
+        );
+        vocab.programs.insert(
+            "fetcher".to_string(),
+            ProgramArgs {
+                flags: vec![FlagSpec {
+                    name: "nic".to_string(),
+                    ty: "option<string>".to_string(),
+                    doc: None,
+                    values: Vec::new(),
+                    kind: Some("component-name".to_string()),
+                }],
+            },
+        );
+        // A name that is NOT in entries but carries args: harmless (the head bind
+        // looks it up only when the captured word matches).
+        vocab
+            .programs
+            .insert("ghost".to_string(), ProgramArgs { flags: vec![flag("x", "bool")] });
+        vocab
     }
 
     fn inc_accepts(vocab: &Vocab, line: &str) -> bool {
@@ -888,6 +1202,172 @@ mod tests {
         );
         assert!(positives >= 300, "fuzz generator degenerated: {positives}");
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// THE MANUAL-FUZZING ARM (docs/design/component-manuals.md §3): adversarial
+    /// argument data — lying manuals injected into the memo — must change ACCEPTANCE
+    /// not at all. Stronger than "never shrinks": the added branches are built to be
+    /// subsets of the free forms they alternate with, so admissibility is EQUAL with
+    /// and without hints, on the corpus and on fuzzed lines. A lying manual can only
+    /// mislead the candidate menu (false green at completion time), never the marker.
+    #[test]
+    fn adversarial_hints_never_change_acceptance() {
+        let plain = {
+            let mut vocab = fake_vocab();
+            vocab.programs.clear();
+            vocab
+        };
+        let mut lying = plain.clone();
+        // Every vocabulary word (and a few corpus heads beyond it) gets hostile args:
+        // reserved/flag/compound/multi-word/control-byte/non-ASCII flag names and
+        // values, every kind tag including garbage.
+        let hostile_values = [
+            "as", "let", "only", "rename", "with", "--x", "-", "[{", "{", "a b c", "", " ",
+            "\u{1b}[31m", "é", "\"q\"", "$", "5", "dhcp",
+        ];
+        let kinds = [
+            None,
+            Some("url"),
+            Some("path"),
+            Some("component-name"),
+            Some("port"),
+            Some("interface-name"),
+            Some("banana"),
+            Some(""),
+        ];
+        let heads: Vec<String> = plain
+            .entries
+            .iter()
+            .map(|(word, _)| word.clone())
+            .chain(["echo", "app", "x", "a", "tool", "interpret"].iter().map(|s| s.to_string()))
+            .collect();
+        for (index, name) in heads.iter().enumerate() {
+            let mut flags: Vec<FlagSpec> = Vec::new();
+            for (offset, hostile) in hostile_values.iter().enumerate() {
+                flags.push(FlagSpec {
+                    name: hostile.to_string(),
+                    ty: "string".to_string(),
+                    doc: Some(hostile.to_string()),
+                    values: hostile_values.iter().map(|v| v.to_string()).collect(),
+                    kind: kinds[(index + offset) % kinds.len()].map(String::from),
+                });
+            }
+            // And ordinary-looking flags carrying the hostile values/kinds.
+            for (offset, real) in ["url", "rounds", "text", "mode", "allow"].iter().enumerate() {
+                flags.push(FlagSpec {
+                    name: real.to_string(),
+                    ty: ["bool", "option<bool>", "u32", "string", "list<u8>"][offset].to_string(),
+                    doc: None,
+                    values: hostile_values.iter().map(|v| v.to_string()).collect(),
+                    kind: kinds[(index + offset + 3) % kinds.len()].map(String::from),
+                });
+            }
+            lying.programs.insert(name.clone(), ProgramArgs { flags });
+        }
+
+        let mut checked = 0usize;
+        let mut check = |line: &str| {
+            let with = inc_accepts(&lying, line);
+            let without = inc_accepts(&plain, line);
+            assert_eq!(
+                with, without,
+                "hints changed acceptance for {line:?} (with hints: {with})"
+            );
+            checked += 1;
+        };
+        for line in CORPUS {
+            check(line);
+        }
+        // Token soup biased toward flag/value shapes.
+        const TOKENS: &[&str] = &[
+            "hello", "browser", "cruncher", "echo", "--url", "--rounds", "--as", "--x", "as",
+            "only", "dhcp", "5", "[{a: 1}]", "\"quoted\"", "$", "&", "(", ")", "=", "x",
+            "--verbose", "true", "é",
+        ];
+        let mut rng = Rng(0x1357_9BDF_2468_ACE0);
+        for _ in 0..3000 {
+            let n = rng.below(8);
+            let mut line = String::new();
+            for i in 0..n {
+                if i > 0 {
+                    line.push(' ');
+                }
+                line.push_str(TOKENS[rng.below(TOKENS.len())]);
+            }
+            check(&line);
+        }
+        assert!(checked > 3000);
+    }
+
+    /// The M3 completion surfaces: flags from the provided signature (with the doc
+    /// description and the Flag tag), typed/hinted value candidates (Value tag), the
+    /// kind sources — and nothing for unknown names.
+    #[test]
+    fn argument_completions_surface_flags_and_typed_candidates() {
+        let vocab = fake_vocab();
+        let comps_at = |prefix: &str| {
+            let state = feed_bytes(command_line(&vocab), prefix.as_bytes()).expect("viable");
+            let mut out = Vec::new();
+            state.completions(&mut out);
+            out
+        };
+
+        // Flag names after `--`: from the signature, tagged Flag, doc as description;
+        // unlexable hostile names are filtered.
+        let flags = comps_at("cruncher --");
+        let words: Vec<&str> = flags.iter().map(|c| c.word.as_str()).collect();
+        assert!(words.contains(&"rounds"), "{words:?}");
+        assert!(words.contains(&"as"), "{words:?}"); // free flag names: harmless
+        assert!(!words.iter().any(|w| w.contains(' ')), "{words:?}");
+        assert!(!words.contains(&"--weird"), "{words:?}");
+        assert!(!words.contains(&""), "{words:?}");
+        assert!(flags.iter().all(|c| c.tag == Tag::Flag));
+        let rounds = flags.iter().find(|c| c.word == "rounds").expect("rounds");
+        assert_eq!(rounds.desc.as_deref(), Some("how many rounds"));
+
+        // A flag prefix narrows.
+        let narrowed = comps_at("cruncher --ro");
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].word, "rounds");
+        assert_eq!(narrowed[0].matched, 2);
+
+        // Value candidates: the manual's literals, filtered of everything the value
+        // position could not lex as one plain non-reserved word — `only`/`as` are
+        // RESERVED there (eosh rejects them as values), so offering them would widen
+        // acceptance; they drop with the flag-shaped/compound/multi-word junk.
+        let values = comps_at("cruncher --rounds ");
+        let words: Vec<&str> = values.iter().map(|c| c.word.as_str()).collect();
+        assert_eq!(words, vec!["fast", "5"]);
+        assert!(values.iter().all(|c| c.tag == Tag::Value));
+
+        // bool → true/false (under option<…> too).
+        let bools = comps_at("hello --verbose ");
+        let words: Vec<&str> = bools.iter().map(|c| c.word.as_str()).collect();
+        assert_eq!(words, vec!["false", "true"]);
+
+        // kind url → the canned glue prefix with its label.
+        let url = comps_at("browser --url ");
+        assert_eq!(url.len(), 1);
+        assert_eq!(url[0].word, "http://");
+        assert_eq!(url[0].desc.as_deref(), Some("url"));
+        assert!(url[0].glue);
+        assert_eq!(url[0].tag, Tag::Value);
+
+        // kind component-name → the dynamic vocabulary, RETAGGED Value (the editor's
+        // name-mark oracle must not see name evidence in a value position).
+        let comp = comps_at("fetcher --nic ");
+        let words: Vec<&str> = comp.iter().map(|c| c.word.as_str()).collect();
+        assert!(words.contains(&"memfs"), "{words:?}");
+        assert!(words.contains(&"det"), "{words:?}");
+        assert!(comp.iter().all(|c| c.tag == Tag::Value), "{comp:?}");
+
+        // Unknown head: the generic grammar — no flag or value candidates anywhere.
+        assert!(comps_at("unknowntool --").is_empty());
+        assert!(comps_at("rng --seed ").is_empty());
+
+        // Argument data never leaks into completions before the `--` (positional
+        // words offer nothing) or at the head.
+        assert!(comps_at("cruncher ").iter().all(|c| c.tag != Tag::Flag));
     }
 
     /// Non-ASCII feed policy: lines eosh accepts with multi-byte words stay green.
