@@ -17,10 +17,22 @@
 /// works identically without a console.
 package eo9:usb-ohci@0.1.0;
 
+/// Compose-time configuration: `configure(region)` pins WHICH platform region the
+/// driver claims (`usb.ohci --region usb-host0-ohci $ usbcheck`). Unconfigured, the
+/// driver claims the first granted region whose name ends in `-ohci` (the option-C
+/// default rule — plain composition never traps; the board table orders
+/// usb-host1-ohci first, the bench mouse's controller). The knob exists so one boot
+/// can probe both controllers without re-granting.
+interface ohci-config {
+    use eo9:usb/types@0.1.0.{usb-impl};
+    configure: func(region: string) -> result<usb-impl, string>;
+}
+
 world ohci-platform {
     import eo9:platform/platform@0.1.0;
     import eo9:text/text@0.1.0;
 
     export eo9:usb/types@0.1.0;
     export eo9:usb/usb@0.1.0;
+    export ohci-config;
 }

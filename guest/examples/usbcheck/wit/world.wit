@@ -13,6 +13,7 @@ package eo9-examples:usbcheck@0.1.0;
 ///   usb.ohci-pci $ usbcheck
 world usbcheck {
     import eo9:usb/usb@0.1.0;
+    import eo9:time/time@0.1.0;
     import eo9:text/text@0.1.0;
 
     variant program-success {
@@ -21,6 +22,9 @@ world usbcheck {
         /// No device connected within the watch window — the controller facts and
         /// port statuses printed (the M1 bench shape: plug a device and re-run).
         no-device,
+        /// Watch mode: the window closed; carries how many port-status transitions
+        /// printed (plug/unplug rounds — the M1 CCS/CSC acceptance).
+        watched(u32),
     }
 
     variant program-failure {
@@ -32,5 +36,10 @@ world usbcheck {
         io(string),
     }
 
-    export main: async func() -> result<program-success, program-failure>;
+    /// `watch-ms`: watch mode — instead of enumerating, poll every port for this
+    /// many milliseconds and print each status TRANSITION (connected/CCS,
+    /// connect-change/CSC, enabled, low-speed/LSDA), paced at ~100 ms sweeps. The
+    /// M1 bench's plug/unplug acceptance: a plug must flip CCS+CSC on exactly one
+    /// controller, with LSDA recording the device speed.
+    export main: async func(watch-ms: option<u32>) -> result<program-success, program-failure>;
 }

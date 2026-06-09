@@ -20,6 +20,7 @@ fn platform_deny_seals_the_driver_and_the_program_reports_denied() {
         "eo9-stub-platform-deny",
         "eo9-stub-usb-ohci",
         "eo9-stub-text-null",
+        "eo9-stub-time-frozen",
         "eo9-example-usbcheck",
     ]);
 
@@ -59,9 +60,10 @@ fn platform_deny_seals_the_driver_and_the_program_reports_denied() {
         "platform.deny must seal the platform import: {residual:?}"
     );
 
-    // Both layers print through eo9:text; seal it so the whole composition runs
-    // against no host providers at all.
+    // Both layers print through eo9:text, and usbcheck holds eo9:time for its watch
+    // mode; seal both so the whole composition runs against no host providers at all.
     let sealed = compose(&guest::load_stub("text.null"), &sealed).expect("text.null $ …");
+    let sealed = compose(&guest::load_stub("time.frozen"), &sealed).expect("time.frozen $ …");
 
     // The composition runs without any host platform provider, and the program
     // reports the refusal in its own vocabulary (usbcheck's `denied` failure case —
@@ -84,6 +86,7 @@ fn the_qemu_shell_seals_usb_over_pci_and_pci_deny_refuses_it() {
         "eo9-stub-pci-deny",
         "eo9-stub-usb-ohci-pci",
         "eo9-stub-text-null",
+        "eo9-stub-time-frozen",
         "eo9-example-usbcheck",
     ]);
 
@@ -113,6 +116,7 @@ fn the_qemu_shell_seals_usb_over_pci_and_pci_deny_refuses_it() {
     let sealed = compose(&guest::load_stub("pci.deny"), &stack)
         .expect("pci.deny $ usb.ohci-pci $ usbcheck must compose");
     let sealed = compose(&guest::load_stub("text.null"), &sealed).expect("text.null $ …");
+    let sealed = compose(&guest::load_stub("time.frozen"), &sealed).expect("time.frozen $ …");
     let outcome = run::run_component(&sealed, &[], Providers::none());
     match outcome {
         Outcome::Failure(failure) => assert!(

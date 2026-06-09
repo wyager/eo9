@@ -14,6 +14,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 
+use eo9_guest::api::time::time as time_api;
 use eo9_guest::api::usb::usb;
 use eo9_guest::text;
 use eo9_ohci::descriptor::{self, Descriptor, DeviceDescriptor};
@@ -21,7 +22,7 @@ use eo9_ohci::setup::descriptor_type;
 
 eo9_guest::bindings!({
     world: "usbcheck",
-    apis: [usb, text],
+    apis: [usb, time, text],
 });
 
 /// How many port-status sweeps to make before concluding nothing is connected. Each
@@ -29,8 +30,12 @@ eo9_guest::bindings!({
 /// the bench shape is "plug, then re-run".
 const WATCH_SWEEPS: u32 = 25;
 
+/// Watch-mode sweep pacing: 100 ms keeps the loop honest toward the scheduler (the
+/// D46 stranded-runnable lesson) and is far inside human plug/unplug timing.
+const WATCH_PACE_NS: u64 = 100_000_000;
+
 eo9_guest::main! {
-    async fn main() -> Result<ProgramSuccess, ProgramFailure> {
+    async fn main(watch_ms: Option<u32>) -> Result<ProgramSuccess, ProgramFailure> {
         let io_failure = |err: text::TextError| ProgramFailure::Io(format!("{err:?}"));
         let usb_failure = |err: usb::UsbError| match err {
             usb::UsbError::Denied => ProgramFailure::Denied,
@@ -49,6 +54,55 @@ eo9_guest::main! {
             info.ports,
         ))
         .map_err(io_failure)?;
+
+        // Watch mode (M1 plug/unplug acceptance): poll every port for the window,
+        // print each transition, count them. No enumeration — the operator is
+        // moving cables; CCS/CSC/LSDA are the observables (OHCI 1.0a §7.4.4).
+        if let Some(window_ms) = watch_ms {
+            let time = time_api::default();
+            let started = time_api::monotonic_now(&time);
+            let window_ns = u64::from(window_ms) * 1_000_000;
+            let mut previous: [Option<usb::PortStatus>; 16] = [const { None }; 16];
+            let mut transitions: u32 = 0;
+            loop {
+                let now = time_api::monotonic_now(&time);
+                if now.nanoseconds.saturating_sub(started.nanoseconds) > window_ns {
+                    break;
+                }
+                for port in 1..=info.ports.min(16) {
+                    let status = usb::port(&root, port).await.map_err(usb_failure)?;
+                    let slot = &mut previous[(port - 1) as usize];
+                    let changed = match slot {
+                        Some(seen) => {
+                            seen.connected != status.connected
+                                || seen.enabled != status.enabled
+                                || seen.low_speed != status.low_speed
+                                || seen.connect_change != status.connect_change
+                        }
+                        None => true,
+                    };
+                    if changed {
+                        transitions += 1;
+                        text::write_out_line(&format!(
+                            "usbcheck: watch port {port}: CCS={} PES={} PPS={} LSDA={} CSC={}",
+                            status.connected,
+                            status.enabled,
+                            status.powered,
+                            status.low_speed,
+                            status.connect_change,
+                        ))
+                        .map_err(io_failure)?;
+                    }
+                    *slot = Some(status);
+                }
+                time_api::sleep(&time, WATCH_PACE_NS).await;
+            }
+            text::write_out_line(&format!(
+                "usbcheck: watch window closed ({transitions} transition line(s))"
+            ))
+            .map_err(io_failure)?;
+            return Ok(ProgramSuccess::Watched(transitions));
+        }
 
         // 2. Bounded port watch: print each port once, keep sweeping until a
         // connection shows (or the bound expires — a typed success either way).

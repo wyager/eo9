@@ -41,6 +41,7 @@ use eo9::platform::platform;
 use eo9::text::text;
 use exports::eo9::usb::types;
 use exports::eo9::usb::usb::{self, ControllerInfo, PortStatus, UsbError};
+use exports::eo9::usb_ohci::ohci_config;
 
 // ------------------------------------------------------------------------------------------
 // The RegionIo adapter: OHCI registers are the claimed region, the DMA arena one
@@ -106,13 +107,64 @@ async fn probe() -> Result<Driver, UsbError> {
     let regions = platform::enumerate(&root)
         .await
         .map_err(labelled("enumerate"))?;
-    // The board profile names the controllers `usb-host0-ohci` / `usb-host1-ohci`;
-    // claim the first OHCI the grant exposes (narrowing is the boot grant's job:
-    // `platform=usb-host0-ohci`).
-    let target = regions
+
+    // Defensive EHCI CONFIGFLAG clear FIRST (EHCI 1.0 §4.2: CF=0 routes every port to
+    // the companion OHCI — the reset default, but a prior vendor-U-Boot `usb start`
+    // may have set CF=1, which would leave the OHCI seeing no devices at all; the
+    // plan's risk 6). One claim → one write → release per granted `-ehci` region;
+    // every failure is silently skipped (defensive, not load-bearing — and absent
+    // regions are simply not in the grant, e.g. all of QEMU).
+    for ehci in regions
         .iter()
-        .find(|region| region.name.ends_with("-ohci") || region.name == "ohci")
-        .ok_or(UsbError::NoController)?;
+        .filter(|region| region.name.ends_with("-ehci"))
+    {
+        let Ok(claimed) = platform::claim(&root, ehci.name.clone()).await else {
+            continue;
+        };
+        // HCCAPBASE dword (EHCI 1.0 §2.2): CAPLENGTH in [7:0] locates the
+        // operational registers; CONFIGFLAG is op + 0x40 (§2.3.8).
+        let Ok(capbase) = platform::read(&claimed, 0, platform::AccessWidth::Dword).await else {
+            continue;
+        };
+        let configflag = (capbase & 0xff) + 0x40;
+        if configflag + 4 <= ehci.size
+            && platform::write(&claimed, configflag, platform::AccessWidth::Dword, 0)
+                .await
+                .is_ok()
+        {
+            let handle = text::default();
+            let _ = text::write(
+                &handle,
+                text::OutputStream::Out,
+                &format!(
+                    "usb.ohci: cleared {} CONFIGFLAG (ports route to the companion OHCI)\n",
+                    ehci.name
+                ),
+            );
+        }
+        // `claimed` drops here: the EHCI region is released, never driven.
+    }
+
+    // Which OHCI: the configured region name if `configure(region)` bound one, else
+    // the first granted region whose name ends in `-ohci` (the board table orders
+    // usb-host1-ohci first; narrowing is also the boot grant's job:
+    // `platform=usb-host1-ohci`).
+    let target = match configured_region() {
+        Some(name) => regions
+            .iter()
+            .find(|region| region.name == name)
+            .ok_or_else(|| {
+                UsbError::Io(format!(
+                    "usb.ohci: the configured region `{name}` is not in this grant \
+                     (granted: {})",
+                    region_names(&regions),
+                ))
+            })?,
+        None => regions
+            .iter()
+            .find(|region| region.name.ends_with("-ohci") || region.name == "ohci")
+            .ok_or(UsbError::NoController)?,
+    };
 
     let region = platform::claim(&root, target.name.clone())
         .await
@@ -189,6 +241,34 @@ struct DriverSlot {
 }
 
 static STATE: ProviderState<DriverSlot> = ProviderState::new();
+
+/// Compose-time configuration (`ohci-config.configure`): the platform region to
+/// claim. Unset = the first granted `-ohci` region (the option-C default rule).
+static REGION: ProviderState<String> = ProviderState::new();
+
+/// The configured region name, if `configure` bound one.
+fn configured_region() -> Option<String> {
+    if REGION.is_set() {
+        Some(REGION.with(|name| name.clone()))
+    } else {
+        None
+    }
+}
+
+/// Granted region names, for the configured-name-missing diagnostic.
+fn region_names(regions: &[platform::RegionInfo]) -> String {
+    let mut names = String::new();
+    for region in regions {
+        if !names.is_empty() {
+            names.push_str(", ");
+        }
+        names.push_str(&region.name);
+    }
+    if names.is_empty() {
+        names.push_str("(none)");
+    }
+    names
+}
 
 /// Puts the driver back when the operation that took it finishes — including by
 /// cancellation (the future dropped mid-await), so a cancelled operation can never
@@ -458,6 +538,13 @@ impl usb::Guest for Shell {
             Ok(None) => Ok(Vec::new()),
             Err(error) => Err(map_driver_error(error)),
         }
+    }
+}
+
+impl ohci_config::Guest for Shell {
+    fn configure(region: String) -> Result<types::UsbImpl, String> {
+        REGION.set(region);
+        Ok(types::UsbImpl::new(UsbRoot))
     }
 }
 
