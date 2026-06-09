@@ -60,6 +60,13 @@ pub const POWEROFF_REFUSAL: &str = "error: poweroff: missing capability: power �
 session's supervisor withheld machine halt (a telnet session can only poweroff when \
 telnetd was started with --allow-poweroff)";
 
+/// Ceiling on the session history (the `history` builtin's list and the editor's
+/// recall source). Eviction drops the oldest entry — the GAPS "eosh session history is
+/// unbounded" fix: a console session can run for the machine's whole uptime, so
+/// per-line state must be bounded. The editor's recall is a further-capped (64) view
+/// over this (eosh-inc's `editor::RECALL_CAP`).
+pub const HISTORY_CAP: usize = 256;
+
 /// One shell session: the backend plus everything the user has built up in it.
 pub struct Session<B: Backend> {
     backend: B,
@@ -119,10 +126,29 @@ impl<B: Backend> Session<B> {
         &mut self.backend
     }
 
+    /// The session's `let`-binding names — one of the editor's per-prompt vocabulary
+    /// sources (alongside the backend's `/bin` listing).
+    pub fn binding_names(&self) -> Vec<String> {
+        self.bindings.keys().cloned().collect()
+    }
+
+    /// The newest `cap` history entries, oldest first — the editor's per-prompt recall
+    /// snapshot (a capped view of the already-capped session history).
+    pub fn recall_view(&self, cap: usize) -> Vec<String> {
+        let start = self.history.len().saturating_sub(cap);
+        self.history[start..].to_vec()
+    }
+
     /// Execute one line of input: parse, dispatch, print, and report what happened.
     pub async fn execute_line(&mut self, line: &str) -> LineResult {
         let trimmed = line.trim();
         if !trimmed.is_empty() {
+            if self.history.len() >= HISTORY_CAP {
+                // Bounded per-line state (see [`HISTORY_CAP`]); the `history` builtin
+                // then lists the surviving window, renumbered from 1 — the honest
+                // rendering of a window.
+                self.history.remove(0);
+            }
             self.history.push(trimmed.to_string());
         }
 
@@ -2265,5 +2291,38 @@ mod tests {
             examples >= 4,
             "expected the help text to carry at least four examples, found {examples}"
         );
+    }
+
+    // -- history bounds and the editor's snapshots ----------------------------------
+
+    #[test]
+    fn history_is_capped_and_recall_view_windows_it() {
+        let mut session = session_with(&[]);
+        for index in 0..HISTORY_CAP + 10 {
+            // Comment lines: recorded in history, no parse/eval side effects.
+            run(&mut session, &format!("# line {index}"));
+        }
+        // The cap held: the oldest 10 were evicted.
+        assert_eq!(session.history.len(), HISTORY_CAP);
+        assert_eq!(session.history[0], "# line 10");
+        assert_eq!(
+            session.history.last().unwrap(),
+            &format!("# line {}", HISTORY_CAP + 9)
+        );
+        // The recall view is the newest window, oldest first.
+        let view = session.recall_view(64);
+        assert_eq!(view.len(), 64);
+        assert_eq!(view[0], format!("# line {}", HISTORY_CAP + 10 - 64));
+        assert_eq!(view[63], format!("# line {}", HISTORY_CAP + 9));
+        // A view wider than the history is just the history.
+        assert_eq!(session.recall_view(10_000).len(), HISTORY_CAP);
+    }
+
+    #[test]
+    fn binding_names_lists_the_session_lets() {
+        let mut session = session_with(&[("hello", binary(&[]))]);
+        assert!(session.binding_names().is_empty());
+        run(&mut session, "let h = hello");
+        assert_eq!(session.binding_names(), vec!["h".to_string()]);
     }
 }
