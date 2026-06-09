@@ -632,3 +632,15 @@ its String allocations via a dedicated non-allocating trait query if it shows).
 Follow-up lane: profile a single step on the board (alloc counters first), then either
 arena-allocate or shrink-clone the combinator states or precompile the grammar's static skeleton.
 Until then per-key feel on the board is bounded by ~50 ms/char echo.
+
+## build-kernel opi5plus overwrites the shared QEMU kernel ELF — silent wrong-binary boots
+(repl-m3 lane workaround, recorded by the review train, 2026-06-09) `cargo xtask
+build-kernel aarch64 opi5plus [minimal]` builds into the same cargo target path the
+QEMU profile uses (`kernel/target/aarch64-unknown-none/release/eo9-kernel`), so a
+board build silently replaces the QEMU ELF: the next `qemu`/`check-*` run boots the
+DW-UART board binary and produces no serial output on the virt machine's PL011 — a
+debug round was lost to exactly this. The check gates rebuild before booting, so they
+self-heal, but any direct `-kernel` use of the stale path bites. Lane: per-profile
+artifact paths (e.g. a `--target-dir` or renamed output per board profile) so the two
+binaries can never shadow each other; until then, sequence board builds AFTER QEMU
+gates in any battery.
