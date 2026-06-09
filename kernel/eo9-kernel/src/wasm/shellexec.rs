@@ -507,23 +507,15 @@ fn is_descendant_of(parents: &[Option<u32>], i: usize, ancestor: usize) -> bool 
     false
 }
 
-/// Waker used when polling one child drive. wasmtime re-polls the sub-futures whose waker
-/// was rung; in addition, this records *whether* the waker was rung at all during the poll,
-/// which is how [`drive_children`] tells a child that yielded on fuel (wants an immediate
-/// re-poll — runnable) from one parked on a host future like `read-line`/`time.sleep` (which
-/// instead registers the executor's idle waker and is re-driven after a `wfi`).
-struct ChildWaker {
-    rung: AtomicBool,
-}
-
-impl alloc::task::Wake for ChildWaker {
-    fn wake(self: Arc<Self>) {
-        self.rung.store(true, Ordering::Release);
-    }
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.rung.store(true, Ordering::Release);
-    }
-}
+/// Waker used when polling one child drive: the shared [`super::RungWaker`]. wasmtime
+/// re-polls the sub-futures whose waker was rung; in addition, it records *whether* the
+/// waker was rung at all during the poll, which is how [`drive_children`] tells a child
+/// that yielded on fuel (wants an immediate re-poll — runnable) from one parked on a host
+/// future like `read-line`/`time.sleep` (which instead registers the executor's idle waker
+/// and is re-driven after a `wfi`). Still-running children's wakers are also registered
+/// with the executor's park gate (`super::register_pass_waker`), so a ring that lands
+/// *after* the check-in below cannot be slept on (area/34-fuel-yield-latency).
+use super::RungWaker as ChildWaker;
 
 /// What [`drive_children`] observed across one pass, so the drive loop can decide whether to
 /// keep polling at full speed or idle the core in `wfi`.
@@ -568,6 +560,12 @@ enum Taken {
 /// never removed or reordered, so the index stays valid across the unlocked poll.
 pub fn drive_children() -> DriveStatus {
     let mut status = DriveStatus::default();
+    // A fresh top-level pass restarts the executor's park-gate registry (the services
+    // pump appends to it). A *nested* pass (fibercompile's pump, running inside a
+    // child's poll — CURRENT_PARENT is set) must not clear the outer pass's wakers.
+    if CURRENT_PARENT.load(Ordering::Acquire) == u32::MAX {
+        super::begin_drive_pass();
+    }
     let mut index = 0usize;
     loop {
         let taken = CHILDREN.with(|children| {
@@ -632,9 +630,23 @@ pub fn drive_children() -> DriveStatus {
         });
         if still_running {
             status.any_running = true;
-            if child_waker.rung.load(Ordering::Acquire) {
+            #[cfg(feature = "drive-stats")]
+            super::drive_stats::CHILD_POLLS.fetch_add(1, Ordering::Relaxed);
+            // Chaos arm (`chaos-strand-runnable`, verification only): ignore the rung
+            // flag so a fuel-yielding child is treated as merely waiting — recreating
+            // the parked-with-runnable-work bug the executor's park gate must catch.
+            // The waker still reaches the gate via `register_pass_waker` below, which
+            // is exactly what lets the gate detect (and loudly report) the strand.
+            if !cfg!(feature = "chaos-strand-runnable")
+                && child_waker.rung.load(Ordering::Acquire)
+            {
                 status.any_runnable = true;
+                #[cfg(feature = "drive-stats")]
+                super::drive_stats::CHILD_RUNG.fetch_add(1, Ordering::Relaxed);
             }
+            // The park gate scans this waker before the executor halts the core, so a
+            // ring landing after the `rung` load above is caught, never slept on.
+            super::register_pass_waker(child_waker);
         }
         index += 1;
     }
@@ -2548,6 +2560,11 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                                 != u32::MAX
                                 || ROOT_CONSUMES_CTRL_C.load(Ordering::Acquire);
                             if waiter_consumes && crate::uart::take_ctrl_c() {
+                                // Measurement builds: a consumed Ctrl-C is the probe's
+                                // pass boundary — dump the drive counters so a serial
+                                // transcript carries per-pass deltas.
+                                #[cfg(feature = "drive-stats")]
+                                super::drive_stats::dump("ctrl-c");
                                 let outcome = kill_task_tree(rep);
                                 return Poll::Ready(Ok(outcome));
                             }

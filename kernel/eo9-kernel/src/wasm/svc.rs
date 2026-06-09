@@ -608,19 +608,11 @@ impl alloc::task::Wake for NopWaker {
 }
 
 /// Waker that records whether it was rung (a fuel yield rings it; a parked host future
-/// does not), mirroring the child drive loop's runnable detection.
-struct RungWaker {
-    rung: AtomicBool,
-}
-
-impl alloc::task::Wake for RungWaker {
-    fn wake(self: Arc<Self>) {
-        self.rung.store(true, core::sync::atomic::Ordering::Release);
-    }
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.rung.store(true, core::sync::atomic::Ordering::Release);
-    }
-}
+/// does not), mirroring the child drive loop's runnable detection: the shared
+/// [`super::RungWaker`]. Still-running services' wakers are also registered with the
+/// executor's park gate (`super::register_pass_waker`), so a ring landing after the
+/// check-in cannot be slept on (area/34-fuel-yield-latency).
+use super::RungWaker;
 
 // -----------------------------------------------------------------------------------------
 // Restart-policy invocation (compiled at detach, instantiated per decision)
@@ -825,9 +817,20 @@ pub fn drive_services() -> DriveStatus {
                     });
                     if still_running {
                         status.any_running = true;
-                        if rung {
+                        #[cfg(feature = "drive-stats")]
+                        super::drive_stats::SVC_POLLS
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        // Chaos arm: see `drive_children` — ignore the rung flag so the
+                        // executor's park gate must catch (and report) the strand.
+                        if !cfg!(feature = "chaos-strand-runnable") && rung {
                             status.any_runnable = true;
+                            #[cfg(feature = "drive-stats")]
+                            super::drive_stats::SVC_RUNG
+                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         }
+                        // The park gate scans this waker before the executor halts the
+                        // core, so a post-check-in ring is caught, never slept on.
+                        super::register_pass_waker(waker_state);
                     }
                 }
             }

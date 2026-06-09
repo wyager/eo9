@@ -150,6 +150,18 @@ fn heartbeat() {
     }
 }
 
+/// The watchdog-pat timed obligation (owner executor model, area/34): the next absolute
+/// uptime by which the executor must wake to pat the dog. 5 s keeps the `hb` heartbeat
+/// on its cadence and leaves >4× margin inside the ~22 s hardware timeout. This is a real
+/// "time T → task X" deadline for the idle arm, not a re-poll cadence — the pat itself
+/// runs at every wake (`pat()` above) whatever woke the core.
+#[cfg(all(target_arch = "aarch64", feature = "board-opi5plus"))]
+#[allow(dead_code)] // callers live in the wasm drive loops (feature-gated)
+pub fn pat_deadline_ns(now: u64) -> u64 {
+    const PAT_INTERVAL_NS: u64 = 5_000_000_000;
+    now.saturating_add(PAT_INTERVAL_NS)
+}
+
 #[cfg(not(all(target_arch = "aarch64", feature = "board-opi5plus")))]
 pub fn arm_and_report() {}
 
@@ -157,3 +169,10 @@ pub fn arm_and_report() {}
 #[allow(dead_code)] // callers live in the wasm drive loops (feature-gated)
 #[inline]
 pub fn pat() {}
+
+/// No watchdog off the board profile: no pat obligation ever comes due.
+#[cfg(not(all(target_arch = "aarch64", feature = "board-opi5plus")))]
+#[allow(dead_code)] // callers live in the wasm drive loops (feature-gated)
+pub fn pat_deadline_ns(_now: u64) -> u64 {
+    u64::MAX
+}

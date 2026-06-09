@@ -62,6 +62,16 @@ first-poll-inline = ["wasmtime?/component-model-async-first-poll"]
 # accumulated across the algebra/compile/spawn host calls, one summary line per spawn.
 # Measurement-only; enable with EO9_KERNEL_FEATURES_EXTRA=spawn-trace. Never default.
 spawn-trace = []
+# Executor drive-loop statistics (area/34-fuel-yield-latency): per-pass counters —
+# child/service polls, fuel-rung re-poll requests, wake-kind histogram, park-gate and
+# input-edge events — dumped on every consumed Ctrl-C and at session end. Measurement
+# only; enable with EO9_KERNEL_FEATURES_EXTRA=drive-stats. Never default.
+drive-stats = []
+# Chaos arm (area/34): the drive loops IGNORE fuel-rung wakes when computing
+# `any_runnable`, deliberately re-creating the parked-with-runnable-work bug so the
+# park-gate liveness detector can be shown to fire (and to recover the latency).
+# Verification batteries only; never default.
+chaos-strand-runnable = []
 # Re-run every fusion the graph cache serves from memory and assert byte equality
 # (the encoder-determinism check, owner design). Verification batteries only.
 graph-verify = []

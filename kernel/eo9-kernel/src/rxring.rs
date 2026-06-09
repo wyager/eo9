@@ -15,7 +15,7 @@
 //! everything past the FIFO depth.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Ring capacity (power of two; one slot is left empty to distinguish full from empty).
 /// Sized to hold the longest line the shell accepts (`MAX_READ_LINE_BYTES`, 4096) so a
@@ -25,6 +25,33 @@ pub(crate) const RX_RING_CAP: usize = 4096;
 
 /// ETX (Ctrl-C) — the interrupt key.
 pub(crate) const CTRL_C: u8 = 0x03;
+
+/// Input-arrival edge: set whenever a producer publishes at least one byte into the
+/// console ring (the IRQ-time FIFO drain, the idle-path scavenger, or the console-sink
+/// injector), cleared when the executor delivers wakes to its parked input futures
+/// (`wasm::wake_idle`). The executor's idle step checks this edge *before* halting the
+/// core: a byte that landed after the input futures were last polled must trigger an
+/// immediate re-poll, never ride out a timer (area/34-fuel-yield-latency — input the
+/// event path owes is delivered by the event path; a backstop rescuing it is a bug).
+static INPUT_EDGE: AtomicBool = AtomicBool::new(false);
+
+/// Record that console input was published (any producer; IRQ context is fine).
+fn note_input_edge() {
+    INPUT_EDGE.store(true, Ordering::Release);
+}
+
+/// Whether console input arrived since the last [`clear_input_edge`].
+#[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
+pub(crate) fn input_edge_pending() -> bool {
+    INPUT_EDGE.load(Ordering::Acquire)
+}
+
+/// Consume the edge — called when the executor wakes its parked input futures, which
+/// re-polls every console reader against the ring.
+#[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
+pub(crate) fn clear_input_edge() {
+    INPUT_EDGE.store(false, Ordering::Release);
+}
 
 /// Single-producer (interrupt path) / single-consumer (boot core) byte ring for received
 /// console input.
@@ -73,6 +100,9 @@ impl RxRing {
                 self.head.store(next, Ordering::Release);
             }
         }
+        if moved > 0 {
+            note_input_edge();
+        }
         moved
     }
 
@@ -91,6 +121,7 @@ impl RxRing {
         // at/after `head`, ahead of the consumer's `tail`).
         unsafe { (*self.buf.get())[head] = byte };
         self.head.store(next, Ordering::Release);
+        note_input_edge();
         true
     }
 
