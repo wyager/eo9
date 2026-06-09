@@ -39,6 +39,12 @@ pub(crate) mod pci_map {
 #[cfg(all(feature = "wasm-store", feature = "board-opi5plus"))]
 pub(crate) mod rk3588_pcie;
 
+/// RK3588 USB2 host plumbing for the Orange Pi 5 Plus (PD_USB, clocks, the u2phy2/3
+/// host ports, the VBUS rail — everything below the OHCI/EHCI blocks the platform
+/// capability grants out). Board profile only; `wasm-store` like its consumers.
+#[cfg(all(feature = "wasm-store", feature = "board-opi5plus"))]
+pub(crate) mod rk3588_usb;
+
 /// PCI INTx delivery on this machine: the gpex host bridge's four legacy interrupt lines
 /// land on GIC SPIs 35-38 (`virt`'s irqmap entry 3 + the SPI base 32), level-sensitive.
 /// The IRQ handler (`exceptions::kirq`) masks a fired line and records it via
@@ -123,13 +129,48 @@ pub(crate) mod platform_regions {
     ];
 }
 
-/// Platform region table, board profile: empty until the M1 USB lane lands the four
-/// RK3588 EHCI/OHCI register blocks (docs/board/usb-ohci-plan.md §0).
+/// Platform region table, board profile: the four RK3588 USB2 host-controller
+/// register blocks (docs/board/usb-ohci-plan.md §0; bases/sizes per rk3588-base.dtsi,
+/// re-exported from `rk3588_usb`). The OHCIs are what `usb.ohci` claims and drives;
+/// the EHCIs are listed so the driver's defensive CONFIGFLAG clear (EHCI 1.0 §4.2 —
+/// at reset every port routes to the companion OHCI, but a prior vendor-U-Boot
+/// `usb start` may have flipped it) has a window to write through — claim, one
+/// write, release. **usb-host1-ohci is deliberately FIRST**: the bench mouse sits on
+/// the second pair's type-A port (the live `usb tree` recon), and the driver's
+/// unconfigured default claims the first granted `-ohci` region. The GIC SPIs
+/// (215/216/218/219) are recorded in the plan; the provider answers `unsupported`
+/// to interrupt ops either way, so `has_irq` stays honest-but-unused.
 #[cfg(all(feature = "wasm-store", feature = "board-opi5plus"))]
 pub(crate) mod platform_regions {
+    use super::rk3588_usb;
     use crate::platform::RegionDef;
 
-    pub(crate) const REGIONS: &[RegionDef] = &[];
+    pub(crate) const REGIONS: &[RegionDef] = &[
+        RegionDef {
+            name: "usb-host1-ohci",
+            base: rk3588_usb::USB_HOST1_OHCI,
+            size: rk3588_usb::USB_HOST_REGION_SIZE,
+            has_irq: true, // GIC SPI 219
+        },
+        RegionDef {
+            name: "usb-host0-ohci",
+            base: rk3588_usb::USB_HOST0_OHCI,
+            size: rk3588_usb::USB_HOST_REGION_SIZE,
+            has_irq: true, // GIC SPI 216
+        },
+        RegionDef {
+            name: "usb-host1-ehci",
+            base: rk3588_usb::USB_HOST1_EHCI,
+            size: rk3588_usb::USB_HOST_REGION_SIZE,
+            has_irq: true, // GIC SPI 218
+        },
+        RegionDef {
+            name: "usb-host0-ehci",
+            base: rk3588_usb::USB_HOST0_EHCI,
+            size: rk3588_usb::USB_HOST_REGION_SIZE,
+            has_irq: true, // GIC SPI 215
+        },
+    ];
 }
 
 /// DMA-coherence maintenance for buffers a PCI device masters (descriptor rings, frame

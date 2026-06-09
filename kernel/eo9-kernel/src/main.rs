@@ -153,6 +153,13 @@ extern "C" fn kmain(dtb: *const u8) -> ! {
     #[cfg(all(feature = "wasm-store", feature = "board-opi5plus"))]
     arch::rk3588_pcie::init();
 
+    // Board profile only: power/clock/PHY plumbing for the two USB2 host pairs and
+    // their VBUS rail (arch/aarch64/rk3588_usb.rs), so the `eo9:platform` regions the
+    // usb.ohci driver claims are live registers. Also after the watchdog, for the
+    // same wedged-bus reason. QEMU has no platform USB; no-op there.
+    #[cfg(all(feature = "wasm-store", feature = "board-opi5plus"))]
+    arch::rk3588_usb::init();
+
     // The kernel command line (QEMU -append) selects what to run: `program=<name>` runs a
     // store entry headless, `demo` runs the original demo sequence below, and nothing at
     // all boots to the interactive eosh shell.
