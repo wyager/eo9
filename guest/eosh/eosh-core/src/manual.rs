@@ -431,8 +431,10 @@ pub fn parse_manual(payload: &[u8]) -> Result<Manual, ManualError> {
 // ---------------------------------------------------------------------------------
 
 /// Strip control bytes from self-reported text (no terminal-escape injection): tabs
-/// become a space, every other control character disappears.
-fn sanitize(text: &str) -> String {
+/// become a space, every other control character disappears. Crate-visible: the
+/// session's argument-hint merge sanitizes manual text the same way before it can
+/// reach the editor's candidate list.
+pub(crate) fn sanitize(text: &str) -> String {
     text.chars()
         .filter_map(|c| match c {
             '\t' => Some(' '),

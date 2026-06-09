@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 
 use crate::ast::{Command, Expr};
 use crate::backend::{AbnormalExit, Backend, ComponentInfo, ComponentKind, Outcome, ServiceInfo};
-use crate::cache::SessionCache;
+use crate::cache::{ArgMemoEntry, SessionCache};
 use crate::envinfo::{self, SessionManifest};
 use crate::eval::{EvalError, Evaluator, complete_args};
 use crate::parse::parse_command;
@@ -66,6 +66,88 @@ telnetd was started with --allow-poweroff)";
 /// per-line state must be bounded. The editor's recall is a further-capped (64) view
 /// over this (eosh-inc's `editor::RECALL_CAP`).
 pub const HISTORY_CAP: usize = 256;
+
+/// Cap on a per-argument doc line handed to the editor's candidate list (the list
+/// renders `candidate  doc` on one terminal line; the manual's own line cap is 120
+/// bytes, this trims the column to fit).
+const ARG_DOC_BUDGET: usize = 80;
+
+/// One program's argument-completion hints, merged for the editor (the repl M3
+/// consumer): the WIT signature is the mechanical truth — one entry per `describe`
+/// ArgSpec — and the manual only ANNOTATES it (doc line, `values:` literals, `kind:`
+/// tag; manual-only arguments are dropped). All manual-supplied text is sanitized
+/// here (control bytes stripped, doc lines trimmed to the column budget), so a
+/// hostile manual cannot inject terminal escapes through the completion menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgHints {
+    pub args: Vec<ArgHint>,
+}
+
+/// One flag of [`ArgHints`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgHint {
+    /// The flag name (without `--`), from the WIT signature.
+    pub name: String,
+    /// The WIT type text — drives the editor's typed candidates.
+    pub ty: String,
+    /// The manual's per-arg doc first line, sanitized and trimmed.
+    pub doc: Option<String>,
+    /// The manual's `values:` literals, split and sanitized — ADDITIVE candidates
+    /// only (the editor's grammar keeps the free forms unconditionally).
+    pub values: Vec<String>,
+    /// The manual's `kind:` tag, sanitized.
+    pub kind: Option<String>,
+}
+
+/// Merge one memo entry into editor-ready hints (see [`ArgHints`]).
+fn merge_arg_hints(entry: &ArgMemoEntry) -> ArgHints {
+    let manual_args = entry
+        .manual
+        .as_ref()
+        .map(|manual| manual.args.as_slice())
+        .unwrap_or(&[]);
+    let args = entry
+        .info
+        .args
+        .iter()
+        .map(|spec| {
+            let documented = manual_args.iter().find(|arg| arg.name == spec.name);
+            let doc = documented
+                .and_then(|arg| arg.doc.first())
+                .map(|line| {
+                    let mut line = crate::manual::sanitize(line);
+                    if let Some((cut, _)) = line.char_indices().nth(ARG_DOC_BUDGET) {
+                        line.truncate(cut);
+                        line.push('…');
+                    }
+                    line
+                })
+                .filter(|line| !line.is_empty());
+            let values = documented
+                .and_then(|arg| arg.values.as_deref())
+                .map(|values| {
+                    values
+                        .split(',')
+                        .map(|value| crate::manual::sanitize(value.trim()))
+                        .filter(|value| !value.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let kind = documented
+                .and_then(|arg| arg.kind.as_deref())
+                .map(|kind| crate::manual::sanitize(kind.trim()))
+                .filter(|kind| !kind.is_empty());
+            ArgHint {
+                name: spec.name.clone(),
+                ty: spec.ty.clone(),
+                doc,
+                values,
+                kind,
+            }
+        })
+        .collect();
+    ArgHints { args }
+}
 
 /// One shell session: the backend plus everything the user has built up in it.
 pub struct Session<B: Backend> {
@@ -766,6 +848,54 @@ impl<B: Backend> Session<B> {
                 LineResult::Ok
             }
         }
+    }
+
+    /// The editor's argument-completion source (repl M3): the named /bin program's
+    /// argument hints — `describe`'s signature annotated by the component's manual —
+    /// memoized per resolved name in the session cache (the lazy memo,
+    /// docs/design/component-manuals.md §4) and invalidated by the bytes cache's
+    /// structural rules (`save` drops the name, an fs-importing run clears all, a
+    /// concurrent writer disables). `None` when the name does not resolve (the editor
+    /// keeps the generic grammar). Display/completion only: nothing here is composed,
+    /// compiled, or run, and a manual can only ADD candidates, never restrict
+    /// (enforced grammar-side in eosh-inc).
+    pub async fn arg_hints(&mut self, name: &str) -> Option<ArgHints> {
+        if let Some(entry) = self.cache.args_get(name) {
+            return Some(merge_arg_hints(entry));
+        }
+        // Resolve the bytes like `man` does: the session bytes cache first, the
+        // backend otherwise (caching what it hands back).
+        let Session { backend, cache, .. } = self;
+        let mut resolved: Option<(B::Component, Option<Vec<u8>>)> = None;
+        if let Some(bytes) = cache.bytes.get(name) {
+            if let Ok(component) = backend.load(bytes) {
+                let bytes = bytes.to_vec();
+                resolved = Some((component, Some(bytes)));
+            }
+        }
+        let (component, bytes) = match resolved {
+            Some(resolved) => resolved,
+            None => match backend.resolve_with_bytes(name).await {
+                Ok((component, bytes)) => {
+                    if let Some(bytes) = &bytes {
+                        cache.bytes.insert(name, bytes.clone());
+                    }
+                    (component, bytes)
+                }
+                // Unresolvable (or a binding-only name): no hints, no memo — the
+                // editor falls back to the generic grammar.
+                Err(_) => return None,
+            },
+        };
+        let info = self.backend.describe(&component);
+        let manual = bytes
+            .as_deref()
+            .and_then(crate::manual::extract_manual)
+            .and_then(|payload| crate::manual::parse_manual(payload).ok());
+        let entry = ArgMemoEntry { info, manual };
+        let hints = merge_arg_hints(&entry);
+        self.cache.args_insert(name, entry);
+        Some(hints)
     }
 
     /// The top-level rule: compose the granted environment onto the command, compile,
@@ -2009,6 +2139,144 @@ mod tests {
             "the describe view follows: {out}"
         );
         assert!(out.contains("--name: option<string>"), "{out}");
+    }
+
+    // -- arg_hints (the repl M3 lazy memo) -------------------------------------------
+
+    #[test]
+    fn arg_hints_merge_describe_with_the_manual_and_memoize() {
+        let mut session = session_with(&[]);
+        session.backend.program_with_bytes(
+            "telnetd",
+            telnetd_like(),
+            crate::manual::fixtures::component_with_manual(MAN_TEXT),
+        );
+        let hints =
+            block_on_ready(session.arg_hints("telnetd")).expect("resolvable program has hints");
+        // One hint per WIT ArgSpec, in signature order; the manual annotates.
+        assert_eq!(hints.args.len(), 2);
+        assert_eq!(hints.args[0].name, "port");
+        assert_eq!(hints.args[0].ty, "option<u16>");
+        assert_eq!(
+            hints.args[0].doc.as_deref(),
+            Some("TCP port to listen on (default 23)")
+        );
+        assert_eq!(hints.args[0].kind.as_deref(), Some("port"));
+        assert!(hints.args[0].values.is_empty());
+        assert_eq!(hints.args[1].name, "address");
+        assert_eq!(hints.args[1].values, vec!["dhcp".to_string()]);
+        // The memo: a second ask answers from the cache — no new resolve/describe.
+        let resolves = |log: &[String]| {
+            log.iter()
+                .filter(|line| line.starts_with("resolve") || line.starts_with("describe"))
+                .count()
+        };
+        let before = resolves(&session.backend.log);
+        let again = block_on_ready(session.arg_hints("telnetd")).expect("memo hit");
+        assert_eq!(again, hints);
+        assert_eq!(resolves(&session.backend.log), before, "memo hit re-resolved");
+    }
+
+    #[test]
+    fn arg_hints_without_a_manual_are_the_bare_signature() {
+        let mut session = session_with(&[("hello", binary(&[("name", "option<string>")]))]);
+        let hints = block_on_ready(session.arg_hints("hello")).expect("hints");
+        assert_eq!(hints.args.len(), 1);
+        assert_eq!(hints.args[0].name, "name");
+        assert_eq!(hints.args[0].doc, None);
+        assert!(hints.args[0].values.is_empty());
+        assert_eq!(hints.args[0].kind, None);
+    }
+
+    #[test]
+    fn arg_hints_for_an_unresolvable_name_are_none() {
+        let mut session = session_with(&[]);
+        assert_eq!(block_on_ready(session.arg_hints("ghost")), None);
+        // A `let` binding is not a /bin artifact either (the memo is keyed by
+        // resolved program name; the editor only asks for Program-tagged words).
+        let mut session = session_with(&[("rng", binary(&[]))]);
+        assert_eq!(run(&mut session, "let mine = rng"), LineResult::Ok);
+        assert_eq!(block_on_ready(session.arg_hints("mine")), None);
+    }
+
+    #[test]
+    fn arg_hints_drop_manual_only_arguments_and_sanitize_text() {
+        // The manual documents an argument the program does not declare (dropped: the
+        // WIT signature is the truth) and carries control bytes in its doc/values
+        // (stripped: the text reaches the editor's candidate list).
+        let manual = "eo9-manual 1\n\
+            name: evil\n\
+            synopsis: s\n\
+            arg real string optional\n\
+            \x20 doc: ok\x1b[31m doc\n\
+            \x20 values: a\x07b, c\n\
+            arg phantom string required\n\
+            \x20 doc: not in the signature\n\
+            end\n";
+        let mut session = session_with(&[]);
+        session.backend.program_with_bytes(
+            "evil",
+            binary(&[("real", "option<string>")]),
+            crate::manual::fixtures::component_with_manual(manual),
+        );
+        let hints = block_on_ready(session.arg_hints("evil")).expect("hints");
+        assert_eq!(hints.args.len(), 1, "manual-only args dropped: {hints:?}");
+        assert_eq!(hints.args[0].name, "real");
+        assert_eq!(hints.args[0].doc.as_deref(), Some("ok[31m doc"));
+        assert_eq!(
+            hints.args[0].values,
+            vec!["ab".to_string(), "c".to_string()]
+        );
+        // A malformed manual degrades to the bare signature, never an error.
+        let mut session = session_with(&[]);
+        session.backend.program_with_bytes(
+            "broken",
+            binary(&[("x", "bool")]),
+            crate::manual::fixtures::component_with_manual("eo9-manual 1\nname: b\n"),
+        );
+        let hints = block_on_ready(session.arg_hints("broken")).expect("hints");
+        assert_eq!(hints.args.len(), 1);
+        assert_eq!(hints.args[0].doc, None);
+    }
+
+    #[test]
+    fn arg_hints_memo_follows_the_bytes_cache_invalidation_rules() {
+        let mut session = session_with(&[]);
+        session.backend.program_with_bytes(
+            "telnetd",
+            telnetd_like(),
+            crate::manual::fixtures::component_with_manual(MAN_TEXT),
+        );
+        session.backend.program(
+            "writer",
+            crate::backend::ComponentInfo {
+                kind: ComponentKind::Binary,
+                imports: vec![crate::backend::ImportNeed {
+                    slot: "eo9:fs/fs".to_string(),
+                    interface: "eo9:fs/fs".to_string(),
+                    version: "0.1.0".to_string(),
+                    required: true,
+                }],
+                exports: vec![],
+                args: vec![],
+            },
+        );
+        let resolves = |log: &[String]| {
+            log.iter()
+                .filter(|line| line.starts_with("resolve("))
+                .count()
+        };
+        block_on_ready(session.arg_hints("telnetd")).expect("hints");
+        let baseline = resolves(&session.backend.log);
+        // A run whose program imports eo9:fs clears the memo (the program could have
+        // rewritten /bin): the next ask resolves again.
+        assert_eq!(run(&mut session, "writer"), LineResult::Ok);
+        block_on_ready(session.arg_hints("telnetd")).expect("hints");
+        assert!(
+            resolves(&session.backend.log) > baseline,
+            "fs run must invalidate the memo: {:?}",
+            session.backend.log
+        );
     }
 
     #[test]
