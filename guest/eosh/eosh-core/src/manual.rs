@@ -188,6 +188,13 @@ pub struct Manual {
 
 /// Why a present `eo9-manual` section could not be used (the user sees "manual
 /// malformed (<this>); showing describe").
+///
+/// INVARIANT: the `Display` text reaches the operator's terminal verbatim through that
+/// message, and the manual is hostile input — so no variant may carry RAW
+/// manual-supplied bytes. Every payload today is a number; the one variant quoting
+/// manual text ([`ManualError::ValuesAndKind`]) is [`sanitize`]d at BOTH construction
+/// sites, keeping `Display` pure and covering any future printer of the error. A new
+/// variant must hold numbers or sanitized text, never a raw slice of the section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManualError {
     /// The section exceeds [`MAX_SECTION_BYTES`].
@@ -208,7 +215,8 @@ pub enum ManualError {
     TooManyExamples,
     /// An `arg` header that is not `arg <name> <type-text> <required|optional>`.
     BadArgHeader { line: usize },
-    /// An arg carries both `values:` and `kind:` (at most one is allowed).
+    /// An arg carries both `values:` and `kind:` (at most one is allowed). The name is
+    /// manual-supplied text, [`sanitize`]d at construction (see the enum invariant).
     ValuesAndKind { arg: String },
     /// No `name:` line.
     MissingName,
@@ -318,15 +326,19 @@ pub fn parse_manual(payload: &[u8]) -> Result<Manual, ManualError> {
                         arg.doc.push(String::from(doc));
                     } else if let Some(values) = trimmed.strip_prefix("values: ") {
                         if arg.kind.is_some() {
+                            // Sanitized at construction: the name is manual-supplied
+                            // and the error's Display reaches the terminal (see the
+                            // ManualError invariant).
                             return Err(ManualError::ValuesAndKind {
-                                arg: arg.name.clone(),
+                                arg: sanitize(&arg.name),
                             });
                         }
                         arg.values = Some(String::from(values));
                     } else if let Some(kind) = trimmed.strip_prefix("kind: ") {
                         if arg.values.is_some() {
+                            // Sanitized at construction (see the ManualError invariant).
                             return Err(ManualError::ValuesAndKind {
-                                arg: arg.name.clone(),
+                                arg: sanitize(&arg.name),
                             });
                         }
                         arg.kind = Some(String::from(kind));
@@ -828,6 +840,46 @@ mod tests {
                 arg: "a".to_string()
             })
         );
+    }
+
+    #[test]
+    fn the_malformed_manual_error_carries_no_control_bytes() {
+        // Terminal-escape injection through the error path: an arg NAME carrying a
+        // live OSC title sequence (ESC ] 0 ; … BEL) plus a CSI color (ESC [ 3 1 m)
+        // survives split_whitespace into the name token and reaches ValuesAndKind —
+        // the one variant that quotes manual text — whose Display the session prints
+        // verbatim as "manual malformed (<err>); showing describe". Sanitization
+        // happens at construction, so every printer of the error is covered.
+        let text = "eo9-manual 1\nname: x\nsynopsis: y\n\
+                    arg \x1b]0;evil\x07\x1b[31mname u8 required\n\
+                    \x20 values: 1\n  kind: port\nend\n";
+        let err = parse_manual(text.as_bytes()).expect_err("values+kind is an error");
+        assert!(
+            matches!(err, ManualError::ValuesAndKind { .. }),
+            "got: {err:?}"
+        );
+        let rendered = format!("{err}");
+        assert!(
+            rendered.chars().all(|c| !c.is_control()),
+            "the error's Display must reach the terminal clean: {rendered:?}"
+        );
+        // The readable remainder of the name survives, so the message still points at
+        // the offending arg.
+        assert!(
+            rendered.contains("]0;evil") && rendered.contains("[31mname"),
+            "{rendered:?}"
+        );
+        // The other direction of the same defense: hitting the kind:-first ordering
+        // (values: after kind:) sanitizes identically.
+        let text = "eo9-manual 1\nname: x\nsynopsis: y\n\
+                    arg \x07bell\x1b. u8 optional\n  kind: port\n  values: 1\nend\n";
+        let err = parse_manual(text.as_bytes()).expect_err("kind+values is an error");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.chars().all(|c| !c.is_control()),
+            "both construction sites sanitize: {rendered:?}"
+        );
+        assert!(rendered.contains("bell."), "{rendered:?}");
     }
 
     #[test]
