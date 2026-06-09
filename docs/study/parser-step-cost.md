@@ -220,6 +220,11 @@ measuring a pacing floor). Discriminating probes, all cheap, all board-lane:
 * **FTDI/pacing audit of the bench harness**: the adapter's default 16 ms latency
   timer quantizes host-side echo timestamps; `eosh_cmd.py`-era pacing did too.
 
+*Status since this study (bench, 2026-06-09): the burst probe has run — flag/value
+keys drop to ~3 ms/char in bursts while name-position keys stay ~46 ms isolated AND
+in bursts — and the residue's active hypothesis lane is `area/34-fuel-yield-latency`
+(H1: fuel-yield quantization riding the kbd service's poll timer).*
+
 ## 6. Mitigation ladder, sized by the data
 
 Ordered by measured leverage per unit of risk. (a) and the word-end fix attack the
