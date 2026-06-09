@@ -2285,6 +2285,11 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
                 // minimal image is now the bench's only serial-loadable store, so
                 // it must carry the supervisor.)
                 ("init", "init"),
+                // The standard restart policies (policies are programs): `detach`
+                // requires a policy clause, so the supervisor story needs them baked.
+                ("eo9-stub-restart-never", "restart.never"),
+                ("eo9-stub-restart-always", "restart.always"),
+                ("eo9-stub-restart-backoff", "restart.backoff"),
                 ("eosh", "eosh"),
             ],
             "store-opi5plus-min.img",
