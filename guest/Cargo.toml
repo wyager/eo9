@@ -41,6 +41,12 @@ eo9-eofs = { path = "../crates/eo9-eofs" }
 # command words) for the net.rtl8125 driver: no_std, host-tested in the root
 # workspace — the same shared-engine pattern as eo9-eofs.
 eo9-rtl8125 = { path = "../crates/eo9-rtl8125" }
+# The DNS wire core (the A/IN query encoder and first-A answer parser) shared by the
+# l4check and curl examples: no_std, host-tested in the root workspace — same pattern.
+eo9-dns = { path = "../crates/eo9-dns" }
+# The URL core of the curl example (http:// parsing, redirect-target resolution, the
+# request-injection control-byte refusal): no_std, host-tested in the root workspace.
+eo9-curl-core = { path = "../crates/eo9-curl-core" }
 # The OHCI device core (register map, ED/TD encode/decode, HCCA, enumeration state
 # machine, HID boot decode, and the RegionIo-generic driver) for the usb.ohci /
 # usb.ohci-pci shells and the usbcheck/hidcheck examples: no_std, host-tested in the

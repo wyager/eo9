@@ -25,6 +25,9 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-hidcheck",
     "eo9-example-l2check",
     "eo9-example-l4check",
+    // The demo HTTP client (docs/board/usb-boot-demo-plan.md Part B): one GET over
+    // the granted l4 capability, http:// only, at most one redirect.
+    "eo9-example-curl",
     "eo9-example-vnicheck",
     "eo9-example-vnic4check",
     "eo9-example-bridgecheck",
@@ -233,6 +236,14 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     ("eo9-stub-net-l2-bridge", "net.l2.bridge"),
     ("eo9-stub-net-l4-over-l2", "net.l4.over-l2"),
     ("eo9-example-l4check", "l4check"),
+    // The demo HTTP client (docs/board/usb-boot-demo-plan.md Part B): a GET against a
+    // real server through the composed transport stack, at the metal prompt:
+    //   net.virtio $ net.l4.over-l2 $ curl http://10.0.2.2:8080/hello.txt
+    //   net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address dhcp)
+    //     $ curl http://example.com --resolver 10.20.3.1
+    // `check-curl` is the scripted QEMU gate (a python http.server fixture reached
+    // through slirp's 10.0.2.2 host alias).
+    ("eo9-example-curl", "curl"),
     // The shell over the network (plan/09 D44): the socket-backed text provider and its
     // supervisor, so the metal prompt can serve telnet sessions against the QEMU
     // user-mode NIC (boot with the `pci` grant and the xtask `net telnet` flags, then
@@ -379,6 +390,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("check-dhcp", rest)?;
             check_dhcp(&root)
         }
+        "check-curl" => {
+            expect_no_args("check-curl", rest)?;
+            check_curl(&root)
+        }
         "firstpoll-ab" => {
             let mut rounds: u32 = 5;
             let mut gate_only = false;
@@ -517,6 +532,12 @@ COMMANDS:
                          serial console and still resolve, and
                          `telnetd --sessions 1 --address dhcp` must serve a session over
                          the host-forward exactly like the static path
+    check-curl           Boot the same machine (no host-forward needed: the guest dials
+                         out), serve a fixture file from a loopback-bound
+                         `python3 -m http.server` on an OS-assigned port, drive
+                         `net.virtio $ net.l4.over-l2 $ curl http://10.0.2.2:<port>/hello.txt`
+                         at the serial eosh prompt (10.0.2.2 is slirp's host alias), and
+                         assert the status line, the body bytes, and the counts line
     firstpoll-ab [--rounds N] [--gate-only]
                          A/B gate for the vendored `first-poll-inline` feature
                          (docs/spikes/first-poll-inline.md): run the async-hardening matrix,
@@ -2121,6 +2142,10 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
                 ("eo9-example-l2check", "l2check"),
                 ("eo9-stub-net-l4-over-l2", "net.l4.over-l2"),
                 ("eo9-example-l4check", "l4check"),
+                // The demo HTTP client (the usb-boot-demo plan's curl lane):
+                //   net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address dhcp)
+                //     $ curl http://example.com --resolver 10.20.3.1
+                ("eo9-example-curl", "curl"),
                 ("eo9-stub-net-text", "net.text"),
                 ("eo9-example-telnetd", "telnetd"),
                 // The HDMI acceptance (plan M2): `draw` run with the boot's `gfx`
@@ -4318,13 +4343,20 @@ fn telnet_connect_session(cmd: &str, what: &str) -> Result<(std::net::TcpStream,
     ))
 }
 
-/// Boot the aarch64 kernel under QEMU with the user-mode NIC + slirp host-forward
-/// (the `pci net telnet` shape), with stdio piped for scripting. Returns the child,
-/// its piped stdin, and the serial-byte channel.
-fn spawn_telnet_qemu(
+/// The slirp netdev with the telnet host-forward (the `pci net telnet` shape).
+fn telnet_netdev() -> String {
+    format!("user,id=eo9net,hostfwd=tcp:127.0.0.1:{TELNET_HOST_PORT}-:{TELNET_GUEST_PORT}")
+}
+
+/// Boot the aarch64 kernel under QEMU with a user-mode NIC (`netdev` chooses the
+/// slirp shape: check-telnet/check-dhcp forward a host port, check-curl needs none —
+/// the guest dials out through slirp's 10.0.2.2 host alias), with stdio piped for
+/// scripting. Returns the child, its piped stdin, and the serial-byte channel.
+fn spawn_net_qemu(
     cmd: &str,
     root: &Path,
     image: &Path,
+    netdev: &str,
 ) -> Result<
     (
         std::process::Child,
@@ -4344,10 +4376,7 @@ fn spawn_telnet_qemu(
         .arg("-kernel")
         .arg(image)
         .args(["-append", "pci"])
-        .arg("-netdev")
-        .arg(format!(
-            "user,id=eo9net,hostfwd=tcp:127.0.0.1:{TELNET_HOST_PORT}-:{TELNET_GUEST_PORT}"
-        ))
+        .args(["-netdev", netdev])
         .args(["-device", "virtio-net-pci,netdev=eo9net,disable-legacy=on"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -4387,7 +4416,8 @@ fn check_telnet(root: &Path) -> Result<(), String> {
         image.display()
     );
 
-    let (mut child, mut stdin, receiver) = spawn_telnet_qemu("check-telnet", root, &image)?;
+    let (mut child, mut stdin, receiver) =
+        spawn_net_qemu("check-telnet", root, &image, &telnet_netdev())?;
     let wait_for =
         |marker: &str, what: &str| serial_wait_for("check-telnet", &receiver, marker, what);
     let type_line = |stdin: &mut std::process::ChildStdin, line: &str| {
@@ -4556,7 +4586,8 @@ fn check_dhcp(root: &Path) -> Result<(), String> {
         image.display()
     );
 
-    let (mut child, mut stdin, receiver) = spawn_telnet_qemu("check-dhcp", root, &image)?;
+    let (mut child, mut stdin, receiver) =
+        spawn_net_qemu("check-dhcp", root, &image, &telnet_netdev())?;
     let wait_for =
         |marker: &str, what: &str| serial_wait_for("check-dhcp", &receiver, marker, what);
 
@@ -4661,6 +4692,242 @@ fn check_dhcp(root: &Path) -> Result<(), String> {
          (10.0.2.15/24, gw 10.0.2.2, dns, lease duration) and resolved, and \
          `telnetd --sessions 1 --address dhcp` served a session over \
          localhost:{TELNET_HOST_PORT}"
+    );
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------------------
+// check-curl: headless end-to-end verification of the demo HTTP client (the usb-boot-demo
+// plan's curl lane). The host serves a fixture file from a loopback-bound
+// `python3 -m http.server` on an OS-assigned port (port 0 — nothing to go stale, nothing
+// to collide with a parallel worktree battery; the GAPS gate-discipline note), the guest
+// dials out through slirp's 10.0.2.2 host alias (no hostfwd at all — this gate cannot
+// fight check-telnet's 5555), and the serial transcript must carry the status line, the
+// fixture's body bytes, the header-count line, the counts line, and the typed outcome.
+// ----------------------------------------------------------------------------------------
+
+/// The fixture body the gate serves and then expects byte-for-byte on the console.
+const CURL_FIXTURE_BODY: &str = "hello from the eo9 check-curl fixture\n";
+/// No-progress alarm for the serial waits: the sliced on-target codegen prints
+/// `still compiling` lines throughout the long pole, so a healthy run is never silent
+/// for long — the clock only runs while the stream is (the GAPS note: progress-aware
+/// waits, not flat bounds).
+const CURL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+/// Hard cap on any single wait regardless of progress (a guest printing forever must
+/// not hang the gate).
+const CURL_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Like [`serial_wait_for`], but progress-aware: any received byte re-arms the `idle`
+/// alarm, and only `total` bounds the wait outright.
+fn serial_wait_for_progress(
+    cmd: &str,
+    receiver: &std::sync::mpsc::Receiver<u8>,
+    marker: &str,
+    what: &str,
+) -> Result<String, String> {
+    let start = std::time::Instant::now();
+    let mut seen = String::new();
+    loop {
+        let remaining = CURL_TOTAL_TIMEOUT
+            .checked_sub(start.elapsed())
+            .ok_or_else(|| {
+                format!(
+                    "{cmd}: gave up waiting for {what} after {CURL_TOTAL_TIMEOUT:?} \
+                     (output kept coming but never matched; last serial output: …{})",
+                    &seen[seen.len().saturating_sub(400)..]
+                )
+            })?;
+        match receiver.recv_timeout(CURL_IDLE_TIMEOUT.min(remaining)) {
+            Ok(byte) => {
+                seen.push(byte as char);
+                if seen.contains(marker) {
+                    return Ok(seen);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "{cmd}: no serial progress for {CURL_IDLE_TIMEOUT:?} waiting for \
+                     {what} (last serial output: …{})",
+                    &seen[seen.len().saturating_sub(400)..]
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(format!(
+                    "{cmd}: the serial stream ended waiting for {what} \
+                     (last serial output: …{})",
+                    &seen[seen.len().saturating_sub(400)..]
+                ));
+            }
+        }
+    }
+}
+
+/// Serve `directory` over HTTP on a loopback, OS-assigned port (`python3 -u -m
+/// http.server 0`). Returns the child and the port it bound. The `-u` matters: with a
+/// piped stdout python would buffer the one line that announces the port.
+fn spawn_http_fixture(directory: &Path) -> Result<(std::process::Child, u16), String> {
+    use std::io::BufRead as _;
+    use std::sync::mpsc;
+
+    let mut server = Command::new("python3")
+        .current_dir(directory)
+        .args(["-u", "-m", "http.server", "0", "--bind", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("check-curl: failed to spawn python3 -m http.server: {err}"))?;
+
+    // Drain both pipes for the server's whole life (a full pipe would wedge it);
+    // stdout's first line carries the bound port.
+    let stdout = server.stdout.take().expect("piped stdout");
+    let (sender, receiver) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if sender.send(line).is_err() {
+                // Nobody is listening anymore; keep draining so the server never blocks.
+                continue;
+            }
+        }
+    });
+    let stderr = server.stderr.take().expect("piped stderr");
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut sink = stderr;
+        let mut buf = [0u8; 1024];
+        while matches!(sink.read(&mut buf), Ok(n) if n > 0) {}
+    });
+
+    // "Serving HTTP on 127.0.0.1 port 54627 (http://127.0.0.1:54627/) ..."
+    let port = (|| -> Result<u16, String> {
+        let line = receiver
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .map_err(|_| {
+                String::from(
+                    "check-curl: python3 -m http.server printed nothing within 15s \
+                     (is python3 installed?)",
+                )
+            })?;
+        let after = line
+            .split(" port ")
+            .nth(1)
+            .ok_or_else(|| format!("check-curl: cannot find the bound port in {line:?}"))?;
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        digits
+            .parse::<u16>()
+            .map_err(|_| format!("check-curl: cannot parse the bound port in {line:?}"))
+    })();
+    let port = match port {
+        Ok(port) => port,
+        Err(err) => {
+            let _ = server.kill();
+            let _ = server.wait();
+            return Err(err);
+        }
+    };
+    Ok((server, port))
+}
+
+/// Boot, GET the fixture through the composed transport stack, validate the report.
+fn check_curl(root: &Path) -> Result<(), String> {
+    let image = build_kernel(root, "aarch64")?;
+
+    // The fixture: one file, served from the repo's target directory (never /tmp).
+    let fixture_dir = root.join("target").join("check-curl");
+    std::fs::create_dir_all(&fixture_dir)
+        .map_err(|err| format!("check-curl: cannot create {}: {err}", fixture_dir.display()))?;
+    std::fs::write(fixture_dir.join("hello.txt"), CURL_FIXTURE_BODY)
+        .map_err(|err| format!("check-curl: cannot write the fixture file: {err}"))?;
+
+    let (mut server, port) = spawn_http_fixture(&fixture_dir)?;
+    // Preflight from the host side before QEMU spends minutes booting: the bound
+    // port is OS-assigned (nothing stale can hold it), but the server must actually
+    // be accepting.
+    if let Err(err) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+        let _ = server.kill();
+        let _ = server.wait();
+        return Err(format!(
+            "check-curl: the fixture server is not accepting on 127.0.0.1:{port}: {err}"
+        ));
+    }
+
+    println!(
+        "xtask: check-curl — fixture at http://127.0.0.1:{port}/hello.txt; booting {} \
+         with a user-mode NIC (no host-forward) and driving \
+         `net.virtio $ net.l4.over-l2 $ curl http://10.0.2.2:{port}/hello.txt` at the \
+         eosh prompt (10.0.2.2 = slirp's host alias)",
+        image.display()
+    );
+
+    let outcome = (|| -> Result<(), String> {
+        let (mut child, mut stdin, receiver) =
+            spawn_net_qemu("check-curl", root, &image, "user,id=eo9net")?;
+        let wait_for = |marker: &str, what: &str| {
+            serial_wait_for_progress("check-curl", &receiver, marker, what)
+        };
+
+        let drive = (|| -> Result<(), String> {
+            wait_for("eosh>", "the eosh prompt")?;
+            let command =
+                format!("net.virtio $ net.l4.over-l2 $ curl http://10.0.2.2:{port}/hello.txt");
+            console_type_line("check-curl", &mut stdin, &command)?;
+            wait_for(
+                &format!("curl http://10.0.2.2:{port}/hello.txt"),
+                "the command echo",
+            )?;
+
+            // The fused three-component chain compiles on target here (the long pole;
+            // the sliced codegen narrates progress, which the waits credit).
+            // python3's http.server answers HTTP/1.0 to our HTTP/1.1 request.
+            let status = wait_for("HTTP/1.0 200 OK", "the fixture's status line")?;
+            println!("\n----- check-curl: transcript (status line) -----\n{status}");
+            let headers = wait_for(" header(s)", "curl's header-count line")?;
+            println!("----- check-curl: transcript (headers) -----\n{headers}");
+            let body = wait_for(
+                CURL_FIXTURE_BODY.trim_end(),
+                "the fixture body on the console",
+            )?;
+            println!("----- check-curl: transcript (body) -----\n{body}");
+            let counts = wait_for(
+                "byte(s) received, 0 redirect(s) followed",
+                "curl's counts line",
+            )?;
+            println!("----- check-curl: transcript (counts) -----\n{counts}");
+            let fetched = wait_for("ok: fetched(", "curl's typed outcome")?;
+            let fetched = format!(
+                "{fetched}{}",
+                wait_for("\n", "the end of the outcome line")?
+            );
+            println!("----- check-curl: transcript (outcome) -----\n{fetched}");
+            if !fetched.contains("200") {
+                return Err(format!(
+                    "check-curl: the fetched outcome does not carry the 200 status: {fetched:?}"
+                ));
+            }
+            wait_for("eosh>", "the prompt after curl")?;
+            console_type_line("check-curl", &mut stdin, "exit")?;
+            Ok(())
+        })();
+        if let Err(err) = drive {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+        let _ = child.wait();
+        Ok(())
+    })();
+
+    // The fixture server dies on every path (the GAPS leaked-gate-process note).
+    let _ = server.kill();
+    let _ = server.wait();
+    outcome?;
+
+    println!(
+        "xtask: check-curl ok — `net.virtio $ net.l4.over-l2 $ curl` fetched the \
+         loopback fixture through slirp's host alias (status line, {} fixture bytes \
+         on the console, counts line, typed fetched outcome)",
+        CURL_FIXTURE_BODY.len()
     );
     Ok(())
 }

@@ -1,0 +1,20 @@
+# eo9-curl-core is the pure, host-testable URL core of the `curl` example program
+# (the eosh-core / eo9-dns precedent: pure logic lives in a library crate the
+# workspace tests, the component stays a thin I/O shell). It owns the two places
+# where attacker-influenced text could reach the HTTP request line — the
+# user-supplied URL and a server-supplied Location header — and enforces the
+# request-injection rule there: spaces and control bytes never pass (a raw CR/LF in
+# the host or path would otherwise smuggle headers, and a bare LF survives
+# CRLF-splitting of a response head, so a hostile server's Location is exactly as
+# untrusted as the argument).
+#
+# no_std claim is kept honest with: cargo check -p eo9-curl-core --target aarch64-unknown-none
+[package]
+name = "eo9-curl-core"
+description = "http:// URL parsing, redirect-target resolution, and the request-injection (control-byte) refusal rule: the pure core of Eo9's curl example."
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]

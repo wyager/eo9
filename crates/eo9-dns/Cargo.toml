@@ -1,0 +1,17 @@
+# eo9-dns is the pure, host-testable DNS wire core shared by the example programs
+# (plan/09: l4check's resolver probe and curl's host resolution): the single-question
+# A/IN query encoder and the answer parser (compression pointers, first-A extraction),
+# factored out of the wasm components so `cargo test` exercises the byte arithmetic on
+# the host (the eo9-rtl8125 / eo9-eofs precedent: pure logic lives in a library crate
+# the workspace tests, the components stay thin I/O shells).
+#
+# no_std claim is kept honest with: cargo check -p eo9-dns --target aarch64-unknown-none
+[package]
+name = "eo9-dns"
+description = "Minimal DNS wire encoding/parsing (one A/IN question, first-A answer extraction): the pure core shared by Eo9's l4check and curl example programs."
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
