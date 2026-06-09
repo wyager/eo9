@@ -2358,6 +2358,21 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
                 .into(),
         );
     }
+    // The serial loader's payload window: load address 0x0020_0000 up to the stub's own
+    // home at 0x0400_0000 (boards/opi5-serial-loader: STUB_BASE; the stub refuses an
+    // overlapping payload at load time). The minimal image exists to fit this window —
+    // when it outgrows it, fail the build, not the bench. The full image is allowed past
+    // the cap (it already is): its transport is booti/kexec, not the stub.
+    const SERIAL_LOADER_PAYLOAD_CAP: usize = 0x0400_0000 - 0x0020_0000;
+    if minimal && flat.len() > SERIAL_LOADER_PAYLOAD_CAP {
+        return Err(format!(
+            "minimal Orange Pi image is {} bytes ({:.1} MiB) — past the serial loader's \
+             62 MiB payload window (load 0x0020_0000 .. stub 0x0400_0000; the stub would \
+             refuse it at the bench). Trim the minimal store list in build_kernel_opi5plus.",
+            flat.len(),
+            flat.len() as f64 / (1024.0 * 1024.0)
+        ));
+    }
     let out = kernel_dir.join("target").join(if minimal {
         "eo9-opi5plus-min.img"
     } else {
