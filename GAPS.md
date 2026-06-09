@@ -436,6 +436,41 @@ lane batteries — likely BlockingPool timing under CPU starvation; distinct bug
 the svc_shell one. The hunt lane should take both: run each under artificial load +
 solo loops, with logs retained.
 
+## svc_shell flaked once under parallel workspace test load (review, 2026-06-08)
+RESOLVED (flake lane, 2026-06-09; cause 3 restated after a review block — the first
+mechanism only narrowed the window and failed the reviewer's 10-burner soak 1-in-10) —
+three distinct causes on area/23-flake-fixes:
+1. `restart_cycles_complete_while_the_foreground_is_quietly_blocked` (was
+   svc_shell.rs:410): the test asserted the whole backoff lifecycle finished at the
+   end of a fixed 600ms quiet gap, but each restart decision recompiles the policy
+   component (~210ms/decision in debug; instrumented), so three decisions + 120ms of
+   delays exceed the window — 16/200 solo, 10/10 at load ~30. The park machinery is
+   precise (respawns 0–1ms after due). Test now polls `svc list` for the terminal
+   state; lifecycle-shape asserts unchanged. 0/501 solo, 0/505 under load after.
+2. `disk::tests::read_only_opens_share_the_image` (disk.rs:483): the pool worker
+   delivered a completion while still holding its Arc<File> clone, so the exclusive
+   flock could outlive the observed write completion and the provider drop; the next
+   open got WouldBlock. 2/1000 solo, 2/2000 at load ~30. Fixed: the clone is dropped
+   before the completer runs (completion observed ⇒ that op's handle released).
+   0/2000 solo, 0/4000 under load after.
+3. The load-16-36 "fails 3-of-3 on master" mode was the park backstop's liveness
+   detector, not the tests: its foreground arm tripping the suites' no-`liveness:`
+   gate (foreground=true) on completions that were delivered but resumed late under
+   load. Final mechanism (per review): the foreground arm is REMOVED by category —
+   while the drive thread is parked, foreground runnability is defined as "doorbell
+   rang" (Task::is_runnable), so any parked-side poll that sees the foreground
+   runnable has proven delivery; a missed edge (completer never rings) is invisible
+   to that poll however gated, detectable only completer-side at the ring site
+   (documented in the detector). A fired-waker gate alone (first attempt) merely
+   narrowed the race and still failed a 10-burner soak 1-in-10. The services arm —
+   the detector's real value, state that can change without this thread's wake-set —
+   stays, with two time-shaped exclusions: fired waker (late resume) and a restart
+   deadline crossing into dueness during the park window. Acceptance soak: full
+   suite x20 under 10 burners (load ~14-28), 0 failures, 0 liveness findings.
+Residual (tracked, by design for now): restart-policy decisions recompile the policy
+per decision (docs/design/policy-components.md blesses precompile-and-cache as the
+upgrade); ~210ms/decision debug-build floor on restart-lifecycle latency.
+
 ## Check gates can leak the QEMU on the failure path (dhcp lane, 2026-06-08)
 A failed check gate (kill()+wait on error) left its qemu-system-aarch64 alive holding
 the 5555 hostfwd port; the NEXT gate then died instantly with "serial stream ended"

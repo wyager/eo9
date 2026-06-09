@@ -291,17 +291,32 @@ fn logs_are_captured_and_restart_always_restarts_in_the_background() {
 // The park path (docs/spikes/registry-liveness.md)
 // -------------------------------------------------------------------------------------
 
-/// Run a session whose stdin is held open and quiet between two line batches: the drive
-/// loop spends the gap parked on a blocked `read-line`, which is exactly the edge the
-/// park wake-set serves (restart deadlines and, in the future, service completions).
-/// The gap starts only once `marker` has appeared on stdout (e.g. the `detached:`
+/// Run a session whose stdin is held open and quiet between two phases: the drive loop
+/// spends the gap parked on a blocked `read-line`, which is exactly the edge the park
+/// wake-set serves (restart deadlines and, in the future, service completions). The gap
+/// starts only once `marker` has appeared on stdout (e.g. the `detached:`
 /// acknowledgment), so slow startup (debug builds) cannot consume the quiet window.
+///
+/// After the gap the session is driven by **polling, not a deadline**: `poll` is sent
+/// repeatedly, each reply awaited (one more stdout line starting with `reply_prefix`),
+/// until `done` accepts the accumulated stdout — only then are the `after` lines sent
+/// and the session closed. The registry guarantees *what* a restart lifecycle does, not
+/// *when* it finishes (each policy decision recompiles the policy component — hundreds
+/// of milliseconds in a debug build, arbitrarily long under load), so asserting the
+/// terminal state at a fixed instant was a flake by construction; waiting on the
+/// observable state is not. A genuine stall still fails loudly via the bounded deadline
+/// on the whole poll phase, and a missed park wake edge is the liveness gate's job (the
+/// `liveness:` stderr assertion), not this helper's.
+#[allow(clippy::too_many_arguments)] // one scripted test session, not a reusable API
 fn shell_session_with_gap(
     store: &Path,
     extra_args: &[&str],
     before: &[&str],
     marker: &str,
     gap: std::time::Duration,
+    poll: &str,
+    reply_prefix: &str,
+    done: impl Fn(&str) -> bool,
     after: &[&str],
 ) -> Session {
     use std::io::Read;
@@ -359,9 +374,46 @@ fn shell_session_with_gap(
         }
         std::thread::sleep(gap);
 
+        // Poll until `done` accepts the output: send the poll line, await its reply (one
+        // more `reply_prefix` line than before), re-check. The deadline bounds a genuine
+        // stall; it is deliberately generous because it guards correctness, not pace.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let replies_before = {
+                let buf = stdout_buf.lock().unwrap();
+                count_reply_lines(&String::from_utf8_lossy(&buf), reply_prefix)
+            };
+            stdin
+                .write_all(format!("{poll}\n").as_bytes())
+                .expect("poll line");
+            stdin.flush().expect("flush poll line");
+            let text = loop {
+                let text = {
+                    let buf = stdout_buf.lock().unwrap();
+                    String::from_utf8_lossy(&buf).into_owned()
+                };
+                if count_reply_lines(&text, reply_prefix) > replies_before {
+                    break text;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the session never answered {poll:?}:\n{text}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            if done(&text) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the polled state never settled:\n{text}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
         let mut tail = after.join("\n");
         tail.push('\n');
-        stdin.write_all(tail.as_bytes()).expect("second batch");
+        stdin.write_all(tail.as_bytes()).expect("final batch");
     }
     drop(child.stdin.take());
 
@@ -382,11 +434,26 @@ fn shell_session_with_gap(
     }
 }
 
-/// A backoff service completes its restart cycles while the foreground sits quietly
-/// blocked on `read-line` — service progress during the gap comes entirely from the
-/// drive loop's parked edge (deadline-bounded parks; the wake-set fix keeps this path
-/// honest). The service traps instantly, restarts twice with a 40ms delay, then gives
-/// up: by the end of a 600ms quiet gap the whole lifecycle must have finished.
+/// The number of stdout lines that look like a poll reply (a row for the polled
+/// service). Used by [`shell_session_with_gap`] to pair each poll with its own reply.
+fn count_reply_lines(text: &str, reply_prefix: &str) -> usize {
+    text.lines()
+        .filter(|line| line.trim_start().starts_with(reply_prefix))
+        .count()
+}
+
+/// A backoff service runs its restart cycles while the foreground sits quietly blocked
+/// on `read-line` — service progress during the gap comes entirely from the drive
+/// loop's parked edge (deadline-bounded parks; the wake-set fix keeps this path honest,
+/// and the suite's `liveness:` gate would flag a missed wake edge). The service traps
+/// instantly, restarts twice with a 40ms backoff, then gives up.
+///
+/// The terminal state is awaited by polling `svc list`, not asserted at a fixed
+/// instant: the registry promises the lifecycle's *shape* (trap, two delayed restarts,
+/// give-up — exactly 2 restarts, then `finished`), but not its duration. Each restart
+/// decision recompiles the policy component (~200ms per decision in a debug build,
+/// more under load), so the three decisions alone can exceed any "quiet window" budget
+/// a fixed-gap assertion would pick — that assumption was this test's 1-in-12 flake.
 #[test]
 fn restart_cycles_complete_while_the_foreground_is_quietly_blocked() {
     let store = temp_store("park-path");
@@ -399,18 +466,28 @@ fn restart_cycles_complete_while_the_foreground_is_quietly_blocked() {
         ],
         "detached: crasher",
         std::time::Duration::from_millis(600),
-        &["svc list", "exit"],
+        "svc list",
+        "crasher",
+        |out| {
+            // Done once the *latest* table row shows the lifecycle's terminal state.
+            out.lines()
+                .rev()
+                .find(|line| line.trim_start().starts_with("crasher"))
+                .is_some_and(|line| line.contains("finished"))
+        },
+        &["exit"],
     );
     assert_eq!(session.code, 0);
     let out = &session.stdout;
     let crasher_line = out
         .lines()
+        .rev()
         .find(|line| line.trim_start().starts_with("crasher"))
         .unwrap_or_else(|| panic!("crasher appears in svc list:\n{out}"));
     assert!(
         crasher_line.contains("finished"),
-        "the backoff lifecycle (trap, 2 delayed restarts, give-up) completed during the \
-         quiet gap:\n{out}"
+        "the backoff lifecycle (trap, 2 delayed restarts, give-up) reached its terminal \
+         state:\n{out}"
     );
     let restarts: u32 = crasher_line
         .split_whitespace()
@@ -419,7 +496,7 @@ fn restart_cycles_complete_while_the_foreground_is_quietly_blocked() {
         .unwrap_or_else(|| panic!("the crasher line has a restart count: {crasher_line}"));
     assert_eq!(
         restarts, 2,
-        "both delayed restarts happened while the foreground was parked:\n{out}"
+        "exactly the two delayed restarts happened while the foreground was blocked:\n{out}"
     );
 }
 
