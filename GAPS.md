@@ -633,6 +633,21 @@ Follow-up lane: profile a single step on the board (alloc counters first), then 
 arena-allocate or shrink-clone the combinator states or precompile the grammar's static skeleton.
 Until then per-key feel on the board is bounded by ~50 ms/char echo.
 
+UPDATE (area/33 study lane, 2026-06-09 — docs/study/parser-step-cost.md): the parser
+stack is measured and CANNOT be the 50 ms. Host-native a tracked keystroke (step + the
+two M3 oracle walks) is ~14 µs / ~820 allocs; the same component bytes under our kernel
++ on-target cranelift + in-wasm dlmalloc on QEMU/HVF cost ~98 µs net (wasm tax ~7×);
+A76-scaled that bounds the parser layers at ~0.2–0.4 ms/keystroke — ≤1% of the
+observed number. The board's own data corroborates: O(1) backspace (zero parser work)
+measures ~54 ms, same as typing, and the pre-M3 slope's ~0.85 s fixed intercept matches
+the 1 s idle backstop (the scavenge-rescued-RX era — a liveness finding, not a parser
+cost). The residue is a board-only layer; the discriminating probes (in-guest timing
+builtin, isolated-vs-burst keystroke, cache-attribute memcpy probe, FTDI latency-timer
+audit of the bench harness) are listed in the study §5 and belong to a board lane. The
+real parser-lane findings: the oracle walks are ~95% of per-key cost (a non-allocating
+early-exit name query is the 5–7× first rung) and the word-end provide_args rebuild()
+is an O(N) 1.4–3.0 ms (HVF) spike that should re-arm incrementally — ladder in §6.
+
 ## build-kernel opi5plus overwrites the shared QEMU kernel ELF — silent wrong-binary boots
 (repl-m3 lane workaround, recorded by the review train, 2026-06-09) `cargo xtask
 build-kernel aarch64 opi5plus [minimal]` builds into the same cargo target path the
