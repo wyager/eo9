@@ -577,3 +577,14 @@ posture):
   arm covers full size), send_image.py --tcp uses a 60 s stall window, and the gate is
   on-demand like check-telnet/check-usb rather than in `ci`. The board runs native and
   is wire-bound.
+
+## Service spawns carry no root capability grants (bench, 2026-06-09)
+Both `detach` and init's services config refuse compositions with unsatisfied ROOT
+imports (platform/console-sink/etc) — correctly, per "a detached service runs with
+exactly what its detacher composed" — but there is no way to grant roots to a
+service at all, so the demo plan's `station` config (`kbd = usb.ohci $ usb.kbd
+restart restart.always`) cannot exist. The plan assumed service spawns inherit the
+boot grant tokens like the console session does. Lane: the svc registry's spawn
+path should link root providers per the same boot grants (operator-authored config
+= console-equivalent trust), and init's config grammar needs either composition
+support or saved-composition references for multi-component services.
