@@ -1,0 +1,29 @@
+// sinkcheck — the console-sink fake injector (docs/board/usb-ohci-plan.md M4: "the
+// mechanics + a fake-HID injector fully QEMU-testable first"): inject a line into the
+// kernel console's input ring and report how many bytes the ring accepted. After this
+// program exits, the next eosh prompt reads the injected line AS IF TYPED — which is
+// the whole point and the scripted acceptance. Capabilities: eo9:console-sink, eo9:text.
+package eo9-examples:sinkcheck@0.1.0;
+
+world sinkcheck {
+    import eo9:console-sink/sink@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    variant program-success {
+        /// Bytes the ring accepted (the text plus its newline).
+        injected(u32),
+    }
+
+    variant program-failure {
+        /// The capability refused (no `console-sink` boot grant / composed denial).
+        denied,
+        /// An argument was unusable.
+        bad-arguments(string),
+        /// Any other sink or console error.
+        io(string),
+    }
+
+    /// `text`: the line to inject (a trailing newline is appended, so the prompt
+    /// executes it; default `hello`).
+    export main: async func(text: option<string>) -> result<program-success, program-failure>;
+}

@@ -20,7 +20,8 @@
 //! **The dance** (`commit`, after the CRC verifies — every step before the final asm
 //! block is refusal-free):
 //!  1. print the final `kexec: jumping to the staged image (N bytes, crc ok)` line;
-//!  2. quiesce: clear bus mastering on every PCI function the machine enumerates
+//!  2. quiesce: clear bus mastering on every PCI function the machine enumerates,
+//!     then run every platform region's quiesce hook (the USB OHCIs' UsbReset drop)
 //!     (revoking every DMA licence — the per-task teardown discipline, applied
 //!     machine-wide because the machine itself is about to end);
 //!  3. write `bootargs` to the staged-bootargs page (USB-boot Option-1 format: one
@@ -263,6 +264,13 @@ fn commit_impl(len: u64, crc_expected: u32, bootargs: &str) -> WitKexecError {
     }
     crate::kprintln!("kexec: bus mastering cleared on {cleared} PCI function(s)");
 
+    // The platform half of the same quiesce (the USB lane's bus-mastering OHCI
+    // regions have no bus-master bit; their per-region hooks drop the controller to
+    // UsbReset — no SOF, no HCCA DMA — before the staged copy starts). Machine-wide
+    // like the PCI walk; 0 on QEMU (no hooked regions), 2 on the board (both OHCIs).
+    let platform_quiesced = super::platform_provider::quiesce_all_regions();
+    crate::kprintln!("kexec: quiesced {platform_quiesced} platform region(s)");
+
     // The staged-bootargs page (Option-1 format: the line, NUL-terminated).
     {
         let page = crate::mmu::BOOTARGS_PAGE as *mut u8;
@@ -288,7 +296,12 @@ fn commit_impl(len: u64, crc_expected: u32, bootargs: &str) -> WitKexecError {
         let start = (&raw const __kexec_stub_start).addr();
         let end = (&raw const __kexec_stub_end).addr();
         let stub_len = end - start;
-        debug_assert!(stub_len <= KEXEC_STUB_LEN);
+        // Hard check (review nit promoted): a stub outgrowing its reserved slot must
+        // never be release-mode-silent — the copy below would overrun the slot.
+        assert!(
+            stub_len <= KEXEC_STUB_LEN,
+            "kexec stub ({stub_len} bytes) exceeds its reserved {KEXEC_STUB_LEN}-byte slot"
+        );
         // SAFETY: the stub slot is the reserved region's first 64 KiB (mmu.rs); the
         // source is the kernel's own text.
         unsafe {

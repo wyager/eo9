@@ -132,6 +132,13 @@ pub fn boot(bootargs: Option<&str>) -> bool {
              is ignored"
         );
     }
+    // The bare `console-sink` token grants console-input injection (typing as the
+    // operator) — never linked by default; see `console_sink_provider`.
+    super::console_sink_provider::set_granted(
+        tokenize(bootargs)
+            .iter()
+            .any(|token| token == "console-sink"),
+    );
     // The bare `storedisk` token claims a virtio-blk function for the kernel's own
     // persistent store: a disk-backed cache of on-target compile results (and nothing
     // else); see `diskcache`. Independent of the guest-facing `pci` grant above.
@@ -293,6 +300,9 @@ fn try_run(entry: &StoreEntry, args: &[(String, String)]) -> Result<String, wasm
     }
     if super::platform_provider::granted() {
         super::platform_provider::add_platform(&mut linker)?;
+    }
+    if super::console_sink_provider::granted() {
+        super::console_sink_provider::add_console_sink(&mut linker)?;
     }
     // The gfx.simplefb root provider follows the same opt-in rule (the `gfx` token).
     #[cfg(feature = "board-opi5plus")]

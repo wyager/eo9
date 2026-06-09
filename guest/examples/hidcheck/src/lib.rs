@@ -37,6 +37,7 @@ eo9_guest::main! {
     async fn main(
         reports: Option<u32>,
         window_ms: Option<u32>,
+        quiet: Option<bool>,
     ) -> Result<ProgramSuccess, ProgramFailure> {
         let io_failure = |err: text::TextError| ProgramFailure::Io(format!("{err:?}"));
         let usb_failure = |err: usb::UsbError| match err {
@@ -52,6 +53,7 @@ eo9_guest::main! {
             None => 5,
         };
         let window_ns = u64::from(window_ms.unwrap_or(30_000)) * 1_000_000;
+        let quiet = quiet.unwrap_or(false);
 
         let root = usb::default();
         let time = time_api::default();
@@ -73,7 +75,22 @@ eo9_guest::main! {
                 "no device connected on any root-hub port",
             )));
         };
-        let device = usb::attach(&root, port).await.map_err(usb_failure)?;
+        let mut device = usb::attach(&root, port).await.map_err(usb_failure)?;
+
+        // One hub level (the bench keyboard sits behind its own built-in FS hub):
+        // when the attached device is a hub (class 09), traverse to the child and
+        // continue against it — the demo-scope hub mini-driver in the shell.
+        let head = usb::control_in(&device, 0x80, 6, 0x0100, 0, 18)
+            .await
+            .map_err(usb_failure)?;
+        if head.get(4).copied() == Some(0x09) {
+            text::write_out_line("hidcheck: the device is a hub - traversing to its child")
+                .map_err(io_failure)?;
+            device = usb::attach_child(&device).await.map_err(|err| match err {
+                usb::UsbError::Io(text) => ProgramFailure::NoHid(text),
+                other => usb_failure(other),
+            })?;
+        }
 
         // The configuration blob, parsed down to the boot interface + endpoint.
         let head = usb::control_in(
@@ -126,9 +143,27 @@ eo9_guest::main! {
         usb::control_out(&device, 0x21, 0x0b, 0, u16::from(interface.interface_number), Vec::new())
             .await
             .map_err(class_failure)?;
-        usb::control_out(&device, 0x21, 0x0a, 0, u16::from(interface.interface_number), Vec::new())
-            .await
-            .map_err(class_failure)?;
+        // SET_IDLE is REQUIRED for keyboards but OPTIONAL for mice (HID 1.11 §7.2.4)
+        // — real mice routinely STALL it (the M3 board round's G500; Linux usbhid
+        // ignores SET_IDLE failures for the same reason). A refusal costs nothing:
+        // the device just reports at its default idle rate, and the keyboard
+        // previous-state diff dedupes repeats anyway.
+        if let Err(error) = usb::control_out(
+            &device,
+            0x21,
+            0x0a,
+            0,
+            u16::from(interface.interface_number),
+            Vec::new(),
+        )
+        .await
+        {
+            text::write_out_line(&format!(
+                "hidcheck: SET_IDLE refused ({error:?}) - optional for mice (HID 1.11 \
+                 §7.2.4), continuing"
+            ))
+            .map_err(io_failure)?;
+        }
 
         let opened = usb::open_interrupt_in(
             &device,
@@ -166,8 +201,14 @@ eo9_guest::main! {
             if first_report_at.is_none() {
                 first_report_at = Some(now);
             }
-            let raw: Vec<String> =
-                report.iter().map(|byte| format!("{byte:02x}")).collect();
+            // Quiet mode: only the first three reports go to the console; the
+            // counting (and the keyboard previous-state tracking) continues.
+            let printing = !quiet || count <= 3;
+            let raw: Vec<String> = if printing {
+                report.iter().map(|byte| format!("{byte:02x}")).collect()
+            } else {
+                Vec::new()
+            };
             let decoded = match interface.protocol {
                 descriptor::PROTOCOL_KEYBOARD => match KeyboardReport::parse(&report) {
                     Some(current) if current.is_rollover_error() => {
@@ -215,11 +256,20 @@ eo9_guest::main! {
                 },
                 _ => String::from("(unknown protocol)"),
             };
-            text::write_out_line(&format!(
-                "hidcheck: report {count} [{}] {decoded}",
-                raw.join(" "),
-            ))
-            .map_err(io_failure)?;
+            if printing {
+                text::write_out_line(&format!(
+                    "hidcheck: report {count} [{}] {decoded}",
+                    raw.join(" "),
+                ))
+                .map_err(io_failure)?;
+                if quiet && count == 3 {
+                    text::write_out_line(&format!(
+                        "hidcheck: (quiet — counting the remaining {} silently)",
+                        target_reports - count,
+                    ))
+                    .map_err(io_failure)?;
+                }
+            }
             if count >= target_reports {
                 break;
             }

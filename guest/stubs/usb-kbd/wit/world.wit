@@ -1,0 +1,50 @@
+/// eo9:usb-kbd — the USB keyboard console service (docs/board/usb-ohci-plan.md M4):
+/// boot-protocol HID reports in, console input bytes out.
+///
+/// `usb.kbd` consumes whatever eo9:usb provider it is composed with (`usb.ohci` on
+/// the board, `usb.ohci-pci` under QEMU), finds the keyboard — directly on a root
+/// port or behind ONE hub level (the bench keyboard's built-in FS hub) — configures
+/// boot protocol, and forwards decoded keystrokes into the kernel console input ring
+/// through `eo9:console-sink` (its own boot grant: typing as the operator IS the
+/// service's purpose). Serial and USB input interleave in the one ring; an injected
+/// Ctrl-C (ctrl+c chord -> raw 0x03) interrupts exactly like the serial key.
+///
+///   usb.ohci $ usb.kbd                  (the demo line; runs until killed)
+///   usb.ohci-pci $ usb.kbd --window-ms 12000   (the scripted QEMU gate)
+package eo9:usb-kbd@0.1.0;
+
+world kbd {
+    import eo9:usb/usb@0.1.0;
+    import eo9:console-sink/sink@0.1.0;
+    import eo9:time/time@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    variant program-success {
+        /// The bounded window closed; carries how many keystroke bytes were
+        /// forwarded (the scripted-test exit — unbounded runs never succeed,
+        /// they run until killed or the device fails).
+        forwarded(u32),
+    }
+
+    variant program-failure {
+        /// An argument was unusable.
+        bad-arguments(string),
+        /// The USB or sink capability refused.
+        denied,
+        /// No host controller is visible through the underlying capability.
+        no-controller,
+        /// No boot-protocol keyboard found (directly or behind one hub level);
+        /// carries what was found instead.
+        no-keyboard(string),
+        /// The device conversation failed mid-stream (disconnect, transfer error)
+        /// — a restart policy re-runs the service and re-enumerates.
+        device-lost(string),
+        /// A console or sink error.
+        io(string),
+    }
+
+    /// `window-ms`: exit successfully after this much wall time (the scripted-test
+    /// bound). Absent or 0 = run until killed (the service shape — pair with a
+    /// restart policy for hotplug-ish recovery).
+    export main: async func(window-ms: option<u32>) -> result<program-success, program-failure>;
+}

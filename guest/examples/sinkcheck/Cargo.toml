@@ -1,0 +1,15 @@
+[package]
+name = "eo9-example-sinkcheck"
+description = "Eo9 example program: inject a line into the kernel console input ring through the granted eo9:console-sink capability - the M4 fake-HID injector (targets the eo9-examples:sinkcheck/sinkcheck world: console-sink + text)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

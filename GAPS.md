@@ -415,7 +415,14 @@ the refusal explicit; decide whether network sessions should ever be grantable
 power (probably yes behind an explicit telnetd flag — remote reset is operationally
 valuable, as this same incident proved via the session-burn workaround).
 
-## svc_shell flaked once under parallel workspace test load (review, 2026-06-08)
+## [GRADUATED 2026-06-08, M3-fix round: now flaky SOLO — needs a real bug hunt] svc_shell flaked once under parallel workspace test load (review, 2026-06-08)
+UPDATE (usb M3-fix round): `restart_cycles_complete_while_the_foreground_is_quietly_blocked`
+failed in `cargo xtask ci` again AND then failed 1-of-3 SOLO runs
+(`cargo test -p eo9-integration --test svc_shell`) on an otherwise idle machine —
+assertion at svc_shell.rs:410 "the backoff lifecycle (trap, 2 delayed restarts,
+give-up) completed during the quiet gap". Not load-conditional; per the original
+watch item this graduates to a service-registry timing bug hunt (the usb lane does
+not touch svc paths). Original entry:
 During the area/09 merge review, `svc_shell` failed once (exit 101) in the parallel
 `cargo test --workspace` run, then passed 8/8 solo and the full ci re-ran green. The
 branch under review does not touch svc/shell paths — smells like load-sensitive
@@ -459,7 +466,13 @@ line. Believed GAPS'd earlier but the entry never landed (caught by the repl stu
 cross-check — the no-drop rule working). Fix folds into the incremental-parser M2
 editor work: the recall ring becomes a capped view (e.g. 64) of session history.
 
-## Platform-provider DMA teardown has no generic quiesce (recorded 2026-06-08, USB M0 lane)
+## [FIXED 2026-06-08, USB M3-fix — per-region quiesce hooks] Platform-provider DMA teardown has no generic quiesce (recorded 2026-06-08, USB M0 lane)
+RESOLUTION: `RegionDef::quiesce` (per-device fn, run at claim release before the
+task's DMA buffers free); the board OHCI regions drop the controller to UsbReset.
+The M3 board idle-reset incident was this gap live (an operational OHCI DMA-writes
+HccaFrameNumber into the HCCA every 1 ms — after teardown, into freed heap). The
+PCI-exclusivity-convergence half of the entry remains open. Original entry:
+
 `eo9:platform` frees a task's DMA buffers at teardown exactly like `eo9:pci` — but a
 platform device has no bus-master bit, so the provider cannot generically revoke a
 device's licence to DMA before the memory returns to the heap (pci_provider's
@@ -480,6 +493,19 @@ quiesce path leaving PHY state the next claim's warm re-init (ram-code skip path
 doesn't recover, or cumulative u2/PHY state across rapid claims. Driver lane: consider
 a full PHY reset on claim when the previous owner was quiesced-by-kexec, or always.
 Bench rule meanwhile: if LinkDown appears, cold-cycle rather than retrying claims.
+
+## svc_shell flake has WIDENED to a 3-of-3 CI blocker on master (usb rebase round, 2026-06-08 night)
+On pristine master 24c8578 (fresh detached worktree, no branch changes), `cargo test
+-p eo9-integration --test svc_shell` failed 3 of 3 consecutive runs, 1-2 tests each,
+rotating among: restart_cycles_complete_while_the_foreground_is_quietly_blocked (the
+original specimen), soundness_a_detached_child_cannot_use_what_its_detacher_did_not_compose,
+detach_list_stop_clear_lifecycle, services_die_with_the_process — several with
+"liveness: the park backstop found stranded work (foreground=true, services=false,
+n=1)" in the transcript. Host was under multi-agent load (runtimes 17s-59s), which
+the original entries predicted would worsen it, but solo-on-idle failures were
+already recorded. This now BLOCKS any branch's `cargo xtask ci` from exiting 0
+reliably; the graduated bug-hunt lane is urgent. The usb branch documents it as the
+sole ci failure with this master baseline as proof.
 
 ## Bundle checkout-dependence is a CLASS, not one component (kernhyg lane, 2026-06-08)
 The fs-eofs path-dep byte-churn applies to EVERY component consuming an

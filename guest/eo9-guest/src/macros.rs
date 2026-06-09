@@ -208,6 +208,16 @@ macro_rules! __bindings_with {
             $($tail)*
         );
     };
+    (apis [console_sink $($rest:ident)*] with [$($acc:tt)*] $($tail:tt)*) => {
+        $crate::__bindings_with!(
+            apis [$($rest)*]
+            with [$($acc)*
+                "eo9:console-sink/types@0.1.0": eo9_guest::api::console_sink::types,
+                "eo9:console-sink/sink@0.1.0": eo9_guest::api::console_sink::sink,
+            ]
+            $($tail)*
+        );
+    };
     // All APIs processed, nothing remapped: a pure-compute world with no eo9 imports.
     (apis [] with [] world $world:literal) => {
         ::wit_bindgen::generate!({

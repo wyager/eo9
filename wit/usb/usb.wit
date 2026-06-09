@@ -89,6 +89,14 @@ interface usb {
     /// control transfers; the full descriptor chain is the consumer's to read.
     attach: async func(u: borrow<usb-impl>, port: u8) -> result<device, usb-error>;
 
+    /// Traverse ONE hub level to the single device behind it (the demo-scope hub
+    /// mini-driver): when `d` enumerated as a hub (class 09), configure it, power
+    /// its downstream ports, hub-reset the one connected full-speed child, and
+    /// enumerate it like any device. Refuses typed (`unsupported`, with the
+    /// limitation named in `io`'s text where finer) on a non-hub device, multiple
+    /// connected children, more than one hub level, or a low-speed child.
+    attach-child: async func(d: borrow<device>) -> result<device, usb-error>;
+
     /// A control transfer with an IN data stage: returns the data the device sent
     /// (possibly shorter than `length` — USB short reads are normal).
     control-in: async func(

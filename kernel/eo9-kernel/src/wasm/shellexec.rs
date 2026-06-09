@@ -875,8 +875,8 @@ pub(super) fn bind_args(
 static SPAWN_LINKER: KLock<Option<(GrantShape, Arc<Linker<KernelState>>)>> = KLock::new(None);
 
 /// The boot-constant grant bits a cached spawn linker was built under:
-/// (pci, platform, gfx, kexec).
-type GrantShape = (bool, bool, bool, bool);
+/// (pci, platform, gfx, kexec, console-sink).
+type GrantShape = (bool, bool, bool, bool, bool);
 
 /// The boot's gfx grant (the `gfx` token). Only the Orange Pi 5 Plus board profile has
 /// the gfx.simplefb root provider; everywhere else the bit is constantly `false` and
@@ -912,6 +912,7 @@ fn spawn_linker(engine: &Engine) -> Result<Arc<Linker<KernelState>>, wasmtime::E
         super::platform_provider::granted(),
         gfx_granted(),
         kexec_granted(),
+        super::console_sink_provider::granted(),
     );
     if let Some(linker) = SPAWN_LINKER.with(|slot| match slot {
         Some((cached, linker)) if *cached == shape => Some(linker.clone()),
@@ -945,6 +946,10 @@ fn spawn_linker(engine: &Engine) -> Result<Arc<Linker<KernelState>>, wasmtime::E
     #[cfg(target_arch = "aarch64")]
     if shape.3 {
         super::kexec_provider::add_kexec(&mut linker)?;
+    }
+    // Console-sink (typing as the operator) is the same per-boot opt-in posture.
+    if shape.4 {
+        super::console_sink_provider::add_console_sink(&mut linker)?;
     }
     let linker = Arc::new(linker);
     SPAWN_LINKER.with(|slot| *slot = Some((shape, linker.clone())));
@@ -2623,6 +2628,9 @@ fn missing_capability(text: &str) -> Option<String> {
     } else if text.contains("eo9:platform/") {
         "platform device access, which this boot did not grant (add the `platform` token \
          — or `platform=<region>,…` for specific regions — to the kernel command line)"
+    } else if text.contains("eo9:console-sink/") {
+        "console-input injection, which this boot did not grant (add the `console-sink` \
+         token to the kernel command line)"
     } else if text.contains("eo9:gfx/") {
         GFX_REFUSAL
     } else if text.contains("eo9:kexec/") {
