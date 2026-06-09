@@ -716,8 +716,16 @@ pub struct Words {
 
 impl Words {
     pub fn entry_is_word(entry: &str) -> bool {
+        // Printable ASCII only (beyond the word-byte rule): control bytes are word
+        // bytes to the lexer (it never sees them — the key decoders map them to Ctrl
+        // keys), but an entry containing one would carry it into `completions()` and
+        // from there raw onto the terminal in a TAB menu. Construction-side
+        // sanitization (eosh-core's manual merge) already strips them; this is the
+        // grammar-side backstop so no caller can put an escape in the menu.
         !entry.is_empty()
-            && entry.bytes().all(is_word_byte)
+            && entry
+                .bytes()
+                .all(|byte| is_word_byte(byte) && (0x21..=0x7e).contains(&byte))
             && !entry.starts_with('[')
             && !entry.starts_with('{')
             && !entry.starts_with("--")

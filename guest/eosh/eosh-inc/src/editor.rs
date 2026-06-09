@@ -421,6 +421,26 @@ impl Editor {
     /// name-dead — module docs), echo. A committed (green) character pushes its
     /// predecessor state onto the snapshot stack — the state is moved, not cloned, so
     /// this costs nothing beyond the step itself.
+    /// The stack invariant (struct docs): one snapshot per green CHARACTER of the
+    /// line. Checked in debug builds after every mutation of line/stack/red_from —
+    /// every host test runs it on every key; release builds (the shipped guest)
+    /// compile it out. The differential tests additionally pin pop == reparse.
+    #[inline]
+    fn debug_check_stack(&self) {
+        if cfg!(debug_assertions) {
+            let green_end = self.red_from.unwrap_or(self.line.len());
+            let green_chars = self.line[..green_end]
+                .iter()
+                .filter(|&&byte| !(0x80..=0xbf).contains(&byte))
+                .count();
+            debug_assert_eq!(
+                self.stack.len(),
+                green_chars,
+                "snapshot stack out of step with the green prefix"
+            );
+        }
+    }
+
     fn insert_char(&mut self, bytes: &[u8]) {
         if self.line.len() + bytes.len() > MAX_LINE_BYTES {
             // The kernel console's policy at the cap: drop, no echo.
@@ -457,6 +477,7 @@ impl Editor {
         if let Ok(text) = core::str::from_utf8(bytes) {
             self.emit(text);
         }
+        self.debug_check_stack();
     }
 
     // -- backspace ---------------------------------------------------------------------
@@ -504,6 +525,7 @@ impl Editor {
                 }
             }
         }
+        self.debug_check_stack();
     }
 
     /// Recompute everything from the line — parser state, snapshot stack, `red_from`
@@ -548,6 +570,7 @@ impl Editor {
             index = end;
         }
         self.line = line;
+        self.debug_check_stack();
     }
 
     // -- TAB --------------------------------------------------------------------------
@@ -676,6 +699,7 @@ impl Editor {
             self.out.push(char::from(byte));
             appended = true;
         }
+        self.debug_check_stack();
         appended
     }
 

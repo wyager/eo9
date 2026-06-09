@@ -1400,6 +1400,44 @@ mod tests {
         assert!(words.contains(&"det"), "{words:?}");
         assert!(comp.iter().all(|c| c.tag == Tag::Value), "{comp:?}");
 
+        // Control bytes in hints never reach the menu (the printable backstop in
+        // `Words::entry_is_word` — construction-side sanitization in eosh-core is the
+        // first line of defense, this is the grammar-side one): an escape-opening or
+        // BEL-carrying value is filtered; flag names likewise.
+        let mut hostile = fake_vocab();
+        hostile.programs.insert(
+            "hello".to_string(),
+            ProgramArgs {
+                flags: vec![
+                    FlagSpec {
+                        name: "mode".to_string(),
+                        ty: "string".to_string(),
+                        doc: None,
+                        values: vec![
+                            "ok".to_string(),
+                            "\u{1b}[31mred".to_string(),
+                            "a\u{7}b".to_string(),
+                        ],
+                        kind: None,
+                    },
+                    flag("\u{1b}]0;title", "string"),
+                ],
+            },
+        );
+        let state = feed_bytes(command_line(&hostile), b"hello --mode ").expect("viable");
+        let mut out = Vec::new();
+        state.completions(&mut out);
+        let words: Vec<&str> = out.iter().map(|c| c.word.as_str()).collect();
+        assert_eq!(words, vec!["ok"], "control-byte hints leaked: {words:?}");
+        let state = feed_bytes(command_line(&hostile), b"hello --").expect("viable");
+        let mut out = Vec::new();
+        state.completions(&mut out);
+        assert!(
+            out.iter()
+                .all(|c| c.word.bytes().all(|b| (0x21..=0x7e).contains(&b))),
+            "control bytes in the flag menu: {out:?}"
+        );
+
         // Unknown head: the generic grammar — no flag or value candidates anywhere.
         assert!(comps_at("unknowntool --").is_empty());
         assert!(comps_at("rng --seed ").is_empty());
