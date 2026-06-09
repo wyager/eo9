@@ -2278,6 +2278,13 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
                 //   sinkcheck --text hello      (sink mechanics without a keyboard)
                 ("eo9-stub-usb-kbd", "usb.kbd"),
                 ("eo9-example-sinkcheck", "sinkcheck"),
+                // init, so the default boot runs the service supervisor and the
+                // console session holds eo9:svc — `detach kbd = usb.ohci $ usb.kbd
+                // restart restart.always` is the demo's persistent keyboard shape.
+                // (The FULL image outgrew the serial loader's 62 MiB cap — the
+                // minimal image is now the bench's only serial-loadable store, so
+                // it must carry the supervisor.)
+                ("init", "init"),
                 ("eosh", "eosh"),
             ],
             "store-opi5plus-min.img",
