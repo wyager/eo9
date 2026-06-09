@@ -148,6 +148,7 @@ impl<B: Backend> Session<B> {
                 LineResult::Ok
             }
             Command::DescribeApi(word) => self.run_describe_api(&word).await,
+            Command::Man(word) => self.run_man(&word).await,
             Command::Imports(expr) => self.run_describe(&expr, true).await,
             Command::Run(expr) => self.run_program(&expr).await,
         }
@@ -625,6 +626,99 @@ impl<B: Backend> Session<B> {
         LineResult::Ok
     }
 
+    /// `man <name>`: render the named artifact's self-described manual (the
+    /// `eo9-manual` custom section — docs/design/component-manuals.md). The dispatch
+    /// ladder: a shell word's builtin/operator card, an OS API card, the manual found
+    /// in the raw bytes of `/bin/<name>.wasm`, then the honest fallbacks — "no manual"
+    /// or "manual malformed", each followed by `describe`'s mechanical view. Display
+    /// only: nothing here is evaluated, composed, compiled, or run, and the manual
+    /// text never feeds resolution or caching.
+    async fn run_man(&mut self, word: &str) -> LineResult {
+        // A shell word: the same card `describe <word>` renders.
+        if let Some(doc) = crate::builtins::builtin_doc(word) {
+            for line in crate::builtins::render_builtin_doc(doc) {
+                self.backend.print(&line);
+            }
+            return LineResult::Ok;
+        }
+        // A colon marks an OS API name (program names cannot carry one).
+        if word.contains(':') {
+            return self.run_describe_api(word).await;
+        }
+        // The NAMED artifact in /bin only — no expression evaluation, no part-chasing,
+        // no `let` bindings (a binding is a value, not a /bin artifact; say so rather
+        // than "cannot resolve" when the name is only a binding). Bytes come from the
+        // session bytes cache when the name was read before, the backend otherwise —
+        // a byte scan of bytes the session mostly already holds, never an instantiation.
+        let Session {
+            backend,
+            cache,
+            bindings,
+            ..
+        } = self;
+        let mut resolved: Option<(B::Component, Option<Vec<u8>>)> = None;
+        if let Some(bytes) = cache.bytes.get(word) {
+            match backend.load(bytes) {
+                Ok(component) => {
+                    let bytes = bytes.to_vec();
+                    resolved = Some((component, Some(bytes)));
+                }
+                Err(err) => return self.report(EvalError::Backend(err)),
+            }
+        }
+        let (component, bytes) = match resolved {
+            Some(resolved) => resolved,
+            None => match backend.resolve_with_bytes(word).await {
+                Ok((component, bytes)) => {
+                    if let Some(bytes) = &bytes {
+                        cache.bytes.insert(word, bytes.clone());
+                    }
+                    (component, bytes)
+                }
+                Err(err) => {
+                    if let Some(binding) = bindings.get(word) {
+                        let info = backend.describe(binding);
+                        backend.print(&format!(
+                            "no manual for `{word}` (a session `let` binding); showing describe"
+                        ));
+                        for line in render_info(&info) {
+                            backend.print(&line);
+                        }
+                        return LineResult::Ok;
+                    }
+                    return self.report(EvalError::Backend(err));
+                }
+            },
+        };
+        let info = self.backend.describe(&component);
+        match bytes.as_deref().and_then(crate::manual::extract_manual) {
+            Some(payload) => match crate::manual::parse_manual(payload) {
+                Ok(manual) => {
+                    for line in crate::manual::render_manual(&manual, Some(&info.args)) {
+                        self.backend.print(&line);
+                    }
+                    LineResult::Ok
+                }
+                Err(err) => {
+                    self.backend
+                        .print(&format!("manual malformed ({err}); showing describe"));
+                    for line in render_info(&info) {
+                        self.backend.print(&line);
+                    }
+                    LineResult::Ok
+                }
+            },
+            None => {
+                self.backend
+                    .print(&format!("no manual for `{word}`; showing describe"));
+                for line in render_info(&info) {
+                    self.backend.print(&line);
+                }
+                LineResult::Ok
+            }
+        }
+    }
+
     /// The top-level rule: compose the granted environment onto the command, compile,
     /// spawn with the bound arguments, await the outcome, print it.
     ///
@@ -826,11 +920,12 @@ pub fn help_lines() -> &'static [&'static str] {
         "  describe <name or expr>       its kind, arguments, imports, exports, and wiring; also",
         "                                  explains the shell's own words (describe describe) and the",
         "                                  OS APIs themselves — e.g. describe eo9:fs/fs",
+        "  man <name>                    a program's own manual page (falls back to describe)",
         "  imports <expr>                just the residual imports of an expression",
         "  env                           what this session holds and what programs run from it receive",
         "  env <expr>                    how this session treats the expression's imports, without running it",
         "",
-        "builtins: help, env [<expr>], history, let, save, detach, svc, describe <expr>, imports <expr>, exit, poweroff (halt the machine — under init, exit only restarts the console)",
+        "builtins: help, env [<expr>], history, let, save, detach, svc, describe <expr>, man <name>, imports <expr>, exit, poweroff (halt the machine — under init, exit only restarts the console)",
     ]
 }
 
@@ -1705,6 +1800,197 @@ mod tests {
         session.backend.out.clear();
         let result = run(&mut session, "describe (help)");
         assert!(matches!(result, LineResult::Error(_)), "got: {result:?}");
+    }
+
+    // -- man ------------------------------------------------------------------------
+
+    /// A manual whose args match [`telnetd_like`]'s signature.
+    const MAN_TEXT: &str = "eo9-manual 1\n\
+        name: telnetd\n\
+        synopsis: serve eosh sessions over telnet, one fused task per session\n\
+        description:\n\
+        \x20 Composes the session stack and serves sessions sequentially.\n\
+        arg port u16 optional\n\
+        \x20 doc: TCP port to listen on (default 23)\n\
+        \x20 kind: port\n\
+        arg address string optional\n\
+        \x20 doc: IPv4 acquisition mode\n\
+        \x20 values: dhcp\n\
+        example: telnetd --port 2323\n\
+        \x20 doc: serve on a non-privileged port\n\
+        see-also: net.l4.over-l2, net.text, eosh\n\
+        end\n";
+
+    fn telnetd_like() -> crate::backend::ComponentInfo {
+        binary(&[("port", "option<u16>"), ("address", "option<string>")])
+    }
+
+    #[test]
+    fn man_renders_an_embedded_manual_without_running_anything() {
+        let mut session = session_with(&[]);
+        session.backend.program_with_bytes(
+            "telnetd",
+            telnetd_like(),
+            crate::manual::fixtures::component_with_manual(MAN_TEXT),
+        );
+        assert_eq!(run(&mut session, "man telnetd"), LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(
+            out.starts_with("telnetd — serve eosh sessions over telnet"),
+            "the manual rendered: {out}"
+        );
+        assert!(out.contains("--port: u16 (optional)"), "{out}");
+        assert!(out.contains("values: dhcp"), "{out}");
+        assert!(out.contains("telnetd --port 2323"), "{out}");
+        assert!(out.contains("see-also: net.l4.over-l2"), "{out}");
+        // The signature agrees, so nothing is flagged.
+        assert!(!out.contains("(!)"), "{out}");
+        // Display only: resolve + describe, never compose/compile/spawn.
+        assert!(
+            !session
+                .backend
+                .log
+                .iter()
+                .any(|line| line.starts_with("compile")
+                    || line.starts_with("spawn")
+                    || line.starts_with("compose")),
+            "log: {:?}",
+            session.backend.log
+        );
+    }
+
+    #[test]
+    fn man_flags_a_manual_that_disagrees_with_the_signature() {
+        // The program's real signature lacks `address` and types port differently: the
+        // manual is self-reported, so the disagreement is flagged, not trusted.
+        let mut session = session_with(&[]);
+        session.backend.program_with_bytes(
+            "telnetd",
+            binary(&[("port", "u32")]),
+            crate::manual::fixtures::component_with_manual(MAN_TEXT),
+        );
+        assert_eq!(run(&mut session, "man telnetd"), LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(
+            out.contains("(!) the program declares `u32`"),
+            "type mismatch flagged: {out}"
+        );
+        assert!(
+            out.contains("(!) the program declares no `--address` argument"),
+            "unknown argument flagged: {out}"
+        );
+    }
+
+    #[test]
+    fn man_without_a_manual_falls_back_to_describe() {
+        let mut session = session_with(&[("hello", binary(&[("name", "option<string>")]))]);
+        assert_eq!(run(&mut session, "man hello"), LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(
+            out.contains("no manual for `hello`; showing describe"),
+            "{out}"
+        );
+        assert!(
+            out.contains("kind: binary"),
+            "the describe view follows: {out}"
+        );
+        assert!(out.contains("--name: option<string>"), "{out}");
+    }
+
+    #[test]
+    fn man_of_a_malformed_manual_says_so_and_shows_describe() {
+        // Truncated text (no `end`): present but unusable.
+        let mut session = session_with(&[]);
+        session.backend.program_with_bytes(
+            "broken",
+            binary(&[]),
+            crate::manual::fixtures::component_with_manual("eo9-manual 1\nname: broken\n"),
+        );
+        assert_eq!(run(&mut session, "man broken"), LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(out.contains("manual malformed ("), "{out}");
+        assert!(out.contains("showing describe"), "{out}");
+        assert!(out.contains("kind: binary"), "{out}");
+    }
+
+    #[test]
+    fn man_of_shell_words_and_apis_renders_their_cards() {
+        let mut session = session_with(&[]);
+        assert_eq!(run(&mut session, "man describe"), LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(out.contains("kind: builtin"), "{out}");
+        // Nothing was resolved for a builtin card.
+        assert!(session.backend.log.is_empty(), "{:?}", session.backend.log);
+
+        session.backend.out.clear();
+        assert_eq!(run(&mut session, "man $"), LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(out.contains("kind: operator"), "{out}");
+
+        session.backend.out.clear();
+        assert_eq!(run(&mut session, "man eo9:fs"), LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(out.contains("kind: OS API package"), "{out}");
+
+        // `man man` explains itself, same as `describe describe`.
+        session.backend.out.clear();
+        assert_eq!(run(&mut session, "man man"), LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(
+            out.contains("kind: builtin") && out.contains("manual"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn man_of_an_unknown_name_is_the_existing_resolve_error() {
+        let mut session = session_with(&[]);
+        let result = run(&mut session, "man nosuch");
+        assert!(matches!(result, LineResult::Error(_)), "{result:?}");
+        assert!(
+            session
+                .backend
+                .err
+                .iter()
+                .any(|line| line.contains("cannot resolve `nosuch`")),
+            "err: {:?}",
+            session.backend.err
+        );
+    }
+
+    #[test]
+    fn man_of_a_let_binding_says_bindings_have_no_manual() {
+        let mut session = session_with(&[("time.frozen", provider(&["eo9:time/time"]))]);
+        assert_eq!(run(&mut session, "let t = time.frozen"), LineResult::Ok);
+        assert_eq!(run(&mut session, "man t"), LineResult::Ok);
+        let out = session.backend.out.join("\n");
+        assert!(
+            out.contains("no manual for `t` (a session `let` binding); showing describe"),
+            "{out}"
+        );
+        assert!(out.contains("kind: provider"), "{out}");
+    }
+
+    #[test]
+    fn man_reads_cached_bytes_instead_of_re_resolving() {
+        let mut session = session_with(&[]);
+        session.backend.program_with_bytes(
+            "telnetd",
+            telnetd_like(),
+            crate::manual::fixtures::component_with_manual(MAN_TEXT),
+        );
+        assert_eq!(run(&mut session, "man telnetd"), LineResult::Ok);
+        let first_len = session.backend.log.len();
+        assert_eq!(run(&mut session, "man telnetd"), LineResult::Ok);
+        let tail: Vec<&String> = session.backend.log[first_len..].iter().collect();
+        assert!(
+            tail.iter().any(|line| line.starts_with("load(telnetd)")),
+            "the second man load()s the session-cached bytes: {tail:?}"
+        );
+        assert!(
+            !tail.iter().any(|line| line.starts_with("resolve(telnetd)")),
+            "no filesystem re-read: {tail:?}"
+        );
     }
 
     #[test]

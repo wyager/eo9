@@ -28,6 +28,33 @@ eo9_guest::bindings!({
     apis: [io, net_l4],
 });
 
+// The user-facing manual, embedded as the `eo9-manual` custom section and rendered by
+// `man l4check` in eosh (docs/design/component-manuals.md).
+eo9_guest::manual! {
+    name: "l4check",
+    synopsis: "one-shot transport probe: a DNS query over UDP, then a TCP connection attempt",
+    description: [
+        "Resolves example.com through the granted transport capability and reports what the resolver",
+        "answered, then attempts a TCP connection to the target's discard port (9) and reports its typed",
+        "outcome. A DNS answer proves datagrams travel both ways through the composed stack; the TCP",
+        "attempt proves a refused or ignored SYN comes back as a typed error, never a trap. The program",
+        "imports only the transport capability — what the resolver answered rides in the outcome itself.",
+    ],
+    args: [
+        { name: "resolver", ty: "string", optional,
+          doc: "the DNS server to query, dotted quad (default 10.0.2.3, QEMU user-net's forwarder)" },
+        { name: "tcp-target", ty: "string", optional,
+          doc: "the host whose discard port the TCP attempt targets (default 10.0.2.2; the port stays 9)" },
+    ],
+    examples: [
+        { line: "net.virtio $ net.l4.over-l2 $ l4check",
+          doc: "QEMU: query the user-net resolver through the composed stack" },
+        { line: "net.rtl8125 $ (net.l4.over-l2 --address dhcp) $ l4check --resolver 10.20.3.1",
+          doc: "the board: lease an address, then ask the router's DNS" },
+    ],
+    see_also: "net.l4.over-l2, l2check, telnetd",
+}
+
 /// The DNS forwarder QEMU user-mode networking runs for its guest (the default
 /// `--resolver`).
 const DEFAULT_RESOLVER: (u8, u8, u8, u8) = (10, 0, 2, 3);

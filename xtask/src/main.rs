@@ -109,6 +109,23 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-usb-ohci-pci",
 ];
 
+/// Guest packages that MUST carry a valid `eo9-manual` custom section (the manuals
+/// retrofit set — docs/design/component-manuals.md). The list grows as manuals are
+/// authored and never shrinks: dropping a manual from a listed component fails the
+/// build. Every OTHER package's manual is optional but, when present, still validated —
+/// a malformed manual never ships either way.
+const MANUALED_COMPONENTS: &[&str] = &[
+    "eo9-example-telnetd",
+    "eo9-stub-net-l4-over-l2",
+    "eo9-stub-net-rtl8125",
+    "eo9-example-l2check",
+    "eo9-example-l4check",
+];
+
+/// Manual-validation rule version, part of the componentize stamp so changing the
+/// rules (or the required-manual list) invalidates previously stamped outputs.
+const MANUAL_VALIDATION_REV: &str = "manual-v1";
+
 /// Target used to build guest crates before componentizing them.
 const GUEST_TARGET: &str = "wasm32-unknown-unknown";
 
@@ -942,10 +959,16 @@ fn componentize_guest_package(root: &Path, package: &str) -> Result<PathBuf, Str
     let module_bytes = std::fs::read(&module)
         .map_err(|err| format!("failed to read {}: {err}", module.display()))?;
     let stamp = components_dir.join(format!("{package}.wasm.stamp"));
+    let manual_required = MANUALED_COMPONENTS.contains(&package);
     let fingerprint = format!(
-        "module={} {} features={COMPONENT_VALIDATE_FEATURES}",
+        "module={} {} features={COMPONENT_VALIDATE_FEATURES} {MANUAL_VALIDATION_REV}{}",
         fingerprint_bytes(&module_bytes),
         wasm_tools_version()?,
+        if manual_required {
+            ",manual-required"
+        } else {
+            ""
+        },
     );
     if stamp_fresh(&component, &stamp, &fingerprint) {
         return Ok(component);
@@ -976,9 +999,40 @@ fn componentize_guest_package(root: &Path, package: &str) -> Result<PathBuf, Str
             component.as_os_str(),
         ],
     )?;
+    validate_component_manual(&component, package, manual_required)?;
     write_stamp(&stamp, &fingerprint)?;
     println!("xtask: built component {}", component.display());
     Ok(component)
+}
+
+/// Validate a component's `eo9-manual` section at componentize time, with the SAME
+/// scanner/parser the eosh `man` builtin uses (the eosh-core dependency — one parser,
+/// two consumers, no drift). A present-but-malformed manual fails the build for every
+/// package; a missing manual fails the build only for [`MANUALED_COMPONENTS`].
+fn validate_component_manual(
+    component: &Path,
+    package: &str,
+    required: bool,
+) -> Result<(), String> {
+    let bytes = std::fs::read(component)
+        .map_err(|err| format!("failed to read {}: {err}", component.display()))?;
+    match eosh_core::manual::extract_manual(&bytes) {
+        Some(payload) => {
+            eosh_core::manual::parse_manual(payload).map_err(|err| {
+                format!(
+                    "{package}: the eo9-manual section is malformed ({err}); fix the \
+                     crate's eo9_guest::manual! invocation"
+                )
+            })?;
+            Ok(())
+        }
+        None if required => Err(format!(
+            "{package}: no eo9-manual section, but the package is in xtask's \
+             MANUALED_COMPONENTS list — author one with eo9_guest::manual! (the list \
+             grows and never shrinks)"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Build one guest crate and componentize it (the targeted version of [`build_guest`],

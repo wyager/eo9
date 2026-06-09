@@ -48,6 +48,38 @@ mod bindings_glue {
 }
 use bindings_glue::*;
 
+// The user-facing manual, embedded as the `eo9-manual` custom section and rendered by
+// `man l2check` in eosh (docs/design/component-manuals.md).
+eo9_guest::manual! {
+    name: "l2check",
+    synopsis: "one-shot link probe: ARP the gateway, answer who-has, optionally beacon",
+    description: [
+        "Opens the granted link-layer capability and, for one bounded window, re-sends an ARP who-has",
+        "for the gateway about once a second, answers any who-has for --source (so a peer pinging us",
+        "measures whether our transmit crosses the switch), and with --beacon true broadcasts a small",
+        "UDP beacon about twice a second. A reply proves whole frames move both ways through the",
+        "composed provider. On a filtered port the beacon discriminates: beacon arrives but ARP does",
+        "not = ARP-specific ingress filtering (DAI-class); nothing arrives = MAC-level port security.",
+        "A final console line reports the probe counts either way, so every run advances a bench round.",
+    ],
+    args: [
+        { name: "gateway", ty: "string", optional,
+          doc: "the IPv4 address to ARP for, dotted quad (default 10.0.2.2, the QEMU user-net gateway)" },
+        { name: "source", ty: "string", optional,
+          doc: "OUR IPv4 address: the ARP sender, the who-has the responder answers, and the beacon source" },
+        { name: "beacon", ty: "bool", optional,
+          doc: "also broadcast the UDP beacon (port 19099, payload `eo9-beacon <seq>`); listen with nc -ul 19099",
+          values: "true, false" },
+    ],
+    examples: [
+        { line: "net.virtio $ l2check",
+          doc: "QEMU: resolve the user-net gateway" },
+        { line: "net.rtl8125 $ l2check --gateway 10.20.3.1 --source 10.20.3.70 --beacon true",
+          doc: "the board bench: probe the LAN and beacon while a peer listens" },
+    ],
+    see_also: "net.rtl8125, net.virtio, l4check",
+}
+
 /// The default target: the QEMU user-mode-networking gateway every slirp instance
 /// answers ARP for.
 const DEFAULT_GATEWAY: [u8; 4] = [10, 0, 2, 2];

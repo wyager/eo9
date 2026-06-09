@@ -95,6 +95,37 @@ use eo9::pci::pci;
 use eo9::text::text;
 use exports::eo9::net::l2::{self, Buffer, InterfaceInfo, L2Error, RecvResult, SendResult};
 
+// The user-facing manual, embedded as the `eo9-manual` custom section and rendered by
+// `man net.rtl8125` in eosh (docs/design/component-manuals.md).
+eo9_guest::manual! {
+    name: "net.rtl8125",
+    synopsis: "the RTL8125 2.5GbE PCIe NIC as a link-layer provider — real silicon by composition",
+    description: [
+        "Drives a Realtek RTL8125 NIC (the Orange Pi 5 Plus's two onboard 2.5GbE ports) through the",
+        "granted PCI capability and exports the link layer — interfaces, MAC addresses, whole Ethernet",
+        "frames — so the existing network stack runs over the physical wire by composition. On first use",
+        "it claims the first RTL8125 function the PCI capability shows it; selecting one of the two",
+        "(identical) board NICs is pci.admit-address's job, composed in front. One console line on first",
+        "use reports the factory MAC and the negotiated link speed. Errors are typed, never traps; a",
+        "link still negotiating reports link-down. Under QEMU (which cannot emulate an RTL8125) the",
+        "probe answers with a typed refusal naming what it looked for.",
+    ],
+    args: [
+        { name: "advertise-max", ty: "u16", required,
+          doc: "cap the speeds autonegotiation advertises; unconfigured it advertises up to 2500BASE-T",
+          values: "2500, 1000, 100" },
+    ],
+    examples: [
+        { line: "net.rtl8125 $ l2check --gateway 10.20.3.1 --source 10.20.3.70",
+          doc: "ARP-probe the LAN over the real NIC" },
+        { line: "net.rtl8125 $ (net.l4.over-l2 --address dhcp) $ l4check --resolver 10.20.3.1",
+          doc: "a full transport stack on the wire, addressing leased from the LAN" },
+        { line: "(net.rtl8125 --advertise-max 1000) $ l2check",
+          doc: "bench triage: frames at 1000 but not at 2500 pins the 2.5G datapath" },
+    ],
+    see_also: "pci.admit-address, l2check, net.l4.over-l2, telnetd",
+}
+
 // ------------------------------------------------------------------------------------------
 // Sizing and bounds
 // ------------------------------------------------------------------------------------------

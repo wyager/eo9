@@ -75,6 +75,10 @@ pub fn provider(exports: &[&str]) -> ComponentInfo {
 pub struct MockBackend {
     /// Name → info for programs `resolve` can find.
     programs: BTreeMap<String, ComponentInfo>,
+    /// Name → raw component bytes, for programs registered with
+    /// [`MockBackend::program_with_bytes`] (the `man` builtin's manual scan). Programs
+    /// without an entry fall back to the name-as-bytes convention below.
+    program_bytes: BTreeMap<String, Vec<u8>>,
     /// Component id → info.
     infos: BTreeMap<u32, ComponentInfo>,
     next_component: u32,
@@ -103,6 +107,7 @@ impl MockBackend {
     pub fn new() -> Self {
         MockBackend {
             programs: BTreeMap::new(),
+            program_bytes: BTreeMap::new(),
             infos: BTreeMap::new(),
             next_component: 0,
             next_image: 0,
@@ -124,6 +129,14 @@ impl MockBackend {
     /// Register a resolvable program.
     pub fn program(&mut self, name: &str, info: ComponentInfo) {
         self.programs.insert(name.to_string(), info);
+    }
+
+    /// Register a resolvable program together with its raw component bytes (what
+    /// `resolve_with_bytes` hands back and `load` accepts — used by the `man` tests to
+    /// serve manual-carrying fixture bytes).
+    pub fn program_with_bytes(&mut self, name: &str, info: ComponentInfo, bytes: Vec<u8>) {
+        self.programs.insert(name.to_string(), info);
+        self.program_bytes.insert(name.to_string(), bytes);
     }
 
     /// Register a resolvable program with an explicit argument signature.
@@ -191,15 +204,33 @@ impl Backend for MockBackend {
         &mut self,
         name: &str,
     ) -> Result<(u32, Option<Vec<u8>>), BackendError> {
-        // The mock's "bytes" are the program name itself, so `load` can find the same
-        // info again — mirroring the real backend, where the bytes round-trip exactly.
+        // The mock's "bytes" are the registered component bytes when the test supplied
+        // them, the program name itself otherwise — either way `load` finds the same
+        // info again, mirroring the real backend, where the bytes round-trip exactly.
         let component = self.resolve(name).await?;
-        Ok((component, Some(name.as_bytes().to_vec())))
+        let bytes = self
+            .program_bytes
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.as_bytes().to_vec());
+        Ok((component, Some(bytes)))
     }
 
     fn load(&mut self, bytes: &[u8]) -> Result<u32, BackendError> {
         // Cached-bytes loads (the session resolve cache) hand back the bytes that
-        // `resolve_with_bytes` produced: a program name. Anything else is opaque bytes.
+        // `resolve_with_bytes` produced: registered component bytes or a program name.
+        // Anything else is opaque bytes.
+        if let Some((name, info)) = self
+            .program_bytes
+            .iter()
+            .find(|(_, registered)| registered.as_slice() == bytes)
+            .map(|(name, _)| (name.clone(), self.programs.get(name).cloned()))
+            .and_then(|(name, info)| info.map(|info| (name, info)))
+        {
+            let id = self.fresh(info);
+            self.log.push(format!("load({name}) -> c{id}"));
+            return Ok(id);
+        }
         if let Ok(name) = core::str::from_utf8(bytes)
             && let Some(info) = self.programs.get(name).cloned()
         {

@@ -48,6 +48,49 @@ use bindings::{Guest, ProgramFailure, ProgramSuccess, export};
 use eo9_guest::api::fs::fs;
 use eo9_guest::api::text::text;
 
+// The user-facing manual, embedded as the `eo9-manual` custom section and rendered by
+// `man telnetd` in eosh (docs/design/component-manuals.md).
+eo9_guest::manual! {
+    name: "telnetd",
+    synopsis: "serve eosh sessions over telnet, one fused task per session",
+    description: [
+        "Resolves net.virtio, net.l4.over-l2, net.text, and eosh from /bin, composes them into one",
+        "session stack, compiles it once, and serves sessions sequentially: spawn, wait, respawn.",
+        "While a session is live, further connections are refused; between sessions clients simply",
+        "retry. A remote `poweroff` is refused — halting the machine stays a console intent.",
+        "SECURITY: sessions are cleartext, unauthenticated telnet; trusted LAN / dev use only.",
+    ],
+    args: [
+        { name: "port", ty: "u16", optional,
+          doc: "TCP port to listen on (default 23)", kind: "port" },
+        { name: "sessions", ty: "u32", optional,
+          doc: "serve exactly this many sessions, then exit (default: a 1000-session cap)" },
+        { name: "nic", ty: "string", optional,
+          doc: "the /bin name of the link-layer driver at the bottom of the stack (default net.virtio)",
+          kind: "component-name" },
+        { name: "address", ty: "string", optional,
+          doc: "IPv4: `dhcp` to lease from the network, or a static dotted quad (give --gateway too)",
+          values: "dhcp" },
+        { name: "prefix-length", ty: "u8", optional,
+          doc: "subnet prefix length for static addressing (default 24)" },
+        { name: "gateway", ty: "string", optional,
+          doc: "IPv4 gateway for static addressing, dotted quad" },
+        { name: "advertise-max", ty: "u16", optional,
+          doc: "cap the NIC's autonegotiated speed, forwarded to its configure interface",
+          values: "2500, 1000, 100" },
+    ],
+    examples: [
+        { line: "telnetd --sessions 2", doc: "serve exactly two sessions, then exit" },
+        { line: "telnetd --port 2323",
+          doc: "serve on a non-privileged port under QEMU user networking" },
+        { line: "telnetd --nic net.rtl8125 --address 10.20.3.70 --gateway 10.20.3.1",
+          doc: "the board bench: real NIC, static LAN addressing" },
+        { line: "telnetd --address dhcp",
+          doc: "lease addressing from the LAN; the console lease line says where to telnet" },
+    ],
+    see_also: "net.l4.over-l2, net.text, eosh",
+}
+
 /// The documented default port (telnet).
 const DEFAULT_PORT: u16 = 23;
 /// Hard ceiling on sessions when `--sessions` is not given: telnetd must not respawn

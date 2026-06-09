@@ -1,5 +1,6 @@
-//! The [`bindings!`](crate::bindings!) and [`main!`](crate::main!) macros: everything a
-//! program crate needs to target its WIT world.
+//! The [`bindings!`](crate::bindings!), [`main!`](crate::main!), and
+//! [`manual!`](crate::manual!) macros: everything a program crate needs to target its
+//! WIT world and describe itself.
 //!
 //! A program crate invokes both at its crate root:
 //!
@@ -234,6 +235,163 @@ macro_rules! __bindings_with {
 /// and required for a program that awaits any `eo9:*` operation (a sync-lifted export
 /// cannot block) — use the `async fn main` form; worlds with a plain `func` entrypoint
 /// (pure compute, sync-only imports) use the `fn main` form.
+/// Embed a user-facing manual in the component as the `eo9-manual` custom section
+/// (docs/design/component-manuals.md). `man <name>` in eosh renders it; the incremental
+/// REPL's argument grammars consume the per-arg hints additively.
+///
+/// Authors write structured fields; the macro `concat!`s the canonical line-oriented
+/// schema text (version header, `name:`/`synopsis:`/`description:`, `arg` blocks,
+/// `example:` blocks, `see-also:`, `end`) and emits it as a `#[used]`
+/// `#[link_section = "eo9-manual"]` static, which the wasm linker turns into a custom
+/// section of the core module. `wasm-tools component new` preserves it; the eosh-side
+/// reader scans the outer component and its depth-1 core modules.
+///
+/// ```ignore
+/// eo9_guest::manual! {
+///     name: "telnetd",
+///     synopsis: "serve eosh sessions over telnet, one fused task per session",
+///     description: [
+///         "Composes net.virtio $ net.l4.over-l2 $ net.text $ eosh, compiles it once,",
+///         "and serves sessions sequentially.",
+///     ],
+///     args: [
+///         { name: "port", ty: "u16", optional, doc: "TCP port to listen on (default 23)" },
+///         { name: "nic", ty: "string", optional, doc: "the NIC provider", kind: "component-name" },
+///         { name: "address", ty: "string", optional, doc: "IPv4 acquisition mode", values: "dhcp" },
+///     ],
+///     examples: [
+///         { line: "telnetd --port 2323", doc: "serve on a non-privileged port" },
+///     ],
+///     see_also: "net.l4.over-l2, net.text, eosh",
+/// }
+/// ```
+///
+/// Rules the schema enforces (validated at componentize time by `cargo xtask
+/// build-guest`; a malformed manual fails the build): every line at most 120 bytes, at
+/// most 64 args and 16 examples, at most one of `values:`/`kind:` per arg, the whole
+/// section at most 16 KiB. The manual is display-only and self-reported: the WIT
+/// argument signature stays the mechanical truth, and the renderer flags any
+/// type/optionality disagreement instead of trusting either side. Invoke at most once
+/// per crate (the section static's name is fixed; a second invocation fails to
+/// compile, which doubles as the one-manual-per-module guarantee).
+#[macro_export]
+macro_rules! manual {
+    (
+        name: $name:literal,
+        synopsis: $synopsis:literal,
+        description: [$($desc:literal),+ $(,)?],
+        args: [$($arg:tt),* $(,)?],
+        examples: [$($example:tt),* $(,)?],
+        see_also: $see:literal $(,)?
+    ) => {
+        const __EO9_MANUAL_TEXT: &str = concat!(
+            "eo9-manual 1\n",
+            "name: ", $name, "\n",
+            "synopsis: ", $synopsis, "\n",
+            "description:\n",
+            $("  ", $desc, "\n",)+
+            $($crate::__manual_arg!($arg),)*
+            $($crate::__manual_example!($example),)*
+            "see-also: ", $see, "\n",
+            "end\n",
+        );
+        #[used]
+        #[unsafe(link_section = "eo9-manual")]
+        static __EO9_MANUAL: [u8; __EO9_MANUAL_TEXT.len()] = {
+            // `concat!` yields a `&str`; the section static must be a byte array so the
+            // wasm linker emits the bytes verbatim. A const copy loop keeps this free of
+            // unsafe and of any runtime cost.
+            let text = __EO9_MANUAL_TEXT.as_bytes();
+            let mut bytes = [0u8; __EO9_MANUAL_TEXT.len()];
+            let mut index = 0;
+            while index < bytes.len() {
+                bytes[index] = text[index];
+                index += 1;
+            }
+            bytes
+        };
+    };
+}
+
+/// Internal helper for [`manual!`]: one `arg` block. `required`/`optional` mirrors the
+/// WIT signature (an `option<…>` parameter is `optional`, its `ty` the inner type); at
+/// most one of `values:` (literal alternatives, comma-separated) or `kind:` (a value
+/// vocabulary tag: url, path, component-name, interface-name, port) may follow `doc:`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __manual_arg {
+    ({ name: $n:literal, ty: $t:literal, required, doc: $d:literal $(,)? }) => {
+        concat!("arg ", $n, " ", $t, " required\n  doc: ", $d, "\n")
+    };
+    ({ name: $n:literal, ty: $t:literal, optional, doc: $d:literal $(,)? }) => {
+        concat!("arg ", $n, " ", $t, " optional\n  doc: ", $d, "\n")
+    };
+    ({ name: $n:literal, ty: $t:literal, required, doc: $d:literal, values: $v:literal $(,)? }) => {
+        concat!(
+            "arg ",
+            $n,
+            " ",
+            $t,
+            " required\n  doc: ",
+            $d,
+            "\n  values: ",
+            $v,
+            "\n"
+        )
+    };
+    ({ name: $n:literal, ty: $t:literal, optional, doc: $d:literal, values: $v:literal $(,)? }) => {
+        concat!(
+            "arg ",
+            $n,
+            " ",
+            $t,
+            " optional\n  doc: ",
+            $d,
+            "\n  values: ",
+            $v,
+            "\n"
+        )
+    };
+    ({ name: $n:literal, ty: $t:literal, required, doc: $d:literal, kind: $k:literal $(,)? }) => {
+        concat!(
+            "arg ",
+            $n,
+            " ",
+            $t,
+            " required\n  doc: ",
+            $d,
+            "\n  kind: ",
+            $k,
+            "\n"
+        )
+    };
+    ({ name: $n:literal, ty: $t:literal, optional, doc: $d:literal, kind: $k:literal $(,)? }) => {
+        concat!(
+            "arg ",
+            $n,
+            " ",
+            $t,
+            " optional\n  doc: ",
+            $d,
+            "\n  kind: ",
+            $k,
+            "\n"
+        )
+    };
+}
+
+/// Internal helper for [`manual!`]: one `example` block (the `doc:` line is optional).
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __manual_example {
+    ({ line: $l:literal, doc: $d:literal $(,)? }) => {
+        concat!("example: ", $l, "\n  doc: ", $d, "\n")
+    };
+    ({ line: $l:literal $(,)? }) => {
+        concat!("example: ", $l, "\n")
+    };
+}
+
 #[macro_export]
 macro_rules! main {
     (
