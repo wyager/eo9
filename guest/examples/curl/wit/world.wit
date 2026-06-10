@@ -13,12 +13,14 @@
 // eo9:text.
 package eo9-examples:curl@0.1.0;
 
-/// Fetches one `http://host[:port][/path]` URL with a single HTTP/1.1 GET
+/// Fetches one `[http://]host[:port][/path]` URL with a single HTTP/1.1 GET
 /// (`Connection: close`) and prints the status line, the header count, and the body.
+/// The scheme is optional in the user's spelling (it defaults to `http://`, applied
+/// before the hardened URL parse); `https://` stays the typed TLS refusal.
 ///
 ///   net.virtio $ net.l4.over-l2 $ curl http://10.0.2.2:8080/hello.txt
 ///   net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address dhcp)
-///       $ curl http://example.com --resolver 10.20.3.1
+///       $ curl yager.io
 world curl {
     import eo9:text/text@0.1.0;
     import eo9:net/l4@0.1.0;
@@ -38,7 +40,10 @@ world curl {
         unsupported(string),
         /// The transport capability refused (e.g. composed over net.l4.deny).
         denied,
-        /// The host could not be resolved to an IPv4 address.
+        /// The host could not be resolved to an IPv4 address — including the
+        /// no-resolver case: `--resolver` absent and the transport capability
+        /// reporting no DNS servers through `dns-servers` (configured static
+        /// addressing names none; the message carries the `--resolver` hint).
         dns(string),
         /// A transport operation failed, carrying the l4 API's own error.
         net(string),
@@ -48,10 +53,12 @@ world curl {
         http(string),
     }
 
-    /// `url`: the http:// URL to fetch. `resolver`: the DNS server consulted when
-    /// the URL's host is not a literal IPv4 address, dotted quad (default 10.0.2.3 —
-    /// the QEMU user-net forwarder; on the bench LAN pass the router,
-    /// `--resolver 10.20.3.1`).
+    /// `url`: the URL to fetch; a missing scheme defaults to `http://`. `resolver`:
+    /// the DNS server consulted when the URL's host is not a literal IPv4 address,
+    /// dotted quad. When absent, the first IPv4 server the transport reports through
+    /// the l4 `dns-servers` introspection is used (the DHCP lease's offer on the
+    /// board, QEMU user-net's 10.0.2.3 under the unconfigured default); a transport
+    /// that reports none refuses typed with a `--resolver` hint.
     export main: async func(url: string, resolver: option<string>)
         -> result<program-success, program-failure>;
 }
