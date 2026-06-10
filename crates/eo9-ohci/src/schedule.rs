@@ -142,7 +142,18 @@ pub enum TdToggle {
 }
 
 /// "No interrupt" DelayInterrupt value (§4.3.1.2) — the polled driver's default.
+/// The controller still retires the TD onto its internal done queue, but the
+/// HccaDoneHead writeback's interrupt-delay counter never arms — fine for the polled
+/// paths, which detect retirement by the ED's head moving, not by the writeback.
 pub const DI_NONE: u8 = 0b111;
+
+/// "Interrupt at the next frame boundary" DelayInterrupt value (§4.3.1.2, DI = 0):
+/// the controller writes HccaDoneHead back and raises WDH within a frame of the TD
+/// retiring. Set on interrupt-endpoint TDs when the driver's event paths are live —
+/// a TD left at [`DI_NONE`] never generates the WDH edge `read_report` parks on (the
+/// area/37 lesson: the first event-mode build waited on an interrupt the TDs
+/// themselves had suppressed, and every report rode the bounded-wait-expiry drain).
+pub const DI_IMMEDIATE: u8 = 0;
 
 impl TransferDescriptor {
     /// A fresh TD for submission: not yet accessed, no errors.

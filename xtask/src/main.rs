@@ -4552,8 +4552,12 @@ fn qmp_inject_keys(socket: &Path, keys: &[&str]) -> Result<(), String> {
                 .write_all(event.as_bytes())
                 .map_err(|err| format!("check-usb: writing QMP: {err}"))?;
             read_until(&mut stream, "\"return\"")?;
-            // Pace the transitions: the boot keyboard reports at its polling interval,
-            // and hidcheck must observe press and release as distinct reports.
+            // Pace the transitions: the emulated keyboard NAKs until the OHCI's
+            // periodic schedule visits its endpoint (its bInterval), so press and
+            // release must be far enough apart to retire as DISTINCT transfers —
+            // that hardware cadence holds whether the guest observes completions by
+            // interrupt (the event-driven read path) or by polling, so the pacing
+            // stays even though the guest-side 2 ms poll pace is gone (audit A1).
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
     }

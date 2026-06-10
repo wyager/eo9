@@ -552,12 +552,17 @@ already recorded. This now BLOCKS any branch's `cargo xtask ci` from exiting 0
 reliably; the graduated bug-hunt lane is urgent. The usb branch documents it as the
 sole ci failure with this master baseline as proof.
 
-## Bundle checkout-dependence is a CLASS, not one component (kernhyg lane, 2026-06-08)
+## Bundle checkout-dependence is a CLASS, not one component (kernhyg lane, 2026-06-08; breadth verified 2026-06-09)
 The fs-eofs path-dep byte-churn applies to EVERY component consuming an
 out-of-workspace path dep (-C metadata hash): now curl, l4check, hidcheck, usbcheck,
 net.rtl8125, usb.ohci, usb.ohci-pci via eo9-dns/eo9-ohci/eo9-rtl8125/eo9-curl-core.
-Standing rule unchanged (refresh from the main checkout post-merge) but the reviewer
-checklist should treat ANY bundle diff from a worktree as suspect-residue first.
+BREADTH (area/37 lane observation, reviewer-verified by running check-components-bundle
+inside a worktree): the class is wider than the path-dep consumers — essentially ALL
+87 components read stale from a worktree checkout (coreutils, examples, stubs
+included), so a full `refresh-components` run anywhere but the main checkout rewrites
+the whole bundle with residue bytes. Standing rule sharpened: refresh-components is
+MAIN-CHECKOUT-ONLY, lanes commit only the components their diff actually changed, and
+the reviewer treats ANY bundle diff from a worktree as suspect-residue first.
 Real fix candidates: workspace-ize the shared crates or pin metadata hashing.
 
 ## Network kexec residuals (area/21-kexec, 2026-06-08)
@@ -789,3 +794,78 @@ restructure — lengthen to detector-grade (~1 s) or delete the cap and trust th
 registered wake set + the existing park-backstop liveness detector. Size S;
 SEQUENCE AFTER area/34 lands so both executors keep one doctrine shape.
 Full inventory: docs/study/timer-crutch-audit.md.
+
+## USB HID events: QEMU leg is interrupt-driven; the board's polled reads are the v1 residue (area/37, fixes timer-crutch audit A1+A4 QEMU legs, 2026-06-09)
+The discarded-event bug is fixed where the plumbing exists: `usb.ohci-pci` now asks
+`pci::enable-interrupts` for one INTx vector at bring-up (the disk.virtio shape) and
+the shared OHCI core unmasks exactly WDH+RHSC (+MIE, `Ohci::enable_events`) — `usb::read`
+parks on the done-queue writeback instead of answering empty every 2 ms, and the new
+`usb::watch-ports` parks on RHSC instead of 50/100 ms port sweeps. Ack discipline
+unchanged: WDH is acked once, by `consume_done_queue` after taking HccaDoneHead; RHSC
+is acked by the wait paths (port change bits stay readable for the sweeps). `usb.kbd`
+and `hidcheck` skip their `POLL_PACE_NS` pacing when `usb::event-driven` answers true.
+Measured (QEMU TCG, foreground `usb.kbd --window-ms 40000`, no typing, same build with
+the shell's vector request toggled): 1904 read rounds per 40 s window polled — each a
+multi-host-call drain through the composed component — vs 4 rounds event-driven (the
+2 s wait-bound cadence): ~480× fewer wakes; with typing, wakes are per keystroke and
+the gates' 250 ms QMP pacing decodes every transition, hub leg included. NOTE the idle
+host-CPU% did NOT move (~83-100% polled, ~99% event-driven, both pegged-class): the
+drive loop stays hot for other reasons — see the companion entry below. Liveness
+doctrine wired, not just honored: a report found by the post-timeout drain prints a
+rate-limited `liveness: usb.ohci-pci:` line (shell), and a connect found by a sweep
+after a timed-out `watch-ports` prints `liveness: usb.kbd:` — the fallback rescues
+loudly, never silently. REMAINING RESIDUE (the board leg, capability-gated not
+cfg-gated): `usb.ohci` already calls `platform::enable-interrupts` and falls back
+cleanly when the v1 kernel root answers `unsupported`, so the board keeps today's
+2 ms read pace and 50 ms connect sweeps until platform interrupt routing lands
+(usb-ohci-plan risk 7 / §6 design note: per-region GIC SPIs 216/219 + an IntxWait
+mirror in platform_provider — kernel-side only, zero guest changes). The audit's A1
+GAPS entry (area/35) should be folded into this one when both lanes merge.
+
+## The kernel session never idles while any composition is alive — USB event wakes are fixed but the core still burns ~100% (area/37 measurement, 2026-06-09)
+Found while proving the A1 fix's wake-rate claim: with the kbd path fully
+event-driven (4 guest read rounds per 40 s, see the entry above), the station config
+STILL pegs the host vCPU at ~99% (10-sample ps means; before the fix it measured
+~83% with dips to ~42%), and a foreground `usb.kbd` window pegs ~99% as well. PC
+sampling via QMP (30 × `info registers` at idle) lands almost every sample inside
+`wasm::svc::drive_services`+0x28 with the rest in `IntxWait::poll` — the drive loop
+is executing passes back-to-back, not parked in `wfi`. Two suspects, both inventoried
+by the audit and owned by area/34's executor lane, now with a measurement attached:
+(1) the exec surface's `task.wait` host call rings its own waker on every pending
+poll ("stay runnable so that loop keeps turning", wasm/shellexec.rs:2555) — any eosh
+waiting on a foreground child is permanently runnable, so the session loop takes the
+hot branch (`wake_idle`, no `idle_wait`) for the child's whole lifetime; (2) even
+with nothing runnable (station at the bare prompt + one parked service), the
+10 ms `IDLE_WAKE_INTERVAL_NS` child-running cap plus the apparent cost of re-polling
+parked component instances keeps the duty cycle saturated under TCG (the parked
+IntxWait's 2 s bound was observed expiring at ~10 s granularity — re-polls are that
+far apart while the core is 100% busy, i.e. each pass is wall-clock expensive).
+Consequence for the doctrine: fixing the device-driver crutches (A1 here, A2 next)
+is necessary but NOT sufficient for an idle station — the executor lane must land
+before the idle-CPU win is observable. Numbers and probes: area/37's lane report.
+UPDATE (review train, 2026-06-09): area/34 has since merged — the blanket hot-pass
+wake and the 10 ms/1 s caps are gone, and the reviewer measured station idle at
+~12% TCG (plain 0.0%), so suspect (2) is resolved; the `task.wait` self-wake half
+(suspect 1, the foreground-composition spin) STANDS and remains the area/35 class-A
+usermode/kernel follow-up this entry's PC samples corroborate.
+
+## usb `watch-ports` has no gate exercising it (area/37 review, 2026-06-09)
+Every gate boots with the keyboard already attached, so usb.kbd's first sweep finds
+the device and `watch-ports` (the RHSC park) never runs end to end — it is covered
+by the eo9-ohci mock tests only. The cheap gate arm when a lane wants it: boot the
+check-usb-hub topology WITHOUT `-device usb-kbd`, start `usb.ohci-pci $ usb.kbd`
+(it enters the watch), then QMP `device_add usb-kbd,bus=eo9ohci.0,port=1.1` and
+assert the attach banner + a forwarded keystroke — proving RHSC delivery, the
+Changed arm, and the liveness line's absence on the event path.
+
+## usb event-mode wait errors map to TimedOut — a latent hot-spin if a vector can ever die mid-task (area/37 review, 2026-06-09)
+Both OHCI shells map any `pci::wait`/`platform::wait` error to `TimedOut` (the
+polled-fallback round). Sound today: interrupt handles are task-scoped, so no live
+task can hold a dead vector, and a real bound expiry takes the full bound. But if a
+revocable-vector state is ever introduced (per-device interrupt teardown, hot
+unplug), an INSTANTLY-erroring wait plus usb.kbd's cached `event-driven` answer
+(pacing dropped) becomes a hot loop: drivers hold no time capability and cannot
+self-pace. The degradation design when that day comes: after N consecutive wait
+errors the shell drops its vector (waits answer `Unsupported`) and flips the
+endpoint's `event-driven` answer false; the consumer re-queries `event-driven` on
+empty reads and resumes its pacing. Comments at both Err arms point here.

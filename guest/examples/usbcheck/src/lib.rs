@@ -31,8 +31,11 @@ eo9_guest::bindings!({
 /// the bench shape is "plug, then re-run".
 const WATCH_SWEEPS: u32 = 25;
 
-/// Watch-mode sweep pacing: 100 ms keeps the loop honest toward the scheduler (the
-/// D46 stranded-runnable lesson) and is far inside human plug/unplug timing.
+/// Watch-mode sweep pacing where the provider has no event surface (`watch-ports`
+/// answers `unsupported` — the v1 board residue): 100 ms keeps the loop honest
+/// toward the scheduler (the D46 stranded-runnable lesson) and is far inside human
+/// plug/unplug timing. With events, the RHSC wait paces the loop and transitions are
+/// observed the moment the controller signals them (timer-crutch audit A4).
 const WATCH_PACE_NS: u64 = 100_000_000;
 
 eo9_guest::main! {
@@ -59,9 +62,11 @@ eo9_guest::main! {
         ))
         .map_err(io_failure)?;
 
-        // Watch mode (M1 plug/unplug acceptance): poll every port for the window,
+        // Watch mode (M1 plug/unplug acceptance): sweep every port for the window,
         // print each transition, count them. No enumeration — the operator is
         // moving cables; CCS/CSC/LSDA are the observables (OHCI 1.0a §7.4.4).
+        // Event-driven where the provider supports `watch-ports` (each sweep waits
+        // on RHSC; `timed-out` just re-sweeps), self-paced sweeps otherwise.
         if let Some(window_ms) = watch_ms {
             let time = time_api::default();
             let started = time_api::monotonic_now(&time);
@@ -99,7 +104,15 @@ eo9_guest::main! {
                     }
                     *slot = Some(status);
                 }
-                time_api::sleep(&time, WATCH_PACE_NS).await;
+                match usb::watch_ports(&root).await {
+                    // A change was signalled, or the bounded wait expired: re-sweep
+                    // now — the wait itself paced the loop.
+                    Ok(usb::WatchOutcome::Changed) | Ok(usb::WatchOutcome::TimedOut) => {}
+                    // No event surface (or the wait failed): the polled fallback.
+                    Ok(usb::WatchOutcome::Unsupported) | Err(_) => {
+                        time_api::sleep(&time, WATCH_PACE_NS).await;
+                    }
+                }
             }
             text::write_out_line(&format!(
                 "usbcheck: watch window closed ({transitions} transition line(s))"

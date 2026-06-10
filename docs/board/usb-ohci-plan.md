@@ -128,11 +128,48 @@ PD/CRU/u2phy/VBUS plumbing, non-coherent DMA on real silicon, low-speed signalin
    without prior `usb start`.
 7. Polled cadence vs ~8–10 ms interrupt period → M3 reports/s under autorepeat
    (steady ~125/s expected; sagging = scheduling, garbled = DMA). SPIs 216/219
-   recorded for the IRQ follow-up.
+   recorded for the IRQ follow-up — surface shape settled, see §6.
 8. The 64-byte UART FIFO bug is context, not a dependency: USB input bypasses the
    UART entirely (this lane is the long-term replacement for serial console input);
    bench automation still needs the UART kernel fix separately. Injection path keeps
    drop-with-counter ring-full policy.
+
+## 6. Board interrupt-wait surface (design note — the risk-7 follow-up's shape)
+
+Status 2026-06-09 (area/37, timer-crutch audit A1/A4): the QEMU leg is event-driven —
+`usb.ohci-pci` asks `pci::enable-interrupts` for one INTx vector at bring-up; granted,
+the shared core unmasks exactly WDH+RHSC (+MIE) via `Ohci::enable_events` and the
+steady-state waits park on the interrupt (`usb::read` on WDH, `usb::watch-ports` on
+RHSC), each wait bounded by the provider (`INTX_WAIT_BOUND`). Everything the board
+leg needs above the kernel is ALREADY IN PLACE and capability-gated, not cfg-gated:
+
+- **Guest side: nothing left to do.** `usb.ohci` calls
+  `platform::enable-interrupts(region)` at bring-up today; the v1 kernel root answers
+  `unsupported`, so the shell keeps `interrupt: None`, the core never unmasks, and
+  reads stay short polls with the consumers pacing (`usb.kbd`/`hidcheck`
+  `POLL_PACE_NS` = 2 ms, the connect watches 50/100 ms) — the documented v1 board
+  residue. The moment `enable-interrupts` answers with a handle, the same shell
+  bytes go event-driven.
+- **Kernel side: mirror `pci_provider`'s `IntxWait` in `platform_provider`.** The
+  region table gains a per-region GIC SPI (usb-host0-ohci → SPI 216, usb-host1-ohci
+  → SPI 219, from the v6.12 dtsi — §0 table); `enable-interrupts(region)` validates
+  the region carries a line, registers a per-line delivery counter with the arch GIC
+  layer (the `kirq` mask-and-count protocol `pci_intx` already implements), and
+  returns the handle; `wait` is the same arm→park→take future with the same
+  2 s bound and Drop mask-and-drain discipline. No new WIT — the surface has been in
+  `eo9:platform` since M0 ("interrupt ops present but `unsupported` in v1").
+- **Acceptance when it lands:** the bring-up line flips from `events: polled` to
+  `events: interrupt` on the bench transcript; the M3 autorepeat reports/s holds
+  (~125/s — the hardware polls the endpoint at its interval either way; the
+  interrupt only replaces the guest-side wake), and the kernel's one-shot
+  "delivery served an interrupt wait" line appears. The liveness arm is already
+  wired: a report found by the post-timeout drain prints a `liveness: usb.ohci:`
+  line (rate-limited), so a half-routed SPI shows up loudly instead of silently
+  degrading to the 2 s-paced fallback.
+- **Watch out for:** level-vs-edge configuration of the SPIs at the GIC distributor
+  (OHCI INTx is level), and the unmask-only-under-a-waiter rule — the kernel masks
+  the line at the controller between waits, so an asserted-but-unawaited OHCI cause
+  must not storm the IRQ handler.
 
 ## Critical files
 

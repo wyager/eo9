@@ -3,8 +3,10 @@
 //! Targets the `eo9-examples:hidcheck/hidcheck` world (see `wit/world.wit`): the M3
 //! milestone of the USB lane, run QEMU-first against `usb.ohci-pci` + `-device
 //! usb-kbd` with QMP key injection (`check-usb`), byte-identical on the board later.
-//! Polling paces itself with `time.sleep` between empty reads — a guest hot-spinning
-//! on synchronous host calls is invisible to cooperative scheduling (the D46
+//! Where the provider routes the controller interrupt (`event-driven`), reads park on
+//! it and no pacing is needed; where it does not (the v1 board residue), polling
+//! paces itself with `time.sleep` between empty reads — a guest hot-spinning on
+//! synchronous host calls is invisible to cooperative scheduling (the D46
 //! stranded-runnable lesson), and a boot keyboard's interval is milliseconds anyway.
 
 #![no_std]
@@ -30,7 +32,9 @@ eo9_guest::bindings!({
 /// Port sweeps before concluding nothing is connected (one host call per port each).
 const WATCH_SWEEPS: u32 = 25;
 /// Pause between empty endpoint polls, in nanoseconds (2 ms — well under a boot
-/// keyboard's 8-10 ms interval, far above hot-spin).
+/// keyboard's 8-10 ms interval, far above hot-spin). The polled-fallback pace only:
+/// where the provider routes the controller interrupt (`event-driven` answers true)
+/// reads park on it and this sleep is skipped.
 const POLL_PACE_NS: u64 = 2_000_000;
 
 eo9_guest::main! {
@@ -174,8 +178,10 @@ eo9_guest::main! {
         .await
         .map_err(usb_failure)?;
 
-        // Poll, decode, count. The reads are short polls (empty = nothing waiting);
-        // pacing sleeps keep the loop honest toward the scheduler.
+        // Read, decode, count. Event-driven where the provider routes the controller
+        // interrupt (reads park on WDH; empty = the bounded wait expired, call
+        // again); short polls with pacing sleeps otherwise.
+        let event_driven = usb::event_driven(&opened);
         text::write_out_line(&format!(
             "hidcheck: polling for {target_reports} report(s) (type into the device / \
              inject events now)"
@@ -193,7 +199,9 @@ eo9_guest::main! {
             }
             let report = usb::read(&opened).await.map_err(usb_failure)?;
             if report.is_empty() {
-                time_api::sleep(&time, POLL_PACE_NS).await;
+                if !event_driven {
+                    time_api::sleep(&time, POLL_PACE_NS).await;
+                }
                 continue;
             }
             count += 1;

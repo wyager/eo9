@@ -9,12 +9,24 @@
 //! never traps, and the short-poll "empty result = nothing waiting" contract on the
 //! interrupt endpoint. The drivers hold no time capability: every wait is counted on
 //! HcFmNumber, the controller's own 1 ms frame counter (OHCI 1.0a §7.3.3).
+//!
+//! Events over polls (the timer-crutch audit A1/A4): where the shell's underlying
+//! capability routes the controller's interrupt (`eo9:pci` enable-interrupts under
+//! QEMU; `eo9:platform` once the board kernel routes GIC SPIs 216/219), the shell
+//! calls [`Ohci::enable_events`] after bring-up and the steady-state waits become
+//! event-driven: [`read_report`](Ohci::read_report) parks on WritebackDoneHead and
+//! [`wait_port_change`](Ohci::wait_port_change) on Root Hub Status Change, each wait
+//! bounded by the provider. Where no interrupt surface exists, both fall back to the
+//! original short-poll shape and the CONSUMER paces (capability-gated, not cfg-gated).
+//! The frame-counted waits ([`wait_ms`](Ohci::wait_ms) for reset recovery / settle)
+//! are honest USB-mandated obligations and stay as they are — a separate owner
+//! decision (audit class B).
 
 use crate::enumerate::{Action, Enumerated, Enumeration, EnumerationError, Event};
 use crate::hub::{self, HubDescriptor, HubPortStatus};
 use crate::schedule::{
-    EdDirection, EndpointDescriptor, TdPid, TdToggle, TransferDescriptor, arena, hcca,
-    walk_done_queue,
+    DI_IMMEDIATE, EdDirection, EndpointDescriptor, TdPid, TdToggle, TransferDescriptor, arena,
+    hcca, walk_done_queue,
 };
 use crate::setup::SetupPacket;
 use crate::{ConditionCode, bits, fm_interval_restore, periodic_start, reg};
@@ -45,6 +57,43 @@ pub trait RegionIo {
 
     /// Copy bytes out of the arena at `offset`.
     fn dma_read(&mut self, offset: u64, buf: &mut [u8]);
+
+    /// Wait for the controller's next interrupt delivery, if the shell routes one.
+    ///
+    /// `Delivered` = at least one delivery arrived (possibly coalesced, possibly a
+    /// shared-line spurious — the caller re-checks the actual cause); `TimedOut` =
+    /// the provider's bounded wait expired (or the wait failed for any other reason
+    /// — the caller falls back to one poll round and may wait again, so a
+    /// persistently failing wait degrades to a provider-bound-paced poll, never a
+    /// hang and never a hot spin); `Unsupported` = no interrupt surface on this
+    /// configuration (the default — e.g. eo9:platform v1, x86_64 PCI), the caller
+    /// keeps the polled shape and its consumer owns the pacing.
+    async fn wait_interrupt(&mut self) -> Result<WaitOutcome, Self::Error> {
+        Ok(WaitOutcome::Unsupported)
+    }
+}
+
+/// Outcome of one bounded interrupt wait (see [`RegionIo::wait_interrupt`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// A delivery arrived; the cause registers say what (and a shared line can make
+    /// this spurious — always re-check the cause).
+    Delivered,
+    /// The bounded wait expired with no delivery.
+    TimedOut,
+    /// No interrupt surface exists on this configuration.
+    Unsupported,
+}
+
+/// What [`Ohci::read_report`] answers: the report length when one retired (`None` =
+/// nothing arrived within this round), plus the liveness flag — `rescued` is set when
+/// the report was found by the post-timeout drain poll, i.e. work the interrupt
+/// should have delivered (the shell reports it loudly; owner doctrine: a backstop
+/// rescuing work the event path owed is a bug surfacing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadReport {
+    pub length: Option<usize>,
+    pub rescued: bool,
 }
 
 /// Typed driver failures. `Io` carries the capability's own error; everything else is
@@ -124,6 +173,10 @@ const FRAME_POLL_LIMIT_PER_MS: u32 = 50_000;
 const CONTROL_POLL_LIMIT: u32 = 500_000;
 /// Done-queue walk bound: the arena only holds TD_SLOTS TDs.
 const DONE_QUEUE_LIMIT: usize = arena::TD_SLOTS as usize + 2;
+/// Event mode: the HccaDoneHead writeback for a retired DI_IMMEDIATE TD lands at the
+/// next frame boundary (≤1 ms); this bounds the wait for it in host calls — a few
+/// frames' worth, far above any healthy controller, far below the executor's bounds.
+const WRITEBACK_POLL_LIMIT: u32 = 200_000;
 
 /// The driver. Construct with [`Ohci::new`], then [`bring_up`](Self::bring_up) before
 /// anything else.
@@ -133,6 +186,10 @@ pub struct Ohci<R: RegionIo> {
     /// The interrupt-IN endpoint's re-arm state: which TD slot is pending and which
     /// is the dummy tail, plus the buffer length to read back.
     interrupt: Option<InterruptState>,
+    /// Whether [`enable_events`](Self::enable_events) unmasked WDH/RHSC — i.e. the
+    /// shell routes the controller's interrupt and the event-driven wait paths are
+    /// live. False = the original polled shape (the consumer paces).
+    events: bool,
 }
 
 struct InterruptState {
@@ -147,6 +204,7 @@ impl<R: RegionIo> Ohci<R> {
             io,
             info: None,
             interrupt: None,
+            events: false,
         }
     }
 
@@ -155,11 +213,43 @@ impl<R: RegionIo> Ohci<R> {
         self.info
     }
 
+    /// Whether the event-driven wait paths are live (see [`enable_events`](Self::enable_events)).
+    pub fn events(&self) -> bool {
+        self.events
+    }
+
+    /// Unmask the two interrupts this driver actually consumes — WritebackDoneHead
+    /// (done-queue completion) and Root Hub Status Change (port connect) — plus
+    /// MasterInterruptEnable, so the controller drives its interrupt line and the
+    /// shell's `wait_interrupt` has an edge to wait on. Call ONLY after bring-up and
+    /// only when the shell actually routes the interrupt (a granted vector): with no
+    /// listener the unmask buys nothing and the polled discipline stays cheaper.
+    ///
+    /// Ack discipline (unchanged by the unmask): WDH is acknowledged exactly once,
+    /// by [`consume_done_queue`](Self::consume_done_queue) AFTER it takes
+    /// HccaDoneHead (§5.2.9 — acking without taking would let the next writeback
+    /// overwrite an unread chain); RHSC is acknowledged by the wait paths after a
+    /// delivery, with the underlying per-port change bits left in HcRhPortStatus for
+    /// the sweeps to read (the status registers carry the data; the interrupt-status
+    /// bits are just the edge latches).
+    pub async fn enable_events(&mut self) -> Result<(), DriverError<R::Error>> {
+        self.io
+            .write32(
+                reg::HC_INTERRUPT_ENABLE,
+                bits::INT_MIE | bits::INT_WDH | bits::INT_RHSC,
+            )
+            .await
+            .map_err(DriverError::Io)?;
+        self.events = true;
+        Ok(())
+    }
+
     /// Take the controller over and make it operational (OHCI 1.0a §5.1.1):
     /// ownership handshake if SMM holds it, software reset **with HcFmInterval saved
     /// and restored across it** (§5.1.1.4 — the gotcha), HCCA, schedules cleared,
-    /// operational state, interrupts masked (the polled driver's suppression
-    /// discipline), root-hub power on.
+    /// operational state, interrupts masked (a shell that routes the controller's
+    /// interrupt unmasks WDH/RHSC afterwards — [`enable_events`](Self::enable_events)),
+    /// root-hub power on.
     pub async fn bring_up(&mut self) -> Result<ControllerInfo, DriverError<R::Error>> {
         let io = |e| DriverError::Io(e);
 
@@ -240,8 +330,11 @@ impl<R: RegionIo> Ohci<R> {
             .await
             .map_err(io)?;
 
-        // No interrupt delivery: the driver is polled (the ISR-suppression discipline
-        // in this device's dialect); the WDH writeback to the HCCA happens regardless.
+        // Mask everything and clear stale causes: bring-up always starts from the
+        // polled shape (the WDH writeback to the HCCA happens regardless). A shell
+        // that routes the controller's interrupt unmasks the two consumed causes
+        // afterwards via `enable_events` — never here, because with no granted
+        // vector an unmasked cause is just an interrupt line nobody listens to.
         self.io
             .write32(reg::HC_INTERRUPT_DISABLE, !0)
             .await
@@ -401,12 +494,27 @@ impl<R: RegionIo> Ohci<R> {
         let status_td = arena::td_slot(2);
         let dummy_td = arena::td_slot(3);
 
+        // Event mode: every TD requests the done-queue writeback (DI = 0). With the
+        // default DI_NONE the controller defers the HccaDoneHead writeback
+        // indefinitely; the deferred chain would then flush all at once when the
+        // first interrupt-endpoint TD retires — pointing at control TD slots long
+        // since rewritten for later transfers (a corrupt walk). Requesting the
+        // writeback per transfer keeps the chain ≤ one transfer and lets
+        // `reap_done_queue` consume it before any slot is reused. Polled mode keeps
+        // DI_NONE and the original drain-by-ED shape, byte for byte.
+        let delay_interrupt = if self.events {
+            DI_IMMEDIATE
+        } else {
+            crate::schedule::DI_NONE
+        };
+
         let mut setup_descriptor = TransferDescriptor::new(
             TdPid::Setup,
             TdToggle::Data0,
             Some((base + arena::SETUP_BUFFER as u32, 8)),
         );
         let has_data = in_length > 0;
+        setup_descriptor.delay_interrupt = delay_interrupt;
         setup_descriptor.next = base + if has_data { data_td } else { status_td } as u32;
         self.io.dma_write(setup_td, &setup_descriptor.encode());
 
@@ -416,6 +524,7 @@ impl<R: RegionIo> Ohci<R> {
                 TdToggle::Data1,
                 Some((base + arena::CONTROL_BUFFER as u32, in_length as u32)),
             );
+            data_descriptor.delay_interrupt = delay_interrupt;
             data_descriptor.next = base + status_td as u32;
             self.io.dma_write(data_td, &data_descriptor.encode());
         }
@@ -423,6 +532,7 @@ impl<R: RegionIo> Ohci<R> {
         // Status stage: IN for OUT/no-data requests, OUT for IN requests; always DATA1.
         let status_pid = if has_data { TdPid::Out } else { TdPid::In };
         let mut status_descriptor = TransferDescriptor::new(status_pid, TdToggle::Data1, None);
+        status_descriptor.delay_interrupt = delay_interrupt;
         status_descriptor.next = base + dummy_td as u32;
         self.io.dma_write(status_td, &status_descriptor.encode());
         self.io
@@ -478,7 +588,20 @@ impl<R: RegionIo> Ohci<R> {
             }
         };
         self.disable_control_list().await?;
-        self.consume_done_queue().await?;
+        // Clean drain: every submitted TD retired (head reached the dummy), so every
+        // writeback is owed. Halted: only the offender is guaranteed retired (its
+        // predecessors' writebacks, if split off, are strays the next consume
+        // collects; the ED and slots are re-initialized wholesale on the next
+        // transfer, so a stray walk reads retired-then-rewritten content only on the
+        // already-rare error path — the happy path is airtight).
+        let expected = if halted {
+            1
+        } else if has_data {
+            3
+        } else {
+            2
+        };
+        self.reap_done_queue(expected).await?;
 
         // Judge the retired TDs by their written-back condition codes.
         // DataUnderrun with rounding on is a permitted short packet; the controller
@@ -555,6 +678,7 @@ impl<R: RegionIo> Ohci<R> {
             .map_err(DriverError::Io)?;
         // Validate the chain (bounded), but the per-TD judgement is the caller's.
         let mut reads: heapless_chain::Chain = Default::default();
+        let mut walked = 0u32;
         let result = walk_done_queue(
             head,
             DONE_QUEUE_LIMIT,
@@ -564,12 +688,48 @@ impl<R: RegionIo> Ohci<R> {
                 self.io.dma_read(offset, &mut td_bytes);
                 TransferDescriptor::decode(&td_bytes)
             },
-            |address, _| reads.push(address),
+            |address, _| {
+                reads.push(address);
+                walked += 1;
+            },
         );
         if result.is_err() {
             return Err(DriverError::DoneQueueCorrupt);
         }
-        Ok(head & !0xf)
+        Ok(walked)
+    }
+
+    /// Take and acknowledge the done-queue writeback for TDs known to have retired,
+    /// COUNTED: `expected` is the number of retired TDs whose writebacks must be
+    /// collected before any of their slots may be reused.
+    ///
+    /// Event mode: the retired TDs requested the interrupt (DI_IMMEDIATE), so the
+    /// writebacks land within a frame each — wait them out (bounded) and consume
+    /// until the count is in, keeping the TD slots clean BEFORE they are reused (a
+    /// slot rewritten while its writeback is still pending would leave HccaDoneHead
+    /// pointing into recycled memory — the corrupt-walk class this discipline exists
+    /// to prevent). Counting matters because the writebacks can SPLIT: a chain whose
+    /// TDs retire across frame boundaries flushes its first batch at the next tick
+    /// and holds the rest behind the WDH it just set — a reap that stops at the
+    /// first non-empty take would leave the held batch to land after slot reuse
+    /// (the recycled-slot walk again, in a narrower window).
+    ///
+    /// Polled mode: DI_NONE TDs never arm the writeback, so this is one best-effort
+    /// take — the original shape, byte for byte; `expected` is ignored.
+    async fn reap_done_queue(&mut self, expected: u32) -> Result<(), DriverError<R::Error>> {
+        let mut taken = self.consume_done_queue().await?;
+        if !self.events {
+            return Ok(());
+        }
+        let mut polls = 0u32;
+        while taken < expected {
+            taken += self.consume_done_queue().await?;
+            polls += 1;
+            if polls > WRITEBACK_POLL_LIMIT {
+                return Err(DriverError::Timeout("done-queue writeback"));
+            }
+        }
+        Ok(())
     }
 
     /// Reset the port, address the device, and run the GET_DESCRIPTOR chain — the
@@ -858,6 +1018,15 @@ impl<R: RegionIo> Ohci<R> {
             TdToggle::FromEd,
             Some((base + arena::INTERRUPT_BUFFER as u32, report_len as u32)),
         );
+        if self.events {
+            // Event mode parks on WDH, so this TD must REQUEST the writeback
+            // interrupt: at the default DI_NONE the controller never arms the
+            // interrupt-delay counter and the edge `read_report` waits on does not
+            // exist. (Control TDs request it too in event mode — control_transfer's
+            // deferred-chain rationale — and their writebacks are reaped counted
+            // before slot reuse.)
+            td.delay_interrupt = DI_IMMEDIATE;
+        }
         td.next = base + dummy as u32;
         self.io.dma_write(pending, &td.encode());
         self.io
@@ -963,7 +1132,7 @@ impl<R: RegionIo> Ohci<R> {
         let copied = received.min(report.len());
         self.io
             .dma_read(arena::INTERRUPT_BUFFER, &mut report[..copied]);
-        self.consume_done_queue().await?;
+        self.reap_done_queue(1).await?;
 
         // Re-arm: the old dummy becomes the pending TD, the old pending the new dummy
         // (the standard tail-swap; the controller owns head, we only move tail).
@@ -974,6 +1143,11 @@ impl<R: RegionIo> Ohci<R> {
             TdToggle::FromEd,
             Some((base + arena::INTERRUPT_BUFFER as u32, report_len as u32)),
         );
+        if self.events {
+            // The re-armed TD must keep requesting the writeback interrupt (see
+            // open_interrupt_in): every report's WDH is what the next read parks on.
+            next.delay_interrupt = DI_IMMEDIATE;
+        }
         next.next = base + arena::td_slot(new_dummy) as u32;
         self.io.dma_write(
             arena::td_slot(new_dummy),
@@ -994,6 +1168,96 @@ impl<R: RegionIo> Ohci<R> {
             max_packet,
         });
         Ok(Some(copied))
+    }
+
+    /// The next interrupt-IN report, event-driven where events are live (audit A1).
+    ///
+    /// Polled shape (`enable_events` never ran): exactly one
+    /// [`poll_interrupt`](Self::poll_interrupt) — empty means nothing waiting, the
+    /// consumer owns the pacing.
+    ///
+    /// Event shape: wait first (a delivery that raced in before this call left the
+    /// provider's counter pending, so the wait resolves immediately — no pre-wait
+    /// poll is needed and the counter never drifts), then drain:
+    /// * `Delivered` + a report — the steady-state keystroke path: take it,
+    ///   [`consume_done_queue`](Self::consume_done_queue) acked WDH, line deasserts.
+    /// * `Delivered` + nothing — the cause was RHSC (or a stale/shared-line
+    ///   delivery): acknowledge RHSC so the level line deasserts instead of storming
+    ///   the next wait, and answer empty (the consumer just calls again).
+    /// * `TimedOut` + a report — work the interrupt owed but never delivered: the
+    ///   `rescued` flag, which the shell reports loudly (owner doctrine — a fallback
+    ///   that rescues silently is the named bug class).
+    pub async fn read_report(
+        &mut self,
+        report: &mut [u8],
+    ) -> Result<ReadReport, DriverError<R::Error>> {
+        if !self.events {
+            let length = self.poll_interrupt(report).await?;
+            return Ok(ReadReport {
+                length,
+                rescued: false,
+            });
+        }
+        let outcome = self.io.wait_interrupt().await.map_err(DriverError::Io)?;
+        let length = self.poll_interrupt(report).await?;
+        match outcome {
+            WaitOutcome::Delivered if length.is_none() => {
+                // The wake was not a report: consume any stale writeback (so an
+                // unacked WDH cannot keep the level line asserted and storm the next
+                // wait) and acknowledge RHSC for the same reason. The consumer just
+                // calls again.
+                self.consume_done_queue().await?;
+                self.ack_root_hub_change().await?;
+                Ok(ReadReport {
+                    length: None,
+                    rescued: false,
+                })
+            }
+            WaitOutcome::TimedOut => Ok(ReadReport {
+                length,
+                rescued: length.is_some(),
+            }),
+            _ => Ok(ReadReport {
+                length,
+                rescued: false,
+            }),
+        }
+    }
+
+    /// Park until the root hub signals a status change (RHSC — audit A4), where
+    /// events are live; `Unsupported` otherwise (the caller paces its own sweeps).
+    /// On a delivery the RHSC latch is acknowledged here — the per-port change bits
+    /// stay readable in HcRhPortStatus, so the caller's sweep sees everything; not
+    /// acking would leave the level line asserted and turn every later wait into an
+    /// instant spurious wake. `TimedOut` is an ordinary answer: re-sweep (free — the
+    /// wait already paced the loop) and call again.
+    pub async fn wait_port_change(&mut self) -> Result<WaitOutcome, DriverError<R::Error>> {
+        if !self.events {
+            return Ok(WaitOutcome::Unsupported);
+        }
+        let outcome = self.io.wait_interrupt().await.map_err(DriverError::Io)?;
+        if outcome == WaitOutcome::Delivered {
+            self.ack_root_hub_change().await?;
+        }
+        Ok(outcome)
+    }
+
+    /// Acknowledge a pending Root Hub Status Change latch (write-1-to-clear), if one
+    /// is set. WDH is deliberately NOT touched here: its one ack site is
+    /// [`consume_done_queue`](Self::consume_done_queue), after the head is taken.
+    async fn ack_root_hub_change(&mut self) -> Result<(), DriverError<R::Error>> {
+        let status = self
+            .io
+            .read32(reg::HC_INTERRUPT_STATUS)
+            .await
+            .map_err(DriverError::Io)?;
+        if status & bits::INT_RHSC != 0 {
+            self.io
+                .write32(reg::HC_INTERRUPT_STATUS, bits::INT_RHSC)
+                .await
+                .map_err(DriverError::Io)?;
+        }
+        Ok(())
     }
 
     /// Borrow the underlying region I/O (the shells' diagnostics read raw registers
@@ -1063,7 +1327,38 @@ mod tests {
         /// written back to HccaDoneHead at a frame tick when WDH is clear — the
         /// silicon-faithful gating QEMU does not model.
         done_head: u32,
+        /// Whether any retired TD on the accumulator REQUESTED the writeback
+        /// interrupt (DelayInterrupt < 0b111). Until one does, the writeback is
+        /// deferred indefinitely (§4.3.1.2 — DI_NONE TDs never arm the
+        /// interrupt-delay counter): the strict modeling that catches a driver
+        /// waiting on WDH while its own TDs suppress it (the area/37 lesson — QEMU
+        /// behaves this way and the first event-mode build missed it).
+        done_di_armed: bool,
         wdh: bool,
+        /// The RHSC interrupt-status latch: set when a port change bit sets, cleared
+        /// only by the write-1-to-clear ack (§7.1.4) — the latch outlives the port
+        /// bits, which is exactly what the ack discipline under test must handle.
+        rhsc: bool,
+        /// HcInterruptEnable, with the real set/clear split: writes to ENABLE set
+        /// bits, writes to DISABLE clear them (§7.1.5-6).
+        interrupt_enable: u32,
+        /// Scripted `wait_interrupt` outcomes (empty = `Unsupported`, the polled
+        /// default). A scripted `Delivered` is silicon-faithful: the mock runs frames
+        /// until an ENABLED cause is actually pending and DOWNGRADES to `TimedOut` if
+        /// none materializes — so a driver that forgets the unmask cannot pass an
+        /// event-mode test.
+        wait_script: std::collections::VecDeque<WaitOutcome>,
+        /// Control TDs retired per processing pass (`u32::MAX` = the whole chain in
+        /// one shot, QEMU's shape). A finite limit models silicon retiring one TD
+        /// per frame, which SPLITS a transfer's done-queue writebacks across ticks
+        /// with WDH gating the later batches — the counted-reap discipline's forcing
+        /// case. The remainder is re-driven from `tick`.
+        control_retire_limit: u32,
+        /// The in-flight control request's answer and refusal flag, carried across
+        /// limited passes (the Setup stage runs in an earlier pass than the data
+        /// stage it answers).
+        control_response: Vec<u8>,
+        control_refused: bool,
     }
 
     const DMA_BASE: u32 = 0x4000_0000;
@@ -1128,12 +1423,32 @@ mod tests {
                 hub_reset_pending: None,
                 hub_reset_change: None,
                 done_head: 0,
+                done_di_armed: false,
                 wdh: false,
+                rhsc: false,
+                interrupt_enable: 0,
+                wait_script: std::collections::VecDeque::new(),
+                control_retire_limit: u32::MAX,
+                control_response: Vec::new(),
+                control_refused: false,
             }
         }
 
         fn register(&self, offset: u64) -> u32 {
             *self.registers.get(&offset).unwrap_or(&0)
+        }
+
+        /// HcInterruptStatus as the driver reads it: the cause latches this mock
+        /// models (WDH from the done writeback, RHSC from port changes).
+        fn interrupt_status(&self) -> u32 {
+            let mut status = 0;
+            if self.wdh {
+                status |= bits::INT_WDH;
+            }
+            if self.rhsc {
+                status |= bits::INT_RHSC;
+            }
+            status
         }
 
         fn arena_slice(&mut self, offset: u32, len: usize) -> &mut [u8] {
@@ -1264,9 +1579,8 @@ mod tests {
             let mut ed_bytes = [0u8; 16];
             ed_bytes.copy_from_slice(self.arena_slice(self.dma_base + ed_offset as u32, 16));
             let mut ed = EndpointDescriptor::decode(&ed_bytes);
-            let mut response: Vec<u8> = Vec::new();
-            let mut refused = false;
-            while ed.head != ed.tail {
+            let mut retired_this_pass = 0u32;
+            while ed.head != ed.tail && retired_this_pass < self.control_retire_limit {
                 let td_address = ed.head;
                 let mut td_bytes = [0u8; 16];
                 td_bytes.copy_from_slice(self.arena_slice(td_address, 16));
@@ -1276,11 +1590,12 @@ mod tests {
                         let mut setup_bytes = [0u8; 8];
                         setup_bytes.copy_from_slice(self.arena_slice(td.current_buffer, 8));
                         let mut answered = Vec::new();
-                        refused = !self.answer(ed.function_address, setup_bytes, &mut answered);
-                        response = answered;
+                        self.control_refused =
+                            !self.answer(ed.function_address, setup_bytes, &mut answered);
+                        self.control_response = answered;
                         td.condition_code = ConditionCode::NoError;
                     }
-                    TdPid::In | TdPid::Out if refused => {
+                    TdPid::In | TdPid::Out if self.control_refused => {
                         // The device refuses the request with a protocol STALL of the
                         // next stage (USB 2.0 §8.5.3.4): retire this TD with the Stall
                         // condition, halt the ED, stop processing its list.
@@ -1290,9 +1605,9 @@ mod tests {
                     TdPid::In => {
                         if td.current_buffer != 0 {
                             let capacity = (td.buffer_end - td.current_buffer + 1) as usize;
-                            let send = response.len().min(capacity);
+                            let send = self.control_response.len().min(capacity);
                             let start = td.current_buffer;
-                            let payload: Vec<u8> = response[..send].to_vec();
+                            let payload: Vec<u8> = self.control_response[..send].to_vec();
                             self.arena_slice(start, send).copy_from_slice(&payload);
                             // CBP: 0 if the buffer was filled exactly, else next byte.
                             td.current_buffer = if send == capacity {
@@ -1310,11 +1625,16 @@ mod tests {
                 ed.head = td.next & !0xf;
                 // Retire onto the internal done accumulator (newest first); the
                 // writeback to HccaDoneHead happens at a frame tick, WDH permitting
+                // AND only once a retired TD has requested the interrupt
                 // (`flush_done`) — the silicon timing, not QEMU's instant one.
+                if td.delay_interrupt != crate::schedule::DI_NONE {
+                    self.done_di_armed = true;
+                }
                 td.next = self.done_head;
                 let encoded = td.encode();
                 self.arena_slice(td_address, 16).copy_from_slice(&encoded);
                 self.done_head = td_address;
+                retired_this_pass += 1;
                 if ed.halted {
                     break;
                 }
@@ -1333,6 +1653,11 @@ mod tests {
                 return;
             }
             self.frame = (self.frame + 1) & 0xffff;
+            if self.control_retire_limit != u32::MAX {
+                // Per-frame retirement model: keep draining the control ED one
+                // limited pass per frame (a no-op once head == tail or halted).
+                self.process_control_list();
+            }
             self.process_periodic();
             self.flush_done();
         }
@@ -1392,6 +1717,9 @@ mod tests {
             td.condition_code = ConditionCode::NoError;
             ed.head = td.next & !0xf;
             ed.toggle_carry = !ed.toggle_carry;
+            if td.delay_interrupt != crate::schedule::DI_NONE {
+                self.done_di_armed = true;
+            }
             td.next = self.done_head;
             let encoded = td.encode();
             self.arena_slice(td_address, 16).copy_from_slice(&encoded);
@@ -1401,15 +1729,20 @@ mod tests {
                 .copy_from_slice(&encoded_ed);
         }
 
-        /// HccaDoneHead writeback, gated on WDH exactly as §5.2.9 describes: the HC
-        /// only writes when the driver has acknowledged the previous batch.
+        /// HccaDoneHead writeback, gated on WDH exactly as §5.2.9 describes (the HC
+        /// only writes when the driver has acknowledged the previous batch) AND on a
+        /// retired TD having requested the interrupt (§4.3.1.2: an accumulator of
+        /// pure DI_NONE TDs never arms the interrupt-delay counter, so the writeback
+        /// — and the WDH edge — is deferred indefinitely; QEMU does the same, which
+        /// is how an event-mode driver with DI_NONE report TDs starves).
         fn flush_done(&mut self) {
-            if self.wdh || self.done_head == 0 {
+            if self.wdh || self.done_head == 0 || !self.done_di_armed {
                 return;
             }
             let head_offset = (arena::HCCA + hcca::DONE_HEAD) as usize;
             self.arena[head_offset..head_offset + 4].copy_from_slice(&self.done_head.to_le_bytes());
             self.done_head = 0;
+            self.done_di_armed = false;
             self.wdh = true;
         }
     }
@@ -1427,6 +1760,12 @@ mod tests {
             self.tick();
             if offset == reg::HC_FM_NUMBER {
                 return Ok(self.frame);
+            }
+            if offset == reg::HC_INTERRUPT_STATUS {
+                return Ok(self.interrupt_status());
+            }
+            if offset == reg::HC_INTERRUPT_ENABLE {
+                return Ok(self.interrupt_enable);
             }
             Ok(self.register(offset))
         }
@@ -1449,17 +1788,30 @@ mod tests {
                 }
                 reg::HC_INTERRUPT_STATUS => {
                     // Write-1-to-clear: acknowledging WDH re-permits the done-queue
-                    // writeback (§5.2.9).
+                    // writeback (§5.2.9); acknowledging RHSC drops the latch (§7.1.4).
                     if value & bits::INT_WDH != 0 {
                         self.wdh = false;
                     }
+                    if value & bits::INT_RHSC != 0 {
+                        self.rhsc = false;
+                    }
+                }
+                reg::HC_INTERRUPT_ENABLE => {
+                    // Set-bits semantics (§7.1.5).
+                    self.interrupt_enable |= value;
+                }
+                reg::HC_INTERRUPT_DISABLE => {
+                    // Clear-bits semantics (§7.1.6).
+                    self.interrupt_enable &= !value;
                 }
                 offset if offset == reg::rh_port_status(1) => {
                     let mut status = self.register(offset);
                     if value & bits::PORT_PRS != 0 {
                         // The controller times the reset itself: complete instantly,
-                        // port enabled.
+                        // port enabled — a port change, so the RHSC latch sets
+                        // (§7.1.4: RHSC reflects a change in HcRhPortStatus).
                         status |= bits::PORT_PRSC | bits::PORT_PES;
+                        self.rhsc = true;
                     }
                     if value & bits::PORT_PRSC != 0 {
                         status &= !bits::PORT_PRSC;
@@ -1489,6 +1841,29 @@ mod tests {
             self.tick();
             let start = offset as usize;
             buf.copy_from_slice(&self.arena[start..start + buf.len()]);
+        }
+
+        async fn wait_interrupt(&mut self) -> Result<WaitOutcome, NoError> {
+            match self.wait_script.pop_front() {
+                // No script = no interrupt surface (the polled default).
+                None => Ok(WaitOutcome::Unsupported),
+                Some(WaitOutcome::Delivered) => {
+                    // Silicon-faithful delivery: run frames until an UNMASKED cause
+                    // is pending under MasterInterruptEnable; a driver that never
+                    // unmasked sees the wait expire instead — the masked-interrupt
+                    // regression QEMU's instant model would hide.
+                    for _ in 0..50_000 {
+                        let deliverable = self.interrupt_enable & bits::INT_MIE != 0
+                            && self.interrupt_status() & self.interrupt_enable != 0;
+                        if deliverable {
+                            return Ok(WaitOutcome::Delivered);
+                        }
+                        self.tick();
+                    }
+                    Ok(WaitOutcome::TimedOut)
+                }
+                Some(outcome) => Ok(outcome),
+            }
         }
     }
 
@@ -1806,6 +2181,52 @@ mod tests {
     }
 
     #[test]
+    fn event_mode_reaps_split_writebacks_before_returning() {
+        // Silicon-shaped timing: one control TD retires per frame, so the
+        // GET_DESCRIPTOR chain's writebacks SPLIT — the first batch flushes at the
+        // next tick and sets WDH, the rest is held behind it. The counted reap must
+        // collect every batch before control() returns; a first-non-empty reap
+        // would return with a writeback still owed, and the next transfer's slot
+        // rewrites would then be walked as a done chain (the recycled-slot class).
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.enable_events()).unwrap();
+        driver.io().control_retire_limit = 1;
+        let mut data = [0u8; 64];
+        let received = run(driver.control(
+            0,
+            8,
+            false,
+            setup::get_descriptor(setup::descriptor_type::DEVICE, 0, 64),
+            &mut data,
+        ))
+        .unwrap();
+        assert_eq!(received, 18, "the split passes still answer the request");
+        assert_eq!(&data[..18], &DEVICE);
+        // Airtight: nothing may still be owed when control() returns — the
+        // accumulator is empty, HccaDoneHead carries no unconsumed chain, and WDH
+        // is acknowledged, so every TD slot is safely reusable.
+        assert_eq!(driver.io().done_head, 0, "accumulator drained");
+        let head_offset = (arena::HCCA + hcca::DONE_HEAD) as usize;
+        assert_eq!(
+            &driver.io().arena[head_offset..head_offset + 4],
+            &[0u8; 4],
+            "no unconsumed HccaDoneHead writeback"
+        );
+        assert!(!driver.io().wdh, "WDH acknowledged after the counted reap");
+        // And the very next transfer over the same slots stays clean.
+        let received = run(driver.control(
+            0,
+            8,
+            false,
+            setup::get_descriptor(setup::descriptor_type::DEVICE, 0, 64),
+            &mut data,
+        ))
+        .unwrap();
+        assert_eq!(received, 18);
+    }
+
+    #[test]
     fn control_in_copies_short_reads_out() {
         let mut driver = Ohci::new(MockOhci::new());
         run(driver.bring_up()).unwrap();
@@ -1822,5 +2243,247 @@ mod tests {
         .unwrap();
         assert_eq!(received, 18);
         assert_eq!(&data[..18], &DEVICE);
+    }
+
+    #[test]
+    fn bring_up_masks_everything_and_enable_events_unmasks_exactly_wdh_rhsc_mie() {
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        // The polled shape is the bring-up default: everything masked, events off.
+        assert_eq!(driver.io().interrupt_enable, 0);
+        assert!(!driver.events());
+
+        run(driver.enable_events()).unwrap();
+        assert!(driver.events());
+        // Exactly the two consumed causes plus the master gate — nothing else (SF in
+        // particular would interrupt every millisecond).
+        assert_eq!(
+            driver.io().interrupt_enable,
+            bits::INT_MIE | bits::INT_WDH | bits::INT_RHSC
+        );
+    }
+
+    #[test]
+    fn the_mock_refuses_delivery_while_the_causes_are_masked() {
+        // The unmask discipline, pinned at the mock level: a scripted delivery
+        // DOWNGRADES to a timeout while HcInterruptEnable is masked — the regression
+        // QEMU's instant model would hide (a driver that forgets `enable_events`
+        // would pass against a mock that delivered regardless).
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.open_interrupt_in(1, false, 1, 8, 10)).unwrap();
+        driver.io().pending_reports.push_back(vec![0, 0, 0x0b, 0]);
+        driver.io().wait_script.push_back(WaitOutcome::Delivered);
+        assert_eq!(
+            run(driver.io().wait_interrupt()),
+            Ok(WaitOutcome::TimedOut),
+            "a masked cause must never deliver"
+        );
+    }
+
+    #[test]
+    fn event_mode_read_parks_on_wdh_and_acks_once() {
+        // The A1 steady-state path: wait → the periodic schedule retires the TD and
+        // the done writeback raises WDH → drain takes the report and acks WDH
+        // exactly once (consume_done_queue), so the next writeback can happen.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.enable_events()).unwrap();
+        run(driver.open_interrupt_in(1, false, 1, 8, 10)).unwrap();
+
+        let mut report = [0u8; 8];
+        for (expected, label) in [([0u8, 0, 0x0b, 0], "first"), ([0u8, 0, 0, 0], "second")] {
+            driver.io().pending_reports.push_back(expected.to_vec());
+            driver.io().wait_script.push_back(WaitOutcome::Delivered);
+            let read = run(driver.read_report(&mut report)).unwrap();
+            assert_eq!(
+                read.length,
+                Some(4),
+                "{label} report must arrive via the wait"
+            );
+            assert!(!read.rescued, "{label}: the event path is not a rescue");
+            assert_eq!(&report[..4], &expected, "{label} report content");
+            assert!(
+                !driver.io().wdh,
+                "{label}: WDH must be acknowledged after the drain (one ack site)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_timed_out_wait_that_finds_work_reports_the_rescue() {
+        // The liveness arm (owner doctrine): a report that retired but whose
+        // interrupt never arrived is found by the post-timeout drain and FLAGGED —
+        // the shell turns the flag into a loud `liveness:` line.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.enable_events()).unwrap();
+        run(driver.open_interrupt_in(1, false, 1, 8, 10)).unwrap();
+
+        // Retire the report and let the done writeback happen BEFORE the wait.
+        driver.io().pending_reports.push_back(vec![0, 0, 0x0b, 0]);
+        for _ in 0..400 {
+            driver.io().tick();
+        }
+        assert!(
+            driver.io().wdh,
+            "the writeback must be pending before the wait"
+        );
+
+        driver.io().wait_script.push_back(WaitOutcome::TimedOut);
+        let mut report = [0u8; 8];
+        let read = run(driver.read_report(&mut report)).unwrap();
+        assert_eq!(read.length, Some(4));
+        assert!(
+            read.rescued,
+            "work found after a timed-out wait is a rescue"
+        );
+    }
+
+    #[test]
+    fn a_spurious_delivery_acks_rhsc_instead_of_storming() {
+        // A delivery whose cause is RHSC (port change), not WDH: the drain finds no
+        // report, the RHSC latch is acknowledged (otherwise the level line stays
+        // asserted and every later wait becomes an instant spurious wake), and the
+        // answer is empty — the consumer just calls again.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.enable_events()).unwrap();
+        run(driver.open_interrupt_in(1, false, 1, 8, 10)).unwrap();
+
+        driver.io().rhsc = true; // a connect-ish change latched
+        driver.io().wait_script.push_back(WaitOutcome::Delivered);
+        let mut report = [0u8; 8];
+        let read = run(driver.read_report(&mut report)).unwrap();
+        assert_eq!(read.length, None);
+        assert!(!read.rescued);
+        assert!(
+            !driver.io().rhsc,
+            "the RHSC latch must be acknowledged on the empty-drain path"
+        );
+    }
+
+    #[test]
+    fn polled_mode_read_is_one_short_poll() {
+        // Without enable_events the read path is byte-for-byte the old shape: one
+        // short poll, no wait call (the empty wait_script would answer Unsupported,
+        // but the polled path must not even ask).
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.open_interrupt_in(1, false, 1, 8, 10)).unwrap();
+        let mut report = [0u8; 8];
+        let read = run(driver.read_report(&mut report)).unwrap();
+        assert_eq!(read.length, None);
+        assert!(!read.rescued);
+
+        driver.io().pending_reports.push_back(vec![0, 0, 0x0b, 0]);
+        let mut received = None;
+        for _ in 0..200 {
+            let read = run(driver.read_report(&mut report)).unwrap();
+            if read.length.is_some() {
+                received = read.length;
+                break;
+            }
+        }
+        assert_eq!(received, Some(4));
+    }
+
+    #[test]
+    fn an_event_mode_stall_still_reports_stall_and_reaps_cleanly() {
+        // The M3 SET_IDLE corner re-pinned for event mode: the refused request's
+        // status stage STALLs, the judge reports the REAL condition code, and the
+        // halted transfer's writeback (its TDs request the interrupt now) is reaped
+        // — so endpoint zero is not wedged and no unacknowledged WDH leaks into the
+        // first endpoint wait.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.enable_events()).unwrap();
+        let result = run(driver.control(0, 8, false, setup::hid_set_idle_indefinite(0), &mut []));
+        assert_eq!(result, Err(DriverError::Stall));
+
+        // The next transfer on the rebuilt ED works and leaves the done queue clean.
+        let mut data = [0u8; 18];
+        let received = run(driver.control(
+            0,
+            8,
+            false,
+            setup::get_descriptor(setup::descriptor_type::DEVICE, 0, 18),
+            &mut data,
+        ))
+        .unwrap();
+        assert_eq!(received, 18);
+        assert_eq!(driver.io().done_head, 0, "every writeback reaped");
+        assert!(!driver.io().wdh, "no unacknowledged WDH left behind");
+    }
+
+    #[test]
+    fn event_mode_enumeration_reaps_writebacks_and_then_streams() {
+        // The full event-mode life cycle, the shape that failed live under QEMU:
+        // enumeration's control transfers retire dozens of TDs through four reused
+        // slots, and each transfer must REAP its own writeback (request it via DI,
+        // wait it out, consume + ack) — a deferred chain flushing later would point
+        // at recycled slots (the corrupt-done-queue failure). Then the interrupt
+        // endpoint streams via WDH waits on the same controller state.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.enable_events()).unwrap();
+
+        let mut config = [0u8; 256];
+        let (attached, _) = run(driver.attach(1, &mut config)).unwrap();
+        assert_eq!(attached.enumerated.address, 1);
+        assert_eq!(
+            driver.io().done_head,
+            0,
+            "every control transfer must have reaped its own writeback"
+        );
+        assert!(!driver.io().wdh, "no writeback may be left unacknowledged");
+
+        run(driver.open_interrupt_in(1, false, 1, 8, 10)).unwrap();
+        let mut report = [0u8; 8];
+        for (expected, label) in [([0u8, 0, 0x0b, 0], "first"), ([0u8, 0, 0, 0], "second")] {
+            driver.io().pending_reports.push_back(expected.to_vec());
+            // The consumer's loop: an empty answer means "call again" (the first
+            // round may consume the stale enumeration RHSC — the port resets latched
+            // it and nothing acked it until now).
+            let mut received = None;
+            for _ in 0..4 {
+                driver.io().wait_script.push_back(WaitOutcome::Delivered);
+                let read = run(driver.read_report(&mut report)).unwrap();
+                assert!(!read.rescued, "{label}: the event path is not a rescue");
+                if read.length.is_some() {
+                    received = read.length;
+                    break;
+                }
+            }
+            assert_eq!(received, Some(4), "{label} report after enumeration");
+            assert_eq!(&report[..4], &expected);
+        }
+    }
+
+    #[test]
+    fn wait_port_change_is_event_driven_where_supported_and_typed_unsupported_otherwise() {
+        // A4: the connect watch. Polled configuration: Unsupported, immediately —
+        // the consumer keeps its sweep pacing.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        assert_eq!(run(driver.wait_port_change()), Ok(WaitOutcome::Unsupported));
+
+        // Event configuration: a port change delivers RHSC; the wait resolves and
+        // acks the latch (the per-port CSC bits stay for the sweep to read).
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.enable_events()).unwrap();
+        driver.io().rhsc = true;
+        driver.io().wait_script.push_back(WaitOutcome::Delivered);
+        assert_eq!(run(driver.wait_port_change()), Ok(WaitOutcome::Delivered));
+        assert!(
+            !driver.io().rhsc,
+            "the wait must acknowledge the RHSC latch"
+        );
+
+        // A bounded expiry is an ordinary answer: the caller re-sweeps and calls
+        // again.
+        driver.io().wait_script.push_back(WaitOutcome::TimedOut);
+        assert_eq!(run(driver.wait_port_change()), Ok(WaitOutcome::TimedOut));
     }
 }
