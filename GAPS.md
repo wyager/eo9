@@ -556,11 +556,17 @@ sole ci failure with this master baseline as proof.
 The fs-eofs path-dep byte-churn applies to EVERY component consuming an
 out-of-workspace path dep (-C metadata hash): now curl, l4check, hidcheck, usbcheck,
 net.rtl8125, usb.ohci, usb.ohci-pci via eo9-dns/eo9-ohci/eo9-rtl8125/eo9-curl-core.
-BREADTH (area/37 lane observation, reviewer-verified by running check-components-bundle
-inside a worktree): the class is wider than the path-dep consumers — essentially ALL
-87 components read stale from a worktree checkout (coreutils, examples, stubs
-included), so a full `refresh-components` run anywhere but the main checkout rewrites
-the whole bundle with residue bytes. Standing rule sharpened: refresh-components is
+BREADTH (area/37 lane observation; reviewer-verified, then root-cause SPLIT at the
+area/37 merge): the all-87 staleness has TWO causes that compound. (1) The residue
+class proper — components built from a different checkout path. (2) A wit/ file
+change ripples into EVERY component's compiled module (the bindings layer consumes
+the whole wit directory), so any branch touching wit/*.wit legitimately changes all
+87 components' bytes — verified at the area/37 merge: the main checkout itself
+rebuilt all 87 differently after the usb.wit change, self-deterministically, with
+the inner core module (not just metadata) shifting. Practical consequence is the
+same for both causes: a full `refresh-components` anywhere but the main checkout
+writes residue, and a wit-touching merge requires the full 87-blob refresh from the
+main checkout (plus the web-vm blob rebuild, which embeds component bytes). Standing rule sharpened: refresh-components is
 MAIN-CHECKOUT-ONLY, lanes commit only the components their diff actually changed, and
 the reviewer treats ANY bundle diff from a worktree as suspect-residue first.
 Real fix candidates: workspace-ize the shared crates or pin metadata hashing.
