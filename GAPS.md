@@ -528,6 +528,16 @@ quiesce path leaving PHY state the next claim's warm re-init (ram-code skip path
 doesn't recover, or cumulative u2/PHY state across rapid claims. Driver lane: consider
 a full PHY reset on claim when the previous owner was quiesced-by-kexec, or always.
 Bench rule meanwhile: if LinkDown appears, cold-cycle rather than retrying claims.
+New datum (bench, 2026-06-09 evening, NO kexec involved): one completed cycle plus
+two spawns KILLED mid-link-bring-up (Ctrl-C ~3s in, drive-stats bracket probes), then
+the 4th spawn hung silently — no codegen/dhcp/error output for 150s; drive-stats
+showed the driver fuel-yielding (~32k rungs/160s) with zero progress and zero events:
+the autoneg/link poll spinning forever. So kill-mid-bring-up aggravates the same
+degradation without kexec — the kill path's release likely strands the PHY mid-autoneg.
+Also: the driver should not spin SILENTLY forever on a dead link — it needs a typed
+LinkDown refusal after a bounded autoneg window (counted polls are the doctrine-accepted
+clock there), so the console sees an error instead of a hang. SYSTEM_RESET recovered
+this instance too.
 
 ## svc_shell flake has WIDENED to a 3-of-3 CI blocker on master (usb rebase round, 2026-06-08 night)
 On pristine master 24c8578 (fresh detached worktree, no branch changes), `cargo test
