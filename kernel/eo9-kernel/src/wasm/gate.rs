@@ -178,6 +178,39 @@ fn addr_to_val(address: &WitSocketAddress) -> Val {
     ])
 }
 
+/// Parse a bare `ip-address` variant (the dns-servers payload element).
+fn val_to_ip(field: &Val) -> core::result::Result<WitIpAddress, String> {
+    let Val::Variant(case, payload) = field else {
+        return Err(format!("malformed ip-address: {field:?}"));
+    };
+    Ok(match (case.as_str(), payload.as_deref()) {
+        ("v4", Some(Val::Tuple(t))) if t.len() == 4 => {
+            let octet = |v: &Val| match v {
+                Val::U8(b) => Ok(*b),
+                other => Err(format!("malformed v4 octet: {other:?}")),
+            };
+            WitIpAddress::V4((octet(&t[0])?, octet(&t[1])?, octet(&t[2])?, octet(&t[3])?))
+        }
+        ("v6", Some(Val::Tuple(t))) if t.len() == 8 => {
+            let group = |v: &Val| match v {
+                Val::U16(g) => Ok(*g),
+                other => Err(format!("malformed v6 group: {other:?}")),
+            };
+            WitIpAddress::V6((
+                group(&t[0])?,
+                group(&t[1])?,
+                group(&t[2])?,
+                group(&t[3])?,
+                group(&t[4])?,
+                group(&t[5])?,
+                group(&t[6])?,
+                group(&t[7])?,
+            ))
+        }
+        _ => return Err(format!("malformed ip-address case `{case}`")),
+    })
+}
+
 fn val_to_addr(value: &Val) -> core::result::Result<WitSocketAddress, String> {
     let Val::Record(fields) = value else {
         return Err(format!("expected a socket-address record, got {value:?}"));
@@ -187,40 +220,7 @@ fn val_to_addr(value: &Val) -> core::result::Result<WitSocketAddress, String> {
     for (name, field) in fields {
         match name.as_str() {
             "address" => {
-                let Val::Variant(case, payload) = field else {
-                    return Err(format!("malformed ip-address: {field:?}"));
-                };
-                address = Some(match (case.as_str(), payload.as_deref()) {
-                    ("v4", Some(Val::Tuple(t))) if t.len() == 4 => {
-                        let octet = |v: &Val| match v {
-                            Val::U8(b) => Ok(*b),
-                            other => Err(format!("malformed v4 octet: {other:?}")),
-                        };
-                        WitIpAddress::V4((
-                            octet(&t[0])?,
-                            octet(&t[1])?,
-                            octet(&t[2])?,
-                            octet(&t[3])?,
-                        ))
-                    }
-                    ("v6", Some(Val::Tuple(t))) if t.len() == 8 => {
-                        let group = |v: &Val| match v {
-                            Val::U16(g) => Ok(*g),
-                            other => Err(format!("malformed v6 group: {other:?}")),
-                        };
-                        WitIpAddress::V6((
-                            group(&t[0])?,
-                            group(&t[1])?,
-                            group(&t[2])?,
-                            group(&t[3])?,
-                            group(&t[4])?,
-                            group(&t[5])?,
-                            group(&t[6])?,
-                            group(&t[7])?,
-                        ))
-                    }
-                    _ => return Err(format!("malformed ip-address case `{case}`")),
-                });
+                address = Some(val_to_ip(field)?);
             }
             "port" => match field {
                 Val::U16(p) => port = Some(*p),
@@ -269,6 +269,10 @@ pub(super) enum GateOp {
     Connect {
         remote: WitSocketAddress,
     },
+    /// `dns-servers` (area/42-curl-ux): transport introspection — the servers the
+    /// owner's own addressing taught it. A root call (needs the handler); no
+    /// reachability granted.
+    DnsServers,
     Listen {
         local: WitSocketAddress,
     },
@@ -315,6 +319,8 @@ pub(super) enum GateDone {
     Accepted(core::result::Result<(u32, WitSocketAddress), WitL4Error>),
     /// listener-address / peer-address / udp-address.
     Addr(WitSocketAddress),
+    /// dns-servers: the transport's own resolver list, or the typed error.
+    Addresses(core::result::Result<Vec<WitIpAddress>, WitL4Error>),
     /// send / recv / send-to: the round-tripped bytes plus the count or typed error.
     Io(Vec<u8>, core::result::Result<u64, WitL4Error>),
     /// recv-from: bytes plus (count, sender) or the typed error.
@@ -858,6 +864,10 @@ pub(super) struct OwnerFuncs {
     udp_address: Func,
     send_to: Func,
     recv_from: Func,
+    /// `dns-servers` (area/42-curl-ux). Optional during the transition: an owner
+    /// composition built before the interface grew it simply lacks the export, and
+    /// gated calls answer the typed io error instead of refusing the whole share.
+    dns_servers: Option<Func>,
 }
 
 /// Look up `func` inside the exported instance `interface` (the async_demo pattern).
@@ -900,12 +910,14 @@ pub(super) fn lookup_owner_funcs(
         udp_address: exported_func(instance, store, L4_INTERFACE, "udp-address")?,
         send_to: exported_func(instance, store, L4_INTERFACE, "send-to")?,
         recv_from: exported_func(instance, store, L4_INTERFACE, "recv-from")?,
+        dns_servers: exported_func(instance, store, L4_INTERFACE, "dns-servers").ok(),
     })
 }
 
 /// What one completed owner-side call should be parsed as.
 enum ResultKind {
     Handle,
+    Addresses,
     Accepted,
     Addr,
     Io,
@@ -1068,6 +1080,13 @@ fn build_call_future<'a>(
             vec![Val::Bool(false), addr_to_val(&local)],
             ResultKind::Handle,
         ),
+        GateOp::DnsServers => Prepared::RootCall(
+            funcs
+                .dns_servers
+                .ok_or("the owner predates dns-servers (rebuild the serving composition)")?,
+            vec![Val::Bool(false)],
+            ResultKind::Addresses,
+        ),
         GateOp::Accept { listener } => Prepared::Plain(
             funcs.accept,
             vec![Val::Resource(table_entry(share_id, grant, listener)?)],
@@ -1204,6 +1223,26 @@ fn build_call_future<'a>(
                 other => Err(format!("expected a result, got {other:?}")),
             },
             ResultKind::Addr => Ok(GateDone::Addr(val_to_addr(value)?)),
+            ResultKind::Addresses => match value {
+                Val::Result(Ok(Some(payload))) => match payload.as_ref() {
+                    Val::List(items) => {
+                        let mut servers = Vec::with_capacity(items.len());
+                        for item in items {
+                            servers.push(val_to_ip(item)?);
+                        }
+                        Ok(GateDone::Addresses(Ok(servers)))
+                    }
+                    other => Err(format!("malformed dns-servers payload: {other:?}")),
+                },
+                Val::Result(Ok(None)) => Ok(GateDone::Addresses(Ok(Vec::new()))),
+                Val::Result(Err(payload)) => {
+                    Ok(GateDone::Addresses(Err(match payload.as_deref() {
+                        Some(error) => val_to_l4_error(error),
+                        None => WitL4Error::Io("malformed error payload".to_string()),
+                    })))
+                }
+                other => Err(format!("expected a result, got {other:?}")),
+            },
             ResultKind::Io | ResultKind::IoFrom => match value {
                 Val::Tuple(pair) if pair.len() == 2 => {
                     let bytes = take_owner_buffer(accessor, &pair[0])?;
@@ -1482,6 +1521,24 @@ pub fn add_l4_gate(linker: &mut Linker<KernelState>) -> Result<()> {
                 Ok((match gate_call(accessor, GateOp::Connect { remote }).await {
                     Ok(GateDone::Handle(Ok(rep))) => Ok(Resource::new_own(rep)),
                     Ok(GateDone::Handle(Err(error))) => Err(error),
+                    Ok(_) => Err(WitL4Error::Io("malformed gate payload".to_string())),
+                    Err(error) => Err(error),
+                },))
+            })
+        },
+    )?;
+
+    // dns-servers (area/42-curl-ux): registered ahead of the WIT landing — the linker
+    // ignores definitions nothing imports, and the moment the interface carries the
+    // function this shim serves it (introspection through the gate, no reachability).
+    l4.func_wrap_concurrent(
+        "dns-servers",
+        |accessor: &Accessor<KernelState>,
+         (_l4,): (Resource<GateL4Res>,)|
+         -> ConcurrentFuture<'_, (core::result::Result<Vec<WitIpAddress>, WitL4Error>,)> {
+            Box::pin(async move {
+                Ok((match gate_call(accessor, GateOp::DnsServers).await {
+                    Ok(GateDone::Addresses(result)) => result,
                     Ok(_) => Err(WitL4Error::Io("malformed gate payload".to_string())),
                     Err(error) => Err(error),
                 },))
