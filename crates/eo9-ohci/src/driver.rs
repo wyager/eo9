@@ -2298,6 +2298,34 @@ mod tests {
     }
 
     #[test]
+    fn an_event_mode_stall_still_reports_stall_and_reaps_cleanly() {
+        // The M3 SET_IDLE corner re-pinned for event mode: the refused request's
+        // status stage STALLs, the judge reports the REAL condition code, and the
+        // halted transfer's writeback (its TDs request the interrupt now) is reaped
+        // — so endpoint zero is not wedged and no unacknowledged WDH leaks into the
+        // first endpoint wait.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.enable_events()).unwrap();
+        let result = run(driver.control(0, 8, false, setup::hid_set_idle_indefinite(0), &mut []));
+        assert_eq!(result, Err(DriverError::Stall));
+
+        // The next transfer on the rebuilt ED works and leaves the done queue clean.
+        let mut data = [0u8; 18];
+        let received = run(driver.control(
+            0,
+            8,
+            false,
+            setup::get_descriptor(setup::descriptor_type::DEVICE, 0, 18),
+            &mut data,
+        ))
+        .unwrap();
+        assert_eq!(received, 18);
+        assert_eq!(driver.io().done_head, 0, "every writeback reaped");
+        assert!(!driver.io().wdh, "no unacknowledged WDH left behind");
+    }
+
+    #[test]
     fn event_mode_enumeration_reaps_writebacks_and_then_streams() {
         // The full event-mode life cycle, the shape that failed live under QEMU:
         // enumeration's control transfers retire dozens of TDs through four reused
