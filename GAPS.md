@@ -684,6 +684,38 @@ usermode twin (`drive_with_services`' 10 ms ambient park backstop — its strand
 detector currently DEPENDS on that cap firing, so the deletion needs the detector
 redesigned completer-side first; S→M), and usb.kbd's 2 ms poll pace → intx-driven.
 
+UPDATE (area/38 first-poll-parks lane, 2026-06-09): the silicon drive-stats round
+KILLED area/34's "~1 ms+/pass on the A76" inference — the board's empty-bracket spin
+measures **~7.5 µs/pass on silicon**, matching HVF's 6.5 µs: the A76 pass machinery is
+fine. H2 (per-keystroke first-poll-pending host futures — fs/oracle reads parking
+deadline-less until the kbd pacing rescues them) is **also refuted** by the new
+host-call census + park-composition histogram (drive-stats, this lane): a tracked
+keystroke makes exactly TWO host calls (read-key 1.05/key, text-write 1.1/key; fs-*
+≈ 0 — the M3 oracle is pure guest compute, and the vocabulary fs walk runs once per
+PROMPT, so "~34 ≈ /bin+builtins" was numerology), there are ZERO mid-key parks on
+TCG (back-to-back tracked keys: median 0.1 ms, ONE park for the whole 20-key burst
+on plain — composition K, event-woken; no hangs, no 1 s rides), and the only park
+compositions that exist anywhere are healthy: KSD (read-key + kbd-sleep,
+deadline-armed) and K. The silicon ~34 deadline-parks/key now have a simpler
+arithmetic identity: **parks/key ≈ inter-key gap ÷ 2 ms in every dataset** (QEMU
+50 ms settles → 23.6/key ≈ 50/2; silicon ~34 ≈ 57–68/2) — the parks count the GAP
+between keys at the kbd pacing, not the key, and the wake counters cannot
+distinguish a slow key from a slow harness. Prime suspect for the flat 52–61 ms
+(uniform across tracked/value/backspace — the signature of a per-round floor, and
+§5's FTDI-latency-timer/reader-pacing audit was never run): the bench harness's
+send→observe round itself. The discriminator is now IN the image: a kernel-side
+**key→echo meter** (input-edge stamp → first guest `text.write`; immune to harness
+pacing) prints in every drive-stats dump — TCG measures 0.45–0.6 ms mean. Next board
+round reads it off one bracketed burst: ~1 ms → the 52–61 ms is the harness (close
+the residue, fix the bench); ~55 ms → a real kernel chain exists and the
+park-composition histogram in the same dump names the parked sites. Also landed: the
+orphaned-pend detector (a park with running work checked in but NO registered idle
+waker and NO requested deadline is loud — the deadline-less silent-pend shape H2
+predicted; zero firings anywhere today, it guards against one being introduced).
+Still open beside this: the task.wait self-wake spin (area/35 class A — 133k
+passes/s, 100% CPU whenever a foreground job is waited on; the empty-bracket control
+measured it directly on silicon).
+
 ## build-kernel opi5plus overwrites the shared QEMU kernel ELF — silent wrong-binary boots
 (repl-m3 lane workaround, recorded by the review train, 2026-06-09) `cargo xtask
 build-kernel aarch64 opi5plus [minimal]` builds into the same cargo target path the

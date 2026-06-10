@@ -53,6 +53,28 @@ pub(crate) fn clear_input_edge() {
     INPUT_EDGE.store(false, Ordering::Release);
 }
 
+/// Uptime stamp of the most recent console-input arrival (set by the producers next to
+/// the edge; 0 = consumed). The drive-stats key→echo meter takes it at the guest's
+/// next `text.write`: input-to-first-output latency measured KERNEL-side, so a bench
+/// harness's own send/observe pacing cannot contaminate the number (area/38 — from the
+/// harness's side, a slow key and a harness pacing at ~55 ms per round are
+/// indistinguishable; this stamp is the ground truth).
+static LAST_INPUT_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Record an input-arrival uptime (producers pass their own clock reading — this
+/// module stays hardware-free so its unit tests run on the host).
+#[allow(dead_code)] // wasm executor measurement path only
+pub(crate) fn stamp_input(now_ns: u64) {
+    LAST_INPUT_NS.store(now_ns, Ordering::Release);
+}
+
+/// Take (and clear) the last input-arrival stamp; 0 when no input arrived since the
+/// last take.
+#[allow(dead_code)] // wasm executor measurement path only
+pub(crate) fn take_input_stamp() -> u64 {
+    LAST_INPUT_NS.swap(0, core::sync::atomic::Ordering::AcqRel)
+}
+
 /// Single-producer (interrupt path) / single-consumer (boot core) byte ring for received
 /// console input.
 pub(crate) struct RxRing {

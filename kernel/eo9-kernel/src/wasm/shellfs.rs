@@ -706,6 +706,7 @@ pub fn add_fs(linker: &mut Linker<KernelState>) -> Result<()> {
         |accessor: &Accessor<KernelState>,
          (_cap, path): (Resource<FsCap>, String)|
          -> ConcurrentFuture<'_, (Result<Resource<ExecRes>, WitFsError>,)> {
+            super::count_host_call(super::host_call::FS_OPEN_EXEC);
             Box::pin(async move {
                 let result = accessor.with(|mut access| -> Result<_> {
                     Ok(access.data_mut().shell_fs()?.open_exec(&path))
@@ -720,6 +721,7 @@ pub fn add_fs(linker: &mut Linker<KernelState>) -> Result<()> {
         |accessor: &Accessor<KernelState>,
          (_cap, path): (Resource<FsCap>, String)|
          -> ConcurrentFuture<'_, (Result<Vec<String>, WitFsError>,)> {
+            super::count_host_call(super::host_call::FS_LIST);
             Box::pin(async move {
                 let result = accessor.with(|mut access| -> Result<_> {
                     Ok(access.data_mut().shell_fs()?.list_directory(&path))
@@ -777,6 +779,7 @@ pub fn add_fs(linker: &mut Linker<KernelState>) -> Result<()> {
         |accessor: &Accessor<KernelState>,
          (file, offset, dst): (Resource<FileRes>, u64, Resource<BufferRes>)|
          -> ConcurrentFuture<'_, (FsReadReturn,)> {
+            super::count_host_call(super::host_call::FS_READ);
             Box::pin(async move {
                 let buffer_rep = dst.rep();
                 let result = accessor.with(|mut access| -> Result<_> {
@@ -848,7 +851,10 @@ pub fn add_fs(linker: &mut Linker<KernelState>) -> Result<()> {
         "exec-size",
         |mut store: StoreContextMut<'_, KernelState>,
          (handle,): (Resource<ExecRes>,)|
-         -> Result<(u64,)> { Ok((store.data_mut().shell_fs()?.exec_size(handle.rep())?,)) },
+         -> Result<(u64,)> {
+            super::count_host_call(super::host_call::FS_EXEC_SIZE);
+            Ok((store.data_mut().shell_fs()?.exec_size(handle.rep())?,))
+        },
     )?;
 
     fs.func_wrap_concurrent(
@@ -856,6 +862,7 @@ pub fn add_fs(linker: &mut Linker<KernelState>) -> Result<()> {
         |accessor: &Accessor<KernelState>,
          (handle, offset, dst): (Resource<ExecRes>, u64, Resource<BufferRes>)|
          -> ConcurrentFuture<'_, (FsReadReturn,)> {
+            super::count_host_call(super::host_call::FS_EXEC_READ);
             Box::pin(async move {
                 let buffer_rep = dst.rep();
                 let result = accessor.with(|mut access| -> Result<_> {

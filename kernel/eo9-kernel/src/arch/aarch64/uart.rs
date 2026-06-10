@@ -332,7 +332,9 @@ fn fifo_to_ring() -> usize {
 #[allow(dead_code)] // wasm/interactive path only; not the feature-less CI build
 pub fn drain_rx() {
     hw::irq_ack();
-    fifo_to_ring();
+    if fifo_to_ring() > 0 {
+        crate::rxring::stamp_input(crate::timer::uptime_ns());
+    }
 }
 
 /// Idle-path receive scavenger: rescue anything the interrupt path missed, and nudge a
@@ -370,6 +372,9 @@ pub fn scavenge_rx(now_ns: u64) -> usize {
     unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags)) };
     let moved = fifo_to_ring();
     let ring_busy = RX_RING.is_busy();
+    if moved > 0 {
+        crate::rxring::stamp_input(now_ns);
+    }
     if moved > 0 || ring_busy {
         LAST_ACTIVITY_NS.store(now_ns, Ordering::Relaxed);
     } else {
@@ -443,6 +448,9 @@ pub fn inject_input(bytes: &[u8]) -> usize {
         } else {
             INJECT_DROPPED.fetch_add(1, Ordering::Relaxed);
         }
+    }
+    if accepted > 0 {
+        crate::rxring::stamp_input(crate::timer::uptime_ns());
     }
     // SAFETY: restore interrupt delivery.
     unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags)) };

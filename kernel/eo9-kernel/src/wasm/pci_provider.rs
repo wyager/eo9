@@ -1029,7 +1029,7 @@ impl Future for IntxWait {
         // registered idle waker; the timer wake bounds the expiry check. Re-armed every
         // poll (the executor consumes both), like `SleepUntil`.
         super::request_timer_wake(this.deadline);
-        super::register_idle_waker(cx.waker());
+        super::register_idle_waker(cx.waker(), super::idle_site::INTX);
         Poll::Pending
     }
 }
