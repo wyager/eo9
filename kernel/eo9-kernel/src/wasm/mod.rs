@@ -29,6 +29,10 @@ pub mod diskcache;
 pub mod dma;
 #[cfg(all(feature = "wasm-codegen", feature = "wasm-store"))]
 pub mod fibercompile;
+// The kernel call gate (shared-resources design): share registry, grant tables, the
+// owner-side intake, and the typed eo9:net/l4 gate shims.
+#[cfg(feature = "wasm-store")]
+pub mod gate;
 #[cfg(feature = "wasm-hello")]
 pub mod hello;
 // The gfx.simplefb root provider exists only where its framebuffer does: the Orange Pi

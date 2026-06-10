@@ -313,6 +313,26 @@ interface l4-optional {
     default: func() -> option<l4-impl>;
 }
 
+/// The blessed factory interface for `l4` (shared-resources design, §5.2): the ONLY
+/// export surface in the sharing model, and it exists only for the broker case (init
+/// wiring strangers). A composition becomes shareable by deliberately exporting this
+/// interface — typically by composing `l4.factory` at the tail:
+///
+///   net.virtio $ net.l4.over-l2 $ l4.factory
+///
+/// `get` mints one handler per wiring: the kernel calls it once per consumer at grant
+/// time, and the returned `l4-impl` is what the consumer's gated import reaches. A
+/// factory that returns a fresh handle onto the shared stack shares fully (v1's
+/// degenerate sharing); a factory that mints a scoped wrapper per `get` attenuates —
+/// "policies are programs", so the choice is the factory author's code, never kernel
+/// surface. Every shareable API gets one blessed sibling of exactly this shape.
+interface l4-factory {
+    use l4.{l4-impl, l4-error};
+
+    /// Mint one handler for one consumer wiring.
+    get: func() -> result<l4-impl, l4-error>;
+}
+
 /// Compose-time configuration entry for net.l4.deny.
 interface l4-deny-config {
     use l4.{l4-impl};
@@ -518,6 +538,22 @@ world l4-deny {
 world l4-loopback {
     export l4;
     export l4-loopback-config;
+}
+
+/// net.l4.factory (`l4.factory` in the store) — the shareable tail: imports `eo9:net/l4`
+/// and re-exports it (pure delegation, the `net.l4.filtered` shape minus the policy)
+/// plus the blessed `eo9:net/l4-factory`, whose `get` mints a fresh wrapper handle onto
+/// the one underlying stack per consumer wiring (v1's degenerate sharing — every grantee
+/// sees the full stack; scoping wrappers are the recorded follow-up). The full `l4`
+/// re-export is load-bearing, not decorative: the kernel call gate can only invoke
+/// *exported* functions of the owner's instance, so the serving composition's terminal
+/// component must surface the whole transport contract for gated calls to land on.
+/// Kind: provider (no `main`); the service registry accepts a share-declared factory
+/// provider with an intake-only drive.
+world l4-factory-tail {
+    import l4;
+    export l4;
+    export l4-factory;
 }
 
 /// net.l4.filtered — attenuation over an underlying transport layer: every endpoint

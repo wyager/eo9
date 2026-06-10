@@ -502,7 +502,7 @@ pub fn set_root_consumes_ctrl_c(consumes: bool) {
 /// outcome. Returns the target's resulting outcome (`Killed` if it was running, else its
 /// existing outcome, or `Killed` if the handle is unknown). Used by `task.kill` and the
 /// Ctrl-C path.
-fn kill_task_tree(rep: usize) -> KOutcome {
+pub(super) fn kill_task_tree(rep: usize) -> KOutcome {
     // Kill descendants first (depth doesn't matter — the registry is flat; we just need to
     // catch every transitive child). Iterate to a fixed point so grandchildren are caught.
     loop {
@@ -1010,6 +1010,10 @@ fn spawn_linker(engine: &Engine) -> Result<Arc<Linker<KernelState>>, wasmtime::E
     super::shellfs::add_buffers(&mut linker)?;
     super::shellfs::add_fs(&mut linker)?;
     add_exec(&mut linker)?;
+    // The typed eo9:net/l4 gate shims (shared-resources design §3.1): registered
+    // unconditionally — collision-free because the kernel links no root provider for
+    // eo9:net/*, and inert (the capability refusal) in any store without a grant.
+    super::gate::add_l4_gate(&mut linker)?;
     // PCI is never granted by default (bus mastering means DMA): only when the boot's
     // command line carried the `pci` token — and even then the loader rule applies, so
     // only a child that imports `eo9:pci/pci` actually links it. `eo9:platform` is the
@@ -1079,9 +1083,23 @@ fn spawn_child(
     #[cfg(feature = "spawn-trace")]
     spawn_trace::add_since(spawn_trace::LINKER, __trace_linker);
 
+    // Gate wiring (shared-resources design §5.3): a spawn whose component still imports
+    // eo9:net/l4 (unfused) gets a grant routed to the boot config's console share, when
+    // one is wired. The handler is minted lazily by the share's factory inside the
+    // owner on the grant's first operation; a wired-but-severed share refuses the spawn
+    // with the §6 story (the supervisor's restart re-opens it). No share wired → no
+    // grant → the gate shims answer the capability refusal at first use.
+    let gate_grant = if super::gate::component_imports_l4(engine, component) {
+        super::gate::mint_console_grant().map_err(WitSpawnError::Internal)?
+    } else {
+        None
+    };
+
     #[cfg(feature = "spawn-trace")]
     let __trace_state = crate::timer::uptime_us();
     let mut state = KernelState::new();
+    state.gate = gate_grant;
+    let grant_ids = state.gate.as_ref().map(|g| (g.share, g.grant));
     // The svc capability reaches exactly the configured number of generations down
     // (owner ruling B, mirroring the usermode generation count): init holds 2, so its
     // console holds 1, and the console's children hold 0 — never a default grant.
@@ -1295,6 +1313,11 @@ fn spawn_child(
         }
         parents[rep] = parent;
     });
+    // The owner-death kill edge (§6 step 2): record which task this grant routes to, so
+    // severing the share takes the gated child down with it.
+    if let Some((share, grant)) = grant_ids {
+        super::gate::bind_grant_task(share, grant, rep as u32);
+    }
     #[cfg(feature = "spawn-trace")]
     {
         spawn_trace::add_since(spawn_trace::ARGS, __trace_args);

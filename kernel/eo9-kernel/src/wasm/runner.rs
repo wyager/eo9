@@ -73,6 +73,48 @@ kbd = usb.ohci-pci $ usb.kbd restart restart.always
 console = eosh
 ";
 
+/// The station-net config (the `station-net` boot token; shared-resources design M1):
+/// init owns the net stack as a boot service — the `lan` line composes the driver, the
+/// TCP/IP middleware, and the shareable factory tail, and the `share` clause opens it
+/// through the kernel call gate; the console's `use` clause routes every console
+/// child's ordinary `eo9:net/l4` import to a factory-minted handler. Typing bare
+/// `curl http://…` at the prompt then works with NO composition typed. Board profile:
+/// the rtl8125 driver with DHCP addressing on the bench LAN.
+#[cfg(feature = "board-opi5plus")]
+const STATION_NET_SERVICES_CONFIG: &str = "\
+# the net station (the `station-net` boot token): init owns the net stack; the console
+# children reach it through the kernel call gate.
+lan = net.rtl8125 $ net.l4.over-l2 --address dhcp $ l4.factory share eo9:net/l4 restart restart.always
+kbd = usb.ohci --region usb-host0-ohci $ usb.kbd restart restart.always
+console = eosh use l4=lan
+";
+
+/// The QEMU shape of station-net: the virtio NIC under slirp's default layout
+/// (10.0.2.15/24, gateway 10.0.2.2 — the middleware's documented default, no
+/// configuration needed). Boot it with `station-net pci console-sink` (the check-share
+/// gate's curl leg).
+#[cfg(not(feature = "board-opi5plus"))]
+const STATION_NET_SERVICES_CONFIG: &str = "\
+# the net station (the `station-net` boot token): init owns the net stack; the console
+# children reach it through the kernel call gate.
+lan = net.virtio $ net.l4.over-l2 $ l4.factory share eo9:net/l4 restart restart.always
+kbd = usb.ohci-pci $ usb.kbd restart restart.always
+console = eosh use l4=lan
+";
+
+/// The gate's QEMU unit config (the `gatedemo` boot token; shared-resources design M1a):
+/// the same share/use wiring with the in-memory loopback transport as the owner — no
+/// NIC, no PCI grant, no host network. `net.l4.loopback $ l4.factory` is the smallest
+/// possible owner, and a bare `sockcheck --payload …` at the console round-trips TCP
+/// and UDP entirely through gate calls into the owner's store (listen/accept/connect
+/// in flight concurrently = the exclusivity story under the instance lock).
+const GATE_DEMO_SERVICES_CONFIG: &str = "\
+# the gate demo (the `gatedemo` boot token): a loopback transport shared through the
+# kernel call gate; `sockcheck --payload x` at the prompt exercises it bare.
+lan = net.l4.loopback $ l4.factory share eo9:net/l4 restart restart.always
+console = eosh use l4=lan
+";
+
 /// Parse the boot arguments and run what they select. Returns `true` when the boot was
 /// handled here (a headless program or the shell ran), `false` when the caller should run
 /// the default demo sequence instead (the `demo` token, or a store image that fails to
@@ -183,6 +225,15 @@ pub fn boot(bootargs: Option<&str>) -> bool {
         return false;
     }
 
+    // The gate's R2 bring-up check (`gatecheck` token): run_concurrent + concurrent
+    // export calls in one store on this no_std build, headless, then power off. The
+    // shared-resources design names this the gate that must pass before any call-gate
+    // traffic is trusted.
+    if program.is_none() && tokenize(bootargs).iter().any(|token| token == "gatecheck") {
+        super::gate::r2_check(entries);
+        return true;
+    }
+
     match program.as_deref() {
         // The default boot runs init, the service supervisor (executor v2): it applies
         // the baked config — services, then the serial console — and the machine powers
@@ -191,14 +242,23 @@ pub fn boot(bootargs: Option<&str>) -> bool {
         // token swaps in the baked demo config (a worker under restart.always and a
         // one-shot banner) to demonstrate the service registry.
         None => {
-            let config = if tokenize(bootargs).iter().any(|token| token == "station") {
+            let config = if tokenize(bootargs).iter().any(|token| token == "station-net") {
+                STATION_NET_SERVICES_CONFIG
+            } else if tokenize(bootargs).iter().any(|token| token == "gatedemo") {
+                GATE_DEMO_SERVICES_CONFIG
+            } else if tokenize(bootargs).iter().any(|token| token == "station") {
                 STATION_SERVICES_CONFIG
             } else if tokenize(bootargs).iter().any(|token| token == "svcdemo") {
                 DEMO_SERVICES_CONFIG
             } else {
                 DEFAULT_SERVICES_CONFIG
             };
-            super::shell::boot_to_init(entries, config);
+            // The gate clauses (`share …` / `use …`) are the kernel registry's to
+            // interpret (shared-resources design §5.3, v1 spelling): parse and strip
+            // them here; init receives the stripped text and detaches the service
+            // lines exactly as before.
+            let config = super::gate::parse_boot_config(config);
+            super::shell::boot_to_init(entries, &config);
         }
         // `program=eosh` keeps the direct console (no supervisor, no svc grant) — the
         // pre-init boot pipeline, still useful for byte-for-byte comparisons.

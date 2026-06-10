@@ -69,6 +69,11 @@ pub struct KernelState {
     /// (see `super::platform_provider`).
     #[cfg(feature = "wasm-store")]
     pub platform: super::platform_provider::PlatformTables,
+    /// The task's gate grant (shared-resources design): present when this spawn's
+    /// `eo9:net/l4` import was routed through the kernel call gate to a config-shared
+    /// owner. Dropping the store releases the grant's kernel-side state.
+    #[cfg(feature = "wasm-store")]
+    pub gate: Option<super::gate::GrantHandle>,
 }
 
 impl KernelState {
@@ -85,6 +90,8 @@ impl KernelState {
             pci: super::pci_provider::PciTables::default(),
             #[cfg(feature = "wasm-store")]
             platform: super::platform_provider::PlatformTables::default(),
+            #[cfg(feature = "wasm-store")]
+            gate: None,
         }
     }
 

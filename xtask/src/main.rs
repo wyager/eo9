@@ -80,6 +80,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-net-l3-deny",
     "eo9-stub-net-l3-none",
     "eo9-stub-net-l4-deny",
+    "eo9-stub-net-l4-factory",
     "eo9-stub-net-l4-filtered",
     "eo9-stub-net-l4-loopback",
     "eo9-stub-net-l4-none",
@@ -314,6 +315,10 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // The transport firewall and its standard port policy ("policies are programs"):
     //   net.policy-ports --allow "[7]" $ net.l4.filtered $ net.l4.loopback-backed program
     ("eo9-stub-net-l4-filtered", "net.l4.filtered"),
+    // The shareable transport tail (shared-resources design §5.2): `… $ l4.factory`
+    // re-exports the fused l4 and adds the blessed eo9:net/l4-factory, which a `share`
+    // config line validates against and the kernel call gate mints handlers from.
+    ("eo9-stub-net-l4-factory", "l4.factory"),
     ("eo9-stub-net-policy-ports", "net.policy-ports"),
     ("eo9-example-sockcheck", "sockcheck"),
     // Basic coreutils, so the metal shell can inspect its own (read-only) filesystem:
