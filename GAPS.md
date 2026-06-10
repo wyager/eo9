@@ -705,10 +705,14 @@ distinguish a slow key from a slow harness. Prime suspect for the flat 52–61 m
 §5's FTDI-latency-timer/reader-pacing audit was never run): the bench harness's
 send→observe round itself. The discriminator is now IN the image: a kernel-side
 **key→echo meter** (input-edge stamp → first guest `text.write`; immune to harness
-pacing) prints in every drive-stats dump — TCG measures 0.45–0.6 ms mean. Next board
-round reads it off one bracketed burst: ~1 ms → the 52–61 ms is the harness (close
-the residue, fix the bench); ~55 ms → a real kernel chain exists and the
-park-composition histogram in the same dump names the parked sites. Also landed: the
+pacing) prints in every drive-stats dump — TCG measures 0.45–0.6 ms mean. CLOSED (bench
+round, 2026-06-09, post-FTDI-replug): the board meter reads **key→echo mean 2.4 ms
+on silicon** (count=41 total-us=97411 max-us=36051; the max is a single outlier),
+wake-event ≈ keystroke count (input is event-woken), parks all KSD (healthy
+read-key + kbd-pace) — and the U-Boot serial console echoed through the same bench
+harness at ~56 ms, pinning the 52–61 ms external numbers on the harness's FTDI
+round-trip floor, not the kernel. The keystroke-latency residue is RESOLVED: fix
+the bench harness (FTDI latency timer / reader pacing), not the image. Also landed: the
 orphaned-pend detector (a park with running work checked in but NO registered idle
 waker and NO requested deadline is loud — the deadline-less silent-pend shape H2
 predicted; zero firings anywhere today, it guards against one being introduced).

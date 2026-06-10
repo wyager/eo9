@@ -256,8 +256,12 @@ inter-key gap at the kbd pacing, not the key. That leaves the flat 52–61 ms
 pointing at the §5 probe this study never ran: the FTDI/reader-pacing audit of the
 bench harness. The image now carries the harness-immune discriminator: a kernel-side
 key→echo meter (input-edge → first guest write; 0.45–0.6 ms mean on TCG) in every
-drive-stats dump, plus the host-call census and park compositions. One bracketed
-board burst reads the verdict directly.*
+drive-stats dump, plus the host-call census and park compositions. The bracketed
+board burst has since run (bench round, 2026-06-09): **key→echo mean 2.4 ms on
+silicon** (count=41, max one 36 ms outlier), input event-woken, parks all KSD — and
+the U-Boot console echoes through the same harness at ~56 ms. Verdict: the 52–61 ms
+was the bench harness's FTDI round-trip floor all along; the board residue of §5 is
+CLOSED on the kernel side, and the remaining work item is the bench harness itself.*
 
 ## 6. Mitigation ladder, sized by the data
 
