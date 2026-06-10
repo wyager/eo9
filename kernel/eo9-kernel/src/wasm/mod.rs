@@ -572,6 +572,14 @@ pub(crate) fn idle_wait() -> WakeKind {
     // the park gate above) and any regression of it is a loud finding, so the cadence
     // would only ever hide bugs (owner doctrine).
     let maintenance = maintenance_deadline_ns(now);
+    // Every profile carries a maintenance entry (the board's watchdog pat, every other
+    // profile's feed kick), so the defensive NO_DEADLINE_ARM_NS arm below is unreachable
+    // today — keep that fact loud in debug images.
+    debug_assert!(
+        maintenance != u64::MAX,
+        "no maintenance deadline on this profile: the idle arm would fall back to the \
+         defensive 60 s arm"
+    );
     let target = requested.min(maintenance);
     // Maintenance-rated: no parked future's deadline decides this wake — anything
     // actionable a late wake then discovers was stranded. A requested deadline at or
@@ -583,11 +591,31 @@ pub(crate) fn idle_wait() -> WakeKind {
     } else {
         target.saturating_sub(now).max(MIN_WAKE_NS)
     };
-    // Mask interrupts, arm the timer wake, halt until an interrupt is pending, then unmask
-    // and take it — the architecture-specific sequence lives in `timer::wait_for_interrupt`,
+    // Mask interrupts FIRST, then re-check the input edge inside the masked window, and
+    // only then arm + halt. An RX interrupt taken between the unmasked gate checks at
+    // the top of this function and this mask has already been fully serviced — FIFO
+    // drained into the ring, edge raised, EOI'd — so nothing is left pending to end the
+    // `wfi`: parking would strand that input for the entire armed window (the deleted
+    // 10 ms cap used to bound this race silently; the masked re-check is what closes it
+    // honestly). Rung wakers need no masked re-check: they are rung from poll context
+    // on this same core, never from an interrupt handler. The bail re-publishes the
+    // consumed deadline request so the bail is behaviorally a pure no-op.
+    crate::timer::irq_mask();
+    if crate::rxring::input_edge_pending() {
+        crate::timer::irq_unmask();
+        if requested != u64::MAX {
+            request_timer_wake(requested);
+        }
+        #[cfg(feature = "drive-stats")]
+        drive_stats::EDGE_BOUNCE.fetch_add(1, Ordering::Relaxed);
+        wake_idle();
+        return WakeKind::Event;
+    }
+    // Arm the timer wake, halt until an interrupt is pending, then unmask and take it —
+    // the architecture-specific sequence lives in `timer::wait_for_interrupt_masked`,
     // which is also the compiler-level memory barrier that makes whatever the interrupt
     // handler wrote (the UART input ring) visible to the re-poll below.
-    crate::timer::wait_for_interrupt(delay);
+    crate::timer::wait_for_interrupt_masked(delay);
     let woke = crate::timer::uptime_ns();
     // Early wake = an interrupt (UART RX, INTx, an earlier-armed timer) ended the halt
     // before the armed delay: event-driven, never a finding. Late + maintenance-rated =

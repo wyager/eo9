@@ -88,11 +88,39 @@ pub fn arm_wake(delay_ns: u64) {
 /// keep those reads from being cached across the halt.
 #[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
 pub fn wait_for_interrupt(delay_ns: u64) {
-    // SAFETY: clearing/setting sstatus.SIE and halting do not touch the stack or clobber
-    // registers the compiler relies on; the missing `nomem` is the memory clobber discussed
-    // above.
+    irq_mask();
+    wait_for_interrupt_masked(delay_ns);
+}
+
+/// Mask interrupt delivery (clear sstatus.SIE). Pairs with [`irq_unmask`] or
+/// [`wait_for_interrupt_masked`] — see the aarch64 twin for why the executor re-checks
+/// its park conditions inside the masked window (area/34).
+#[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
+pub fn irq_mask() {
+    // SAFETY: clearing sstatus.SIE touches neither stack nor compiler-visible state.
     unsafe {
         core::arch::asm!("csrci sstatus, 2", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Unmask interrupt delivery (the bail path). Omits `nomem` like the halt path: the
+/// interrupt taken at the unmask writes memory the caller re-reads right afterwards.
+#[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
+pub fn irq_unmask() {
+    // SAFETY: as the unmask in `wait_for_interrupt_masked`; the missing `nomem` is the
+    // memory clobber discussed above.
+    unsafe {
+        core::arch::asm!("csrsi sstatus, 2", options(nostack, preserves_flags));
+    }
+}
+
+/// The masked tail of [`wait_for_interrupt`]: arm, `wfi`, unmask. The caller must hold
+/// the [`irq_mask`].
+#[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
+pub fn wait_for_interrupt_masked(delay_ns: u64) {
+    // SAFETY: arming and halting do not touch the stack or clobber registers the
+    // compiler relies on; the missing `nomem` is the memory clobber discussed above.
+    unsafe {
         arm_wake(delay_ns);
         core::arch::asm!("wfi", options(nostack, preserves_flags));
         core::arch::asm!("csrsi sstatus, 2", options(nostack, preserves_flags));
