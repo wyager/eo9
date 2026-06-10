@@ -173,11 +173,17 @@ programs is window-local and gets rewritten by any future mode-set anyway.
 
 ### Coordination notes
 
-- area/40 (eosh wrap-aware repaint): fbcon now renders CSI K (EL mode 0, erase to
-  end of line) and SGR 31/0 — the repaint primitives the editor lane may emit. CSI G
-  / cursor-column moves are still consumed-and-ignored: the 2026-06-09 census found
-  no emitter; if the editor starts emitting them, implement them in fbcon's subset
-  (kernel/eo9-kernel/src/fbcon.rs `csi_dispatch`) rather than letting them strip.
+- area/40 (eosh wrap-aware repaint): fbcon renders the lane's full documented
+  emission alphabet (the contract table in guest/eosh/eosh-inc/src/editor.rs module
+  docs): `\b \b`, `\r`, `\r\n`, `ESC[K` (EL0), `ESC[A` (CUU — emitted bare; counts
+  accepted defensively, clamped at the top row, never a reverse scroll),
+  `ESC[<n>G` (CHA — 1-based, clamped to [1, COLS]), and SGR 31/0 (7/27 consumed
+  zero-width). The wrap-boundary backspace composite (`CSI A` `CSI <width>G`
+  `CSI K`) and the recall replace composite (`\r` `CSI K` + (`CSI A` `CSI K`)×rows +
+  re-emit) are pinned by fbcon host tests against the grid. Anything beyond this
+  alphabet is consumed-and-ignored: extend `csi_dispatch`
+  (kernel/eo9-kernel/src/fbcon.rs) in lockstep with the editor contract rather than
+  letting new sequences strip.
 - The fbcon scroll repaint is the long render window feeding the new tee-ring
   backlog; (b) does not change its cost (the surface stays 800×480). Option (a)
   would have multiplied it — one more reason (b) wins for the console use case.

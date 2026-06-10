@@ -37,18 +37,27 @@
 //! Device-nGnRnE memory back for a memmove would double the cost), and on erase-to-EOL
 //! (CSI K), which black-fills at most one row of pixels.
 //!
-//! **The CSI subset.** fbcon renders exactly what the repo's console emitters emit
-//! (census 2026-06-09: eosh-inc's editor emits SGR 31/0 — the M3 red marking — plus
-//! `\b \b`, `\r\n` and BEL; the kernel's read-line echo emits only `\b \b`; nothing
-//! emits cursor moves):
+//! **The CSI subset.** fbcon renders exactly the emission alphabet of the repo's
+//! console writers — the area/40 wrap-aware editor contract (the complete table in
+//! guest/eosh/eosh-inc/src/editor.rs module docs: `\b \b` same-row erase, `\r` to
+//! column 0, `\r\n` row advance on last-column fill, `ESC[K` EL0, `ESC[A` CUU,
+//! `ESC[<n>G` CHA, SGR 31/0 and 7/27 zero-width; 1 char = 1 cell; the board width is
+//! `COLS` = 100, const-asserted on their side) plus the kernel read-line echo
+//! (`\b \b` only):
 //!
 //! * **SGR** (`ESC [ … m`): parameter 31 sets the red pen, 0 (or no parameter) resets
-//!   to white; all other parameters are ignored. Red breaks the grayscale (r=g=b)
-//!   chroma-mangling immunity above — under the boot-state-dependent link mismatch the
-//!   mark renders wrong-hued but still *distinct*, which is the marking's whole job;
-//!   `Marker::INVERSE` (SGR 7/27) remains the colorspace-proof follow-up.
-//! * **CSI K** (parameter 0 or none): erase from the cursor to the end of the line —
-//!   the repaint primitive the wrap-aware editor lane (area/40) coordinates on.
+//!   to white; all other parameters — including the editor's zero-width 7/27 — are
+//!   ignored. Red breaks the grayscale (r=g=b) chroma-mangling immunity above — under
+//!   the boot-state-dependent link mismatch the mark renders wrong-hued but still
+//!   *distinct*, which is the marking's whole job; rendering `Marker::INVERSE`
+//!   (SGR 7/27) as true inverse video remains the colorspace-proof follow-up.
+//! * **CSI K** (parameter 0 or none): erase from the cursor to the end of the line.
+//! * **CSI A** (CUU): up one row, column preserved, clamped at the top — never a
+//!   reverse scroll. The editor emits it bare; an optional count is accepted
+//!   defensively (0 counts as 1).
+//! * **CSI G** (CHA): 1-based column set, clamped to `[1, COLS]` (0 counts as 1).
+//!   The editor's wrap-boundary backspace reaches the last column of the row above
+//!   with `ESC[<width>G`.
 //!
 //! Everything else ESC-led is consumed and ignored as before (CSI through its final
 //! byte — unknown finals, malformed parameter bytes and parameter overflows consume the
@@ -410,8 +419,9 @@ impl Grid {
     }
 
     /// Act on a completed, well-formed CSI sequence. The rendered subset is exactly the
-    /// console's emission census (module docs): SGR 0/31 and CSI K mode 0. Every other
-    /// final (cursor moves, clears, unknown SGR parameters) is ignored.
+    /// console's emission alphabet (module docs — the area/40 editor contract): SGR
+    /// 0/31, CSI K mode 0, CSI A (CUU) and CSI G (CHA). Every other final (other
+    /// cursor moves, clears, unknown SGR parameters) is ignored.
     fn csi_dispatch(&mut self, final_byte: u8, s: &mut impl Surface) {
         let count = if self.csi.any { self.csi.n + 1 } else { 0 };
         match final_byte {
@@ -432,6 +442,35 @@ impl Grid {
                 // EL: only mode 0 (cursor to end of line) is emitted/rendered.
                 if count == 0 || self.csi.params[0] == 0 {
                     self.erase_to_eol(s);
+                }
+            }
+            b'A' => {
+                // CUU: up `n` rows (the editor emits it bare = 1; 0 counts as 1),
+                // column preserved, clamped at the top row — never a reverse scroll.
+                let n = if count == 0 {
+                    1
+                } else {
+                    self.csi.params[0].max(1) as usize
+                };
+                if self.row > 0 {
+                    self.uncursor(s);
+                    self.row = self.row.saturating_sub(n);
+                    self.cursor(s);
+                }
+            }
+            b'G' => {
+                // CHA: 1-based column set, clamped to [1, COLS] (0 counts as 1). The
+                // editor's wrap-boundary backspace targets the last column this way.
+                let n = if count == 0 {
+                    1
+                } else {
+                    self.csi.params[0] as usize
+                };
+                let col = n.clamp(1, COLS) - 1;
+                if col != self.col {
+                    self.uncursor(s);
+                    self.col = col;
+                    self.cursor(s);
                 }
             }
             _ => {}
@@ -1174,13 +1213,14 @@ mod tests {
         assert_matches_redraw(&grid, &fb);
     }
 
-    /// Census discipline: nothing in the repo emits EL modes 1/2, cursor moves, clears
-    /// or exotic parameter shapes — they are consumed whole with no effect (the day
-    /// something emits one, implement it; never let it leak glyphs or move the cursor).
+    /// Census discipline: nothing in the repo emits EL modes 1/2, CUD/CUF/CUP-style
+    /// cursor moves, clears or exotic parameter shapes — they are consumed whole with
+    /// no effect (the day something emits one, implement it; never let it leak glyphs
+    /// or move the cursor).
     #[test]
     fn unimplemented_csi_sequences_are_consumed_without_effect() {
         let (grid, fb) = render(
-            "ab\u{1b}[1K\u{1b}[2K\u{1b}[5G\u{1b}[2J\u{1b}[99999m\u{1b}[1;2;3;4;5m\u{1b}[?25lc",
+            "ab\u{1b}[1K\u{1b}[2K\u{1b}[B\u{1b}[2J\u{1b}[99999m\u{1b}[1;2;3;4;5m\u{1b}[?25lc",
         );
         let (plain_grid, plain_fb) = render("abc");
         assert_eq!(grid.text[..], plain_grid.text[..]);
@@ -1214,6 +1254,81 @@ mod tests {
             fb.0, fresh.0,
             "recall repaint must render like a fresh line"
         );
+        assert_matches_redraw(&grid, &fb);
+    }
+
+    /// area/40's wrap-boundary backspace contract: erasing past a wrap emits
+    /// `CSI A` `CSI <width>G` `CSI K` — up one row, last column, erase to EOL. A
+    /// two-row line must unwrap cleanly back onto the first row.
+    #[test]
+    fn the_wrap_boundary_backspace_composite_unwraps_to_the_row_above() {
+        let mut grid = Grid::new();
+        let mut fb = ModelFb::new();
+        grid.redraw(&mut fb);
+        for _ in 0..COLS {
+            grid.feed(b'a', &mut fb);
+        }
+        grid.feed(b'b', &mut fb);
+        assert_eq!((grid.row, grid.col), (1, 1));
+        // Same-row erase of `b` first (`\b \b`), then the wrap-boundary composite.
+        feed_str(&mut grid, &mut fb, "\u{8} \u{8}");
+        assert_eq!((grid.row, grid.col), (1, 0));
+        feed_str(&mut grid, &mut fb, "\u{1b}[A\u{1b}[100G\u{1b}[K");
+        assert_eq!((grid.row, grid.col), (0, COLS - 1));
+        assert_eq!(grid.text[COLS - 1], 0, "the last column must be erased");
+        assert_eq!(&grid.text[..COLS - 1], &[b'a'; COLS - 1][..]);
+        assert_matches_redraw(&grid, &fb);
+    }
+
+    /// area/40's recall-replace contract: `\r` `CSI K`, then (`CSI A` `CSI K`) per
+    /// wrapped row, then the re-emit. Replacing a two-row line with a shorter one must
+    /// leave zero residue — the frame equals a freshly typed short line.
+    #[test]
+    fn the_recall_repaint_composite_clears_a_wrapped_line_without_residue() {
+        let mut grid = Grid::new();
+        let mut fb = ModelFb::new();
+        grid.redraw(&mut fb);
+        feed_str(&mut grid, &mut fb, "eosh> ");
+        for _ in 0..144 {
+            grid.feed(b'x', &mut fb);
+        }
+        // 6 prompt + 144 = a full row 0 plus 50 chars on row 1.
+        assert_eq!((grid.row, grid.col), (1, 50));
+        feed_str(&mut grid, &mut fb, "\r\u{1b}[K\u{1b}[A\u{1b}[K");
+        assert_eq!((grid.row, grid.col), (0, 0));
+        feed_str(&mut grid, &mut fb, "eosh> curl");
+        let (_, fresh) = render("eosh> curl");
+        assert_eq!(
+            fb.0, fresh.0,
+            "no residue may survive the wrapped-line replace"
+        );
+        assert_matches_redraw(&grid, &fb);
+    }
+
+    #[test]
+    fn cuu_and_cha_clamp_at_the_edges() {
+        // CUU at the top row: no move, never a reverse scroll (bare and counted).
+        let (grid, fb) = render("ab\u{1b}[A\u{1b}[5Ac");
+        assert_eq!((grid.row, grid.col), (0, 3));
+        assert_eq!(&grid.text[..3], b"abc");
+        assert_matches_redraw(&grid, &fb);
+        // A counted CUU clamps to row 0; count 0 acts as 1.
+        let (grid, fb) = render("\n\n\n\u{1b}[7Ax\u{1b}[0Ay");
+        assert_eq!((grid.row, grid.col), (0, 2));
+        assert_eq!(&grid.text[..2], b"xy");
+        assert_matches_redraw(&grid, &fb);
+        // CHA beyond the width clamps to the last column (the glyph then wraps).
+        let (grid, fb) = render("\u{1b}[999Gz");
+        assert_eq!(grid.text[COLS - 1], b'z');
+        assert_eq!((grid.row, grid.col), (1, 0));
+        assert_matches_redraw(&grid, &fb);
+        // Bare CSI G and an explicit 0 both go to column 1.
+        let (grid, fb) = render("abc\u{1b}[Gz");
+        assert_eq!(&grid.text[..3], b"zbc");
+        assert_eq!((grid.row, grid.col), (0, 1));
+        assert_matches_redraw(&grid, &fb);
+        let (grid, fb) = render("abc\u{1b}[0Gz");
+        assert_eq!(&grid.text[..3], b"zbc");
         assert_matches_redraw(&grid, &fb);
     }
 
