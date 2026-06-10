@@ -364,7 +364,7 @@ pub(crate) fn deliver_due_events() {
 /// explicit so the access is sound.
 struct IdleWaker {
     locked: AtomicBool,
-    wakers: UnsafeCell<Vec<Waker>>,
+    wakers: UnsafeCell<Vec<(Waker, u8)>>,
 }
 
 // SAFETY: all access goes through the `locked` flag below, on the kernel's single core.
@@ -386,17 +386,77 @@ impl IdleWaker {
     }
 }
 
+/// Which parked host future registered an idle waker — measurement tags for the
+/// park-composition histogram (`drive-stats`), and self-describing call sites either
+/// way. Values are bit positions in a 4-bit mask (≤ 16 buckets).
+pub(crate) mod idle_site {
+    pub const READ_KEY: u8 = 0;
+    pub const READ_LINE: u8 = 1;
+    pub const SLEEP: u8 = 2;
+    pub const INTX: u8 = 3;
+}
+
 /// Register a waker to re-drive after the next `wfi` (called by a parked host future).
 /// A waker that would re-poll the same future as one already registered is skipped
 /// (`will_wake`), so a future re-registering across passes does not accumulate clones.
-pub(crate) fn register_idle_waker(waker: &Waker) {
+/// `site` tags the registrant ([`idle_site`]) for the drive-stats park histogram.
+pub(crate) fn register_idle_waker(waker: &Waker, site: u8) {
     IDLE_WAKER.lock();
     // SAFETY: exclusive while `locked` is held.
     let wakers = unsafe { &mut *IDLE_WAKER.wakers.get() };
-    if !wakers.iter().any(|known| known.will_wake(waker)) {
-        wakers.push(waker.clone());
+    if !wakers.iter().any(|(known, _)| known.will_wake(waker)) {
+        wakers.push((waker.clone(), site));
     }
     IDLE_WAKER.unlock();
+}
+
+/// The bitmask of [`idle_site`] tags currently registered (who is parked right now).
+/// Cold path only (the executor is about to halt); the list holds at most a few
+/// entries, so the scan is trivially cheap in shipped builds too (the orphaned-pend
+/// detector below needs it whatever the feature set).
+fn idle_waker_site_mask() -> usize {
+    IDLE_WAKER.lock();
+    // SAFETY: exclusive while `locked` is held.
+    let mask = unsafe { &*IDLE_WAKER.wakers.get() }
+        .iter()
+        .fold(0usize, |mask, (_, site)| mask | (1 << site));
+    IDLE_WAKER.unlock();
+    mask & 0xf
+}
+
+/// Host-call census indices (`drive-stats`): one counter per provider entry point on
+/// the per-keystroke suspects list. [`count_host_call`] is a no-op without the feature.
+pub(crate) mod host_call {
+    pub const TEXT_WRITE: usize = 0;
+    pub const READ_LINE: usize = 1;
+    pub const READ_KEY: usize = 2;
+    pub const SLEEP: usize = 3;
+    pub const MONOTONIC: usize = 4;
+    pub const FS_OPEN_EXEC: usize = 5;
+    pub const FS_LIST: usize = 6;
+    pub const FS_READ: usize = 7;
+    pub const FS_EXEC_READ: usize = 8;
+    pub const FS_EXEC_SIZE: usize = 9;
+    pub const N: usize = 10;
+    pub const NAMES: [&str; N] = [
+        "text-write",
+        "read-line",
+        "read-key",
+        "sleep",
+        "monotonic",
+        "fs-open-exec",
+        "fs-list",
+        "fs-read",
+        "fs-exec-read",
+        "fs-exec-size",
+    ];
+}
+
+/// Count one host-provider call (no-op unless `drive-stats`).
+#[inline(always)]
+pub(crate) fn count_host_call(_index: usize) {
+    #[cfg(feature = "drive-stats")]
+    drive_stats::HOST_CALLS[_index].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Wake (and clear) every registered idle waker, so wasmtime re-polls the parked futures.
@@ -414,7 +474,7 @@ pub(crate) fn wake_idle() {
     let wakers = core::mem::take(unsafe { &mut *IDLE_WAKER.wakers.get() });
     IDLE_WAKER.unlock();
     crate::rxring::clear_input_edge();
-    for waker in wakers {
+    for (waker, _site) in wakers {
         waker.wake();
     }
 }
@@ -488,6 +548,16 @@ pub(crate) fn register_pass_waker(waker: Arc<RungWaker>) {
     // SAFETY: exclusive while `locked` is held.
     unsafe { &mut *PASS_WAKERS.wakers.get() }.push(waker);
     PASS_WAKERS.unlock();
+}
+
+/// Whether the current pass checked in any still-running child/service at all (the
+/// orphaned-pend detector's "something is supposed to be making progress" predicate).
+pub(crate) fn pass_wakers_nonempty() -> bool {
+    PASS_WAKERS.lock();
+    // SAFETY: exclusive while `locked` is held.
+    let nonempty = !unsafe { &*PASS_WAKERS.wakers.get() }.is_empty();
+    PASS_WAKERS.unlock();
+    nonempty
 }
 
 /// Whether any of this pass's checked-in children/services has been rung since its poll
@@ -565,6 +635,20 @@ pub(crate) fn idle_wait() -> WakeKind {
     }
     let now = crate::timer::uptime_ns();
     let requested = NEXT_TIMER_WAKE_NS.swap(u64::MAX, Ordering::AcqRel);
+    // Orphaned-pend detector (area/38-first-poll-parks): a child or service is checked
+    // in and still running, yet nothing is positioned to wake this park — no host
+    // future registered an idle waker, no requested deadline, and no rung waker (the
+    // park gate above came up empty). Whatever that work pends on can only ever be
+    // rescued by a maintenance entry — the silent-rescuer shape the doctrine forbids
+    // (a future must ring when runnable or register the wake it waits for). No such
+    // future exists today; this catches one being introduced.
+    if requested == u64::MAX && idle_waker_site_mask() == 0 && pass_wakers_nonempty() {
+        liveness_finding(
+            "orphaned pend: running work is parked with no registered waker and no \
+             deadline - only a maintenance wake can rescue it",
+            &LIVENESS_ORPHANED_PEND,
+        );
+    }
     // The single armed timer points at the earliest real deadline: a parked future's
     // requested wake, or a maintenance obligation (watchdog pat / feed kick). No cap:
     // the old 10 ms-while-running interval existed to bound re-poll latency "in case a
@@ -610,6 +694,17 @@ pub(crate) fn idle_wait() -> WakeKind {
         drive_stats::EDGE_BOUNCE.fetch_add(1, Ordering::Relaxed);
         wake_idle();
         return WakeKind::Event;
+    }
+    // Measurement: the park composition — which host futures hold a registered idle
+    // waker as the core halts, and whether any parked future requested the deadline
+    // (bit 4 set = the armed target is a real requested deadline, clear = maintenance).
+    #[cfg(feature = "drive-stats")]
+    {
+        let mut bucket = idle_waker_site_mask();
+        if !maintenance_rated {
+            bucket |= 0x10;
+        }
+        drive_stats::PARK_MASKS[bucket].fetch_add(1, Ordering::Relaxed);
     }
     // Arm the timer wake, halt until an interrupt is pending, then unmask and take it —
     // the architecture-specific sequence lives in `timer::wait_for_interrupt_masked`,
@@ -690,6 +785,7 @@ static LIVENESS_STRANDED_INPUT: AtomicU64 = AtomicU64::new(0);
 static LIVENESS_STRANDED_INTX: AtomicU64 = AtomicU64::new(0);
 static LIVENESS_STRANDED_RUNNABLE: AtomicU64 = AtomicU64::new(0);
 static LIVENESS_PARK_RUNNABLE: AtomicU64 = AtomicU64::new(0);
+static LIVENESS_ORPHANED_PEND: AtomicU64 = AtomicU64::new(0);
 
 fn liveness_finding(what: &str, counter: &AtomicU64) {
     let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -732,7 +828,24 @@ pub(crate) mod drive_stats {
     pub static GATE_CATCH: AtomicU64 = AtomicU64::new(0);
     pub static EDGE_BOUNCE: AtomicU64 = AtomicU64::new(0);
 
-    /// Print one cumulative summary line (the consumer diffs successive dumps).
+    /// Host-provider call census ([`super::host_call`] indices).
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    pub static HOST_CALLS: [AtomicU64; super::host_call::N] = [ZERO; super::host_call::N];
+
+    /// Park-composition histogram: bits 0..3 = the [`super::idle_site`] tags with a
+    /// registered idle waker at the moment of the park, bit 4 = the armed delay belongs
+    /// to a *requested* deadline (clear = a maintenance entry decides the wake).
+    pub static PARK_MASKS: [AtomicU64; 32] = [ZERO; 32];
+
+    /// Key→echo meter: kernel-side input-arrival → first guest `text.write` latency
+    /// (count / total ns / max ns). The harness-immune per-keystroke ground truth.
+    pub static KEY_ECHO_COUNT: AtomicU64 = AtomicU64::new(0);
+    pub static KEY_ECHO_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub static KEY_ECHO_NS_MAX: AtomicU64 = AtomicU64::new(0);
+
+    /// Print the cumulative summary (the consumer diffs successive dumps): the pass /
+    /// wake line, the host-call census, and every non-zero park-composition bucket.
     pub fn dump(reason: &str) {
         crate::kprintln!(
             "drive-stats[{reason}]: passes={} hot={} child-polls={} child-rung={} \
@@ -750,6 +863,36 @@ pub(crate) mod drive_stats {
             GATE_CATCH.load(Ordering::Relaxed),
             EDGE_BOUNCE.load(Ordering::Relaxed),
         );
+        crate::kprint!("drive-stats[{reason}] hostcalls:");
+        for (index, name) in super::host_call::NAMES.iter().enumerate() {
+            crate::kprint!(" {name}={}", HOST_CALLS[index].load(Ordering::Relaxed));
+        }
+        crate::kprint!(
+            "\ndrive-stats[{reason}] key-echo: count={} total-us={} max-us={}",
+            KEY_ECHO_COUNT.load(Ordering::Relaxed),
+            KEY_ECHO_NS_TOTAL.load(Ordering::Relaxed) / 1_000,
+            KEY_ECHO_NS_MAX.load(Ordering::Relaxed) / 1_000,
+        );
+        crate::kprint!("\ndrive-stats[{reason}] parks:");
+        for (mask, count) in PARK_MASKS.iter().enumerate() {
+            let count = count.load(Ordering::Relaxed);
+            if count == 0 {
+                continue;
+            }
+            // Render the bucket as site letters (K=read-key, L=read-line, S=sleep,
+            // X=intx) plus D when a requested deadline armed the wake.
+            let mut tag = [0u8; 5];
+            let mut len = 0;
+            for (bit, letter) in [(0, b'K'), (1, b'L'), (2, b'S'), (3, b'X'), (4, b'D')] {
+                if mask & (1 << bit) != 0 {
+                    tag[len] = letter;
+                    len += 1;
+                }
+            }
+            let tag = core::str::from_utf8(&tag[..len]).unwrap_or("?");
+            crate::kprint!(" {}={count}", if len == 0 { "none" } else { tag });
+        }
+        crate::kprint!("\n");
     }
 }
 

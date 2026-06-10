@@ -242,6 +242,27 @@ discriminator, now joined by the `drive-stats` image
 rung/wake histogram, splitting per-pass machinery (fiber resume, store traversal)
 from raw guest-execution slowness (the memory-attribute check above).*
 
+*area/38 verdict (2026-06-09, after the silicon drive-stats round): the "~1 ms+/pass"
+inference above is **dead** — the board's empty-bracket spin measures **~7.5 µs/pass
+on the A76**, matching HVF; the pass machinery is fine. H2 (per-key host futures
+first-poll-pending into the kbd pacing) is **also refuted**: the drive-stats
+host-call census shows a tracked key makes exactly two host calls (read-key +
+text-write; zero fs/oracle calls — the vocabulary walk is per-prompt), and the
+park-composition histogram shows zero mid-key parks (TCG back-to-back: 0.1 ms median,
+one event-woken park per 20-key burst on plain; no hang, no 1 s rides). The silicon
+~34 deadline-parks/key obey parks ≈ gap÷2 ms in every dataset — they count the
+inter-key gap at the kbd pacing, not the key. That leaves the flat 52–61 ms
+(uniform across key classes — fact 1's shape, now on the event-driven executor)
+pointing at the §5 probe this study never ran: the FTDI/reader-pacing audit of the
+bench harness. The image now carries the harness-immune discriminator: a kernel-side
+key→echo meter (input-edge → first guest write; 0.45–0.6 ms mean on TCG) in every
+drive-stats dump, plus the host-call census and park compositions. The bracketed
+board burst has since run (bench round, 2026-06-09): **key→echo mean 2.4 ms on
+silicon** (count=41, max one 36 ms outlier), input event-woken, parks all KSD — and
+the U-Boot console echoes through the same harness at ~56 ms. Verdict: the 52–61 ms
+was the bench harness's FTDI round-trip floor all along; the board residue of §5 is
+CLOSED on the kernel side, and the remaining work item is the bench harness itself.*
+
 ## 6. Mitigation ladder, sized by the data
 
 Ordered by measured leverage per unit of risk. (a) and the word-end fix attack the

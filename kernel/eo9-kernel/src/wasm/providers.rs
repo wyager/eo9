@@ -408,6 +408,21 @@ fn add_text(linker: &mut Linker<KernelState>) -> Result<()> {
         |_store: StoreContextMut<'_, KernelState>,
          (_cap, _to, content): (Resource<TextCap>, WitOutputStream, String)|
          -> Result<(Result<(), WitTextError>,)> {
+            super::count_host_call(super::host_call::TEXT_WRITE);
+            // Key→echo meter (drive-stats): input arrived since the last guest write —
+            // this write is the guest's first observable response to it. Kernel-side
+            // ground truth, immune to any bench harness's own pacing.
+            #[cfg(feature = "drive-stats")]
+            {
+                let stamp = crate::rxring::take_input_stamp();
+                if stamp != 0 {
+                    let elapsed = crate::timer::uptime_ns().saturating_sub(stamp);
+                    use core::sync::atomic::Ordering;
+                    super::drive_stats::KEY_ECHO_COUNT.fetch_add(1, Ordering::Relaxed);
+                    super::drive_stats::KEY_ECHO_NS_TOTAL.fetch_add(elapsed, Ordering::Relaxed);
+                    super::drive_stats::KEY_ECHO_NS_MAX.fetch_max(elapsed, Ordering::Relaxed);
+                }
+            }
             crate::kprint!("{content}");
             Ok((Ok(()),))
         },
@@ -422,6 +437,7 @@ fn add_text(linker: &mut Linker<KernelState>) -> Result<()> {
         |_accessor: &Accessor<KernelState>,
          (_cap,): (Resource<TextCap>,)|
          -> ConcurrentFuture<'_, (Result<Option<String>, WitTextError>,)> {
+            super::count_host_call(super::host_call::READ_LINE);
             Box::pin(async move { Ok((Ok(ReadLine::default().await),)) })
         },
     )?;
@@ -435,6 +451,7 @@ fn add_text(linker: &mut Linker<KernelState>) -> Result<()> {
         |_accessor: &Accessor<KernelState>,
          (_cap,): (Resource<TextCap>,)|
          -> ConcurrentFuture<'_, (Result<Option<WitKey>, WitTextError>,)> {
+            super::count_host_call(super::host_call::READ_KEY);
             Box::pin(async move { Ok((Ok(Some(ReadKey::default().await)),)) })
         },
     )?;
@@ -467,6 +484,7 @@ fn add_time(linker: &mut Linker<KernelState>) -> Result<()> {
         |_store: StoreContextMut<'_, KernelState>,
          (_cap,): (Resource<TimeCap>,)|
          -> Result<(WitInstant,)> {
+            super::count_host_call(super::host_call::MONOTONIC);
             Ok((WitInstant {
                 nanoseconds: crate::timer::uptime_ns(),
             },))
@@ -489,6 +507,7 @@ fn add_time(linker: &mut Linker<KernelState>) -> Result<()> {
         |_accessor: &Accessor<KernelState>,
          (_cap, duration_ns): (Resource<TimeCap>, u64)|
          -> ConcurrentFuture<'_, ()> {
+            super::count_host_call(super::host_call::SLEEP);
             let deadline = crate::timer::uptime_ns().saturating_add(duration_ns);
             Box::pin(async move {
                 SleepUntil { deadline }.await;
@@ -552,7 +571,7 @@ impl Future for ReadKey {
             }
         }
         // Same parking discipline as ReadLine below.
-        super::register_idle_waker(cx.waker());
+        super::register_idle_waker(cx.waker(), super::idle_site::READ_KEY);
         Poll::Pending
     }
 }
@@ -700,7 +719,7 @@ impl Future for ReadLine {
         // Park instead of self-waking: registering the waker lets `block_on` re-drive this
         // future after its timer-interrupt `wfi` wake, so the core idles rather than
         // wasmtime busy-re-polling here (which would never return to `block_on`'s `wfi`).
-        super::register_idle_waker(cx.waker());
+        super::register_idle_waker(cx.waker(), super::idle_site::READ_LINE);
         Poll::Pending
     }
 }
@@ -722,7 +741,7 @@ impl Future for SleepUntil {
             // fixed polling tick — and so a purely input-bound idle prompt can sleep until a
             // keystroke instead of waking on a timer it does not need.
             super::request_timer_wake(self.deadline);
-            super::register_idle_waker(cx.waker());
+            super::register_idle_waker(cx.waker(), super::idle_site::SLEEP);
             Poll::Pending
         }
     }

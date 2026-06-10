@@ -182,6 +182,10 @@ fn run_init(entries: &'static [StoreEntry], config: &str) -> Result<String, wasm
         }
     }
 
+    // The session is over: drop the last pass's checked-in wakers so later block_on
+    // idles (shutdown paths) cannot read them as still-running work.
+    super::begin_drive_pass();
+
     #[cfg(feature = "drive-stats")]
     super::drive_stats::dump("init-end");
 
@@ -387,6 +391,9 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
             }
         }
     }
+
+    // As in run_init: the session is over, drop the last pass's checked-in wakers.
+    super::begin_drive_pass();
 
     #[cfg(feature = "drive-stats")]
     super::drive_stats::dump("eosh-end");
