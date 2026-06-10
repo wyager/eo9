@@ -78,6 +78,32 @@ static INTX_DELIVERIES: [AtomicU64; INTX_LINES] = [
 #[cfg_attr(feature = "board-opi5plus", allow(dead_code))]
 pub fn intx_record(line: usize) {
     INTX_DELIVERIES[line % INTX_LINES].fetch_add(1, Ordering::Release);
+    INTX_EDGE.store(true, Ordering::Release);
+}
+
+/// INTx-arrival edge: set whenever the IRQ handler records a delivery, cleared when the
+/// executor wakes its parked futures (`wasm::wake_idle`). The wfi-wake argument covers a
+/// SLEEPING core (a masked-pending IRQ ends the halt); an INTx taken while the core is
+/// AWAKE (mid-pass) records its delivery and returns — without this edge nothing would
+/// ring the parked waiter, and the completion would ride the wait's own deadline (the
+/// area/37 event-driven USB reads measured exactly that: one report per 2 s bound).
+/// The full event-path fix is area/36's wake plumbing; this edge is the same
+/// input-arrival-edge pattern already used for console bytes, applied to the second
+/// IRQ-time producer class.
+static INTX_EDGE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether an INTx delivery arrived since the last [`clear_intx_edge`].
+#[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
+pub fn intx_edge_pending() -> bool {
+    INTX_EDGE.load(Ordering::Acquire)
+}
+
+/// Consume the edge — called when the executor wakes its parked futures (every waiter
+/// re-polls and takes its pending count; an edge with no waiter clears harmlessly, so
+/// a stale pending can never livelock the park gate).
+#[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
+pub fn clear_intx_edge() {
+    INTX_EDGE.store(false, Ordering::Release);
 }
 
 /// Consume the pending delivery count for gpex line `line` (0 = nothing delivered).

@@ -875,3 +875,18 @@ self-pace. The degradation design when that day comes: after N consecutive wait
 errors the shell drops its vector (waits answer `Unsupported`) and flips the
 endpoint's `event-driven` answer false; the consumer re-queries `event-driven` on
 empty reads and resumes its pacing. Comments at both Err arms point here.
+
+## INTx deliveries while the core is awake raised no wake — bridged with the INTx edge until area/36 (review train, 2026-06-09)
+The wfi-wake argument covers a sleeping core only: an INTx taken MID-PASS records its
+delivery (handler masks + counts) and nothing rings the parked waiter, so the
+completion rides the wait's own deadline. Invisible pre-area/37 (the 2 ms USB poll
+pace rescued it silently — the audit's silent-rescuer shape); event-driven USB reads
+surfaced it as exactly one HID report per 2 s wait bound (check-usb-hub deterministic
+failure, forwarded(5)). Bridge landed: an INTx-arrival edge (set in intx_record,
+cleared by wake_idle) checked at the hot path, the pre-park gate, and the IRQ-masked
+re-check — the same pattern as the console input edge, second producer class.
+area/36-net-rx-events' wake plumbing is the full fix and subsumes the edge when it
+merges. Same hunt also fixed an OHCI done-queue race: a writeback consumed by the
+spurious-wake drain left the next counted reap waiting forever (silent freeze or
+device-lost under TCG) — now credit-accounted with a frame-bounded spin, pinned by
+a mock regression test.

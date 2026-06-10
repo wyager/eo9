@@ -186,6 +186,11 @@ pub struct Ohci<R: RegionIo> {
     /// The interrupt-IN endpoint's re-arm state: which TD slot is pending and which
     /// is the dummy tail, plus the buffer length to read back.
     interrupt: Option<InterruptState>,
+    /// Done-queue writebacks consumed AHEAD of their reap (the stale-drain in
+    /// `read_report`'s spurious-wake arm can eat a writeback that lands between the
+    /// ED-head check and the drain): the next counted reap takes this credit first,
+    /// so it never spins for a writeback that was already collected.
+    reaped_credit: u32,
     /// Whether [`enable_events`](Self::enable_events) unmasked WDH/RHSC — i.e. the
     /// shell routes the controller's interrupt and the event-driven wait paths are
     /// live. False = the original polled shape (the consumer paces).
@@ -205,6 +210,7 @@ impl<R: RegionIo> Ohci<R> {
             info: None,
             interrupt: None,
             events: false,
+            reaped_credit: 0,
         }
     }
 
@@ -699,6 +705,16 @@ impl<R: RegionIo> Ohci<R> {
         Ok(walked)
     }
 
+    /// The controller's 16-bit frame counter (HcFmNumber — the driver's only clock).
+    async fn frame_number(&mut self) -> Result<u32, DriverError<R::Error>> {
+        Ok(self
+            .io
+            .read32(reg::HC_FM_NUMBER)
+            .await
+            .map_err(DriverError::Io)?
+            & 0xffff)
+    }
+
     /// Take and acknowledge the done-queue writeback for TDs known to have retired,
     /// COUNTED: `expected` is the number of retired TDs whose writebacks must be
     /// collected before any of their slots may be reused.
@@ -717,18 +733,29 @@ impl<R: RegionIo> Ohci<R> {
     /// Polled mode: DI_NONE TDs never arm the writeback, so this is one best-effort
     /// take — the original shape, byte for byte; `expected` is ignored.
     async fn reap_done_queue(&mut self, expected: u32) -> Result<(), DriverError<R::Error>> {
-        let mut taken = self.consume_done_queue().await?;
+        let mut taken = self
+            .reaped_credit
+            .saturating_add(self.consume_done_queue().await?);
+        self.reaped_credit = 0;
         if !self.events {
             return Ok(());
         }
+        // Bound the wait in FRAME TIME (the writeback lands at the next frame
+        // boundary, §4.3.1.2), not host-call rounds: under a slow emulator 200k MMIO
+        // round-trips are wall-clock-unbounded — the silent-freeze shape this fix
+        // replaced. A few frames is far above any healthy controller.
+        let start_frame = self.frame_number().await?;
         let mut polls = 0u32;
         while taken < expected {
-            taken += self.consume_done_queue().await?;
+            taken = taken.saturating_add(self.consume_done_queue().await?);
             polls += 1;
-            if polls > WRITEBACK_POLL_LIMIT {
+            let elapsed = self.frame_number().await?.wrapping_sub(start_frame) & 0xffff;
+            if elapsed > 8 || polls > WRITEBACK_POLL_LIMIT {
                 return Err(DriverError::Timeout("done-queue writeback"));
             }
         }
+        // Writebacks beyond the expectation (a racing chain) stay credited.
+        self.reaped_credit = taken - expected;
         Ok(())
     }
 
@@ -1202,11 +1229,14 @@ impl<R: RegionIo> Ohci<R> {
         let length = self.poll_interrupt(report).await?;
         match outcome {
             WaitOutcome::Delivered if length.is_none() => {
-                // The wake was not a report: consume any stale writeback (so an
-                // unacked WDH cannot keep the level line asserted and storm the next
-                // wait) and acknowledge RHSC for the same reason. The consumer just
-                // calls again.
-                self.consume_done_queue().await?;
+                // The wake was not a report — OR the report retired in the race
+                // window between the ED-head check above and this drain. Consume any
+                // writeback (so an unacked WDH cannot keep the level line asserted
+                // and storm the next wait) and CREDIT it: if it was the racing
+                // report's, the next read's counted reap must not wait for it again
+                // (the silent-freeze/device-lost wedge this credit closes).
+                let consumed = self.consume_done_queue().await?;
+                self.reaped_credit = self.reaped_credit.saturating_add(consumed);
                 self.ack_root_hub_change().await?;
                 Ok(ReadReport {
                     length: None,
@@ -2178,6 +2208,47 @@ mod tests {
             )),
             Err(DriverError::Hub("the attached device is not a hub"))
         );
+    }
+
+    #[test]
+    fn a_pre_consumed_writeback_is_credited_not_awaited() {
+        // The QEMU-observed wedge (area/37 post-merge): a report retires in the race
+        // window between read_report's ED-head check and its spurious-wake drain —
+        // the drain consumes the report's writeback, and the NEXT read's counted
+        // reap then waited for a writeback that never comes (a 200k-host-call spin,
+        // wall-clock-unbounded under TCG, surfacing as forwarded(5) freezes or
+        // device-lost Timeout). The credit closes it: writebacks consumed ahead of
+        // their reap are banked, and the reap takes the bank before waiting.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.enable_events()).unwrap();
+        run(driver.open_interrupt_in(1, false, 1, 8, 10)).unwrap();
+        driver.io().pending_reports.push_back(vec![0, 0, 0x0b, 0]);
+        // Let the report retire and its writeback land (a scripted silicon-faithful
+        // delivery runs frames until WDH is pending).
+        driver.io().wait_script.push_back(WaitOutcome::Delivered);
+        assert_eq!(
+            run(driver.io().wait_interrupt()),
+            Ok(WaitOutcome::Delivered)
+        );
+        // The spurious-wake drain shape: the writeback is consumed (and credited)
+        // before the copy path runs — exactly what read_report's Delivered+none arm
+        // does when the retirement races its ED check.
+        let consumed = run(driver.consume_done_queue()).unwrap();
+        assert_eq!(consumed, 1, "the racing report's writeback");
+        driver.reaped_credit += consumed;
+        // The next read must complete instantly on the credit — without it the reap
+        // spins its frame bound and errors Timeout (the regression).
+        let mut report = [0u8; 8];
+        let read = run(driver.read_report(&mut report)).unwrap();
+        assert_eq!(read.length, Some(4), "the raced report is still delivered");
+        assert_eq!(&report[..4], &[0, 0, 0x0b, 0]);
+        assert_eq!(driver.reaped_credit, 0, "credit consumed by the reap");
+        // And the endpoint stays live: another report flows normally.
+        driver.io().pending_reports.push_back(vec![0, 0, 0x28, 0]);
+        driver.io().wait_script.push_back(WaitOutcome::Delivered);
+        let read = run(driver.read_report(&mut report)).unwrap();
+        assert_eq!(read.length, Some(4), "the endpoint is not wedged");
     }
 
     #[test]

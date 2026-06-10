@@ -346,7 +346,10 @@ pub(crate) fn deliver_due_events() {
         // future is re-requested then, exactly as after an `idle_wait` wake).
         NEXT_TIMER_WAKE_NS.store(u64::MAX, Ordering::Release);
     }
-    if deadline_due || crate::rxring::input_edge_pending() {
+    if deadline_due
+        || crate::rxring::input_edge_pending()
+        || crate::pci::intx_edge_pending()
+    {
         wake_idle();
     }
 }
@@ -474,6 +477,7 @@ pub(crate) fn wake_idle() {
     let wakers = core::mem::take(unsafe { &mut *IDLE_WAKER.wakers.get() });
     IDLE_WAKER.unlock();
     crate::rxring::clear_input_edge();
+    crate::pci::clear_intx_edge();
     for (waker, _site) in wakers {
         waker.wake();
     }
@@ -627,7 +631,7 @@ pub(crate) fn idle_wait() -> WakeKind {
     //    UART drain, or the console-sink injector — the USB keyboard path, which raises
     //    no interrupt at all). Deliver the wake now instead of riding the next timer:
     //    this is the event path doing its job, not a finding.
-    if crate::rxring::input_edge_pending() {
+    if crate::rxring::input_edge_pending() || crate::pci::intx_edge_pending() {
         #[cfg(feature = "drive-stats")]
         drive_stats::EDGE_BOUNCE.fetch_add(1, Ordering::Relaxed);
         wake_idle();
@@ -685,7 +689,7 @@ pub(crate) fn idle_wait() -> WakeKind {
     // on this same core, never from an interrupt handler. The bail re-publishes the
     // consumed deadline request so the bail is behaviorally a pure no-op.
     crate::timer::irq_mask();
-    if crate::rxring::input_edge_pending() {
+    if crate::rxring::input_edge_pending() || crate::pci::intx_edge_pending() {
         crate::timer::irq_unmask();
         if requested != u64::MAX {
             request_timer_wake(requested);
