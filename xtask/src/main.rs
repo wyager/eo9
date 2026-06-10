@@ -6059,8 +6059,12 @@ fn check_share(root: &Path) -> Result<(), String> {
     // ----- leg 3: the virtio share (station-net) + curl ---------------------------------
     println!("xtask: check-share — leg 3: station-net (virtio share, bare curl)");
     let fixture_dir = root.join("target").join("check-share");
-    std::fs::create_dir_all(&fixture_dir)
-        .map_err(|err| format!("check-share: cannot create {}: {err}", fixture_dir.display()))?;
+    std::fs::create_dir_all(&fixture_dir).map_err(|err| {
+        format!(
+            "check-share: cannot create {}: {err}",
+            fixture_dir.display()
+        )
+    })?;
     std::fs::write(fixture_dir.join("hello.txt"), CURL_FIXTURE_BODY)
         .map_err(|err| format!("check-share: cannot write the fixture file: {err}"))?;
     let (mut server, port) = spawn_http_fixture(&fixture_dir)?;
@@ -6087,7 +6091,10 @@ fn check_share(root: &Path) -> Result<(), String> {
             wait_for("eosh>", "the eosh prompt")?;
             let command = format!("curl http://10.0.2.2:{port}/hello.txt");
             console_type_line("check-share", &mut stdin, &command)?;
-            wait_for("HTTP/1.0 200 OK", "the fixture's status line through the gate")?;
+            wait_for(
+                "HTTP/1.0 200 OK",
+                "the fixture's status line through the gate",
+            )?;
             wait_for(
                 CURL_FIXTURE_BODY.trim_end(),
                 "the fixture body on the console",
