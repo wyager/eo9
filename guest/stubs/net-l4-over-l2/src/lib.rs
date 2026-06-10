@@ -21,8 +21,11 @@
 //!   DHCP service on first use (smoltcp's built-in DHCPv4 client — discover → offer →
 //!   request → ack — gated before any l4 operation is served; the lease is announced in
 //!   one console line, and no lease within the bounded window is a typed error, never a
-//!   trap or a hang). DNS servers offered by the lease are only logged: the middleware
-//!   sends no DNS queries — resolvers live *above* `l4`. Lease renewal (T1/T2) is
+//!   trap or a hang). DNS servers offered by the lease are logged AND reported through
+//!   the l4 `dns-servers` introspection (lease-gated like every other operation; the
+//!   unconfigured QEMU default layout reports that layout's forwarder, 10.0.2.3, and
+//!   explicitly configured static addressing reports none): the middleware still sends
+//!   no DNS queries itself — resolvers live *above* `l4`. Lease renewal (T1/T2) is
 //!   handled inside smoltcp's client as long as the stack is pumped, which in this
 //!   executor model means **while l4 operations are in flight** — an idle stack does
 //!   not renew. Sessions here are short-lived relative to any real lease, so this is
@@ -96,7 +99,9 @@ eo9_guest::manual! {
         "lazily on first use, so plain composition always works. With --address dhcp it leases address,",
         "prefix, and gateway from the network on first use and announces the lease in one console line;",
         "on a real LAN that line is where to reach the stack. No lease within the bounded window is a",
-        "typed error, never a hang.",
+        "typed error, never a hang. DNS servers the addressing teaches the stack — the lease's offer, or",
+        "the unconfigured QEMU layout's forwarder 10.0.2.3 — are reported to consumers through the l4",
+        "dns-servers introspection (curl's default resolver); configured static addressing reports none.",
     ],
     args: [
         { name: "address", ty: "string", required,
@@ -137,6 +142,10 @@ const OUR_ADDRESS: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
 const PREFIX_LEN: u8 = 24;
 /// The default gateway (QEMU user-mode networking's router).
 const GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+/// The DNS forwarder of the same documented QEMU user-net layout: what `dns-servers`
+/// reports when the provider runs unconfigured (the layout comes as a set; an
+/// explicitly configured static address reports no servers instead).
+const USER_NET_DNS: Ipv4Address = Ipv4Address::new(10, 0, 2, 3);
 
 // ------------------------------------------------------------------------------------------
 // Configured addressing (`eo9:net/l4-over-l2-config`).
@@ -540,6 +549,10 @@ struct NetState {
     /// The IPv4 address/prefix currently bound on the interface: set at construction in
     /// static mode, set (and re-set, and cleared on lease loss) by DHCP lease events.
     bound: Option<(Ipv4Address, u8)>,
+    /// The DNS servers the current DHCP lease offered, in the lease's order; cleared
+    /// with the lease. Always empty in static mode (the unconfigured QEMU default's
+    /// forwarder is answered straight from the mode, never stored here).
+    dns: Vec<Ipv4Address>,
 }
 
 impl NetState {
@@ -591,6 +604,7 @@ impl NetState {
             listening_ports: Vec::new(),
             dhcp,
             bound,
+            dns: Vec::new(),
         }
     }
 
@@ -662,6 +676,9 @@ fn poll_stack(link: &Link) {
                     }
                 }
                 n.bound = Some((address, prefix));
+                // Kept for the l4 `dns-servers` introspection (the lease's order is
+                // its preference order); the console line below stays the operator's.
+                n.dns = lease.dns_servers.iter().copied().collect();
 
                 let mut line = format!("net.l4.over-l2: dhcp acquired {address}/{prefix}");
                 match lease.router {
@@ -686,6 +703,7 @@ fn poll_stack(link: &Link) {
                 // let the next operation's acquisition gate re-acquire.
                 let lost = n.bound.take().is_some();
                 if lost {
+                    n.dns.clear();
                     n.iface.update_ip_addrs(|addrs| addrs.clear());
                     n.iface.routes_mut().remove_default_ipv4_route();
                     Some(String::from(
@@ -1441,6 +1459,41 @@ impl l4::Guest for Stub {
                 )
             }
             Err(err) => (dst, Err(err)),
+        }
+    }
+
+    /// What the stack's own addressing taught it about DNS. Static modes answer from
+    /// the configuration alone (no link bring-up: the answer cannot change); DHCP mode
+    /// runs behind the same acquisition gate as every transport operation, so the
+    /// reported servers are the bound lease's — or the wait's typed error, never a
+    /// guess.
+    async fn dns_servers(_l4: l4::L4ImplBorrow<'_>) -> Result<Vec<IpAddress>, L4Error> {
+        match mode() {
+            AddressMode::Static(_) => {
+                if MODE.is_set() {
+                    // Explicitly configured static addressing: the operator chose the
+                    // addressing and named no DNS (the config deliberately has no DNS
+                    // knob) — honestly report none rather than invent one.
+                    Ok(Vec::new())
+                } else {
+                    // The unconfigured documented default is QEMU user-net's layout,
+                    // and that layout comes as a set: address, gateway, forwarder.
+                    let o = USER_NET_DNS.octets();
+                    Ok(vec![IpAddress::V4((o[0], o[1], o[2], o[3]))])
+                }
+            }
+            AddressMode::Dhcp => {
+                let _link = acquire().await?;
+                Ok(with_net(|n| {
+                    n.dns
+                        .iter()
+                        .map(|server| {
+                            let o = server.octets();
+                            IpAddress::V4((o[0], o[1], o[2], o[3]))
+                        })
+                        .collect()
+                }))
+            }
         }
     }
 }

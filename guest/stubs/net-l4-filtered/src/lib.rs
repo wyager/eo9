@@ -254,6 +254,25 @@ impl l4::Guest for Stub {
                 .map_err(map_error),
         )
     }
+
+    /// Forwarded unfiltered: the policy gates *endpoint operations* (connect, listen,
+    /// bind, send-to) — knowing where the underlying network's DNS lives opens no
+    /// connection, and the servers are only ever *used* through those gated
+    /// operations, where a refused endpoint still answers `denied`.
+    async fn dns_servers(
+        _l4: l4::L4ImplBorrow<'_>,
+    ) -> Result<alloc::vec::Vec<l4::IpAddress>, L4Error> {
+        let servers = underlying::dns_servers(&underlying::default())
+            .await
+            .map_err(map_error)?;
+        Ok(servers
+            .into_iter()
+            .map(|server| match server {
+                underlying::IpAddress::V4(octets) => IpAddress::V4(octets),
+                underlying::IpAddress::V6(groups) => IpAddress::V6(groups),
+            })
+            .collect())
+    }
 }
 
 export!(Stub);

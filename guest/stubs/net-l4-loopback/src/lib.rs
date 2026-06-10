@@ -453,6 +453,13 @@ impl l4::Guest for Stub {
             )),
         )
     }
+
+    /// The loopback network has no DNS service and reaches nothing outside itself:
+    /// honestly no servers (an empty list, not an error — the capability itself is
+    /// granted and answering).
+    async fn dns_servers(_l4: l4::L4ImplBorrow<'_>) -> Result<Vec<IpAddress>, L4Error> {
+        Ok(Vec::new())
+    }
 }
 
 export!(Stub);
