@@ -637,8 +637,7 @@ pub fn drive_children() -> DriveStatus {
             // the parked-with-runnable-work bug the executor's park gate must catch.
             // The waker still reaches the gate via `register_pass_waker` below, which
             // is exactly what lets the gate detect (and loudly report) the strand.
-            if !cfg!(feature = "chaos-strand-runnable")
-                && child_waker.rung.load(Ordering::Acquire)
+            if !cfg!(feature = "chaos-strand-runnable") && child_waker.rung.load(Ordering::Acquire)
             {
                 status.any_runnable = true;
                 #[cfg(feature = "drive-stats")]

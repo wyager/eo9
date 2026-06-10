@@ -359,7 +359,9 @@ pub fn scavenge_rx(now_ns: u64) -> usize {
     /// Uptime of the last observed receive activity (ring movement or FIFO data).
     static LAST_ACTIVITY_NS: AtomicU64 = AtomicU64::new(0);
     /// Uptime of the last feed kick, so a fully idle console kicks at most once a second.
+    #[cfg(not(feature = "board-opi5plus"))]
     static LAST_KICK_NS: AtomicU64 = AtomicU64::new(0);
+    #[cfg(not(feature = "board-opi5plus"))]
     const QUIET_BEFORE_KICK_NS: u64 = 1_000_000_000;
 
     // Mask IRQs so this thread is the ring's only producer for the duration (the IRQ
@@ -371,17 +373,23 @@ pub fn scavenge_rx(now_ns: u64) -> usize {
     if moved > 0 || ring_busy {
         LAST_ACTIVITY_NS.store(now_ns, Ordering::Relaxed);
     } else {
-        let quiet_since = LAST_ACTIVITY_NS.load(Ordering::Relaxed);
-        let last_kick = LAST_KICK_NS.load(Ordering::Relaxed);
-        if now_ns.saturating_sub(quiet_since) >= QUIET_BEFORE_KICK_NS
-            && now_ns.saturating_sub(last_kick) >= QUIET_BEFORE_KICK_NS
+        // The feed kick is QEMU-profile only (area/35 timer-crutch audit, class C): the
+        // wedged character feed is a QEMU chardev bug that cannot exist on the board's
+        // physical DW UART, so the board never issues the workaround's dummy read (a
+        // stale-data read there would also race a byte landing in the same window).
+        #[cfg(not(feature = "board-opi5plus"))]
         {
-            LAST_KICK_NS.store(now_ns, Ordering::Relaxed);
-            // The FIFO is empty (checked under the mask just above): this read returns
-            // stale data and exists purely for QEMU's unconditional `accept_input` side
-            // effect, which resumes a wedged character feed (harmless stale read on real
-            // hardware).
-            let _ = hw::rx_read();
+            let quiet_since = LAST_ACTIVITY_NS.load(Ordering::Relaxed);
+            let last_kick = LAST_KICK_NS.load(Ordering::Relaxed);
+            if now_ns.saturating_sub(quiet_since) >= QUIET_BEFORE_KICK_NS
+                && now_ns.saturating_sub(last_kick) >= QUIET_BEFORE_KICK_NS
+            {
+                LAST_KICK_NS.store(now_ns, Ordering::Relaxed);
+                // The FIFO is empty (checked under the mask just above): this read
+                // returns stale data and exists purely for QEMU's unconditional
+                // `accept_input` side effect, which resumes a wedged character feed.
+                let _ = hw::rx_read();
+            }
         }
     }
     // SAFETY: restore IRQ delivery.

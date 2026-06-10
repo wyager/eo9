@@ -166,13 +166,16 @@ fn run_init(entries: &'static [StoreEntry], config: &str) -> Result<String, wasm
                     if !any_runnable {
                         last_wake = super::idle_wait();
                     } else {
-                        // The loop stays hot for a runnable child/service; wake any
-                        // input-parked future (the console's read-line) each pass so
-                        // the prompt stays responsive while something spins. Busy passes
+                        // The loop stays hot for a runnable child/service. Deliver any
+                        // *due* events to parked futures (console input that arrived,
+                        // an expired sleep deadline) so the prompt stays responsive
+                        // while something spins — but never a blanket wake, which
+                        // would mark every parked future runnable and keep the loop
+                        // hot forever (the 100% spin drive-stats caught). Busy passes
                         // also pat the board watchdog (idle passes pat in `idle_wait`),
                         // so a hot loop never starves the hang backstop. No-op on QEMU.
                         crate::wdt::pat();
-                        super::wake_idle();
+                        super::deliver_due_events();
                     }
                 }
             }
@@ -369,13 +372,16 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
                     if !any_runnable {
                         last_wake = super::idle_wait();
                     } else {
-                        // The loop stays hot for a runnable child/service; wake any
-                        // input-parked future (the console's read-line) each pass so
-                        // the prompt stays responsive while something spins. Busy passes
+                        // The loop stays hot for a runnable child/service. Deliver any
+                        // *due* events to parked futures (console input that arrived,
+                        // an expired sleep deadline) so the prompt stays responsive
+                        // while something spins — but never a blanket wake, which
+                        // would mark every parked future runnable and keep the loop
+                        // hot forever (the 100% spin drive-stats caught). Busy passes
                         // also pat the board watchdog (idle passes pat in `idle_wait`),
                         // so a hot loop never starves the hang backstop. No-op on QEMU.
                         crate::wdt::pat();
-                        super::wake_idle();
+                        super::deliver_due_events();
                     }
                 }
             }

@@ -325,6 +325,32 @@ pub(crate) fn request_timer_wake(deadline_ns: u64) {
     NEXT_TIMER_WAKE_NS.fetch_min(deadline_ns, Ordering::AcqRel);
 }
 
+/// Deliver *due* events to parked futures during a hot stretch (a runnable child or
+/// service is keeping the drive loop away from [`idle_wait`]): wake the parked input
+/// futures when console input has arrived (the edge) or a requested sleep deadline has
+/// expired — and only then.
+///
+/// This replaces the hot branch's old unconditional `wake_idle()`. The blanket wake
+/// was a self-sustaining spin: it rang every parked future's poll waker each pass, the
+/// next pass's rung flags then read as "runnable", so one hot pass made every later
+/// pass hot and the executor never slept again — under the station config drive-stats
+/// measured 27.8 M passes, all hot, zero `idle_wait` entries, i.e. 100% CPU at an idle
+/// prompt. Waking only on due events breaks the cycle while keeping the contract the
+/// old wake served: the console's `read-line` cannot go deaf while something spins,
+/// because input arrival itself raises the edge (IRQ drain, scavenger, injector).
+pub(crate) fn deliver_due_events() {
+    let now = crate::timer::uptime_ns();
+    let deadline_due = NEXT_TIMER_WAKE_NS.load(Ordering::Acquire) <= now;
+    if deadline_due {
+        // Consumed: woken sleepers re-arm on their re-poll (and anything still in the
+        // future is re-requested then, exactly as after an `idle_wait` wake).
+        NEXT_TIMER_WAKE_NS.store(u64::MAX, Ordering::Release);
+    }
+    if deadline_due || crate::rxring::input_edge_pending() {
+        wake_idle();
+    }
+}
+
 /// Where parked host-import futures ([`providers`]' `read-line`/`time.sleep`) leave the
 /// wakers they want woken. [`wake_idle`] drains and wakes **all** of them after each
 /// `wfi`, so wasmtime re-polls every parked future on the next loop. This must hold
@@ -590,17 +616,23 @@ pub(crate) fn idle_wait() -> WakeKind {
         WakeKind::Deadline => drive_stats::WAKE_DEADLINE.fetch_add(1, Ordering::Relaxed),
         WakeKind::Backstop => drive_stats::WAKE_BACKSTOP.fetch_add(1, Ordering::Relaxed),
     };
+    // Detector probes (SPEC: actionable work a wake discovers that no event delivered is
+    // a high-priority bug). The runnable-child probe lives in the drive loops (shell.rs),
+    // which see the next pass's `any_runnable`; the park gate above covers post-check-in
+    // rungs.
+    //
+    // Scavenged bytes are a finding on EVERY wake kind, not just maintenance-rated ones
+    // (area/35 timer-crutch audit): the RX interrupt owed those bytes a delivery whatever
+    // else woke the core — rating the report by wake kind made an Event- or Deadline-
+    // rated rescue silent, exactly the rescuer shape the doctrine forbids.
+    if scavenged > 0 {
+        liveness_finding(
+            "stranded input: an idle wake scavenged receive bytes the interrupt path \
+             missed (possible benign race only within the same microsecond)",
+            &LIVENESS_STRANDED_INPUT,
+        );
+    }
     if kind == WakeKind::Backstop {
-        // Detector probes (SPEC: every backstop firing that discovers actionable work no
-        // event delivered is a high-priority bug). The runnable-child probe lives in the
-        // drive loops (shell.rs), which see the next pass's `any_runnable`.
-        if scavenged > 0 {
-            liveness_finding(
-                "stranded input: the idle backstop scavenged receive bytes the interrupt \
-                 path missed (possible benign race only within the same microsecond)",
-                &LIVENESS_STRANDED_INPUT,
-            );
-        }
         let pending = crate::pci::intx_pending_total();
         if pending > 0 {
             liveness_finding(

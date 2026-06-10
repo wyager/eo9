@@ -263,6 +263,9 @@ def main():
 
         proc.stdin.write(b"poweroff\r")
         proc.stdin.flush()
+        # Capture the shutdown tail (drive-stats dumps, liveness findings, the init
+        # outcome) before the process exits.
+        drain_for(proc, 10.0, transcript)
         try:
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:

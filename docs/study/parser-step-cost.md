@@ -225,6 +225,23 @@ keys drop to ~3 ms/char in bursts while name-position keys stay ~46 ms isolated 
 in bursts — and the residue's active hypothesis lane is `area/34-fuel-yield-latency`
 (H1: fuel-yield quantization riding the kbd service's poll timer).*
 
+*area/34 verdict (2026-06-09): **H1 refuted.** The station topology reproduced under
+QEMU (echolat.py `--config station`) shows station == plain at ~0.1 ms/tracked-key
+(HVF) / ~1.5 ms (TCG), and drive-stats instrumentation proves fuel yields ring the
+poll waker and the loop re-polls hot — tracked keys cross ~30–50 fuel quanta with the
+executor never sleeping mid-keystroke (pre-fix it never slept at all: the hot branch's
+blanket wake re-rang every parked future, a 100% spin drive-stats caught and the lane
+fixed). Fuel burn is deterministic, so the board crosses the same quanta: ~46 ms ≈
+30–50 passes × **~1 ms+/pass on the A76 vs 6.5 µs/pass HVF** — the residue is now
+"per-drive-pass cost ≈ 1 ms on the board", a ~150–200× execution anomaly per §5's
+categorical row, NOT a wake/cadence artifact. Corroborating fact 1 above (one latency
+across work mixes) is bench-era data superseded by the burst result; fact 3's
+intercept analysis stands. The §5 probe ladder remains the board lane's
+discriminator, now joined by the `drive-stats` image
+(`EO9_KERNEL_FEATURES_EXTRA=drive-stats`): one board boot prints passes/s and the
+rung/wake histogram, splitting per-pass machinery (fiber resume, store traversal)
+from raw guest-execution slowness (the memory-attribute check above).*
+
 ## 6. Mitigation ladder, sized by the data
 
 Ordered by measured leverage per unit of risk. (a) and the word-end fix attack the
