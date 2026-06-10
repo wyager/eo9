@@ -433,6 +433,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("check-dhcp", rest)?;
             check_dhcp(&root)
         }
+        "check-x0" => {
+            expect_no_args("check-x0", rest)?;
+            check_x0(&root)
+        }
         "check-kexec" => {
             expect_no_args("check-kexec", rest)?;
             check_kexec(&root)
@@ -605,6 +609,14 @@ COMMANDS:
                          serial console and still resolve, and
                          `telnetd --sessions 1 --address dhcp` must serve a session over
                          the host-forward exactly like the static path
+    check-x0             Boot the aarch64 kernel under QEMU with the `x0matrix` token and
+                         replay the junk-x0 boot shapes through the shared FDT validation
+                         choke point (x0 = 0 kexec / 1, 2 U-Boot go argc / 8 aligned junk /
+                         an unaligned pointer / DRAM garbage / an insane totalsize / a
+                         truncated FDT): every case must come back bounded with the
+                         absent-x0 recovery and the loud rejection line, and the boot must
+                         still reach the eosh prompt — the QEMU twin of the board's USB
+                         `go` entry (whose junk x0 once hung boot into the watchdog loop)
     check-kexec          Boot the aarch64 kernel with the `kexec` grant and a slirp
                          host-forward (derived host port) to oskexec's :9909, build a
                          second, banner-stamped kernel, flash it over TCP with
@@ -5595,6 +5607,81 @@ const KEXEC_SECRET: &str = "check-kexec-preshared-secret";
 const KEXEC_B_STAMP: &str = "kexec-B";
 
 /// Boot kernel A, flash kernel B over TCP, assert B's banner on the same serial stream.
+// ----------------------------------------------------------------------------------------
+// check-x0: the junk-x0 boot matrix (the board's USB `go` entry, replayed under QEMU).
+// QEMU's -kernel loader always passes a valid DTB in x0, so the field failure shapes are
+// driven in-kernel (the `x0matrix` boot token, kernel src/fdt.rs x0_matrix_selftest): the
+// SAME fdt::validate choke point the board boots through is fed x0 = 0 (the kexec jump),
+// 1/2 (U-Boot go's argc — the value that hung USB-boot round A1 into the watchdog loop),
+// 8 (an aligned small integer), an unaligned pointer, aligned DRAM garbage, a valid-magic
+// header declaring an insane totalsize, and a truncated FDT. Every case must come back
+// bounded (no hang — the serial waits below are the alarm) with exactly the absent-x0
+// recovery (on QEMU: the RAM-base DTB probe, i.e. the live cmdline), the loud rejection
+// line must be on the wire, and the boot must still reach the eosh prompt.
+// ----------------------------------------------------------------------------------------
+fn check_x0(root: &Path) -> Result<(), String> {
+    let image = build_kernel(root, "aarch64")?;
+    println!(
+        "xtask: check-x0 — booting {} with the `x0matrix` token (the in-kernel junk-x0 \
+         matrix over the shared fdt validation choke point)",
+        image.display()
+    );
+    let (mut child, mut stdin, receiver) =
+        spawn_net_qemu("check-x0", root, &image, "x0matrix", "user,id=eo9net")?;
+    let wait_for = |marker: &str, what: &str| serial_wait_for("check-x0", &receiver, marker, what);
+
+    let drive = (|| -> Result<(), String> {
+        // The live x0 parse (QEMU's real DTB) must win untouched — the serial path's
+        // valid-FDT behavior is unchanged by the hardening.
+        wait_for("cmdline: x0matrix", "the live x0 cmdline (QEMU's real DTB)")?;
+        // The canonical absent-x0 recovery must equal the live cmdline (the RAM-base
+        // DTB probe is the QEMU fallback) — junk x0 loses nothing on this machine.
+        wait_for(
+            "absent-x0 recovery Some(\"x0matrix\")",
+            "the absent-x0 recovery equalling the live cmdline",
+        )?;
+        // At least one loud rejection line (each rejected case prints its own).
+        wait_for("is not an FDT", "the loud absent-FDT rejection line")?;
+        // The verdict — and the accumulated transcript must carry every case by name.
+        let transcript = wait_for("fdt-x0-matrix: PASS (8 cases)", "the matrix verdict")?;
+        for case in [
+            "null-kexec",
+            "go-argc-1",
+            "go-argc-2",
+            "aligned-low-8",
+            "unaligned-junk",
+            "dram-garbage",
+            "insane-totalsize",
+            "corrupt-fdt",
+        ] {
+            if !transcript.contains(&format!("fdt-x0-matrix: case {case} ")) {
+                return Err(format!(
+                    "check-x0: case {case} is missing from the matrix transcript \
+                     (last output: …{})",
+                    &transcript[transcript.len().saturating_sub(600)..]
+                ));
+            }
+        }
+        // The boot must survive the whole matrix and still hand over a live console.
+        wait_for("eosh>", "the eosh prompt after the matrix")?;
+        console_type_line("check-x0", &mut stdin, "exit")?;
+        Ok(())
+    })();
+    if let Err(err) = drive {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    let _ = child.wait();
+
+    println!(
+        "xtask: check-x0 ok — all 8 junk-x0 shapes were rejected/contained by the shared \
+         fdt choke point, each recovered the live cmdline via the RAM-base DTB fallback \
+         with the loud absent-FDT line, and the boot reached the eosh prompt"
+    );
+    Ok(())
+}
+
 fn check_kexec(root: &Path) -> Result<(), String> {
     // Kernel A: the plain build, copied aside so kernel B's build (same cargo output
     // path) cannot replace it underneath QEMU.
