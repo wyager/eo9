@@ -877,6 +877,56 @@ pub fn drive_services() -> DriveStatus {
     status
 }
 
+/// Poll ONE service's drive future once, with the checkout discipline (the gate's
+/// synchronous owner pump: the three sync l4 address getters cannot park, so their
+/// shims nested-poll the owner from inside the child's host call — the F4/fibercompile
+/// nested-entry shape, guarded by the `Polling` sentinel exactly as the compile pump
+/// is). Refuses (never blocks, never re-enters) when the owner is checked out up-stack.
+pub(super) fn poll_service_once(index: usize) -> core::result::Result<(), String> {
+    let taken = SERVICES.with(|services| {
+        match services.get_mut(index).and_then(Option::as_mut) {
+            Some(service) => match &mut service.run {
+                SRun::Running(_) => match core::mem::replace(&mut service.run, SRun::Polling) {
+                    SRun::Running(drive) => Ok(drive),
+                    _ => unreachable!("checked-out service was not running"),
+                },
+                // Inside the owner's own poll chain: nested entry would re-enter a
+                // store already mutably borrowed up-stack — forbidden (§3.3).
+                SRun::Polling => Err("the share owner is checked out (nested entry refused)"
+                    .to_string()),
+                _ => Err("the share owner is not running".to_string()),
+            },
+            None => Err("the share owner is gone".to_string()),
+        }
+    });
+    let mut drive = taken?;
+    let waker_state = Arc::new(RungWaker {
+        rung: AtomicBool::new(false),
+    });
+    let waker = Waker::from(waker_state);
+    let mut cx = Context::from_waker(&waker);
+    let polled = drive.as_mut().poll(&mut cx);
+    let completed = SERVICES.with(|services| {
+        let service = services.get_mut(index).and_then(Option::as_mut)?;
+        match &service.run {
+            SRun::Polling => match polled {
+                Poll::Ready(outcome) => Some(outcome),
+                Poll::Pending => {
+                    service.run = SRun::Running(drive);
+                    None
+                }
+            },
+            // Stopped while we were polling: keep that state; dropping the checked-out
+            // future here releases the owner's store.
+            _ => None,
+        }
+    });
+    if let Some(outcome) = completed {
+        complete_run(index, outcome);
+    }
+    Ok(())
+}
+
 /// A run completed: record it, consult the policy (unless killed), act.
 fn complete_run(index: usize, outcome: KOutcome) {
     let class = OutcomeClass::of(&outcome);

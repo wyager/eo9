@@ -1057,7 +1057,14 @@ fn spawn_child(
     let internal = |err: wasmtime::Error| {
         let text = format!("{err:?}");
         WitSpawnError::Internal(match missing_capability(&text) {
-            Some(friendly) => friendly,
+            Some(friendly) => {
+                // Keep the raw refusal visible on the serial log: the friendly story
+                // covers the common case, but a *linker-shape* mismatch (a host shim
+                // disagreeing with the component's expected type) tells its real story
+                // only here.
+                crate::kprintln!("spawn: instantiation refused: {text}");
+                friendly
+            }
             None => text,
         })
     };

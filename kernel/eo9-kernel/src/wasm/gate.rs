@@ -136,7 +136,11 @@ pub(super) struct WitRecvResult {
 
 /// The owner-task-ended severance error, exactly the vocabulary §6 prescribes.
 fn severed_error(reason: &str) -> WitL4Error {
-    WitL4Error::Io(format!("provider task ended: {reason}"))
+    WitL4Error::Io(severed_text(reason))
+}
+
+fn severed_text(reason: &str) -> String {
+    format!("provider task ended: {reason}")
 }
 
 // -----------------------------------------------------------------------------------------
@@ -642,6 +646,40 @@ fn submit(share_id: usize, grant: u32, op: GateOp) -> core::result::Result<Arc<G
     Ok(call)
 }
 
+/// Synchronously pump the owner until `call` completes (the sync-getter path: the WIT
+/// declares `listener-address`/`peer-address`/`udp-address` as plain funcs, so their
+/// host shims cannot park — wasmtime refuses a concurrent shim for a sync import with
+/// "type mismatch with async"). One checkout-disciplined poll of the owner's drive
+/// future per iteration (svc::poll_service_once — the F4 nested-entry shape); the
+/// getters are pure metadata reads inside the owner, so completion is prompt. Bounded:
+/// a wedged owner fails the call typed instead of hanging the child.
+fn pump_owner_until(
+    share_id: usize,
+    call: &Arc<GateCall>,
+) -> core::result::Result<GateDone, WitL4Error> {
+    const MAX_POLLS: u32 = 100_000;
+    for _ in 0..MAX_POLLS {
+        let state = call.inner.with(|inner| match &mut inner.state {
+            CallState::Done(done) => Some(match done.take() {
+                Some(done) => Ok(done),
+                None => Err(severed_error("result already consumed")),
+            }),
+            CallState::Severed(reason) => Some(Err(severed_error(reason))),
+            CallState::Enqueued | CallState::InFlight => None,
+        });
+        if let Some(result) = state {
+            return result;
+        }
+        let service = SHARES
+            .with(|shares| shares.get(share_id).and_then(|share| share.service))
+            .ok_or_else(|| severed_error("the owner is gone"))?;
+        super::svc::poll_service_once(service).map_err(|reason| severed_error(&reason))?;
+    }
+    Err(WitL4Error::Io(
+        "the owner did not answer a synchronous getter within the pump bound".to_string(),
+    ))
+}
+
 // -----------------------------------------------------------------------------------------
 // Boot-config clauses: `share <interface> [lock=instance]` and `use l4=<share>`
 // -----------------------------------------------------------------------------------------
@@ -697,7 +735,12 @@ pub fn parse_boot_config(config: &str) -> String {
                 end += 1;
             }
             let _ = lock;
-            match interface {
+            // Accept the unversioned spelling too (`share eo9:net/l4`) — the config
+            // names an API, the registry pins the version.
+            let normalized = interface.as_deref().map(|i| {
+                if i == "eo9:net/l4" { L4_INTERFACE.to_string() } else { i.to_string() }
+            });
+            match normalized {
                 Some(interface) if interface == L4_INTERFACE => {
                     SHARES.with(|shares| {
                         shares.push(Share {
@@ -1325,6 +1368,30 @@ fn child_buffer_restore(
     Resource::new_own(rep)
 }
 
+/// The sync-getter path: enqueue, then pump the owner synchronously (these WIT funcs
+/// are not async, so the shim cannot park).
+fn sync_gate_addr(
+    store: &StoreContextMut<'_, KernelState>,
+    op: GateOp,
+    what: &str,
+) -> Result<(WitSocketAddress,)> {
+    let (share, grant) = store
+        .data()
+        .gate
+        .as_ref()
+        .map(|handle| (handle.share, handle.grant))
+        .ok_or_else(no_grant_refusal)?;
+    let call =
+        submit(share, grant, op).map_err(|reason| wasmtime::Error::msg(severed_text(&reason)))?;
+    match pump_owner_until(share, &call) {
+        Ok(GateDone::Addr(addr)) => Ok((addr,)),
+        Ok(_) => Err(wasmtime::Error::msg("malformed gate payload")),
+        Err(error) => Err(wasmtime::Error::msg(format!(
+            "{what} failed through the gate: {error:?}"
+        ))),
+    }
+}
+
 /// Register the typed `eo9:net/l4` gate shims (design §3.1: registered unconditionally
 /// in the spawn linker — collision-free because the kernel links no root provider for
 /// `eo9:net/*`; a store with no grant answers the capability refusal).
@@ -1432,43 +1499,32 @@ pub fn add_l4_gate(linker: &mut Linker<KernelState>) -> Result<()> {
         },
     )?;
 
-    // The address getters are sync in the WIT; the host side still goes through the
-    // queue as a concurrent shim (stackful async lets a sync-lowered guest import wait
-    // on a pending host future). Pure metadata reads inside the owner — one queue round
-    // trip, no parking beyond it.
-    l4.func_wrap_concurrent(
+    // The address getters are sync in the WIT, so their shims are sync `func_wrap`s
+    // (a concurrent shim for a sync import is refused at link time — "type mismatch
+    // with async"). A sync host call cannot park, so these enqueue and then PUMP the
+    // owner synchronously (one checkout-disciplined poll per iteration — the
+    // F4/fibercompile nested-entry shape). Pure metadata reads; prompt completion.
+    l4.func_wrap(
         "listener-address",
-        |accessor: &Accessor<KernelState>,
+        |store: StoreContextMut<'_, KernelState>,
          (listener,): (Resource<GateListenerRes>,)|
-         -> ConcurrentFuture<'_, (WitSocketAddress,)> {
-            let listener = listener.rep();
-            Box::pin(async move {
-                match gate_call(accessor, GateOp::ListenerAddress { listener }).await {
-                    Ok(GateDone::Addr(addr)) => Ok((addr,)),
-                    Ok(_) => Err(wasmtime::Error::msg("malformed gate payload")),
-                    Err(error) => Err(wasmtime::Error::msg(format!(
-                        "listener-address failed through the gate: {error:?}"
-                    ))),
-                }
-            })
+         -> Result<(WitSocketAddress,)> {
+            sync_gate_addr(
+                &store,
+                GateOp::ListenerAddress {
+                    listener: listener.rep(),
+                },
+                "listener-address",
+            )
         },
     )?;
 
-    l4.func_wrap_concurrent(
+    l4.func_wrap(
         "peer-address",
-        |accessor: &Accessor<KernelState>,
+        |store: StoreContextMut<'_, KernelState>,
          (conn,): (Resource<GateConnRes>,)|
-         -> ConcurrentFuture<'_, (WitSocketAddress,)> {
-            let conn = conn.rep();
-            Box::pin(async move {
-                match gate_call(accessor, GateOp::PeerAddress { conn }).await {
-                    Ok(GateDone::Addr(addr)) => Ok((addr,)),
-                    Ok(_) => Err(wasmtime::Error::msg("malformed gate payload")),
-                    Err(error) => Err(wasmtime::Error::msg(format!(
-                        "peer-address failed through the gate: {error:?}"
-                    ))),
-                }
-            })
+         -> Result<(WitSocketAddress,)> {
+            sync_gate_addr(&store, GateOp::PeerAddress { conn: conn.rep() }, "peer-address")
         },
     )?;
 
@@ -1557,21 +1613,18 @@ pub fn add_l4_gate(linker: &mut Linker<KernelState>) -> Result<()> {
         },
     )?;
 
-    l4.func_wrap_concurrent(
+    l4.func_wrap(
         "udp-address",
-        |accessor: &Accessor<KernelState>,
+        |store: StoreContextMut<'_, KernelState>,
          (socket,): (Resource<GateUdpRes>,)|
-         -> ConcurrentFuture<'_, (WitSocketAddress,)> {
-            let socket = socket.rep();
-            Box::pin(async move {
-                match gate_call(accessor, GateOp::UdpAddress { socket }).await {
-                    Ok(GateDone::Addr(addr)) => Ok((addr,)),
-                    Ok(_) => Err(wasmtime::Error::msg("malformed gate payload")),
-                    Err(error) => Err(wasmtime::Error::msg(format!(
-                        "udp-address failed through the gate: {error:?}"
-                    ))),
-                }
-            })
+         -> Result<(WitSocketAddress,)> {
+            sync_gate_addr(
+                &store,
+                GateOp::UdpAddress {
+                    socket: socket.rep(),
+                },
+                "udp-address",
+            )
         },
     )?;
 
