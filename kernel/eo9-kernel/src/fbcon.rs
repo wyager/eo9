@@ -461,9 +461,7 @@ impl Grid {
             Esc::Csi => match byte {
                 b'0'..=b'9' => {
                     let slot = &mut self.csi.params[self.csi.n];
-                    *slot = slot
-                        .saturating_mul(10)
-                        .saturating_add((byte - b'0') as u16);
+                    *slot = slot.saturating_mul(10).saturating_add((byte - b'0') as u16);
                     self.csi.any = true;
                     return;
                 }
@@ -566,7 +564,11 @@ impl Grid {
 /// producer drops (counted, surfaced — never silent).
 #[cfg(any(
     test,
-    all(target_os = "none", target_arch = "aarch64", feature = "board-opi5plus")
+    all(
+        target_os = "none",
+        target_arch = "aarch64",
+        feature = "board-opi5plus"
+    )
 ))]
 mod ring {
     use core::cell::UnsafeCell;
@@ -625,7 +627,8 @@ mod ring {
             // producer (head moved past it with release ordering, observed by the
             // acquire load above).
             let byte = unsafe { (*self.buf.get())[tail] };
-            self.tail.store((tail + 1) % TEE_RING_CAP, Ordering::Release);
+            self.tail
+                .store((tail + 1) % TEE_RING_CAP, Ordering::Release);
             Some(byte)
         }
 
@@ -1150,7 +1153,10 @@ mod tests {
         for py in 0..CELL_H {
             let from = py * gfxfb::STRIDE + 3 * CELL_ROW_BYTES;
             let to = (py + 1) * gfxfb::STRIDE;
-            assert!(fb.0[from..to].iter().all(|&b| b == 0), "row {py} not erased");
+            assert!(
+                fb.0[from..to].iter().all(|&b| b == 0),
+                "row {py} not erased"
+            );
         }
         // An explicit mode 0 behaves identically.
         let (_, explicit) = render("abcdef\rxy\u{1b}[0K");
@@ -1173,8 +1179,9 @@ mod tests {
     /// something emits one, implement it; never let it leak glyphs or move the cursor).
     #[test]
     fn unimplemented_csi_sequences_are_consumed_without_effect() {
-        let (grid, fb) =
-            render("ab\u{1b}[1K\u{1b}[2K\u{1b}[5G\u{1b}[2J\u{1b}[99999m\u{1b}[1;2;3;4;5m\u{1b}[?25lc");
+        let (grid, fb) = render(
+            "ab\u{1b}[1K\u{1b}[2K\u{1b}[5G\u{1b}[2J\u{1b}[99999m\u{1b}[1;2;3;4;5m\u{1b}[?25lc",
+        );
         let (plain_grid, plain_fb) = render("abc");
         assert_eq!(grid.text[..], plain_grid.text[..]);
         assert_eq!((grid.row, grid.col), (plain_grid.row, plain_grid.col));
@@ -1203,7 +1210,10 @@ mod tests {
         // The recalled entry echoes.
         feed_str(&mut grid, &mut fb, "curl q");
         let (_, fresh) = render("eosh> curl q");
-        assert_eq!(fb.0, fresh.0, "recall repaint must render like a fresh line");
+        assert_eq!(
+            fb.0, fresh.0,
+            "recall repaint must render like a fresh line"
+        );
         assert_matches_redraw(&grid, &fb);
     }
 
