@@ -346,10 +346,7 @@ pub(crate) fn deliver_due_events() {
         // future is re-requested then, exactly as after an `idle_wait` wake).
         NEXT_TIMER_WAKE_NS.store(u64::MAX, Ordering::Release);
     }
-    if deadline_due
-        || crate::rxring::input_edge_pending()
-        || crate::pci::intx_edge_pending()
-    {
+    if deadline_due || crate::rxring::input_edge_pending() || crate::pci::intx_edge_pending() {
         wake_idle();
     }
 }
