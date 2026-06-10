@@ -266,17 +266,44 @@ fn val_to_l4_error(value: &Val) -> WitL4Error {
 /// Buffer payloads ride as moved bytes ([`BufferTable::take`] on the child side,
 /// `insert` on the owner side — an entry move, not a copy).
 pub(super) enum GateOp {
-    Connect { remote: WitSocketAddress },
-    Listen { local: WitSocketAddress },
-    Accept { listener: u32 },
-    ListenerAddress { listener: u32 },
-    PeerAddress { conn: u32 },
-    Send { conn: u32, bytes: Vec<u8> },
-    Recv { conn: u32, bytes: Vec<u8> },
-    BindUdp { local: WitSocketAddress },
-    UdpAddress { socket: u32 },
-    SendTo { socket: u32, remote: WitSocketAddress, bytes: Vec<u8> },
-    RecvFrom { socket: u32, bytes: Vec<u8> },
+    Connect {
+        remote: WitSocketAddress,
+    },
+    Listen {
+        local: WitSocketAddress,
+    },
+    Accept {
+        listener: u32,
+    },
+    ListenerAddress {
+        listener: u32,
+    },
+    PeerAddress {
+        conn: u32,
+    },
+    Send {
+        conn: u32,
+        bytes: Vec<u8>,
+    },
+    Recv {
+        conn: u32,
+        bytes: Vec<u8>,
+    },
+    BindUdp {
+        local: WitSocketAddress,
+    },
+    UdpAddress {
+        socket: u32,
+    },
+    SendTo {
+        socket: u32,
+        remote: WitSocketAddress,
+        bytes: Vec<u8>,
+    },
+    RecvFrom {
+        socket: u32,
+        bytes: Vec<u8>,
+    },
 }
 
 /// A completed gate call's typed payload, kernel-plain (no store pointers — §3.2:
@@ -485,9 +512,11 @@ pub(super) fn wire_owner(share_id: usize, service: usize) {
 /// plain data, never store pointers, so no use-after-free is reachable once severance
 /// precedes the store drop.
 pub(super) fn on_owner_run_ended(service: usize, reason: &str) {
-    let Some(share_id) =
-        SHARES.with(|shares| shares.iter().position(|share| share.service == Some(service)))
-    else {
+    let Some(share_id) = SHARES.with(|shares| {
+        shares
+            .iter()
+            .position(|share| share.service == Some(service))
+    }) else {
         return;
     };
     let (calls, tasks) = SHARES.with(|shares| {
@@ -738,7 +767,11 @@ pub fn parse_boot_config(config: &str) -> String {
             // Accept the unversioned spelling too (`share eo9:net/l4`) — the config
             // names an API, the registry pins the version.
             let normalized = interface.as_deref().map(|i| {
-                if i == "eo9:net/l4" { L4_INTERFACE.to_string() } else { i.to_string() }
+                if i == "eo9:net/l4" {
+                    L4_INTERFACE.to_string()
+                } else {
+                    i.to_string()
+                }
             });
             match normalized {
                 Some(interface) if interface == L4_INTERFACE => {
@@ -775,8 +808,7 @@ pub fn parse_boot_config(config: &str) -> String {
                 match edge.split_once('=') {
                     Some(("l4", share_name)) => {
                         CONSOLE_USE.with(|console_use| {
-                            *console_use =
-                                Some(("l4".to_string(), share_name.to_string()));
+                            *console_use = Some(("l4".to_string(), share_name.to_string()));
                         });
                         crate::kprintln!(
                             "gate: console children's eo9:net/l4 imports route to `{share_name}`"
@@ -1245,11 +1277,7 @@ fn build_call_future<'a>(
 /// wasmtime permits starting calls — and (b) polls the in-flight calls alongside
 /// whatever else the store is running. It never completes; the owner's run ends by
 /// being dropped (kill/stop), and severance is the registry's job, not this future's.
-pub(super) async fn intake(
-    accessor: &Accessor<KernelState>,
-    share_id: usize,
-    funcs: OwnerFuncs,
-) {
+pub(super) async fn intake(accessor: &Accessor<KernelState>, share_id: usize, funcs: OwnerFuncs) {
     let mut in_flight: Vec<(Arc<GateCall>, CallFut<'_>)> = Vec::new();
     core::future::poll_fn(move |cx| {
         // Drain the queue (FIFO — the v1 instance-domain admission order), registering
@@ -1465,7 +1493,10 @@ pub fn add_l4_gate(linker: &mut Linker<KernelState>) -> Result<()> {
         "listen",
         |accessor: &Accessor<KernelState>,
          (_l4, local): (Resource<GateL4Res>, WitSocketAddress)|
-         -> ConcurrentFuture<'_, (core::result::Result<Resource<GateListenerRes>, WitL4Error>,)> {
+         -> ConcurrentFuture<
+            '_,
+            (core::result::Result<Resource<GateListenerRes>, WitL4Error>,),
+        > {
             Box::pin(async move {
                 Ok((match gate_call(accessor, GateOp::Listen { local }).await {
                     Ok(GateDone::Handle(Ok(rep))) => Ok(Resource::new_own(rep)),
@@ -1483,18 +1514,20 @@ pub fn add_l4_gate(linker: &mut Linker<KernelState>) -> Result<()> {
          (listener,): (Resource<GateListenerRes>,)|
          -> ConcurrentFuture<
             '_,
-            (
-                core::result::Result<(Resource<GateConnRes>, WitSocketAddress), WitL4Error>,
-            ),
+            (core::result::Result<(Resource<GateConnRes>, WitSocketAddress), WitL4Error>,),
         > {
             let listener = listener.rep();
             Box::pin(async move {
-                Ok((match gate_call(accessor, GateOp::Accept { listener }).await {
-                    Ok(GateDone::Accepted(Ok((rep, peer)))) => Ok((Resource::new_own(rep), peer)),
-                    Ok(GateDone::Accepted(Err(error))) => Err(error),
-                    Ok(_) => Err(WitL4Error::Io("malformed gate payload".to_string())),
-                    Err(error) => Err(error),
-                },))
+                Ok((
+                    match gate_call(accessor, GateOp::Accept { listener }).await {
+                        Ok(GateDone::Accepted(Ok((rep, peer)))) => {
+                            Ok((Resource::new_own(rep), peer))
+                        }
+                        Ok(GateDone::Accepted(Err(error))) => Err(error),
+                        Ok(_) => Err(WitL4Error::Io("malformed gate payload".to_string())),
+                        Err(error) => Err(error),
+                    },
+                ))
             })
         },
     )?;
@@ -1524,7 +1557,11 @@ pub fn add_l4_gate(linker: &mut Linker<KernelState>) -> Result<()> {
         |store: StoreContextMut<'_, KernelState>,
          (conn,): (Resource<GateConnRes>,)|
          -> Result<(WitSocketAddress,)> {
-            sync_gate_addr(&store, GateOp::PeerAddress { conn: conn.rep() }, "peer-address")
+            sync_gate_addr(
+                &store,
+                GateOp::PeerAddress { conn: conn.rep() },
+                "peer-address",
+            )
         },
     )?;
 
@@ -1534,12 +1571,10 @@ pub fn add_l4_gate(linker: &mut Linker<KernelState>) -> Result<()> {
          (conn, src): (Resource<GateConnRes>, Resource<BufferRes>)|
          -> ConcurrentFuture<
             '_,
-            (
-                (
-                    Resource<BufferRes>,
-                    core::result::Result<WitSendResult, WitL4Error>,
-                ),
-            ),
+            ((
+                Resource<BufferRes>,
+                core::result::Result<WitSendResult, WitL4Error>,
+            ),),
         > {
             let conn = conn.rep();
             let src_rep = src.rep();
@@ -1568,12 +1603,10 @@ pub fn add_l4_gate(linker: &mut Linker<KernelState>) -> Result<()> {
          (conn, dst): (Resource<GateConnRes>, Resource<BufferRes>)|
          -> ConcurrentFuture<
             '_,
-            (
-                (
-                    Resource<BufferRes>,
-                    core::result::Result<WitRecvResult, WitL4Error>,
-                ),
-            ),
+            ((
+                Resource<BufferRes>,
+                core::result::Result<WitRecvResult, WitL4Error>,
+            ),),
         > {
             let conn = conn.rep();
             let dst_rep = dst.rep();
@@ -1634,12 +1667,10 @@ pub fn add_l4_gate(linker: &mut Linker<KernelState>) -> Result<()> {
          (socket, remote, src): (Resource<GateUdpRes>, WitSocketAddress, Resource<BufferRes>)|
          -> ConcurrentFuture<
             '_,
-            (
-                (
-                    Resource<BufferRes>,
-                    core::result::Result<WitSendResult, WitL4Error>,
-                ),
-            ),
+            ((
+                Resource<BufferRes>,
+                core::result::Result<WitSendResult, WitL4Error>,
+            ),),
         > {
             let socket = socket.rep();
             let src_rep = src.rep();
@@ -1676,12 +1707,10 @@ pub fn add_l4_gate(linker: &mut Linker<KernelState>) -> Result<()> {
          (socket, dst): (Resource<GateUdpRes>, Resource<BufferRes>)|
          -> ConcurrentFuture<
             '_,
-            (
-                (
-                    Resource<BufferRes>,
-                    core::result::Result<(WitRecvResult, WitSocketAddress), WitL4Error>,
-                ),
-            ),
+            ((
+                Resource<BufferRes>,
+                core::result::Result<(WitRecvResult, WitSocketAddress), WitL4Error>,
+            ),),
         > {
             let socket = socket.rep();
             let dst_rep = dst.rep();
@@ -1778,8 +1807,7 @@ fn try_r2(entries: &'static [super::store::StoreEntry]) -> Result<String> {
     )??;
 
     let lookup = |store: &mut wasmtime::Store<KernelState>, name: &str| {
-        exported_func(&instance, store, L4_INTERFACE, name)
-            .map_err(wasmtime::Error::msg)
+        exported_func(&instance, store, L4_INTERFACE, name).map_err(wasmtime::Error::msg)
     };
     let f_default = lookup(&mut store, "default")?;
     let f_listen = lookup(&mut store, "listen")?;
@@ -1799,7 +1827,8 @@ fn try_r2(entries: &'static [super::store::StoreEntry]) -> Result<String> {
         store.run_concurrent(async |accessor| -> Result<String> {
             let one_result = |func: Func, params: Vec<Val>| async move {
                 let mut results = vec![Val::Bool(false)];
-                func.call_concurrent(accessor, &params, &mut results).await?;
+                func.call_concurrent(accessor, &params, &mut results)
+                    .await?;
                 Ok::<Val, wasmtime::Error>(results.remove(0))
             };
             let unwrap_handle = |value: Val, what: &str| match value {
@@ -1841,14 +1870,8 @@ fn try_r2(entries: &'static [super::store::StoreEntry]) -> Result<String> {
                 "connect",
             )?;
             let _ = first;
-            let accept_fut = one_result(
-                f_accept,
-                vec![Val::Resource(listener)],
-            );
-            let connect_fut = one_result(
-                f_connect,
-                vec![Val::Resource(l4), addr_to_val(&addr)],
-            );
+            let accept_fut = one_result(f_accept, vec![Val::Resource(listener)]);
+            let connect_fut = one_result(f_connect, vec![Val::Resource(l4), addr_to_val(&addr)]);
             let (accepted, connected) = join2(accept_fut, connect_fut).await;
             let accepted = match accepted? {
                 Val::Result(Ok(Some(payload))) => match *payload {
@@ -1900,8 +1923,7 @@ fn try_r2(entries: &'static [super::store::StoreEntry]) -> Result<String> {
             };
             let dst = mint(vec![0u8; PAYLOAD.len()])?;
             let src = mint(PAYLOAD.to_vec())?;
-            let sent =
-                one_result(f_send, vec![Val::Resource(client), Val::Resource(src)]).await?;
+            let sent = one_result(f_send, vec![Val::Resource(client), Val::Resource(src)]).await?;
             let _ = sent;
             // `client` is the SECOND connection's client end; its server end is
             // `accepted2` (the backlog is FIFO: the joined accept took the first).
@@ -1915,8 +1937,7 @@ fn try_r2(entries: &'static [super::store::StoreEntry]) -> Result<String> {
                     let Val::Resource(any) = &pair[0] else {
                         return Err(wasmtime::Error::msg("recv returned a non-buffer"));
                     };
-                    let resource =
-                        Resource::<BufferRes>::try_from_resource_any(*any, &mut access)?;
+                    let resource = Resource::<BufferRes>::try_from_resource_any(*any, &mut access)?;
                     access.get().shell_buffers()?.take(resource.rep())
                 })?,
                 other => {
@@ -1961,7 +1982,10 @@ async fn join2<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
             out_b = Some(value);
         }
         if out_a.is_some() && out_b.is_some() {
-            Poll::Ready((out_a.take().expect("checked"), out_b.take().expect("checked")))
+            Poll::Ready((
+                out_a.take().expect("checked"),
+                out_b.take().expect("checked"),
+            ))
         } else {
             Poll::Pending
         }

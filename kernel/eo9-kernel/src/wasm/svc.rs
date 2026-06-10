@@ -577,9 +577,9 @@ fn spawn_service_run(
             // The intake never returns; reaching here means the store's event loop
             // failed (a trap inside a gated call's machinery, fuel poisoning, …).
             match result {
-                Ok(()) => KOutcome::Trapped(String::from(
-                    "the share owner's intake ended unexpectedly",
-                )),
+                Ok(()) => {
+                    KOutcome::Trapped(String::from("the share owner's intake ended unexpectedly"))
+                }
                 Err(err) => KOutcome::Trapped(format!("{err:?}")),
             }
         }));
@@ -892,8 +892,9 @@ pub(super) fn poll_service_once(index: usize) -> core::result::Result<(), String
                 },
                 // Inside the owner's own poll chain: nested entry would re-enter a
                 // store already mutably borrowed up-stack — forbidden (§3.3).
-                SRun::Polling => Err("the share owner is checked out (nested entry refused)"
-                    .to_string()),
+                SRun::Polling => {
+                    Err("the share owner is checked out (nested entry refused)".to_string())
+                }
                 _ => Err("the share owner is not running".to_string()),
             },
             None => Err("the share owner is gone".to_string()),

@@ -242,7 +242,10 @@ pub fn boot(bootargs: Option<&str>) -> bool {
         // token swaps in the baked demo config (a worker under restart.always and a
         // one-shot banner) to demonstrate the service registry.
         None => {
-            let config = if tokenize(bootargs).iter().any(|token| token == "station-net") {
+            let config = if tokenize(bootargs)
+                .iter()
+                .any(|token| token == "station-net")
+            {
                 STATION_NET_SERVICES_CONFIG
             } else if tokenize(bootargs).iter().any(|token| token == "gatedemo") {
                 GATE_DEMO_SERVICES_CONFIG
