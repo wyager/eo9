@@ -82,3 +82,101 @@ The surface is RGB888 already; only the LINK mangles chroma. So:
   `crc32 0x10000000 0x1000000` (cache-pressure eviction — U-Boot writes cacheable,
   VOP2 scans DRAM; the playbook §3 lesson applies to paints too).
 - VOP2 window dump: `md.l 0xfdd91800 0x40` (Esmart0; MST at +0x14).
+
+## The small-image fix: filling the negotiated timing (area/39 study, 2026-06-09)
+
+Bench bug: the HDMI picture is small — the console occupies only the center of the
+capture dongle's frame. Study only (no board access this lane); the planner runs the
+experiments below.
+
+### Diagnosis from the Round-0 readbacks
+
+The Esmart0 scaler is ALREADY engaged: ACT_INFO 0x01df031f (800×480 source) vs
+DSP_INFO 0x034805f0 (1521×841 on screen). So vendor U-Boot scales the logo window up,
+but its destination rectangle stops well short of the timing the dongle negotiated
+(1521×841 is neither 800×480's aspect nor any standard mode — it is whatever the
+vendor logo path computed that boot). The black frame around the console is simply
+the unfilled remainder of the video port's active area. Two readbacks pin the truth
+on the next bench session (VOP2 base 0xfdd90000, VP0 regs at +0xc00):
+
+- `md.l 0xfdd90c4c 1` / `md.l 0xfdd90c54 1` — VP0 DSP_HACT_ST_END / DSP_VACT_ST_END:
+  the negotiated timing's active start/end (end−start = active width/height).
+- `md.l 0xfdd91830 4` — Esmart0 REGION0_SCL_CTRL + SCL_FACTOR_YRGB as vendor left
+  them (which filter the logo path uses; we mimic).
+- `md.l 0xfdd90c28 1` — VP0 DSP_ST, and OVL_PORT_SEL at +0x608 if there is any doubt
+  that Esmart0 is on VP0.
+
+### The options, costed
+
+**(a) Make vendor U-Boot scan out a bigger surface (logo.bmp swap).** The vendor DRM
+logo path allocates the framebuffer at the BMP's own dimensions (that is where
+800×480 comes from — the shipped logo, not a mode choice; the env has no splashimage
+or size knobs per Round-0). Replacing logo.bmp on the boot medium with e.g. a
+1920×1080 BMP gives a full-size surface with no kernel register writes at all — but
+it invalidates every verified constant (base moves, 0x119400 → 0x5ef400 bytes, VIR,
+ACT, the locator gates), grows the U-Boot-heap framebuffer to ~6 MB, multiplies every
+fbcon repaint/scroll by ~5.4× device-write cost (the scroll repaint is already the
+long BUSY window), and re-opens the does-the-base-move question at the new size. A
+re-verification bench day plus geometry churn across gfxfb/fbcon. NOT recommended
+while (b) exists.
+
+**(b) RECOMMENDED — stretch the Esmart0 window over the full active area.** Keep the
+verified 800×480 RGB888 surface and every kernel constant untouched; reprogram only
+the window's destination rectangle and scale factors, exactly what the vendor logo
+path already does with smaller numbers. The scaler is luma-safe (bilinear on r=g=b
+stays r=g=b), Esmart scale-up tops out at 8× (mainline `max_upscale_factor = 8` —
+even 3840/800 = 4.8 fits), and the kernel keeps writing 384 KB frames while the
+hardware does the filling. Register-level sketch (offsets from mainline
+rockchip_vop2_reg.c / rockchip_drm_vop2.h; Esmart0 region0 base 0xfdd91800):
+
+```
+W = active width, H = active height        # from the VP0 readbacks above
+hfac = ceil((800-1)<<16 / (W-1)) - 1       # vop2_scale_factor(), scale-up shift 16
+vfac = ceil((480-1)<<16 / (H-1)) - 1
++0x24 DSP_INFO        = (H-1)<<16 | (W-1)
++0x28 DSP_ST          = 0                   # or center if aspect-preserving (below)
++0x30 SCL_CTRL        = hor_scl_mode[1:0]=1 (up) | hscl_filter[3:2]=1 (bilinear)
+                      | ver_scl_mode[5:4]=1 (up) | vscl_filter[7:6]=1 (bilinear)
+                        (verify against the vendor readback; mimic its filter)
++0x34 SCL_FACTOR_YRGB = vfac<<16 | hfac
+then strobe the shadow-register commit:
+0xfdd90000 REG_CFG_DONE = BIT(15) | BIT(vp_id) | BIT(vp_id)<<16
+                        # GLB_CFG_DONE_EN + per-VP done; high half is the
+                        # write-enable mask convention — confirm by readback
+```
+
+Worked example if the timing turns out 1920×1080: DSP_INFO = 0x0437077f, hfac =
+0x6a96, vfac = 0x71a5, SCL_FACTOR_YRGB = 0x71a56a96.
+
+Aspect: 800×480 is 5:3; a 16:9 timing stretched full-frame distorts ~11% — for a
+text console that is fine and maximizes glyph size (recommended default). The
+aspect-preserving alternative is height-fill (dst H×(H·5/3), DSP_ST centering the
+pillarbox), one extra line of arithmetic — owner's call on the bench day.
+
+Experiment plan (planner, one session, all from the U-Boot prompt before any kernel
+code): read the VP0 timing, compute the four values, `mw.l` them, strobe CFG_DONE,
+confirm the logo fills the frame on the capture stick. Risks are all visible-and-
+recoverable: a wrong CFG_DONE mask simply never latches (logo stays small), a wrong
+factor renders a stretched/garbled logo until the next power cycle. No CRU, no
+mode-set, no irreversible state. Once proven, the kernel leg is a small `fbscale`
+boot-token step in fbcon/gfx activation (~40 lines: VP readback, factor math, five
+MMIO writes, evidence line) — gated like every scanout-touching leg on the locate
+checks, and refusing (serial-only, small picture) on any unexpected readback.
+
+**(c) Proper mode-set (own the timing).** Unchanged from the top of this doc: the
+dw-hdmi-qp + HDPTX + VOP2 bring-up lane (~1.5-2.5k lines, multiple bench sessions).
+Still the only path that controls WHICH timing is negotiated (e.g. forcing 1080p over
+the dongle's 4K preference to cut scan bandwidth) and the eventual home of the
+colorspace/InfoFrame fix. Stays deferred; (b) does not prejudice it — everything (b)
+programs is window-local and gets rewritten by any future mode-set anyway.
+
+### Coordination notes
+
+- area/40 (eosh wrap-aware repaint): fbcon now renders CSI K (EL mode 0, erase to
+  end of line) and SGR 31/0 — the repaint primitives the editor lane may emit. CSI G
+  / cursor-column moves are still consumed-and-ignored: the 2026-06-09 census found
+  no emitter; if the editor starts emitting them, implement them in fbcon's subset
+  (kernel/eo9-kernel/src/fbcon.rs `csi_dispatch`) rather than letting them strip.
+- The fbcon scroll repaint is the long render window feeding the new tee-ring
+  backlog; (b) does not change its cost (the surface stays 800×480). Option (a)
+  would have multiplied it — one more reason (b) wins for the console use case.
