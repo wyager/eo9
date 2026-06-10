@@ -103,8 +103,9 @@ on the next bench session (VOP2 base 0xfdd90000, VP0 regs at +0xc00):
   the negotiated timing's active start/end (end−start = active width/height).
 - `md.l 0xfdd91830 4` — Esmart0 REGION0_SCL_CTRL + SCL_FACTOR_YRGB as vendor left
   them (which filter the logo path uses; we mimic).
-- `md.l 0xfdd90c28 1` — VP0 DSP_ST, and OVL_PORT_SEL at +0x608 if there is any doubt
-  that Esmart0 is on VP0.
+- `md.l 0xfdd90c34 2` — VP0 POST_DSP_HACT_INFO / POST_DSP_VACT_INFO (the port's
+  post-scaler placement), and OVL_PORT_SEL at +0x608 if there is any doubt that
+  Esmart0 is on VP0.
 
 ### The options, costed
 
