@@ -377,3 +377,11 @@ Critical path: L1 → L2 → L5 → L6 → R1–R4 ≈ **5–7 dev days + 3–4 
    double-build is the failure mode this sentence exists to prevent.
 6. **Planning session was read-only** except this document; no serial port touched;
    the one external action was the local QEMU smoke test in /tmp.
+
+## R0 status: PROVEN (bench, 2026-06-09 night — before this plan merged)
+
+The USB-boot round A1 ran with the stick in USB2-A #2 (mouse omitted, keyboard in
+#1 — exactly this plan's required layout): the vendor distro chain scanned usb,
+found the stick, sourced /boot.scr, and loaded BOOTARGS.TXT + EO9.IMG at 25.9 MiB/s.
+(The kernel then hit the junk-x0 hang — area/43's lane — but that is past every
+U-Boot leg R0 gates on.) All further lanes are unblocked; workaround 3 is retired.
