@@ -640,7 +640,11 @@ impl Driver {
             // `wait-recv` is parked on it, and is deasserted by the ISR read the
             // consuming paths perform. The transmit ring stays suppressed — its
             // completions are consumed by `send`'s inline poll.
-            pci::dma_write(&self.rings, RX_RING_BASE + AVAIL_OFFSET, &0u16.to_le_bytes());
+            pci::dma_write(
+                &self.rings,
+                RX_RING_BASE + AVAIL_OFFSET,
+                &0u16.to_le_bytes(),
+            );
         }
 
         // Hand the device its receive buffers and open the doorbell once.
@@ -1054,7 +1058,9 @@ impl Driver {
             Err(_) => {
                 if self.used_index(RX_RING_BASE) != self.rx.used_index {
                     self.missed_intx = self.missed_intx.wrapping_add(1);
-                    if self.missed_intx == 1 || self.missed_intx % LIVENESS_REPORT_EVERY == 0 {
+                    if self.missed_intx == 1
+                        || self.missed_intx.is_multiple_of(LIVENESS_REPORT_EVERY)
+                    {
                         let handle = text::default();
                         let line = format!(
                             "liveness: net.virtio rx frame present after a bounded \
@@ -1243,10 +1249,7 @@ impl l2::Guest for Stub {
         }
     }
 
-    async fn wait_recv(
-        _iface: l2::L2InterfaceBorrow<'_>,
-        max_wait_ns: u64,
-    ) -> Result<(), L2Error> {
+    async fn wait_recv(_iface: l2::L2InterfaceBorrow<'_>, max_wait_ns: u64) -> Result<(), L2Error> {
         let mut driver = acquire_driver().await.map_err(L2Error::from)?;
         driver.wait_rx(max_wait_ns).await.map_err(L2Error::from)
     }

@@ -713,22 +713,56 @@ enable-interrupts/wait is proven by disk.virtio) — size M. Board leg blocked o
 eo9:platform interrupt routing (usb-ohci-plan risk 7, GIC SPIs 216/219) — size L.
 Full inventory: docs/study/timer-crutch-audit.md.
 
-## Idle network listeners busy-pump the core at 100% — net receive has no interrupt arm (timer-crutch audit A2, elevates plan/12 D59, 2026-06-09)
-`net.l4.over-l2`'s `wait_until` pumps with ZERO pacing between rounds
-(guest/stubs/net-l4-over-l2/src/lib.rs:769-805) and `net.text`'s accept loop retries
-4 s timed-out accepts forever (guest/stubs/net-text/src/lib.rs:395-401), so an idle
-telnetd/oskexec listener is a permanently runnable child: the kernel drive loop never
-reaches `idle_wait`, the core never sleeps, tens of thousands of host calls/s at the
-bare "waiting for a connection" state. The event exists: virtio-net RX INTx — the
-recorded D59 follow-up, stated in net-virtio's own header ("disk.virtio waits on
-them — but this driver still polls"). Doctrine elevation: this is a class-A bug, not
-a nice-to-have. Fix shape: `net.virtio` recv-frame gains an interrupt-wait arm
-(unmask RX, await INTx via the proven IntxWait path, ack ISR; poll fallback where
-unsupported); the l4 pump then parks naturally per round, no consumer changes. QEMU
-leg size M. Board leg (rtl8125) blocked on rk3588 PCIe INTx
-(arch::pci_intx::WIRED = false, deferral recorded in rk3588_pcie.rs:93) — size L;
+## Net receive rides the RX interrupt on QEMU; the board leg (rtl8125) still polls — rk3588 PCIe INTx is the blocker (timer-crutch audit A2 / plan/12 D59; QEMU leg FIXED 2026-06-09, area/36)
+THE QEMU LEG IS FIXED (area/36-net-rx-events): an idle telnetd/oskexec listener now
+parks the whole executor instead of pegging a core. The landed shape, recorded here
+so the board lane can mirror it exactly:
+* `eo9:pci` `wait` takes a caller-stated `max-ns` bound, clamped by the provider to
+  its own 2 s cap (`INTX_WAIT_BOUND_NS`) — the deadline crosses the driver without
+  the driver holding time (doctrine-clean: IntxWait is a device capability).
+* `eo9:net/l2` gains `wait-recv(iface, max-wait-ns)` — advisory "park until receive
+  work is plausible or the bound passes"; providers without an event source return
+  immediately (the documented poll fallback, today's behavior exactly).
+* `net.virtio` finds the ISR window, takes one INTx vector at bring-up, un-suppresses
+  used-buffer interrupts on the RX ring only (TX stays suppressed — its completions
+  are consumed inline), acks the ISR after each consumed receive, and `wait-recv`
+  checks the used ring, then parks on `pci::wait`. A bound expiry with RX work
+  already in the ring = a missed event → loud `liveness:` line (1st + every 16th),
+  never a silent rescue.
+* `net.l4.over-l2`'s `wait_until` parks on `wait-recv` after any pump round that
+  moved no frame, bounded by min(operation window remaining, smoltcp `poll_delay`) —
+  ARP/TCP retransmits and DHCP timers stay deadline-bounded timed obligations.
+  `net.text`'s accept retry needs no change: each 4 s accept window is parked.
+* Two executor crutches the parked stack then exposed, both fixed in the same lane:
+  kernel `task.wait`/`task.runnable` self-woke every poll ("stay runnable so the
+  loop keeps turning"), keeping every waiting parent permanently runnable — a fully
+  parked telnetd still burned ~190k passes/s through the console's and telnetd's
+  waits; replaced by a completion doorbell (the drive loop's own Running→Done
+  transition and the kill paths ring parked waiters; waiters also register the
+  idle waker, so Ctrl-C rides the input edge — verified 20 ms kill on a parked
+  child). And `idle_wait`'s post-wfi blanket `wake_idle` re-polled every parked
+  future on maintenance-rated wakes, which mis-rated the next pass runnable and
+  false-fired the stranded-runnable detector ~1/s once the stack actually parked;
+  the post-wfi path now delivers due events only (Event/Deadline wakes ring; a pure
+  maintenance wake rings nothing and re-publishes the consumed unexpired deadline),
+  so the detector stays a regression alarm. Measured: idle listener 92.6% → 0.7%
+  host CPU, established idle session 83.5% → 0.6%, bare prompt 0.0%, hello
+  round-trip over the session 121 → 40 ms, zero `liveness:` lines.
+STILL OPEN — the board leg: `net.rtl8125`'s `wait-recv` deliberately returns
+immediately (poll fallback; the driver's comment points here). The RTL8125 ISR
+exists, but rk3588 PCIe INTx is unwired (`arch::pci_intx::WIRED = false`, deferral
+recorded in rk3588_pcie.rs:93), so an idle listener on the board still busy-pumps —
 likely the workload class behind the board's first stranded-runnable detector hit
-(GAPS 2026-06-08). Full inventory: docs/study/timer-crutch-audit.md.
+(GAPS 2026-06-08). When the INTx plumbing lands, the board lane mirrors the
+net.virtio shape verbatim (ring-check → bounded `pci::wait` → ISR ack → missed-event
+finding); the l4/middleware side is already done and needs nothing. Also open,
+recorded by area/36: `net.l2.switch`/`net.l2.bridge` ports answer `wait-recv`
+immediately rather than forwarding to the uplink — forwarding would let one parked
+port starve its sibling's every operation into the typed busy answer for the bound's
+duration (the uplink is an exclusive slot); an event-driven park there needs a
+cross-port wake (sibling drain → parked port). Idle multi-stack vNIC compositions
+therefore still poll. Size S–M, after a guest-local waker shape exists.
+Full inventory: docs/study/timer-crutch-audit.md.
 
 ## Usermode service drive loop carries a hard-coded 10 ms ambient park backstop (timer-crutch audit A3, 2026-06-09)
 `drive_with_services` parks with `Duration::from_millis(10)`

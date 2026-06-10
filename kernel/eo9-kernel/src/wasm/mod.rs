@@ -669,7 +669,29 @@ pub(crate) fn idle_wait() -> WakeKind {
             );
         }
     }
-    wake_idle();
+    // Due-event delivery, post-wfi edition (the same no-blanket-wake rule as
+    // `deliver_due_events`): an Event-rated wake delivers an interrupt and a
+    // Deadline-rated wake delivers an expired requested deadline — ring the parked
+    // futures so they observe it. A maintenance-rated wake delivered *nothing*: ring
+    // only a raised input edge (scavenged bytes), otherwise nothing — parked futures
+    // stay parked, their wakers stay registered (deduplicated by `will_wake`), and the
+    // next pass's `any_runnable` keeps meaning "stranded work", so the shell loops'
+    // runnable-after-backstop detector stays a regression alarm instead of firing on
+    // every feed-kick cadence (the area/36 false-positive: the blanket ring re-polled
+    // parked guests on each maintenance wake, and the resulting activity read as
+    // runnable-after-backstop). The consumed-but-unexpired requested deadline is
+    // re-published below — without the blanket re-poll nothing else would re-arm it,
+    // and the sleeper's deadline-rated wake must still arrive on time.
+    if kind == WakeKind::Backstop {
+        if requested != u64::MAX && requested > woke {
+            request_timer_wake(requested);
+        }
+        if crate::rxring::input_edge_pending() {
+            wake_idle();
+        }
+    } else {
+        wake_idle();
+    }
     kind
 }
 
