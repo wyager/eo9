@@ -47,15 +47,17 @@ static mut LEVEL3_TABLES: [TranslationTable; DRAM_L2_ENTRIES] =
 /// on the board), the image links at 0x0020_0000, and the kernel uses the first 528 MiB
 /// (0x0..0x2100_0000) — comfortably below U-Boot's runtime relocation (~0xEDC5_1000), the
 /// control FDT (~0xEB9F_6C38) and TF-A's high region (0xFF10_0000).
+// `RAM_BASE`/`RAM_END` are pub(crate): src/fdt.rs derives the windows a boot-handed FDT
+// pointer may legitimately occupy from them (the x0 validation choke point).
 #[cfg(not(feature = "board-opi5plus"))]
-const RAM_BASE: usize = 0x4000_0000;
+pub(crate) const RAM_BASE: usize = 0x4000_0000;
 #[cfg(feature = "board-opi5plus")]
-const RAM_BASE: usize = 0;
+pub(crate) const RAM_BASE: usize = 0;
 #[cfg(not(feature = "board-opi5plus"))]
 const RAM_SIZE: usize = 512 * 1024 * 1024;
 #[cfg(feature = "board-opi5plus")]
 const RAM_SIZE: usize = 528 * 1024 * 1024;
-const RAM_END: usize = RAM_BASE + RAM_SIZE;
+pub(crate) const RAM_END: usize = RAM_BASE + RAM_SIZE;
 /// Level-1 entry covering the DRAM window (1 GiB per entry; the window fits in one).
 const RAM_L1_INDEX: usize = RAM_BASE >> 30;
 /// Level-1 entries mapped as 1 GiB Device-nGnRnE blocks. QEMU `virt`: the low gigabyte
