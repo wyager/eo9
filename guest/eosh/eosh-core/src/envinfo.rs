@@ -18,8 +18,15 @@
 //! eo9-session 1
 //! shell <capability> <description…>
 //! child <capability> <description…>
+//! term-width <columns>
 //! note <free-form text…>
 //! ```
+//!
+//! `term-width` is the embedder's statement of the console's column count (the kernel
+//! console writes its known width; embedders that cannot say simply omit the record).
+//! eosh's line editor uses it for wrap-aware repainting; like everything here it is
+//! informational — absent or malformed just means the editor never wraps. Older
+//! parsers skip the record (unknown kinds are non-fatal by design).
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -46,6 +53,9 @@ pub struct SessionManifest {
     pub shell: Vec<CapabilityLine>,
     pub child: Vec<CapabilityLine>,
     pub notes: Vec<String>,
+    /// The console's column count, when the embedder declared one (`term-width`).
+    /// Zero is treated as undeclared (a width of 0 columns is not a terminal).
+    pub term_width: Option<usize>,
 }
 
 impl SessionManifest {
@@ -86,6 +96,9 @@ impl SessionManifest {
                     }
                 }
                 "note" => manifest.notes.push(rest.trim().to_string()),
+                "term-width" => {
+                    manifest.term_width = rest.trim().parse::<usize>().ok().filter(|&w| w > 0);
+                }
                 // Unknown record kinds are ignored so older shells keep working when the
                 // embedder learns to say more.
                 _ => {}
@@ -256,6 +269,21 @@ mod tests {
             manifest.notes,
             vec!["children never receive the exec capability".to_string()]
         );
+    }
+
+    #[test]
+    fn term_width_parses_and_rejects_degenerate_values() {
+        let manifest = SessionManifest::parse("eo9-session 1\nterm-width 100\nshell text serial\n")
+            .expect("parses");
+        assert_eq!(manifest.term_width, Some(100));
+        assert_eq!(manifest.shell.len(), 1);
+        // Absent, malformed, or zero: undeclared — the editor never wraps.
+        let absent = SessionManifest::parse(manifest_text()).expect("parses");
+        assert_eq!(absent.term_width, None);
+        let zero = SessionManifest::parse("eo9-session 1\nterm-width 0\n").expect("parses");
+        assert_eq!(zero.term_width, None);
+        let words = SessionManifest::parse("eo9-session 1\nterm-width wide\n").expect("parses");
+        assert_eq!(words.term_width, None);
     }
 
     #[test]

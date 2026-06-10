@@ -470,6 +470,16 @@ three distinct causes on area/23-flake-fixes:
 Residual (tracked, by design for now): restart-policy decisions recompile the policy
 per decision (docs/design/policy-components.md blesses precompile-and-cache as the
 upgrade); ~210ms/decision debug-build floor on restart-lifecycle latency.
+NEW SPECIMEN (editor-wrap lane, 2026-06-09): same test, different bound — the 30s
+*marker* deadline ("the session never printed \"detached: crasher\"",
+svc_shell.rs:370) blown in 2 of 4 full `cargo xtask ci` runs and once solo
+immediately after a full battery (the initial detach compiles the child + policy
+components in a debug build, on a still-contended machine); solo runs on a settled
+machine pass every time (13.4s single, 8/8 suite in 32s), and the other 2 ci runs
+were fully green. The lane's diff (eosh editor output layer) does not touch
+svc/exec. Same debug-compile-latency residual as above, hitting the fixed marker
+bound instead of the (now-polled) gap — the marker wait wants the same
+poll-not-deadline treatment or a longer bound.
 
 ## Check gates can leak the QEMU on the failure path (dhcp lane, 2026-06-08)
 A failed check gate (kill()+wait on error) left its qemu-system-aarch64 alive holding
