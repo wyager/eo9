@@ -2293,6 +2293,10 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
                 ("eo9-stub-net-rtl8125", "net.rtl8125"),
                 ("eo9-example-l2check", "l2check"),
                 ("eo9-stub-net-l4-over-l2", "net.l4.over-l2"),
+                // The shareable tail (shared-resources M1): the station-net config's
+                // `lan` line composes `net.rtl8125 $ net.l4.over-l2 --address dhcp $
+                // l4.factory`, so the bench's serial-loadable image must carry it.
+                ("eo9-stub-net-l4-factory", "l4.factory"),
                 ("eo9-example-l4check", "l4check"),
                 // The demo HTTP client (the usb-boot-demo plan's curl lane):
                 //   net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address dhcp)

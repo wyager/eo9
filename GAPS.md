@@ -936,3 +936,36 @@ it at the hot path, both park gates, the masked re-check, and the post-wfi arm. 
 spurious-wake drain left the next counted reap waiting forever (silent freeze or
 device-lost under TCG) — now credit-accounted with a frame-bounded spin, pinned by
 a mock regression test.
+## Kernel call gate v1 residuals (area/41-gate-m1, 2026-06-09)
+
+M1 of docs/design/shared-resources.md landed (gate mechanism, l4.factory, share/use config, check-share
+green: R2 + loopback sockcheck + severance + station-net bare curl). Deliberate v1 deferrals and findings,
+each honest in the module docs (kernel/eo9-kernel/src/wasm/gate.rs):
+
+- **Owner-side handle drops are deferred.** `ResourceAny::resource_drop` demands a sync call context
+  (refused on the async-configured store) and `resource_drop_async` needs the bare `Store` — neither is
+  callable from inside the owner's `run_concurrent`, which is the only legal entry into a live owner
+  (design F1/F2). A dropped child handle frees its kernel-side translation-table entry immediately, but
+  the owner-side wrapper resource (and its host-table slot) lives until the owner's store drops. For M2's
+  telnetd close path (FIN driven by the wrapper destructor — design §7) this MUST be solved: either a
+  vendored concurrent-context resource-drop entry point (upstream-delta ledger) or a blessed explicit
+  `close` on the wrapped session. Returned buffers do NOT leak (`try_from_resource_any` consumes the
+  entry).
+- **The inline first-poll fast path (§3.3) is not implemented** — queue-only, +1 drive-pass latency per
+  gate call, exactly the doc's sanctioned fallback. The R1 TLS-canary test goes with the fast path when it
+  lands. (The three sync WIT getters — listener-address/peer-address/udp-address — DO nested-poll the
+  owner synchronously via the checkout-guarded `svc::poll_service_once`, because a sync shim cannot park:
+  wasmtime refuses `func_wrap_concurrent` for a sync import with "type mismatch with async".)
+- **The guest-visible `spawn(..., grants)` surface is not implemented** (parent→child sharing — the M2
+  telnetd item); v1 sharing is the broker case only (config share/use, kernel-interpreted).
+- **`serves:` in `describe` (R7's presentation half) is not implemented**; the structural validation at
+  detach is (provider kind + blessed factory + full l4 export, refused typed pre-run).
+- **`lock=token` is config-accepted but refused to instance** (v1 ships the instance domain only, which on
+  the single boot core is structurally provided by wasmtime store-entry serialization + FIFO intake).
+- **A trap inside one gated call** maps to that call's typed io error, but may poison the owner's store
+  for subsequent calls (un-probed); the share's restart policy is the recovery story.
+- **Pre-existing, NOT gate-induced: the stranded-runnable liveness detector fires ~1/s at an idle eosh
+  prompt on QEMU default boots — on master's own image too** (verified 2026-06-09: master image, default
+  config, 4 rate-limited prints in 45 s; identical counts on the gate branch with and without a live
+  share). The gate adds zero findings over that baseline, but the baseline itself contradicts the
+  events-or-wfi doctrine and wants its own lane.
