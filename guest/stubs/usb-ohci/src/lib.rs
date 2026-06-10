@@ -112,6 +112,11 @@ impl RegionIo for Adapter {
             Ok(_deliveries) => Ok(WaitOutcome::Delivered),
             // Bound expiry or any other wait failure: one poll round, then the
             // caller may wait again — bounded, never a hang, never a hot spin.
+            // SOUNDNESS NOTE: "never a hot spin" assumes a wait error takes the
+            // provider's bound or the handle stays valid for the task's life — true
+            // today (vectors are task-scoped). If a vector can ever die mid-task
+            // (instant errors), this arm must degrade instead (GAPS "usb event-mode
+            // wait errors map to TimedOut").
             Err(_) => Ok(WaitOutcome::TimedOut),
         }
     }
