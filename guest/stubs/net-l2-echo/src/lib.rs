@@ -261,6 +261,17 @@ impl l2::Guest for Stub {
         (frame, Ok(SendResult { bytes_sent: len }))
     }
 
+    async fn wait_recv(
+        _iface: l2::L2InterfaceBorrow<'_>,
+        _max_wait_ns: u64,
+    ) -> Result<(), L2Error> {
+        // No event source: replies only ever appear synchronously, queued by a
+        // preceding `send-frame` — so there is nothing to park on and waiting could
+        // never be woken. Return immediately (the documented poll-fallback contract);
+        // the consumer's loop behaves exactly as it did before `wait-recv` existed.
+        Ok(())
+    }
+
     async fn recv_frame(
         _iface: l2::L2InterfaceBorrow<'_>,
         dst: Buffer,

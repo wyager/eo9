@@ -93,6 +93,10 @@ impl l2::Guest for Stub {
     ) -> (Buffer, Result<RecvResult, L2Error>) {
         iface.get::<NoIface>().unreachable()
     }
+
+    async fn wait_recv(iface: l2::L2InterfaceBorrow<'_>, _max_wait_ns: u64) -> Result<(), L2Error> {
+        iface.get::<NoIface>().unreachable()
+    }
 }
 
 export!(Stub);

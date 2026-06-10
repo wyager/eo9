@@ -852,7 +852,9 @@ impl Driver {
                     break false;
                 }
                 waits += 1;
-                match pci::wait(&vector).await {
+                // `u64::MAX` = exactly the provider's own wait bound (this driver has
+                // no shorter deadline of its own; the retry counter bounds the total).
+                match pci::wait(&vector, u64::MAX).await {
                     Ok(_deliveries) => self.acknowledge_isr().await,
                     Err(_) => break false,
                 }
