@@ -281,20 +281,38 @@ extern "C" fn wasmtime_concurrent_tls_set(pointer: *mut u8) {
 /// Generous because QEMU TCG is slow; a healthy operation finishes in milliseconds.
 const BLOCK_ON_WATCHDOG_NS: u64 = 30_000_000_000;
 
-/// Safety-net `wfi` interval used when work is still in flight (a child is running) but no
-/// nearer wake was requested: bounds re-poll latency so a compute-bound child whose fuel
-/// yield is somehow not detected as runnable still advances. Sleep deadlines (via
-/// [`request_timer_wake`]) and serial input (the UART RX interrupt) wake the core directly,
-/// so this is only a backstop, not the normal cadence.
-const IDLE_WAKE_INTERVAL_NS: u64 = 10_000_000;
-
-/// Backstop `wfi` interval when nothing is running (the bare eosh prompt with no children):
-/// input arrives via the UART RX interrupt, so the core need only wake about once a second
-/// as a liveness backstop — this is what drops idle host CPU from the old ~1% toward ~0%.
-const IDLE_BACKSTOP_NS: u64 = 1_000_000_000;
-
 /// Floor on an armed wake so we never program a zero/at-deadline timer.
 const MIN_WAKE_NS: u64 = 100_000;
+
+/// QEMU profiles only: the character-feed kick obligation. QEMU's per-chunk pause/resume
+/// of the serial feed has been observed to wedge with the RX FIFO *empty* (the
+/// paste-freeze bug, plan/12) — there is nothing to event on, so the scavenger's kick is
+/// an honest timed obligation: after a second of total input silence one dummy data-
+/// register read resumes the feed (`uart::scavenge_rx`). This entry is what arms the wake
+/// that runs it; the board profile carries no feed to kick and no such entry.
+const FEED_KICK_INTERVAL_NS: u64 = 1_000_000_000;
+
+/// Armed delay when no deadline exists at all (no parked sleep, no maintenance
+/// obligation). Unreachable today — every QEMU profile carries the feed-kick entry and
+/// the board profile carries the watchdog-pat entry — but the arm stays bounded so a
+/// future profile without either cannot sleep unwakeably; interrupts still end it early.
+const NO_DEADLINE_ARM_NS: u64 = 60_000_000_000;
+
+/// The earliest maintenance obligation at/after `now`: the board watchdog pat (the
+/// DW-WDT must be patted well inside its ~22 s timeout; the 5 s heartbeat rides the same
+/// pat) and the QEMU feed kick ([`FEED_KICK_INTERVAL_NS`]). These are real "time T →
+/// task X" entries in the owner's executor model — NOT a re-poll cadence: a wake rated
+/// against one of these that discovers actionable guest work is a stranded-work liveness
+/// finding (the backstop detectors in [`idle_wait`]).
+fn maintenance_deadline_ns(now: u64) -> u64 {
+    let pat = crate::wdt::pat_deadline_ns(now);
+    let kick = if cfg!(all(target_arch = "aarch64", feature = "board-opi5plus")) {
+        u64::MAX
+    } else {
+        now.saturating_add(FEED_KICK_INTERVAL_NS)
+    };
+    pat.min(kick)
+}
 
 /// Earliest absolute uptime (ns) any parked future has asked the executor to wake for —
 /// `u64::MAX` means "nothing time-bound is pending". [`SleepUntil`](providers) lowers it to
@@ -305,6 +323,32 @@ static NEXT_TIMER_WAKE_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Takes the earliest across all callers in a drive pass.
 pub(crate) fn request_timer_wake(deadline_ns: u64) {
     NEXT_TIMER_WAKE_NS.fetch_min(deadline_ns, Ordering::AcqRel);
+}
+
+/// Deliver *due* events to parked futures during a hot stretch (a runnable child or
+/// service is keeping the drive loop away from [`idle_wait`]): wake the parked input
+/// futures when console input has arrived (the edge) or a requested sleep deadline has
+/// expired — and only then.
+///
+/// This replaces the hot branch's old unconditional `wake_idle()`. The blanket wake
+/// was a self-sustaining spin: it rang every parked future's poll waker each pass, the
+/// next pass's rung flags then read as "runnable", so one hot pass made every later
+/// pass hot and the executor never slept again — under the station config drive-stats
+/// measured 27.8 M passes, all hot, zero `idle_wait` entries, i.e. 100% CPU at an idle
+/// prompt. Waking only on due events breaks the cycle while keeping the contract the
+/// old wake served: the console's `read-line` cannot go deaf while something spins,
+/// because input arrival itself raises the edge (IRQ drain, scavenger, injector).
+pub(crate) fn deliver_due_events() {
+    let now = crate::timer::uptime_ns();
+    let deadline_due = NEXT_TIMER_WAKE_NS.load(Ordering::Acquire) <= now;
+    if deadline_due {
+        // Consumed: woken sleepers re-arm on their re-poll (and anything still in the
+        // future is re-requested then, exactly as after an `idle_wait` wake).
+        NEXT_TIMER_WAKE_NS.store(u64::MAX, Ordering::Release);
+    }
+    if deadline_due || crate::rxring::input_edge_pending() {
+        wake_idle();
+    }
 }
 
 /// Where parked host-import futures ([`providers`]' `read-line`/`time.sleep`) leave the
@@ -360,14 +404,105 @@ pub(crate) fn register_idle_waker(waker: &Waker) {
 /// keeps the loop hot, skipping `idle_wait`): the console's `read-line` parks on these
 /// wakers, and without the wake it would never be re-polled — a spinning service must
 /// not deafen the prompt.
+///
+/// Delivering these wakes also consumes the console input edge
+/// (`rxring::clear_input_edge`): every parked console reader has now been rung and will
+/// re-poll against the ring, so input published before this point is delivered.
 pub(crate) fn wake_idle() {
     IDLE_WAKER.lock();
     // SAFETY: exclusive while `locked` is held.
     let wakers = core::mem::take(unsafe { &mut *IDLE_WAKER.wakers.get() });
     IDLE_WAKER.unlock();
+    crate::rxring::clear_input_edge();
     for waker in wakers {
         waker.wake();
     }
+}
+
+// --- The drive-pass rung registry (area/34-fuel-yield-latency) ---------------------------
+
+/// Per-poll waker for one child/service drive: wasmtime re-polls the sub-futures whose
+/// waker was rung; in addition this records *whether* the waker was rung at all during
+/// (or after) the poll, which is how the drive loops tell work that wants an immediate
+/// re-poll — a fuel yield rings it synchronously — from work parked on a host future
+/// (`read-line`/`time.sleep` register the executor's idle waker instead). Shared by
+/// `shellexec::drive_children` and `svc::drive_services` so the executor's park gate
+/// ([`pass_rung_pending`]) can scan one registry covering both.
+pub(crate) struct RungWaker {
+    pub(crate) rung: AtomicBool,
+}
+
+impl Wake for RungWaker {
+    fn wake(self: Arc<Self>) {
+        self.rung.store(true, Ordering::Release);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.rung.store(true, Ordering::Release);
+    }
+}
+
+/// The wakers handed out during the current drive pass, one per still-running child or
+/// service (checked back in by `drive_children`/`drive_services`). The executor's idle
+/// step scans them just before halting the core: a flag that became true *after* its
+/// check-in (a wake edge the pass status missed) means runnable work exists and parking
+/// would strand it for a full timer cadence — the executor must re-poll instead, and the
+/// miss is a loud liveness finding (owner doctrine: a timer rescuing work the event path
+/// owed is a bug). Same single-core lock discipline as [`IdleWaker`].
+struct PassWakers {
+    locked: AtomicBool,
+    wakers: UnsafeCell<Vec<Arc<RungWaker>>>,
+}
+
+// SAFETY: all access goes through the `locked` flag below, on the kernel's single core.
+unsafe impl Sync for PassWakers {}
+
+static PASS_WAKERS: PassWakers = PassWakers {
+    locked: AtomicBool::new(false),
+    wakers: UnsafeCell::new(Vec::new()),
+};
+
+impl PassWakers {
+    fn lock(&self) {
+        while self.locked.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+    fn unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+}
+
+/// Start a fresh drive pass: forget the previous pass's wakers (their slots were either
+/// re-polled by this pass or are no longer running). Called by `drive_children` at the
+/// top of a non-nested pass — the services pump appends to the same pass.
+pub(crate) fn begin_drive_pass() {
+    PASS_WAKERS.lock();
+    // SAFETY: exclusive while `locked` is held.
+    unsafe { &mut *PASS_WAKERS.wakers.get() }.clear();
+    PASS_WAKERS.unlock();
+}
+
+/// Record a still-running child/service's poll waker for the park-gate scan.
+pub(crate) fn register_pass_waker(waker: Arc<RungWaker>) {
+    PASS_WAKERS.lock();
+    // SAFETY: exclusive while `locked` is held.
+    unsafe { &mut *PASS_WAKERS.wakers.get() }.push(waker);
+    PASS_WAKERS.unlock();
+}
+
+/// Whether any of this pass's checked-in children/services has been rung since its poll
+/// — runnable work the pass's `any_runnable` status missed. Consuming (the flags are
+/// cleared): the caller reacts by re-polling everything, which re-establishes fresh
+/// flags, so a stale registry can never wedge the executor hot.
+pub(crate) fn pass_rung_pending() -> bool {
+    PASS_WAKERS.lock();
+    // SAFETY: exclusive while `locked` is held.
+    let pending = unsafe { &*PASS_WAKERS.wakers.get() }
+        .iter()
+        .map(|waker| waker.rung.swap(false, Ordering::AcqRel))
+        .fold(false, |any, rung| any | rung);
+    PASS_WAKERS.unlock();
+    pending
 }
 
 /// One idle step for a polling drive loop ([`block_on`] and the interactive shell): arm the
@@ -376,75 +511,156 @@ pub(crate) fn wake_idle() {
 /// the kernel's busy-poll into an idle wait — QEMU's vCPU (and a real core) sleeps between
 /// polls instead of spinning.
 ///
-/// The wake delay is the earliest of: a sleep deadline a parked future requested
-/// ([`request_timer_wake`]), capped by a backstop. The backstop is short
-/// ([`IDLE_WAKE_INTERVAL_NS`]) when a child is still running (so it keeps getting turns even
-/// if its fuel-yield wake is missed) and long ([`IDLE_BACKSTOP_NS`]) when nothing is running
-/// — at the bare prompt, input arrives as a UART interrupt, so the core can sleep ~1 s at a
-/// time and idle near 0% instead of waking every 10 ms.
+/// The executor model (owner ruling, area/34): either there is runnable work and the drive
+/// loop is polling it hot (it never calls this), or the core halts armed to the **earliest
+/// real deadline** — a wake a parked future requested ([`request_timer_wake`]), or a
+/// maintenance obligation ([`maintenance_deadline_ns`]: the board watchdog pat, the QEMU
+/// feed kick). There is no re-poll cadence: a runnable child is detected by its rung waker
+/// (check-in or the park gate below), input by its interrupt/edge, a sleep by its armed
+/// deadline. A late wake rated against a *maintenance* deadline that discovers actionable
+/// guest work means that work was stranded — every such discovery is a loud liveness
+/// finding (the detectors below), because the event path owed it a wake.
 ///
 /// IRQs are masked across the `wfi`: a timer or UART interrupt that becomes pending in the
 /// window between the caller's last poll and the `wfi` then stays pending and still wakes the
 /// `wfi` (architecturally, a masked-but-pending IRQ is a `wfi` wake-up event), so there is no
 /// lost-wakeup race; unmasking afterwards takes the interrupt (`kirq` services + EOIs it).
-pub(crate) fn idle_wait(child_running: bool) -> WakeKind {
+pub(crate) fn idle_wait() -> WakeKind {
     // Board profile: every idle wake pats the hardware watchdog (the busy passes pat in
     // the drive loops, so neither a parked nor a hot kernel starves it). No-op on QEMU.
     // The pat runs before the backstop-detector rating below: the watchdog is a
     // dead-man's switch for the whole kernel, not a liveness probe, so the ordering is
     // immaterial to the detector — patting first just keeps the dead-man margin maximal.
     crate::wdt::pat();
+    // The park gate (area/34-fuel-yield-latency): never halt the core on work the event
+    // path already delivered.
+    //
+    // 1. A checked-in child/service whose waker was rung after its poll (a wake edge the
+    //    pass's `any_runnable` missed) is runnable NOW; sleeping on it strands it for a
+    //    full timer cadence. This cannot happen through the normal paths — a fuel yield
+    //    rings during the poll and is seen at check-in — so a hit here is a drive-loop
+    //    regression: recover hot AND log loudly (owner doctrine: a timer flushing work
+    //    the event path owed is a bug, and this detector must catch a regression of
+    //    exactly that bug).
+    if pass_rung_pending() {
+        liveness_finding(
+            "stranded runnable at the park gate: a child or service became runnable \
+             after its check-in and the executor was about to sleep on it",
+            &LIVENESS_PARK_RUNNABLE,
+        );
+        #[cfg(feature = "drive-stats")]
+        drive_stats::GATE_CATCH.fetch_add(1, Ordering::Relaxed);
+        wake_idle();
+        return WakeKind::Event;
+    }
+    // 2. Console input published since the parked readers were last woken (a mid-pass
+    //    UART drain, or the console-sink injector — the USB keyboard path, which raises
+    //    no interrupt at all). Deliver the wake now instead of riding the next timer:
+    //    this is the event path doing its job, not a finding.
+    if crate::rxring::input_edge_pending() {
+        #[cfg(feature = "drive-stats")]
+        drive_stats::EDGE_BOUNCE.fetch_add(1, Ordering::Relaxed);
+        wake_idle();
+        return WakeKind::Event;
+    }
     let now = crate::timer::uptime_ns();
     let requested = NEXT_TIMER_WAKE_NS.swap(u64::MAX, Ordering::AcqRel);
-    let cap = if child_running {
-        IDLE_WAKE_INTERVAL_NS
+    // The single armed timer points at the earliest real deadline: a parked future's
+    // requested wake, or a maintenance obligation (watchdog pat / feed kick). No cap:
+    // the old 10 ms-while-running interval existed to bound re-poll latency "in case a
+    // fuel yield is somehow not detected" — that miss is now detected (check-in rung +
+    // the park gate above) and any regression of it is a loud finding, so the cadence
+    // would only ever hide bugs (owner doctrine).
+    let maintenance = maintenance_deadline_ns(now);
+    // Every profile carries a maintenance entry (the board's watchdog pat, every other
+    // profile's feed kick), so the defensive NO_DEADLINE_ARM_NS arm below is unreachable
+    // today — keep that fact loud in debug images.
+    debug_assert!(
+        maintenance != u64::MAX,
+        "no maintenance deadline on this profile: the idle arm would fall back to the \
+         defensive 60 s arm"
+    );
+    let target = requested.min(maintenance);
+    // Maintenance-rated: no parked future's deadline decides this wake — anything
+    // actionable a late wake then discovers was stranded. A requested deadline at or
+    // before the maintenance entry makes the wake deadline-rated (the event is time —
+    // SleepUntil, an IntxWait bound, a service restart).
+    let maintenance_rated = requested == u64::MAX || maintenance < requested;
+    let delay = if target == u64::MAX {
+        NO_DEADLINE_ARM_NS
     } else {
-        IDLE_BACKSTOP_NS
+        target.saturating_sub(now).max(MIN_WAKE_NS)
     };
-    // Cap-rated: the backstop, not a requested deadline, decides when we wake. A
-    // requested deadline at or inside the cap makes the wake deadline-rated (the event
-    // is time — SleepUntil, an IntxWait bound, a service restart).
-    let cap_rated = requested == u64::MAX || requested.saturating_sub(now) > cap;
-    let delay = if requested == u64::MAX {
-        cap
-    } else {
-        requested.saturating_sub(now).clamp(MIN_WAKE_NS, cap)
-    };
-    // Mask interrupts, arm the timer wake, halt until an interrupt is pending, then unmask
-    // and take it — the architecture-specific sequence lives in `timer::wait_for_interrupt`,
+    // Mask interrupts FIRST, then re-check the input edge inside the masked window, and
+    // only then arm + halt. An RX interrupt taken between the unmasked gate checks at
+    // the top of this function and this mask has already been fully serviced — FIFO
+    // drained into the ring, edge raised, EOI'd — so nothing is left pending to end the
+    // `wfi`: parking would strand that input for the entire armed window (the deleted
+    // 10 ms cap used to bound this race silently; the masked re-check is what closes it
+    // honestly). Rung wakers need no masked re-check: they are rung from poll context
+    // on this same core, never from an interrupt handler. The bail re-publishes the
+    // consumed deadline request so the bail is behaviorally a pure no-op.
+    crate::timer::irq_mask();
+    if crate::rxring::input_edge_pending() {
+        crate::timer::irq_unmask();
+        if requested != u64::MAX {
+            request_timer_wake(requested);
+        }
+        #[cfg(feature = "drive-stats")]
+        drive_stats::EDGE_BOUNCE.fetch_add(1, Ordering::Relaxed);
+        wake_idle();
+        return WakeKind::Event;
+    }
+    // Arm the timer wake, halt until an interrupt is pending, then unmask and take it —
+    // the architecture-specific sequence lives in `timer::wait_for_interrupt_masked`,
     // which is also the compiler-level memory barrier that makes whatever the interrupt
     // handler wrote (the UART input ring) visible to the re-poll below.
-    crate::timer::wait_for_interrupt(delay);
+    crate::timer::wait_for_interrupt_masked(delay);
     let woke = crate::timer::uptime_ns();
     // Early wake = an interrupt (UART RX, INTx, an earlier-armed timer) ended the halt
-    // before the armed delay: event-driven, never a finding. Late + cap-rated = the
-    // backstop fired; anything actionable it now discovers was stranded while we slept
-    // (on this single core nothing changes guest-visible state during the masked `wfi`
-    // except interrupts, and an interrupt would have woken us early).
+    // before the armed delay: event-driven, never a finding. Late + maintenance-rated =
+    // no event arrived for the whole armed window; anything actionable it now discovers
+    // was stranded while we slept (on this single core nothing changes guest-visible
+    // state during the masked `wfi` except interrupts, and an interrupt would have woken
+    // us early).
     let late = woke.saturating_sub(now) >= delay;
     // Idle-path UART scavenge (plan/12, the paste-freeze fix): rescue any receive bytes
-    // the interrupt path missed and, after a second of total input silence, nudge QEMU's
-    // character feed (which has been observed to wedge under host load) back to life.
-    // Runs on every idle wake — at least about once a second via the backstop above.
+    // the interrupt path missed and, on QEMU profiles, run the feed-kick obligation
+    // (after a second of total input silence, nudge QEMU's character feed — which has
+    // been observed to wedge under host load — back to life). Runs on every idle wake;
+    // the feed-kick maintenance entry guarantees one at least about once a second on
+    // QEMU even when nothing else is due.
     let scavenged = crate::uart::scavenge_rx(woke);
     let kind = if !late {
         WakeKind::Event
-    } else if cap_rated {
+    } else if maintenance_rated {
         WakeKind::Backstop
     } else {
         WakeKind::Deadline
     };
+    #[cfg(feature = "drive-stats")]
+    match kind {
+        WakeKind::Event => drive_stats::WAKE_EVENT.fetch_add(1, Ordering::Relaxed),
+        WakeKind::Deadline => drive_stats::WAKE_DEADLINE.fetch_add(1, Ordering::Relaxed),
+        WakeKind::Backstop => drive_stats::WAKE_BACKSTOP.fetch_add(1, Ordering::Relaxed),
+    };
+    // Detector probes (SPEC: actionable work a wake discovers that no event delivered is
+    // a high-priority bug). The runnable-child probe lives in the drive loops (shell.rs),
+    // which see the next pass's `any_runnable`; the park gate above covers post-check-in
+    // rungs.
+    //
+    // Scavenged bytes are a finding on EVERY wake kind, not just maintenance-rated ones
+    // (area/35 timer-crutch audit): the RX interrupt owed those bytes a delivery whatever
+    // else woke the core — rating the report by wake kind made an Event- or Deadline-
+    // rated rescue silent, exactly the rescuer shape the doctrine forbids.
+    if scavenged > 0 {
+        liveness_finding(
+            "stranded input: an idle wake scavenged receive bytes the interrupt path \
+             missed (possible benign race only within the same microsecond)",
+            &LIVENESS_STRANDED_INPUT,
+        );
+    }
     if kind == WakeKind::Backstop {
-        // Detector probes (SPEC: every backstop firing that discovers actionable work no
-        // event delivered is a high-priority bug). The runnable-child probe lives in the
-        // drive loops (shell.rs), which see the next pass's `any_runnable`.
-        if scavenged > 0 {
-            liveness_finding(
-                "stranded input: the idle backstop scavenged receive bytes the interrupt \
-                 path missed (possible benign race only within the same microsecond)",
-                &LIVENESS_STRANDED_INPUT,
-            );
-        }
         let pending = crate::pci::intx_pending_total();
         if pending > 0 {
             liveness_finding(
@@ -473,6 +689,7 @@ pub(crate) enum WakeKind {
 static LIVENESS_STRANDED_INPUT: AtomicU64 = AtomicU64::new(0);
 static LIVENESS_STRANDED_INTX: AtomicU64 = AtomicU64::new(0);
 static LIVENESS_STRANDED_RUNNABLE: AtomicU64 = AtomicU64::new(0);
+static LIVENESS_PARK_RUNNABLE: AtomicU64 = AtomicU64::new(0);
 
 fn liveness_finding(what: &str, counter: &AtomicU64) {
     let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -488,6 +705,52 @@ pub(crate) fn liveness_stranded_runnable() {
         "stranded runnable: a child or service was runnable across an entire idle backstop",
         &LIVENESS_STRANDED_RUNNABLE,
     );
+}
+
+/// Executor drive-loop counters (`drive-stats` feature; area/34-fuel-yield-latency).
+/// Zero-cost when the feature is off — every increment site is cfg-gated. Dumped on
+/// each consumed Ctrl-C and at session end, so a serial transcript carries the numbers.
+#[cfg(feature = "drive-stats")]
+pub(crate) mod drive_stats {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Drive-loop passes (one init/eosh loop iteration that reached the Pending arm).
+    pub static PASSES: AtomicU64 = AtomicU64::new(0);
+    /// Passes that stayed hot (`any_runnable` — re-poll without parking).
+    pub static HOT_PASSES: AtomicU64 = AtomicU64::new(0);
+    /// Individual child polls, and how many reported a rung waker (fuel yield).
+    pub static CHILD_POLLS: AtomicU64 = AtomicU64::new(0);
+    pub static CHILD_RUNG: AtomicU64 = AtomicU64::new(0);
+    /// Individual service polls, and how many reported a rung waker.
+    pub static SVC_POLLS: AtomicU64 = AtomicU64::new(0);
+    pub static SVC_RUNG: AtomicU64 = AtomicU64::new(0);
+    /// `idle_wait` outcomes by wake kind.
+    pub static WAKE_EVENT: AtomicU64 = AtomicU64::new(0);
+    pub static WAKE_DEADLINE: AtomicU64 = AtomicU64::new(0);
+    pub static WAKE_BACKSTOP: AtomicU64 = AtomicU64::new(0);
+    /// Park-gate catches (the liveness detector) and input-edge bounces.
+    pub static GATE_CATCH: AtomicU64 = AtomicU64::new(0);
+    pub static EDGE_BOUNCE: AtomicU64 = AtomicU64::new(0);
+
+    /// Print one cumulative summary line (the consumer diffs successive dumps).
+    pub fn dump(reason: &str) {
+        crate::kprintln!(
+            "drive-stats[{reason}]: passes={} hot={} child-polls={} child-rung={} \
+             svc-polls={} svc-rung={} wake-event={} wake-deadline={} wake-backstop={} \
+             gate-catch={} edge-bounce={}",
+            PASSES.load(Ordering::Relaxed),
+            HOT_PASSES.load(Ordering::Relaxed),
+            CHILD_POLLS.load(Ordering::Relaxed),
+            CHILD_RUNG.load(Ordering::Relaxed),
+            SVC_POLLS.load(Ordering::Relaxed),
+            SVC_RUNG.load(Ordering::Relaxed),
+            WAKE_EVENT.load(Ordering::Relaxed),
+            WAKE_DEADLINE.load(Ordering::Relaxed),
+            WAKE_BACKSTOP.load(Ordering::Relaxed),
+            GATE_CATCH.load(Ordering::Relaxed),
+            EDGE_BOUNCE.load(Ordering::Relaxed),
+        );
+    }
 }
 
 /// Drive a wasmtime future (`instantiate_async`, `call_async`, …) to completion on the
@@ -523,13 +786,12 @@ pub fn block_on<F: Future>(what: &str, future: F) -> Result<F::Output, wasmtime:
                         "{what} did not complete within the kernel executor's watchdog"
                     )));
                 }
-                // Idle in `wfi` until the nearest pending wake (a sleep deadline) or a UART
-                // RX interrupt fires, then re-drive the parked host future, instead of
-                // busy-spinning. block_on drives a single future with no sibling children, so
-                // `child_running = false`: it sleeps to the requested deadline (or the long
-                // backstop). A guest awaiting `time.sleep`/`read-line` registered its waker
-                // rather than self-waking, so this is what lets the core actually sleep.
-                last_wake = idle_wait(false);
+                // Idle in `wfi` until the nearest pending wake (a sleep deadline, a
+                // maintenance obligation) or a UART RX interrupt fires, then re-drive the
+                // parked host future, instead of busy-spinning. A guest awaiting
+                // `time.sleep`/`read-line` registered its waker rather than self-waking,
+                // so this is what lets the core actually sleep.
+                last_wake = idle_wait();
             }
         }
     }

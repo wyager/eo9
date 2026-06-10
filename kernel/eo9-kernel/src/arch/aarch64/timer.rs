@@ -129,11 +129,47 @@ pub fn arm_wake(delay_ns: u64) {
 #[cfg(target_os = "none")]
 #[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
 pub fn wait_for_interrupt(delay_ns: u64) {
-    // SAFETY: mask IRQ (DAIF.I=1), arm the timer, `wfi`, then unmask; the instructions do
-    // not touch the stack or clobber registers the compiler relies on, and the missing
-    // `nomem` is the memory clobber discussed above.
+    irq_mask();
+    wait_for_interrupt_masked(delay_ns);
+}
+
+/// Mask IRQ delivery (DAIF.I=1). Pairs with [`irq_unmask`] or
+/// [`wait_for_interrupt_masked`]: the executor masks, re-checks its park conditions
+/// (the input edge an already-taken RX interrupt may have raised), and only then halts
+/// — an interrupt serviced *before* the mask leaves nothing pending to end the `wfi`,
+/// so the masked re-check is what closes that window (area/34).
+#[cfg(target_os = "none")]
+#[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
+pub fn irq_mask() {
+    // SAFETY: masking IRQ delivery touches neither stack nor compiler-visible state.
     unsafe {
         core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Unmask IRQ delivery (the bail path out of a masked park-condition re-check). Omits
+/// `nomem` like the halt path: the interrupt taken at the unmask writes memory the
+/// caller re-reads right afterwards (the UART input ring).
+#[cfg(target_os = "none")]
+#[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
+pub fn irq_unmask() {
+    // SAFETY: as the unmask in `wait_for_interrupt_masked`; the missing `nomem` is the
+    // memory clobber discussed above.
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", options(nostack, preserves_flags));
+    }
+}
+
+/// The masked tail of [`wait_for_interrupt`]: arm the timer, `wfi`, unmask. The caller
+/// must hold the [`irq_mask`] — splitting the mask out is what lets the executor
+/// re-check its park conditions inside the lost-wakeup-free window.
+#[cfg(target_os = "none")]
+#[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
+pub fn wait_for_interrupt_masked(delay_ns: u64) {
+    // SAFETY: arming the timer and halting do not touch the stack or clobber registers
+    // the compiler relies on, and the missing `nomem` is the memory clobber discussed
+    // above.
+    unsafe {
         arm_wake(delay_ns);
         core::arch::asm!("wfi", options(nostack, preserves_flags));
         core::arch::asm!("msr daifclr, #2", options(nostack, preserves_flags));

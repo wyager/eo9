@@ -149,7 +149,14 @@ fn run_init(entries: &'static [StoreEntry], config: &str) -> Result<String, wasm
                     let children = shellexec::drive_children();
                     let services = super::svc::drive_services();
                     let any_runnable = children.any_runnable || services.any_runnable;
-                    let any_running = children.any_running || services.any_running;
+                    #[cfg(feature = "drive-stats")]
+                    {
+                        use core::sync::atomic::Ordering;
+                        super::drive_stats::PASSES.fetch_add(1, Ordering::Relaxed);
+                        if any_runnable {
+                            super::drive_stats::HOT_PASSES.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     // Liveness detector: runnable work discovered on the pass right after
                     // a backstop-rated wake was runnable while the core slept the cap.
                     if any_runnable && last_wake == super::WakeKind::Backstop {
@@ -157,20 +164,26 @@ fn run_init(entries: &'static [StoreEntry], config: &str) -> Result<String, wasm
                     }
                     last_wake = super::WakeKind::Event;
                     if !any_runnable {
-                        last_wake = super::idle_wait(any_running);
+                        last_wake = super::idle_wait();
                     } else {
-                        // The loop stays hot for a runnable child/service; wake any
-                        // input-parked future (the console's read-line) each pass so
-                        // the prompt stays responsive while something spins. Busy passes
+                        // The loop stays hot for a runnable child/service. Deliver any
+                        // *due* events to parked futures (console input that arrived,
+                        // an expired sleep deadline) so the prompt stays responsive
+                        // while something spins — but never a blanket wake, which
+                        // would mark every parked future runnable and keep the loop
+                        // hot forever (the 100% spin drive-stats caught). Busy passes
                         // also pat the board watchdog (idle passes pat in `idle_wait`),
                         // so a hot loop never starves the hang backstop. No-op on QEMU.
                         crate::wdt::pat();
-                        super::wake_idle();
+                        super::deliver_due_events();
                     }
                 }
             }
         }
     }
+
+    #[cfg(feature = "drive-stats")]
+    super::drive_stats::dump("init-end");
 
     Ok(results.first().map(wave::render).unwrap_or_default())
 }
@@ -342,7 +355,14 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
                     let children = shellexec::drive_children();
                     let services = super::svc::drive_services();
                     let any_runnable = children.any_runnable || services.any_runnable;
-                    let any_running = children.any_running || services.any_running;
+                    #[cfg(feature = "drive-stats")]
+                    {
+                        use core::sync::atomic::Ordering;
+                        super::drive_stats::PASSES.fetch_add(1, Ordering::Relaxed);
+                        if any_runnable {
+                            super::drive_stats::HOT_PASSES.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     // Liveness detector: runnable work discovered on the pass right after
                     // a backstop-rated wake was runnable while the core slept the cap.
                     if any_runnable && last_wake == super::WakeKind::Backstop {
@@ -350,20 +370,26 @@ fn run_eosh(entries: &'static [StoreEntry]) -> Result<String, wasmtime::Error> {
                     }
                     last_wake = super::WakeKind::Event;
                     if !any_runnable {
-                        last_wake = super::idle_wait(any_running);
+                        last_wake = super::idle_wait();
                     } else {
-                        // The loop stays hot for a runnable child/service; wake any
-                        // input-parked future (the console's read-line) each pass so
-                        // the prompt stays responsive while something spins. Busy passes
+                        // The loop stays hot for a runnable child/service. Deliver any
+                        // *due* events to parked futures (console input that arrived,
+                        // an expired sleep deadline) so the prompt stays responsive
+                        // while something spins — but never a blanket wake, which
+                        // would mark every parked future runnable and keep the loop
+                        // hot forever (the 100% spin drive-stats caught). Busy passes
                         // also pat the board watchdog (idle passes pat in `idle_wait`),
                         // so a hot loop never starves the hang backstop. No-op on QEMU.
                         crate::wdt::pat();
-                        super::wake_idle();
+                        super::deliver_due_events();
                     }
                 }
             }
         }
     }
+
+    #[cfg(feature = "drive-stats")]
+    super::drive_stats::dump("eosh-end");
 
     Ok(results.first().map(wave::render).unwrap_or_default())
 }

@@ -648,6 +648,42 @@ real parser-lane findings: the oracle walks are ~95% of per-key cost (a non-allo
 early-exit name query is the 5–7× first rung) and the word-end provide_args rebuild()
 is an O(N) 1.4–3.0 ms (HVF) spike that should re-arm incrementally — ladder in §6.
 
+UPDATE (area/34 fuel-yield-latency lane, 2026-06-09): **H1 — fuel-yield quantization
+riding a wake timer — is REFUTED**, and the board residue is sharpened. The QEMU
+reproduction under the board's exact station topology (echolat.py `--config station`:
+init + the kbd service chain + eosh as a fuel-sliced console child) shows NO
+tracked-key anomaly — station == plain, ~0.1 ms/key HVF, ~1.5 ms TCG — and the new
+`drive-stats` counters prove the mechanism H1 required does not exist: a fuel yield
+DOES ring the child's poll waker and the drive loop re-polls hot (tracked keys cross
+~30–50 FUEL_QUANTUM slices per key, all hot; the executor never sleeps mid-keystroke).
+Fuel burn is deterministic, so the board crosses the same quanta: ~46 ms tracked /
+~3 ms flag ≈ 30–50 drive passes at **~1 ms+ per pass on the A76 vs ~6.5 µs for the
+identical pass on HVF** — a ~150–200× per-pass execution anomaly, the same categorical
+multiplier §5 cornered, now pinned to the drive pass (and incompatible with cadence
+quantization: pre-fix the station loop never parked at all, and 3 ms is no cadence
+multiple). What the instrumentation found INSTEAD, both fixed on the area/34 branch:
+(1) the hot branch's blanket `wake_idle()` re-rang every parked future each pass — one
+hot pass made all later passes hot, so the station executor NEVER parked (27.8 M
+passes / 3 min, 100% CPU at an idle prompt, board included); now due-event delivery
+only, and the owner's executor ruling is in force — the 10 ms/1 s idle re-poll caps
+are deleted, the idle arm is exactly the earliest real deadline (sleeps, the 5 s board
+watchdog-pat obligation, the QEMU-only 1 s feed-kick), idle CPU measures 0.0% plain /
+~6–9% station-TCG (the remainder is the kbd service's own 2 ms HID pacing — a
+service-side follow-up: make usb.kbd intx-driven); (2) console-sink `inject` raised no
+wake at all — a USB keystroke sat until the next timer — now an input-arrival edge is
+checked before any park (QEMU A/B: injected-key median 9.2 → 6.2 ms, min 3.1 →
+0.76 ms; the residue is QEMU's own OHCI HID poll pacing). Detectors per doctrine: a
+park-gate scan (rung-after-check-in = loud `liveness:` finding + hot recovery; proven
+to fire under the `chaos-strand-runnable` arm while holding ~0.1 ms keys), and
+stranded-input scavenges now report on EVERY wake kind. The board residue stays OPEN
+as: per-drive-pass cost ≈ 1 ms on the A76 (fiber resume/suspend, store traversal,
+or the §5 memory-attribute suspicion) — one boot of the `drive-stats` image
+(`EO9_KERNEL_FEATURES_EXTRA=drive-stats`) gives passes/s + the rung/wake histogram to
+split per-pass overhead from raw guest-execution slowness. Queued follow-ups: the
+usermode twin (`drive_with_services`' 10 ms ambient park backstop — its stranded-work
+detector currently DEPENDS on that cap firing, so the deletion needs the detector
+redesigned completer-side first; S→M), and usb.kbd's 2 ms poll pace → intx-driven.
+
 ## build-kernel opi5plus overwrites the shared QEMU kernel ELF — silent wrong-binary boots
 (repl-m3 lane workaround, recorded by the review train, 2026-06-09) `cargo xtask
 build-kernel aarch64 opi5plus [minimal]` builds into the same cargo target path the

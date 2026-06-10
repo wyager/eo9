@@ -142,11 +142,41 @@ pub fn arm_wake(delay_ns: u64) {
 /// keep those reads from being cached across the halt.
 #[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
 pub fn wait_for_interrupt(delay_ns: u64) {
-    // SAFETY: masking delivery, programming the wake timer, and halting do not touch the
-    // stack or clobber registers the compiler relies on; the missing `nomem` on the
-    // halt/unmask pair is the memory clobber discussed above.
+    irq_mask();
+    wait_for_interrupt_masked(delay_ns);
+}
+
+/// Mask interrupt delivery (`cli`). Pairs with [`irq_unmask`] or
+/// [`wait_for_interrupt_masked`] — see the aarch64 twin for why the executor re-checks
+/// its park conditions inside the masked window (area/34).
+#[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
+pub fn irq_mask() {
+    // SAFETY: masking delivery touches neither stack nor compiler-visible state.
     unsafe {
         core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Unmask interrupt delivery (the bail path). Omits `nomem` like the halt path: the
+/// interrupt taken at the unmask writes memory the caller re-reads right afterwards.
+#[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
+pub fn irq_unmask() {
+    // SAFETY: as the `sti` in `wait_for_interrupt_masked`; the missing `nomem` is the
+    // memory clobber discussed above.
+    unsafe {
+        core::arch::asm!("sti", options(nostack, preserves_flags));
+    }
+}
+
+/// The masked tail of [`wait_for_interrupt`]: arm, then the `sti; hlt` pair (x86's
+/// lost-wakeup-free idle — `sti` takes effect after the following instruction). The
+/// caller must hold the [`irq_mask`].
+#[allow(dead_code)] // wasm executor idle path only; not the feature-less CI build
+pub fn wait_for_interrupt_masked(delay_ns: u64) {
+    // SAFETY: arming and halting do not touch the stack or clobber registers the
+    // compiler relies on; the missing `nomem` on the halt/unmask pair is the memory
+    // clobber discussed above.
+    unsafe {
         arm_wake(delay_ns);
         core::arch::asm!("sti", "hlt", options(nostack, preserves_flags));
     }
