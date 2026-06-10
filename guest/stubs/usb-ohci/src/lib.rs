@@ -17,6 +17,15 @@
 //! releases the claim so the next use retries), bounded polls (inside the core),
 //! typed errors never traps, and the short-poll "empty result = nothing waiting"
 //! contract on the interrupt endpoint.
+//!
+//! Events over polls (timer-crutch audit A1/A4): bring-up asks the provider for the
+//! region's interrupt (`platform::enable-interrupts`) — the SAME capability-gated
+//! shape as the QEMU shell `usb.ohci-pci` over eo9:pci. The v1 kernel root answers
+//! `unsupported` (platform interrupt routing is the recorded follow-up, usb-ohci-plan
+//! risk 7: GIC SPIs 216/219), so the board keeps the original short-poll shape and
+//! the consumers pace their reads — the documented v1 board residue. The moment the
+//! kernel routes the SPIs and answers `enable-interrupts` with a vector, this shell's
+//! reads and port watch park on the controller interrupt with NO change here.
 
 #![no_std]
 
@@ -27,7 +36,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use eo9_guest::provider::ProviderState;
-use eo9_ohci::driver::{DriverError, Ohci, RegionIo};
+use eo9_ohci::driver::{DriverError, Ohci, RegionIo, WaitOutcome};
 use eo9_ohci::schedule::arena;
 use eo9_ohci::setup::SetupPacket;
 
@@ -55,6 +64,10 @@ struct Adapter {
     region: platform::Region,
     dma: platform::DmaBuffer,
     dma_base: u32,
+    /// The interrupt handle the provider granted at bring-up, or `None` where the
+    /// provider routes no interrupts (the v1 kernel root answers `unsupported`) —
+    /// the polled fallback, decided once by capability availability.
+    interrupt: Option<platform::Interrupt>,
 }
 
 impl RegionIo for Adapter {
@@ -87,6 +100,20 @@ impl RegionIo for Adapter {
     fn dma_read(&mut self, offset: u64, buf: &mut [u8]) {
         let bytes = platform::dma_read(&self.dma, offset, buf.len() as u64);
         buf.copy_from_slice(&bytes);
+    }
+
+    async fn wait_interrupt(&mut self) -> Result<WaitOutcome, platform::PlatformError> {
+        let Some(line) = &self.interrupt else {
+            return Ok(WaitOutcome::Unsupported);
+        };
+        match platform::wait(line).await {
+            // A delivery (possibly coalesced or spurious): the core re-checks the
+            // cause registers.
+            Ok(_deliveries) => Ok(WaitOutcome::Delivered),
+            // Bound expiry or any other wait failure: one poll round, then the
+            // caller may wait again — bounded, never a hang, never a hot spin.
+            Err(_) => Ok(WaitOutcome::TimedOut),
+        }
     }
 }
 
@@ -183,27 +210,66 @@ async fn probe() -> Result<Driver, UsbError> {
         )));
     }
 
+    // Interrupt delivery: ask the provider to route the region's line. The v1 kernel
+    // root answers `unsupported` (usb-ohci-plan risk 7 — GIC SPIs 216/219 are the
+    // recorded follow-up); the driver then keeps the polled shape and the consumers
+    // pace their own reads. Capability-gated: when the routing lands, this same call
+    // starts answering with a handle and the event paths light up unchanged.
+    let interrupt = platform::enable_interrupts(&region).await.ok();
+    let events = interrupt.is_some();
+
     let name = target.name.clone();
     let mut driver = Ohci::new(Adapter {
         region,
         dma,
         dma_base: base as u32,
+        interrupt,
     });
     let info = driver.bring_up().await.map_err(map_driver_error)?;
+    if events {
+        // Unmask exactly the consumed causes (WDH + RHSC, under MIE): reads and the
+        // port watch park on the controller interrupt from here on.
+        driver.enable_events().await.map_err(map_driver_error)?;
+    }
 
-    // One diagnostic line, like net.rtl8125's: the bring-up facts a transcript needs.
+    // One diagnostic line, like net.rtl8125's: the bring-up facts a transcript needs
+    // (including how completions are observed — the disk.virtio convention).
     let handle = text::default();
     let _ = text::write(
         &handle,
         text::OutputStream::Out,
         &format!(
-            "usb.ohci: OHCI {:x}.{:x} on region {name} - {} root-hub port(s)\n",
+            "usb.ohci: OHCI {:x}.{:x} on region {name} - {} root-hub port(s), events: {}\n",
             info.revision >> 4,
             info.revision & 0xf,
             info.ports,
+            if events { "interrupt" } else { "polled" },
         ),
     );
     Ok(driver)
+}
+
+/// Report a rescue loudly (owner doctrine): a report that arrived only through the
+/// post-timeout drain is work the interrupt owed — a `liveness:` line, first
+/// occurrence and every 16th after, the kernel detectors' rate-limit convention.
+/// (Unreachable while the platform root answers `unsupported`; armed for the day
+/// the board routes its SPIs.)
+fn report_rescue() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static RESCUES: AtomicU32 = AtomicU32::new(0);
+    let n = RESCUES.fetch_add(1, Ordering::Relaxed);
+    if n.is_multiple_of(16) {
+        let handle = text::default();
+        let _ = text::write(
+            &handle,
+            text::OutputStream::Out,
+            &format!(
+                "liveness: usb.ohci: a HID report arrived only via the post-timeout \
+                 drain poll - the WDH interrupt owed this wake (n={})\n",
+                n + 1,
+            ),
+        );
+    }
 }
 
 /// Map the shared core's typed failures onto the WIT's vocabulary.
@@ -383,8 +449,11 @@ struct ShellDevice {
 }
 
 /// The opened interrupt-IN endpoint (one per controller in v1 — the core owns its
-/// re-arm state).
-struct ShellEndpoint;
+/// re-arm state). Carries whether reads park on the controller interrupt, decided
+/// once at bring-up by capability availability (the consumer's pacing signal).
+struct ShellEndpoint {
+    events: bool,
+}
 
 impl types::Guest for Shell {
     type UsbImpl = UsbRoot;
@@ -426,6 +495,16 @@ impl usb::Guest for Shell {
             powered: status.powered,
             low_speed: status.low_speed,
             connect_change: status.connect_change,
+        })
+    }
+
+    async fn watch_ports(_u: types::UsbImplBorrow<'_>) -> Result<usb::WatchOutcome, UsbError> {
+        let mut guard = acquire().await?;
+        let outcome = guard.wait_port_change().await.map_err(map_driver_error)?;
+        Ok(match outcome {
+            WaitOutcome::Delivered => usb::WatchOutcome::Changed,
+            WaitOutcome::TimedOut => usb::WatchOutcome::TimedOut,
+            WaitOutcome::Unsupported => usb::WatchOutcome::Unsupported,
         })
     }
 
@@ -564,17 +643,33 @@ impl usb::Guest for Shell {
             .open_interrupt_in(address, low_speed, endpoint, max_packet, interval_ms)
             .await
             .map_err(map_driver_error)?;
-        Ok(usb::Endpoint::new(ShellEndpoint))
+        Ok(usb::Endpoint::new(ShellEndpoint {
+            events: guard.events(),
+        }))
+    }
+
+    fn event_driven(e: usb::EndpointBorrow<'_>) -> bool {
+        e.get::<ShellEndpoint>().events
     }
 
     async fn read(_e: usb::EndpointBorrow<'_>) -> Result<Vec<u8>, UsbError> {
         let mut guard = acquire().await?;
         let mut report = [0u8; arena::INTERRUPT_BUFFER_LEN as usize];
-        match guard.poll_interrupt(&mut report).await {
-            Ok(Some(length)) => Ok(report[..length].to_vec()),
-            // Nothing arrived within the short poll: the empty result, the consumer
-            // owns the wait policy (the recv-frame contract).
-            Ok(None) => Ok(Vec::new()),
+        match guard.read_report(&mut report).await {
+            Ok(read) => {
+                if read.rescued {
+                    // The fallback poll found work the interrupt owed: loud, never
+                    // silent (the scavenge_rx lesson).
+                    report_rescue();
+                }
+                // With events live this parked on WDH (empty = bounded wait expired,
+                // call again); without — the v1 board shape — it was one short poll
+                // and the consumer owns the wait policy (the recv-frame contract).
+                Ok(read
+                    .length
+                    .map(|length| report[..length].to_vec())
+                    .unwrap_or_default())
+            }
             Err(error) => Err(map_driver_error(error)),
         }
     }

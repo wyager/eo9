@@ -659,3 +659,52 @@ self-heal, but any direct `-kernel` use of the stale path bites. Lane: per-profi
 artifact paths (e.g. a `--target-dir` or renamed output per board profile) so the two
 binaries can never shadow each other; until then, sequence board builds AFTER QEMU
 gates in any battery.
+
+## USB HID events: QEMU leg is interrupt-driven; the board's polled reads are the v1 residue (area/37, fixes timer-crutch audit A1+A4 QEMU legs, 2026-06-09)
+The discarded-event bug is fixed where the plumbing exists: `usb.ohci-pci` now asks
+`pci::enable-interrupts` for one INTx vector at bring-up (the disk.virtio shape) and
+the shared OHCI core unmasks exactly WDH+RHSC (+MIE, `Ohci::enable_events`) — `usb::read`
+parks on the done-queue writeback instead of answering empty every 2 ms, and the new
+`usb::watch-ports` parks on RHSC instead of 50/100 ms port sweeps. Ack discipline
+unchanged: WDH is acked once, by `consume_done_queue` after taking HccaDoneHead; RHSC
+is acked by the wait paths (port change bits stay readable for the sweeps). `usb.kbd`
+and `hidcheck` skip their `POLL_PACE_NS` pacing when `usb::event-driven` answers true.
+Measured (QEMU TCG, foreground `usb.kbd --window-ms 40000`, no typing, same build with
+the shell's vector request toggled): 1904 read rounds per 40 s window polled — each a
+multi-host-call drain through the composed component — vs 4 rounds event-driven (the
+2 s wait-bound cadence): ~480× fewer wakes; with typing, wakes are per keystroke and
+the gates' 250 ms QMP pacing decodes every transition, hub leg included. NOTE the idle
+host-CPU% did NOT move (~83-100% polled, ~99% event-driven, both pegged-class): the
+drive loop stays hot for other reasons — see the companion entry below. Liveness
+doctrine wired, not just honored: a report found by the post-timeout drain prints a
+rate-limited `liveness: usb.ohci-pci:` line (shell), and a connect found by a sweep
+after a timed-out `watch-ports` prints `liveness: usb.kbd:` — the fallback rescues
+loudly, never silently. REMAINING RESIDUE (the board leg, capability-gated not
+cfg-gated): `usb.ohci` already calls `platform::enable-interrupts` and falls back
+cleanly when the v1 kernel root answers `unsupported`, so the board keeps today's
+2 ms read pace and 50 ms connect sweeps until platform interrupt routing lands
+(usb-ohci-plan risk 7 / §6 design note: per-region GIC SPIs 216/219 + an IntxWait
+mirror in platform_provider — kernel-side only, zero guest changes). The audit's A1
+GAPS entry (area/35) should be folded into this one when both lanes merge.
+
+## The kernel session never idles while any composition is alive — USB event wakes are fixed but the core still burns ~100% (area/37 measurement, 2026-06-09)
+Found while proving the A1 fix's wake-rate claim: with the kbd path fully
+event-driven (4 guest read rounds per 40 s, see the entry above), the station config
+STILL pegs the host vCPU at ~99% (10-sample ps means; before the fix it measured
+~83% with dips to ~42%), and a foreground `usb.kbd` window pegs ~99% as well. PC
+sampling via QMP (30 × `info registers` at idle) lands almost every sample inside
+`wasm::svc::drive_services`+0x28 with the rest in `IntxWait::poll` — the drive loop
+is executing passes back-to-back, not parked in `wfi`. Two suspects, both inventoried
+by the audit and owned by area/34's executor lane, now with a measurement attached:
+(1) the exec surface's `task.wait` host call rings its own waker on every pending
+poll ("stay runnable so that loop keeps turning", wasm/shellexec.rs:2555) — any eosh
+waiting on a foreground child is permanently runnable, so the session loop takes the
+hot branch (`wake_idle`, no `idle_wait`) for the child's whole lifetime; (2) even
+with nothing runnable (station at the bare prompt + one parked service), the
+10 ms `IDLE_WAKE_INTERVAL_NS` child-running cap plus the apparent cost of re-polling
+parked component instances keeps the duty cycle saturated under TCG (the parked
+IntxWait's 2 s bound was observed expiring at ~10 s granularity — re-polls are that
+far apart while the core is 100% busy, i.e. each pass is wall-clock expensive).
+Consequence for the doctrine: fixing the device-driver crutches (A1 here, A2 next)
+is necessary but NOT sufficient for an idle station — the executor lane must land
+before the idle-CPU win is observable. Numbers and probes: area/37's lane report.

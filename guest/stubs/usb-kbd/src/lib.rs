@@ -37,9 +37,19 @@ eo9_guest::bindings!({
     apis: [usb, console_sink, time, text],
 });
 
-/// Port sweeps before concluding nothing is connected.
-const WATCH_SWEEPS: u32 = 50;
+/// Wall-clock budget for the connect watch before concluding nothing is connected
+/// (the old 50 sweeps × 50 ms, expressed as the time window it always was).
+const WATCH_WINDOW_NS: u64 = 2_500_000_000;
+/// Sweep pacing for the connect watch where the provider has no event surface
+/// (`watch-ports` answers `unsupported` — the v1 board residue; with events the
+/// RHSC wait paces the loop and this sleep never runs).
+const WATCH_PACE_NS: u64 = 50_000_000;
 /// Pause between empty endpoint polls (2 ms — under a keyboard's 8-10 ms interval).
+/// The capability-gated fallback ONLY: where the provider routes the controller
+/// interrupt (`event-driven` answers true — the QEMU PCI leg today, the board once
+/// GIC SPIs 216/219 are routed), `read` parks on the interrupt and this pace is
+/// skipped entirely (timer-crutch audit A1). Where it does not (eo9:platform v1),
+/// reads are short polls and this pace is the documented v1 board residue.
 const POLL_PACE_NS: u64 = 2_000_000;
 /// HID usage for 'c' (ctrl+c -> raw 0x03).
 const USAGE_C: u8 = 0x06;
@@ -59,23 +69,45 @@ eo9_guest::main! {
     let time = time_api::default();
     let console = sink::default();
 
-    // Find the first connected root port.
+    // Find the first connected root port: sweep, then park on the root-hub change
+    // event (RHSC) where the provider supports it — `timed-out` answers just mean
+    // "re-sweep and wait again" (the wait paced the loop); only the `unsupported`
+    // fallback paces itself (audit A4). Bounded by wall clock, as the sweep count
+    // always effectively was.
     let info = usb::controller(&root).await.map_err(usb_failure)?;
-    let mut connected_port = None;
-    'watch: for _ in 0..WATCH_SWEEPS {
+    let watch_started = time_api::monotonic_now(&time);
+    let mut after_timed_out_wait = false;
+    let port = 'watch: loop {
         for port in 1..=info.ports {
             let status = usb::port(&root, port).await.map_err(usb_failure)?;
             if status.connected {
-                connected_port = Some(port);
-                break 'watch;
+                if after_timed_out_wait {
+                    // The sweep found a connect the RHSC event never delivered:
+                    // loud, never silent (owner doctrine — the fallback may keep
+                    // things working but must report the missed event).
+                    let _ = text::write_out_line(
+                        "liveness: usb.kbd: the port sweep found a connect after a \
+                         timed-out watch-ports wait - the RHSC event owed this wake",
+                    );
+                }
+                break 'watch port;
             }
         }
-        time_api::sleep(&time, 50_000_000).await;
-    }
-    let Some(port) = connected_port else {
-        return Err(ProgramFailure::NoKeyboard(String::from(
-            "no device connected on any root-hub port",
-        )));
+        let now = time_api::monotonic_now(&time);
+        if now.nanoseconds.saturating_sub(watch_started.nanoseconds) > WATCH_WINDOW_NS {
+            return Err(ProgramFailure::NoKeyboard(String::from(
+                "no device connected on any root-hub port",
+            )));
+        }
+        after_timed_out_wait = false;
+        match usb::watch_ports(&root).await {
+            Ok(usb::WatchOutcome::Changed) => {}
+            Ok(usb::WatchOutcome::TimedOut) => after_timed_out_wait = true,
+            // No event surface (or the wait failed): the polled fallback paces.
+            Ok(usb::WatchOutcome::Unsupported) | Err(_) => {
+                time_api::sleep(&time, WATCH_PACE_NS).await;
+            }
+        }
     };
 
     // Attach; traverse one hub level when the root device is a hub (class 09).
@@ -178,7 +210,13 @@ eo9_guest::main! {
     )
     .map_err(io_failure)?;
 
-    // The forwarding loop.
+    // The forwarding loop. Event-driven where the provider routes the controller
+    // interrupt: `read` parks on WDH and an empty answer is just the provider's
+    // bounded wait expiring — call again, no pacing, the core sleeps between
+    // keystrokes (audit A1: this service used to wake the core every 2 ms forever).
+    // Without events (the v1 board residue) reads are short polls and POLL_PACE_NS
+    // keeps the loop honest toward the scheduler, exactly as before.
+    let event_driven = usb::event_driven(&opened);
     let started = time_api::monotonic_now(&time);
     let window_ns = u64::from(window_ms.unwrap_or(0)) * 1_000_000;
     let mut previous = KeyboardReport::default();
@@ -194,7 +232,9 @@ eo9_guest::main! {
             ProgramFailure::DeviceLost(format!("interrupt endpoint: {err:?}"))
         })?;
         if report.is_empty() {
-            time_api::sleep(&time, POLL_PACE_NS).await;
+            if !event_driven {
+                time_api::sleep(&time, POLL_PACE_NS).await;
+            }
             continue;
         }
         let Some(current) = KeyboardReport::parse(&report) else {

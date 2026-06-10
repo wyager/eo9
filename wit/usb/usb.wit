@@ -57,6 +57,21 @@ interface usb {
         ports: u8,
     }
 
+    /// Outcome of one bounded root-hub event wait (`watch-ports`).
+    enum watch-outcome {
+        /// The controller signalled a root-hub status change (the event path) —
+        /// re-read `port` now.
+        changed,
+        /// The provider's bounded wait window expired with no change signalled.
+        /// Re-sweeping costs nothing (the wait already paced the loop); a device
+        /// found by that sweep is work the event should have delivered.
+        timed-out,
+        /// The provider has no interrupt surface on this configuration (e.g. the
+        /// board's eo9:platform answers `unsupported` in v1): the caller owns its
+        /// sweep pacing — the polled fallback.
+        unsupported,
+    }
+
     /// One root-hub port's status (OHCI: HcRhPortStatus decoded).
     record port-status {
         /// A device is connected (CCS).
@@ -83,6 +98,14 @@ interface usb {
     /// One port's current status. Ports are numbered from 1, as in the OHCI register
     /// file.
     port: async func(u: borrow<usb-impl>, port: u8) -> result<port-status, usb-error>;
+
+    /// Park until the root hub signals a connect-status change (OHCI RHSC), where the
+    /// controller's interrupt is routed; the wait is bounded by the provider (the
+    /// SPEC's awaits-are-bounded rule), so `timed-out` is an ordinary answer — call
+    /// again after re-sweeping `port`. Where no interrupt surface exists the call
+    /// returns `unsupported` immediately and the caller paces its own sweeps (the
+    /// capability-gated polled fallback — the board's v1 shape).
+    watch-ports: async func(u: borrow<usb-impl>) -> result<watch-outcome, usb-error>;
 
     /// Reset the port (OHCI 1.0a port-reset timing), assign the device an address, and
     /// size endpoint 0 from the descriptor head. The returned device is ready for
@@ -127,9 +150,21 @@ interface usb {
         interval-ms: u8,
     ) -> result<endpoint, usb-error>;
 
-    /// Poll for the next report on the endpoint. An empty list means nothing arrived
-    /// within the provider's short poll window — the consumer owns the wait policy
-    /// (the same "empty result = nothing waiting" contract as eo9:net's recv-frame).
+    /// Whether reads on this endpoint are event-driven: `true` means `read` parks on
+    /// the controller's interrupt (the consumer drops its poll pacing and just calls
+    /// `read` again on an empty answer); `false` means reads are short polls and the
+    /// consumer owns the pacing (the capability-gated fallback where the underlying
+    /// device capability routes no interrupts — drivers hold no time capability, so
+    /// the pacing has to live with the consumer).
+    event-driven: func(e: borrow<endpoint>) -> bool;
+
+    /// The next report on the endpoint. Where the controller's interrupt is routed
+    /// (`event-driven` answers true), this parks until the endpoint's done-queue
+    /// writeback (OHCI WDH) or the provider's bounded wait window expires — an empty
+    /// list then just means "call again". Where no interrupt surface exists it is a
+    /// short poll: an empty list means nothing arrived and the consumer owns the wait
+    /// policy (the same "empty result = nothing waiting" contract as eo9:net's
+    /// recv-frame).
     read: async func(e: borrow<endpoint>) -> result<list<u8>, usb-error>;
 }
 
