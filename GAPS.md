@@ -542,12 +542,17 @@ already recorded. This now BLOCKS any branch's `cargo xtask ci` from exiting 0
 reliably; the graduated bug-hunt lane is urgent. The usb branch documents it as the
 sole ci failure with this master baseline as proof.
 
-## Bundle checkout-dependence is a CLASS, not one component (kernhyg lane, 2026-06-08)
+## Bundle checkout-dependence is a CLASS, not one component (kernhyg lane, 2026-06-08; breadth verified 2026-06-09)
 The fs-eofs path-dep byte-churn applies to EVERY component consuming an
 out-of-workspace path dep (-C metadata hash): now curl, l4check, hidcheck, usbcheck,
 net.rtl8125, usb.ohci, usb.ohci-pci via eo9-dns/eo9-ohci/eo9-rtl8125/eo9-curl-core.
-Standing rule unchanged (refresh from the main checkout post-merge) but the reviewer
-checklist should treat ANY bundle diff from a worktree as suspect-residue first.
+BREADTH (area/37 lane observation, reviewer-verified by running check-components-bundle
+inside a worktree): the class is wider than the path-dep consumers — essentially ALL
+87 components read stale from a worktree checkout (coreutils, examples, stubs
+included), so a full `refresh-components` run anywhere but the main checkout rewrites
+the whole bundle with residue bytes. Standing rule sharpened: refresh-components is
+MAIN-CHECKOUT-ONLY, lanes commit only the components their diff actually changed, and
+the reviewer treats ANY bundle diff from a worktree as suspect-residue first.
 Real fix candidates: workspace-ize the shared crates or pin metadata hashing.
 
 ## Network kexec residuals (area/21-kexec, 2026-06-08)
@@ -708,3 +713,29 @@ far apart while the core is 100% busy, i.e. each pass is wall-clock expensive).
 Consequence for the doctrine: fixing the device-driver crutches (A1 here, A2 next)
 is necessary but NOT sufficient for an idle station — the executor lane must land
 before the idle-CPU win is observable. Numbers and probes: area/37's lane report.
+UPDATE (review train, 2026-06-09): area/34 has since merged — the blanket hot-pass
+wake and the 10 ms/1 s caps are gone, and the reviewer measured station idle at
+~12% TCG (plain 0.0%), so suspect (2) is resolved; the `task.wait` self-wake half
+(suspect 1, the foreground-composition spin) STANDS and remains the area/35 class-A
+usermode/kernel follow-up this entry's PC samples corroborate.
+
+## usb `watch-ports` has no gate exercising it (area/37 review, 2026-06-09)
+Every gate boots with the keyboard already attached, so usb.kbd's first sweep finds
+the device and `watch-ports` (the RHSC park) never runs end to end — it is covered
+by the eo9-ohci mock tests only. The cheap gate arm when a lane wants it: boot the
+check-usb-hub topology WITHOUT `-device usb-kbd`, start `usb.ohci-pci $ usb.kbd`
+(it enters the watch), then QMP `device_add usb-kbd,bus=eo9ohci.0,port=1.1` and
+assert the attach banner + a forwarded keystroke — proving RHSC delivery, the
+Changed arm, and the liveness line's absence on the event path.
+
+## usb event-mode wait errors map to TimedOut — a latent hot-spin if a vector can ever die mid-task (area/37 review, 2026-06-09)
+Both OHCI shells map any `pci::wait`/`platform::wait` error to `TimedOut` (the
+polled-fallback round). Sound today: interrupt handles are task-scoped, so no live
+task can hold a dead vector, and a real bound expiry takes the full bound. But if a
+revocable-vector state is ever introduced (per-device interrupt teardown, hot
+unplug), an INSTANTLY-erroring wait plus usb.kbd's cached `event-driven` answer
+(pacing dropped) becomes a hot loop: drivers hold no time capability and cannot
+self-pace. The degradation design when that day comes: after N consecutive wait
+errors the shell drops its vector (waits answer `Unsupported`) and flips the
+endpoint's `event-driven` answer false; the consumer re-queries `event-driven` on
+empty reads and resumes its pacing. Comments at both Err arms point here.

@@ -588,7 +588,20 @@ impl<R: RegionIo> Ohci<R> {
             }
         };
         self.disable_control_list().await?;
-        self.reap_done_queue().await?;
+        // Clean drain: every submitted TD retired (head reached the dummy), so every
+        // writeback is owed. Halted: only the offender is guaranteed retired (its
+        // predecessors' writebacks, if split off, are strays the next consume
+        // collects; the ED and slots are re-initialized wholesale on the next
+        // transfer, so a stray walk reads retired-then-rewritten content only on the
+        // already-rare error path — the happy path is airtight).
+        let expected = if halted {
+            1
+        } else if has_data {
+            3
+        } else {
+            2
+        };
+        self.reap_done_queue(expected).await?;
 
         // Judge the retired TDs by their written-back condition codes.
         // DataUnderrun with rounding on is a permitted short packet; the controller
@@ -665,6 +678,7 @@ impl<R: RegionIo> Ohci<R> {
             .map_err(DriverError::Io)?;
         // Validate the chain (bounded), but the per-TD judgement is the caller's.
         let mut reads: heapless_chain::Chain = Default::default();
+        let mut walked = 0u32;
         let result = walk_done_queue(
             head,
             DONE_QUEUE_LIMIT,
@@ -674,38 +688,48 @@ impl<R: RegionIo> Ohci<R> {
                 self.io.dma_read(offset, &mut td_bytes);
                 TransferDescriptor::decode(&td_bytes)
             },
-            |address, _| reads.push(address),
+            |address, _| {
+                reads.push(address);
+                walked += 1;
+            },
         );
         if result.is_err() {
             return Err(DriverError::DoneQueueCorrupt);
         }
-        Ok(head & !0xf)
+        Ok(walked)
     }
 
-    /// Take and acknowledge the done-queue writeback for TDs known to have retired.
+    /// Take and acknowledge the done-queue writeback for TDs known to have retired,
+    /// COUNTED: `expected` is the number of retired TDs whose writebacks must be
+    /// collected before any of their slots may be reused.
     ///
     /// Event mode: the retired TDs requested the interrupt (DI_IMMEDIATE), so the
-    /// writeback lands within a frame — wait it out (bounded) and consume it, keeping
-    /// the TD slots clean BEFORE they are reused (a slot rewritten while its
-    /// writeback is still pending would leave HccaDoneHead pointing into recycled
-    /// memory — the corrupt-walk class this discipline exists to prevent).
+    /// writebacks land within a frame each — wait them out (bounded) and consume
+    /// until the count is in, keeping the TD slots clean BEFORE they are reused (a
+    /// slot rewritten while its writeback is still pending would leave HccaDoneHead
+    /// pointing into recycled memory — the corrupt-walk class this discipline exists
+    /// to prevent). Counting matters because the writebacks can SPLIT: a chain whose
+    /// TDs retire across frame boundaries flushes its first batch at the next tick
+    /// and holds the rest behind the WDH it just set — a reap that stops at the
+    /// first non-empty take would leave the held batch to land after slot reuse
+    /// (the recycled-slot walk again, in a narrower window).
     ///
     /// Polled mode: DI_NONE TDs never arm the writeback, so this is one best-effort
-    /// take — the original shape, byte for byte.
-    async fn reap_done_queue(&mut self) -> Result<(), DriverError<R::Error>> {
-        if self.consume_done_queue().await? != 0 || !self.events {
+    /// take — the original shape, byte for byte; `expected` is ignored.
+    async fn reap_done_queue(&mut self, expected: u32) -> Result<(), DriverError<R::Error>> {
+        let mut taken = self.consume_done_queue().await?;
+        if !self.events {
             return Ok(());
         }
         let mut polls = 0u32;
-        loop {
-            if self.consume_done_queue().await? != 0 {
-                return Ok(());
-            }
+        while taken < expected {
+            taken += self.consume_done_queue().await?;
             polls += 1;
             if polls > WRITEBACK_POLL_LIMIT {
                 return Err(DriverError::Timeout("done-queue writeback"));
             }
         }
+        Ok(())
     }
 
     /// Reset the port, address the device, and run the GET_DESCRIPTOR chain — the
@@ -998,8 +1022,9 @@ impl<R: RegionIo> Ohci<R> {
             // Event mode parks on WDH, so this TD must REQUEST the writeback
             // interrupt: at the default DI_NONE the controller never arms the
             // interrupt-delay counter and the edge `read_report` waits on does not
-            // exist. (Control TDs stay DI_NONE — their path drains the ED by poll
-            // and an unconsumed WDH mid-enumeration would only be a spurious wake.)
+            // exist. (Control TDs request it too in event mode — control_transfer's
+            // deferred-chain rationale — and their writebacks are reaped counted
+            // before slot reuse.)
             td.delay_interrupt = DI_IMMEDIATE;
         }
         td.next = base + dummy as u32;
@@ -1107,7 +1132,7 @@ impl<R: RegionIo> Ohci<R> {
         let copied = received.min(report.len());
         self.io
             .dma_read(arena::INTERRUPT_BUFFER, &mut report[..copied]);
-        self.reap_done_queue().await?;
+        self.reap_done_queue(1).await?;
 
         // Re-arm: the old dummy becomes the pending TD, the old pending the new dummy
         // (the standard tail-swap; the controller owns head, we only move tail).
@@ -1323,6 +1348,17 @@ mod tests {
         /// none materializes — so a driver that forgets the unmask cannot pass an
         /// event-mode test.
         wait_script: std::collections::VecDeque<WaitOutcome>,
+        /// Control TDs retired per processing pass (`u32::MAX` = the whole chain in
+        /// one shot, QEMU's shape). A finite limit models silicon retiring one TD
+        /// per frame, which SPLITS a transfer's done-queue writebacks across ticks
+        /// with WDH gating the later batches — the counted-reap discipline's forcing
+        /// case. The remainder is re-driven from `tick`.
+        control_retire_limit: u32,
+        /// The in-flight control request's answer and refusal flag, carried across
+        /// limited passes (the Setup stage runs in an earlier pass than the data
+        /// stage it answers).
+        control_response: Vec<u8>,
+        control_refused: bool,
     }
 
     const DMA_BASE: u32 = 0x4000_0000;
@@ -1392,6 +1428,9 @@ mod tests {
                 rhsc: false,
                 interrupt_enable: 0,
                 wait_script: std::collections::VecDeque::new(),
+                control_retire_limit: u32::MAX,
+                control_response: Vec::new(),
+                control_refused: false,
             }
         }
 
@@ -1540,9 +1579,8 @@ mod tests {
             let mut ed_bytes = [0u8; 16];
             ed_bytes.copy_from_slice(self.arena_slice(self.dma_base + ed_offset as u32, 16));
             let mut ed = EndpointDescriptor::decode(&ed_bytes);
-            let mut response: Vec<u8> = Vec::new();
-            let mut refused = false;
-            while ed.head != ed.tail {
+            let mut retired_this_pass = 0u32;
+            while ed.head != ed.tail && retired_this_pass < self.control_retire_limit {
                 let td_address = ed.head;
                 let mut td_bytes = [0u8; 16];
                 td_bytes.copy_from_slice(self.arena_slice(td_address, 16));
@@ -1552,11 +1590,12 @@ mod tests {
                         let mut setup_bytes = [0u8; 8];
                         setup_bytes.copy_from_slice(self.arena_slice(td.current_buffer, 8));
                         let mut answered = Vec::new();
-                        refused = !self.answer(ed.function_address, setup_bytes, &mut answered);
-                        response = answered;
+                        self.control_refused =
+                            !self.answer(ed.function_address, setup_bytes, &mut answered);
+                        self.control_response = answered;
                         td.condition_code = ConditionCode::NoError;
                     }
-                    TdPid::In | TdPid::Out if refused => {
+                    TdPid::In | TdPid::Out if self.control_refused => {
                         // The device refuses the request with a protocol STALL of the
                         // next stage (USB 2.0 §8.5.3.4): retire this TD with the Stall
                         // condition, halt the ED, stop processing its list.
@@ -1566,9 +1605,9 @@ mod tests {
                     TdPid::In => {
                         if td.current_buffer != 0 {
                             let capacity = (td.buffer_end - td.current_buffer + 1) as usize;
-                            let send = response.len().min(capacity);
+                            let send = self.control_response.len().min(capacity);
                             let start = td.current_buffer;
-                            let payload: Vec<u8> = response[..send].to_vec();
+                            let payload: Vec<u8> = self.control_response[..send].to_vec();
                             self.arena_slice(start, send).copy_from_slice(&payload);
                             // CBP: 0 if the buffer was filled exactly, else next byte.
                             td.current_buffer = if send == capacity {
@@ -1595,6 +1634,7 @@ mod tests {
                 let encoded = td.encode();
                 self.arena_slice(td_address, 16).copy_from_slice(&encoded);
                 self.done_head = td_address;
+                retired_this_pass += 1;
                 if ed.halted {
                     break;
                 }
@@ -1613,6 +1653,11 @@ mod tests {
                 return;
             }
             self.frame = (self.frame + 1) & 0xffff;
+            if self.control_retire_limit != u32::MAX {
+                // Per-frame retirement model: keep draining the control ED one
+                // limited pass per frame (a no-op once head == tail or halted).
+                self.process_control_list();
+            }
             self.process_periodic();
             self.flush_done();
         }
@@ -2133,6 +2178,52 @@ mod tests {
             )),
             Err(DriverError::Hub("the attached device is not a hub"))
         );
+    }
+
+    #[test]
+    fn event_mode_reaps_split_writebacks_before_returning() {
+        // Silicon-shaped timing: one control TD retires per frame, so the
+        // GET_DESCRIPTOR chain's writebacks SPLIT — the first batch flushes at the
+        // next tick and sets WDH, the rest is held behind it. The counted reap must
+        // collect every batch before control() returns; a first-non-empty reap
+        // would return with a writeback still owed, and the next transfer's slot
+        // rewrites would then be walked as a done chain (the recycled-slot class).
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.enable_events()).unwrap();
+        driver.io().control_retire_limit = 1;
+        let mut data = [0u8; 64];
+        let received = run(driver.control(
+            0,
+            8,
+            false,
+            setup::get_descriptor(setup::descriptor_type::DEVICE, 0, 64),
+            &mut data,
+        ))
+        .unwrap();
+        assert_eq!(received, 18, "the split passes still answer the request");
+        assert_eq!(&data[..18], &DEVICE);
+        // Airtight: nothing may still be owed when control() returns — the
+        // accumulator is empty, HccaDoneHead carries no unconsumed chain, and WDH
+        // is acknowledged, so every TD slot is safely reusable.
+        assert_eq!(driver.io().done_head, 0, "accumulator drained");
+        let head_offset = (arena::HCCA + hcca::DONE_HEAD) as usize;
+        assert_eq!(
+            &driver.io().arena[head_offset..head_offset + 4],
+            &[0u8; 4],
+            "no unconsumed HccaDoneHead writeback"
+        );
+        assert!(!driver.io().wdh, "WDH acknowledged after the counted reap");
+        // And the very next transfer over the same slots stays clean.
+        let received = run(driver.control(
+            0,
+            8,
+            false,
+            setup::get_descriptor(setup::descriptor_type::DEVICE, 0, 64),
+            &mut data,
+        ))
+        .unwrap();
+        assert_eq!(received, 18);
     }
 
     #[test]
