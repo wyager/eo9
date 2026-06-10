@@ -91,14 +91,14 @@ console = eosh use l4=lan
 
 /// The QEMU shape of station-net: the virtio NIC under slirp's default layout
 /// (10.0.2.15/24, gateway 10.0.2.2 — the middleware's documented default, no
-/// configuration needed). Boot it with `station-net pci console-sink` (the check-share
-/// gate's curl leg).
+/// configuration needed). Boot it with `station-net pci` (the check-share gate's curl
+/// leg). The keyboard service is the board profile's line (and check-station's QEMU
+/// subject); this config keeps the QEMU gate transcript single-subject.
 #[cfg(not(feature = "board-opi5plus"))]
 const STATION_NET_SERVICES_CONFIG: &str = "\
 # the net station (the `station-net` boot token): init owns the net stack; the console
 # children reach it through the kernel call gate.
 lan = net.virtio $ net.l4.over-l2 $ l4.factory share eo9:net/l4 restart restart.always
-kbd = usb.ohci-pci $ usb.kbd restart restart.always
 console = eosh use l4=lan
 ";
 

@@ -447,6 +447,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("check-kexec", rest)?;
             check_kexec(&root)
         }
+        "check-share" => {
+            expect_no_args("check-share", rest)?;
+            check_share(&root)
+        }
         "check-curl" => {
             expect_no_args("check-curl", rest)?;
             check_curl(&root)
@@ -630,6 +634,12 @@ COMMANDS:
                          framing, ack-driven progress), and assert the `kexec: jumping`
                          line followed by kernel B's stamped banner and a live prompt on
                          the same serial stream
+    check-share          The kernel call gate, end to end (shared-resources M1): the R2
+                         bring-up check headless; the gatedemo boot (loopback share) with
+                         a bare `sockcheck` through the gate plus the typed severance
+                         refusal after `svc stop lan`; the station-net boot (virtio share)
+                         with a bare `curl` fetching a host fixture — no composition typed
+                         anywhere.
     check-curl           Boot the same machine (no host-forward needed: the guest dials
                          out), serve a fixture file from a loopback-bound
                          `python3 -m http.server` on an OS-assigned port, drive
@@ -5979,6 +5989,135 @@ fn spawn_http_fixture(directory: &Path) -> Result<(std::process::Child, u16), St
 }
 
 /// Boot, GET the fixture through the composed transport stack, validate the report.
+/// `cargo xtask check-share` — the kernel call gate's scripted QEMU battery
+/// (shared-resources design, M1). Three legs, each a fresh boot:
+///
+/// 1. **R2** (`gatecheck`, headless): `run_concurrent` + concurrent export calls in one
+///    store on the no_std vendored wasmtime — the design's bring-up gate.
+/// 2. **gatedemo** (loopback share): a bare `sockcheck --payload …` at the console runs
+///    its whole TCP+UDP battery through gate calls into the owner's store (multiple
+///    calls in flight through one owner = the instance-lock serialization story), then
+///    `svc stop lan` severs the share and the next spawn refuses with the typed §6
+///    story.
+/// 3. **station-net** (virtio share): init owns `net.virtio $ net.l4.over-l2 $
+///    l4.factory` as the `lan` service; a bare `curl http://10.0.2.2:<port>/hello.txt`
+///    at the console fetches a host fixture through the gate — status line, body bytes,
+///    and the typed fetched outcome asserted. smoltcp's recv parks inside the owner
+///    while serving, which is the parked-call flavor R2's loopback leg cannot exercise.
+fn check_share(root: &Path) -> Result<(), String> {
+    let image = build_kernel(root, "aarch64")?;
+
+    // ----- leg 1: the R2 bring-up check, headless --------------------------------------
+    println!("xtask: check-share — leg 1: the R2 bring-up check (gatecheck, headless)");
+    {
+        let (mut child, _stdin, receiver) =
+            spawn_net_qemu("check-share", root, &image, "gatecheck", "user,id=eo9net")?;
+        let outcome = serial_wait_for_progress(
+            "check-share",
+            &receiver,
+            "gate r2: PASS",
+            "the R2 PASS line",
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        outcome?;
+    }
+    println!("xtask: check-share — R2 PASS (run_concurrent + concurrent calls, no_std)");
+
+    // ----- leg 2: the loopback share (gatedemo) -----------------------------------------
+    println!("xtask: check-share — leg 2: gatedemo (loopback share, sockcheck + severance)");
+    {
+        let (mut child, mut stdin, receiver) =
+            spawn_net_qemu("check-share", root, &image, "gatedemo", "user,id=eo9net")?;
+        let drive = (|| -> Result<(), String> {
+            let wait_for = |marker: &str, what: &str| {
+                serial_wait_for_progress("check-share", &receiver, marker, what)
+            };
+            wait_for("gate: `lan` is serving eo9:net/l4", "the share-open line")?;
+            wait_for("eosh>", "the eosh prompt")?;
+            console_type_line("check-share", &mut stdin, "sockcheck --payload gate-proof")?;
+            wait_for("ok: echoed(", "sockcheck's typed outcome through the gate")?;
+            console_type_line("check-share", &mut stdin, "svc stop lan")?;
+            wait_for("stopped: lan", "the owner's stop")?;
+            console_type_line("check-share", &mut stdin, "sockcheck --payload post-stop")?;
+            wait_for(
+                "is not running (the gate is severed)",
+                "the typed severance refusal",
+            )?;
+            console_type_line("check-share", &mut stdin, "exit")?;
+            wait_for("requesting PSCI", "the poweroff")?;
+            Ok(())
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        drive?;
+    }
+    println!(
+        "xtask: check-share — gatedemo ok (bare sockcheck echoed through the owner's          store; severed share refuses typed)"
+    );
+
+    // ----- leg 3: the virtio share (station-net) + curl ---------------------------------
+    println!("xtask: check-share — leg 3: station-net (virtio share, bare curl)");
+    let fixture_dir = root.join("target").join("check-share");
+    std::fs::create_dir_all(&fixture_dir)
+        .map_err(|err| format!("check-share: cannot create {}: {err}", fixture_dir.display()))?;
+    std::fs::write(fixture_dir.join("hello.txt"), CURL_FIXTURE_BODY)
+        .map_err(|err| format!("check-share: cannot write the fixture file: {err}"))?;
+    let (mut server, port) = spawn_http_fixture(&fixture_dir)?;
+    if let Err(err) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+        let _ = server.kill();
+        let _ = server.wait();
+        return Err(format!(
+            "check-share: the fixture server is not accepting on 127.0.0.1:{port}: {err}"
+        ));
+    }
+    let outcome = (|| -> Result<(), String> {
+        let (mut child, mut stdin, receiver) = spawn_net_qemu(
+            "check-share",
+            root,
+            &image,
+            "station-net pci",
+            "user,id=eo9net",
+        )?;
+        let drive = (|| -> Result<(), String> {
+            let wait_for = |marker: &str, what: &str| {
+                serial_wait_for_progress("check-share", &receiver, marker, what)
+            };
+            wait_for("gate: `lan` is serving eo9:net/l4", "the share-open line")?;
+            wait_for("eosh>", "the eosh prompt")?;
+            let command = format!("curl http://10.0.2.2:{port}/hello.txt");
+            console_type_line("check-share", &mut stdin, &command)?;
+            wait_for("HTTP/1.0 200 OK", "the fixture's status line through the gate")?;
+            wait_for(
+                CURL_FIXTURE_BODY.trim_end(),
+                "the fixture body on the console",
+            )?;
+            wait_for("ok: fetched(", "curl's typed outcome")?;
+            console_type_line("check-share", &mut stdin, "svc stop lan")?;
+            wait_for("stopped: lan", "the owner's stop")?;
+            console_type_line("check-share", &mut stdin, "exit")?;
+            wait_for("requesting PSCI", "the poweroff")?;
+            Ok(())
+        })();
+        if let Err(err) = drive {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+        let _ = child.wait();
+        Ok(())
+    })();
+    let _ = server.kill();
+    let _ = server.wait();
+    outcome?;
+
+    println!(
+        "xtask: check-share ok — the kernel call gate end to end: R2 PASS; bare          sockcheck through a loopback share with typed severance; bare curl through the          init-owned virtio net stack ({} fixture bytes, no composition typed anywhere)",
+        CURL_FIXTURE_BODY.len()
+    );
+    Ok(())
+}
+
 fn check_curl(root: &Path) -> Result<(), String> {
     let image = build_kernel(root, "aarch64")?;
 
