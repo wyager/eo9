@@ -261,11 +261,15 @@ must land the board back at the bootloader prompt with a legible trace. Build th
 4. **Boot-bisection beacons.** Single raw characters banged straight at the UART THR
    (poll LSR THRE, store — pre-MMU, pre-stack, two scratch registers) at every early
    stage: `A` image entry, `B`/`b` after the EL2 drop / EL1-direct entry, `C` kmain
-   reached, `H` banner imminent, `E` MMU on, `F` heap up, `G` watchdog armed, `D` FDT
-   parse returned. When a boot dies silently, the last surviving letter pinpoints the
-   dead stage with zero debugger access — this is exactly how the first silent hang
-   on this board was bisected. The beacons stay in the production board image: they
-   cost nothing and the prefix reads as a boot signature.
+   reached, `H` banner imminent, `E` MMU on, `F` heap up, `G` watchdog armed, `I`
+   PCIe bring-up entered, `J` USB bring-up entered, `K` FDT/bootargs parse entered
+   (the first consumer of the boot-handed `x0`), `D` FDT parse returned. When a boot
+   dies silently, the last surviving letter pinpoints the dead stage with zero
+   debugger access — this is exactly how the first silent hang on this board was
+   bisected, and `I`/`J`/`K` were added after USB-boot round A1 hung in the
+   then-unbeaconed stretch between the USB peeks and `D` (the junk-x0 dereference,
+   kernel src/fdt.rs). The beacons stay in the production board image: they cost
+   nothing and the prefix reads as a boot signature.
 5. **Periodic heartbeat.** `hb <uptime-ms>` every ~5 s from the watchdog-pat
    chokepoint, so a live-but-quiet kernel is distinguishable from a hung one within
    seconds on any serial capture.
