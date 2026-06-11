@@ -14,6 +14,11 @@ publish.workspace = true
 [dependencies]
 blake3 = { workspace = true }
 eo9-component = { path = "../crates/eo9-component" }
+# build-stick: the stick image's CRC (eo9-flashwire::Crc32 — the one CRC implementation
+# both wire ends and the BOOT.SCR baking share) and the post-build self-check that walks
+# the freshly built FAT32 partition exactly the way the board-side flasher will.
+eo9-fatwalk = { path = "../crates/eo9-fatwalk" }
+eo9-flashwire = { path = "../crates/eo9-flashwire" }
 # The eo9-manual section scanner/parser (a dependency-free no_std library from the
 # guest workspace): componentize-time validation runs the SAME code the eosh `man`
 # builtin runs, so the build gate and the on-target reader cannot drift

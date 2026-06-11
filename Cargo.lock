@@ -509,6 +509,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-fatwalk"
+version = "0.1.0"
+
+[[package]]
+name = "eo9-flashwire"
+version = "0.1.0"
+
+[[package]]
 name = "eo9-integration"
 version = "0.1.0"
 dependencies = [
@@ -2415,6 +2423,8 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "eo9-component",
+ "eo9-fatwalk",
+ "eo9-flashwire",
  "eosh-core",
  "wasmtime",
  "wat",

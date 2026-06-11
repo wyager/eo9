@@ -343,6 +343,7 @@ dependencies = [
 name = "eo9-example-oskexec"
 version = "0.0.0"
 dependencies = [
+ "eo9-flashwire",
  "eo9-guest",
  "wit-bindgen",
 ]
@@ -427,6 +428,10 @@ dependencies = [
  "eo9-guest",
  "wit-bindgen",
 ]
+
+[[package]]
+name = "eo9-flashwire"
+version = "0.1.0"
 
 [[package]]
 name = "eo9-guest"
