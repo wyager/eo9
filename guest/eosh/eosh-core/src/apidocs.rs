@@ -81,6 +81,20 @@ pub fn package_names() -> Vec<&'static str> {
     API_PACKAGES.iter().map(|p| p.name).collect()
 }
 
+/// Every API word `describe`/`man` resolves to a card: the package names and the full
+/// `package/interface` names. The editor's TAB candidates and name-mark consult this —
+/// the same tables [`api_doc`] routes on, so a new WIT package is automatically
+/// completable and green (the coverage test pins the tables against `wit/` itself).
+pub fn api_words() -> Vec<String> {
+    let mut words: Vec<String> = API_PACKAGES.iter().map(|p| String::from(p.name)).collect();
+    words.extend(
+        API_INTERFACES
+            .iter()
+            .map(|i| format!("{}/{}", i.package, i.name)),
+    );
+    words
+}
+
 /// Render a package card (the static part; the session appends the live store section).
 pub fn render_package(doc: &ApiPackageDoc) -> Vec<String> {
     let mut lines = Vec::new();

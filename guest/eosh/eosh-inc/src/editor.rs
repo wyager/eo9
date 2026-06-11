@@ -1538,6 +1538,66 @@ mod tests {
         assert_eq!(ed.take_output(), "help");
     }
 
+    #[test]
+    fn describe_completes_and_keeps_carded_words_green() {
+        // The owner's report, leg 1: `describe d…` must offer (and complete) the
+        // builtins' own cards from the same table acceptance routes on. `descr` is
+        // unique → TAB finishes the word plus the separating space.
+        let mut ed = editor();
+        type_text(&mut ed, "describe descr");
+        ed.take_output();
+        ed.handle(Key::Tab);
+        assert_eq!(ed.take_output(), "ibe ");
+        assert_eq!(submit(&mut ed), "describe describe ");
+
+        // And the fully typed word never marks: `describe describe` is a card.
+        for line in [
+            "describe describe",
+            "describe help",
+            "describe compose",
+            "describe eo9:fs/fs",
+            "man describe",
+            "man let",
+            "man eo9:fs/fs",
+        ] {
+            let mut ed = editor();
+            type_text(&mut ed, line);
+            let out = ed.take_output();
+            assert!(!out.contains("\u{1b}[31m"), "{line:?} marked: {out:?}");
+        }
+    }
+
+    #[test]
+    fn man_argument_completes_programs_and_cards() {
+        // `man hell` → the /bin program `hello` (the cards' `help` already diverged).
+        let mut ed = editor();
+        type_text(&mut ed, "man hell");
+        ed.take_output();
+        ed.handle(Key::Tab);
+        assert_eq!(ed.take_output(), "o ");
+        assert_eq!(submit(&mut ed), "man hello ");
+    }
+
+    #[test]
+    fn escribe_marks_as_name_dead_in_both_positions() {
+        // The owner's report, leg 2: `escribe` (the d-less typo) paints red — and that
+        // is CORRECT under the documented red semantics ("this line will not execute
+        // successfully"): no card, no builtin, no /bin name, no binding can ever
+        // prefix-extend from `es`, so resolution is guaranteed to fail at run time.
+        // Head position: `e` still extends (env, exit), `s` is name-dead.
+        let mut ed = editor();
+        type_text(&mut ed, "escribe");
+        assert_eq!(ed.take_output(), "e\u{1b}[31mscribe");
+        assert_eq!(submit(&mut ed), "escribe");
+
+        // Argument position: `describe escribe` would parse (an expression), but
+        // `escribe` resolves nowhere — name-dead, same honest red.
+        let mut ed = editor();
+        type_text(&mut ed, "describe escribe");
+        let out = ed.take_output();
+        assert!(out.contains("\u{1b}[31m"), "{out:?}");
+    }
+
     // -- argument completion (M3 deliverable 2) ----------------------------------------
 
     /// The flagship program args: net.l4.over-l2's signature dressed with its manual

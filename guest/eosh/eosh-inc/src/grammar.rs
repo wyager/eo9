@@ -7,7 +7,8 @@
 //!               | "detach" name "=" expr                          (LOOSE — below)
 //!               | "svc" ( ε | "list" | ("log"|"stop"|"clear") name )
 //!               | "help" | "history" | "exit" | "quit" | "poweroff"
-//!               | "env" ( ε | expr ) | "describe" ("$"|"&"|reserved-doc-word|expr)
+//!               | "env" ( ε | expr ) | "describe" ("$"|"&"|carded-word|expr)
+//!               | "man" ( "$" | "&" | word | compound )            (one token, then EOF)
 //!               | "imports" expr
 //!               | expr                  (head name not a dispatch word — eosh's
 //!                                        command() matches the first Word token)
@@ -72,7 +73,7 @@ use alloc::vec::Vec;
 
 use crate::comb::{
     HintEntry, Words, alt, bare_word, bind, cap_bare_word, cap_flag_name, comment_rest, compound,
-    flag_name, hint_words, kw, lazy, lit, lit_byte, map, pure, quoted, rep, star, words, ws,
+    flag_name, hint_words, kw, lazy, lit, lit_byte, map, pure, quoted, rep, star, ws,
 };
 use crate::inc::{BoxP, Tag};
 
@@ -84,14 +85,9 @@ const RESERVED: &[&str] = &["as", "let", "only", "rename", "with"];
 /// dispatch (`parse.rs::command()`) and therefore cannot head a plain run-expression:
 /// the dispatch words plus the reserved words.
 const CMD_HEAD_EXCLUDED: &[&str] = &[
-    "as", "describe", "detach", "env", "exit", "help", "history", "imports", "let", "only",
+    "as", "describe", "detach", "env", "exit", "help", "history", "imports", "let", "man", "only",
     "poweroff", "quit", "rename", "save", "svc", "with",
 ];
-
-/// The reserved words that `describe` accepts as its lone argument because they have
-/// builtin cards (`builtins.rs::builtin_doc`): `describe only` is a card, while plain
-/// word arguments (`describe help`) already parse as expressions. `as` has no card.
-const DESCRIBE_RESERVED_DOC_WORDS: &[&str] = &["let", "only", "rename", "with"];
 
 /// The dynamic vocabulary for name positions: builtins are spoken for by the grammar's
 /// own keyword branches; entries here are the store's /bin listing, session bindings,
@@ -159,13 +155,25 @@ struct ProgramSlots {
     values: Rc<BTreeMap<String, Rc<Vec<HintEntry>>>>,
 }
 
-/// The grammar's shared context: the vocabulary, pre-filtered per position, and the
-/// per-program argument slots (M3).
+/// The grammar's shared context: the vocabulary, pre-filtered per position, the
+/// per-program argument slots (M3), and the card vocabularies for `describe`/`man`
+/// argument positions (the carded shell words from `eosh_core::builtins::card_words`
+/// plus the API card words from `eosh_core::apidocs::api_words` — the SAME tables the
+/// session routes and renders from, so acceptance, completion, and marking are three
+/// views of one datum).
 #[derive(Clone)]
 struct Cx {
     head_vocab: Rc<Vec<HintEntry>>,
     vocab: Rc<Vec<HintEntry>>,
     programs: Rc<BTreeMap<String, ProgramSlots>>,
+    /// Carded words (builtin/operator cards + API package/interface cards): the
+    /// completable argument vocabulary of `describe`. Acceptance-relevant ONLY for the
+    /// reserved carded words (`let only rename with` — the free expression word covers
+    /// every other entry).
+    cards: Rc<Vec<HintEntry>>,
+    /// `man`'s argument vocabulary: the cards plus the /bin programs (a manual lives on
+    /// a card or on a program; bindings have no manual).
+    man_vocab: Rc<Vec<HintEntry>>,
 }
 
 /// Sequence two parsers, keeping the first's laziness discipline: the second is built
@@ -488,9 +496,31 @@ fn command(cx: &Cx) -> BoxP<()> {
             alt(vec![
                 t_byte(b'$'),
                 t_byte(b'&'),
-                describe_reserved_doc_words(),
+                // The carded words (builtins, operators, API names). Acceptance-wise
+                // this branch matters only for the reserved carded words (`describe
+                // only` is a card; plain words like `describe help` already parse as
+                // expressions) — but completion-wise it is what makes `describe d⇥`
+                // offer `describe`'s own card, and marking-wise what keeps a typed
+                // carded word green (the owner's `describe describe` report).
+                then(ws(), hint_words(cx.cards.clone())),
                 expr_l(cx, Pos::Normal),
             ]),
+        ),
+        // `man <one token>`: exactly one bare word (reserved words included — `man let`
+        // is a card), a compound (the lexer hands `[a]` over as one Word token), or a
+        // lone `$`/`&` operator; nothing may follow but trailing space/comment.
+        then(
+            t_kw("man", Tag::Builtin),
+            then(
+                ws(),
+                alt(vec![
+                    lit_byte(b'$'),
+                    lit_byte(b'&'),
+                    bare_word(&[]),
+                    compound(),
+                    hint_words(cx.man_vocab.clone()),
+                ]),
+            ),
         ),
         then(t_kw("imports", Tag::Builtin), expr_l(cx, Pos::Normal)),
         expr(cx, Pos::Head),
@@ -498,12 +528,18 @@ fn command(cx: &Cx) -> BoxP<()> {
     ])
 }
 
-fn describe_reserved_doc_words() -> BoxP<()> {
-    let vocab: Vec<(String, Tag)> = DESCRIBE_RESERVED_DOC_WORDS
-        .iter()
-        .map(|word| (String::from(*word), Tag::Builtin))
+/// The card vocabulary: every word with a builtin/operator card and every API card
+/// word, tagged Builtin. Built once per [`command_line`] (the tables are static).
+fn card_entries() -> Vec<HintEntry> {
+    let mut entries: Vec<HintEntry> = eosh_core::builtins::card_words()
+        .map(|word| HintEntry::plain(String::from(word), Tag::Builtin))
         .collect();
-    then(ws(), words(Rc::new(vocab)))
+    entries.extend(
+        eosh_core::apidocs::api_words()
+            .into_iter()
+            .map(|word| HintEntry::plain(word, Tag::Builtin)),
+    );
+    entries
 }
 
 /// Trailing whitespace and an optional comment, then end of line.
@@ -624,10 +660,23 @@ pub fn command_line(vocab: &Vocab) -> BoxP<()> {
         .filter(|(_, program)| !program.flags.is_empty())
         .map(|(name, program)| (name.clone(), build_slots(program, &normal)))
         .collect();
+    let cards = card_entries();
+    let man_vocab: Vec<HintEntry> = cards
+        .iter()
+        .cloned()
+        .chain(
+            normal
+                .iter()
+                .filter(|entry| entry.tag == Tag::Program)
+                .cloned(),
+        )
+        .collect();
     let cx = Cx {
         head_vocab: filter(CMD_HEAD_EXCLUDED),
         vocab: normal,
         programs: Rc::new(programs),
+        cards: Rc::new(cards),
+        man_vocab: Rc::new(man_vocab),
     };
     then(command(&cx), trailing())
 }
@@ -909,6 +958,30 @@ mod tests {
         "with fs.memfs as upper, fs.readonly as lower $ fs.overlay $ ls /",
         "describe entropy.seeded",
         "imports entropy.seeded $ rng",
+        // man (the manuals builtin: exactly one token)
+        "man telnetd",
+        "man net.l4.over-l2",
+        "man hello",
+        "man describe",
+        "man let",
+        "man as",
+        "man only",
+        "man $",
+        "man &",
+        "man eo9:fs/fs",
+        "man eo9:fs/fs@0.1.0",
+        "man [a]",
+        "man -x",
+        "man hello # trailing comment",
+        "man",
+        "man a b",
+        "man (hello)",
+        "man hello --flag x",
+        "man net.virtio $ l2check",
+        "man \"quoted\"",
+        "man --x",
+        "manx",
+        "man let = x",
         // edge lines from the grammar review
         "only(a)$x",
         "only[a] $ x",
@@ -1087,6 +1160,7 @@ mod tests {
             "env",
             "help",
             "describe",
+            "man",
             "imports",
             "exit",
             "list",
@@ -1555,10 +1629,36 @@ mod tests {
             assert!(svc.contains(&sub.to_string()), "{sub}");
         }
 
-        // `describe ` offers the reserved card words alongside the vocabulary.
+        // `describe ` offers the carded words alongside the vocabulary: reserved
+        // cards, the builtins' own cards (the owner's `describe describe` report),
+        // operator aliases, and the API card words.
         let desc = words_of(&comps_at("describe "));
         assert!(desc.contains(&"only".to_string()));
         assert!(desc.contains(&"browser".to_string()));
+        assert!(desc.contains(&"describe".to_string()));
+        assert!(desc.contains(&"help".to_string()));
+        assert!(desc.contains(&"compose".to_string()));
+        assert!(desc.contains(&"eo9:fs".to_string()));
+        assert!(desc.contains(&"eo9:fs/fs".to_string()));
+
+        // The owner's case: `describe d` keeps `describe`'s own card on offer, and
+        // `describe descr` completes uniquely to it.
+        let desc_d = words_of(&comps_at("describe d"));
+        assert!(desc_d.contains(&"describe".to_string()), "{desc_d:?}");
+        let descr = comps_at("describe descr");
+        assert_eq!(descr.len(), 1);
+        assert_eq!(descr[0].word, "describe");
+        assert_eq!(descr[0].matched, 5);
+        assert_eq!(descr[0].tag, Tag::Builtin);
+
+        // `man ` offers the cards and the /bin programs — not the session bindings
+        // (a binding has no manual).
+        let man = words_of(&comps_at("man "));
+        assert!(man.contains(&"describe".to_string()));
+        assert!(man.contains(&"let".to_string()));
+        assert!(man.contains(&"hello".to_string()));
+        assert!(man.contains(&"eo9:fs/fs".to_string()));
+        assert!(!man.contains(&"det".to_string()), "{man:?}");
 
         // `let ` binds a fresh name: nothing sensible to complete.
         assert!(comps_at("let ").is_empty());
@@ -1616,6 +1716,11 @@ mod tests {
             "a $ ",
             "()",
             "browser ) extra",
+            "man",
+            "man a b",
+            "man --x",
+            "man (hello)",
+            r#"man "quoted""#,
         ];
         for line in red {
             assert!(parse_command(line).is_err(), "corpus assumption: {line:?}");
@@ -1633,6 +1738,13 @@ mod tests {
             "with (a) as x $ t",
             "x $ env",
             "[a][b]",
+            "man let",
+            "man as",
+            "man $",
+            "man [a]",
+            "man eo9:fs/fs",
+            "man -x",
+            "manx",
         ];
         for line in green {
             assert!(parse_command(line).is_ok(), "corpus assumption: {line:?}");
