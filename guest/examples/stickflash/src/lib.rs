@@ -44,9 +44,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use eo9_fatwalk::{FileMap, Run, Volume, SECTOR};
+use eo9_fatwalk::{FileMap, Run, SECTOR, Volume};
 use eo9_flashwire::{
-    Crc32, AUTHENTICATED, CRC_FRAME, GO_AHEAD, HEADER_FRAME, Handshake, MAGIC, MAX_SESSIONS,
+    AUTHENTICATED, CRC_FRAME, Crc32, GO_AHEAD, HEADER_FRAME, Handshake, MAGIC, MAX_SESSIONS,
     MIN_SECRET, PROGRESS_ACK, REFUSED, Refusal, SECRET_LEN_FRAME, STICKFLASH_PORT, Transfer,
     VERIFIED,
 };

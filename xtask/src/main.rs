@@ -7146,9 +7146,7 @@ fn check_stickflash(root: &Path) -> Result<(), String> {
             root,
             &image,
             "pci",
-            &format!(
-                "user,id=eo9net,hostfwd=tcp:127.0.0.1:{host_port}-:{STICKFLASH_GUEST_PORT}"
-            ),
+            &format!("user,id=eo9net,hostfwd=tcp:127.0.0.1:{host_port}-:{STICKFLASH_GUEST_PORT}"),
             &devices,
         )?;
         Ok((child, stdin, receiver, host_port))
@@ -7158,9 +7156,8 @@ fn check_stickflash(root: &Path) -> Result<(), String> {
     let (mut child, mut stdin, receiver, host_port) =
         boot("arm 1 (refusal): wrong secret twice, the stick must stay untouched")?;
     let drive = (|| -> Result<(), String> {
-        let wait = |marker: &str, what: &str| {
-            serial_wait_for("check-stickflash", &receiver, marker, what)
-        };
+        let wait =
+            |marker: &str, what: &str| serial_wait_for("check-stickflash", &receiver, marker, what);
         wait("eosh>", "the eosh prompt")?;
         console_type_line("check-stickflash", &mut stdin, &composition)?;
         // The slot line proves the whole storage half of the chain before any network
@@ -7234,9 +7231,8 @@ fn check_stickflash(root: &Path) -> Result<(), String> {
     let (mut child, mut stdin, receiver, host_port) =
         boot("arm 2 (flash): variant B over send_image.py --stick")?;
     let drive = (|| -> Result<(), String> {
-        let wait = |marker: &str, what: &str| {
-            serial_wait_for("check-stickflash", &receiver, marker, what)
-        };
+        let wait =
+            |marker: &str, what: &str| serial_wait_for("check-stickflash", &receiver, marker, what);
         let tail = |text: &str, keep: usize| {
             let start = text.len().saturating_sub(keep);
             text[start..].to_string()
