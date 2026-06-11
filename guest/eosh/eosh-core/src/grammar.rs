@@ -157,8 +157,8 @@ struct ProgramSlots {
 
 /// The grammar's shared context: the vocabulary, pre-filtered per position, the
 /// per-program argument slots (M3), and the card vocabularies for `describe`/`man`
-/// argument positions (the carded shell words from `eosh_core::builtins::card_words`
-/// plus the API card words from `eosh_core::apidocs::api_words` — the SAME tables the
+/// argument positions (the carded shell words from `crate::builtins::card_words`
+/// plus the API card words from `crate::apidocs::api_words` — the SAME tables the
 /// session routes and renders from, so acceptance, completion, and marking are three
 /// views of one datum).
 #[derive(Clone)]
@@ -531,11 +531,11 @@ fn command(cx: &Cx) -> BoxP<()> {
 /// The card vocabulary: every word with a builtin/operator card and every API card
 /// word, tagged Builtin. Built once per [`command_line`] (the tables are static).
 fn card_entries() -> Vec<HintEntry> {
-    let mut entries: Vec<HintEntry> = eosh_core::builtins::card_words()
+    let mut entries: Vec<HintEntry> = crate::builtins::card_words()
         .map(|word| HintEntry::plain(String::from(word), Tag::Builtin))
         .collect();
     entries.extend(
-        eosh_core::apidocs::api_words()
+        crate::apidocs::api_words()
             .into_iter()
             .map(|word| HintEntry::plain(word, Tag::Builtin)),
     );
@@ -689,7 +689,7 @@ mod tests {
     use crate::input::Input;
     use alloc::format;
     use alloc::string::ToString;
-    use eosh_core::parse::{ParseError, parse_command};
+    use crate::parse::{ParseError, parse_command};
     use std::println;
 
     fn flag(name: &str, ty: &str) -> FlagSpec {

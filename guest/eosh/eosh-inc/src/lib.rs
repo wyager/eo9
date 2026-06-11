@@ -34,12 +34,10 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-pub mod charset;
-pub mod comb;
 pub mod editor;
-pub mod grammar;
-pub mod inc;
-pub mod input;
 
-#[cfg(test)]
-mod check;
+// The parser core and the grammar moved into eosh-core (the single-parser
+// unification): eosh-core owns the one grammar that acceptance, completion, marking,
+// and execution all read; this crate keeps the per-keystroke editor built on it.
+// Re-exported here so embedders keep their import paths.
+pub use eosh_core::{charset, check, comb, grammar, inc, input};
