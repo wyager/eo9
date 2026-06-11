@@ -630,14 +630,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eo9-stub-net-l4-factory"
-version = "0.0.0"
-dependencies = [
- "eo9-guest",
- "wit-bindgen",
-]
-
-[[package]]
 name = "eo9-stub-net-l4-filtered"
 version = "0.0.0"
 dependencies = [

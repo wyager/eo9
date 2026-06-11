@@ -1374,8 +1374,9 @@ fn host_detach(
         if child_info.kind != shellexec::WitComponentKind::Provider {
             return Err(internal(format!(
                 "`{name}` is declared as a share, so it must be a factory-serving \
-                 provider (compose `… $ l4.factory` at the tail); a binary cannot \
-                 serve in v1 (the main+factory ruling is the M2 item)"
+                 provider whose tail exports the blessed factory (every l4 provider \
+                 does natively — end the chain on the transport provider); a binary \
+                 cannot serve in v1 (the main+factory ruling is the M2 item)"
             )));
         }
         let exports_factory = child_info
@@ -1390,7 +1391,8 @@ fn host_detach(
             return Err(internal(format!(
                 "`{name}` is declared as a share but does not serve eo9:net/l4: the \
                  composition must export the blessed eo9:net/l4-factory and the full \
-                 eo9:net/l4 surface (compose `… $ l4.factory` at the tail; it exports: {})",
+                 eo9:net/l4 surface (end the chain on an l4 provider — every l4 \
+                 provider exports the blessed factory natively; it exports: {})",
                 child_info
                     .exports
                     .iter()

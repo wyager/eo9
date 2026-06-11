@@ -136,6 +136,7 @@ use eo9::time::time;
 use exports::eo9::net::l4::{
     self, Buffer, IpAddress, L4Error, RecvResult, SendResult, SocketAddress,
 };
+use exports::eo9::net::l4_factory;
 use exports::eo9::net::l4_over_l2_config;
 
 // ------------------------------------------------------------------------------------------
@@ -1106,6 +1107,17 @@ impl l4_over_l2_config::Guest for Stub {
 // ------------------------------------------------------------------------------------------
 // The exported l4 surface.
 // ------------------------------------------------------------------------------------------
+
+/// The blessed factory (shared-resources design §5.2, native per owner ruling): the
+/// kernel call gate mints one handler per consumer wiring through this export. A
+/// fresh full-access root onto the one smoltcp stack (the degenerate sharing the
+/// design's v1 prescribes); per-grantee attenuation is a policy provider composed on
+/// top (`… $ net.l4.filtered`), whose own factory then serves.
+impl l4_factory::Guest for Stub {
+    fn get() -> Result<l4_factory::L4Impl, l4_factory::L4Error> {
+        Ok(l4::L4Impl::new(Root))
+    }
+}
 
 impl l4::Guest for Stub {
     type L4Impl = Root;

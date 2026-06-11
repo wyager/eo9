@@ -80,7 +80,6 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-net-l3-deny",
     "eo9-stub-net-l3-none",
     "eo9-stub-net-l4-deny",
-    "eo9-stub-net-l4-factory",
     "eo9-stub-net-l4-filtered",
     "eo9-stub-net-l4-loopback",
     "eo9-stub-net-l4-none",
@@ -315,10 +314,6 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // The transport firewall and its standard port policy ("policies are programs"):
     //   net.policy-ports --allow "[7]" $ net.l4.filtered $ net.l4.loopback-backed program
     ("eo9-stub-net-l4-filtered", "net.l4.filtered"),
-    // The shareable transport tail (shared-resources design §5.2): `… $ l4.factory`
-    // re-exports the fused l4 and adds the blessed eo9:net/l4-factory, which a `share`
-    // config line validates against and the kernel call gate mints handlers from.
-    ("eo9-stub-net-l4-factory", "l4.factory"),
     ("eo9-stub-net-policy-ports", "net.policy-ports"),
     ("eo9-example-sockcheck", "sockcheck"),
     // Basic coreutils, so the metal shell can inspect its own (read-only) filesystem:
@@ -2293,10 +2288,6 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
                 ("eo9-stub-net-rtl8125", "net.rtl8125"),
                 ("eo9-example-l2check", "l2check"),
                 ("eo9-stub-net-l4-over-l2", "net.l4.over-l2"),
-                // The shareable tail (shared-resources M1): the station-net config's
-                // `lan` line composes `net.rtl8125 $ net.l4.over-l2 --address dhcp $
-                // l4.factory`, so the bench's serial-loadable image must carry it.
-                ("eo9-stub-net-l4-factory", "l4.factory"),
                 ("eo9-example-l4check", "l4check"),
                 // The demo HTTP client (the usb-boot-demo plan's curl lane):
                 //   net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address dhcp)
@@ -6003,8 +5994,9 @@ fn spawn_http_fixture(directory: &Path) -> Result<(std::process::Child, u16), St
 ///    calls in flight through one owner = the instance-lock serialization story), then
 ///    `svc stop lan` severs the share and the next spawn refuses with the typed §6
 ///    story.
-/// 3. **station-net** (virtio share): init owns `net.virtio $ net.l4.over-l2 $
-///    l4.factory` as the `lan` service; a bare `curl http://10.0.2.2:<port>/hello.txt`
+/// 3. **station-net** (virtio share): init owns `net.virtio $ net.l4.over-l2`
+///    (the tail provider's native factory serving) as the `lan` service; a bare
+///    `curl http://10.0.2.2:<port>/hello.txt`
 ///    at the console fetches a host fixture through the gate — status line, body bytes,
 ///    and the typed fetched outcome asserted. smoltcp's recv parks inside the owner
 ///    while serving, which is the parked-call flavor R2's loopback leg cannot exercise.

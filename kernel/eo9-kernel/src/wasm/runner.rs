@@ -74,17 +74,18 @@ console = eosh
 ";
 
 /// The station-net config (the `station-net` boot token; shared-resources design M1):
-/// init owns the net stack as a boot service — the `lan` line composes the driver, the
-/// TCP/IP middleware, and the shareable factory tail, and the `share` clause opens it
-/// through the kernel call gate; the console's `use` clause routes every console
-/// child's ordinary `eo9:net/l4` import to a factory-minted handler. Typing bare
-/// `curl http://…` at the prompt then works with NO composition typed. Board profile:
-/// the rtl8125 driver with DHCP addressing on the bench LAN.
+/// init owns the net stack as a boot service — the `lan` line is a PLAIN provider
+/// chain (every l4 provider exports the blessed factory natively; owner ruling, the
+/// area/41 respin), and the `share` clause opens it through the kernel call gate; the
+/// console's `use` clause routes every console child's ordinary `eo9:net/l4` import to
+/// a factory-minted handler. Typing bare `curl http://…` at the prompt then works with
+/// NO composition typed. Board profile: the rtl8125 driver with DHCP addressing on the
+/// bench LAN.
 #[cfg(feature = "board-opi5plus")]
 const STATION_NET_SERVICES_CONFIG: &str = "\
 # the net station (the `station-net` boot token): init owns the net stack; the console
 # children reach it through the kernel call gate.
-lan = net.rtl8125 $ net.l4.over-l2 --address dhcp $ l4.factory share eo9:net/l4 restart restart.always
+lan = net.rtl8125 $ net.l4.over-l2 --address dhcp share eo9:net/l4 restart restart.always
 kbd = usb.ohci --region usb-host0-ohci $ usb.kbd restart restart.always
 console = eosh use l4=lan
 ";
@@ -98,20 +99,21 @@ console = eosh use l4=lan
 const STATION_NET_SERVICES_CONFIG: &str = "\
 # the net station (the `station-net` boot token): init owns the net stack; the console
 # children reach it through the kernel call gate.
-lan = net.virtio $ net.l4.over-l2 $ l4.factory share eo9:net/l4 restart restart.always
+lan = net.virtio $ net.l4.over-l2 share eo9:net/l4 restart restart.always
 console = eosh use l4=lan
 ";
 
 /// The gate's QEMU unit config (the `gatedemo` boot token; shared-resources design M1a):
 /// the same share/use wiring with the in-memory loopback transport as the owner — no
-/// NIC, no PCI grant, no host network. `net.l4.loopback $ l4.factory` is the smallest
-/// possible owner, and a bare `sockcheck --payload …` at the console round-trips TCP
-/// and UDP entirely through gate calls into the owner's store (listen/accept/connect
-/// in flight concurrently = the exclusivity story under the instance lock).
+/// NIC, no PCI grant, no host network. A bare `net.l4.loopback` is the smallest
+/// possible owner (its native factory export serves), and a bare `sockcheck --payload
+/// …` at the console round-trips TCP and UDP entirely through gate calls into the
+/// owner's store (listen/accept/connect in flight concurrently = the exclusivity story
+/// under the instance lock).
 const GATE_DEMO_SERVICES_CONFIG: &str = "\
 # the gate demo (the `gatedemo` boot token): a loopback transport shared through the
 # kernel call gate; `sockcheck --payload x` at the prompt exercises it bare.
-lan = net.l4.loopback $ l4.factory share eo9:net/l4 restart restart.always
+lan = net.l4.loopback share eo9:net/l4 restart restart.always
 console = eosh use l4=lan
 ";
 

@@ -1866,7 +1866,13 @@ fn try_r2(entries: &'static [super::store::StoreEntry]) -> Result<String> {
     let lookup = |store: &mut wasmtime::Store<KernelState>, name: &str| {
         exported_func(&instance, store, L4_INTERFACE, name).map_err(wasmtime::Error::msg)
     };
-    let f_default = lookup(&mut store, "default")?;
+    // The native factory export (owner ruling, area/41 respin): every l4 provider
+    // exports the blessed eo9:net/l4-factory itself, so the R2 check enters exactly
+    // the way the gate does — `get` mints the handler, and the handle it returns is
+    // the SAME nominal resource type as the provider's own l4 export's, accepted by
+    // the l4 functions without any wrapper or lift in between.
+    let f_get = exported_func(&instance, &mut store, L4_FACTORY_INTERFACE, "get")
+        .map_err(wasmtime::Error::msg)?;
     let f_listen = lookup(&mut store, "listen")?;
     let f_accept = lookup(&mut store, "accept")?;
     let f_connect = lookup(&mut store, "connect")?;
@@ -1898,15 +1904,8 @@ fn try_r2(entries: &'static [super::store::StoreEntry]) -> Result<String> {
                 other => Err(wasmtime::Error::msg(format!("{what} failed: {other:?}"))),
             };
 
-            // default() → the root handle.
-            let l4 = match one_result(f_default, vec![]).await? {
-                Val::Resource(any) => any,
-                other => {
-                    return Err(wasmtime::Error::msg(format!(
-                        "default returned a non-resource: {other:?}"
-                    )));
-                }
-            };
+            // The factory's get() → the minted handler (the gate's own entry path).
+            let l4 = unwrap_handle(one_result(f_get, vec![]).await?, "the factory's get")?;
 
             // listen(l4, 127.0.0.1:7777).
             let listener = unwrap_handle(
@@ -2009,9 +2008,11 @@ fn try_r2(entries: &'static [super::store::StoreEntry]) -> Result<String> {
                 )));
             }
             Ok(format!(
-                "accept+connect ran as joined concurrent calls in one store; {} payload \
-                 bytes round-tripped (loopback never parks; the parked-call leg is the \
-                 smoltcp owner's, proven by the station-net curl gate)",
+                "the native factory minted the handler and the provider's own l4 \
+                 exports accepted it; accept+connect ran as joined concurrent calls in \
+                 one store; {} payload bytes round-tripped (loopback never parks; the \
+                 parked-call leg is the smoltcp owner's, proven by the station-net \
+                 curl gate)",
                 PAYLOAD.len()
             ))
         }),

@@ -958,8 +958,17 @@ each honest in the module docs (kernel/eo9-kernel/src/wasm/gate.rs):
   wasmtime refuses `func_wrap_concurrent` for a sync import with "type mismatch with async".)
 - **The guest-visible `spawn(..., grants)` surface is not implemented** (parent→child sharing — the M2
   telnetd item); v1 sharing is the broker case only (config share/use, kernel-interpreted).
-- **`serves:` in `describe` (R7's presentation half) is not implemented**; the structural validation at
-  detach is (provider kind + blessed factory + full l4 export, refused typed pre-run).
+- **`serves:` in `describe` IS implemented** (the respin): eosh renders `serves: <api> (can serve
+  through the kernel call gate)` whenever a component exports an API root plus its blessed `*-factory`
+  sibling (pinned by eosh-core unit test); the structural validation at detach is unchanged (provider
+  kind + blessed factory + full l4 export, refused typed pre-run, source-agnostic).
+- **Respin note (owner ruling, 2026-06-10): the standalone `l4.factory` component is DELETED** — every
+  l4 provider (over-l2, filtered, loopback, deny; none is exempt — it has no l4) exports the blessed
+  factory natively and serving compositions are plain `$` chains ending on the provider. `$` still
+  seals the factory away under any further consumer, so only a provider-tailed chain surfaces it. The
+  `&` operator's sharing role is retrofit-only (adding a factory to a third-party/legacy provider that
+  lacks one) — doc delta for shared-resources.md §5.2; the area/45 study's wac-unification spike was
+  obviated before it ran (no lifting machinery exists to spike).
 - **`lock=token` is config-accepted but refused to instance** (v1 ships the instance domain only, which on
   the single boot core is structurally provided by wasmtime store-entry serialization + FIFO intake).
 - **A trap inside one gated call** maps to that call's typed io error, but may poison the owner's store
