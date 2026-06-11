@@ -459,3 +459,64 @@ fn typed_refusals() {
     assert_eq!(volume.runs(&map, 990, 11), Err(FatError::OutOfRange));
     assert_eq!(volume.runs(&map, 0, 0), Err(FatError::OutOfRange));
 }
+
+/// Adversarial FAT corruption (review hardening): a crafted FAT — free cluster mid-
+/// chain, out-of-range next pointer, a self-loop cycle — must yield the TYPED chain
+/// refusals at locate time, before any write plan can exist. The chain walk
+/// materializes and validates every cluster (2..count+2) up front, so a hostile
+/// device can never steer a WriteOp at the FAT, the directory, or anything below the
+/// data region: the refusal IS the bound.
+#[test]
+fn crafted_fat_chains_refuse_typed_before_any_plan() {
+    let dir = scratch("crafted-fat");
+    let image = dir.join("fat32.img");
+    mkfat32(&image, 131072, 1);
+    // Three 512-byte clusters so the chain has interior entries to corrupt.
+    let content = pattern(3, 1536);
+    let source = write_file(&dir, "eo9.img", &content);
+    put(&image, &source, "EO9.IMG");
+
+    let pristine = std::fs::read(&image).expect("fixture bytes");
+    let mut disk = load(&image);
+    let volume = Volume::open(&mut disk).expect("FAT32 volume");
+    let map = volume.locate(&mut disk, "EO9.IMG").expect("locate");
+    assert_eq!(map.chain.len(), 3);
+    let first = map.chain[0];
+
+    // FAT32 entry LBA/offset for `first` (mirrors Volume's fat-entry math: the
+    // entry for cluster N lives at reserved + N/128, byte (N%128)*4).
+    let reserved = u64::from(u16::from_le_bytes([pristine[14], pristine[15]]));
+    let entry_at =
+        (reserved + u64::from(first / 128)) as usize * SECTOR + (first as usize % 128) * 4;
+
+    let corrupt = |next: u32| {
+        let mut bytes = pristine.clone();
+        bytes[entry_at..entry_at + 4].copy_from_slice(&next.to_le_bytes());
+        ImageDisk { bytes }
+    };
+
+    // 1. Free cluster mid-chain.
+    let mut disk = corrupt(0);
+    let err = volume.locate(&mut disk, "EO9.IMG").unwrap_err();
+    assert!(
+        matches!(err, Error::Fat(FatError::FreeClusterInChain { cluster }) if cluster == first),
+        "free-cluster refusal, got {err:?}"
+    );
+
+    // 2. Out-of-range next pointer (way past the data region).
+    let mut disk = corrupt(0x0fff_0000);
+    let err = volume.locate(&mut disk, "EO9.IMG").unwrap_err();
+    assert!(
+        matches!(err, Error::Fat(FatError::BadClusterInChain { .. })),
+        "bad-cluster refusal, got {err:?}"
+    );
+
+    // 3. A self-loop: the full-chain walk hits its cycle cap, typed — never an
+    //    unbounded spin, never a plan with repeated sectors.
+    let mut disk = corrupt(first);
+    let err = volume.locate(&mut disk, "EO9.IMG").unwrap_err();
+    assert!(
+        matches!(err, Error::Fat(FatError::ChainCycle)),
+        "cycle refusal, got {err:?}"
+    );
+}

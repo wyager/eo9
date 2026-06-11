@@ -785,6 +785,17 @@ fn doctor(root: &Path) -> Result<(), String> {
     }
 
     // Optional: QEMU, only needed to boot the bare-metal kernel.
+    match probe(root, "mformat", &["-V"]) {
+        Some(version) => println!(
+            "  ok       {}",
+            version.lines().next().unwrap_or("mtools").trim()
+        ),
+        None => println!(
+            "  optional mtools (mformat/mcopy/mdir) not found — needed by `cargo xtask ci` \
+             (the fatwalk fixture tests build their FAT images with mtools) and by \
+             `build-stick`; install with `brew install mtools` / `apt install mtools`"
+        ),
+    }
     match probe(root, "qemu-system-aarch64", &["--version"]) {
         Some(version) => println!(
             "  ok       {}",
