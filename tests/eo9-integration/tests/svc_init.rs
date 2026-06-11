@@ -5,35 +5,13 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Once;
 
 use eo9_integration::guest;
 
 fn eo9_binary() -> PathBuf {
-    static BUILD: Once = Once::new();
-    let profile_dir = std::env::current_exe()
-        .expect("test executable path")
-        .parent()
-        .expect("deps dir")
-        .parent()
-        .expect("profile dir")
-        .to_path_buf();
-    let binary = profile_dir.join("eo9");
-    if !binary.exists() {
-        BUILD.call_once(|| {
-            let mut args = vec!["build", "-p", "eo9", "--bin", "eo9"];
-            if profile_dir.file_name().and_then(|n| n.to_str()) == Some("release") {
-                args.push("--release");
-            }
-            let status = Command::new("cargo")
-                .args(&args)
-                .current_dir(guest::repo_root())
-                .status()
-                .expect("failed to invoke cargo to build the eo9 binary");
-            assert!(status.success(), "building the eo9 binary failed");
-        });
-    }
-    binary
+    // The shared always-build + bundle-freshness helper: a stale eo9 binary (or a
+    // stale committed bundle) silently tests OLD init bytes — the trap this lane hit.
+    guest::fresh_eo9_binary()
 }
 
 fn temp_dir(test: &str) -> PathBuf {
