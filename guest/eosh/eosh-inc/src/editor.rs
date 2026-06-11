@@ -75,6 +75,34 @@
 //!   kernel console's read-line recall: the in-progress line is stashed on the first ↑,
 //!   restored by ↓ past the newest entry, and any edit commits the shown entry.
 //!
+//! Line wrap (the board-console fix): the editor optionally knows the terminal width
+//! (`Editor::new`'s `width`; `None` = the transport's width is unknown and the editor
+//! never wraps — byte-for-byte today's behavior, the regression pin). With a width, the
+//! editor owns the row geometry instead of trusting terminal auto-wrap (whose deferred
+//! last-column state is exactly what made the recall repaint corrupt long lines):
+//!
+//! * echoing a character that fills the last column is followed by an explicit `\r\n`
+//!   (so the cursor is always at a known column, never in the auto-wrap pending state);
+//! * backspace across a row boundary moves up and erases the last cell of the previous
+//!   row instead of emitting `\b` at column 0 (where it is a no-op);
+//! * the recall/replacement repaint clears every row the prompt+line occupies — `\r`
+//!   `CSI K`, then `CSI A` `CSI K` per additional row — and re-emits prompt + line.
+//!
+//! **The emitted-sequence contract** (keep in sync with fbcon's CSI subset — the
+//! area/39 lane implements exactly this set; do not add sequences without coordinating):
+//!
+//! * `\b \b` — erase one cell, same row (the only erase the width-less editor uses);
+//! * `\r` — column 0 of the current row; `\r\n` — explicit row advance;
+//! * `CSI K` (`ESC [ K`) — erase from the cursor to the end of the row;
+//! * `CSI A` (`ESC [ A`) — cursor up one row, column preserved;
+//! * `CSI <n> G` (`ESC [ <n> G`) — cursor to absolute column n (1-based; used only by
+//!   the wrap-boundary backspace to reach the last column of the row above);
+//! * the [`Marker`] SGR pairs (`CSI 31/0 m` or `CSI 7/27 m`), zero-width.
+//!
+//! Column model: one character = one terminal cell (the same assumption `\b \b` has
+//! always made; double-width CJK is out of scope with the rest of v1). The prompt is
+//! assumed to fit on one row (`prompt < width`).
+//!
 //! UTF-8: `read-key` delivers multi-byte characters as their individual `char` bytes;
 //! the editor assembles them (echoing only complete characters, so the emitted stream
 //! stays valid UTF-8 for the `text.write` API) and steps the parser per byte with the
@@ -179,6 +207,11 @@ struct Snap {
 pub struct Editor {
     vocab: Vocab,
     prompt: String,
+    /// The prompt's column count (chars; computed once — the wrap math's offset).
+    prompt_cols: usize,
+    /// Terminal width in columns, when the transport knows it (the kernel console's
+    /// manifest record). `None` = never wrap = the exact pre-width byte stream.
+    width: Option<usize>,
     marker: Marker,
     /// The line so far — always valid UTF-8 (characters are inserted whole).
     line: Vec<u8>,
@@ -215,10 +248,19 @@ pub struct Editor {
 }
 
 impl Editor {
-    /// A fresh editor: `prompt` is what already sits on the screen line (used only to
-    /// repaint after a candidate list); `history` is the session recall snapshot,
-    /// oldest first (only the newest [`RECALL_CAP`] are kept).
-    pub fn new(prompt: &str, vocab: Vocab, mut history: Vec<String>, marker: Marker) -> Editor {
+    /// A fresh editor: `prompt` is what already sits on the screen line (used to
+    /// repaint after a candidate list and by the wrap-aware repaint); `history` is the
+    /// session recall snapshot, oldest first (only the newest [`RECALL_CAP`] are kept);
+    /// `width` is the terminal width in columns when the transport knows it (`None` —
+    /// or a degenerate `Some(0)` — means never wrap: today's exact byte stream, for
+    /// transports that cannot say, e.g. the browser line transport).
+    pub fn new(
+        prompt: &str,
+        vocab: Vocab,
+        mut history: Vec<String>,
+        marker: Marker,
+        width: Option<usize>,
+    ) -> Editor {
         if history.len() > RECALL_CAP {
             history.drain(..history.len() - RECALL_CAP);
         }
@@ -226,6 +268,8 @@ impl Editor {
         Editor {
             vocab,
             prompt: String::from(prompt),
+            prompt_cols: prompt.chars().count(),
+            width: width.filter(|&w| w > 0),
             marker,
             line: Vec::new(),
             state,
@@ -477,7 +521,60 @@ impl Editor {
         if let Ok(text) = core::str::from_utf8(bytes) {
             self.emit(text);
         }
+        // Width-aware echo (module docs, "Line wrap"): a character that filled the last
+        // column is followed by an explicit row advance — never the auto-wrap limbo.
+        self.advance_row_if_full();
         self.debug_check_stack();
+    }
+
+    // -- the width-aware output layer ---------------------------------------------------
+    //
+    // Everything here is OUTPUT ONLY: parser state, the snapshot stack, and the marker
+    // logic never consult the width (the M3 differential gates are pinned on that).
+    // With `width == None` none of these emit anything beyond the historical bytes.
+
+    /// Display cells occupied by prompt + line (one cell per character — module docs).
+    fn display_cols(&self) -> usize {
+        self.prompt_cols + char_count(&self.line)
+    }
+
+    /// After echoing one character: if it filled the last column of a row, advance to
+    /// the next row explicitly. No-op without a width.
+    fn advance_row_if_full(&mut self) {
+        if let Some(width) = self.width
+            && self.display_cols().is_multiple_of(width)
+        {
+            self.emit("\r\n");
+        }
+    }
+
+    /// Echo `text`, inserting the explicit `\r\n` row advance whenever a character
+    /// fills the last column. `col` is the absolute display column the text starts at,
+    /// advanced as it goes (the repaint paths thread it through prompt and line
+    /// segments so the marker SGRs — zero-width — can interleave).
+    fn emit_wrapped(&mut self, text: &str, width: usize, col: &mut usize) {
+        for ch in text.chars() {
+            self.out.push(ch);
+            *col += 1;
+            if col.is_multiple_of(width) {
+                self.out.push_str("\r\n");
+            }
+        }
+    }
+
+    /// Erase one display cell, wrap-aware: at column 0 of a wrapped row, move up to the
+    /// last column of the row above and clear it (`CSI A`, `CSI <width> G`, `CSI K`);
+    /// anywhere else — and always without a width — the historical `\b \b`.
+    /// `display_before` is the cursor's display position BEFORE the erased character
+    /// left the line.
+    fn erase_one_cell(&mut self, display_before: usize) {
+        match self.width {
+            Some(width) if display_before.is_multiple_of(width) => {
+                let sequence = format!("\u{1b}[A\u{1b}[{width}G\u{1b}[K");
+                self.emit(&sequence);
+            }
+            _ => self.emit("\u{8} \u{8}"),
+        }
     }
 
     // -- backspace ---------------------------------------------------------------------
@@ -487,6 +584,9 @@ impl Editor {
             return;
         }
         self.commit_recall();
+        // The cursor's display position before the erase — the wrap-boundary test
+        // (column 0 of a wrapped row ⇒ the erased character sits on the row above).
+        let display_before = self.display_cols();
         // Pop one whole character (continuation bytes, then the lead).
         while let Some(&byte) = self.line.last() {
             self.line.pop();
@@ -494,7 +594,7 @@ impl Editor {
                 break;
             }
         }
-        self.emit("\u{8} \u{8}");
+        self.erase_one_cell(display_before);
         match self.red_from {
             Some(red) if self.line.len() <= red => {
                 // Rewound to the first dead byte: green again. Dead characters were
@@ -656,9 +756,22 @@ impl Editor {
             self.emit("\r\n");
         }
         let prompt = self.prompt.clone();
-        self.emit(&prompt);
-        let end = self.line.len();
-        self.emit_line_bytes(0, end);
+        match self.width {
+            None => {
+                self.emit(&prompt);
+                let end = self.line.len();
+                self.emit_line_bytes(0, end);
+            }
+            Some(width) => {
+                // The candidate list left the cursor at column 0 of a fresh row:
+                // wrapped echo keeps the row geometry consistent for what follows.
+                // (The line is green here — red lines bailed to the bell above.)
+                let mut col = 0;
+                self.emit_wrapped(&prompt, width, &mut col);
+                let line = line_text(&self.line, 0, self.line.len());
+                self.emit_wrapped(&line, width, &mut col);
+            }
+        }
     }
 
     /// Append completion-produced bytes (ASCII, from the grammar/vocabulary): step,
@@ -697,6 +810,7 @@ impl Editor {
             }
             self.line.push(byte);
             self.out.push(char::from(byte));
+            self.advance_row_if_full();
             appended = true;
         }
         self.debug_check_stack();
@@ -743,25 +857,65 @@ impl Editor {
     /// replacement itself has a red tail (recalled entries can be lines that never
     /// parsed — history records what was executed, including errors). Returns the
     /// replaced line (the first ↑ stashes it).
+    ///
+    /// Without a width: per-character `\b \b` on the one row (today's exact bytes —
+    /// the prompt is never repainted). With one: prompt + line span
+    /// `display_cols / width + 1` rows; clear the cursor's row (`\r` `CSI K`), then
+    /// each row above (`CSI A` `CSI K` — `CSI A` preserves the column, which `\r`
+    /// already put at 0), and re-emit prompt + replacement with wrapped echo. The
+    /// erase-by-rows is what makes recall correct past the width: `\b` cannot cross a
+    /// row boundary (the board bench's render-error report).
     fn replace_line(&mut self, text: Vec<u8>) -> Vec<u8> {
-        for _ in 0..char_count(&self.line) {
-            self.emit("\u{8} \u{8}");
+        match self.width {
+            None => {
+                for _ in 0..char_count(&self.line) {
+                    self.emit("\u{8} \u{8}");
+                }
+            }
+            Some(width) => {
+                self.close_marker();
+                self.emit("\r\u{1b}[K");
+                for _ in 0..self.display_cols() / width {
+                    self.emit("\u{1b}[A\u{1b}[K");
+                }
+            }
         }
         self.close_marker();
         let old = core::mem::replace(&mut self.line, text);
         self.utf8_pending.clear();
         self.rebuild();
-        let (begin, red_from) = (self.marker.begin, self.red_from);
-        match red_from {
-            Some(red) => {
-                self.emit_line_bytes(0, red);
-                self.emit(begin);
-                let end = self.line.len();
-                self.emit_line_bytes(red, end);
-            }
+        match self.width {
             None => {
+                let (begin, red_from) = (self.marker.begin, self.red_from);
+                match red_from {
+                    Some(red) => {
+                        self.emit_line_bytes(0, red);
+                        self.emit(begin);
+                        let end = self.line.len();
+                        self.emit_line_bytes(red, end);
+                    }
+                    None => {
+                        let end = self.line.len();
+                        self.emit_line_bytes(0, end);
+                    }
+                }
+            }
+            Some(width) => {
+                // The row clear wiped the prompt too: repaint it, then the line, all
+                // through the wrapped echo so the cursor lands at a known column.
+                let prompt = self.prompt.clone();
+                let mut col = 0;
+                self.emit_wrapped(&prompt, width, &mut col);
+                let (begin, red_from) = (self.marker.begin, self.red_from);
                 let end = self.line.len();
-                self.emit_line_bytes(0, end);
+                let split = red_from.unwrap_or(end);
+                let green = line_text(&self.line, 0, split);
+                self.emit_wrapped(&green, width, &mut col);
+                if red_from.is_some() {
+                    self.emit(begin);
+                    let red = line_text(&self.line, split, end);
+                    self.emit_wrapped(&red, width, &mut col);
+                }
             }
         }
         old
@@ -869,6 +1023,15 @@ fn display_word(completion: &Completion) -> String {
     }
 }
 
+/// `line[start..end]` as an owned string (always whole characters by construction;
+/// empty on the defensive invalid-UTF-8 path, like [`Editor::emit_line_bytes`]).
+fn line_text(line: &[u8], start: usize, end: usize) -> String {
+    match core::str::from_utf8(&line[start..end]) {
+        Ok(text) => String::from(text),
+        Err(_) => String::new(),
+    }
+}
+
 /// Characters (not bytes) in a UTF-8 buffer — the erase-column count.
 fn char_count(bytes: &[u8]) -> usize {
     bytes
@@ -930,7 +1093,7 @@ mod tests {
     }
 
     fn editor() -> Editor {
-        Editor::new("eosh> ", vocab(), Vec::new(), Marker::RED)
+        Editor::new("eosh> ", vocab(), Vec::new(), Marker::RED, None)
     }
 
     fn editor_with_history(history: &[&str]) -> Editor {
@@ -939,6 +1102,7 @@ mod tests {
             vocab(),
             history.iter().map(|s| s.to_string()).collect(),
             Marker::RED,
+            None,
         )
     }
 
@@ -1241,7 +1405,7 @@ mod tests {
     #[test]
     fn recall_view_is_capped() {
         let history: Vec<String> = (0..100).map(|i| format!("line{i}")).collect();
-        let ed = Editor::new("eosh> ", vocab(), history, Marker::RED);
+        let ed = Editor::new("eosh> ", vocab(), history, Marker::RED, None);
         assert_eq!(ed.history.len(), RECALL_CAP);
         assert_eq!(ed.history[0], "line36");
         assert_eq!(ed.history.last().unwrap(), "line99");
@@ -1364,12 +1528,12 @@ mod tests {
     fn marking_is_per_prompt_vocabulary_not_hardcoded() {
         // An empty vocabulary still tracks at the head (builtins are alive there):
         // a word that is no builtin prefix marks.
-        let mut ed = Editor::new("eosh> ", Vocab::default(), Vec::new(), Marker::RED);
+        let mut ed = Editor::new("eosh> ", Vocab::default(), Vec::new(), Marker::RED, None);
         type_text(&mut ed, "zq");
         let out = ed.take_output();
         assert!(out.contains("\u{1b}[31m"), "{out:?}");
         // `h` extends to builtins (help, history): green until it dies.
-        let mut ed = Editor::new("eosh> ", Vocab::default(), Vec::new(), Marker::RED);
+        let mut ed = Editor::new("eosh> ", Vocab::default(), Vec::new(), Marker::RED, None);
         type_text(&mut ed, "help");
         assert_eq!(ed.take_output(), "help");
     }
@@ -1579,7 +1743,13 @@ mod tests {
             String::from_utf8_lossy(&ed.line)
         );
         // The differential: rebuild the same line from scratch and compare.
-        let mut fresh = Editor::new(&ed.prompt, ed.vocab.clone(), Vec::new(), ed.marker);
+        let mut fresh = Editor::new(
+            &ed.prompt,
+            ed.vocab.clone(),
+            Vec::new(),
+            ed.marker,
+            ed.width,
+        );
         fresh.line = ed.line.clone();
         fresh.rebuild();
         let line = String::from_utf8_lossy(&ed.line);
@@ -1695,7 +1865,15 @@ mod tests {
         const BYTES: &[u8] = b"net.l4ovrhlpsvco $&()=,\"#[]-x\t";
         let mut rng = Rng(0xDEAD_BEEF_CAFE_1234);
         for round in 0..60 {
-            let mut ed = editor_with_history(&["net.l4.over-l2 --address dhcp", "zzz qq"]);
+            // A third of the rounds run width-aware (a small width so wraps are
+            // frequent): the differential below pins that the wrap layer is output
+            // only — parser state, stack, and marks are identical with and without.
+            let width = if round % 3 == 0 { Some(7) } else { None };
+            let history = ["net.l4.over-l2 --address dhcp", "zzz qq"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let mut ed = Editor::new("eosh> ", vocab(), history, Marker::RED, width);
             if round % 2 == 0 {
                 ed.provide_args("net.l4.over-l2", l4_args());
             }
@@ -1714,9 +1892,141 @@ mod tests {
         }
     }
 
+    // -- the width-aware output layer (the board-console wrap fix) ----------------------
+    //
+    // The fake-terminal harness: every test asserts the EXACT emitted byte sequence
+    // against the module-docs contract (\r, \r\n, \b \b, CSI K, CSI A, CSI <n>G, SGR).
+    // Width 8 with the 6-column prompt keeps the boundaries readable: the first row
+    // holds `eosh> ` plus two characters.
+
+    /// A width-aware editor over the same vocabulary and prompt.
+    fn editor_with_width(width: usize, history: &[&str]) -> Editor {
+        Editor::new(
+            "eosh> ",
+            vocab(),
+            history.iter().map(|s| s.to_string()).collect(),
+            Marker::RED,
+            Some(width),
+        )
+    }
+
+    #[test]
+    fn typing_across_the_boundary_advances_the_row_explicitly() {
+        let mut ed = editor_with_width(8, &[]);
+        // `h` lands at column 7, `e` fills column 8 → explicit `\r\n`, never the
+        // terminal's deferred auto-wrap.
+        type_text(&mut ed, "hello");
+        assert_eq!(ed.take_output(), "he\r\nllo");
+        assert_eq!(submit(&mut ed), "hello");
+        assert_eq!(ed.take_output(), "\r\n");
+    }
+
+    #[test]
+    fn backspace_across_the_wrap_boundary_climbs_a_row() {
+        let mut ed = editor_with_width(8, &[]);
+        type_text(&mut ed, "hel");
+        ed.take_output();
+        // Erasing `l` (cursor at column 1 of row 2): plain same-row erase.
+        ed.handle(Key::Backspace);
+        assert_eq!(ed.take_output(), "\u{8} \u{8}");
+        // Erasing `e` (cursor at column 0 of row 2, the character on the row above):
+        // up, to the last column (1-based CHA), clear it — never `\b` at column 0.
+        ed.handle(Key::Backspace);
+        assert_eq!(ed.take_output(), "\u{1b}[A\u{1b}[8G\u{1b}[K");
+        // And the next erase is back to a plain same-row one.
+        ed.handle(Key::Backspace);
+        assert_eq!(ed.take_output(), "\u{8} \u{8}");
+        assert_eq!(submit(&mut ed), "");
+    }
+
+    #[test]
+    fn recall_of_a_line_longer_than_the_width_wraps_the_repaint() {
+        // `eosh> hello --name one` is 22 cells: rows `eosh> he` / `llo --na` / `me one`.
+        // ↑ from the empty line: clear the one row, repaint prompt + entry wrapped.
+        let mut ed = editor_with_width(8, &["hello --name one"]);
+        ed.handle(Key::Up);
+        assert_eq!(ed.take_output(), "\r\u{1b}[Keosh> he\r\nllo --na\r\nme one");
+        assert_eq!(submit(&mut ed), "hello --name one");
+    }
+
+    #[test]
+    fn recall_replacing_a_longer_line_with_a_shorter_one_clears_every_row() {
+        // ↑↑ shows the 22-cell entry (3 rows), then ↓ replaces it with the 9-cell
+        // `eosh> det` (2 rows): each repaint must clear every row the OLD content
+        // occupied — `\b` cannot do that across rows (the board bench's bug).
+        let mut ed = editor_with_width(8, &["hello --name one", "det"]);
+        ed.handle(Key::Up);
+        assert_eq!(ed.take_output(), "\r\u{1b}[Keosh> de\r\nt");
+        ed.handle(Key::Up);
+        // 9 cells span 2 rows: clear the cursor row + 1 above, repaint 3 wrapped rows.
+        assert_eq!(
+            ed.take_output(),
+            "\r\u{1b}[K\u{1b}[A\u{1b}[Keosh> he\r\nllo --na\r\nme one"
+        );
+        ed.handle(Key::Down);
+        // 22 cells span 3 rows (cursor on the third): clear all three, repaint 2 rows.
+        assert_eq!(
+            ed.take_output(),
+            "\r\u{1b}[K\u{1b}[A\u{1b}[K\u{1b}[A\u{1b}[Keosh> de\r\nt"
+        );
+        assert_eq!(submit(&mut ed), "det");
+    }
+
+    #[test]
+    fn recalling_a_red_entry_wraps_with_the_marker_interleaved() {
+        // `help xx`: green `help ` + red `xx`; the SGRs are zero-width — the column
+        // count runs straight through them.
+        let mut ed = editor_with_width(8, &["help xx"]);
+        ed.handle(Key::Up);
+        assert_eq!(ed.take_output(), "\r\u{1b}[Keosh> he\r\nlp \u{1b}[31mxx");
+        // Backspacing the red tail: same-row erases, then the red→green marker close.
+        ed.handle(Key::Backspace);
+        assert_eq!(ed.take_output(), "\u{8} \u{8}");
+        ed.handle(Key::Backspace);
+        assert_eq!(ed.take_output(), "\u{8} \u{8}\u{1b}[0m");
+        assert_eq!(submit(&mut ed), "help ");
+    }
+
+    #[test]
+    fn tab_completion_and_list_repaint_wrap_too() {
+        // Width 10: `eosh> ti` + TAB appends `me.f`, whose `e` fills column 10.
+        let mut ed = Editor::new("eosh> ", vocab(), Vec::new(), Marker::RED, Some(10));
+        type_text(&mut ed, "ti");
+        ed.take_output();
+        ed.handle(Key::Tab);
+        assert_eq!(ed.take_output(), "me\r\n.f");
+        // No further progress: the list, then the wrapped prompt+line repaint
+        // (`eosh> time` fills the first row exactly).
+        ed.handle(Key::Tab);
+        assert_eq!(
+            ed.take_output(),
+            "\r\ntime.frozen  time.fuzzy\r\neosh> time\r\n.f"
+        );
+        assert_eq!(submit(&mut ed), "time.f");
+    }
+
+    #[test]
+    fn width_none_preserves_the_exact_historical_bytes() {
+        // The regression pin: a width-less editor (every transport that cannot say —
+        // the browser line transport, usermode today) emits byte-for-byte the
+        // pre-width stream: no CSI outside the SGR marker, `\b \b` only.
+        let mut ed = editor_with_history(&["hello --name one"]);
+        // ↑ on the empty line: no erases, just the entry text.
+        ed.handle(Key::Up);
+        assert_eq!(ed.take_output(), "hello --name one");
+        // ↓ back to the (empty) fresh line: one `\b \b` per character, nothing else.
+        ed.handle(Key::Down);
+        assert_eq!(ed.take_output(), "\u{8} \u{8}".repeat(16));
+        // Typing past any width and the backspace stay plain.
+        type_text(&mut ed, "hello --name eo9");
+        assert_eq!(ed.take_output(), "hello --name eo9");
+        ed.handle(Key::Backspace);
+        assert_eq!(ed.take_output(), "\u{8} \u{8}");
+    }
+
     #[test]
     fn inverse_marker_swaps_the_sequences() {
-        let mut ed = Editor::new("eosh> ", vocab(), vec![], Marker::INVERSE);
+        let mut ed = Editor::new("eosh> ", vocab(), vec![], Marker::INVERSE, None);
         type_text(&mut ed, "help x");
         assert_eq!(ed.take_output(), "help \u{1b}[7mx");
         ed.handle(Key::Backspace);

@@ -246,7 +246,7 @@ fn smoke_demo_line_is_green_and_counters_count() {
     assert_eq!(states.len(), 88);
     assert!(allocs > 0 && bytes > 0, "the allocator hook is live");
     // And the editor agrees the line is green.
-    let mut editor = Editor::new("eosh> ", board_vocab(), Vec::new(), Marker::RED);
+    let mut editor = Editor::new("eosh> ", board_vocab(), Vec::new(), Marker::RED, None);
     for &byte in DEMO_LINE.as_bytes() {
         editor.handle(Key::Char(byte));
     }
@@ -299,7 +299,7 @@ fn census_allocs_per_keystroke() {
     // tracker arming, step, the tracking completions walk, the snapshot push).
     eprintln!("\n== census: editor-composite heap traffic per keystroke ==");
     eprintln!("pos\tbyte\tallocs\talloc_bytes\tfrees\tfree_bytes");
-    let mut editor = Editor::new("eosh> ", board_vocab(), Vec::new(), Marker::RED);
+    let mut editor = Editor::new("eosh> ", board_vocab(), Vec::new(), Marker::RED, None);
     let mut total = (0u64, 0u64);
     for (i, &byte) in DEMO_LINE.as_bytes().iter().enumerate() {
         let (a, ab, f, fb, _) = heap_traffic(|| {
@@ -369,7 +369,7 @@ fn phase_timing_per_position() {
     // The editor-composite per keystroke, timed end to end (one fresh editor per rep
     // so the snapshot stack does not grow rep over rep).
     let comp_ns = time_ns(REPS, || {
-        let mut editor = Editor::new("eosh> ", board_vocab(), Vec::new(), Marker::RED);
+        let mut editor = Editor::new("eosh> ", board_vocab(), Vec::new(), Marker::RED, None);
         for &byte in DEMO_LINE.as_bytes() {
             editor.handle(Key::Char(byte));
             editor.take_output();
@@ -391,7 +391,7 @@ fn phase_timing_per_position() {
     for (i, &byte) in DEMO_LINE.as_bytes().iter().enumerate() {
         let mut samples = Vec::with_capacity(REPS);
         for _ in 0..REPS {
-            let mut editor = Editor::new("eosh> ", board_vocab(), Vec::new(), Marker::RED);
+            let mut editor = Editor::new("eosh> ", board_vocab(), Vec::new(), Marker::RED, None);
             for &prefix_byte in &DEMO_LINE.as_bytes()[..i] {
                 editor.handle(Key::Char(prefix_byte));
             }
@@ -416,7 +416,7 @@ fn width_scaling() {
     eprintln!("vocab\tline_us\tper_key_us\tstep_allocs_total\tlive_nodes_at_end");
     for width in [4usize, 16, 38, 67, 100] {
         let line_ns = time_ns(REPS, || {
-            let mut editor = Editor::new("eosh> ", vocab_of(width), Vec::new(), Marker::RED);
+            let mut editor = Editor::new("eosh> ", vocab_of(width), Vec::new(), Marker::RED, None);
             for &byte in DEMO_LINE.as_bytes() {
                 editor.handle(Key::Char(byte));
                 editor.take_output();

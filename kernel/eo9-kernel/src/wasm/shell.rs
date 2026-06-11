@@ -192,6 +192,15 @@ fn run_init(entries: &'static [StoreEntry], config: &str) -> Result<String, wasm
     Ok(results.first().map(wave::render).unwrap_or_default())
 }
 
+/// The kernel console's column count, declared to eosh via the manifest's `term-width`
+/// record. One value for every kernel boot: QEMU and the board serial console are both
+/// operated at 100 columns (the bench protocol's terminal geometry), and the fbcon tee
+/// renders exactly this many — the const assert keeps the two in lock step (fbcon is
+/// only compiled on the board profile, hence the cfg).
+const TERM_WIDTH: usize = 100;
+#[cfg(feature = "board-opi5plus")]
+const _: () = assert!(TERM_WIDTH == crate::fbcon::COLS);
+
 /// The session manifest eosh's `env` builtin reads from `/session` (the `eo9-session 1`
 /// format from plan/10 D9 / plan/11 D12 — keep in sync with eosh-core's `envinfo`).
 /// Children read the same manifest through their own fs view (they inherit the full
@@ -208,6 +217,10 @@ pub(super) fn session_manifest(entries: &'static [StoreEntry]) -> String {
     let mut lines = vec![
         String::from("eo9-session 1"),
         String::from("shell text PL011 serial console"),
+        // The console's column count (the `term-width` record eosh's editor reads for
+        // wrap-aware repainting) — see TERM_WIDTH above, const-pinned to fbcon::COLS
+        // on the board profile.
+        format!("term-width {TERM_WIDTH}"),
         if writable_store {
             String::from(
                 "shell fs the baked-in store image plus a writable disk store (saved \

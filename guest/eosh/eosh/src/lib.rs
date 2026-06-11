@@ -745,12 +745,22 @@ async fn editor_loop(
     text: &text::TextImpl,
     first: text::Key,
 ) -> Result<ProgramSuccess, ProgramFailure> {
+    // The console's column count, when the embedder declared one in the session
+    // manifest (the `term-width` record — the kernel console writes its known width;
+    // see eosh-core's envinfo): the editor's wrap-aware repaint needs it to handle
+    // lines longer than the terminal row. Read once per session; an absent manifest
+    // or record means the editor never wraps — exactly today's behavior on every
+    // transport that cannot declare a width.
+    let width = match session.backend_mut().session_manifest().await {
+        Some(text) => eosh_core::envinfo::SessionManifest::parse(&text).and_then(|m| m.term_width),
+        None => None,
+    };
     // The probe key arrives before the first editor exists; feed it in.
     let mut pending = Some(first);
     loop {
         let vocab = snapshot_vocab(session).await;
         let history = session.recall_view(RECALL_CAP);
-        let mut editor = Editor::new(PROMPT, vocab, history, Marker::RED);
+        let mut editor = Editor::new(PROMPT, vocab, history, Marker::RED, width);
         let submitted = loop {
             let key = match pending.take() {
                 Some(key) => editor_key(key),
