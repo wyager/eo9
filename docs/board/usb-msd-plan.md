@@ -153,10 +153,23 @@ The stick (usb-boot-demo-plan): MBR, one FAT32 partition, 8.3 names — `EO9.IMG
 `BOOTARGS.TXT`, `BOOT.SCR` (mkimage script with the image CRC **baked in**). Image
 sizes vary per build (23–52 MiB) — naive in-place overwrite breaks the moment the
 image grows. Rather than implement FAT cluster allocation, **change the stick
-build**: xtask pads `EO9.IMG` with zeros to a **fixed slot size** (default 56 MiB —
-covers the 52 MiB full build with headroom, under the 62 MiB structural cap;
-configurable) and renders `BOOT.SCR` with **fixed-width** hex CRC and size fields, so
-both files are byte-count-invariant across builds. Then every rewrite is:
+build**: xtask pads `EO9.IMG` with zeros to a **fixed slot size** (default 56 MiB;
+configurable up to the 62 MiB structural cap) and renders `BOOT.SCR` with
+**fixed-width** hex CRC and size fields, so both files are byte-count-invariant
+across builds. Then every rewrite is:
+
+> **Sizing note (L4 delivery 2026-06-10, confirmed against the L1 lane's finding):
+> the stick carries the MINIMAL/station profile, by construction.** The FULL board
+> image measured 65.0–65.6 MiB at the L1/L4 builds — past this plan's 52 MiB sizing
+> assumption and past the **62 MiB structural boot cap** (load 0x0020_0000 up to
+> 0x0400_0000), so no boot path can run it from the stick at all; kexec into a
+> staged copy is its only transport. That puts it out of stick scope regardless of
+> slot sizing. The minimal image (~35 MiB; it carries init/eosh/the station set
+> since the serial-cap change) is the stick payload — `cargo xtask build-stick`
+> defaults to building it, refuses any image past the cap with this explanation
+> (never a truncate, never a silent pad failure), and caps `--slot-mib` at 62. The
+> 56 MiB default slot stands: comfortable growth headroom for the minimal profile
+> under the cap.
 
 1. Parse the FAT32 boot sector + root directory, locate `EO9.IMG` and `BOOT.SCR`,
    walk their cluster chains once (read-only against the FAT).
