@@ -311,6 +311,55 @@ consume it — one protocol, two sinks, the tests stay shared).
   enumerates but bulk times out → bulk-list/DMA-coherence (the provider sweep
   brackets are structural, same as interrupt EDs — but bulk is the first OUT-heavy
   DMA path on silicon, watch it).
+
+  **The R1 bench drill, spelled out** (the store side landed with area/53 — the
+  MINIMAL image now bakes `usb.msd`, `disk.part`, `stickflash`):
+
+  1. Serial-load the minimal image (`build-kernel aarch64 opi5plus minimal`;
+     still under the serial stub's 62 MiB payload window). Stick in USB2-A #2
+     (the old mouse port), keyboard untouched in #1.
+  2. Foreground at the eosh prompt — on a `station-net` boot (the console's
+     `use l4=lan` routes stickflash's `eo9:net/l4` import through the gate):
+
+     ```
+     usb.ohci --region usb-host1-ohci $ usb.msd $ disk.part --partition 1
+         $ stickflash --secret <16+ bytes>
+     ```
+
+     On a plain boot there is no l4 root for stickflash's import — prepend the
+     net legs explicitly (the appendix config line's foreground twin):
+
+     ```
+     net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address dhcp)
+         $ usb.ohci --region usb-host1-ohci $ usb.msd $ disk.part --partition 1
+         $ stickflash --secret <16+ bytes>
+     ```
+
+  3. R1's evidence is the enumeration banner (usb.msd's VID:PID / INQUIRY /
+     READ CAPACITY lines) plus stickflash's FAT slot-discovery line — both print
+     before any network peer exists (check-stickflash arm 1 pins exactly that
+     ordering). Ctrl-C out after the banner; no flash needed for R1. Note:
+     `mdcheck` is NOT baked in the minimal store — on a serial-loaded board the
+     enumeration evidence comes from usb.msd's own banner through this chain
+     (the full store, which carries mdcheck, no longer fits the serial window).
+
+  **The region question — both names, and the collision rule.** The board grants
+  two OHCI platform regions (kernel region table, `arch/aarch64/mod.rs`):
+
+  | region | base (SPI) | who is on it (bench layout) |
+  |---|---|---|
+  | `usb-host0-ohci` | 0xfc84_0000 (216) | the KEYBOARD (FS behind its built-in hub) — the station `kbd` service's claim: `kbd = usb.ohci --region usb-host0-ohci $ usb.kbd restart restart.always` |
+  | `usb-host1-ohci` | 0xfc8c_0000 (219) | the STICK in USB2-A #2 (the G500 mouse's old port, per the live `usb tree` recon) |
+
+  Collision rule: a region is single-claim. The flash chain must never name
+  `usb-host0-ohci` while the kbd service runs — the claim answers denied and the
+  drill dies before enumerating (`svc stop kbd` first if host0 must be probed).
+  The unconfigured `usb.ohci` default claims the FIRST granted `-ohci` region,
+  which is deliberately `usb-host1-ohci` (the region-table order exists for the
+  bench mouse, now the stick) — so even the bare spelling lands on the stick's
+  controller. The drill names `--region usb-host1-ohci` anyway: explicit beats
+  default, and the bench planner picks at run time (e.g. if the stick is
+  re-seated onto the other pair's port).
 - **R2 — read**: sector 0 (MBR matches the stick we built), then a **full EO9.IMG
   read via the chain, CRC against the xtask-baked value** — end-to-end read
   integrity against ground truth the bench already owns (the sdcard M2 trick).
@@ -441,6 +490,8 @@ flash = net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address dhcp)
 
 (Secret delivery into the init grammar — literal `--secret` vs a file/env
 indirection — is a bench-time decision; the gate types the literal at the prompt.
-The minimal/station store does not yet bake usb.msd/disk.part/mdcheck/stickflash:
-that addition is R1's first move, deliberately left out of L5 per the
-no-baked-config-changes rule.)
+The minimal/station store now bakes usb.msd/disk.part/stickflash — R1's first
+move, landed with area/53; mdcheck remains full-store-only, so the serial-loaded
+board's enumeration evidence is usb.msd's own banner through the flash chain —
+see the §5.2 R1 drill for the foreground composition and the region/collision
+rule.)
