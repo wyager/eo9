@@ -936,3 +936,13 @@ it at the hot path, both park gates, the masked re-check, and the post-wfi arm. 
 spurious-wake drain left the next counted reap waiting forever (silent freeze or
 device-lost under TCG) — now credit-accounted with a frame-bounded spin, pinned by
 a mock regression test.
+
+## wit/disk's dormant `world readonly` has the broken shared-types shape (area/50 finding 1, 2026-06-10)
+The dormant `readonly` world in wit/disk imports and exports `eo9:disk/disk` in the
+shape that makes the imported and exported interface carry DISTINCT resource types
+under component sealing: a provider built against it fails composition validation
+with "resource types are not the same" when sealed-chained. disk.part avoided it by
+declaring its own world with the wrap idiom (a fresh exported interface whose
+resource wraps the imported one, the disk-part world.wit shape). When disk.readonly
+(or any disk middleware) gets built, use the wrap idiom — do not copy the dormant
+world. Lane: fix or delete the dormant world so it cannot be copied.

@@ -142,7 +142,7 @@ Consistent with the disk.* family and sdcard-plan §B.3, unchanged in spirit:
   usermode-testable over disk.mem with an MBR fixture, no silicon dependency, no
   duplication risk if both lanes read this paragraph.
 - The flasher chain is therefore:
-  `usb.ohci --region usb-host1-ohci $ usb.msd $ disk.part --index 1 $ …` — the FAT
+  `usb.ohci --region usb-host1-ohci $ usb.msd $ disk.part --partition 1 $ …` — the FAT
   partition as a windowed eo9:disk, p-boot-layout knowledge nowhere in the driver.
 
 ## 3. The FAT file rewrite — smallest correct v1
@@ -238,7 +238,7 @@ Init config line (the station grammar — `$` chains, `--flag value`):
 
 ```
 flash = net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address dhcp)
-        $ usb.ohci --region usb-host1-ohci $ usb.msd $ disk.part --index 1
+        $ usb.ohci --region usb-host1-ohci $ usb.msd $ disk.part --partition 1
         $ stickflash --secret-… restart restart.always
 ```
 
@@ -270,7 +270,7 @@ check-usb, mirroring the usb-kbd gate pattern exactly.
 - **check-msd**: xtask builds a FAT32 fixture image (mtools or the fatwalk crate's
   own test builder — same fixture both places) with a dummy EO9.IMG + BOOT.SCR;
   boots with pci-ohci + usb-storage; drives at the eosh prompt:
-  `usb.ohci-pci $ usb.msd $ disk.part --index 1 $ readwrite`-style scratch
+  `usb.ohci-pci $ usb.msd $ disk.part --partition 1 $ readwrite`-style scratch
   write+read-back (the existing readwrite example or a thin mdcheck), then
   `usb.ohci $ usb.msd` for the typed no-controller refusal — the check-usb
   three-composition pattern verbatim.
