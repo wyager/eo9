@@ -865,16 +865,18 @@ mod tests {
             "at column 13: expected `$` or `,`, found `c`"
         );
         assert_eq!(msg("svc restart ticker").contains("one of:"), true);
-        assert_eq!(
-            msg("let x memfs"),
-            "at column 7: expected `=`, found `m`"
+        assert_eq!(msg("let x memfs"), "at column 7: expected `=`, found `m`");
+        assert_eq!(msg("browser ) extra").contains("end of line"), true);
+        assert!(
+            msg("echo \"unterminated").contains("not closed"),
+            "{}",
+            msg("echo \"unterminated")
         );
-        assert_eq!(
-            msg("browser ) extra").contains("end of line"),
-            true
+        assert!(
+            msg("echo \"bad \\q escape\"").contains("`\\\\`"),
+            "{}",
+            msg("echo \"bad \\q escape\"")
         );
-        assert!(msg("echo \"unterminated").contains("not closed"), "{}", msg("echo \"unterminated"));
-        assert!(msg("echo \"bad \\q escape\"").contains("`\\\\`"), "{}", msg("echo \"bad \\q escape\""));
         assert!(msg("browser --url").starts_with("unexpected end of line"));
         assert!(msg("detach n = x").starts_with("unexpected end of line"));
         // Column counts characters, not bytes.

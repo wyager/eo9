@@ -268,7 +268,9 @@ pub fn builtin_doc(word: &str) -> Option<&'static BuiltinDoc> {
 /// of the same table — a card added to [`BUILTIN_DOCS`] is automatically completable
 /// and green, with no parallel word list to keep in sync.
 pub fn card_words() -> impl Iterator<Item = &'static str> {
-    BUILTIN_DOCS.iter().flat_map(|doc| doc.names.iter().copied())
+    BUILTIN_DOCS
+        .iter()
+        .flat_map(|doc| doc.names.iter().copied())
 }
 
 /// Render a card in `describe`'s voice.

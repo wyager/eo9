@@ -1091,9 +1091,9 @@ fn longest_common_prefix(words: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::grammar::FlagSpec;
-    use alloc::boxed::Box;
     use crate::inc::Tag;
     use alloc::borrow::ToOwned;
+    use alloc::boxed::Box;
     use alloc::format;
     use alloc::string::ToString;
     use alloc::vec;

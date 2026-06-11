@@ -332,10 +332,7 @@ fn star_args_for(cx: &Cx, name: &str) -> BoxP<Vec<Arg>> {
 /// (offering the program's flags alongside), and the bound value position offers that
 /// flag's typed candidates alongside the free forms.
 fn arg_known(cx: &Cx, program: &ProgramSlots) -> BoxP<Arg> {
-    let flag: BoxP<String> = alt(vec![
-        cap_flag_name(),
-        overlay_words(program.flags.clone()),
-    ]);
+    let flag: BoxP<String> = alt(vec![cap_flag_name(), overlay_words(program.flags.clone())]);
     let value_cx = cx.clone();
     let values = program.values.clone();
     keep_right(
@@ -470,14 +467,11 @@ fn word_list_rest(acc: Vec<String>) -> BoxP<Vec<String>> {
     let acc2 = acc.clone();
     alt(vec![
         pure(acc),
-        bind(
-            keep_right(t_byte(b','), t_plain_word()),
-            move |word| {
-                let mut next = acc2.clone();
-                next.push(word);
-                word_list_rest(next)
-            },
-        ),
+        bind(keep_right(t_byte(b','), t_plain_word()), move |word| {
+            let mut next = acc2.clone();
+            next.push(word);
+            word_list_rest(next)
+        }),
     ])
 }
 
@@ -524,14 +518,11 @@ fn with_items_rest(cx: &Cx, acc: Vec<WithBinding>) -> BoxP<Vec<WithBinding>> {
     let acc2 = acc.clone();
     alt(vec![
         pure(acc),
-        bind(
-            keep_right(t_byte(b','), with_item(cx)),
-            move |more| {
-                let mut next = acc2.clone();
-                next.extend(more);
-                with_items_rest(&cx2, next)
-            },
-        ),
+        bind(keep_right(t_byte(b','), with_item(cx)), move |more| {
+            let mut next = acc2.clone();
+            next.extend(more);
+            with_items_rest(&cx2, next)
+        }),
     ])
 }
 
@@ -554,10 +545,7 @@ fn with_item(cx: &Cx) -> BoxP<Vec<WithBinding>> {
                 alt(vec![
                     // Single parenthesized provider: `) as slot`.
                     map(
-                        keep_right(
-                            seq!(t_byte(b')'), t_kw("as", Tag::Keyword)),
-                            t_plain_word(),
-                        ),
+                        keep_right(seq!(t_byte(b')'), t_kw("as", Tag::Keyword)), t_plain_word()),
                         move |slot| {
                             vec![WithBinding {
                                 provider: single.clone(),
@@ -660,11 +648,7 @@ fn provider_no_paren(cx: &Cx) -> BoxP<Expr> {
 // -- commands --------------------------------------------------------------------------
 
 /// `<keyword> <name> = <expr>` (let and save).
-fn name_eq_expr(
-    cx: &Cx,
-    word: &'static str,
-    build: fn(String, Expr) -> Command,
-) -> BoxP<Command> {
+fn name_eq_expr(cx: &Cx, word: &'static str, build: fn(String, Expr) -> Command) -> BoxP<Command> {
     let cx2 = cx.clone();
     keep_right(
         t_kw(word, Tag::Builtin),
@@ -697,10 +681,7 @@ fn detach(cx: &Cx) -> BoxP<Command> {
                     let program2 = program.clone();
                     let cx4 = cx3.clone();
                     map(
-                        keep_right(
-                            t_kw("restart", Tag::Keyword),
-                            expr_l(&cx4, Pos::Normal),
-                        ),
+                        keep_right(t_kw("restart", Tag::Keyword), expr_l(&cx4, Pos::Normal)),
                         move |policy| Command::Detach {
                             name: name2.clone(),
                             expr: program2.clone(),
@@ -749,8 +730,12 @@ fn describe(cx: &Cx) -> BoxP<Command> {
     keep_right(
         t_kw("describe", Tag::Builtin),
         alt(vec![
-            map(t_byte(b'$'), |()| Command::DescribeBuiltin(String::from("$"))),
-            map(t_byte(b'&'), |()| Command::DescribeBuiltin(String::from("&"))),
+            map(t_byte(b'$'), |()| {
+                Command::DescribeBuiltin(String::from("$"))
+            }),
+            map(t_byte(b'&'), |()| {
+                Command::DescribeBuiltin(String::from("&"))
+            }),
             keep_right(
                 ws(),
                 alt(vec![
@@ -997,9 +982,9 @@ mod tests {
     use crate::check::sanity_check;
     use crate::inc::{accepts, feed_bytes, forced_prefix};
     use crate::input::Input;
+    use crate::parse::parse_command;
     use alloc::format;
     use alloc::string::ToString;
-    use crate::parse::parse_command;
     use std::println;
 
     fn flag(name: &str, ty: &str) -> FlagSpec {
@@ -1143,7 +1128,10 @@ mod tests {
     /// AST) ran clean over this corpus and ~12k fuzzed lines.
     const CORPUS: &[(&str, bool)] = &[
         // lex.rs tests
-        ("virtualfs --dir /tmp/sandbox $ browser --url https://example.com", true),
+        (
+            "virtualfs --dir /tmp/sandbox $ browser --url https://example.com",
+            true,
+        ),
         ("only eo9:time,eo9:fs$cruncher", true),
         ("let det-env = (time.frozen & virtualnet)", true),
         (r#"echo --text "a \"b\" \\ c\nd" "#, true),
@@ -1151,8 +1139,14 @@ mod tests {
         ("browser # composed, then run by the shell", true),
         ("# a whole-line comment", true),
         ("time.monotonic-stub eo9:fs/fs@0.1.0 virtualfs.create", true),
-        ("pci.admit-address --allow [{segment: 0, bus: 0, device: 1, function: 0}] $ lspci", true),
-        ("--pairs [[1, 2], [3, 4]] --opts {a: some(1), b: (5)}", false),
+        (
+            "pci.admit-address --allow [{segment: 0, bus: 0, device: 1, function: 0}] $ lspci",
+            true,
+        ),
+        (
+            "--pairs [[1, 2], [3, 4]] --opts {a: some(1), b: (5)}",
+            false,
+        ),
         (r#"--names ["a]b", "c,{d", "e\"]f"]"#, false),
         (r#"--allow "[{segment: 0, bus: 0}]""#, false),
         ("only eo9:time,eo9:fs $ cruncher", true),
@@ -1164,7 +1158,10 @@ mod tests {
         ("", true),
         ("   \t ", true),
         // parse.rs tests
-        ("(virtualfs --dir /tmp/sandbox) $ (browser --url https://example.com)", true),
+        (
+            "(virtualfs --dir /tmp/sandbox) $ (browser --url https://example.com)",
+            true,
+        ),
         ("virtualfs $ virtualnet $ browser", true),
         ("virtualfs $ (virtualnet $ browser)", true),
         ("(virtualnet $ virtualfs) $ browser", true),
@@ -1174,23 +1171,47 @@ mod tests {
         ("posix-base & loopback-net --port 8080 $ app", true),
         ("interpret (virtualnet $ browser)", true),
         ("interpret virtualnet $ browser", true),
-        (r#"run --program (net.none $ browser) --label "my run" --retries 3"#, true),
+        (
+            r#"run --program (net.none $ browser) --label "my run" --retries 3"#,
+            true,
+        ),
         ("only eo9:time,eo9:fs $ cruncher --input data.bin", true),
         ("only sandbox.no-net $ only eo9:fs $ app", true),
         ("only eo9:fs $ virtualnet $ browser", true),
         ("realfs $ only eo9:fs $ app", true),
         ("rename eo9:fs/fs scratch-fs $ tool", true),
-        ("with realfs as system-fs, memfs as scratch-fs $ backup-tool --src /home --dst /backups", true),
+        (
+            "with realfs as system-fs, memfs as scratch-fs $ backup-tool --src /home --dst /backups",
+            true,
+        ),
         ("with (a, b) as (x, y) $ tool", true),
         ("with a as x, b as y $ tool", true),
-        ("with (realnet & nat) as net, memfs & overlay as scratch $ app", true),
+        (
+            "with (realnet & nat) as net, memfs & overlay as scratch $ app",
+            true,
+        ),
         ("with (a, b, c) as (x, y) $ tool", false),
-        ("detach ticker = cruncher --rounds 50 restart restart.never", true),
-        ("detach worker = cruncher restart restart.backoff --max-restarts 5 --base-delay-ms 200", true),
-        ("detach worker = cruncher restart (restart.backoff --max-restarts 5 --base-delay-ms 200)", true),
-        ("detach greeter = time.frozen $ hello --name svc restart restart.always", true),
+        (
+            "detach ticker = cruncher --rounds 50 restart restart.never",
+            true,
+        ),
+        (
+            "detach worker = cruncher restart restart.backoff --max-restarts 5 --base-delay-ms 200",
+            true,
+        ),
+        (
+            "detach worker = cruncher restart (restart.backoff --max-restarts 5 --base-delay-ms 200)",
+            true,
+        ),
+        (
+            "detach greeter = time.frozen $ hello --name svc restart restart.always",
+            true,
+        ),
         ("detach r = restart restart restart.never", true),
-        ("detach r = (restart --mode soft) restart restart.never", true),
+        (
+            "detach r = (restart --mode soft) restart restart.never",
+            true,
+        ),
         ("svc", true),
         ("svc list", true),
         ("svc log ticker", true),
@@ -1238,8 +1259,14 @@ mod tests {
         ("detach t = time.frozen restart restart.never", true),
         ("detach t = timeit hello restart restart.never", true),
         ("detach w = worker restart restart.never", true),
-        ("detach worker = cruncher --rounds 5 restart restart.never", true),
-        ("detach worker = cruncher --seed 1 --rounds 5 restart restart.never", true),
+        (
+            "detach worker = cruncher --rounds 5 restart restart.never",
+            true,
+        ),
+        (
+            "detach worker = cruncher --seed 1 --rounds 5 restart restart.never",
+            true,
+        ),
         ("describe (help)", true),
         ("describe eo9:fs", true),
         ("describe eo9:fs/fs", true),
@@ -1267,13 +1294,25 @@ mod tests {
         ("# comment only", true),
         // builtin-card usage examples
         ("let det = time.frozen & entropy.seeded --seed 7", true),
-        ("save frozen-hello = time.frozen --now-seconds 5 --monotonic-ns 0 $ hello", true),
-        ("detach worker = cruncher --rounds 100000 restart restart.never", true),
+        (
+            "save frozen-hello = time.frozen --now-seconds 5 --monotonic-ns 0 $ hello",
+            true,
+        ),
+        (
+            "detach worker = cruncher --rounds 100000 restart restart.never",
+            true,
+        ),
         ("entropy.seeded --seed 7 $ rng --count 2", true),
-        ("time.frozen --now-seconds 0 --monotonic-ns 0 & entropy.seeded --seed 7", true),
+        (
+            "time.frozen --now-seconds 0 --monotonic-ns 0 & entropy.seeded --seed 7",
+            true,
+        ),
         ("only eo9:text,eo9:time $ hello", true),
         ("rename eo9:fs/fs upper $ fs.overlay", true),
-        ("with fs.memfs as upper, fs.readonly as lower $ fs.overlay $ ls /", true),
+        (
+            "with fs.memfs as upper, fs.readonly as lower $ fs.overlay $ ls /",
+            true,
+        ),
         ("describe entropy.seeded", true),
         ("imports entropy.seeded $ rng", true),
         // man (the manuals builtin: exactly one token)

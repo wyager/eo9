@@ -231,11 +231,7 @@ impl<B: Backend> Session<B> {
     /// Enter passes it here — no second parse of a submitted green line. `None` (every
     /// non-editor path, and red/incomplete editor lines) parses here, which is also
     /// where the user-facing parse error is rendered.
-    pub async fn execute_line_with(
-        &mut self,
-        line: &str,
-        parsed: Option<Command>,
-    ) -> LineResult {
+    pub async fn execute_line_with(&mut self, line: &str, parsed: Option<Command>) -> LineResult {
         let trimmed = line.trim();
         if !trimmed.is_empty() {
             if self.history.len() >= HISTORY_CAP {

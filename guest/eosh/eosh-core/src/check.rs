@@ -59,10 +59,7 @@ pub fn sanity_check<T: 'static>(parser: &dyn IncParse<T>) -> usize {
     // finish-rejecting are both fine — a soft state hands it back like any other
     // non-charset input).
     let text_step = parser.step(Input::Text(0xC3));
-    let text_consumes = matches!(
-        text_step,
-        Some(Step::Continue(_)) | Some(Step::Both { .. })
-    );
+    let text_consumes = matches!(text_step, Some(Step::Continue(_)) | Some(Step::Both { .. }));
     if admissible.non_ascii_ok && !text_consumes {
         panic!("Parser claimed non_ascii_ok but did not consume a text byte");
     }
