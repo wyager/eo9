@@ -88,7 +88,7 @@ fn run<T: 'static>(
             }
         }
         if !ok {
-            let expected = match feed_bytes(rebuild(), line[..start].as_bytes()) {
+            let expected = match feed_bytes(rebuild(), &line.as_bytes()[..start]) {
                 Some(at) => render_expected(&*at),
                 None => String::from("nothing (internal: prefix no longer viable)"),
             };
