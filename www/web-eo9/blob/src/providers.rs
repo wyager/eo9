@@ -907,7 +907,6 @@ fn add_gfx(linker: &mut Linker<WebState>) -> Result<()> {
     Ok(())
 }
 
-
 // -------------------------------------------------------------------------------------
 // The KeyDecoder contract corpus (host tests): the kernel suite's exact vectors
 // (kernel/eo9-kernel/src/keydecoder.rs) against this mirrored copy — drift between the
@@ -920,7 +919,10 @@ mod keydecoder_contract {
 
     fn events(bytes: &[u8]) -> Vec<WitKey> {
         let mut decoder = KeyDecoder::default();
-        bytes.iter().filter_map(|&byte| decoder.push(byte)).collect()
+        bytes
+            .iter()
+            .filter_map(|&byte| decoder.push(byte))
+            .collect()
     }
 
     #[test]
