@@ -5,35 +5,13 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Once;
 
 use eo9_integration::guest;
 
 fn eo9_binary() -> PathBuf {
-    static BUILD: Once = Once::new();
-    let profile_dir = std::env::current_exe()
-        .expect("test executable path")
-        .parent()
-        .expect("deps dir")
-        .parent()
-        .expect("profile dir")
-        .to_path_buf();
-    let binary = profile_dir.join("eo9");
-    if !binary.exists() {
-        BUILD.call_once(|| {
-            let mut args = vec!["build", "-p", "eo9", "--bin", "eo9"];
-            if profile_dir.file_name().and_then(|n| n.to_str()) == Some("release") {
-                args.push("--release");
-            }
-            let status = Command::new("cargo")
-                .args(&args)
-                .current_dir(guest::repo_root())
-                .status()
-                .expect("failed to invoke cargo to build the eo9 binary");
-            assert!(status.success(), "building the eo9 binary failed");
-        });
-    }
-    binary
+    // The shared always-build + bundle-freshness helper: a stale eo9 binary (or a
+    // stale committed bundle) silently tests OLD init bytes — the trap this lane hit.
+    guest::fresh_eo9_binary()
 }
 
 fn temp_dir(test: &str) -> PathBuf {
@@ -229,6 +207,117 @@ bounded = cruncher --seed 1 --rounds 100 restart restart.backoff --max-restarts 
             .contains("init: started `bounded` (cruncher under restart.backoff)"),
         "the configured-policy entry started:\n{}",
         run.stdout
+    );
+}
+
+/// A chain whose tail is a BINARY keeps the original routing byte-for-byte: the tail's
+/// flags bind as `main` arguments (and a non-tail provider's flags still configure it).
+/// This is the regression pin for the ordinary-service path around the provider-tail
+/// routing (the station-net flagged-tail fix must not disturb it).
+#[test]
+fn chain_binary_tail_flags_still_bind_as_main_arguments() {
+    guest::ensure_components(&["eo9-stub-time-frozen", "eo9-example-hello"]);
+    let dir = temp_dir("binary-tail-chain");
+    let config = "\
+greeter = time.frozen --now-seconds 1700000000 --monotonic-ns 0 $ hello --name tailpin restart restart.never
+";
+    let run = init_session(&dir, Some(config), &["svc log greeter", "exit"]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    assert!(
+        run.stdout
+            .contains("init: started `greeter` (time.frozen $ hello under restart.never)"),
+        "the chain with a binary tail started:\n{}",
+        run.stdout
+    );
+    // The tail's flag reached `main` (hello greeted the configured name), proving the
+    // tail's flags were bound as arguments, not routed to a configure surface.
+    assert!(
+        run.stdout.contains("tailpin"),
+        "the binary tail's flag bound as a main argument:\n{}",
+        run.stdout
+    );
+}
+
+/// A chain that ENDS on a provider routes the tail's flags to that provider's
+/// `configure`, never to `main` — the share-owning factory shape (the station-net
+/// silicon bug: `… $ net.l4.over-l2 --address dhcp share …` was refused because the
+/// tail's flags were bound as `main` arguments, which a factory service does not have).
+///
+/// The usermode registry has no `share` clause, so the detach itself still refuses the
+/// provider — but the refusal must be the provider-kind one, reached AFTER the flags
+/// were consumed by `configure`. An argument-shaped refusal here would mean the flags
+/// were mis-bound as main arguments again.
+#[test]
+fn provider_tail_flags_route_to_configure() {
+    guest::ensure_components(&["eo9-stub-time-frozen"]);
+    let dir = temp_dir("provider-tail");
+    let config = "\
+clock = time.frozen --now-seconds 42 --monotonic-ns 7 restart restart.never
+";
+    let run = init_session(&dir, Some(config), &["exit"]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    let all = format!("{}{}", run.stdout, run.stderr);
+    // The flags bound cleanly against the provider's configure signature; what remains
+    // is the usermode registry's kind refusal (no shares there), not anything about
+    // arguments or flags.
+    assert!(
+        all.contains("could not start `clock`") && all.contains("provider, not a runnable program"),
+        "the refusal is the provider-kind one (flags consumed by configure):\n{all}"
+    );
+    assert!(
+        !all.contains("takes no arguments"),
+        "no argument-shaped refusal for a provider tail's flags:\n{all}"
+    );
+}
+
+/// The routing direction itself, pinned: an unknown flag on a provider tail fails at
+/// the tail's `configure` (typed, naming the segment) — NOT at the registry as a
+/// misrouted `main` argument. Before the routing fix this config produced the
+/// provider-kind detach refusal instead, because the flag rode through as a main
+/// argument.
+#[test]
+fn provider_tail_unknown_flag_is_a_configure_error() {
+    guest::ensure_components(&["eo9-stub-time-frozen"]);
+    let dir = temp_dir("provider-tail-bad-flag");
+    let config = "\
+clock = time.frozen --bogus 1 restart restart.never
+";
+    let run = init_session(&dir, Some(config), &["exit"]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    let all = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        all.contains("could not start `clock`") && all.contains("configuring `time.frozen` failed"),
+        "an unknown tail flag fails at the provider's configure:\n{all}"
+    );
+}
+
+/// Ungiven `option<…>` configure parameters fill with `none` (eosh's evaluator rule,
+/// eosh-core wave.rs) — the algebra's `configure` requires every parameter of the
+/// signature, so without the fill the board's own `… $ net.l4.over-l2 --address dhcp
+/// share …` line dies with `missing argument `prefix-length`` (the second leg of the
+/// station-net silicon bug). Only `address` of
+/// `configure(address, prefix-length: option<u8>, gateway: option<string>)` is given
+/// here; the two options must fill as `none` and the configure must bind.
+#[test]
+fn provider_tail_ungiven_option_params_fill_with_none() {
+    guest::ensure_components(&["eo9-stub-net-l4-over-l2"]);
+    let dir = temp_dir("provider-tail-option-fill");
+    let config = "\
+lan = net.l4.over-l2 --address dhcp restart restart.never
+";
+    let run = init_session(&dir, Some(config), &["exit"]);
+    assert_eq!(run.code, 0, "stderr: {}", run.stderr);
+    let all = format!("{}{}", run.stdout, run.stderr);
+    // The configure bound (address given, the two options filled with `none`); the
+    // refusal that remains is the usermode registry's (it has no `share` clause),
+    // never the algebra's missing-argument one.
+    assert!(
+        all.contains("could not start `lan`"),
+        "the usermode registry still refuses the share-less provider service:\n{all}"
+    );
+    assert!(
+        !all.contains("configuring `net.l4.over-l2` failed"),
+        "no configure-time refusal for ungiven option parameters:\n{all}"
     );
 }
 

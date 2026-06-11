@@ -21,8 +21,15 @@
 //!
 //! Programs are referenced by their `/bin` names. A `$` chain is eosh's composition
 //! operator, right-associative: every segment but the last is a provider (configured
-//! with its `--flag value` arguments at compose time), the last is the binary whose
-//! flags become its `main` arguments. The grammar is deliberately this small — names,
+//! with its `--flag value` arguments at compose time), the last is ordinarily the
+//! binary whose flags become its `main` arguments. A chain may instead END on a
+//! provider — the share-owning factory shape (shared-resources design §5.2), where the
+//! whole chain is a factory-serving provider with no `main`; the tail's flags are then
+//! compose-time `configure` arguments exactly like every other segment's. The tail's
+//! own kind decides the routing (init never sees the `share` clause — the kernel
+//! registry parses and strips it before the config reaches init): a binary tail's
+//! flags are `main` arguments, a provider tail's flags configure it. The grammar is
+//! deliberately this small — names,
 //! flags, `$` — and nothing more (no parentheses, no `&`/`only`/`rename`/`with`, no
 //! `let`); anything richer is `save`d under a name first (in a `--svc` shell) and
 //! referenced by that name. The console entry stays a single program: keystroke echo
@@ -77,7 +84,9 @@ struct Flag {
 
 /// One segment of a service's `$` chain: `<program> [--flag value …]`. Every segment
 /// but the last is a provider whose flags are compose-time `configure` arguments; the
-/// last is the binary whose flags are `main` arguments bound at detach.
+/// last is ordinarily the binary whose flags are `main` arguments bound at detach — or
+/// a provider itself (the share-owning factory shape), whose flags configure it like
+/// any other segment's (see `start_service`).
 struct Stage {
     program: String,
     flags: Vec<Flag>,
@@ -385,6 +394,37 @@ fn bind_args(
     Ok(bound)
 }
 
+/// Bind config `--flag value` pairs as compose-time `configure` arguments for a
+/// provider segment: the given pairs bind exactly as [`bind_args`] does, and every
+/// declared `option<…>` parameter NOT given is filled with `none` — the same rule as
+/// eosh's evaluator (eosh-core wave.rs: an ungiven optional parameter is the absent
+/// option), because the algebra's `configure` requires every parameter of the
+/// signature. A missing REQUIRED parameter is deliberately not filled, so `configure`
+/// answers its own typed refusal naming it. (Only called for segments that carry at
+/// least one flag: a flag-less provider segment stays unconfigured and keeps its
+/// documented default, which is not the same thing as configured-with-nones.)
+fn bind_configure_args(
+    info: &algebra::ComponentInfo,
+    flags: &[Flag],
+) -> Result<Vec<algebra::NamedArg>, String> {
+    let mut bound: Vec<algebra::NamedArg> = bind_args(info, flags)?
+        .into_iter()
+        .map(|arg| algebra::NamedArg {
+            name: arg.name,
+            value: arg.value,
+        })
+        .collect();
+    for spec in &info.args {
+        if spec.ty.starts_with("option<") && !bound.iter().any(|arg| arg.name == spec.name) {
+            bound.push(algebra::NamedArg {
+                name: spec.name.clone(),
+                value: String::from("none"),
+            });
+        }
+    }
+    Ok(bound)
+}
+
 fn encode_for_type(ty: &str, value: &str) -> String {
     if ty == "string" {
         return wave_string(value);
@@ -592,24 +632,34 @@ async fn start_service(
     entry: &ServiceEntry,
 ) -> Result<(), String> {
     // The `$` chain, folded right to left (`a $ b $ c` = `a $ (b $ c)` — eosh's
-    // right-associativity): the last stage is the binary, every earlier stage a
-    // provider, configured with its flags at compose time.
+    // right-associativity): the last stage is ordinarily the binary, every earlier
+    // stage a provider, configured with its flags at compose time.
+    //
+    // A chain may instead END on a provider — the share-owning factory shape
+    // (shared-resources design §5.2): the kernel registry accepts a provider-kind
+    // service when the entry's name is share-declared, and its run is the call-gate
+    // intake. Such a service has no `main`, so the tail's flags are compose-time
+    // `configure` arguments exactly like every other segment's, never `main`
+    // arguments. init never sees the `share` clause (the kernel parses and strips it
+    // before the config reaches init), so the tail's own kind decides the routing:
+    // binary tail → flags are `main` arguments; provider tail → flags configure it.
     let (consumer, providers) = entry
         .chain
         .split_last()
         .expect("the parser never admits an empty chain");
     let mut program = resolve(fs_handle, &consumer.program).await?;
+    let tail_info = algebra::describe(&program);
+    let tail_is_provider = matches!(tail_info.kind, algebra::ComponentKind::Provider);
+    if tail_is_provider && !consumer.flags.is_empty() {
+        let configure_args = bind_configure_args(&tail_info, &consumer.flags)?;
+        program = algebra::configure(program, &configure_args)
+            .map_err(|err| format!("configuring `{}` failed: {err:?}", consumer.program))?;
+    }
     for stage in providers.iter().rev() {
         let mut provider = resolve(fs_handle, &stage.program).await?;
         if !stage.flags.is_empty() {
             let provider_info = algebra::describe(&provider);
-            let configure_args: Vec<algebra::NamedArg> = bind_args(&provider_info, &stage.flags)?
-                .into_iter()
-                .map(|arg| algebra::NamedArg {
-                    name: arg.name,
-                    value: arg.value,
-                })
-                .collect();
+            let configure_args = bind_configure_args(&provider_info, &stage.flags)?;
             provider = algebra::configure(provider, &configure_args)
                 .map_err(|err| format!("configuring `{}` failed: {err:?}", stage.program))?;
         }
@@ -624,9 +674,15 @@ async fn start_service(
     }
 
     // The binary's arguments, bound against the composed program's signature
-    // (composition never changes `main`'s signature).
-    let info = algebra::describe(&program);
-    let args = bind_args(&info, &consumer.flags)?;
+    // (composition never changes `main`'s signature). A provider tail has no `main`
+    // and its flags were already routed to its `configure` above, so the registry
+    // receives no arguments at all for the factory-service shape.
+    let args = if tail_is_provider {
+        Vec::new()
+    } else {
+        let info = algebra::describe(&program);
+        bind_args(&info, &consumer.flags)?
+    };
 
     // The restart policy (configured when the entry gives policy flags).
     let mut policy = resolve(fs_handle, &entry.policy).await?;

@@ -35,6 +35,59 @@ pub fn component_path(package: &str) -> PathBuf {
 
 /// Ensure the named guest components exist, building the guest workspace once (per test
 /// process) if any are missing. Panics if they are still missing afterwards.
+/// The eo9 CLI binary, rebuilt EVERY test run (under a Once) with the bundle-freshness
+/// gate: the binary embeds `crates/eo9-bundled-programs/data/*.wasm` at ITS build
+/// time, so a guest-source edit tests OLD bytes until `refresh-components` runs — a
+/// stale binary silently tests fixed code (the area/52 lane hit exactly this; the
+/// svc_shell stale-binary flake was the same class). Two halves, both closed here:
+/// build-on-absence (always build instead) and bundle staleness (compare the built
+/// component against the committed bundle byte and fail with the instruction).
+pub fn fresh_eo9_binary() -> PathBuf {
+    static BUILD: Once = Once::new();
+    let profile_dir = std::env::current_exe()
+        .expect("test executable path")
+        .parent()
+        .expect("deps dir")
+        .parent()
+        .expect("profile dir")
+        .to_path_buf();
+    let binary = profile_dir.join("eo9");
+    BUILD.call_once(|| {
+        // Freshness gate: when both the built component and the committed bundle
+        // bytes exist, they must agree — the binary embeds the BUNDLE, so a stale
+        // bundle means the test exercises old guest code whatever we build below.
+        let root = repo_root();
+        for name in ["init", "eosh"] {
+            let built = root
+                .join("guest/target/components")
+                .join(format!("{name}.wasm"));
+            let bundled = root
+                .join("crates/eo9-bundled-programs/data")
+                .join(format!("{name}.wasm"));
+            if built.exists()
+                && bundled.exists()
+                && std::fs::read(&built).ok() != std::fs::read(&bundled).ok()
+            {
+                panic!(
+                    "the committed bundle is stale for `{name}`: the eo9 binary embeds                      crates/eo9-bundled-programs/data/{name}.wasm, which differs from the                      freshly built guest/target/components/{name}.wasm — run                      `cargo xtask refresh-components` first, or this test silently                      exercises old guest bytes"
+                );
+            }
+        }
+        let mut args = vec!["build", "-p", "eo9", "--bin", "eo9"];
+        if profile_dir.file_name().and_then(|n| n.to_str()) == Some("release") {
+            args.push("--release");
+        }
+        let status = Command::new("cargo")
+            .args(&args)
+            .current_dir(root)
+            .status()
+            .expect("failed to invoke cargo to build the eo9 binary");
+        assert!(status.success(), "building the eo9 binary failed");
+    });
+    assert!(binary.exists(), "eo9 binary missing after the build");
+    binary
+}
+
 pub fn ensure_components(packages: &[&str]) {
     static BUILD: Once = Once::new();
     if packages.iter().all(|name| component_path(name).exists()) {

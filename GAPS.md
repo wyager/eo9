@@ -1031,3 +1031,12 @@ The standing rule covers it mechanically — blob conflicts are resolved arbitra
 and the MAIN-CHECKOUT refresh immediately after is the canonical step, never
 skippable — but the sub-case is recorded so a future reviewer treats any --theirs
 blob resolution as provisional until the refresh lands.
+
+## Kernel configure failures squash to ConfigureError::Internal (area/52 workaround 2, 2026-06-11)
+The kernel's component-algebra `configure` surfaces every refusal as
+`ConfigureError::Internal` where usermode answers the typed `InvalidArgs` naming the
+parameter — a board operator typo in a config line (`--adress dhcp`) gets "internal
+error" instead of the parameter-naming refusal QEMU-side development shows. Same
+class as the registry's typed-refusal discipline everywhere else. Lane: thread the
+typed configure error through the kernel algebra shim (small; the WIT vocabulary
+already exists).
