@@ -31,6 +31,16 @@ saveenv, no typed commands; stick out = today's bench exactly.
   fatloads it to 0x00100000. Editing the demo composition = editing a text file.
   Rejected: a second-stage shim (new artifact + coherency bootstrap + baked FDT
   address); fdt-set games (control-FDT address stability + quoting); baked-in args.
+  **A1 field finding (2026-06-09): "kernel tolerates junk x0" was FALSE.** The boot
+  ran A…G + PCIe + USB peeks then hung before `D` into the 22 s watchdog loop:
+  `go` puts argc (x0=1) in x0, and the old fallback chain's plain-cmdline probe
+  *dereferenced* it — a cacheable read into the secure bottom MiB of DRAM (TF-A
+  behind the DDR firewall), which stalls the interconnect with no exception.
+  Hardened (area/43): a single fdt::validate() choke point — null/8-alignment/
+  DRAM-window/magic/totalsize checks BEFORE any dereference, the FDT decided
+  absent ONCE with one loud line, the plain-cmdline probe confined to x86_64 PVH,
+  `I`/`J`/`K` stage beacons in the formerly silent window, and the junk-x0 matrix
+  gated under QEMU (`cargo xtask check-x0`, the `x0matrix` boot token).
 
 ### boot.scr (mkimage -T script; xtask emits it with the image CRC baked)
 ```

@@ -36,12 +36,13 @@
 
 use core::arch::asm;
 
-/// Start of RAM on the QEMU `virt` machine.
-const RAM_BASE: usize = 0x8000_0000;
+/// Start of RAM on the QEMU `virt` machine. Pub(crate) with [`RAM_END`]: src/fdt.rs
+/// derives the windows a boot-handed FDT pointer may occupy from them (a1 validation).
+pub(crate) const RAM_BASE: usize = 0x8000_0000;
 /// RAM size the kernel assumes; must match the `-m` value in xtask's QEMU invocation.
 const RAM_SIZE: usize = 512 * 1024 * 1024;
 /// First byte past RAM.
-const RAM_END: usize = RAM_BASE + RAM_SIZE;
+pub(crate) const RAM_END: usize = RAM_BASE + RAM_SIZE;
 /// Reservation at the top of RAM for QEMU's device tree (placed 2 MiB-aligned at the top).
 const FDT_RESERVATION: usize = 2 * 1024 * 1024;
 /// First byte past the heap (src/heap.rs): the top of RAM minus the device-tree reservation.

@@ -34,9 +34,12 @@ extern crate alloc;
 /// (zero bytes of code), so the QEMU images stay byte-identical. The legend:
 /// 'A' image entry, 'B'/'b' after the EL2 drop / EL1-direct entry (both in boot.rs asm),
 /// 'C' kmain reached (BSS zeroed, stack live), 'H' console path about to print the banner,
-/// 'E' MMU enabled, 'F' heap initialised, 'G' watchdog armed, 'D' FDT/bootargs parse
-/// returned. The last surviving letter pinpoints the dead boot stage; the beacons stay in
-/// the final image (they cost nothing and read as a boot signature).
+/// 'E' MMU enabled, 'F' heap initialised, 'G' watchdog armed, 'I' PCIe bring-up entered,
+/// 'J' USB bring-up entered, 'K' FDT/bootargs parse entered (the first consumer of the
+/// boot-handed x0), 'D' FDT/bootargs parse returned. The last surviving letter pinpoints
+/// the dead boot stage — the USB-boot A1 hang sat in the then-unbeaconed stretch between
+/// the USB peeks and 'D', which is why every stage in that window now announces itself.
+/// The beacons stay in the final image (they cost nothing and read as a boot signature).
 #[macro_export]
 macro_rules! beacon {
     ($c:expr) => {{
@@ -168,23 +171,49 @@ extern "C" fn kmain(dtb: *const u8) -> ! {
     // watchdog: a wedged bus access during bring-up resets to U-Boot instead of hanging
     // the bench. QEMU's ECAM needs no bring-up; this is a no-op there.
     #[cfg(all(feature = "wasm-store", feature = "board-opi5plus"))]
-    arch::rk3588_pcie::init();
+    {
+        // 'I': entering PCIe bring-up.
+        beacon!(b'I');
+        arch::rk3588_pcie::init();
+    }
 
     // Board profile only: power/clock/PHY plumbing for the two USB2 host pairs and
     // their VBUS rail (arch/aarch64/rk3588_usb.rs), so the `eo9:platform` regions the
     // usb.ohci driver claims are live registers. Also after the watchdog, for the
     // same wedged-bus reason. QEMU has no platform USB; no-op there.
     #[cfg(all(feature = "wasm-store", feature = "board-opi5plus"))]
-    arch::rk3588_usb::init();
+    {
+        // 'J': entering USB bring-up.
+        beacon!(b'J');
+        arch::rk3588_usb::init();
+    }
 
     // The kernel command line (QEMU -append) selects what to run: `program=<name>` runs a
     // store entry headless, `demo` runs the original demo sequence below, and nothing at
     // all boots to the interactive eosh shell.
+    //
+    // 'K': entering the FDT/bootargs parse — the first consumer of the boot-handed x0.
+    // This is where USB-boot round A1 hung: U-Boot's `go` passes argc in x0, and the
+    // pre-hardening fallback chain dereferenced it (src/fdt.rs has the full story).
+    beacon!(b'K');
     let bootargs = fdt::bootargs(dtb);
     // 'D': the FDT/bootargs parse returned (whatever the vendor control FDT held).
     beacon!(b'D');
     if let Some(bootargs) = bootargs {
         kprintln!("cmdline: {bootargs}");
+    }
+    // The `x0matrix` boot token (xtask check-x0): replay the junk-x0 field shapes through
+    // the same fdt validation choke point this boot just used — every case must return
+    // (bounded, no hang) with the canonical absent-x0 recovery. After the live parse, so
+    // the transcript shows live-vs-recovered side by side.
+    if bootargs
+        .map(|args| {
+            args.split_ascii_whitespace()
+                .any(|token| token == "x0matrix")
+        })
+        .unwrap_or(false)
+    {
+        fdt::x0_matrix_selftest(bootargs);
     }
     // Board profile: the `gfxprobe` boot token runs the M1 framebuffer first-light
     // diagnostic (locate + cross-check, map check, grayscale band paint, read-back CRC)
