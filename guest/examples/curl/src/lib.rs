@@ -1,9 +1,15 @@
 //! curl — the demo HTTP client (docs/board/usb-boot-demo-plan.md Part B).
 //!
 //! Targets the `eo9-examples:curl/curl` world (see `wit/world.wit`): parse one
-//! `http://host[:port][/path]` URL, resolve the host over UDP DNS when it is not a
+//! `[http://]host[:port][/path]` URL — the scheme is optional for the user's spelling
+//! (`curl yager.io`; the default is `http://`, applied BEFORE the hardened parse so
+//! every injection refusal still runs), resolve the host over UDP DNS when it is not a
 //! literal IPv4 address (the shared `eo9-dns` wire core — the l4check encoder,
-//! factored out), send a single HTTP/1.1 GET with `Connection: close`, and print the
+//! factored out; the resolver is `--resolver` when given, otherwise the first IPv4
+//! server the transport capability reports via l4 `dns-servers` — the DHCP lease's
+//! offer on the board, QEMU user-net's forwarder 10.0.2.3 under the unconfigured
+//! default, and a typed refusal with a `--resolver` hint when the transport knows
+//! none), send a single HTTP/1.1 GET with `Connection: close`, and print the
 //! status line, the header count, and the body (capped at [`BODY_CAP`], with an
 //! honest truncation note). A `Transfer-Encoding: chunked` body is de-framed before
 //! printing/counting (`eo9-curl-core::dechunk`, host-tested; the cap applies to the
@@ -46,9 +52,40 @@ eo9_guest::bindings!({
     apis: [io, net_l4, text],
 });
 
-/// The DNS forwarder QEMU user-mode networking runs for its guest (the default
-/// `--resolver`; on the bench LAN pass the router, `--resolver 10.20.3.1`).
-const DEFAULT_RESOLVER: (u8, u8, u8, u8) = (10, 0, 2, 3);
+// The user-facing manual, embedded as the `eo9-manual` custom section and rendered by
+// `man curl` in eosh; the M3 argument-completion hints derive from it additively
+// (docs/design/component-manuals.md).
+eo9_guest::manual! {
+    name: "curl",
+    synopsis: "fetch one http URL: a single GET, then the status line, header count, and body",
+    description: [
+        "Sends one HTTP/1.1 GET (Connection: close) over the granted transport capability and prints the",
+        "status line, the header count, and the body (16 KiB cap, honest truncation note; chunked bodies",
+        "are de-framed first). The scheme is optional: `curl yager.io` fetches http://yager.io/ (https://",
+        "is refused typed — TLS is a deferred decision). Hosts that are not literal IPv4 addresses resolve",
+        "over UDP DNS: --resolver when given, otherwise the first IPv4 server the transport reports via",
+        "l4 dns-servers (the DHCP lease's offer; QEMU user-net's 10.0.2.3 unconfigured). A transport that",
+        "reports none (configured static addressing) refuses typed with a --resolver hint. At most one",
+        "301/302 redirect is followed, and a counts line is printed on every exit.",
+    ],
+    args: [
+        { name: "url", ty: "string", required,
+          doc: "the URL to fetch; a missing scheme defaults to http:// (https:// is refused: TLS deferred)",
+          kind: "url" },
+        { name: "resolver", ty: "string", optional,
+          doc: "DNS server, dotted quad (default: the transport's dns-servers — lease DNS, or 10.0.2.3)" },
+    ],
+    examples: [
+        { line: "net.virtio $ net.l4.over-l2 $ curl yager.io",
+          doc: "QEMU: scheme and resolver both defaulted (user-net's forwarder answers DNS)" },
+        { line: "net.rtl8125 $ (net.l4.over-l2 --address dhcp) $ curl yager.io",
+          doc: "the board: the DHCP lease supplies the resolver" },
+        { line: "net.rtl8125 $ (net.l4.over-l2 --address 10.20.3.70 --gateway 10.20.3.1) $ curl yager.io --resolver 10.20.3.1",
+          doc: "configured static addressing names no DNS: pass the resolver" },
+    ],
+    see_also: "net.l4.over-l2, l4check, telnetd",
+}
+
 /// A fixed DNS query id (the reply must echo it back; the l4check convention).
 const QUERY_ID: u16 = 0xe09;
 /// How many datagrams to inspect before giving up on the DNS answer.
@@ -401,24 +438,69 @@ struct Counts {
     redirects: u32,
 }
 
+/// The resolver the transport capability itself knows: the first IPv4 server from the
+/// l4 `dns-servers` introspection (the DHCP lease's offer on the board, QEMU
+/// user-net's forwarder under the unconfigured default). Asked only when a host
+/// actually needs resolving — literal-IP fetches never depend on it — and a transport
+/// that reports none refuses typed, with the `--resolver` hint.
+async fn transport_resolver(root: &l4::L4Impl) -> Result<(u8, u8, u8, u8), ProgramFailure> {
+    let servers = l4::dns_servers(root).await.map_err(net_failure)?;
+    let mut saw_non_v4 = false;
+    for server in &servers {
+        match server {
+            l4::IpAddress::V4(v4) => return Ok(*v4),
+            l4::IpAddress::V6(_) => saw_non_v4 = true,
+        }
+    }
+    Err(ProgramFailure::Dns(String::from(if saw_non_v4 {
+        "no usable resolver: the transport reports only non-IPv4 DNS servers — \
+         pass --resolver <dotted quad>"
+    } else {
+        "no resolver: the transport reports no DNS servers (configured static \
+         addressing names none) — pass --resolver <dotted quad>"
+    })))
+}
+
 /// The whole fetch: resolve, GET, follow at most one redirect, print the report.
 async fn run(
     url_text: &str,
     resolver_text: Option<&str>,
     counts: &mut Counts,
 ) -> Result<ProgramSuccess, ProgramFailure> {
-    let resolver = match resolver_text {
-        Some(text) => eo9_curl_core::parse_ipv4(text)
-            .ok_or_else(|| ProgramFailure::BadArguments(format!("not a dotted quad: {text:?}")))?,
-        None => DEFAULT_RESOLVER,
-    };
+    // An explicit `--resolver` always wins and is validated up front (a bad flag is a
+    // bad flag even when the URL turns out to be a literal address).
+    let explicit =
+        match resolver_text {
+            Some(text) => Some(eo9_curl_core::parse_ipv4(text).ok_or_else(|| {
+                ProgramFailure::BadArguments(format!("not a dotted quad: {text:?}"))
+            })?),
+            None => None,
+        };
     let root = l4::default();
-    let mut url = eo9_curl_core::parse(url_text).map_err(|err| url_failure(err, url_text))?;
+    // The user's spelling may omit the scheme (`curl yager.io`): the http:// default
+    // is applied BEFORE the hardened parse, so every injection refusal still runs.
+    let mut url = eo9_curl_core::parse_with_default_scheme(url_text)
+        .map_err(|err| url_failure(err, url_text))?;
+    // The transport-reported resolver, asked at most once (memoized across redirects).
+    let mut from_transport: Option<(u8, u8, u8, u8)> = None;
 
     loop {
         let address = match eo9_curl_core::parse_ipv4(&url.host) {
             Some(literal) => literal,
             None => {
+                let resolver = match (explicit, from_transport) {
+                    (Some(flagged), _) => flagged,
+                    (None, Some(known)) => known,
+                    (None, None) => {
+                        let learned = transport_resolver(&root).await?;
+                        say(&format!(
+                            "curl: resolver {} (the transport's dns-servers)",
+                            format_ip(learned)
+                        ));
+                        from_transport = Some(learned);
+                        learned
+                    }
+                };
                 let address = resolve(&root, &url.host, resolver).await?;
                 say(&format!(
                     "curl: resolved {} -> {}",

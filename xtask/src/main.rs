@@ -122,6 +122,7 @@ const MANUALED_COMPONENTS: &[&str] = &[
     "eo9-stub-net-rtl8125",
     "eo9-example-l2check",
     "eo9-example-l4check",
+    "eo9-example-curl",
 ];
 
 /// Manual-validation rule version, part of the componentize stamp so changing the

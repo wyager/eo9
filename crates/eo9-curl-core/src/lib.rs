@@ -1,6 +1,9 @@
-//! The pure URL core of the `curl` example: parse `http://host[:port][/path]`,
-//! resolve a redirect target, refuse anything that could smuggle bytes into the
-//! HTTP request line — and decode `Transfer-Encoding: chunked` body framing
+//! The pure URL core of the `curl` example: parse `http://host[:port][/path]` (with
+//! the scheme optional for user-typed URLs — [`parse_with_default_scheme`] prepends
+//! `http://` and then runs the SAME hardened parse, so normalization sits before the
+//! refusals, never around them), resolve a redirect target, refuse anything that could
+//! smuggle bytes into the HTTP request line — and decode `Transfer-Encoding: chunked`
+//! body framing
 //! ([`dechunk`]; real HTTP/1.1 servers answer our HTTP/1.1 request chunked, as
 //! example.com did on the board bench).
 //!
@@ -132,6 +135,45 @@ pub fn parse(url: &str) -> Result<Url, UrlError> {
         port,
         path: path.to_string(),
     })
+}
+
+/// Does `url` spell a scheme? True for `<scheme>://…` (any RFC 3986 scheme shape:
+/// ALPHA, then ALPHA/DIGIT/`+`/`-`/`.`, before the `://`), and for the two schemes this
+/// client knows by name even without the `//` (`http:…`, `https:…` — so a missing-slash
+/// typo refuses as "not an http:// URL" rather than mis-parsing as host plus port).
+/// False for everything else — including `host:port/...` shapes, whose colon belongs to
+/// the authority.
+fn has_scheme(url: &str) -> bool {
+    let head = url.split(['/', '?', '#']).next().unwrap_or("");
+    if let Some((scheme, _)) = head.split_once(':')
+        && (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+    {
+        return true;
+    }
+    match url.find("://") {
+        Some(at) => {
+            let scheme = &url[..at];
+            let mut chars = scheme.chars();
+            chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+                && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        }
+        None => false,
+    }
+}
+
+/// Parse a *user-typed* URL with the scheme optional: `yager.io`, `yager.io/path`, and
+/// `host:8080/x` get `http://` prepended, then run through the SAME hardened [`parse`]
+/// (normalization happens BEFORE the request-injection refusals, never around them — a
+/// control byte or space in a scheme-less URL still refuses typed). A URL that does
+/// spell a scheme passes through untouched: `https://` stays the typed TLS refusal,
+/// any other scheme stays [`UrlError::NotHttp`]. Server-supplied redirect targets get
+/// NO such default — they keep the strict [`redirect_target`] rules.
+pub fn parse_with_default_scheme(url: &str) -> Result<Url, UrlError> {
+    if has_scheme(url) {
+        parse(url)
+    } else {
+        parse(&format!("http://{url}"))
+    }
 }
 
 /// The redirect target: an absolute http:// URL, or a server-relative path on the
@@ -338,6 +380,117 @@ mod tests {
         assert_eq!(
             parse("http://example.com:0/"),
             Err(UrlError::BadPort(String::from("0")))
+        );
+    }
+
+    // --- the scheme-optional user spelling ----------------------------------------
+
+    #[test]
+    fn defaults_the_scheme_for_user_urls() {
+        assert_eq!(
+            parse_with_default_scheme("yager.io"),
+            Ok(url("yager.io", 80, "/"))
+        );
+        assert_eq!(
+            parse_with_default_scheme("yager.io/a/b?q=1"),
+            Ok(url("yager.io", 80, "/a/b?q=1"))
+        );
+        // A bare authority colon is a port, not a scheme.
+        assert_eq!(
+            parse_with_default_scheme("localhost:8080/x"),
+            Ok(url("localhost", 8080, "/x"))
+        );
+        assert_eq!(
+            parse_with_default_scheme("10.0.2.2:8080/hello.txt"),
+            Ok(url("10.0.2.2", 8080, "/hello.txt"))
+        );
+        // A spelled scheme passes through to the strict parse untouched.
+        assert_eq!(
+            parse_with_default_scheme("http://yager.io/p"),
+            Ok(url("yager.io", 80, "/p"))
+        );
+        // Fragments still never travel, scheme spelled or not.
+        assert_eq!(
+            parse_with_default_scheme("yager.io#frag"),
+            Ok(url("yager.io", 80, "/"))
+        );
+    }
+
+    #[test]
+    fn keeps_the_typed_refusals_under_the_default_scheme() {
+        // https stays the typed TLS refusal; other schemes stay not-http.
+        assert_eq!(
+            parse_with_default_scheme("https://yager.io"),
+            Err(UrlError::Https)
+        );
+        assert_eq!(
+            parse_with_default_scheme("HTTPS://yager.io"),
+            Err(UrlError::Https)
+        );
+        assert_eq!(
+            parse_with_default_scheme("ftp://yager.io"),
+            Err(UrlError::NotHttp)
+        );
+        assert_eq!(
+            parse_with_default_scheme("gopher+x://y"),
+            Err(UrlError::NotHttp)
+        );
+        // The missing-slashes typo refuses as not-http (never mis-parsed as a port).
+        assert_eq!(
+            parse_with_default_scheme("http:yager.io"),
+            Err(UrlError::NotHttp)
+        );
+        assert_eq!(
+            parse_with_default_scheme("https:yager.io"),
+            Err(UrlError::NotHttp)
+        );
+        // The odd-authority refusals run on the normalized form too.
+        assert_eq!(
+            parse_with_default_scheme("user@yager.io"),
+            Err(UrlError::Userinfo)
+        );
+        assert_eq!(
+            parse_with_default_scheme("[::1]:80/"),
+            Err(UrlError::Ipv6Literal)
+        );
+        assert_eq!(
+            parse_with_default_scheme("yager.io:0"),
+            Err(UrlError::BadPort(String::from("0")))
+        );
+        assert_eq!(parse_with_default_scheme(""), Err(UrlError::NoHost));
+    }
+
+    #[test]
+    fn refuses_injection_bytes_through_the_default_scheme() {
+        // Normalization happens BEFORE the hardened parse: a scheme-less URL carrying
+        // CR/LF/space hits exactly the same request-injection refusal.
+        assert_eq!(
+            parse_with_default_scheme("yager.io/\r\nX-Evil: 1"),
+            Err(UrlError::ForbiddenByte)
+        );
+        assert_eq!(
+            parse_with_default_scheme("ya\nger.io/"),
+            Err(UrlError::ForbiddenByte)
+        );
+        assert_eq!(
+            parse_with_default_scheme("yager.io/a b"),
+            Err(UrlError::ForbiddenByte)
+        );
+        // Percent sequences stay inert text, exactly as on the spelled-scheme path.
+        assert_eq!(
+            parse_with_default_scheme("yager.io/%0d%0a"),
+            Ok(url("yager.io", 80, "/%0d%0a"))
+        );
+    }
+
+    #[test]
+    fn the_default_scheme_never_applies_to_redirect_targets() {
+        // A server-supplied Location keeps the strict rules: a scheme-less absolute
+        // target is still refused (the documented limitation), not silently fetched.
+        let current = url("yager.io", 80, "/old");
+        assert_eq!(
+            redirect_target(&current, "evil.example/payload"),
+            Err(UrlError::NotHttp)
         );
     }
 

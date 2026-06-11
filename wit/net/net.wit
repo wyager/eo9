@@ -271,6 +271,21 @@ interface l4 {
 
     recv-from: async func(s: borrow<udp-socket>, dst: buffer)
         -> tuple<buffer, result<tuple<recv-result, socket-address>, l4-error>>;
+
+    // --- Introspection ---------------------------------------------------------
+
+    /// The DNS servers this transport view knows for the network it reaches, in
+    /// preference order; an empty list when it knows none. The layer stays out of
+    /// the DNS business — resolvers are programs or middleware *above* `l4` — this
+    /// only reports what the provider's own addressing taught it: `net.l4.over-l2`
+    /// reports its DHCP lease's servers (acquiring the lease first if need be, hence
+    /// async and fallible exactly like every other lease-gated operation) and, under
+    /// its unconfigured QEMU user-net default layout, that layout's forwarder
+    /// (10.0.2.3). Explicitly configured static addressing reports none — the
+    /// operator chose the addressing, so a consumer needing a resolver must ask its
+    /// caller for one.
+    dns-servers: async func(l4: borrow<l4-impl>)
+        -> result<list<ip-address>, l4-error>;
 }
 
 /// Optional flavor of `l4`.
@@ -305,8 +320,10 @@ interface l4-loopback-config {
 /// unconfigured provider keeps its documented default — QEMU user-mode networking's
 /// layout (10.0.2.15/24, gateway 10.0.2.2) — so plain composition still works. (A DNS
 /// server is deliberately not part of this configuration: the middleware itself sends no
-/// DNS queries — resolvers are programs or middleware *above* `l4`. DNS servers offered
-/// by a DHCP lease are logged on the console for the operator, nothing more.)
+/// DNS queries — resolvers are programs or middleware *above* `l4`. DNS servers the
+/// addressing taught the stack — a DHCP lease's offer, or the unconfigured QEMU layout's
+/// forwarder — are logged on the console and reported through the l4 `dns-servers`
+/// introspection, nothing more.)
 interface l4-over-l2-config {
     use l4.{l4-impl};
     configure: func(address: string, prefix-length: option<u8>, gateway: option<string>)

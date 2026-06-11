@@ -136,6 +136,14 @@ impl l4::Guest for Stub {
     ) -> (Buffer, Result<(RecvResult, SocketAddress), L4Error>) {
         s.get::<NoSocket>().unreachable()
     }
+
+    /// Refused like the endpoint operations: where DNS lives is knowledge about the
+    /// network this stub exists to withhold.
+    async fn dns_servers(
+        _l4: l4::L4ImplBorrow<'_>,
+    ) -> Result<alloc::vec::Vec<l4::IpAddress>, L4Error> {
+        Err(L4Error::Denied)
+    }
 }
 
 export!(Stub);
