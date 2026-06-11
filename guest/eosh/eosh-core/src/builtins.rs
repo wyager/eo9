@@ -262,6 +262,17 @@ pub fn builtin_doc(word: &str) -> Option<&'static BuiltinDoc> {
     BUILTIN_DOCS.iter().find(|doc| doc.names.contains(&word))
 }
 
+/// Every word that has a card — names and aliases alike. This is the ONE datum behind
+/// `describe <shell-word>` and `man <shell-word>`: the parser's routing consults
+/// [`builtin_doc`], and the editor's TAB candidates and name-mark consult this listing
+/// of the same table — a card added to [`BUILTIN_DOCS`] is automatically completable
+/// and green, with no parallel word list to keep in sync.
+pub fn card_words() -> impl Iterator<Item = &'static str> {
+    BUILTIN_DOCS
+        .iter()
+        .flat_map(|doc| doc.names.iter().copied())
+}
+
 /// Render a card in `describe`'s voice.
 pub fn render_builtin_doc(doc: &BuiltinDoc) -> Vec<String> {
     let mut lines = Vec::new();

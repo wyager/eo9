@@ -1,26 +1,26 @@
 {
-  "blob": "/vm/web-eo9.8a0f151e66281c3c.wasm",
+  "blob": "/vm/web-eo9.f51a65a0eda968b4.wasm",
   "page": {
     "vm.js": "/vm/vm.3363de7463cd0276.js",
     "vm.css": "/vm/vm.b7c2d1b49a4561f0.css"
   },
   "store": {
-    "cat": "/vm/store/cat.01a88aafba1c3a4f.cwasm",
-    "cp": "/vm/store/cp.66fa8471a40a905e.cwasm",
-    "cruncher": "/vm/store/cruncher.7c2f234cd75ff2c0.cwasm",
+    "cat": "/vm/store/cat.7d8c7ad2031db142.cwasm",
+    "cp": "/vm/store/cp.5b5dba8588a1309f.cwasm",
+    "cruncher": "/vm/store/cruncher.9fd5575ca55c0904.cwasm",
     "echo": "/vm/store/echo.5f9d0c9aab4ead2f.cwasm",
-    "find": "/vm/store/find.dbb4174860615d08.cwasm",
-    "head": "/vm/store/head.031acac1fde67a99.cwasm",
-    "hello": "/vm/store/hello.7415cbc2ffefb305.cwasm",
-    "ls": "/vm/store/ls.bc5056c2511de71e.cwasm",
-    "mkdir": "/vm/store/mkdir.e80c2b15e7a15136.cwasm",
-    "outcomes": "/vm/store/outcomes.9047a51a8d4e021b.cwasm",
-    "readwrite": "/vm/store/readwrite.bae5cd230f499128.cwasm",
-    "rm": "/vm/store/rm.a6a13acea9564763.cwasm",
-    "rng": "/vm/store/rng.0b3358c07081624f.cwasm",
+    "find": "/vm/store/find.a8848c4e36ac110c.cwasm",
+    "head": "/vm/store/head.15d8e13ca775768b.cwasm",
+    "hello": "/vm/store/hello.7fde81eba6e199c0.cwasm",
+    "ls": "/vm/store/ls.2e868f059a8f654b.cwasm",
+    "mkdir": "/vm/store/mkdir.c303857dbc2b54e3.cwasm",
+    "outcomes": "/vm/store/outcomes.b9fe3efc01aaf58f.cwasm",
+    "readwrite": "/vm/store/readwrite.1b290caf7ecefb7e.cwasm",
+    "rm": "/vm/store/rm.a321441b785f1790.cwasm",
+    "rng": "/vm/store/rng.5cfabaf323c88e52.cwasm",
     "sleepy": "/vm/store/sleepy.0f0fafc8b008d00f.cwasm",
-    "stat": "/vm/store/stat.bac4a8a6aeab9584.cwasm",
-    "touch": "/vm/store/touch.b882a1f3f019bd48.cwasm",
-    "wc": "/vm/store/wc.4d0cc7f6cab03d7a.cwasm"
+    "stat": "/vm/store/stat.51dbe3b92484df90.cwasm",
+    "touch": "/vm/store/touch.6426c416da38f754.cwasm",
+    "wc": "/vm/store/wc.5e343a6d7cd907b1.cwasm"
   }
 }

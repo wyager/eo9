@@ -223,6 +223,15 @@ impl<B: Backend> Session<B> {
 
     /// Execute one line of input: parse, dispatch, print, and report what happened.
     pub async fn execute_line(&mut self, line: &str) -> LineResult {
+        self.execute_line_with(line, None).await
+    }
+
+    /// [`Session::execute_line`] with the parse already in hand: the per-keystroke
+    /// editor accumulates the [`Command`] as the line is typed (the one grammar), and
+    /// Enter passes it here — no second parse of a submitted green line. `None` (every
+    /// non-editor path, and red/incomplete editor lines) parses here, which is also
+    /// where the user-facing parse error is rendered.
+    pub async fn execute_line_with(&mut self, line: &str, parsed: Option<Command>) -> LineResult {
         let trimmed = line.trim();
         if !trimmed.is_empty() {
             if self.history.len() >= HISTORY_CAP {
@@ -234,13 +243,16 @@ impl<B: Backend> Session<B> {
             self.history.push(trimmed.to_string());
         }
 
-        let command = match parse_command(line) {
-            Ok(command) => command,
-            Err(err) => {
-                let message = format!("parse error: {err}");
-                self.backend.print_error(&message);
-                return LineResult::Error(message);
-            }
+        let command = match parsed {
+            Some(command) => command,
+            None => match parse_command(line) {
+                Ok(command) => command,
+                Err(err) => {
+                    let message = format!("parse error: {err}");
+                    self.backend.print_error(&message);
+                    return LineResult::Error(message);
+                }
+            },
         };
 
         match command {

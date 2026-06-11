@@ -203,7 +203,7 @@ fn board_vocab() -> Vocab {
 
 /// Feed `prefix` bytes through a fresh grammar, returning each intermediate state
 /// (index i = the state BEFORE byte i is stepped). All demo bytes are ASCII.
-fn states_along(vocab: &Vocab, line: &[u8]) -> Vec<BoxP<()>> {
+fn states_along(vocab: &Vocab, line: &[u8]) -> Vec<BoxP<eosh_core::ast::Command>> {
     let mut states = Vec::with_capacity(line.len() + 1);
     let mut current = command_line(vocab);
     for &byte in line {

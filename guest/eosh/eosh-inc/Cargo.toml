@@ -7,10 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-# Intentionally none: like eosh-core, the crate is pure no_std + alloc so it can be
-# unit-tested on the host and linked unchanged into the eosh component.
-
-[dev-dependencies]
-# The differential soundness gate parses every corpus line with BOTH parsers:
-# eosh-core's parse_command is the ground truth the incremental grammar must cover.
+# eosh-core is the shell's single vocabulary source: the builtin cards
+# (`builtins::card_words`) and the OS API cards (`apidocs::api_words`) feed the
+# grammar's describe/man argument positions, so acceptance, completion, and marking
+# all read the one table the session renders from. Still no_std + alloc end to end.
 eosh-core = { path = "../eosh-core" }

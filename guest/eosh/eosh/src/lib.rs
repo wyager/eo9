@@ -801,14 +801,17 @@ async fn editor_loop(
             }
             match action {
                 Action::Pending => {}
-                Action::Submit(line) => break Some(line),
+                Action::Submit { line, parsed } => break Some((line, parsed)),
                 Action::EndOfInput => break None,
             }
         };
-        let Some(line) = submitted else {
+        let Some((line, parsed)) = submitted else {
             return Ok(ProgramSuccess::Exited);
         };
-        match session.execute_line(&line).await {
+        // The editor's accumulated parse IS the parse (the one grammar): a green line
+        // executes the Command its keystrokes built; red/incomplete lines parse here,
+        // which renders the positional error.
+        match session.execute_line_with(&line, parsed).await {
             LineResult::Exit => return Ok(ProgramSuccess::Exited),
             LineResult::Poweroff => return Ok(ProgramSuccess::PoweroffRequested),
             _ => {}
