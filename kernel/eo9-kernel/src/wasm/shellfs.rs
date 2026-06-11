@@ -221,6 +221,50 @@ impl BufferTable {
             .ok_or_else(|| wasmtime::Error::msg(format!("unknown buffer handle {rep}")))
     }
 
+    /// Move a buffer's bytes out of the table, leaving the slot reserved-but-empty (the
+    /// kernel call gate's entry-move: the bytes cross to the owner store's table without
+    /// a copy; [`BufferTable::restore`] puts the round-tripped bytes back under the same
+    /// child rep).
+    pub(super) fn take(&mut self, rep: u32) -> Result<Vec<u8>> {
+        let slot = self
+            .slots
+            .get_mut(rep as usize)
+            .ok_or_else(|| wasmtime::Error::msg(format!("unknown buffer handle {rep}")))?;
+        let bytes = slot
+            .take()
+            .ok_or_else(|| wasmtime::Error::msg(format!("unknown buffer handle {rep}")))?;
+        self.total_bytes = self.total_bytes.saturating_sub(bytes.len() as u64);
+        Ok(bytes)
+    }
+
+    /// Put bytes back into a slot previously emptied by [`BufferTable::take`] (the gate's
+    /// return leg: the same child rep keeps naming the round-tripped buffer).
+    pub(super) fn restore(&mut self, rep: u32, bytes: Vec<u8>) {
+        self.total_bytes += bytes.len() as u64;
+        if let Some(slot) = self.slots.get_mut(rep as usize) {
+            *slot = Some(bytes);
+        }
+    }
+
+    /// Enter foreign bytes as a fresh entry (the gate's owner-side mint: a child
+    /// buffer's bytes arriving in the owner's table). The gate's per-call bytes were
+    /// already admitted by the child-side caps at allocation, so no re-check here.
+    pub(super) fn insert(&mut self, bytes: Vec<u8>) -> u32 {
+        self.total_bytes += bytes.len() as u64;
+        let index = self.slots.iter().position(Option::is_none);
+        let index = match index {
+            Some(index) => {
+                self.slots[index] = Some(bytes);
+                index
+            }
+            None => {
+                self.slots.push(Some(bytes));
+                self.slots.len() - 1
+            }
+        };
+        index as u32
+    }
+
     fn free(&mut self, rep: u32) {
         if let Some(slot) = self.slots.get_mut(rep as usize)
             && let Some(bytes) = slot.take()
@@ -579,7 +623,7 @@ impl KernelState {
             .ok_or_else(|| wasmtime::Error::msg("the fs capability was not granted to this task"))
     }
 
-    fn shell_buffers(&mut self) -> Result<&mut BufferTable> {
+    pub(super) fn shell_buffers(&mut self) -> Result<&mut BufferTable> {
         self.shell
             .as_mut()
             .map(|shell| &mut shell.buffers)

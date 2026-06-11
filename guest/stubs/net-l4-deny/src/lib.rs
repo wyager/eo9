@@ -29,6 +29,7 @@ wit_bindgen::generate!({
 
 use exports::eo9::net::l4::{self, Buffer, L4Error, RecvResult, SendResult, SocketAddress};
 use exports::eo9::net::l4_deny_config;
+use exports::eo9::net::l4_factory;
 
 /// The `net.l4.deny` provider.
 struct Stub;
@@ -55,6 +56,16 @@ impl l4::GuestUdpSocket for NoSocket {}
 
 impl l4_deny_config::Guest for Stub {
     fn configure() -> Result<l4::L4Impl, String> {
+        Ok(l4::L4Impl::new(DenyL4))
+    }
+}
+
+/// The blessed factory (shared-resources design §5.2, native per owner ruling): the
+/// kernel call gate mints one handler per consumer wiring through this export. A
+/// denying root: sharing a deny is a legitimate grant of a denying net — the grantee
+/// gets the typed `denied` vocabulary, never a missing-capability story.
+impl l4_factory::Guest for Stub {
+    fn get() -> Result<l4_factory::L4Impl, l4_factory::L4Error> {
         Ok(l4::L4Impl::new(DenyL4))
     }
 }

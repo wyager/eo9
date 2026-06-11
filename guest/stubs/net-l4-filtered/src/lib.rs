@@ -40,6 +40,7 @@ use eo9::net::l4 as underlying;
 use exports::eo9::net::l4::{
     self, Buffer, IpAddress, L4Error, RecvResult, SendResult, SocketAddress,
 };
+use exports::eo9::net::l4_factory;
 
 /// Map an exported socket address onto the underlying interface's (structurally
 /// identical) type. The connection policy's `socket-address` is a `use` of the imported
@@ -125,6 +126,17 @@ impl l4::GuestL4Impl for FilteredL4 {}
 impl l4::GuestTcpConnection for FilteredConnection {}
 impl l4::GuestTcpListener for FilteredListener {}
 impl l4::GuestUdpSocket for FilteredUdp {}
+
+/// The blessed factory (shared-resources design §5.2, native per owner ruling): the
+/// kernel call gate mints one handler per consumer wiring through this export. A
+/// root of the FILTERED view: policy flows through naturally — every endpoint
+/// operation a grantee performs through the minted handler is submitted to the
+/// composed connection policy, exactly as the provider's ordinary consumers are.
+impl l4_factory::Guest for Stub {
+    fn get() -> Result<l4_factory::L4Impl, l4_factory::L4Error> {
+        Ok(l4::L4Impl::new(FilteredL4))
+    }
+}
 
 impl l4::Guest for Stub {
     type L4Impl = FilteredL4;

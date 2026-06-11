@@ -269,6 +269,10 @@ enum SRun {
 
 struct KService {
     name: String,
+    /// The gate share this service owns (a config `share` clause named it): its drive
+    /// is the call-gate intake (shared-resources design §3.3), and every run boundary
+    /// severs/re-wires the share.
+    share: Option<usize>,
     run: SRun,
     /// The engine the service's artifacts were compiled on (a wasmtime component can
     /// only instantiate on its own engine, so restarts and policy decisions reuse it).
@@ -495,6 +499,13 @@ fn service_linker(
 
 /// Instantiate one run of a service and return its drive future (the same shape as a
 /// foreground child's, so the root drive loop pumps both identically).
+///
+/// A share-owning service (`share` is the gate share id) gets the widened drive of the
+/// shared-resources design §3.3: instead of "one call to `main`", the store runs
+/// `run_concurrent` over the kernel-side gate intake, which starts each queued gate
+/// call as a concurrent guest call on the owner's exported l4 surface. v1 owners are
+/// factory-only providers (no `main` at all); the drive never completes on its own and
+/// the run ends only by stop/kill.
 fn spawn_service_run(
     engine: &wasmtime::Engine,
     entries: &'static [StoreEntry],
@@ -502,6 +513,7 @@ fn spawn_service_run(
     args: &[(String, String)],
     ring: &SharedRing,
     capture: bool,
+    share: Option<usize>,
 ) -> core::result::Result<Pin<Box<dyn Future<Output = KOutcome> + Send>>, String> {
     let linker = service_linker(engine, capture.then(|| ring.clone()))
         .map_err(|err| format!("building the service environment failed: {err:?}"))?;
@@ -543,10 +555,35 @@ fn spawn_service_run(
 
     // The normal fuel regime: an effectively-infinite pool sliced by the yield quantum,
     // so a compute-bound service is preempted and the console stays responsive.
+    // Owner-pays (§3.7) falls out structurally for share owners: gate calls execute
+    // inside this store, on this pool.
     store.set_fuel(u64::MAX).map_err(|err| format!("{err:?}"))?;
     store
         .fuel_async_yield_interval(Some(shellexec::FUEL_QUANTUM))
         .map_err(|err| format!("{err:?}"))?;
+
+    // A share owner's drive: run_concurrent over the gate intake; no `main` (v1 owners
+    // are factory-only providers — the kind judgment forbids main+exports, and the
+    // design's "binary may serve" ruling is the M2 telnetd item).
+    if let Some(share_id) = share {
+        let funcs = super::gate::lookup_owner_funcs(&instance, &mut store)?;
+        return Ok(Box::pin(async move {
+            let mut store = store;
+            let result = store
+                .run_concurrent(async move |accessor| {
+                    super::gate::intake(accessor, share_id, funcs).await;
+                })
+                .await;
+            // The intake never returns; reaching here means the store's event loop
+            // failed (a trap inside a gated call's machinery, fuel poisoning, …).
+            match result {
+                Ok(()) => {
+                    KOutcome::Trapped(String::from("the share owner's intake ended unexpectedly"))
+                }
+                Err(err) => KOutcome::Trapped(format!("{err:?}")),
+            }
+        }));
+    }
 
     let main = instance
         .get_func(&mut store, "main")
@@ -840,11 +877,68 @@ pub fn drive_services() -> DriveStatus {
     status
 }
 
+/// Poll ONE service's drive future once, with the checkout discipline (the gate's
+/// synchronous owner pump: the three sync l4 address getters cannot park, so their
+/// shims nested-poll the owner from inside the child's host call — the F4/fibercompile
+/// nested-entry shape, guarded by the `Polling` sentinel exactly as the compile pump
+/// is). Refuses (never blocks, never re-enters) when the owner is checked out up-stack.
+pub(super) fn poll_service_once(index: usize) -> core::result::Result<(), String> {
+    let taken = SERVICES.with(|services| {
+        match services.get_mut(index).and_then(Option::as_mut) {
+            Some(service) => match &mut service.run {
+                SRun::Running(_) => match core::mem::replace(&mut service.run, SRun::Polling) {
+                    SRun::Running(drive) => Ok(drive),
+                    _ => unreachable!("checked-out service was not running"),
+                },
+                // Inside the owner's own poll chain: nested entry would re-enter a
+                // store already mutably borrowed up-stack — forbidden (§3.3).
+                SRun::Polling => {
+                    Err("the share owner is checked out (nested entry refused)".to_string())
+                }
+                _ => Err("the share owner is not running".to_string()),
+            },
+            None => Err("the share owner is gone".to_string()),
+        }
+    });
+    let mut drive = taken?;
+    let waker_state = Arc::new(RungWaker {
+        rung: AtomicBool::new(false),
+    });
+    let waker = Waker::from(waker_state);
+    let mut cx = Context::from_waker(&waker);
+    let polled = drive.as_mut().poll(&mut cx);
+    let completed = SERVICES.with(|services| {
+        let service = services.get_mut(index).and_then(Option::as_mut)?;
+        match &service.run {
+            SRun::Polling => match polled {
+                Poll::Ready(outcome) => Some(outcome),
+                Poll::Pending => {
+                    service.run = SRun::Running(drive);
+                    None
+                }
+            },
+            // Stopped while we were polling: keep that state; dropping the checked-out
+            // future here releases the owner's store.
+            _ => None,
+        }
+    });
+    if let Some(outcome) = completed {
+        complete_run(index, outcome);
+    }
+    Ok(())
+}
+
 /// A run completed: record it, consult the policy (unless killed), act.
 fn complete_run(index: usize, outcome: KOutcome) {
     let class = OutcomeClass::of(&outcome);
     let rendered = truncated(render_service_outcome(&outcome));
     let at_ms = crate::timer::uptime_us() / 1000;
+
+    // Sever FIRST (shared-resources §6 step 1): if this run owned a gate share, every
+    // grant is severed — parked and in-flight gate calls answer the typed severance
+    // error and the gated children are killed — before any restart bookkeeping. A
+    // restart (below) re-wires a fresh share state via `respawn`.
+    super::gate::on_owner_run_ended(index, &rendered);
 
     // Phase 1: record the run.
     let policy_input = SERVICES.with(|services| {
@@ -934,41 +1028,61 @@ fn respawn(index: usize) {
                 service.log.clone(),
                 service.capture,
                 service.entries,
+                service.share,
             )
         })
     });
-    let Some((engine, component, args, ring, capture, entries)) = setup else {
+    let Some((engine, component, args, ring, capture, entries, share)) = setup else {
         return;
     };
-    let spawned = spawn_service_run(&engine, entries, &component, &args, &ring, capture);
-    SERVICES.with(|services| {
+    let spawned = spawn_service_run(&engine, entries, &component, &args, &ring, capture, share);
+    let respawned = SERVICES.with(|services| {
         if let Some(service) = services.get_mut(index).and_then(Option::as_mut) {
             match spawned {
-                Ok(drive) => service.run = SRun::Running(drive),
+                Ok(drive) => {
+                    service.run = SRun::Running(drive);
+                    true
+                }
                 Err(reason) => {
                     service.last_outcome = Some(truncated(format!("restart failed: {reason}")));
                     service.run = SRun::Finished;
+                    false
                 }
             }
+        } else {
+            false
         }
     });
+    // Whole-subtree restart semantics (§6 step 4): the fresh run re-opens the gate;
+    // grants are minted anew by fresh consumer spawns — there is never a "reattach".
+    if respawned && let Some(share_id) = share {
+        super::gate::wire_owner(share_id, index);
+        crate::kprintln!("gate: share re-opened after the owner's restart");
+    }
 }
 
 /// Stop everything still running and report it (the boot supervisor exited; the
 /// registry's lifetime — the machine — is ending).
 pub fn stop_all_and_report() {
-    let alive: Vec<String> = SERVICES.with(|services| {
+    let stopped: Vec<(usize, String)> = SERVICES.with(|services| {
         services
             .iter_mut()
-            .flatten()
-            .filter(|service| !matches!(service.run, SRun::Finished))
-            .map(|service| {
+            .enumerate()
+            .filter_map(|(index, slot)| slot.as_mut().map(|service| (index, service)))
+            .filter(|(_, service)| !matches!(service.run, SRun::Finished))
+            .map(|(index, service)| {
                 service.run = SRun::Finished;
                 service.last_outcome = Some(String::from("abnormal(killed)"));
-                service.name.clone()
+                (index, service.name.clone())
             })
             .collect()
     });
+    // Sever any shares the stopped services owned (the registry's lifetime is ending;
+    // gated children die with their owners).
+    for (index, _) in &stopped {
+        super::gate::on_owner_run_ended(*index, "the machine is powering off");
+    }
+    let alive: Vec<String> = stopped.into_iter().map(|(_, name)| name).collect();
     if !alive.is_empty() {
         crate::kprintln!(
             "svc: stopping the service(s) still running (the registry lives until poweroff): {}",
@@ -1164,11 +1278,11 @@ pub fn add_svc(linker: &mut Linker<KernelState>) -> Result<()> {
 
 /// Kill a running service (or cancel its pending restart); the rendered final outcome.
 fn host_stop(name: &str) -> Option<String> {
-    SERVICES.with(|services| {
-        let service = services
-            .iter_mut()
-            .flatten()
-            .find(|service| service.name == name)?;
+    let (index, rendered) = SERVICES.with(|services| {
+        let index = services
+            .iter()
+            .position(|slot| matches!(slot, Some(service) if service.name == name))?;
+        let service = services[index].as_mut().expect("matched above");
         let rendered = match &service.run {
             // Setting the slot away from Running drops the drive future (and with it the
             // service's store and in-flight work) — for a service currently checked out,
@@ -1184,8 +1298,12 @@ fn host_stop(name: &str) -> Option<String> {
         };
         service.run = SRun::Finished;
         service.last_outcome = Some(rendered.clone());
-        Some(rendered)
-    })
+        Some((index, rendered))
+    })?;
+    // Stop means stop (§6): sever the share — gated children die with their owner, and
+    // no policy re-opens the gate (a killed run never consults its policy).
+    super::gate::on_owner_run_ended(index, "stopped by the operator");
+    Some(rendered)
 }
 
 /// The detach operation: validate, compile, spawn the first run, register.
@@ -1243,9 +1361,54 @@ fn host_detach(
     };
 
     // --- the child: a binary, closed except for what the registry supplies ----------
+    // A share-declared name (a config `share` clause — shared-resources design §5.2)
+    // is the one sanctioned exception to the binary rule: a factory-serving PROVIDER
+    // (no `main`; the kind judgment forbids main+exports) whose run is the call-gate
+    // intake. Blessing-with-validation (R7): it must export the blessed factory AND
+    // the full l4 surface (the gate can only call exported functions), or the detach
+    // refuses before anything runs.
+    let share = super::gate::declared_share(&name);
     let child_info = shellexec::component_info(entries, &child_kc)
         .map_err(|err| internal(format!("describing the service failed: {err}")))?;
-    if child_info.kind != shellexec::WitComponentKind::Binary {
+    if share.is_some() {
+        if child_info.kind != shellexec::WitComponentKind::Provider {
+            return Err(internal(format!(
+                "`{name}` is declared as a share, so it must be a factory-serving \
+                 provider whose tail exports the blessed factory (every l4 provider \
+                 does natively — end the chain on the transport provider); a binary \
+                 cannot serve in v1 (the main+factory ruling is the M2 item)"
+            )));
+        }
+        let exports_factory = child_info
+            .exports
+            .iter()
+            .any(|export| export.interface == "eo9:net/l4-factory");
+        let exports_l4 = child_info
+            .exports
+            .iter()
+            .any(|export| export.interface == "eo9:net/l4");
+        if !exports_factory || !exports_l4 {
+            return Err(internal(format!(
+                "`{name}` is declared as a share but does not serve eo9:net/l4: the \
+                 composition must export the blessed eo9:net/l4-factory and the full \
+                 eo9:net/l4 surface (end the chain on an l4 provider — every l4 \
+                 provider exports the blessed factory natively; it exports: {})",
+                child_info
+                    .exports
+                    .iter()
+                    .map(|e| e.interface.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        if !args.is_empty() {
+            return Err(internal(format!(
+                "`{name}` is a share-owning factory service; it has no `main` and \
+                 takes no arguments (configure the chain's providers with `--flag` \
+                 on their own segments instead)"
+            )));
+        }
+    } else if child_info.kind != shellexec::WitComponentKind::Binary {
         return Err(WitDetachError::NotABinary);
     }
     let unsupplied: Vec<String> = child_info
@@ -1322,11 +1485,12 @@ fn host_detach(
     let capture = matches!(logs, WitLogPolicy::Capture);
     let ring: SharedRing = Arc::new(KLock::new(LogRing::default()));
     let args: Vec<(String, String)> = args.into_iter().map(|arg| (arg.name, arg.value)).collect();
-    let drive = spawn_service_run(&engine, entries, &component, &args, &ring, capture)
+    let drive = spawn_service_run(&engine, entries, &component, &args, &ring, capture, share)
         .map_err(|err| internal(format!("spawning the service failed: {err}")))?;
 
     let service = KService {
         name: name.clone(),
+        share,
         run: SRun::Running(drive),
         engine,
         component,
@@ -1341,9 +1505,21 @@ fn host_detach(
         fuel_used: 0,
         last_outcome: None,
     };
-    SERVICES.with(|services| match services.iter().position(Option::is_none) {
-        Some(index) => services[index] = Some(service),
-        None => services.push(Some(service)),
+    let index = SERVICES.with(|services| match services.iter().position(Option::is_none) {
+        Some(index) => {
+            services[index] = Some(service);
+            index
+        }
+        None => {
+            services.push(Some(service));
+            services.len() - 1
+        }
     });
+    // Open the gate for this run (shared-resources §5.3): consumers can wire from the
+    // moment the detach returns.
+    if let Some(share_id) = share {
+        super::gate::wire_owner(share_id, index);
+        crate::kprintln!("gate: `{name}` is serving eo9:net/l4 (share open)");
+    }
     Ok(name)
 }

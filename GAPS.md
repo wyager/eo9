@@ -953,3 +953,49 @@ ripple feeds every module (sibling of the bundle path-dep residue class). ~11 MB
 binary churn per rebuild and the diff hides real changes. Lane: pin down which (AOT
 determinism probe: same input, two runs, diff), then either make the AOT
 deterministic or fingerprint on the component INPUT hash instead of the output.
+
+## Kernel call gate v1 residuals (area/41-gate-m1, 2026-06-09)
+
+M1 of docs/design/shared-resources.md landed (gate mechanism, l4.factory, share/use config, check-share
+green: R2 + loopback sockcheck + severance + station-net bare curl). Deliberate v1 deferrals and findings,
+each honest in the module docs (kernel/eo9-kernel/src/wasm/gate.rs):
+
+- **Owner-side handle drops are deferred.** `ResourceAny::resource_drop` demands a sync call context
+  (refused on the async-configured store) and `resource_drop_async` needs the bare `Store` — neither is
+  callable from inside the owner's `run_concurrent`, which is the only legal entry into a live owner
+  (design F1/F2). A dropped child handle frees its kernel-side translation-table entry immediately, but
+  the owner-side wrapper resource (and its host-table slot) lives until the owner's store drops. For M2's
+  telnetd close path (FIN driven by the wrapper destructor — design §7) this MUST be solved: either a
+  vendored concurrent-context resource-drop entry point (upstream-delta ledger) or a blessed explicit
+  `close` on the wrapped session. Returned buffers do NOT leak (`try_from_resource_any` consumes the
+  entry).
+- **The inline first-poll fast path (§3.3) is not implemented** — queue-only, +1 drive-pass latency per
+  gate call, exactly the doc's sanctioned fallback. The R1 TLS-canary test goes with the fast path when it
+  lands. (The three sync WIT getters — listener-address/peer-address/udp-address — DO nested-poll the
+  owner synchronously via the checkout-guarded `svc::poll_service_once`, because a sync shim cannot park:
+  wasmtime refuses `func_wrap_concurrent` for a sync import with "type mismatch with async".)
+- **The guest-visible `spawn(..., grants)` surface is not implemented** (parent→child sharing — the M2
+  telnetd item); v1 sharing is the broker case only (config share/use, kernel-interpreted).
+- **`serves:` in `describe` IS implemented** (the respin): eosh renders `serves: <api> (can serve
+  through the kernel call gate)` whenever a component exports an API root plus its blessed `*-factory`
+  sibling (pinned by eosh-core unit test); the structural validation at detach is unchanged (provider
+  kind + blessed factory + full l4 export, refused typed pre-run, source-agnostic).
+- **Respin note (owner ruling, 2026-06-10): the standalone `l4.factory` component is DELETED** — every
+  l4 provider (over-l2, filtered, loopback, deny; none is exempt — it has no l4) exports the blessed
+  factory natively and serving compositions are plain `$` chains ending on the provider. `$` still
+  seals the factory away under any further consumer, so only a provider-tailed chain surfaces it. The
+  `&` operator's sharing role is retrofit-only (adding a factory to a third-party/legacy provider that
+  lacks one) — doc delta for shared-resources.md §5.2; the area/45 study's wac-unification spike was
+  obviated before it ran (no lifting machinery exists to spike).
+- **`lock=token` is config-accepted but refused to instance** (v1 ships the instance domain only, which on
+  the single boot core is structurally provided by wasmtime store-entry serialization + FIFO intake).
+- **A trap inside one gated call** maps to that call's typed io error, but may poison the owner's store
+  for subsequent calls (un-probed); the share's restart policy is the recovery story.
+- **[CLOSED by area/36, verified 2026-06-10] the idle-prompt stranded-runnable flood is gone**: on the
+  rebased base (master f0372a0a, the task.wait completion-doorbell merge) a 45 s idle default boot AND a
+  45 s idle gatedemo boot (lan owner running) both report ZERO liveness findings. R6 for the gate now
+  holds absolutely, not merely relative-to-baseline: an intake-only owner parked between gate calls
+  costs no backstop wakes. One residual single-shot observed: a lone `stranded runnable (n=1)` can
+  fire on the pass after `svc stop <owner>` (the stop/kill transition racing an idle park — one finding
+  at the edge, never a flood; the kill path's doorbell covers waiters, not the stopping slot's own
+  transition). Worth folding into any future kill-path wake audit; not gate-specific.

@@ -47,6 +47,7 @@ wit_bindgen::generate!({
 use exports::eo9::net::l4::{
     self, Buffer, IpAddress, L4Error, RecvResult, SendResult, SocketAddress,
 };
+use exports::eo9::net::l4_factory;
 use exports::eo9::net::l4_loopback_config;
 
 /// The `net.l4.loopback` provider.
@@ -241,6 +242,16 @@ impl l4::GuestUdpSocket for UdpState {}
 impl l4_loopback_config::Guest for Stub {
     fn configure() -> Result<l4::L4Impl, String> {
         STATE.set(Loopback::empty());
+        Ok(l4::L4Impl::new(LoopbackRoot))
+    }
+}
+
+/// The blessed factory (shared-resources design §5.2, native per owner ruling): the
+/// kernel call gate mints one handler per consumer wiring through this export. A
+/// fresh root onto the one in-memory transport — every grantee shares the same
+/// listener/datagram space, which is exactly what the gate's QEMU unit shape tests.
+impl l4_factory::Guest for Stub {
+    fn get() -> Result<l4_factory::L4Impl, l4_factory::L4Error> {
         Ok(l4::L4Impl::new(LoopbackRoot))
     }
 }

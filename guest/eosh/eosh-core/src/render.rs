@@ -57,6 +57,22 @@ pub fn render_info(info: &ComponentInfo) -> Vec<String> {
         }
     }
 
+    // The R7 serving line (shared-resources design §5.2): a component exporting both
+    // an API's root surface and its blessed `*-factory` sibling can serve that API
+    // through the kernel call gate — what it offers to strangers, auditable at a
+    // glance. The factory export is the structural signal; whether a boot is actually
+    // sharing it is the registry's story (the `share` config clause and the kernel's
+    // own gate lines on the console).
+    for export in &info.exports {
+        if let Some(api) = export.interface.strip_suffix("-factory")
+            && info.exports.iter().any(|other| other.interface == api)
+        {
+            lines.push(format!(
+                "serves: {api} (can serve through the kernel call gate)"
+            ));
+        }
+    }
+
     lines
 }
 
@@ -187,6 +203,51 @@ mod tests {
                 "exports:",
                 "  eo9:fs/fs (eo9:fs/fs@0.1.0)",
             ]
+        );
+    }
+
+    #[test]
+    fn serving_providers_get_the_serves_line() {
+        // A provider exporting an API root AND its blessed factory sibling reports the
+        // R7 `serves:` line; a factory export without the root surface (or vice versa)
+        // reports nothing.
+        let serving = ComponentInfo {
+            kind: ComponentKind::Provider,
+            imports: vec![],
+            exports: vec![
+                ExportSlot {
+                    name: "eo9:net/l4".to_string(),
+                    interface: "eo9:net/l4".to_string(),
+                    version: "0.1.0".to_string(),
+                },
+                ExportSlot {
+                    name: "eo9:net/l4-factory".to_string(),
+                    interface: "eo9:net/l4-factory".to_string(),
+                    version: "0.1.0".to_string(),
+                },
+            ],
+            args: vec![],
+        };
+        let lines = render_info(&serving);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("serves: eo9:net/l4 (can serve through the kernel call gate)")
+        );
+
+        let factory_only = ComponentInfo {
+            kind: ComponentKind::Provider,
+            imports: vec![],
+            exports: vec![ExportSlot {
+                name: "eo9:net/l4-factory".to_string(),
+                interface: "eo9:net/l4-factory".to_string(),
+                version: "0.1.0".to_string(),
+            }],
+            args: vec![],
+        };
+        assert!(
+            render_info(&factory_only)
+                .iter()
+                .all(|line| !line.starts_with("serves:"))
         );
     }
 

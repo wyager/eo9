@@ -313,6 +313,30 @@ interface l4-optional {
     default: func() -> option<l4-impl>;
 }
 
+/// The blessed factory interface for `l4` (shared-resources design, §5.2): the ONLY
+/// export surface in the sharing model, and it exists only for the broker case (init
+/// wiring strangers). Every l4 PROVIDER exports it natively alongside `l4` itself
+/// (owner ruling, area/41 respin): the serving composition is then a plain chain —
+///
+///   net.virtio $ net.l4.over-l2          (the tail provider's own factory serves)
+///   stack $ net.l4.filtered              (policy: the filtered view's factory serves)
+///
+/// `get` mints one handler per wiring: the kernel calls it once per consumer at grant
+/// time, and the returned `l4-impl` is what the consumer's gated import reaches. A
+/// provider's `get` returns a fresh root handle onto its own implementation (the
+/// degenerate full sharing); attenuation is interposing a policy provider whose own
+/// factory then serves — "policies are programs", never kernel surface. `$` still
+/// seals: a factory export composed UNDER a consumer disappears like any other unused
+/// export, so only a chain whose tail is the provider surfaces it. (`&` remains the
+/// retrofit spelling for third-party providers lacking the export.) Every shareable
+/// API gets one blessed sibling of exactly this shape.
+interface l4-factory {
+    use l4.{l4-impl, l4-error};
+
+    /// Mint one handler for one consumer wiring.
+    get: func() -> result<l4-impl, l4-error>;
+}
+
 /// Compose-time configuration entry for net.l4.deny.
 interface l4-deny-config {
     use l4.{l4-impl};
@@ -508,6 +532,7 @@ world l4-none {
 /// ever exist.
 world l4-deny {
     export l4;
+    export l4-factory;
     export l4-deny-config;
 }
 
@@ -517,6 +542,7 @@ world l4-deny {
 /// layers at all.
 world l4-loopback {
     export l4;
+    export l4-factory;
     export l4-loopback-config;
 }
 
@@ -530,6 +556,7 @@ world l4-filtered {
     import l4;
     import connection-policy;
     export l4;
+    export l4-factory;
 }
 
 /// net.policy-ports — the port allow-list connection policy: admits endpoints whose
