@@ -357,6 +357,18 @@ grant PCI") even on a `pci` boot, while direct interactive `lspci` works — con
 the earlier verified filtered-chain flow (plan/12). Needs a lane: the spawn-path grant
 propagation for composed pci chains vs the interactive path.
 
+## Ungranted-platform composition spins instead of refusing typed (found 2026-06-10, L2 msd lane)
+On a QEMU boot whose command line carried `pci` but NO `platform=` grant,
+`usb.ohci $ usb.msd $ mdcheck` at the eosh prompt never returned: the serial stream
+filled with `liveness: stranded runnable: a child or service was runnable across an
+entire idle backstop (n=…)` lines until the gate's 300 s timeout. The same chain on a
+`pci platform=pl031-rtc` boot refuses promptly and typed (usb.ohci's no-controller
+probe) — which is how check-usb always boots and how check-msd's refusal arm now
+boots. Expected per the capability posture: an ungranted import should surface as a
+typed denial/refusal, never a spin. Reproduction: drop `platform=pl031-rtc` from
+check-msd's `-append` and run the gate's step 2. Needs a kernel/spawn-lane look
+(possibly the same grant-propagation family as the composed-spawn PCI refusal above).
+
 ## Backstop detector first real hit: stranded runnable on the board (2026-06-08)
 During net.rtl8125's polled gateway wait on the Orange Pi, the idle backstop detector
 fired once: `liveness: stranded runnable: a child or service was runnable across an
