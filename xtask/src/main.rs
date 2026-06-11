@@ -132,11 +132,8 @@ const MANUALED_COMPONENTS: &[&str] = &[
     "eo9-example-l2check",
     "eo9-example-l4check",
     "eo9-example-curl",
-<<<<<<< HEAD
     "eo9-stub-usb-msd",
-=======
     "eo9-stub-disk-part",
->>>>>>> area/50-disk-part
 ];
 
 /// Manual-validation rule version, part of the componentize stamp so changing the

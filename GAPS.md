@@ -949,7 +949,6 @@ spurious-wake drain left the next counted reap waiting forever (silent freeze or
 device-lost under TCG) — now credit-accounted with a frame-bounded spin, pinned by
 a mock regression test.
 
-<<<<<<< HEAD
 ## fingerprint-web-vm standalone is DESTRUCTIVE (area/46 lane workaround 1, 2026-06-10)
 Run standalone, `cargo xtask fingerprint-web-vm` clears the fingerprinted /vm assets
 BEFORE reading the canonical blob — if the blob is not freshly present (the normal
@@ -1012,7 +1011,7 @@ each honest in the module docs (kernel/eo9-kernel/src/wasm/gate.rs):
   fire on the pass after `svc stop <owner>` (the stop/kill transition racing an idle park — one finding
   at the edge, never a flood; the kill path's doorbell covers waiters, not the stopping slot's own
   transition). Worth folding into any future kill-path wake audit; not gate-specific.
-=======
+
 ## wit/disk's dormant `world readonly` has the broken shared-types shape (area/50 finding 1, 2026-06-10)
 The dormant `readonly` world in wit/disk imports and exports `eo9:disk/disk` in the
 shape that makes the imported and exported interface carry DISTINCT resource types
@@ -1022,4 +1021,3 @@ declaring its own world with the wrap idiom (a fresh exported interface whose
 resource wraps the imported one, the disk-part world.wit shape). When disk.readonly
 (or any disk middleware) gets built, use the wrap idiom — do not copy the dormant
 world. Lane: fix or delete the dormant world so it cannot be copied.
->>>>>>> area/50-disk-part
