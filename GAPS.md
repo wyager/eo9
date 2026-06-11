@@ -936,3 +936,20 @@ it at the hot path, both park gates, the masked re-check, and the post-wfi arm. 
 spurious-wake drain left the next counted reap waiting forever (silent freeze or
 device-lost under TCG) — now credit-accounted with a frame-bounded spin, pinned by
 a mock regression test.
+
+## fingerprint-web-vm standalone is DESTRUCTIVE (area/46 lane workaround 1, 2026-06-10)
+Run standalone, `cargo xtask fingerprint-web-vm` clears the fingerprinted /vm assets
+BEFORE reading the canonical blob — if the blob is not freshly present (the normal
+case outside a build-web-vm run, which invokes it internally), the clear eats the
+committed assets and the tree shows a mass deletion. Inside build-web-vm the ordering
+is safe; the standalone entry point is the trap. Lane: make the standalone path read
+the canonical inputs first and refuse loudly when they are absent, or fold the
+command into build-web-vm and retire the standalone spelling.
+
+## web-vm store cwasm fingerprints flip wholesale on rebuild (area/46 lane workaround 2, 2026-06-10)
+A web-vm rebuild renames EVERY store .cwasm asset even when component inputs are
+byte-identical — either the pulley AOT output is nondeterministic or a config/dep
+ripple feeds every module (sibling of the bundle path-dep residue class). ~11 MB of
+binary churn per rebuild and the diff hides real changes. Lane: pin down which (AOT
+determinism probe: same input, two runs, diff), then either make the AOT
+deterministic or fingerprint on the component INPUT hash instead of the output.
