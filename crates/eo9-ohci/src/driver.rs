@@ -1545,30 +1545,36 @@ impl<R: RegionIo> Ohci<R> {
                 // The NAK-forever cancel path: sKip the ED so the controller stops
                 // visiting it (§4.2.2), give it a frame to finish any in-flight
                 // access, then re-check once — the TD may have retired in the race
-                // window.
+                // window. The skip set/lift writes touch ONLY dword0: a full-ED
+                // write here could clobber a head the controller advanced between
+                // our read and the write (head and toggleCarry are controller-owned
+                // while the ED is live — §5.2.7); dword-granular writes make the
+                // fence itself race-free.
                 let mut ed_bytes = [0u8; 16];
                 self.io.dma_read(ed_offset, &mut ed_bytes);
                 let mut ed = EndpointDescriptor::decode(&ed_bytes);
                 ed.skip = true;
-                self.io.dma_write(ed_offset, &ed.encode());
+                self.io.dma_write(ed_offset, &ed.encode()[..4]);
                 self.wait_ms(2).await?;
                 let mut ed_bytes = [0u8; 16];
                 self.io.dma_read(ed_offset, &mut ed_bytes);
                 let mut ed = EndpointDescriptor::decode(&ed_bytes);
                 if ed.halted || ed.head == tail {
-                    // Retired after all: lift the skip and judge below.
+                    // Retired after all: lift the skip (dword0 only) and judge below.
                     let halted = ed.halted;
                     ed.skip = false;
-                    self.io.dma_write(ed_offset, &ed.encode());
+                    self.io.dma_write(ed_offset, &ed.encode()[..4]);
                     break halted;
                 }
-                // Still pending: take the TD back — empty the queue (head = tail;
-                // toggle preserved as read) and lift the skip. No writeback is owed:
-                // the TD never retired, so nothing was (or will be) pushed onto the
-                // done queue for it.
+                // Still pending — and the skip fence has been live for a full frame,
+                // so the controller is no longer touching this ED: take the TD back —
+                // empty the queue (head = tail; toggle preserved as read), then lift
+                // the skip. No writeback is owed: the TD never retired, so nothing
+                // was (or will be) pushed onto the done queue for it.
                 ed.head = tail;
-                ed.skip = false;
                 self.io.dma_write(ed_offset, &ed.encode());
+                ed.skip = false;
+                self.io.dma_write(ed_offset, &ed.encode()[..4]);
                 return Err(DriverError::Timeout("bulk transfer"));
             }
         };
