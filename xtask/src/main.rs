@@ -26,6 +26,9 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-hidcheck",
     "eo9-example-l2check",
     "eo9-example-l4check",
+    // The block-device probe (docs/board/usb-msd-plan.md §5.1): size, high-LBA
+    // scratch write+read-back, the typed past-capacity refusal — check-msd's leg.
+    "eo9-example-mdcheck",
     // The demo HTTP client (docs/board/usb-boot-demo-plan.md Part B): one GET over
     // the granted l4 capability, http:// only, at most one redirect.
     "eo9-example-curl",
@@ -107,6 +110,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-stub-time-monotonic-stub",
     "eo9-stub-time-none",
     "eo9-stub-usb-kbd",
+    "eo9-stub-usb-msd",
     "eo9-stub-usb-ohci",
     "eo9-stub-usb-ohci-pci",
 ];
@@ -123,6 +127,7 @@ const MANUALED_COMPONENTS: &[&str] = &[
     "eo9-example-l2check",
     "eo9-example-l4check",
     "eo9-example-curl",
+    "eo9-stub-usb-msd",
 ];
 
 /// Manual-validation rule version, part of the componentize stamp so changing the
@@ -234,6 +239,14 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     //   sinkcheck --text hello        (the fake-HID mechanics probe)
     ("eo9-stub-usb-kbd", "usb.kbd"),
     ("eo9-example-sinkcheck", "sinkcheck"),
+    // The mass-storage chain (docs/board/usb-msd-plan.md L2): the BOT/SCSI driver
+    // exporting eo9:disk over the composed usb provider, and the block-device probe
+    // check-msd drives at the eosh prompt (QEMU: -device usb-storage on the OHCI bus;
+    // the board: the stick in a USB2-A port):
+    //   usb.ohci-pci $ usb.msd $ mdcheck
+    //   usb.ohci --region usb-host1-ohci $ usb.msd $ mdcheck
+    ("eo9-stub-usb-msd", "usb.msd"),
+    ("eo9-example-mdcheck", "mdcheck"),
     // The network stack for real hardware: the virtio-net driver, its link-layer
     // check, the TCP/IP middleware, and its transport-layer check, so the metal shell
     // can compose `net.virtio $ l2check` and `net.virtio $ net.l4.over-l2 $ l4check`
@@ -426,6 +439,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("check-usb-bulk", rest)?;
             check_usb_bulk(&root)
         }
+        "check-msd" => {
+            expect_no_args("check-msd", rest)?;
+            check_msd(&root)
+        }
         "check-usb-hub" => {
             expect_no_args("check-usb-hub", rest)?;
             check_usb_hub(&root)
@@ -589,7 +606,15 @@ COMMANDS:
                          serial eosh prompt: enumerate 46f4:0001, open the bulk pair, and
                          round-trip one opaque BOT INQUIRY (CBW out, 36 data bytes in, the
                          CSW in as a short read) — the usb-msd plan's L1 bulk leg; the full
-                         mass-storage gate (check-msd) arrives with the L2 msd lane
+                         mass-storage gate is check-msd (the L2 lane)
+    check-msd            Boot the aarch64 kernel under QEMU with a mass-storage stick on the
+                         OHCI bus (-device pci-ohci -device usb-storage over a scratch 8 MiB
+                         raw image the gate creates) and drive the L2 msd lane at the serial
+                         eosh prompt: `usb.ohci-pci $ usb.msd $ mdcheck` (enumerate, INQUIRY +
+                         READ CAPACITY printed, a high-LBA 64 KiB scratch write read back
+                         byte-exact through BOT READ(10)/WRITE(10), past-capacity read AND
+                         write answering the typed out-of-range), then `usb.ohci $ usb.msd $
+                         mdcheck` (the typed no-controller refusal through the disk surface)
     check-usb-hub        Boot the aarch64 kernel under QEMU with the keyboard BEHIND a hub
                          (-device usb-hub + usb-kbd on its port 1) plus the console-sink
                          grant, and drive the full M4 keyboard chain: hidcheck through the
@@ -4749,6 +4774,207 @@ fn check_usb_bulk(root: &Path) -> Result<(), String> {
         "xtask: check-usb-bulk ok — the QEMU stick enumerated on the OHCI bus, the bulk \
          pair opened, and one opaque BOT INQUIRY round-tripped (bulk-out CBW, bulk-in \
          data, short-read bulk-in CSW with status 0)"
+    );
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------------------
+// check-msd: the L2 mass-storage gate (docs/board/usb-msd-plan.md §5.1) — QEMU's
+// `-device usb-storage` over a scratch 8 MiB raw image the gate creates, driven through
+// the REAL protocol stack at the eosh prompt (where check-usb-bulk moved opaque fixture
+// bytes, this leg runs crates/eo9-msd's BOT/SCSI engine inside usb.msd):
+//
+//   1. `usb.ohci-pci $ usb.msd $ mdcheck --span 65537` — enumerate the stick, INQUIRY
+//      identity + READ CAPACITY geometry on the diagnostic line, then a high-LBA
+//      scratch write read back byte-exact via BOT READ(10)/WRITE(10) (the odd span
+//      starts mid-block, so usb.msd's read-modify-write edge path runs), and the
+//      past-capacity read AND write answering the typed out-of-range (usb.msd's
+//      READ-CAPACITY-derived bounds check — no bytes move on the bus).
+//   2. `usb.ohci $ usb.msd $ mdcheck` — the board shell refuses typed on QEMU (no OHCI
+//      platform region) and the refusal surfaces through the disk surface as a typed
+//      io error naming the missing controller (the check-usb refusal-arm pattern, one
+//      capability layer deeper).
+// ----------------------------------------------------------------------------------------
+
+fn check_msd(root: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::sync::mpsc;
+
+    let arch = "aarch64";
+    let image = build_kernel(root, arch)?;
+
+    // A scratch raw disk for usb-storage to expose: 8 MiB of zeros, created fresh by
+    // the gate (never a repo file). 8 MiB = 16384 blocks of 512 — small enough that
+    // the full-speed QD1 scratch pass stays quick, large enough that the high-LBA
+    // window sits far from sector 0.
+    const STICK_BYTES: usize = 8 * 1024 * 1024;
+    let stick = root.join("kernel").join("target").join("eo9-msd-stick.img");
+    std::fs::write(&stick, vec![0u8; STICK_BYTES])
+        .map_err(|err| format!("check-msd: writing the scratch stick image: {err}"))?;
+
+    println!(
+        "xtask: check-msd — booting {} with -device usb-storage on the OHCI bus, driving \
+         `usb.ohci-pci $ usb.msd $ mdcheck` (BOT/SCSI end to end) and the usb.ohci \
+         refusal arm at the eosh prompt",
+        image.display()
+    );
+
+    let mut command = Command::new(format!("qemu-system-{arch}"));
+    command
+        .current_dir(root)
+        .args(["-M", "virt,gic-version=2,highmem=off", "-cpu", "max"])
+        .args(["-device", "virtio-rng-pci"])
+        .args(["-smp", "1", "-m", KERNEL_QEMU_MEMORY, "-nographic"])
+        .arg("-kernel")
+        .arg(&image)
+        // pci carries the OHCI-PCI claim path; the platform grant must ALSO exist so
+        // the usb.ohci refusal arm probes the region table and refuses TYPED
+        // no-controller (the check-usb machine config — with platform ungranted the
+        // composition never reaches the probe).
+        .args(["-append", "pci platform=pl031-rtc"])
+        .args(["-device", "pci-ohci,id=eo9ohci"])
+        .arg("-drive")
+        .arg(format!(
+            "file={},if=none,format=raw,id=stick",
+            stick.display()
+        ))
+        .args(["-device", "usb-storage,bus=eo9ohci.0,drive=stick"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("check-msd: failed to spawn qemu-system-{arch}: {err}"))?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+
+    // Reader thread: forward serial bytes over a channel so waits can time out.
+    let (sender, receiver) = mpsc::channel::<u8>();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut stdout = stdout;
+        let mut byte = [0u8; 1];
+        while let Ok(n) = stdout.read(&mut byte) {
+            if n == 0 || sender.send(byte[0]).is_err() {
+                break;
+            }
+        }
+    });
+
+    /// Accumulate serial output until `marker` appears, or time out.
+    fn wait_for(receiver: &mpsc::Receiver<u8>, marker: &str, what: &str) -> Result<String, String> {
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + USB_STEP_TIMEOUT;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| {
+                    format!(
+                        "check-msd: timed out waiting for {what} (last output: …{})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    )
+                })?;
+            match receiver.recv_timeout(remaining) {
+                Ok(byte) => {
+                    seen.push(byte as char);
+                    if seen.contains(marker) {
+                        return Ok(seen);
+                    }
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "check-msd: the serial stream ended or timed out waiting for {what} \
+                         (last output: …{})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Type a line the way a human would (the metal console drops fast input —
+    /// plan/12 D49; same pacing as check-usb).
+    fn type_line(stdin: &mut std::process::ChildStdin, line: &str) -> Result<(), String> {
+        for byte in line.as_bytes() {
+            stdin
+                .write_all(core::slice::from_ref(byte))
+                .map_err(|err| format!("check-msd: writing to the console: {err}"))?;
+            stdin
+                .flush()
+                .map_err(|err| format!("check-msd: flushing the console: {err}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        stdin
+            .write_all(b"\n")
+            .and_then(|()| stdin.flush())
+            .map_err(|err| format!("check-msd: writing to the console: {err}"))
+    }
+
+    let drive = (|| -> Result<(), String> {
+        wait_for(&receiver, "eosh>", "the eosh prompt")?;
+
+        // Step 1: the full chain. The odd span (65537) starts the scratch window
+        // mid-block, so the RMW edge path runs alongside the aligned WRITE(10)s.
+        type_line(&mut stdin, "usb.ohci-pci $ usb.msd $ mdcheck --span 65537")?;
+        let output = wait_for(&receiver, "ok: verified(65537)", "mdcheck's green verdict")?;
+        for line in [
+            // The shell and the enumeration (QEMU's stick is 46f4:0001).
+            "usb.ohci-pci: OHCI 1.0",
+            "usb.msd: 46f4:0001 'QEMU' 'QEMU HARDDISK'",
+            // READ CAPACITY's geometry: 8 MiB = 16384 blocks of 512.
+            "16384 blocks of 512 bytes (8 MiB)",
+            "mdcheck: device size 8388608 bytes",
+            // The high-LBA scratch round trip, byte-exact.
+            "byte-exact",
+            // The typed past-capacity refusals (the REQUEST-SENSE-class arm under
+            // QEMU: usb.msd's bounds check refuses before any bus traffic; the
+            // status-1 -> REQUEST SENSE -> typed-error ladder itself is host-pinned
+            // in eo9-msd against scripted stalls/sense fixtures).
+            "mdcheck: past-capacity read answered out-of-range - ok",
+            "mdcheck: past-capacity write answered out-of-range - ok",
+        ] {
+            if !output.contains(line) {
+                return Err(format!(
+                    "check-msd: mdcheck finished but its transcript is missing `{line}` \
+                     (see the serial output above)"
+                ));
+            }
+        }
+        wait_for(&receiver, "eosh>", "the prompt after the msd chain")?;
+
+        // Step 2: the board shell refuses typed on QEMU (no OHCI platform region),
+        // and the refusal rides the disk surface as a typed io error naming the
+        // missing controller.
+        type_line(&mut stdin, "usb.ohci $ usb.msd $ mdcheck")?;
+        let output = wait_for(
+            &receiver,
+            "no usb host controller is visible",
+            "usb.msd's typed no-controller refusal through the disk surface",
+        )?;
+        if !output.contains("error:") {
+            return Err(String::from(
+                "check-msd: the no-controller text appeared but not as a typed error \
+                 (see the serial output above)",
+            ));
+        }
+        wait_for(&receiver, "eosh>", "the prompt after the refusal probe")?;
+
+        type_line(&mut stdin, "exit")?;
+        Ok(())
+    })();
+    if let Err(err) = drive {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    let _ = child.wait();
+
+    println!(
+        "xtask: check-msd ok — usb.msd enumerated the QEMU stick (INQUIRY identity, READ \
+         CAPACITY geometry), a 65537-byte high-LBA scratch window round-tripped byte-exact \
+         through BOT READ(10)/WRITE(10) incl. the RMW edge path, past-capacity accesses \
+         refused typed, and the usb.ohci arm refused with the no-controller diagnosis"
     );
     Ok(())
 }

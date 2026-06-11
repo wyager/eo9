@@ -1,0 +1,21 @@
+# eo9-msd is the pure, host-testable core of the `usb.msd` driver component
+# (docs/board/usb-msd-plan.md §1.2): USB Mass Storage Class Bulk-Only Transport 1.0
+# framing (CBW encode, CSW decode, tags, residue), the three-phase command ladder with
+# the BOT error-recovery rules (clear-halt on stall, REQUEST SENSE on command failure,
+# mass-storage reset on phase error), and the six-command SCSI set a boot stick needs
+# (INQUIRY, TEST UNIT READY, REQUEST SENSE, READ CAPACITY(10), READ(10), WRITE(10)) —
+# everything about the device conversation that is plain byte arithmetic and protocol
+# sequencing, factored out of the wasm component so `cargo test` exercises it on the
+# host against scripted endpoint mocks (the eo9-ohci / eo9-rtl8125 precedent: the
+# component is a thin I/O shell, the logic is host-tested).
+#
+# no_std claim is kept honest with: cargo check -p eo9-msd --target aarch64-unknown-none
+[package]
+name = "eo9-msd"
+description = "USB mass-storage Bulk-Only Transport framing, the BOT error-recovery ladder, and the minimal SCSI command set: the pure core of Eo9's usb.msd driver."
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]

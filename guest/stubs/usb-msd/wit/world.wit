@@ -1,0 +1,28 @@
+/// eo9:usb-msd — the USB mass-storage driver world (docs/board/usb-msd-plan.md §1.2).
+///
+/// `usb.msd` is a disk provider, nothing more: it speaks Bulk-Only Transport plus the
+/// six-command SCSI set over whatever eo9:usb provider it is composed with (`usb.ohci`
+/// on the board, `usb.ohci-pci` under QEMU's `-device pci-ohci` + `-device
+/// usb-storage`) and exports `eo9:disk/disk` — so everything that already runs over a
+/// block device (`fs.eofs`, `disk.part`, the stick flasher) runs over a USB stick by
+/// composition:
+///
+///   usb.ohci-pci $ usb.msd $ mdcheck                      (the QEMU gate)
+///   usb.ohci --region usb-host1-ohci $ usb.msd $ …        (the board chain)
+///
+/// `eo9:time/time` paces the connect watch and the TEST-UNIT-READY settle loop;
+/// `eo9:text/text` carries one diagnostic line on first use (the enumerated device,
+/// its INQUIRY strings, and READ CAPACITY's geometry). There is no configure
+/// interface: the documented default is to claim the first connected port's device on
+/// first use (the option-C default-configuration rule); per-port selection arrives
+/// with a future attenuator, not a driver flag.
+package eo9:usb-msd@0.1.0;
+
+world msd {
+    import eo9:usb/usb@0.1.0;
+    import eo9:time/time@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    export eo9:disk/types@0.1.0;
+    export eo9:disk/disk@0.1.0;
+}

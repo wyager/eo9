@@ -1,0 +1,15 @@
+[package]
+name = "eo9-example-mdcheck"
+description = "Eo9 example program: the mass-storage disk probe — reports the composed disk's size, writes an offset-dependent pattern to the highest addresses and reads it back byte-exact, and pins the typed out-of-range refusal on past-capacity accesses (targets the eo9-examples:mdcheck/mdcheck world)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

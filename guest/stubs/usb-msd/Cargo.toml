@@ -1,0 +1,20 @@
+[package]
+name = "eo9-stub-usb-msd"
+description = "Eo9 device driver `usb.msd`: speaks USB mass-storage Bulk-Only Transport plus the minimal SCSI command set over the composed eo9:usb provider and exports eo9:disk, so filesystems and the stick flasher run over a USB stick by composition."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+# BOT framing + the recovery ladder + the SCSI six (the host-tested core).
+eo9-msd = { workspace = true }
+# Descriptor parsing + the SET_CONFIGURATION setup words (the host-tested core the
+# usb shells and usbcheck already share).
+eo9-ohci = { workspace = true }
+wit-bindgen = { workspace = true }
