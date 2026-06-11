@@ -1,0 +1,21 @@
+# eo9-partwalk is the pure, host-testable MBR partition-table core of the `disk.part`
+# middleware component (docs/board/usb-msd-plan.md §2 / sdcard-plan.md §B.3 — the
+# component both lanes share): sector-0 parse, the classic extended-partition (EBR)
+# chain walk as a pull-driven state machine (the caller does the reads; this crate never
+# does I/O), and the validation ladder — signature, GPT detection (typed refusal, never
+# a misread), per-entry bounds against the device capacity, overlap detection, chain
+# cycle/length bounds. Factored out of the wasm component so `cargo test` exercises the
+# byte arithmetic against adversarial fixtures on the host (the eo9-ohci / eo9-rtl8125 /
+# eo9-dns precedent: pure logic lives in a library crate the workspace tests, the
+# component stays a thin I/O shell).
+#
+# no_std claim is kept honest with: cargo check -p eo9-partwalk --target aarch64-unknown-none
+[package]
+name = "eo9-partwalk"
+description = "MBR partition-table parsing, extended-chain walking, and validation: the pure core of Eo9's disk.part middleware component."
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]

@@ -167,7 +167,7 @@ impl pci::Guest for Stub {
         dev.get::<NoDevice>().unreachable()
     }
 
-    async fn wait(i: pci::InterruptBorrow<'_>) -> Result<u64, PciError> {
+    async fn wait(i: pci::InterruptBorrow<'_>, _max_ns: u64) -> Result<u64, PciError> {
         i.get::<NoInterrupt>().unreachable()
     }
 

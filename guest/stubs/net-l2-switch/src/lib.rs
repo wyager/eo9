@@ -427,6 +427,21 @@ async fn port_recv(slot: Slot) -> Result<Option<Vec<u8>>, SwitchError> {
     Ok(with_state(|state| state.rx[slot.index()].pop_front()))
 }
 
+/// `wait-recv` for one port: the documented poll-fallback — return immediately, so a
+/// consumer's wait loop degrades to exactly the poll cadence it ran before the
+/// operation existed. Forwarding the wait to the uplink's own `wait-recv` is NOT done
+/// deliberately: the uplink is an exclusive slot shared by both ports, and a port
+/// parked on it for the caller's bound would starve the sibling's every operation into
+/// the typed busy answer for the duration. An event-driven park here needs a cross-port
+/// wake (the sibling's drain waking this port's parked wait) — recorded as the
+/// follow-up next to the A2 board leg; until then both ports stay honestly polled.
+async fn port_wait_recv(slot: Slot, _max_wait_ns: u64) -> Result<(), SwitchError> {
+    // Nothing waiting is the normal answer; a frame already demuxed into the port's
+    // queue returns just the same — the consumer re-polls either way.
+    let _ = slot;
+    Ok(())
+}
+
 // ------------------------------------------------------------------------------------------
 // The two exported ports. The macro instantiates the identical binding once per port
 // module: each named export mints its own (nominal) resource and error types, so this
@@ -516,6 +531,13 @@ macro_rules! port_binding {
                     .map(|bytes_sent| exports::$module::SendResult { bytes_sent })
                     .map_err($error);
                 (frame, outcome)
+            }
+
+            async fn wait_recv(
+                _iface: exports::$module::L2InterfaceBorrow<'_>,
+                max_wait_ns: u64,
+            ) -> Result<(), exports::$module::L2Error> {
+                port_wait_recv($slot, max_wait_ns).await.map_err($error)
             }
 
             async fn recv_frame(

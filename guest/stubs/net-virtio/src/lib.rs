@@ -25,13 +25,19 @@
 //!   front of it (zeroed on transmit — no offloads are negotiated — and stripped on
 //!   receive). Transmit publishes one descriptor and polls the used ring for
 //!   completion; receive polls the used ring for the next delivered buffer, copies the
-//!   frame out, and immediately re-posts the buffer. (The PCI provider can deliver
-//!   INTx interrupts — `disk.virtio` waits on them — but this driver still polls;
-//!   converting receive to an interrupt wait is the recorded follow-up in plan/12 D59.
-//!   The used-ring polling bounds stay: every await here resolves within the call —
-//!   pci operations are plain MMIO/memory work in the provider — so the bounds are
-//!   what keep a wedged device a typed error instead of a hang, per the SPEC's
-//!   awaits-are-bounded rule.)
+//!   frame out, and immediately re-posts the buffer. The used-ring polling bounds
+//!   stay: every await here resolves within the call — pci operations are plain
+//!   MMIO/memory work in the provider — so the bounds are what keep a wedged device a
+//!   typed error instead of a hang, per the SPEC's awaits-are-bounded rule.
+//! * **The receive event (plan/12 D59, the timer-crutch audit's A2).** Where the PCI
+//!   provider routes INTx (QEMU aarch64-virt and riscv64 today), bring-up asks for one
+//!   vector and leaves used-buffer interrupts enabled on the receive queue, and the
+//!   exported `wait-recv` parks the calling task on the device's RX interrupt (bounded
+//!   by the caller's `max-wait-ns`, clamped by the provider) — so a consumer waiting
+//!   for traffic costs the machine nothing instead of busy-pumping `recv-frame`. Where
+//!   interrupts are not routed (`enable-interrupts` answers `unsupported`: x86_64, the
+//!   v1 platform provider), `wait-recv` returns immediately and the consumer degrades
+//!   to exactly the poll loop it always ran.
 //!
 //! The exported `eo9:net/l2` surface is the single interface `virtio0`: `recv-frame`
 //! that finds nothing within its short poll window reports **an empty result**
@@ -95,6 +101,7 @@ const PCI_CAP_WALK_LIMIT: usize = 48;
 /// virtio_pci_cap.cfg_type values.
 const VIRTIO_PCI_CAP_COMMON: u64 = 1;
 const VIRTIO_PCI_CAP_NOTIFY: u64 = 2;
+const VIRTIO_PCI_CAP_ISR: u64 = 3;
 const VIRTIO_PCI_CAP_DEVICE: u64 = 4;
 
 /// Offsets within the common configuration window (virtio 1.0 §4.1.4.3).
@@ -128,17 +135,18 @@ const FEATURE_MAC_LOW: u64 = 1 << 5;
 const DESC_F_WRITE: u16 = 2;
 
 /// `VIRTQ_AVAIL_F_NO_INTERRUPT` (virtio 1.0 §2.6.7): tell the device this driver does
-/// not want used-buffer interrupts. This driver is purely polled (no `enable-interrupts`,
-/// no ISR window — converting receive to an interrupt wait is the plan/12 D59 follow-up),
-/// so without the suppression the device would assert its level-triggered INTx on every
-/// completion and *nobody would ever read the ISR to deassert it*: harmless to this
-/// driver, but a permanently wedged line for any device sharing the swizzled INTx — its
-/// interrupt-mode sibling (disk.virtio, gpu.virtio) would then see endless stale
-/// deliveries and drift into its polled fallback. The flag is the spec's hint, not a
-/// guarantee, which is exactly right: a device that interrupts anyway costs nothing here,
-/// suppression just stops the routine wedging. When D59 converts receive to interrupt
-/// waits, the rx ring's flag goes back to 0 (and the converted driver acks its ISR like
-/// the siblings).
+/// not want used-buffer interrupts on a queue. Both rings start suppressed at setup;
+/// when bring-up is granted an INTx vector (plan/12 D59 landed: receive is
+/// interrupt-capable through `wait-recv`), the **receive** ring's flag is cleared again
+/// and the driver acks its ISR like the interrupt-mode siblings (disk.virtio,
+/// gpu.virtio). The **transmit** ring stays suppressed always: transmit completion is
+/// consumed by an inline poll within the same `send`, so a tx interrupt would assert
+/// the level-triggered line with nobody waiting on it — exactly the stale-delivery
+/// wedge the suppression exists to prevent. Where no vector is granted (interrupts
+/// unrouted) the receive ring stays suppressed too, and the driver is purely polled as
+/// before. The flag is the spec's hint, not a guarantee, which is exactly right: a
+/// device that interrupts anyway costs nothing (the line is masked at the controller
+/// outside waits), suppression just stops the routine wedging.
 const AVAIL_F_NO_INTERRUPT: u16 = 1;
 
 /// Queue size the driver uses for both queues (the device's maximum is reduced to this).
@@ -187,6 +195,11 @@ const TX_POLL_LIMIT: u64 = 50_000_000;
 /// (User study 08 finding F2: this was 2,000,000 — ~1.7 s per empty poll — which
 /// stacked up to ~6.7 s ARP stalls through the middleware's pump loop.)
 const RX_POLL_LIMIT: u64 = 2_000;
+
+/// Rate limit for the missed-RX-interrupt liveness finding (the detector discipline:
+/// a bounded wait that expires with receive work already in the ring means the event
+/// path failed to deliver — report it loudly, first occurrence and every 16th after).
+const LIVENESS_REPORT_EVERY: u32 = 16;
 
 // ------------------------------------------------------------------------------------------
 // Awaited driving of the async pci imports.
@@ -241,6 +254,15 @@ struct Driver {
     common: Region,
     device_config: Region,
     notify: Region,
+    /// The ISR status window (read-to-clear; deasserts INTx). `None` when the device
+    /// exposes no ISR capability — interrupt mode is then never entered.
+    isr: Option<Region>,
+    /// The INTx vector the provider granted, or `None` when interrupts are not routed
+    /// on this platform/provider (`wait-recv` then returns immediately and the
+    /// consumer stays on its poll loop).
+    interrupt: Option<pci::Interrupt>,
+    /// Missed-interrupt liveness findings so far (rate-limits the loud line).
+    missed_intx: u32,
     rings: pci::DmaBuffer,
     rx_data: pci::DmaBuffer,
     tx_data: pci::DmaBuffer,
@@ -404,7 +426,8 @@ impl Driver {
         let device = pci_call("net.virtio: open", pci::open(&root, address)).await?;
 
         // Walk the vendor-specific capabilities to find the virtio register windows.
-        let (common, notify_base, notify_multiplier, device_config) = find_windows(&device).await?;
+        let (common, notify_base, notify_multiplier, device_config, isr) =
+            find_windows(&device).await?;
 
         // Open each BAR the windows live in exactly once.
         let mut bar_indices: Vec<u8> = Vec::new();
@@ -412,6 +435,11 @@ impl Driver {
             if !bar_indices.contains(&index) {
                 bar_indices.push(index);
             }
+        }
+        if let Some(isr) = &isr
+            && !bar_indices.contains(&isr.bar)
+        {
+            bar_indices.push(isr.bar);
         }
         let mut bars: Vec<(u8, pci::Bar)> = Vec::new();
         for index in bar_indices {
@@ -445,6 +473,9 @@ impl Driver {
             common,
             device_config,
             notify: notify_base,
+            isr,
+            interrupt: None,
+            missed_intx: 0,
             rings,
             rx_data,
             tx_data,
@@ -589,16 +620,49 @@ impl Driver {
         }
         self.mac = mac;
 
+        // Receive-event delivery (plan/12 D59): ask the provider for one INTx vector.
+        // `unsupported` (or any other failure) means this platform/provider does not
+        // route PCI interrupts — `wait-recv` then returns immediately and consumers
+        // keep their poll loops, which work everywhere. Interrupt mode also needs the
+        // ISR window (reading it clears the device-side cause), so without one the
+        // vector is not requested at all.
+        if self.isr.is_some() {
+            self.interrupt =
+                match pci::enable_interrupts(&self._device, pci::InterruptKind::Intx, 1).await {
+                    Ok(mut vectors) if !vectors.is_empty() => Some(vectors.remove(0)),
+                    _ => None,
+                };
+        }
+        if self.interrupt.is_some() {
+            // Un-suppress used-buffer interrupts on the receive ring (setup_queue wrote
+            // the suppression hint into both rings): RX completions may now assert the
+            // level-triggered INTx, which stays masked at the controller except while a
+            // `wait-recv` is parked on it, and is deasserted by the ISR read the
+            // consuming paths perform. The transmit ring stays suppressed — its
+            // completions are consumed by `send`'s inline poll.
+            pci::dma_write(
+                &self.rings,
+                RX_RING_BASE + AVAIL_OFFSET,
+                &0u16.to_le_bytes(),
+            );
+        }
+
         // Hand the device its receive buffers and open the doorbell once.
         self.post_initial_receive_buffers().await?;
 
-        // One best-effort diagnostic line so a metal session shows what was probed.
+        // One best-effort diagnostic line so a metal session shows what was probed and
+        // how receive traffic is observed.
         let handle = text::default();
         let line = format!(
-            "net.virtio: virtio-net {}, queues rx/tx {}/{}",
+            "net.virtio: virtio-net {}, queues rx/tx {}/{}, rx wait: {}",
             format_mac(&self.mac),
             self.rx.size,
             self.tx.size,
+            if self.interrupt.is_some() {
+                "INTx interrupt"
+            } else {
+                "polled"
+            },
         );
         let _ = text::write(&handle, text::OutputStream::Out, &line);
         let _ = text::write(&handle, text::OutputStream::Out, "\n");
@@ -632,9 +696,9 @@ impl Driver {
         // table and both rings so the device's first used-index write is the first
         // non-zero value the polling loops ever observe.
         pci::dma_write(&self.rings, ring_base, &[0u8; 1024]);
-        // Suppress used-buffer interrupts on this queue: the driver polls and never
-        // reads an ISR, so an interrupt it provoked would stay asserted forever (see
-        // AVAIL_F_NO_INTERRUPT).
+        // Suppress used-buffer interrupts on this queue at setup. If bring-up is later
+        // granted an INTx vector, the receive ring's flag is cleared again (interrupt
+        // mode); the transmit ring stays suppressed (see AVAIL_F_NO_INTERRUPT).
         pci::dma_write(
             &self.rings,
             ring_base + AVAIL_OFFSET,
@@ -947,10 +1011,79 @@ impl Driver {
                 .map_err(L2Fail::Io)?;
         }
 
+        // Interrupt mode: the delivery just consumed set the device's ISR bit (and may
+        // hold the level-triggered line asserted, masked at the controller). Read it
+        // away now so the next `wait-recv` arms on a clean line instead of taking one
+        // spurious wake. Safe against losing events: a frame that lands between this
+        // consume and the ISR read re-raises the ISR *and* sits in the used ring, and
+        // `wait_rx` checks the ring before ever parking.
+        if self.interrupt.is_some() {
+            self.acknowledge_isr().await;
+        }
+
         // An unusable completion (a slot we never posted, or a runt the virtio-net
         // header alone fills) is wire noise: report it the same way as "nothing
         // waiting" and let the consumer poll again.
         Ok(bytes)
+    }
+
+    /// Park until the device's RX interrupt reports receive work, the caller's bound
+    /// (clamped by the provider) expires, or — with no vector granted — immediately:
+    /// the `wait-recv` arm of the l2 surface (plan/12 D59). Never parks over work
+    /// already delivered: the used ring is checked first.
+    ///
+    /// Liveness discipline: the bound is a backstop, not the delivery path. If it
+    /// expires and the used ring advanced *during* the wait, the event path missed an
+    /// edge — that is reported loudly (a `liveness:` line the check gates assert
+    /// against), never silently rescued by the re-poll. (A frame can land in the
+    /// microseconds between the provider masking the line at expiry and the ring check
+    /// here; that benign race is why the line is rate-limited rather than fatal.)
+    async fn wait_rx(&mut self, max_ns: u64) -> Result<(), L2Fail> {
+        if self.used_index(RX_RING_BASE) != self.rx.used_index {
+            return Ok(());
+        }
+        let Some(vector) = self.interrupt.take() else {
+            // No interrupt routing on this platform/provider: the documented poll
+            // fallback — return immediately, the consumer keeps polling.
+            return Ok(());
+        };
+        let outcome = pci::wait(&vector, max_ns).await;
+        self.interrupt = Some(vector);
+        match outcome {
+            // A delivery (possibly coalesced, possibly a shared-line sibling's): clear
+            // the ISR so the line deasserts, and let the caller re-poll the ring.
+            Ok(_deliveries) => self.acknowledge_isr().await,
+            // Bound expiry (or any wait failure): nothing to do — unless receive work
+            // arrived without a delivery, which is a missed event, reported loudly.
+            Err(_) => {
+                if self.used_index(RX_RING_BASE) != self.rx.used_index {
+                    self.missed_intx = self.missed_intx.wrapping_add(1);
+                    if self.missed_intx == 1
+                        || self.missed_intx.is_multiple_of(LIVENESS_REPORT_EVERY)
+                    {
+                        let handle = text::default();
+                        let line = format!(
+                            "liveness: net.virtio rx frame present after a bounded \
+                             interrupt wait expired (missed INTx; occurrence {})",
+                            self.missed_intx
+                        );
+                        let _ = text::write(&handle, text::OutputStream::Out, &line);
+                        let _ = text::write(&handle, text::OutputStream::Out, "\n");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read (and thereby clear) the device's ISR status register, deasserting its INTx
+    /// line. Best-effort: a failure here only risks one spurious re-delivery.
+    async fn acknowledge_isr(&self) {
+        if let Some(isr) = &self.isr
+            && let Ok(bar) = self.bar(isr.bar)
+        {
+            let _ = pci::bar_read(bar, isr.offset, pci::AccessWidth::Byte).await;
+        }
     }
 }
 
@@ -980,11 +1113,15 @@ async fn config_read(
 }
 
 /// Walk the configuration-space capability list and return the common, notify (plus its
-/// multiplier), and device-config windows.
-async fn find_windows(device: &pci::Device) -> Result<(Region, Region, u32, Region), String> {
+/// multiplier), and device-config windows, plus the ISR window when the device has one
+/// (it always does on QEMU; interrupt mode needs it to deassert INTx).
+async fn find_windows(
+    device: &pci::Device,
+) -> Result<(Region, Region, u32, Region, Option<Region>), String> {
     let mut common: Option<Region> = None;
     let mut notify: Option<(Region, u32)> = None;
     let mut device_config: Option<Region> = None;
+    let mut isr: Option<Region> = None;
 
     let mut pointer =
         (config_read(device, PCI_CAP_POINTER, pci::AccessWidth::Byte).await? & 0xfc) as u32;
@@ -1006,6 +1143,9 @@ async fn find_windows(device: &pci::Device) -> Result<(Region, Region, u32, Regi
                         config_read(device, pointer + 16, pci::AccessWidth::Dword).await? as u32;
                     notify = Some((Region { bar, offset }, multiplier));
                 }
+                VIRTIO_PCI_CAP_ISR if isr.is_none() => {
+                    isr = Some(Region { bar, offset });
+                }
                 VIRTIO_PCI_CAP_DEVICE if device_config.is_none() => {
                     device_config = Some(Region { bar, offset });
                 }
@@ -1023,7 +1163,7 @@ async fn find_windows(device: &pci::Device) -> Result<(Region, Region, u32, Regi
     let device_config = device_config.ok_or_else(|| {
         String::from("net.virtio: the function has no virtio device-config capability")
     })?;
-    Ok((common, notify, multiplier, device_config))
+    Ok((common, notify, multiplier, device_config, isr))
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1107,6 +1247,11 @@ impl l2::Guest for Stub {
             Ok(bytes_sent) => (frame, Ok(SendResult { bytes_sent })),
             Err(fail) => (frame, Err(L2Error::from(fail))),
         }
+    }
+
+    async fn wait_recv(_iface: l2::L2InterfaceBorrow<'_>, max_wait_ns: u64) -> Result<(), L2Error> {
+        let mut driver = acquire_driver().await.map_err(L2Error::from)?;
+        driver.wait_rx(max_wait_ns).await.map_err(L2Error::from)
     }
 
     async fn recv_frame(

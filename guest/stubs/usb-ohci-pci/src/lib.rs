@@ -98,7 +98,9 @@ impl RegionIo for Adapter {
         let Some(vector) = &self.interrupt else {
             return Ok(WaitOutcome::Unsupported);
         };
-        match pci::wait(vector).await {
+        // u64::MAX = exactly the provider's own bound (the area/36 max-ns contract);
+        // the USB read pacing stays provider-bound, as before the parameter existed.
+        match pci::wait(vector, u64::MAX).await {
             // A delivery (possibly coalesced or shared-line spurious): the core
             // re-checks the cause registers.
             Ok(_deliveries) => Ok(WaitOutcome::Delivered),

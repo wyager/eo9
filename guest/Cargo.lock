@@ -357,6 +357,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-example-partcheck"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-example-platcheck"
 version = "0.0.0"
 dependencies = [
@@ -450,6 +458,10 @@ name = "eo9-ohci"
 version = "0.1.0"
 
 [[package]]
+name = "eo9-partwalk"
+version = "0.1.0"
+
+[[package]]
 name = "eo9-rtl8125"
 version = "0.1.0"
 
@@ -466,6 +478,15 @@ name = "eo9-stub-disk-none"
 version = "0.0.0"
 dependencies = [
  "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-disk-part"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "eo9-partwalk",
  "wit-bindgen",
 ]
 

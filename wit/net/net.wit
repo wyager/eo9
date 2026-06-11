@@ -79,6 +79,23 @@ interface l2 {
     /// Receive the next frame addressed to this interface into `dst`.
     recv-frame: async func(iface: borrow<l2-interface>, dst: buffer)
         -> tuple<buffer, result<recv-result, l2-error>>;
+
+    /// Park until the interface plausibly has a frame for `recv-frame` to collect or
+    /// `max-wait-ns` elapses — the event-driven companion to `recv-frame`'s short poll
+    /// (which stays the "what's there right now" operation). A driver with a receive
+    /// event (an RX interrupt) parks the caller on it, so an idle consumer costs the
+    /// machine nothing; a provider with no event source (a polled driver, an in-memory
+    /// fixture) returns immediately, degrading the consumer to exactly the poll loop it
+    /// would otherwise run. Advisory by contract: the provider may return before the
+    /// bound and before any frame (spurious wakes are fine, and returning with nothing
+    /// waiting is normal — the caller re-polls); it must never return *later* than
+    /// `max-wait-ns` plus the underlying event provider's own wait bound, and it must
+    /// return promptly once receive work is plausibly available. The bound is the
+    /// caller's, because timed obligations (protocol retransmit deadlines) live in the
+    /// consumer — drivers hold no time capability and only forward the bound to their
+    /// event source.
+    wait-recv: async func(iface: borrow<l2-interface>, max-wait-ns: u64)
+        -> result<_, l2-error>;
 }
 
 /// Optional flavor of `l2` (hand-written for v0; see SPEC: The capability algebra).

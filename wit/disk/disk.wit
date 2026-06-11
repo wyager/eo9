@@ -89,6 +89,15 @@ interface mem-config {
     configure: func(size: u64) -> result<disk-impl, string>;
 }
 
+/// Compose-time configuration entry for disk.part: `configure` binds which partition of
+/// the underlying device's MBR the exported `disk` windows (1-based, fdisk numbering:
+/// primaries 1–4, logicals 5+) and returns the root handle that the exported `disk`
+/// serves via `default()`. Unconfigured, the documented default is partition 1.
+interface part-config {
+    use types.{disk-impl};
+    configure: func(partition: u32) -> result<disk-impl, string>;
+}
+
 /// disk.none — absence: exports the optional flavor answering `none`.
 world none {
     export types;
@@ -108,4 +117,21 @@ world mem {
     export types;
     export disk;
     export mem-config;
+}
+
+/// disk.part — partition-table middleware over an underlying block device: parses the
+/// MBR (classic extended chains included; GPT answers a typed refusal, never a misread)
+/// on first use and exports the selected partition as a strict window — offset 0 is the
+/// partition start, `size` is the partition length, accesses beyond it refuse
+/// `out-of-range`. Every partition-table sector (the MBR and the EBR chain) lies outside
+/// every window, so the table is read-only through this component by construction.
+world part {
+    import disk;
+    // The exported surface carries its own `types` instance (its own root resource),
+    // so a consumer wiring `disk` + `types` from this component sees one consistent
+    // resource identity — the same reason fs.filtered/net.l4.filtered wrap their
+    // underlying handles rather than re-exporting them.
+    export types;
+    export disk;
+    export part-config;
 }

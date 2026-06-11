@@ -397,6 +397,9 @@ async fn bring_up() -> Result<(), TextError> {
             Ok((conn, _peer)) => break conn,
             // The transport's per-operation deadline expired with nobody there yet:
             // keep waiting, exactly like a console waiting for its first keystroke.
+            // Cheap by construction: the transport's wait loop parks on the link's
+            // receive event for the whole accept window (the A2 fix), so this retry
+            // re-arms a parked wait once per expired window — not a hot poll.
             Err(err) if timed_out(&err) => continue,
             Err(err) => return Err(io_error("accept", err)),
         }

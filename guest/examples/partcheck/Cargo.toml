@@ -1,0 +1,15 @@
+[package]
+name = "eo9-example-partcheck"
+description = "Eo9 example program: probe a disk window served by disk.part — verify the size and the fixture magic at offset 0, round-trip a write inside the window, pin the out-of-range refusals at its edges, or assert a typed table refusal (targets the eo9-examples:partcheck/partcheck world: disk + text)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+wit-bindgen = { workspace = true }

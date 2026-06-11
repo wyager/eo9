@@ -69,12 +69,14 @@ use crate::pci;
 /// providers).
 type ConcurrentFuture<'a, R> = Pin<Box<dyn Future<Output = Result<R>> + Send + 'a>>;
 
-/// How long a single `wait` call waits for a delivery before giving up with a typed `io`
-/// error. Generous for any healthy device (QEMU completes block requests in well under a
-/// millisecond); a hung device falls back to the driver's polled path, which has its own
-/// bound. Bounded so a dead device cannot wedge the calling task open-endedly (the
-/// SPEC's awaits-are-bounded rule); the executor's own wake backstops bound how stale
-/// the expiry check can get if a wake is missed.
+/// The provider's own cap on a single `wait` call: how long it waits for a delivery
+/// before giving up with a typed `io` error, whatever bound the caller asked for (the
+/// WIT `max-ns` argument is clamped to this). Generous for any healthy device (QEMU
+/// completes block requests in well under a millisecond); a hung device falls back to
+/// the driver's polled path, which has its own bound. Bounded so a dead device cannot
+/// wedge the calling task open-endedly (the SPEC's awaits-are-bounded rule); the
+/// executor's own wake backstops bound how stale the expiry check can get if a wake is
+/// missed.
 const INTX_WAIT_BOUND_NS: u64 = 2_000_000_000;
 
 // -----------------------------------------------------------------------------------------
@@ -852,7 +854,7 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
     interface.func_wrap_concurrent(
         "wait",
         |accessor: &Accessor<KernelState>,
-         (interrupt,): (Resource<InterruptRes>,)|
+         (interrupt, max_ns): (Resource<InterruptRes>, u64)|
          -> ConcurrentFuture<'_, (Result<u64, WitPciError>,)> {
             Box::pin(async move {
                 let line = accessor.with(|mut access| {
@@ -864,9 +866,13 @@ pub fn add_pci(linker: &mut Linker<KernelState>) -> Result<()> {
                 });
                 let result = match line {
                     Ok(line) => {
+                        // The caller's bound, clamped to the provider's own (the WIT
+                        // contract): a consumer's protocol deadline shortens the park,
+                        // and nothing lengthens it past INTX_WAIT_BOUND_NS.
+                        let bound = max_ns.min(INTX_WAIT_BOUND_NS);
                         IntxWait {
                             line,
-                            deadline: crate::timer::uptime_ns().saturating_add(INTX_WAIT_BOUND_NS),
+                            deadline: crate::timer::uptime_ns().saturating_add(bound),
                             armed: false,
                         }
                         .await

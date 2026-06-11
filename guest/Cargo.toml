@@ -44,6 +44,10 @@ eo9-rtl8125 = { path = "../crates/eo9-rtl8125" }
 # The DNS wire core (the A/IN query encoder and first-A answer parser) shared by the
 # l4check and curl examples: no_std, host-tested in the root workspace — same pattern.
 eo9-dns = { path = "../crates/eo9-dns" }
+# The MBR partition-table core (sector decode, extended-chain walk, the validation
+# ladder) for the disk.part middleware: no_std, host-tested in the root workspace —
+# same pattern.
+eo9-partwalk = { path = "../crates/eo9-partwalk" }
 # The URL core of the curl example (http:// parsing, redirect-target resolution, the
 # request-injection control-byte refusal): no_std, host-tested in the root workspace.
 eo9-curl-core = { path = "../crates/eo9-curl-core" }
