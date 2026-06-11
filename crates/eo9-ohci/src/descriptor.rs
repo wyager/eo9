@@ -317,3 +317,44 @@ mod tests {
         assert_eq!(descriptors(&zeros).count(), 0);
     }
 }
+
+/// Device-supplied bytes as a console-safe string: bytes outside printable ASCII
+/// (0x20..=0x7E) become `.` — a malicious device's INQUIRY/descriptor strings must
+/// not carry escape sequences into the console (serial terminals AND the board's
+/// fbcon interpret SGR/EL/CUU/CHA post-area/39; ESC is an ASCII byte, so a
+/// "non-ASCII trim" is NOT sufficient). Sanitize-at-construction: call this where
+/// the bytes are first decoded, never at print sites, so no future print site can
+/// forget. Trailing spaces (SCSI's fixed-width padding) are trimmed AFTER the
+/// filter.
+pub fn printable_ascii(bytes: &[u8]) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(bytes.len());
+    for &byte in bytes {
+        out.push(if (0x20..=0x7e).contains(&byte) {
+            byte as char
+        } else {
+            '.'
+        });
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+#[cfg(test)]
+mod printable_tests {
+    use super::printable_ascii;
+
+    #[test]
+    fn escape_and_control_bytes_render_as_dots_byte_pinned() {
+        // The security fixture: an INQUIRY vendor field carrying an SGR escape and a
+        // BEL — the exact class the fbcon renderer would interpret.
+        let vendor: &[u8] = b"[31mAB";
+        assert_eq!(printable_ascii(vendor), ".[31mAB.");
+        // SCSI fixed-width padding trims; interior spaces stay.
+        assert_eq!(printable_ascii(b"QEMU    "), "QEMU");
+        assert_eq!(printable_ascii(b"A B    "), "A B..");
+        // DEL and high bytes are dots too.
+        assert_eq!(printable_ascii(&[0x7f, 0x80, 0xff]), "...");
+    }
+}

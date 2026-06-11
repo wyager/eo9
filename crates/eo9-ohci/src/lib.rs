@@ -32,6 +32,10 @@
 
 #![cfg_attr(not(test), no_std)]
 
+// `descriptor::printable_ascii` builds console-safe strings from device bytes; the
+// driver core itself stays allocation-free.
+extern crate alloc;
+
 pub mod descriptor;
 pub mod driver;
 pub mod enumerate;

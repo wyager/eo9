@@ -392,9 +392,10 @@ async fn probe_bot(device: &usb::Device, config_blob: &[u8]) -> Result<(), Progr
         }
         inquiry.extend_from_slice(&chunk);
     }
-    let vendor = core::str::from_utf8(&inquiry[8..16])
-        .unwrap_or("?")
-        .trim_end();
+    // Sanitize-at-construction (eo9-ohci::descriptor::printable_ascii): the vendor
+    // field is DEVICE-SUPPLIED — a malicious stick must not type escape sequences
+    // into the console.
+    let vendor = eo9_ohci::descriptor::printable_ascii(&inquiry[8..16]);
     text::write_out_line(&format!(
         "usbcheck: bot: inquiry type {:#04x} vendor '{}' ({} byte(s) in)",
         inquiry[0] & 0x1f,
