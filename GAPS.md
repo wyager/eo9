@@ -973,8 +973,11 @@ each honest in the module docs (kernel/eo9-kernel/src/wasm/gate.rs):
   the single boot core is structurally provided by wasmtime store-entry serialization + FIFO intake).
 - **A trap inside one gated call** maps to that call's typed io error, but may poison the owner's store
   for subsequent calls (un-probed); the share's restart policy is the recovery story.
-- **Pre-existing, NOT gate-induced: the stranded-runnable liveness detector fires ~1/s at an idle eosh
-  prompt on QEMU default boots — on master's own image too** (verified 2026-06-09: master image, default
-  config, 4 rate-limited prints in 45 s; identical counts on the gate branch with and without a live
-  share). The gate adds zero findings over that baseline, but the baseline itself contradicts the
-  events-or-wfi doctrine and wants its own lane.
+- **[CLOSED by area/36, verified 2026-06-10] the idle-prompt stranded-runnable flood is gone**: on the
+  rebased base (master f0372a0a, the task.wait completion-doorbell merge) a 45 s idle default boot AND a
+  45 s idle gatedemo boot (lan owner running) both report ZERO liveness findings. R6 for the gate now
+  holds absolutely, not merely relative-to-baseline: an intake-only owner parked between gate calls
+  costs no backstop wakes. One residual single-shot observed: a lone `stranded runnable (n=1)` can
+  fire on the pass after `svc stop <owner>` (the stop/kill transition racing an idle park — one finding
+  at the edge, never a flood; the kill path's doorbell covers waiters, not the stopping slot's own
+  transition). Worth folding into any future kill-path wake audit; not gate-specific.
