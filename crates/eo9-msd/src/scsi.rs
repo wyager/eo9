@@ -91,32 +91,41 @@ impl Inquiry {
     }
 
     /// The vendor field as trimmed ASCII (non-ASCII bytes read as '?').
-    pub fn vendor_str(&self) -> &str {
+    pub fn vendor_str(&self) -> alloc::string::String {
         trimmed_ascii(&self.vendor)
     }
 
     /// The product field as trimmed ASCII.
-    pub fn product_str(&self) -> &str {
+    pub fn product_str(&self) -> alloc::string::String {
         trimmed_ascii(&self.product)
     }
 
     /// The revision field as trimmed ASCII.
-    pub fn revision_str(&self) -> &str {
+    pub fn revision_str(&self) -> alloc::string::String {
         trimmed_ascii(&self.revision)
     }
 }
 
-/// The longest ASCII prefix, right-trimmed — INQUIRY identification fields are
-/// space-padded ASCII by spec (SPC-3 §6.4.2), so a non-ASCII byte just ends the
-/// readable prefix instead of failing the parse.
-fn trimmed_ascii(bytes: &[u8]) -> &str {
-    let ascii_end = bytes
-        .iter()
-        .position(|&b| !(0x20..=0x7e).contains(&b))
-        .unwrap_or(bytes.len());
-    core::str::from_utf8(&bytes[..ascii_end])
-        .expect("printable ASCII is UTF-8")
-        .trim_end()
+/// Device-supplied identification bytes as a console-safe string: bytes outside
+/// printable ASCII (0x20..=0x7E) become `.`, then the SPC-3 space padding is trimmed.
+/// Sanitize-at-construction (the manuals/usbcheck precedent — eo9-ohci's
+/// `printable_ascii` is the sibling): a malicious device's INQUIRY strings must not
+/// carry escape sequences into the console, which fbcon now interprets — and dotting
+/// (rather than truncating at the first bad byte) keeps tampering VISIBLE instead of
+/// hiding everything after an embedded ESC.
+fn trimmed_ascii(bytes: &[u8]) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(bytes.len());
+    for &byte in bytes {
+        out.push(if (0x20..=0x7e).contains(&byte) {
+            byte as char
+        } else {
+            '.'
+        });
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
 }
 
 /// Decoded READ CAPACITY(10) data (SBC-2 §5.10.2: two big-endian u32s).
@@ -248,11 +257,17 @@ mod tests {
     }
 
     #[test]
-    fn inquiry_fields_with_unprintable_bytes_trim_honestly() {
+    fn inquiry_fields_with_unprintable_bytes_render_as_dots() {
         let mut bytes = [0u8; 36];
         bytes[8..16].copy_from_slice(&[b'A', 0x00, 0xff, b'B', b' ', b' ', b' ', b' ']);
         let parsed = Inquiry::parse(&bytes).unwrap();
-        assert_eq!(parsed.vendor_str(), "A");
+        assert_eq!(parsed.vendor_str(), "A..B");
+        // The security fixture: an SGR escape plus a BEL in the vendor field — the
+        // console-injection class fbcon would interpret — renders as dots, byte-pinned.
+        let mut bytes = [0u8; 36];
+        bytes[8..16].copy_from_slice(b"\x1b[31mAB\x07");
+        let parsed = Inquiry::parse(&bytes).unwrap();
+        assert_eq!(parsed.vendor_str(), ".[31mAB.");
     }
 
     #[test]
