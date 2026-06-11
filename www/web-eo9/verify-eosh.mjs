@@ -23,7 +23,11 @@ function finish(code) {
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 let memory = null;
-const lines = [];
+// Output arrives as raw terminal chunks (newlines included — the page interprets the
+// stream like a terminal; see vm.js); accumulate, stripping the per-chunk U+0001 stderr
+// marker. The read-line stub below echoes each submitted command line, so the transcript
+// reads like a real console session ("eosh> <command>" on one line, output on its own).
+let raw = "";
 let inputQueue = []; // command lines fed to the interactive eosh prompt via read-line
 let gfxLastFullFrame = null; // the last full-frame canvas blit (see host_gfx_present)
 
@@ -39,9 +43,9 @@ function fnv1a64(bytes) {
 
 const imports = {
   env: {
-    // Standard-error lines carry a leading U+0001 marker (the page styles them); strip it here.
-    host_write: (ptr, len) =>
-      lines.push(decoder.decode(new Uint8Array(memory.buffer, ptr, len)).replace(/^\u0001/, "")),
+    host_write: (ptr, len) => {
+      raw += decoder.decode(new Uint8Array(memory.buffer, ptr, len)).replace(/^\u0001/, "");
+    },
     host_now_ms: () => Date.now(),
     host_monotonic_ns: () => performance.now() * 1e6,
     host_random_fill: (ptr, len) => {
@@ -61,11 +65,17 @@ const imports = {
     host_sleep_ms: new WebAssembly.Suspending((ms) => new Promise((r) => setTimeout(r, ms))),
     host_read_line: new WebAssembly.Suspending(async (ptr, cap) => {
       if (inputQueue.length === 0) return -1; // end of input
-      const bytes = encoder.encode(inputQueue.shift());
+      const line = inputQueue.shift();
+      // Echo the submitted line (a real console shows what was typed after the prompt).
+      raw += line + "\n";
+      const bytes = encoder.encode(line);
       if (bytes.length > cap) return -1;
       new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
       return bytes.length;
     }),
+    // This harness is a line-based transport: -3 sends eosh down its read-line path
+    // (the page's per-key editor is covered by verify-render.mjs).
+    host_read_key: new WebAssembly.Suspending(async () => -3),
     host_fetch_len: new WebAssembly.Suspending(async () => -1),
   },
 };
@@ -96,7 +106,7 @@ const [ptr, len] = passStr("hello --name web --excited true");
 const cmdRc = await eoshCommand(ptr, len);
 x.web_free(ptr, len);
 
-const oneShot = lines.join("\n");
+const oneShot = raw;
 
 // Sub-step 3: the interactive `eosh>` prompt — feed command lines through read-line (JSPI),
 // the same path the page terminal uses. eosh runs each and reads the next until EOF/exit.
@@ -198,31 +208,34 @@ inputQueue = [
   "draw",
   "exit",
 ];
-lines.length = 0;
+raw = "";
 const eoshBoot = WebAssembly.promising(x.eosh_boot);
 const bootRc = await eoshBoot();
-const interactive = lines.join("\n");
+const interactive = raw;
 
 console.log("--- one-shot ---\n" + oneShot + "\n--- interactive ---\n" + interactive);
 
 // Pure-digit lines come only from rng (u64 per line); split on the markers to separate the
 // runs: two identical default-seeded `$` runs (determinism), then the `&` run with a
 // re-configured right layer (must differ from the default stream).
-const [beforeAmp, ampPart] = interactive.split("AMPMARK");
-const parts = beforeAmp.split("RNGMARK");
+// Split on a marker line exactly (the echoed `echo --text X` command lines contain the
+// marker word too; only echo's own output is the bare marker on its own line).
+const markerSplit = (text, marker) => text.split(new RegExp(`^${marker}$`, "m"));
+const [beforeAmp, ampPart] = markerSplit(interactive, "AMPMARK");
+const parts = markerSplit(beforeAmp, "RNGMARK");
 const run1 = (parts[0]?.match(/^\d{3,}$/gm) || []).slice(-3);
 const run2 = (parts[1]?.match(/^\d{3,}$/gm) || []).slice(0, 3);
 const deterministic =
   run1.length === 3 && run2.length === 3 && run1.join(",") === run2.join(",");
-const [ampOnly, explorePart] = (ampPart || "").split("EXPLOREMARK");
+const [ampOnly, explorePart] = markerSplit(ampPart || "", "EXPLOREMARK");
 const ampRun = (ampOnly?.match(/^\d{3,}$/gm) || []).slice(0, 2);
 const exploreRun = (explorePart?.match(/^\d{3,}$/gm) || []).slice(0, 2);
 // The /bin catch-up sections (plan/18 D39), scoped by their markers.
-const gfxPart = (interactive.split("GFXMARK")[1] || "").split("SOCKMARK")[0] || "";
-const sockPart = (interactive.split("SOCKMARK")[1] || "").split("FSMARK")[0] || "";
-const fsPart = (interactive.split("FSMARK")[1] || "").split("SWMARK")[0] || "";
-const swPart = (interactive.split("SWMARK")[1] || "").split("CANVASMARK")[0] || "";
-const canvasPart = interactive.split("CANVASMARK")[1] || "";
+const gfxPart = markerSplit(markerSplit(interactive, "GFXMARK")[1] || "", "SOCKMARK")[0] || "";
+const sockPart = markerSplit(markerSplit(interactive, "SOCKMARK")[1] || "", "FSMARK")[0] || "";
+const fsPart = markerSplit(markerSplit(interactive, "FSMARK")[1] || "", "SWMARK")[0] || "";
+const swPart = markerSplit(markerSplit(interactive, "SWMARK")[1] || "", "CANVASMARK")[0] || "";
+const canvasPart = markerSplit(interactive, "CANVASMARK")[1] || "";
 const drawChecksums = gfxPart.match(/presented\((\d+)\)/g) || [];
 // The bare `draw` against the page-canvas provider: the checksum it reports from its own
 // read-back must equal the FNV-1a-64 of the pixels the canvas actually received.

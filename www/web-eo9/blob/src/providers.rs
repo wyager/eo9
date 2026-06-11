@@ -7,12 +7,15 @@
 //! Eo9 program's imports resolve directly to the page — text → the page terminal, time →
 //! the browser clocks (`Date.now` / `performance.now`), entropy → `crypto.getRandomValues`.
 //!
-//! The genuinely-blocking operations (`time.sleep`, `text.read-line`) call JSPI
-//! [`WebAssembly.Suspending`] imports: from the blob's point of view the import call is
-//! synchronous, but the browser parks the whole blob activation until the timer fires or
-//! the visitor presses Enter, then resumes it — so the guest's await spans real wall-clock
-//! time / real input without the blob needing a fiber backend (the guest call itself runs
-//! on the vendored fiberless path, exactly as on the bare-metal kernel's polling executor).
+//! The genuinely-blocking operations (`time.sleep`, `text.read-line`, `text.read-key`)
+//! call JSPI [`WebAssembly.Suspending`] imports: from the blob's point of view the import
+//! call is synchronous, but the browser parks the whole blob activation until the timer
+//! fires or the visitor presses a key, then resumes it — so the guest's await spans real
+//! wall-clock time / real input without the blob needing a fiber backend (the guest call
+//! itself runs on the vendored fiberless path, exactly as on the bare-metal kernel's
+//! polling executor). `read-key` is what carries eosh's per-keystroke editor: keydown
+//! events reach the blob as the serial console's byte encoding, one suspended import call
+//! per byte, and the editor's echo/marker bytes flow back through `text.write` raw.
 //!
 //! The WIT-shaped host types are structural copies of the kernel's (which themselves mirror
 //! `eo9-runtime::link`); that crate targets host wasmtime and does not compile for
@@ -56,13 +59,10 @@ pub struct WebState {
     /// before trapping, if any (write-once, bounded — see [`WebState::report_panic`]).
     /// Read host-side when a trap is rendered into a `trapped(reason)`; never guest-readable.
     pub panic_message: Option<String>,
-    /// Partial-line buffers for the two terminal output streams. Guests write line text
-    /// and the terminating newline as separate `text.write` calls; the page renders one
-    /// terminal line per host write, so emitting on every call produced doubled spacing
-    /// and stray prefix-only lines (user study 10, finding 12). Buffering until a newline
-    /// arrives renders exactly the lines the guest meant to print.
-    out_line: String,
-    err_line: String,
+    /// The escape-sequence decoder for the per-keystroke input path: the page feeds the
+    /// serial byte encoding (arrows as `ESC [ A/B/C/D`), and this state machine survives
+    /// across `read-key` calls so a sequence split across reads still decodes.
+    keys: KeyDecoder,
 }
 
 /// Ceiling on a reported panic message (bytes); anything longer is truncated on a char
@@ -86,8 +86,7 @@ impl WebState {
             exec: crate::execsurface::ExecTables::default(),
             gfx: None,
             panic_message: None,
-            out_line: String::new(),
-            err_line: String::new(),
+            keys: KeyDecoder::default(),
         }
     }
 
@@ -97,44 +96,25 @@ impl WebState {
             .get_or_insert_with(|| std::vec![0u8; (GFX_WIDTH * GFX_HEIGHT * 4) as usize])
     }
 
-    /// Append terminal output, emitting one host write per *complete* line. Standard-error
-    /// lines are prefixed with U+0001 — an in-band marker the page strips and styles with
-    /// its error class (and the verify harnesses strip before matching). Empty content is
-    /// a no-op; a bare newline terminates whatever is buffered (possibly an intentionally
-    /// blank line).
+    /// Forward terminal output to the page raw, exactly as the guest wrote it. The page's
+    /// terminal-render layer interprets the stream itself (`\r`, `\n`, `\b`, and the
+    /// editor's CSI/SGR subset — see vm.js), so nothing is buffered or split here: the
+    /// editor's echo bytes must reach the page between keystrokes, and its control
+    /// sequences must arrive un-mangled. Standard-error chunks are prefixed with U+0001 —
+    /// an in-band marker the page strips and styles with its error class (and the verify
+    /// harnesses strip before matching). The line-buffering this replaced (user study 10,
+    /// finding 12) existed only because the page once rendered one DOM line per host
+    /// write; the render layer made it obsolete.
     ///
     /// Module-private: the only caller is this module's `eo9:text/text.write` handler
     /// (and `WitOutputStream` is itself module-private).
     fn write_text(&mut self, stream: WitOutputStream, content: &str) {
-        let (buffer, marker) = match stream {
-            WitOutputStream::Out => (&mut self.out_line, ""),
-            WitOutputStream::Err => (&mut self.err_line, "\u{1}"),
-        };
-        buffer.push_str(content);
-        while let Some(newline) = buffer.find('\n') {
-            let line: String = buffer.drain(..=newline).collect();
-            let line = line.trim_end_matches('\n');
-            host::write_out(&std::format!("{marker}{line}"));
+        if content.is_empty() {
+            return;
         }
-    }
-
-    /// Flush buffered *partial* lines to the page. Reading input is the terminal's flush
-    /// point — exactly C stdio's contract — because a partial line written just before a
-    /// read is a prompt: eosh writes `eosh> ` with no newline and then calls `read-line`.
-    /// Without this flush the prompt sits in the buffer accumulating one `eosh> ` per
-    /// read until the shell's next complete line drags them all out glued together
-    /// ("eosh> eosh> eosh> ok: greeted" — the prompt-accumulation regression), and the
-    /// page attaches the visitor's typing to whatever line happened to render last.
-    /// Also called when a run ends, so a program whose final output lacks a trailing
-    /// newline still gets that text onto the page.
-    pub fn flush_partial_lines(&mut self) {
-        if !self.out_line.is_empty() {
-            let line = core::mem::take(&mut self.out_line);
-            host::write_out(&line);
-        }
-        if !self.err_line.is_empty() {
-            let line = core::mem::take(&mut self.err_line);
-            host::write_out(&std::format!("\u{1}{line}"));
+        match stream {
+            WitOutputStream::Out => host::write_out(content),
+            WitOutputStream::Err => host::write_out(&std::format!("\u{1}{content}")),
         }
     }
 
@@ -158,12 +138,16 @@ impl WebState {
 
 /// The session manifest the browser embedder leaves at `/session` for eosh's `env`
 /// builtin (the `eo9-session 1` format from eosh-core's `envinfo`; keep in sync with
-/// `eo9::providers::session_manifest` and the kernel's equivalent). Purely informational:
-/// it describes exactly what `add_providers`/`add_providers_for` and the exec surface
-/// register for this page — the registrations themselves are the authority.
+/// `eo9::providers::session_manifest` and the kernel's equivalent). The capability lines
+/// are informational — they describe exactly what `add_providers`/`add_providers_for`
+/// and the exec surface register for this page; the registrations themselves are the
+/// authority. The `term-width` record is load-bearing: eosh's editor reads it for its
+/// wrap-aware repaint, and it MUST equal the page render layer's column count
+/// (`TERM_COLS` in vm.js) or wrapped-line repaints corrupt.
 fn session_manifest() -> &'static str {
     "eo9-session 1\n\
      shell text the page terminal\n\
+     term-width 100\n\
      shell time the browser clock\n\
      shell entropy the browser's crypto random generator\n\
      shell fs an in-memory filesystem seeded with /welcome.txt, /docs, and the /bin programs\n\
@@ -190,6 +174,86 @@ pub fn trapped_reason(error: &wasmtime::Error, panic_message: Option<&str>) -> S
     }
 }
 
+// --- The keystroke decoder (serial byte encoding -> semantic keys) ------------------------
+
+/// Escape-sequence parser state for [`KeyDecoder`]: arrows arrive from the page as
+/// `ESC [ <final>` / `ESC O <final>` sequences, with optional parameter bytes
+/// (`0x30..=0x3f`) and intermediates (`0x20..=0x2f`) before the final (`0x40..=0x7e`).
+#[derive(Default, Clone, Copy, PartialEq)]
+enum EscState {
+    /// Not inside an escape sequence.
+    #[default]
+    Idle,
+    /// Saw ESC; deciding whether a CSI/SS3 sequence follows.
+    Esc,
+    /// Inside `ESC [` / `ESC O`; consuming until the final byte.
+    Csi,
+}
+
+/// Escape-sequence decoder for the page's per-keystroke input: raw bytes in (the page
+/// encodes keydown events as the SAME stream the serial console and usb.kbd produce),
+/// semantic [`WitKey`]s out. Mirrors the kernel's `keydecoder::KeyDecoder` (mirrored,
+/// not reused — that module is kernel-private and this crate targets wasm32): arrows
+/// decode, unknown CSI finals are consumed silently (no `[A`-style garbage leaks into a
+/// line), a lone ESC is dropped and the byte after it decodes normally.
+#[derive(Default)]
+struct KeyDecoder {
+    state: EscState,
+}
+
+impl KeyDecoder {
+    /// Feed one byte; `Some(key)` when a complete keystroke decodes.
+    fn push(&mut self, byte: u8) -> Option<WitKey> {
+        match self.state {
+            EscState::Esc => {
+                if byte == b'[' || byte == b'O' {
+                    self.state = EscState::Csi;
+                    return None;
+                }
+                if byte == 0x1b {
+                    // ESC ESC: stay armed for a sequence.
+                    return None;
+                }
+                // A lone ESC: drop it, decode this byte normally.
+                self.state = EscState::Idle;
+                Self::plain(byte)
+            }
+            EscState::Csi => {
+                if (0x20..=0x3f).contains(&byte) {
+                    // Parameter / intermediate bytes.
+                    return None;
+                }
+                self.state = EscState::Idle;
+                match byte {
+                    b'A' => Some(WitKey::Up),
+                    b'B' => Some(WitKey::Down),
+                    b'C' => Some(WitKey::Right),
+                    b'D' => Some(WitKey::Left),
+                    // Home/End/Delete and other finals: consumed, ignored (v1).
+                    _ => None,
+                }
+            }
+            EscState::Idle => {
+                if byte == 0x1b {
+                    self.state = EscState::Esc;
+                    return None;
+                }
+                Self::plain(byte)
+            }
+        }
+    }
+
+    fn plain(byte: u8) -> Option<WitKey> {
+        Some(match byte {
+            b'\r' | b'\n' => WitKey::Enter,
+            0x08 | 0x7f => WitKey::Backspace,
+            b'\t' => WitKey::Tab,
+            0x00..=0x1f => WitKey::Ctrl(byte),
+            _ => WitKey::Char(byte),
+        })
+    }
+}
+
 // --- Host resource representations (stateless tokens; all state is the browser) ----------
 
 struct TextCap;
@@ -212,8 +276,8 @@ enum WitOutputStream {
 #[derive(Clone, ComponentType, Lift, Lower)]
 #[component(variant)]
 // The page terminal cannot fail (Closed/Io satisfy the interface type); Unsupported is
-// the `read-key` answer — the page input box is line-based, so eosh falls back to its
-// read-line loop here.
+// the `read-key` answer on hosts whose transport is line-based (the node verify
+// harnesses) — eosh falls back to its read-line loop there.
 #[allow(dead_code)]
 enum WitTextError {
     #[component(name = "closed")]
@@ -224,12 +288,11 @@ enum WitTextError {
     Io(String),
 }
 
-/// `eo9:text/text.key` — the `read-key` payload. Never constructed here (the page
-/// terminal is line-based and `read-key` answers `unsupported`); the type exists so the
-/// host function's signature matches the interface.
+/// `eo9:text/text.key` — the `read-key` payload, decoded from the page's serial-encoded
+/// keydown bytes by [`KeyDecoder`].
 #[derive(Clone, Copy, ComponentType, Lift, Lower)]
 #[component(variant)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Eof satisfies the interface type (end-of-input is the `none` answer)
 enum WitKey {
     #[component(name = "char")]
     Char(u8),
@@ -463,32 +526,44 @@ fn add_text(linker: &mut Linker<WebState>) -> Result<()> {
         },
     )?;
 
-    // One line from the page terminal's input box. The JSPI `Suspending` import parks the
-    // whole blob until the visitor presses Enter (or signals end-of-input), then resumes it
-    // with the line — the same contract the kernel's PL011 read-line future provides.
-    // Reading flushes buffered partial output first: the partial line written just before
-    // a read is the prompt, and it must be on the page before we park on the keyboard.
+    // One line from the page terminal. The JSPI `Suspending` import parks the whole blob
+    // until the visitor presses Enter (or signals end-of-input), then resumes it with the
+    // line — the same contract the kernel's PL011 read-line future provides. (Output needs
+    // no flushing first: every write reaches the page raw and immediately.)
     text.func_wrap_concurrent(
         "read-line",
-        |accessor: &Accessor<WebState>,
+        |_accessor: &Accessor<WebState>,
          (_cap,): (Resource<TextCap>,)|
          -> ConcurrentFuture<'_, (core::result::Result<Option<String>, WitTextError>,)> {
-            Box::pin(async move {
-                accessor.with(|mut access| access.data_mut().flush_partial_lines());
-                Ok((Ok(host::read_line(MAX_READ_LINE_BYTES)),))
-            })
+            Box::pin(async move { Ok((Ok(host::read_line(MAX_READ_LINE_BYTES)),)) })
         },
     )?;
 
-    // Per-key input: the page terminal's input box is line-based (the browser owns its
-    // editing), so the typed refusal sends eosh down its read-line path. Wiring real
-    // keydown events through JSPI is a possible follow-up.
+    // Per-key input: the page encodes keydown events as the serial console's byte stream
+    // (the usb.kbd/PL011 encoding) and the JSPI import parks the whole blob until a byte
+    // arrives; the decoder assembles escape sequences into semantic keys. This is what
+    // makes eosh's real editor (per-keystroke parsing, TAB completion, dead-name marking,
+    // history) run on the page. A line-based host (the node verify harnesses) answers -3
+    // and the typed refusal sends eosh down its read-line path, exactly as before.
     text.func_wrap_concurrent(
         "read-key",
-        |_accessor: &Accessor<WebState>,
+        |accessor: &Accessor<WebState>,
          (_cap,): (Resource<TextCap>,)|
          -> ConcurrentFuture<'_, (core::result::Result<Option<WitKey>, WitTextError>,)> {
-            Box::pin(async move { Ok((Err(WitTextError::Unsupported),)) })
+            Box::pin(async move {
+                loop {
+                    let byte = host::read_key_byte();
+                    let key = match byte {
+                        -1 => return Ok((Ok(None),)),
+                        // -2 (no JSPI) and -3 (line-based transport): the typed refusal.
+                        byte if byte < 0 => return Ok((Err(WitTextError::Unsupported),)),
+                        byte => accessor.with(|mut access| access.data_mut().keys.push(byte as u8)),
+                    };
+                    if let Some(key) = key {
+                        return Ok((Ok(Some(key)),));
+                    }
+                }
+            })
         },
     )?;
 

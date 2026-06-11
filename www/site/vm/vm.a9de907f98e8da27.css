@@ -34,6 +34,20 @@
   color: #fb6962;
 }
 
+/* The editor's inadmissible-region marker (SGR 31 … 0): the live red the shell paints on
+   input that cannot run — a dead name, a parse the grammar already rejected. */
+
+#vm-output .vm-red {
+  color: #fb6962;
+}
+
+/* SGR 7 … 27 (inverse video) — the editor's colorspace-proof marker variant. */
+
+#vm-output .vm-inv {
+  color: #111;
+  background: #d6d6d6;
+}
+
 /* The in-progress command line, rendered inside the terminal while the shell is reading. */
 
 #vm-output .vm-cursor {

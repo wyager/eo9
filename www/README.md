@@ -129,8 +129,16 @@ Operational notes:
   `cargo xtask build-web-vm` (from the repository root) and verify with `cargo xtask
   check-web-vm`; commit the result.
 - There is no third-party JavaScript: the terminal and host glue are hand-written ES modules.
-- The shell's read-line needs JSPI (`WebAssembly.Suspending`); the page feature-detects it and
-  says so when it is missing (current Chrome/Edge have it).
+- The shell's keyboard input needs JSPI (`WebAssembly.Suspending`); the page feature-detects it
+  and says so when it is missing (current Chrome/Edge have it).
+- The prompt is eosh's real per-keystroke editor: the page encodes keydown events as the serial
+  console's byte stream (arrows as `ESC [ A/B/C/D`, Backspace as 0x7f, Ctrl-C as 0x03) into the
+  blob's `read-key` import, and a minimal terminal-render layer in `vm.js` interprets the
+  editor's emitted-sequence contract (`\b`, `\r`, `\r\n`, `CSI K`, `CSI A`, `CSI <n> G`, SGR
+  31/0 and 7/27 — see `guest/eosh/eosh-inc/src/editor.rs`) on a 100-column grid; the blob's
+  session manifest declares `term-width 100` to match. `web-eo9/verify-term.mjs` pins the
+  render layer byte-for-byte; `web-eo9/verify-render.mjs` drives the whole editor (red
+  dead-name marking, TAB completion, recall, ^C, paste) through the real vm.js + blob.
 
 ## Deploying eo9.org (standalone)
 

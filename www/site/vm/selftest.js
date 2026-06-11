@@ -8,7 +8,10 @@ const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 let memory = null;
 let exports = null;
-let lines = [];
+// Output arrives as raw terminal chunks (newlines included — the page interprets the
+// stream like a terminal; see vm.js); accumulate, stripping the per-chunk U+0001 stderr
+// marker, and split on newlines when matching.
+let raw = "";
 
 const hasJSPI =
   typeof WebAssembly === "object" &&
@@ -20,12 +23,12 @@ function note(line) {
 }
 
 function hostWrite(ptr, len) {
-  // Standard-error lines carry a leading U+0001 marker (the page styles them); strip it here.
+  // Standard-error chunks carry a leading U+0001 marker (the page styles them); strip it.
   const text = decoder
     .decode(new Uint8Array(memory.buffer, ptr, len))
     .replace(/^\u0001/, "");
-  lines.push(text);
-  terminal.textContent += text + "\n";
+  raw += text;
+  terminal.textContent += text;
 }
 
 // Resolve fingerprinted asset URLs via /vm/assets.json (falls back to canonical names).
@@ -86,9 +89,13 @@ const imports = {
           await new Promise((resolve) => setTimeout(resolve, ms));
         })
       : () => {},
-    // The self-test never reads interactively; report end-of-input.
+    // The self-test never reads interactively; report end-of-input (and a line-based
+    // transport for read-key, the same refusal the node harnesses give).
     host_read_line: hasJSPI
       ? new WebAssembly.Suspending(async () => -1)
+      : () => -2,
+    host_read_key: hasJSPI
+      ? new WebAssembly.Suspending(async () => -3)
       : () => -2,
     host_fetch_len: hasJSPI ? new WebAssembly.Suspending(hostFetchLen) : () => -2,
   },
@@ -103,7 +110,7 @@ function intoBlob(text) {
 }
 
 function sawLine(pattern) {
-  return lines.some((line) => pattern.test(line));
+  return raw.split("\n").some((line) => pattern.test(line));
 }
 
 let failures = 0;
@@ -122,16 +129,16 @@ async function run() {
 
   check("boot", exports.boot() === 0);
 
-  lines = [];
+  raw = "";
   check("run_hello rc", exports.run_hello() === 0);
   check("run_hello greeting", sawLine(/Hello from a WebAssembly component/));
   check("run_hello add", sawLine(/add\(17, 25\) -> 42/));
 
-  lines = [];
+  raw = "";
   check("run_fuel rc", exports.run_fuel() === 0);
   check("run_fuel metered", sawLine(/fuel metered/));
 
-  lines = [];
+  raw = "";
   check("run_entropy rc", exports.run_entropy(0xe09, 0, 2) === 0);
   check("run_entropy first draw", sawLine(/0x505f147c387507b6/));
   check("run_entropy second draw", sawLine(/0xe2e264775fe9be54/));
@@ -139,7 +146,7 @@ async function run() {
   // The component algebra (eo9-component) running in the blob: load + describe + only on a
   // raw component, then execution of the same component via Pulley. No JSPI needed (hello
   // does not suspend).
-  lines = [];
+  raw = "";
   check("algebra_demo rc", exports.algebra_demo() === 0);
   check("algebra describe binary", sawLine(/describe: kind = binary/));
   check("algebra only seals", sawLine(/only .* -> a sealed component/));
@@ -163,49 +170,49 @@ async function run() {
       }
     };
 
-    lines = [];
+    raw = "";
     check("store hello rc", (await runStored("hello", ["selftest", "true"])) === 0);
     check("store hello output", sawLine(/Hello, selftest!/));
     check("store hello outcome", sawLine(/outcome = success\(greeted\)/));
 
-    lines = [];
+    raw = "";
     check("store cruncher rc", (await runStored("cruncher", ["9", "200000"])) === 0);
     check("store cruncher digest", sawLine(/success\(digest\(14341732361190694547\)\)/));
 
-    lines = [];
+    raw = "";
     check("store outcomes rc (typed failure)", (await runStored("outcomes", ["fail", "sad path"])) === 0);
     check("store outcomes failure", sawLine(/failure\(requested-failure\("sad path"\)\)/));
 
     // readwrite: an async-main SDK guest that awaits async fs ops, exercising the in-blob
     // memfs (eo9:fs) + owned-buffer (eo9:io) providers and the fiberless async-await path.
-    lines = [];
+    raw = "";
     check("store readwrite rc", (await runStored("readwrite", ["/scratch/note.txt", "hello disk"])) === 0);
     check("store readwrite round-trip", sawLine(/success\(round-tripped\(10\)\)/));
 
     // Coreutils: real Eo9 guest programs run against the blob's seeded in-memory eo9:fs.
-    lines = [];
+    raw = "";
     check("coreutil echo rc", (await runStored("echo", ["hello from the web VM"])) === 0);
     check("coreutil echo output", sawLine(/hello from the web VM/));
 
-    lines = [];
+    raw = "";
     check("coreutil rng rc", (await runStored("rng", ["5"])) === 0);
     check("coreutil rng generated", sawLine(/success\(generated\(5\)\)/));
 
-    lines = [];
+    raw = "";
     check("coreutil cat rc", (await runStored("cat", ["/welcome.txt"])) === 0);
     check("coreutil cat reads the seeded file", sawLine(/Hello from the Eo9 web VM filesystem/));
 
-    lines = [];
+    raw = "";
     check("coreutil ls rc", (await runStored("ls", ["/"])) === 0);
     check("coreutil ls lists the seeded tree", sawLine(/welcome\.txt/) && sawLine(/docs/));
 
-    lines = [];
+    raw = "";
     check("coreutil find rc", (await runStored("find", ["/", ".txt"])) === 0);
     check("coreutil find matches", sawLine(/welcome\.txt/));
 
     // In-blob codegen: compile a raw component and an algebra-fused composition inside the
     // blob (Cranelift -> Pulley) and run them — fully client-side, no server, no pre-AOT.
-    lines = [];
+    raw = "";
     const compileDemo = promising(exports.compile_demo);
     check("in-blob codegen rc", (await compileDemo()) === 0);
     check("in-blob codegen compiled hello client-side", sawLine(/hello compiled in [\d.]+ ms \(client-side, no server\)/));
@@ -213,7 +220,7 @@ async function run() {
 
     // eosh booting in the blob: the unmodified shell links the in-blob eo9:exec surface and
     // runs a command end to end (resolve from /bin -> load -> compile -> spawn -> wait).
-    lines = [];
+    raw = "";
     const eoshCommand = promising(exports.eosh_command);
     const [eoshPtr, eoshLen] = intoBlob("hello --name web --excited true");
     let eoshRc;
@@ -226,7 +233,7 @@ async function run() {
     check("eosh ran hello via the exec surface", sawLine(/Hello, web!/));
     check("eosh session exited", sawLine(/session outcome = success\(exited\)/));
 
-    lines = [];
+    raw = "";
     const before = performance.now();
     const parkRc = await WebAssembly.promising(exports.probe_sleep)(300);
     const elapsed = performance.now() - before;
@@ -234,7 +241,7 @@ async function run() {
     check("park page elapsed >= 300 ms", elapsed >= 295);
     note(`park page-side elapsed: ${elapsed.toFixed(1)} ms`);
 
-    lines = [];
+    raw = "";
     const sleepyRc = await runSleepy();
     // The kernel's stackful-lift sleep canary now runs on this host too (it used to be
     // refused by the fiberless path); assert the successful await-and-measure behaviour.

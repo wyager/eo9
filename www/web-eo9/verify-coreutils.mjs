@@ -18,13 +18,15 @@ const encoder = new TextEncoder();
 const US = "\u001f";
 let memory = null;
 let fetched = null;
-let lines = [];
+// Output arrives as raw terminal chunks (newlines included — the page interprets the
+// stream; see vm.js); accumulate, stripping the per-chunk U+0001 stderr marker.
+let raw = "";
 
 const imports = {
   env: {
-    // Standard-error lines carry a leading U+0001 marker (the page styles them); strip it here.
-    host_write: (ptr, len) =>
-      lines.push(decoder.decode(new Uint8Array(memory.buffer, ptr, len)).replace(/^\u0001/, "")),
+    host_write: (ptr, len) => {
+      raw += decoder.decode(new Uint8Array(memory.buffer, ptr, len)).replace(/^\u0001/, "");
+    },
     host_now_ms: () => Date.now(),
     host_monotonic_ns: () => performance.now() * 1e6,
     host_random_fill: (ptr, len) => {
@@ -39,6 +41,8 @@ const imports = {
     host_gfx_present: () => {},
     host_sleep_ms: new WebAssembly.Suspending((ms) => new Promise((r) => setTimeout(r, ms))),
     host_read_line: new WebAssembly.Suspending(async () => -1),
+    // This harness is a line-based transport: -3 sends eosh down its read-line path.
+    host_read_key: new WebAssembly.Suspending(async () => -3),
     host_fetch_len: new WebAssembly.Suspending(async (namePtr, nameLen) => {
       const name = decoder.decode(new Uint8Array(memory.buffer, namePtr, nameLen));
       try {
@@ -68,13 +72,13 @@ const into = (text) => {
 };
 
 async function run(name, args) {
-  lines = [];
+  raw = "";
   const [nP, nL] = into(name);
   const [aP, aL] = into(args.join(US));
   const rc = await runProgram(nP, nL, aP, aL);
   x.web_free(nP, nL);
   if (aL) x.web_free(aP, aL);
-  return { rc, out: lines.join("\n") };
+  return { rc, out: raw };
 }
 
 // (name, args, predicate over the combined output, expected rc — defaults to 0)
