@@ -10,10 +10,10 @@
 //!
 //! This crate adds two things the eosh grammar needs that audio2's did not:
 //!
-//! * `Admissible::non_ascii_ok` — eosh words, quoted strings, compound literals, and
-//!   comments accept arbitrary non-ASCII text. The step machinery itself is
-//!   ASCII-guarded; this flag tells the editor (and [`feed_bytes`]) that a byte
-//!   >= 0x80 is fine here and behaves like a generic text byte.
+//! * `Admissible::non_ascii_ok` + [`Input::Text`] — eosh words, quoted strings,
+//!   compound literals, and comments accept arbitrary non-ASCII text. Such bytes step
+//!   as `Input::Text` carrying the real byte (captured values must round-trip the
+//!   line); the flag reports where they are consumable.
 //!
 //! * [`Step::Both`] — DESIGN DEVIATION from the study sketch (`Step::{Done,Continue}`).
 //!   audio2's `Alt` returns the first `Done` and drops continuing branches, which is
@@ -56,9 +56,8 @@ pub struct Admissible {
     /// true` still means every non-charset input fails. The test-side checker pins
     /// exactly this contract.
     pub hard_required: bool,
-    /// Are bytes >= 0x80 acceptable here, behaving as generic text bytes? True inside
-    /// eosh words, quoted strings, compound literals, and comments. See [`feed_bytes`]
-    /// for the substitution policy.
+    /// Are bytes >= 0x80 ([`Input::Text`]) consumable here, behaving as generic text
+    /// bytes? True inside eosh words, quoted strings, compound literals, and comments.
     pub non_ascii_ok: bool,
 }
 
@@ -253,29 +252,17 @@ pub fn forced_prefix<T: 'static>(parser: &dyn IncParse<T>) -> Vec<u8> {
     out
 }
 
-/// Feed a whole byte string (the line so far) through a parser, applying the
-/// non-ASCII policy: a byte >= 0x80 requires `non_ascii_ok` at the current state and
-/// is then stepped as the representative text byte `b'x'` (any plain word byte — at
-/// every `non_ascii_ok` position the grammar treats text bytes uniformly, so the
-/// substitution preserves acceptance; it is an over-approximation only for branches
-/// that wanted a literal `x`, which can only widen, never shrink, the accepted set —
-/// the safe direction under the superset rule).
+/// Feed a whole byte string (the line so far) through a parser. Bytes >= 0x80 step as
+/// [`Input::Text`] — each parser decides (word interiors, quoted strings, compound
+/// literals, and comments consume them, everything else fails), and capturing parsers
+/// keep the REAL byte, so the constructed value round-trips the line exactly.
 ///
 /// Returns the state after the last byte; `None` when some byte was not viable
 /// (including a parse that finished early and refused a byte no other branch took).
 pub fn feed_bytes<T: 'static>(parser: BoxP<T>, bytes: &[u8]) -> Option<BoxP<T>> {
     let mut current = parser;
     for &byte in bytes {
-        let input = match Input::byte(byte) {
-            Some(input) => input,
-            None => {
-                if !current.admissible().non_ascii_ok {
-                    return None;
-                }
-                Input::byte(b'x').expect("ascii")
-            }
-        };
-        current = current.step(input)?.cont()?;
+        current = current.step(Input::of_byte(byte))?.cont()?;
     }
     Some(current)
 }

@@ -4,7 +4,8 @@
 //! all laziness and recursion in a grammar goes through a bind's right side or
 //! [`lazy`]), n-ary [`Alt`] over `Vec<BoxP<T>>`, and the derived [`star`]/[`rep`].
 //!
-//! Leaf parsers, mirroring eosh-core's lexer (`eosh-core/src/lex.rs`): [`Lit`]
+//! Leaf parsers, carrying the shell's lexical rules (these ARE the lexer now —
+//! the separate `lex.rs` is deleted): [`Lit`]
 //! (suffix-slice byte literal, self-delimiting — structural characters), [`Kw`]
 //! (a literal that must end at a word boundary — keywords), [`Words`] (the runtime
 //! vocabulary primitive: a set of tagged words, matched with boundary semantics,
@@ -14,7 +15,8 @@
 //! (the balanced `[…]`/`{…}` literal with opaque embedded strings, mirroring
 //! `lex_compound`), [`Ws`], [`CommentRest`], and the carried [`Nat`].
 //!
-//! Word-boundary convention (the crate-wide one, from `lex.rs::ends_word`): ASCII
+//! Word-boundary convention (the crate-wide one, the retired lexer's `ends_word`):
+//! ASCII
 //! whitespace, the structural bytes `$ & ( ) , =`, `"`, and `#` end a word; `Eof`
 //! counts as a boundary. Everything else ASCII — including `[ ] { }` mid-word, `-`,
 //! and control bytes — is a word byte, because that is exactly what eosh's lexer does.
@@ -29,6 +31,7 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::{format, vec};
+use core::marker::PhantomData;
 
 use crate::charset::Charset;
 use crate::inc::{Admissible, BoxP, Completion, IncParse, Step, Tag};
@@ -38,9 +41,9 @@ use crate::input::Input;
 // The word-boundary convention and its charsets
 // ---------------------------------------------------------------------------
 
-/// Does `byte` end a bare word? Mirrors `eosh-core/src/lex.rs::ends_word` plus the
-/// structural set: ASCII whitespace (`char::is_whitespace` over ASCII is exactly
-/// 0x09..=0x0D and space), `$ & ( ) , =`, `"`, `#`.
+/// Does `byte` end a bare word? The shell's boundary set: ASCII whitespace
+/// (`char::is_whitespace` over ASCII is exactly 0x09..=0x0D and space),
+/// `$ & ( ) , =`, `"`, `#`.
 pub const fn is_boundary_byte(byte: u8) -> bool {
     matches!(
         byte,
@@ -306,11 +309,19 @@ impl<A: 'static, B: 'static> IncParse<B> for Bind<A, B> {
                             }
                             // hard_required depends on p2: anything admissible for p1
                             // is fine; anything else goes to p2, so we fail only where
-                            // p2 hard-requires.
+                            // p2 hard-requires. The RHS's non-ASCII claim counts only
+                            // if P1 actually finishes on a text byte (same probe
+                            // discipline as the byte loop above: over-claims are the
+                            // dangerous direction).
+                            let rhs_text_ok = p2e.non_ascii_ok
+                                && matches!(
+                                    p1.step(Input::Text(0x80)),
+                                    Some(Step::Done { .. }) | Some(Step::Both { .. })
+                                );
                             Admissible {
                                 charset,
                                 hard_required: p2e.hard_required,
-                                non_ascii_ok: p1e.non_ascii_ok || p2e.non_ascii_ok,
+                                non_ascii_ok: p1e.non_ascii_ok || rhs_text_ok,
                             }
                         }
                         Some(Step::Continue(_)) => {
@@ -519,6 +530,92 @@ pub fn rep(n: usize, item: impl Fn() -> BoxP<()> + Clone + 'static) -> BoxP<()> 
     }
 }
 
+/// Sequence, keeping the left value: `a` then `b`, finishing with `a`'s value.
+pub fn keep_left<T: Clone + 'static>(first: BoxP<T>, second: BoxP<()>) -> BoxP<T> {
+    bind(first, move |value| {
+        let value2 = value.clone();
+        map(second.clone(), move |()| value2.clone())
+    })
+}
+
+/// Sequence, keeping the right value: `a` then `b`, finishing with `b`'s value.
+pub fn keep_right<T: 'static>(first: BoxP<()>, second: BoxP<T>) -> BoxP<T> {
+    bind(first, move |()| second.clone())
+}
+
+/// Zero or more value-carrying items, collected in order. Same non-committing shape
+/// as [`star`]: the no-more-items branch stays alive in parallel with a started item.
+pub fn star_vec<T: Clone + 'static>(item: impl Fn() -> BoxP<T> + Clone + 'static) -> BoxP<Vec<T>> {
+    star_vec_from(Vec::new(), item)
+}
+
+fn star_vec_from<T: Clone + 'static>(
+    acc: Vec<T>,
+    item: impl Fn() -> BoxP<T> + Clone + 'static,
+) -> BoxP<Vec<T>> {
+    let again = item.clone();
+    let acc2 = acc.clone();
+    alt(vec![
+        pure(acc),
+        bind(item(), move |value| {
+            let mut next = acc2.clone();
+            next.push(value);
+            star_vec_from(next, again.clone())
+        }),
+    ])
+}
+
+/// Exactly `n` value-carrying items, collected in order (the tuple-slot grammar).
+pub fn rep_vec<T: Clone + 'static>(
+    n: usize,
+    item: impl Fn() -> BoxP<T> + Clone + 'static,
+) -> BoxP<Vec<T>> {
+    rep_vec_from(Vec::new(), n, item)
+}
+
+fn rep_vec_from<T: Clone + 'static>(
+    acc: Vec<T>,
+    n: usize,
+    item: impl Fn() -> BoxP<T> + Clone + 'static,
+) -> BoxP<Vec<T>> {
+    if n == 0 {
+        return pure(acc);
+    }
+    let again = item.clone();
+    bind(item(), move |value| {
+        let mut next = acc.clone();
+        next.push(value);
+        rep_vec_from(next, n - 1, again.clone())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Fail — the parser that never accepts anything
+// ---------------------------------------------------------------------------
+
+/// Never steps, never finishes. The dead end of value-dependent routing (e.g. the
+/// `describe <word>` card lookup: a word with no card and no colon falls through to
+/// the expression branch of the surrounding alternation).
+pub struct Fail<T>(PhantomData<fn() -> T>);
+
+impl<T: 'static> IncParse<T> for Fail<T> {
+    fn step(&self, _input: Input) -> Option<Step<T>> {
+        None
+    }
+
+    fn admissible(&self) -> Admissible {
+        Admissible::new(Charset::empty(), true, false)
+    }
+
+    fn clone_box(&self) -> BoxP<T> {
+        Box::new(Fail(PhantomData))
+    }
+}
+
+pub fn fail<T: 'static>() -> BoxP<T> {
+    Box::new(Fail(PhantomData))
+}
+
 // ---------------------------------------------------------------------------
 // Lit — exact byte literal (structural characters)
 // ---------------------------------------------------------------------------
@@ -540,7 +637,7 @@ impl IncParse<()> for Lit {
             });
         }
         match input {
-            Input::Eof => None,
+            Input::Eof | Input::Text(_) => None,
             Input::Byte(byte) => {
                 if byte.get() == self.rest[0] {
                     Some(Step::Continue(Box::new(Lit {
@@ -601,6 +698,9 @@ impl IncParse<()> for Kw {
     fn step(&self, input: Input) -> Option<Step<()>> {
         let bytes = self.word.as_bytes();
         match input {
+            // A text byte is a word byte to the lexer: it extends the word past the
+            // keyword (`leté` is one word, not `let`), so the keyword dies on it.
+            Input::Text(_) => None,
             Input::Eof => {
                 if self.pos == bytes.len() {
                     Some(Step::Done {
@@ -740,6 +840,9 @@ impl IncParse<()> for Words {
                 .any(|&i| self.vocab[i as usize].word.len() == pos)
         };
         match input {
+            // Entries are printable ASCII (the construction filter): a text byte can
+            // extend no entry, and as a word byte it is no boundary either.
+            Input::Text(_) => None,
             Input::Eof => {
                 if complete(self.pos) {
                     Some(Step::Done {
@@ -844,6 +947,98 @@ pub fn words(vocab: Rc<Vec<(String, Tag)>>) -> BoxP<()> {
     hint_words(Rc::new(entries))
 }
 
+/// The completion OVERLAY: a [`Words`]-shaped branch that steps along the vocabulary
+/// and reports completions but NEVER finishes — acceptance belongs entirely to the
+/// free-form branch it alternates with (whose language every entry is a subset of, by
+/// the same construction filter). This is what makes a vocabulary purely a view: an
+/// overlay added to an alternation can never change the language OR the value, only
+/// what TAB offers and what the name-mark sees. Generic in the value type for exactly
+/// that reason — it has no value.
+pub struct Overlay<T> {
+    vocab: Rc<Vec<HintEntry>>,
+    alive: Vec<u32>,
+    pos: usize,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<T: 'static> IncParse<T> for Overlay<T> {
+    fn step(&self, input: Input) -> Option<Step<T>> {
+        let b = match input {
+            // Never finishes: boundary bytes, text bytes, and Eof all kill it.
+            Input::Eof | Input::Text(_) => return None,
+            Input::Byte(byte) => byte.get(),
+        };
+        if is_boundary_byte(b) {
+            return None;
+        }
+        let alive: Vec<u32> = self
+            .alive
+            .iter()
+            .copied()
+            .filter(|&i| self.vocab[i as usize].word.as_bytes().get(self.pos) == Some(&b))
+            .collect();
+        if alive.is_empty() {
+            None
+        } else {
+            Some(Step::Continue(Box::new(Overlay {
+                vocab: self.vocab.clone(),
+                alive,
+                pos: self.pos + 1,
+                _marker: PhantomData,
+            })))
+        }
+    }
+
+    fn admissible(&self) -> Admissible {
+        let mut charset = Charset::empty();
+        for &i in &self.alive {
+            if let Some(&b) = self.vocab[i as usize].word.as_bytes().get(self.pos) {
+                charset.add(b);
+            }
+        }
+        Admissible::new(charset, true, false)
+    }
+
+    fn completions(&self, out: &mut Vec<Completion>) {
+        for &i in &self.alive {
+            let entry = &self.vocab[i as usize];
+            out.push(Completion {
+                word: entry.word.clone(),
+                matched: self.pos,
+                tag: entry.tag,
+                desc: entry.desc.clone(),
+                glue: entry.glue,
+            });
+        }
+    }
+
+    fn clone_box(&self) -> BoxP<T> {
+        Box::new(Overlay {
+            vocab: self.vocab.clone(),
+            alive: self.alive.clone(),
+            pos: self.pos,
+            _marker: PhantomData,
+        })
+    }
+}
+
+/// The overlay over a shared entry list (entries that are not single plain words are
+/// skipped, like [`hint_words`]).
+pub fn overlay_words<T: 'static>(vocab: Rc<Vec<HintEntry>>) -> BoxP<T> {
+    let alive: Vec<u32> = vocab
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| Words::entry_is_word(&entry.word))
+        .map(|(i, _)| i as u32)
+        .collect();
+    Box::new(Overlay {
+        vocab,
+        alive,
+        pos: 0,
+        _marker: PhantomData,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Word — the free bare word
 // ---------------------------------------------------------------------------
@@ -899,6 +1094,17 @@ impl Word {
                 } else {
                     WordStep::Fail
                 };
+            }
+            // Words accept arbitrary text: a byte >= 0x80 is a word byte that matches
+            // no exclusion entry and triggers no carve-out.
+            Input::Text(_) => {
+                return WordStep::Advance(Word {
+                    excluded: self.excluded,
+                    bare: self.bare,
+                    len: self.len + 1,
+                    dash1: false,
+                    excl_alive: 0,
+                });
             }
             Input::Byte(byte) => byte.get(),
         };
@@ -968,18 +1174,15 @@ impl IncParse<()> for Word {
     }
 }
 
-/// [`Word`] plus the consumed text: finishes with the word it read. The grammar's M3
-/// argument layer binds on the captured name to look up that program's (or that
-/// flag's) completion data — acceptance is identical to the plain [`Word`].
-///
-/// The captured text is what was *stepped*: the editor substitutes the representative
-/// byte for non-ASCII input (see `feed_bytes`), so a word containing non-ASCII text
-/// captures mangled — which only makes the M3 lookup miss and fall back to the generic
-/// grammar, never changes acceptance.
+/// [`Word`] plus the consumed text: finishes with the word it read — the REAL bytes,
+/// non-ASCII included ([`Input::Text`] carries them), because captured words feed the
+/// constructed AST and must round-trip exactly. The M3 argument layer also binds on
+/// the captured name to look up that program's completion data; acceptance is
+/// identical to the plain [`Word`].
 #[derive(Clone)]
 pub struct CapWord {
     word: Word,
-    text: String,
+    bytes: Vec<u8>,
 }
 
 impl IncParse<String> for CapWord {
@@ -987,15 +1190,20 @@ impl IncParse<String> for CapWord {
         match self.word.step_core(input) {
             WordStep::Fail => None,
             WordStep::Finish => Some(Step::Done {
-                value: self.text.clone(),
+                // The captured bytes are the line's own bytes: valid UTF-8 from every
+                // real caller (the editor inserts whole validated characters; the
+                // parser drivers feed `&str`); lossy is the belt-and-suspenders.
+                value: String::from_utf8_lossy(&self.bytes).into_owned(),
                 rejected: input,
             }),
             WordStep::Advance(next) => {
-                let mut text = self.text.clone();
-                if let Input::Byte(byte) = input {
-                    text.push(char::from(byte.get()));
+                let mut bytes = self.bytes.clone();
+                match input {
+                    Input::Byte(byte) => bytes.push(byte.get()),
+                    Input::Text(byte) => bytes.push(byte),
+                    Input::Eof => {}
                 }
-                Some(Step::Continue(Box::new(CapWord { word: next, text })))
+                Some(Step::Continue(Box::new(CapWord { word: next, bytes })))
             }
         }
     }
@@ -1029,7 +1237,7 @@ pub fn bare_word(excluded: &'static [&'static str]) -> BoxP<()> {
 pub fn cap_bare_word(excluded: &'static [&'static str]) -> BoxP<String> {
     Box::new(CapWord {
         word: word_state(excluded, true),
-        text: String::new(),
+        bytes: Vec::new(),
     })
 }
 
@@ -1042,7 +1250,7 @@ pub fn flag_name() -> BoxP<()> {
 pub fn cap_flag_name() -> BoxP<String> {
     Box::new(CapWord {
         word: word_state(&[], false),
-        text: String::new(),
+        bytes: Vec::new(),
     })
 }
 
@@ -1086,6 +1294,20 @@ impl IncParse<()> for Quoted {
                         rejected: input,
                     }),
                     // Unterminated string: a lex error in eosh.
+                    _ => None,
+                };
+            }
+            // Interior bytes are arbitrary text; the escape position and the opening
+            // quote are exact, and a finished string rejects everything.
+            Input::Text(_) => {
+                return match self.state {
+                    QuotedState::Body => Some(Step::Continue(Box::new(Quoted {
+                        state: QuotedState::Body,
+                    }))),
+                    QuotedState::Finished => Some(Step::Done {
+                        value: (),
+                        rejected: input,
+                    }),
                     _ => None,
                 };
             }
@@ -1142,6 +1364,99 @@ pub fn quoted() -> BoxP<()> {
     })
 }
 
+/// [`Quoted`] plus the DECODED interior: finishes with the string's text, escapes
+/// processed (`\"` `\\` `\n` `\t` `\r` — the same five the lexer knew). Acceptance is
+/// identical to [`Quoted`].
+#[derive(Clone)]
+pub struct CapQuoted {
+    state: QuotedState,
+    text: Vec<u8>,
+}
+
+impl IncParse<String> for CapQuoted {
+    fn step(&self, input: Input) -> Option<Step<String>> {
+        let done = |text: &[u8]| Step::Done {
+            value: String::from_utf8_lossy(text).into_owned(),
+            rejected: input,
+        };
+        let byte = match input {
+            Input::Eof => {
+                return match self.state {
+                    QuotedState::Finished => Some(done(&self.text)),
+                    _ => None,
+                };
+            }
+            Input::Text(b) => {
+                return match self.state {
+                    QuotedState::Body => {
+                        let mut text = self.text.clone();
+                        text.push(b);
+                        Some(Step::Continue(Box::new(CapQuoted {
+                            state: QuotedState::Body,
+                            text,
+                        })))
+                    }
+                    QuotedState::Finished => Some(done(&self.text)),
+                    _ => None,
+                };
+            }
+            Input::Byte(byte) => byte.get(),
+        };
+        let mut text = self.text.clone();
+        let next = match self.state {
+            QuotedState::Open => {
+                if byte == b'"' {
+                    QuotedState::Body
+                } else {
+                    return None;
+                }
+            }
+            QuotedState::Body => match byte {
+                b'"' => QuotedState::Finished,
+                b'\\' => QuotedState::Escape,
+                _ => {
+                    text.push(byte);
+                    QuotedState::Body
+                }
+            },
+            QuotedState::Escape => {
+                let decoded = match byte {
+                    b'"' => b'"',
+                    b'\\' => b'\\',
+                    b'n' => b'\n',
+                    b't' => b'\t',
+                    b'r' => b'\r',
+                    _ => return None,
+                };
+                text.push(decoded);
+                QuotedState::Body
+            }
+            QuotedState::Finished => return Some(done(&self.text)),
+        };
+        Some(Step::Continue(Box::new(CapQuoted { state: next, text })))
+    }
+
+    fn admissible(&self) -> Admissible {
+        match self.state {
+            QuotedState::Open => Admissible::new(Charset::singleton(b'"'), true, false),
+            QuotedState::Body => Admissible::new(Charset::all(), true, true),
+            QuotedState::Escape => Admissible::new(quote_escape_charset(), true, false),
+            QuotedState::Finished => Admissible::TIME_TO_FINISH,
+        }
+    }
+
+    fn clone_box(&self) -> BoxP<String> {
+        Box::new(self.clone())
+    }
+}
+
+pub fn cap_quoted() -> BoxP<String> {
+    Box::new(CapQuoted {
+        state: QuotedState::Open,
+        text: Vec::new(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Compound — balanced […]/{…} literal
 // ---------------------------------------------------------------------------
@@ -1177,6 +1492,26 @@ impl IncParse<()> for Compound {
                     }),
                     // UnterminatedCompound / UnterminatedString in eosh.
                     _ => None,
+                };
+            }
+            // Interior bytes are verbatim text; the opener is exact (`[`/`{`), and a
+            // finished literal rejects everything.
+            Input::Text(_) => {
+                return match self.state {
+                    CompoundState::Open => None,
+                    CompoundState::Finished => Some(Step::Done {
+                        value: (),
+                        rejected: input,
+                    }),
+                    CompoundState::Plain(depth) => Some(Step::Continue(Box::new(Compound {
+                        state: CompoundState::Plain(depth),
+                    }))),
+                    CompoundState::Str(depth) => Some(Step::Continue(Box::new(Compound {
+                        state: CompoundState::Str(depth),
+                    }))),
+                    CompoundState::StrEscape(depth) => Some(Step::Continue(Box::new(Compound {
+                        state: CompoundState::Str(depth),
+                    }))),
                 };
             }
             Input::Byte(byte) => byte.get(),
@@ -1239,6 +1574,98 @@ pub fn compound() -> BoxP<()> {
     })
 }
 
+/// [`Compound`] plus the VERBATIM text, delimiters included — exactly the token the
+/// lexer handed the parser as `Token::Word` (typing of the contents is downstream).
+/// Acceptance is identical to [`Compound`].
+#[derive(Clone)]
+pub struct CapCompound {
+    state: CompoundState,
+    text: Vec<u8>,
+}
+
+impl IncParse<String> for CapCompound {
+    fn step(&self, input: Input) -> Option<Step<String>> {
+        let done = |text: &[u8]| Step::Done {
+            value: String::from_utf8_lossy(text).into_owned(),
+            rejected: input,
+        };
+        let byte = match input {
+            Input::Eof => {
+                return match self.state {
+                    CompoundState::Finished => Some(done(&self.text)),
+                    _ => None,
+                };
+            }
+            Input::Text(b) => {
+                let next = match self.state {
+                    CompoundState::Open => return None,
+                    CompoundState::Finished => return Some(done(&self.text)),
+                    CompoundState::Plain(depth) => CompoundState::Plain(depth),
+                    CompoundState::Str(depth) | CompoundState::StrEscape(depth) => {
+                        CompoundState::Str(depth)
+                    }
+                };
+                let mut text = self.text.clone();
+                text.push(b);
+                return Some(Step::Continue(Box::new(CapCompound { state: next, text })));
+            }
+            Input::Byte(byte) => byte.get(),
+        };
+        let next = match self.state {
+            CompoundState::Open => match byte {
+                b'[' | b'{' => CompoundState::Plain(1),
+                _ => return None,
+            },
+            CompoundState::Plain(depth) => match byte {
+                b'[' | b'{' => CompoundState::Plain(depth + 1),
+                b']' | b'}' => {
+                    if depth == 1 {
+                        CompoundState::Finished
+                    } else {
+                        CompoundState::Plain(depth - 1)
+                    }
+                }
+                b'"' => CompoundState::Str(depth),
+                _ => CompoundState::Plain(depth),
+            },
+            CompoundState::Str(depth) => match byte {
+                b'"' => CompoundState::Plain(depth),
+                b'\\' => CompoundState::StrEscape(depth),
+                _ => CompoundState::Str(depth),
+            },
+            CompoundState::StrEscape(depth) => CompoundState::Str(depth),
+            CompoundState::Finished => return Some(done(&self.text)),
+        };
+        let mut text = self.text.clone();
+        text.push(byte);
+        Some(Step::Continue(Box::new(CapCompound { state: next, text })))
+    }
+
+    fn admissible(&self) -> Admissible {
+        match self.state {
+            CompoundState::Open => {
+                let mut cs = Charset::empty();
+                cs.add(b'[');
+                cs.add(b'{');
+                Admissible::new(cs, true, false)
+            }
+            CompoundState::Finished => Admissible::TIME_TO_FINISH,
+            _ => Admissible::new(Charset::all(), true, true),
+        }
+    }
+
+    fn clone_box(&self) -> BoxP<String> {
+        Box::new(self.clone())
+    }
+}
+
+pub fn cap_compound() -> BoxP<String> {
+    Box::new(CapCompound {
+        state: CompoundState::Open,
+        text: Vec::new(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Ws — optional whitespace
 // ---------------------------------------------------------------------------
@@ -1290,7 +1717,7 @@ impl IncParse<()> for CommentRest {
                 value: (),
                 rejected: input,
             }),
-            Input::Byte(_) => Some(Step::Continue(Box::new(CommentRest))),
+            Input::Byte(_) | Input::Text(_) => Some(Step::Continue(Box::new(CommentRest))),
         }
     }
 
@@ -1325,7 +1752,7 @@ pub enum Nat {
 impl IncParse<u64> for Nat {
     fn step(&self, input: Input) -> Option<Step<u64>> {
         let digit = match input {
-            Input::Eof => None,
+            Input::Eof | Input::Text(_) => None,
             Input::Byte(byte) => {
                 let b = byte.get();
                 b.is_ascii_digit().then(|| (b - b'0') as u64)

@@ -7,13 +7,14 @@
 //! byte at a time and report their admissible-next-byte set — plus a v1 grammar module
 //! that mirrors eosh-core's lexer and parser.
 //!
-//! THE one invariant (docs/study/incremental-repl-for-eosh.md, "The soundness rule"):
-//! the incremental grammar's language is a SUPERSET of what `eosh_core::parse_command`
-//! accepts. The editor may show a false green (input that later fails the real parser),
-//! never a false red (input the real parser would take). Execution always goes through
-//! the battle-tested eosh-core lex/parse path; this crate never replaces it. The
-//! property is enforced by the differential host test in [`grammar`], which runs the
-//! eosh-core parser corpus plus fuzzed lines through both parsers.
+//! Since the one-parser unification there is no separate "real parser" to mirror:
+//! the incremental grammar (now `eosh_core::grammar`) IS the shell's parser — the
+//! same states this editor steps for marking and completion construct the executed
+//! `Command`, and Enter hands the accumulated parse to the session (no second parse
+//! of a submitted line). The old soundness rule ("a superset of `parse_command`,
+//! false green allowed, false red never") became an identity at the unification; the
+//! exact differential that proved it lives on as the corpus pins in the grammar
+//! module.
 //!
 //! Theory and the small invariant-bearing pieces (the u128 [`charset::Charset`], the
 //! step/admissible ontology with `hard_required`, the forced-prefix TAB walk, the

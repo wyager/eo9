@@ -47,7 +47,6 @@ pub mod eval;
 pub mod grammar;
 pub mod inc;
 pub mod input;
-pub mod lex;
 pub mod manual;
 pub mod parse;
 pub mod render;

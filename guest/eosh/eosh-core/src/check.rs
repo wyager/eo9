@@ -54,6 +54,22 @@ pub fn sanity_check<T: 'static>(parser: &dyn IncParse<T>) -> usize {
         }
     }
 
+    // The Text contract: where `non_ascii_ok`, a text byte must CONSUME (it is a
+    // generic text byte there); where not, it must never consume (failing or
+    // finish-rejecting are both fine — a soft state hands it back like any other
+    // non-charset input).
+    let text_step = parser.step(Input::Text(0xC3));
+    let text_consumes = matches!(
+        text_step,
+        Some(Step::Continue(_)) | Some(Step::Both { .. })
+    );
+    if admissible.non_ascii_ok && !text_consumes {
+        panic!("Parser claimed non_ascii_ok but did not consume a text byte");
+    }
+    if !admissible.non_ascii_ok && text_consumes {
+        panic!("Parser consumed a text byte without claiming non_ascii_ok");
+    }
+
     let eof_finishes = matches!(
         parser.step(Input::Eof),
         Some(Step::Done { .. }) | Some(Step::Both { .. })

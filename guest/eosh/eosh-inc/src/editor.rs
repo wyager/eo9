@@ -15,8 +15,8 @@
 //!   inside the marked region. A character is dead in either of two ways, and red
 //!   means exactly "**this line will not execute successfully**":
 //!
-//!   - **parse-dead**: no parse of the [`crate::grammar`] continues through it — the
-//!     real parser *will* reject the line (the grammar's superset rule);
+//!   - **parse-dead**: no parse of the [`crate::grammar`] continues through it — and
+//!     since the unification that grammar IS the parser: the line cannot execute;
 //!   - **name-dead** (M3, editor-layer only): in a NAME position — one whose
 //!     completions carry name tags ([`crate::inc::Tag::is_name`]): the command head,
 //!     post-`$`/`&`/`(`/`=` component positions — the word can no longer
@@ -25,9 +25,9 @@
 //!     guaranteed to fail at run time.
 //!
 //!   Both marks are honest — neither ever marks a line that would run; green only
-//!   means the line still might. The parser itself stays loose: name-marking lives
-//!   entirely here in the editor, so the differential superset gate (which tests the
-//!   PARSER) is unaffected. Free-text positions (`let`/`save` names, service names,
+//!   means the line still might. Name-marking lives entirely here in the editor: the
+//!   grammar's acceptance (and the value it builds) never depends on the vocabulary,
+//!   which is pinned by the adversarial-hints gate. Free-text positions (`let`/`save` names, service names,
 //!   flag names, flag values, gate slots, quoted/compound/comment interiors) carry no
 //!   name-tagged completions and are never name-marked; M3's argument candidates are
 //!   tagged `Flag`/`Value` precisely so they cannot make a value position look like a
@@ -65,10 +65,12 @@
 //!   hands the result to [`Editor::provide_args`] — which re-arms the grammar with the
 //!   program's flag and value candidates (never changing acceptance; the manuals
 //!   design's additive-hints rule). Until then the generic v1 grammar applies.
-//! * **Enter** always submits — the editor never blocks a line; `parse_command`'s
-//!   curated errors are the user-facing diagnosis for red lines (feeding `Eof` to decide
-//!   otherwise would only duplicate that verdict). The marker is closed first so the
-//!   command's own output is never tinted.
+//! * **Enter** always submits — the editor never blocks a line. On a green line the
+//!   accumulated parse is finished and handed over in [`Action::Submit`]: the editor's
+//!   states built the executed `Command` as it was typed, so the session runs exactly
+//!   that value with no second parse. Red or incomplete lines submit without it; the
+//!   session's parse of the line renders the positional error. The marker is closed
+//!   first so the command's own output is never tinted.
 //! * **↑/↓** recall over the history snapshot the embedder passed in — a capped view
 //!   (64 entries, [`RECALL_CAP`]) of the session history (whose own cap is the GAPS
 //!   "eosh session history is unbounded" fix, in eosh-core). Same semantics as the
@@ -105,9 +107,10 @@
 //!
 //! UTF-8: `read-key` delivers multi-byte characters as their individual `char` bytes;
 //! the editor assembles them (echoing only complete characters, so the emitted stream
-//! stays valid UTF-8 for the `text.write` API) and steps the parser per byte with the
-//! [`crate::inc::feed_bytes`] substitution policy, so its viability verdicts agree
-//! exactly with a reparse. Invalid sequences are dropped, like the host editor did.
+//! stays valid UTF-8 for the `text.write` API) and steps the parser per byte — bytes
+//! >= 0x80 as [`crate::input::Input::Text`], real bytes into captured values — so its
+//! viability verdicts AND the accumulated parse agree exactly with a reparse. Invalid
+//! sequences are dropped, like the host editor did.
 //!
 //! Marker choice: SGR 31 (red) by default. The study calls for inverse video (SGR 7/27)
 //! on the framebuffer console because red can render wrong-hued under the
@@ -130,8 +133,9 @@ use alloc::vec::Vec;
 
 use crate::comb::is_word_byte;
 use crate::grammar::{ProgramArgs, Vocab, command_line};
-use crate::inc::{BoxP, Completion, Step, Tag, forced_prefix};
+use crate::inc::{BoxP, Completion, Step, Tag, finish, forced_prefix};
 use crate::input::Input;
+use eosh_core::ast::Command;
 
 /// One decoded keystroke, mirroring the WIT `eo9:text/text.key` variant. The transport
 /// owns the wire decoding; the editor only sees semantics.
@@ -159,8 +163,14 @@ pub enum Action {
     /// Keep feeding keys (drain the output first).
     Pending,
     /// The line is finished: execute it (then build a fresh editor for the next prompt —
-    /// the vocabulary and history snapshots are per prompt).
-    Submit(String),
+    /// the vocabulary and history snapshots are per prompt). `parsed` is the editor's
+    /// accumulated parse, finished at Enter — when present, it IS the parse (the one
+    /// grammar; the session must not parse the line again). `None` means the line was
+    /// not green to its end (the session's parse produces the user-facing error).
+    Submit {
+        line: String,
+        parsed: Option<Command>,
+    },
     /// End of input: the session is over.
     EndOfInput,
 }
@@ -197,7 +207,7 @@ pub const MAX_LINE_BYTES: usize = 4096;
 /// One green character's snapshot: the parser state and word tracker as they were
 /// BEFORE the character was committed — what backspace restores in O(1).
 struct Snap {
-    state: BoxP<()>,
+    state: BoxP<Command>,
     in_word: bool,
     tracking: bool,
 }
@@ -216,7 +226,7 @@ pub struct Editor {
     /// The line so far — always valid UTF-8 (characters are inserted whole).
     line: Vec<u8>,
     /// Parser state covering `line[..red_from.unwrap_or(line.len())]`.
-    state: BoxP<()>,
+    state: BoxP<Command>,
     /// One snapshot per GREEN character of `line` (dead characters are never
     /// committed to the parser): `stack[k]` is the state/tracker before character
     /// k+1. INVARIANT (pinned by the differential editor test): `stack.len()` equals
@@ -348,9 +358,13 @@ impl Editor {
             }
             Key::Enter => {
                 self.utf8_pending.clear();
+                let parsed = self.finish_parse();
                 self.close_marker();
                 self.emit("\r\n");
-                Action::Submit(self.take_line())
+                Action::Submit {
+                    line: self.take_line(),
+                    parsed,
+                }
             }
             Key::Up => {
                 self.utf8_pending.clear();
@@ -371,7 +385,10 @@ impl Editor {
                 self.close_marker();
                 self.emit("^C\r\n");
                 self.line.clear();
-                Action::Submit(String::new())
+                Action::Submit {
+                    line: String::new(),
+                    parsed: None,
+                }
             }
             // Ctrl-D on an empty line: end of input. Mid-line it is ignored (the host
             // editor's delete-at-cursor has no cursor to act at here).
@@ -388,9 +405,13 @@ impl Editor {
                     self.emit("\r\n");
                     Action::EndOfInput
                 } else {
+                    let parsed = self.finish_parse();
                     self.close_marker();
                     self.emit("\r\n");
-                    Action::Submit(self.take_line())
+                    Action::Submit {
+                        line: self.take_line(),
+                        parsed,
+                    }
                 }
             }
         }
@@ -951,6 +972,17 @@ impl Editor {
         }
     }
 
+    /// The accumulated parse, finished: `Some` exactly when the whole line is green
+    /// and the grammar can wrap up at end of line — the submitted [`Command`], built
+    /// by the same states every keystroke stepped. Red or incomplete lines yield
+    /// `None`; the session's own parse of the line then produces the error message.
+    fn finish_parse(&self) -> Option<Command> {
+        if self.red_from.is_some() {
+            return None;
+        }
+        finish(&*self.state)
+    }
+
     fn take_line(&mut self) -> String {
         let bytes = core::mem::take(&mut self.line);
         self.recall = None;
@@ -964,24 +996,16 @@ impl Editor {
     }
 }
 
-/// Step one character's bytes from `state` WITHOUT mutating it, applying the
-/// `feed_bytes` non-ASCII substitution policy so the editor's verdicts agree exactly
-/// with a from-scratch reparse. `None` when no parse continues; on success the caller
-/// owns the new state (and can move the predecessor onto the snapshot stack).
-fn try_step(state: &BoxP<()>, bytes: &[u8]) -> Option<BoxP<()>> {
-    let mut current: Option<BoxP<()>> = None;
+/// Step one character's bytes from `state` WITHOUT mutating it (bytes >= 0x80 step
+/// as [`Input::Text`], like `feed_bytes`, so the editor's verdicts — and the captured
+/// values — agree exactly with a from-scratch reparse). `None` when no parse
+/// continues; on success the caller owns the new state (and can move the predecessor
+/// onto the snapshot stack).
+fn try_step(state: &BoxP<Command>, bytes: &[u8]) -> Option<BoxP<Command>> {
+    let mut current: Option<BoxP<Command>> = None;
     for &byte in bytes {
-        let at: &BoxP<()> = current.as_ref().unwrap_or(state);
-        let input = match Input::byte(byte) {
-            Some(input) => input,
-            None => {
-                if !at.admissible().non_ascii_ok {
-                    return None;
-                }
-                Input::byte(b'x').expect("ascii")
-            }
-        };
-        current = Some(at.step(input).and_then(Step::cont)?);
+        let at: &BoxP<Command> = current.as_ref().unwrap_or(state);
+        current = Some(at.step(Input::of_byte(byte)).and_then(Step::cont)?);
     }
     current
 }
@@ -999,7 +1023,7 @@ struct NameCompletions {
     strong: bool,
 }
 
-fn name_completions(state: &BoxP<()>) -> NameCompletions {
+fn name_completions(state: &BoxP<Command>) -> NameCompletions {
     let mut completions: Vec<Completion> = Vec::new();
     state.completions(&mut completions);
     let mut any = false;
@@ -1067,6 +1091,7 @@ fn longest_common_prefix(words: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::grammar::FlagSpec;
+    use alloc::boxed::Box;
     use crate::inc::Tag;
     use alloc::borrow::ToOwned;
     use alloc::format;
@@ -1115,7 +1140,14 @@ mod tests {
 
     fn submit(ed: &mut Editor) -> String {
         match ed.handle(Key::Enter) {
-            Action::Submit(line) => line,
+            Action::Submit { line, .. } => line,
+            other => panic!("expected Submit, got {other:?}"),
+        }
+    }
+
+    fn submit_parsed(ed: &mut Editor) -> (String, Option<Command>) {
+        match ed.handle(Key::Enter) {
+            Action::Submit { line, parsed } => (line, parsed),
             other => panic!("expected Submit, got {other:?}"),
         }
     }
@@ -1352,13 +1384,25 @@ mod tests {
         // A viable prefix (of `browser`) — the green-line cancel shape.
         type_text(&mut ed, "brows");
         ed.take_output();
-        assert_eq!(ed.handle(Key::Ctrl(3)), Action::Submit(String::new()));
+        assert_eq!(
+            ed.handle(Key::Ctrl(3)),
+            Action::Submit {
+                line: String::new(),
+                parsed: None
+            }
+        );
         assert_eq!(ed.take_output(), "^C\r\n");
         // On a red line the marker closes before the ^C echo.
         let mut ed = editor();
         type_text(&mut ed, "oops");
         ed.take_output();
-        assert_eq!(ed.handle(Key::Ctrl(3)), Action::Submit(String::new()));
+        assert_eq!(
+            ed.handle(Key::Ctrl(3)),
+            Action::Submit {
+                line: String::new(),
+                parsed: None
+            }
+        );
         assert_eq!(ed.take_output(), "\u{1b}[0m^C\r\n");
     }
 
@@ -1370,7 +1414,15 @@ mod tests {
         let mut ed = editor();
         type_text(&mut ed, "x");
         assert_eq!(ed.handle(Key::Ctrl(4)), Action::Pending);
-        assert_eq!(ed.handle(Key::Eof), Action::Submit("x".to_owned()));
+        // `x` names nothing in this vocabulary (name-dead red), so the accumulated
+        // parse is withheld: the session's own parse renders the verdict.
+        assert_eq!(
+            ed.handle(Key::Eof),
+            Action::Submit {
+                line: "x".to_owned(),
+                parsed: None
+            }
+        );
 
         let mut ed = editor();
         assert_eq!(ed.handle(Key::Eof), Action::EndOfInput);
@@ -1536,6 +1588,63 @@ mod tests {
         let mut ed = Editor::new("eosh> ", Vocab::default(), Vec::new(), Marker::RED, None);
         type_text(&mut ed, "help");
         assert_eq!(ed.take_output(), "help");
+    }
+
+    #[test]
+    fn enter_hands_over_the_accumulated_parse() {
+        use eosh_core::ast::{Arg, ArgValue, Expr};
+        // A green line: Enter's Submit carries the Command the keystroke states
+        // accumulated — the same value `parse_command` builds, with no second parse.
+        let mut ed = editor();
+        type_text(&mut ed, "hello --name eo9");
+        let (line, parsed) = submit_parsed(&mut ed);
+        assert_eq!(line, "hello --name eo9");
+        let expected = eosh_core::parse_command(&line).expect("parses");
+        assert_eq!(parsed, Some(expected.clone()));
+        assert_eq!(
+            parsed,
+            Some(Command::Run(Expr::App {
+                callee: Box::new(Expr::Name("hello".into())),
+                args: vec![Arg::Flag {
+                    name: "name".into(),
+                    value: ArgValue::Word("eo9".into()),
+                }],
+            }))
+        );
+
+        // A parse-dead red line withholds it (the session's parse is the verdict).
+        let mut ed = editor();
+        type_text(&mut ed, "help x");
+        let (_, parsed) = submit_parsed(&mut ed);
+        assert_eq!(parsed, None);
+
+        // A green-but-incomplete line (viable prefix, cannot finish) withholds it too.
+        let mut ed = editor();
+        type_text(&mut ed, "let x = ");
+        let (_, parsed) = submit_parsed(&mut ed);
+        assert_eq!(parsed, None);
+
+        // Non-ASCII words round-trip exactly (the Text-input path: real bytes, not
+        // substitutes, reach the captured value).
+        let mut ed = editor();
+        type_text(&mut ed, "hello --name niño");
+        let (line, parsed) = submit_parsed(&mut ed);
+        assert_eq!(
+            parsed,
+            Some(eosh_core::parse_command(&line).expect("parses"))
+        );
+        match parsed {
+            Some(Command::Run(Expr::App { args, .. })) => {
+                assert_eq!(
+                    args,
+                    vec![Arg::Flag {
+                        name: "name".into(),
+                        value: ArgValue::Word("niño".into()),
+                    }]
+                );
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
     }
 
     #[test]
@@ -1832,7 +1941,7 @@ mod tests {
             fresh.state.admissible(),
             "admissibility at {context} ({line:?})"
         );
-        let comps = |state: &BoxP<()>| {
+        let comps = |state: &BoxP<Command>| {
             let mut out = Vec::new();
             state.completions(&mut out);
             out.sort_by(|a: &crate::inc::Completion, b| {
@@ -1845,7 +1954,8 @@ mod tests {
             comps(&fresh.state),
             "completions at {context} ({line:?})"
         );
-        let finishes = |state: &BoxP<()>| state.step(Input::Eof).and_then(Step::value).is_some();
+        let finishes =
+            |state: &BoxP<Command>| state.step(Input::Eof).and_then(Step::value).is_some();
         assert_eq!(
             finishes(&ed.state),
             finishes(&fresh.state),

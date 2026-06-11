@@ -1,17 +1,24 @@
-//! The v1 eosh grammar, expressed incrementally — a byte-level mirror of
-//! eosh-core's lexer + parser composed (`eosh-core/src/{lex,parse}.rs`):
+//! THE eosh grammar — the shell's single parser surface.
+//!
+//! One grammar serves every consumer: the per-keystroke editor steps it for the red
+//! marker, TAB completion, and the forced-prefix walk; `parse_command` drives it over
+//! a whole line; and the VALUE it constructs is the executed [`crate::ast::Command`]
+//! itself — acceptance, completion, marking, and execution are views of this one
+//! module. (The separate recursive-descent parser and lexer this grammar once
+//! mirrored as a superset are deleted; their language and ASTs were pinned equal by
+//! an exact differential before retirement, and live on as the corpus pins below.)
 //!
 //! ```text
 //! line         := ws command? ws ( "#" anything )? EOF
 //! command      := "let"  name "=" expr | "save" name "=" expr
-//!               | "detach" name "=" expr                          (LOOSE — below)
+//!               | "detach" name "=" expr "restart" expr     (split at the LAST
+//!                                                            top-level `restart`)
 //!               | "svc" ( ε | "list" | ("log"|"stop"|"clear") name )
 //!               | "help" | "history" | "exit" | "quit" | "poweroff"
 //!               | "env" ( ε | expr ) | "describe" ("$"|"&"|carded-word|expr)
-//!               | "man" ( "$" | "&" | word | compound )            (one token, then EOF)
+//!               | "man" ( "$" | "&" | word | compound )      (one token, then EOF)
 //!               | "imports" expr
-//!               | expr                  (head name not a dispatch word — eosh's
-//!                                        command() matches the first Word token)
+//!               | expr                  (head name not a dispatch word)
 //! expr         := gate | amp-expr ( "$" expr )?                   ($ right-assoc)
 //! gate         := "only" name ("," name)* "$" expr
 //!               | "rename" name name "$" expr
@@ -24,56 +31,61 @@
 //! with-item    := "(" expr ")" "as" name
 //!               | "(" expr ("," expr)+ ")" "as" "(" name ("," name)N ")"   (arity ==)
 //!               | amp-expr-with-non-paren-head "as" name
-//! name         := bare word (reserved excluded) | compound        (the lexer calls
-//!                                                                  both Token::Word)
+//! name         := bare word (reserved excluded) | compound
 //! ```
 //!
 //! Reserved words (`let only rename with as`) are excluded exactly (typing past one
-//! resumes normal word life). Name positions also alternate a [`crate::comb::Words`]
-//! vocabulary — acceptance is unchanged (the free word already covers every vocabulary
-//! word), it exists to power `completions()`; soundness never depends on the vocabulary.
+//! resumes normal word life). Name positions also alternate a completion OVERLAY
+//! ([`crate::comb::Overlay`]) — a vocabulary view that can change neither the language
+//! nor the value, only what TAB offers and what the editor's name-mark sees.
+//!
+//! AMBIGUITY DISCIPLINE: the breadth-first `Alt`/`Bind` fork keeps every viable parse
+//! alive, and where several COMPLETE parses coexist at end of line the FIRST finisher
+//! in branch order wins. Two places lean on that deliberately:
+//!
+//! * `describe <word>`: the card-routing branch (builtin cards via
+//!   [`crate::builtins::builtin_doc`], API cards via the colon rule) is ordered before
+//!   the expression branch, so a lone carded word is its card (`describe describe`)
+//!   while anything longer falls to the expression parse — the old lone-token rule.
+//! * `detach`: the program expression may consume a top-level `restart` as an
+//!   ordinary word OR stop before it; `Bind` keeps the still-consuming branch first,
+//!   so the first finisher is the parse whose program ran longest — the split lands
+//!   at the LAST top-level `restart`, exactly the old rule.
+//!
+//! TIGHTENINGS at unification (the one-shot differential proved both exact):
+//!
+//! * `detach` now REQUIRES its `restart <policy>` clause (the old grammar's one
+//!   documented looseness — green-until-Enter then a parse error — is gone; the
+//!   missing clause is an end-of-line error here too, and never a mid-line red).
+//! * Non-ASCII bytes step as themselves ([`crate::input::Input::Text`]) instead of a
+//!   representative substitute: word interiors, quoted strings, compound literals,
+//!   and comments take them (exactly the retired lexer's rule), and captured values
+//!   round-trip the line byte-for-byte.
 //!
 //! ARGUMENT COMPLETION (M3, docs/design/component-manuals.md §3–4): when the embedder
 //! has provided a resolved program's argument data ([`Vocab::programs`]), the
-//! application grammar captures the head name and binds the matching argument layer in:
-//! flag-name positions additionally alternate the program's `--flag` names (from the
-//! WIT `describe` signature, with the manual's per-arg doc line as the menu
-//! description), and each flag's value position additionally alternates its typed
+//! application grammar captures the head name and binds the matching argument layer
+//! in: flag-name positions additionally overlay the program's `--flag` names (from
+//! the WIT `describe` signature, with the manual's per-arg doc line as the menu
+//! description), and each flag's value position additionally overlays its typed
 //! candidates — `union(wit_grammar(ty), words(hint_literals))`. THE HARD RULE (the
-//! manuals design's §3): hints are ADDITIVE, NEVER RESTRICTIVE — every added `Words`
-//! branch's language is a subset of the free word it alternates with (the entry filter
-//! in [`crate::comb::Words`] plus the reserved-word filter below guarantee it), so the
-//! WIT-derived/free branch is unconditionally present and a lying manual can produce a
-//! false green (a candidate eosh later refuses), never a false red. The manual-fuzzing
-//! arm of the differential test pins acceptance EQUAL with and without argument data.
-//! Names with no provided data (unresolved, still resolving, or argument-less) keep
-//! the generic v1 argument grammar unchanged.
-//!
-//! DELIBERATE LOOSENESS (the superset rule tolerates false green, never false red):
-//!
-//! * `detach <name> = <expr>` does not require eosh's `restart <policy>` clause: in the
-//!   real parser the line is split at the last top-level `restart` *word* and both
-//!   halves must parse — but since `restart` is an ordinary word, any program+policy
-//!   pair that eosh accepts is also one plain `expr` (the policy words become
-//!   application arguments), so the loose form is a strict superset. The cost: a
-//!   `detach` line missing its `restart` clause shows green and fails at parse time.
-//! * Bytes >= 0x80 step as the representative text byte (see
-//!   [`crate::inc::feed_bytes`]): acceptance can only widen.
-//!
-//! Everything else is tight by construction and pinned by the differential test below:
-//! gates require `$`, `with` tuple arity must match, `svc` subcommands are exact,
-//! no-argument builtins reject arguments, reserved words are refused in name/value
-//! positions, flags require values.
+//! manuals design's §3) is now structural: hints are overlays, and an overlay NEVER
+//! finishes, so it cannot change acceptance or the constructed value — a lying manual
+//! can only mislead the candidate menu, never the parse. The adversarial-hints gate
+//! pins it end to end.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::ast::{Arg, ArgValue, Command, Expr, WithBinding};
 use crate::comb::{
-    HintEntry, Words, alt, bare_word, bind, cap_bare_word, cap_flag_name, comment_rest, compound,
-    flag_name, hint_words, kw, lazy, lit, lit_byte, map, pure, quoted, rep, star, ws,
+    HintEntry, Words, alt, bind, cap_bare_word, cap_compound, cap_flag_name, cap_quoted,
+    comment_rest, fail, keep_left, keep_right, kw, lazy, lit, lit_byte, map, overlay_words, pure,
+    rep_vec, star_vec, ws,
 };
 use crate::inc::{BoxP, Tag};
 
@@ -176,10 +188,10 @@ struct Cx {
     man_vocab: Rc<Vec<HintEntry>>,
 }
 
-/// Sequence two parsers, keeping the first's laziness discipline: the second is built
-/// eagerly (cheap) and cloned per completion of the first. Recursive references must
-/// NOT go through this — use [`expr_l`].
-fn then<T: 'static>(first: BoxP<()>, second: BoxP<T>) -> BoxP<T> {
+/// Sequence two UNIT parsers, keeping the first's laziness discipline: the second is
+/// built eagerly (cheap) and cloned per completion of the first. Recursive references
+/// must NOT go through this — use [`expr_l`].
+fn then(first: BoxP<()>, second: BoxP<()>) -> BoxP<()> {
     bind(first, move |()| second.clone())
 }
 
@@ -199,92 +211,118 @@ fn t_kw(word: &'static str, tag: Tag) -> BoxP<()> {
     then(ws(), kw(word, tag))
 }
 
-/// A plain word where eosh runs `expect_word`: a non-reserved bare word — or a
-/// compound literal, which the lexer also hands over as `Token::Word` (yes, `let [a] =
-/// x` parses in eosh; mirroring that is part of the superset rule).
-fn t_plain_word() -> BoxP<()> {
-    then(ws(), alt(vec![bare_word(RESERVED), compound()]))
+/// A plain word: a non-reserved bare word — or a compound literal, which is one word
+/// token to the boundary rules (yes, `let [a] = x` parses; the captured text is the
+/// verbatim token).
+fn t_plain_word() -> BoxP<String> {
+    keep_right(ws(), alt(vec![cap_bare_word(RESERVED), cap_compound()]))
 }
 
 /// A lazy reference to `expr` — every recursive edge of the grammar goes through here.
-fn expr_l(cx: &Cx, pos: Pos) -> BoxP<()> {
+fn expr_l(cx: &Cx, pos: Pos) -> BoxP<Expr> {
     let cx = cx.clone();
     lazy(move || expr(&cx, pos))
 }
 
 /// `"(" expr ")"` (no leading-whitespace handling: callers sit behind a `ws`).
-fn paren_expr(cx: &Cx) -> BoxP<()> {
-    seq!(lit_byte(b'('), expr_l(cx, Pos::Normal), t_byte(b')'))
+/// Grouping leaves no trace in the tree (ast.rs's rule) — the value is the inner
+/// expression.
+fn paren_expr(cx: &Cx) -> BoxP<Expr> {
+    keep_left(
+        keep_right(lit_byte(b'('), expr_l(cx, Pos::Normal)),
+        t_byte(b')'),
+    )
 }
 
 // -- expressions -------------------------------------------------------------------
 
-/// A name in `primary` position, captured: free word (position-appropriate
-/// exclusions), compound, or a vocabulary word (completions only — see module docs).
-/// The captured value is the consumed word for the word-shaped branches and `""` for
-/// the structural ones. The capturing branch sits FIRST deliberately: every word the
-/// vocabulary branch finishes, the free word finishes too (the vocabulary survives
-/// [`Words`]' entry filter, so its language is a subset), and `Alt`'s first-finisher
-/// rule then always yields the real name to the argument-layer bind.
-fn cap_primary(cx: &Cx, pos: Pos) -> BoxP<String> {
+/// A name in `primary` position: free word (position-appropriate exclusions),
+/// compound, parenthesized expression — plus the vocabulary OVERLAY (completions
+/// only; it never finishes, so it can affect neither the language nor the value).
+/// The value is the primary's [`Expr`] plus the head word when the primary IS a word
+/// (the M3 argument layer binds on it to look up that program's completion data).
+fn cap_primary(cx: &Cx, pos: Pos) -> BoxP<(Option<String>, Expr)> {
     let (excluded, vocab) = match pos {
         Pos::Head => (CMD_HEAD_EXCLUDED, cx.head_vocab.clone()),
         Pos::Normal => (RESERVED, cx.vocab.clone()),
     };
-    then(
+    keep_right(
         ws(),
         alt(vec![
-            cap_bare_word(excluded),
-            map(hint_words(vocab), |()| String::new()),
-            map(compound(), |()| String::new()),
-            map(paren_expr(cx), |()| String::new()),
+            map(cap_bare_word(excluded), |word| {
+                let expr = Expr::Name(word.clone());
+                (Some(word), expr)
+            }),
+            overlay_words(vocab),
+            map(cap_compound(), |raw| (None, Expr::Name(raw))),
+            map(paren_expr(cx), |expr| (None, expr)),
         ]),
     )
 }
 
 /// A flag-or-positional application argument (the generic v1 layer — no program data).
-fn arg(cx: &Cx) -> BoxP<()> {
-    then(
+fn arg(cx: &Cx) -> BoxP<Arg> {
+    let value_cx = cx.clone();
+    keep_right(
         ws(),
         alt(vec![
             // `--name value`: the flag name is any nonempty word-byte run; the value
-            // is mandatory (eosh: "a value after the flag").
-            seq!(lit(b"--"), flag_name(), value(cx)),
-            bare_word(RESERVED),
-            compound(),
-            quoted(),
-            paren_expr(cx),
+            // is mandatory.
+            keep_right(
+                lit(b"--"),
+                bind(cap_flag_name(), move |name| {
+                    map(value(&value_cx), move |value| Arg::Flag {
+                        name: name.clone(),
+                        value,
+                    })
+                }),
+            ),
+            map(cap_bare_word(RESERVED), |word| {
+                Arg::Positional(ArgValue::Word(word))
+            }),
+            map(cap_compound(), |raw| Arg::Positional(ArgValue::Word(raw))),
+            map(cap_quoted(), |text| Arg::Positional(ArgValue::Quoted(text))),
+            map(paren_expr(cx), |expr| {
+                Arg::Positional(ArgValue::Expr(Box::new(expr)))
+            }),
         ]),
     )
 }
 
 /// A flag value: word, quoted string, compound, or parenthesized expression.
-fn value(cx: &Cx) -> BoxP<()> {
-    then(
-        ws(),
-        alt(vec![
-            bare_word(RESERVED),
-            compound(),
-            quoted(),
-            paren_expr(cx),
-        ]),
-    )
+fn value(cx: &Cx) -> BoxP<ArgValue> {
+    value_hinted(cx, None)
 }
 
-fn star_args(cx: &Cx) -> BoxP<()> {
+/// [`value`] plus a flag's candidate words, when it has any (an overlay: candidates
+/// never change what is admissible — the additive-hints hard rule, now structural).
+fn value_hinted(cx: &Cx, hints: Option<Rc<Vec<HintEntry>>>) -> BoxP<ArgValue> {
+    let mut branches: Vec<BoxP<ArgValue>> = vec![
+        map(cap_bare_word(RESERVED), ArgValue::Word),
+        map(cap_compound(), ArgValue::Word),
+        map(cap_quoted(), ArgValue::Quoted),
+        map(paren_expr(cx), |expr| ArgValue::Expr(Box::new(expr))),
+    ];
+    if let Some(hints) = hints {
+        branches.push(overlay_words(hints));
+    }
+    keep_right(ws(), alt(branches))
+}
+
+fn star_args(cx: &Cx) -> BoxP<Vec<Arg>> {
     let cx = cx.clone();
-    star(move || arg(&cx))
+    star_vec(move || arg(&cx))
 }
 
 /// The argument list for a captured head name (M3): the program's slots when the
 /// embedder provided them, the generic layer otherwise. Identical acceptance either
-/// way — the slots only add completion branches (module docs, the hard rule).
-fn star_args_for(cx: &Cx, name: &str) -> BoxP<()> {
+/// way — the slots are overlays.
+fn star_args_for(cx: &Cx, name: &str) -> BoxP<Vec<Arg>> {
     match cx.programs.get(name) {
         Some(program) => {
             let cx = cx.clone();
             let program = program.clone();
-            star(move || arg_known(&cx, &program))
+            star_vec(move || arg_known(&cx, &program))
         }
         None => star_args(cx),
     }
@@ -293,238 +331,497 @@ fn star_args_for(cx: &Cx, name: &str) -> BoxP<()> {
 /// [`arg`] with one program's slots alternated in: the flag token captures its name
 /// (offering the program's flags alongside), and the bound value position offers that
 /// flag's typed candidates alongside the free forms.
-fn arg_known(cx: &Cx, program: &ProgramSlots) -> BoxP<()> {
-    let flag = alt(vec![
+fn arg_known(cx: &Cx, program: &ProgramSlots) -> BoxP<Arg> {
+    let flag: BoxP<String> = alt(vec![
         cap_flag_name(),
-        map(hint_words(program.flags.clone()), |()| String::new()),
+        overlay_words(program.flags.clone()),
     ]);
     let value_cx = cx.clone();
     let values = program.values.clone();
-    then(
+    keep_right(
         ws(),
         alt(vec![
-            then(
+            keep_right(
                 lit(b"--"),
                 bind(flag, move |name| {
-                    value_hinted(&value_cx, values.get(&name).cloned())
+                    let hinted = value_hinted(&value_cx, values.get(&name).cloned());
+                    map(hinted, move |value| Arg::Flag {
+                        name: name.clone(),
+                        value,
+                    })
                 }),
             ),
-            bare_word(RESERVED),
-            compound(),
-            quoted(),
-            paren_expr(cx),
+            map(cap_bare_word(RESERVED), |word| {
+                Arg::Positional(ArgValue::Word(word))
+            }),
+            map(cap_compound(), |raw| Arg::Positional(ArgValue::Word(raw))),
+            map(cap_quoted(), |text| Arg::Positional(ArgValue::Quoted(text))),
+            map(paren_expr(cx), |expr| {
+                Arg::Positional(ArgValue::Expr(Box::new(expr)))
+            }),
         ]),
     )
 }
 
-/// [`value`] plus a flag's candidate words, when it has any.
-fn value_hinted(cx: &Cx, hints: Option<Rc<Vec<HintEntry>>>) -> BoxP<()> {
-    let mut branches = vec![bare_word(RESERVED), compound(), quoted(), paren_expr(cx)];
-    if let Some(hints) = hints {
-        branches.push(hint_words(hints));
-    }
-    then(ws(), alt(branches))
-}
-
-/// `app-expr := primary arg*`, with the head parser supplied (the `with`-item path
-/// needs a non-paren head).
-fn app_from(head: BoxP<()>, cx: &Cx) -> BoxP<()> {
-    then(head, star_args(cx))
-}
-
-fn app(cx: &Cx, pos: Pos) -> BoxP<()> {
+/// `app-expr := primary arg*`, from a supplied head (the `with`-item path needs a
+/// non-paren head). An argument-less application is just its callee (ast.rs).
+fn app_from(head: BoxP<(Option<String>, Expr)>, cx: &Cx) -> BoxP<Expr> {
     let cx2 = cx.clone();
-    bind(cap_primary(cx, pos), move |name| star_args_for(&cx2, &name))
+    bind(head, move |(name, callee)| {
+        let args_p = match &name {
+            Some(n) => star_args_for(&cx2, n),
+            None => star_args(&cx2),
+        };
+        let callee2 = callee.clone();
+        map(args_p, move |args| {
+            if args.is_empty() {
+                callee2.clone()
+            } else {
+                Expr::App {
+                    callee: Box::new(callee2.clone()),
+                    args,
+                }
+            }
+        })
+    })
 }
 
-fn star_amp(cx: &Cx) -> BoxP<()> {
-    let cx = cx.clone();
-    star(move || then(t_byte(b'&'), app(&cx, Pos::Normal)))
+fn app(cx: &Cx, pos: Pos) -> BoxP<Expr> {
+    app_from(cap_primary(cx, pos), cx)
 }
 
-fn amp(cx: &Cx, pos: Pos) -> BoxP<()> {
-    then(app(cx, pos), star_amp(cx))
+/// The left-associative `&` fold: `acc & layer & …`.
+fn amp_rest(cx: &Cx, acc: Expr) -> BoxP<Expr> {
+    let cx2 = cx.clone();
+    let acc2 = acc.clone();
+    alt(vec![
+        pure(acc),
+        bind(
+            keep_right(t_byte(b'&'), app(cx, Pos::Normal)),
+            move |layer| {
+                amp_rest(
+                    &cx2,
+                    Expr::Extend {
+                        base: Box::new(acc2.clone()),
+                        layer: Box::new(layer),
+                    },
+                )
+            },
+        ),
+    ])
 }
 
-fn expr(cx: &Cx, pos: Pos) -> BoxP<()> {
+fn amp(cx: &Cx, pos: Pos) -> BoxP<Expr> {
+    let cx2 = cx.clone();
+    bind(app(cx, pos), move |first| amp_rest(&cx2, first))
+}
+
+fn expr(cx: &Cx, pos: Pos) -> BoxP<Expr> {
+    let cx2 = cx.clone();
     alt(vec![
         gate_only(cx),
         gate_rename(cx),
         gate_with(cx),
-        then(
-            amp(cx, pos),
-            alt(vec![pure(()), then(t_byte(b'$'), expr_l(cx, Pos::Normal))]),
-        ),
+        bind(amp(cx, pos), move |left| {
+            // `$` is right-associative: recurse for the consumer.
+            let provider = left.clone();
+            let cx3 = cx2.clone();
+            alt(vec![
+                pure(left),
+                map(
+                    keep_right(t_byte(b'$'), expr_l(&cx3, Pos::Normal)),
+                    move |consumer| Expr::Compose {
+                        provider: Box::new(provider.clone()),
+                        consumer: Box::new(consumer),
+                    },
+                ),
+            ])
+        }),
     ])
 }
 
 // -- gates ---------------------------------------------------------------------------
 
-fn gate_only(cx: &Cx) -> BoxP<()> {
-    seq!(
+/// The `$ <expr>` every gate requires.
+fn gate_body(cx: &Cx) -> BoxP<Expr> {
+    keep_right(t_byte(b'$'), expr_l(cx, Pos::Normal))
+}
+
+fn gate_only(cx: &Cx) -> BoxP<Expr> {
+    let cx2 = cx.clone();
+    keep_right(
         t_kw("only", Tag::Keyword),
-        t_plain_word(),
-        star(|| seq!(t_byte(b','), t_plain_word())),
-        t_byte(b'$'),
-        expr_l(cx, Pos::Normal),
+        bind(word_list(), move |allow| {
+            let allow2 = allow.clone();
+            map(gate_body(&cx2), move |body| Expr::Only {
+                allow: allow2.clone(),
+                body: Box::new(body),
+            })
+        }),
     )
 }
 
-fn gate_rename(cx: &Cx) -> BoxP<()> {
-    seq!(
-        t_kw("rename", Tag::Keyword),
-        t_plain_word(),
-        t_plain_word(),
-        t_byte(b'$'),
-        expr_l(cx, Pos::Normal),
-    )
+/// `name ("," name)*` — the only-gate's allow-list.
+fn word_list() -> BoxP<Vec<String>> {
+    bind(t_plain_word(), |first| word_list_rest(vec![first]))
 }
 
-fn gate_with(cx: &Cx) -> BoxP<()> {
-    let item_cx = cx.clone();
-    seq!(
-        t_kw("with", Tag::Keyword),
-        with_item(cx),
-        star(move || seq!(t_byte(b','), with_item(&item_cx))),
-        t_byte(b'$'),
-        expr_l(cx, Pos::Normal),
-    )
-}
-
-/// One `with` binding. eosh's `with_item` COMMITS on a leading `(`: after `( expr )`
-/// only `as <slot>` may follow (`with (a) & b as x` is an error), and the tuple form
-/// `( e1, e2, … ) as ( s1, s2, … )` must match arities — mirrored here by binding the
-/// provider count into the slot grammar (the monadic bind earning its keep).
-fn with_item(cx: &Cx) -> BoxP<()> {
+fn word_list_rest(acc: Vec<String>) -> BoxP<Vec<String>> {
+    let acc2 = acc.clone();
     alt(vec![
-        seq!(
-            t_byte(b'('),
-            expr_l(cx, Pos::Normal),
-            alt(vec![
-                // Single parenthesized provider: `) as slot`.
-                seq!(t_byte(b')'), t_kw("as", Tag::Keyword), t_plain_word()),
-                // Tuple: `, e2 [, …] ) as ( s1 [, …] )` with matching arity.
-                bind(more_exprs(cx), |extra| {
-                    seq!(
-                        t_kw("as", Tag::Keyword),
-                        t_byte(b'('),
-                        t_plain_word(),
-                        rep(extra, || seq!(t_byte(b','), t_plain_word())),
-                        t_byte(b')'),
-                    )
-                }),
-            ]),
-        ),
-        // Non-paren-headed amp-expr: `provider as slot`.
-        seq!(
-            then(
-                app_from(
-                    then(
-                        ws(),
-                        alt(vec![
-                            bare_word(RESERVED),
-                            compound(),
-                            hint_words(cx.vocab.clone()),
-                        ]),
-                    ),
-                    cx,
-                ),
-                star_amp(cx),
-            ),
-            t_kw("as", Tag::Keyword),
-            t_plain_word(),
+        pure(acc),
+        bind(
+            keep_right(t_byte(b','), t_plain_word()),
+            move |word| {
+                let mut next = acc2.clone();
+                next.push(word);
+                word_list_rest(next)
+            },
         ),
     ])
 }
 
-/// `("," expr)+ ")"`, counting the extra providers (the first sits before this).
-fn more_exprs(cx: &Cx) -> BoxP<usize> {
+fn gate_rename(cx: &Cx) -> BoxP<Expr> {
     let cx2 = cx.clone();
-    then(
-        seq!(t_byte(b','), expr_l(cx, Pos::Normal)),
-        alt(vec![
-            map(t_byte(b')'), |()| 1usize),
-            lazy(move || map(more_exprs(&cx2), |extra| extra + 1)),
-        ]),
+    keep_right(
+        t_kw("rename", Tag::Keyword),
+        bind(t_plain_word(), move |from| {
+            let cx3 = cx2.clone();
+            bind(t_plain_word(), move |to| {
+                let from2 = from.clone();
+                let to2 = to.clone();
+                map(gate_body(&cx3), move |body| Expr::Rename {
+                    from: from2.clone(),
+                    to: to2.clone(),
+                    body: Box::new(body),
+                })
+            })
+        }),
     )
+}
+
+fn gate_with(cx: &Cx) -> BoxP<Expr> {
+    let cx2 = cx.clone();
+    keep_right(
+        t_kw("with", Tag::Keyword),
+        bind(with_items(cx), move |bindings| {
+            let bindings2 = bindings.clone();
+            map(gate_body(&cx2), move |body| Expr::With {
+                bindings: bindings2.clone(),
+                body: Box::new(body),
+            })
+        }),
+    )
+}
+
+fn with_items(cx: &Cx) -> BoxP<Vec<WithBinding>> {
+    let cx2 = cx.clone();
+    bind(with_item(cx), move |first| with_items_rest(&cx2, first))
+}
+
+fn with_items_rest(cx: &Cx, acc: Vec<WithBinding>) -> BoxP<Vec<WithBinding>> {
+    let cx2 = cx.clone();
+    let acc2 = acc.clone();
+    alt(vec![
+        pure(acc),
+        bind(
+            keep_right(t_byte(b','), with_item(cx)),
+            move |more| {
+                let mut next = acc2.clone();
+                next.extend(more);
+                with_items_rest(&cx2, next)
+            },
+        ),
+    ])
+}
+
+/// One `with` binding (or several: the tuple form expands positionally, like the old
+/// parser did). eosh's `with_item` COMMITS on a leading `(`: after `( expr )` only
+/// `as <slot>` may follow (`with (a) & b as x` is an error), and the tuple form
+/// `( e1, e2, … ) as ( s1, s2, … )` must match arities — the provider count is bound
+/// into the slot grammar (the monadic bind earning its keep), and the matched pairs
+/// zip into individual bindings.
+fn with_item(cx: &Cx) -> BoxP<Vec<WithBinding>> {
+    let tuple_cx = cx.clone();
+    let head_cx = cx.clone();
+    alt(vec![
+        keep_right(
+            t_byte(b'('),
+            bind(expr_l(cx, Pos::Normal), move |first| {
+                let single = first.clone();
+                let tuple_first = first.clone();
+                let cx3 = tuple_cx.clone();
+                alt(vec![
+                    // Single parenthesized provider: `) as slot`.
+                    map(
+                        keep_right(
+                            seq!(t_byte(b')'), t_kw("as", Tag::Keyword)),
+                            t_plain_word(),
+                        ),
+                        move |slot| {
+                            vec![WithBinding {
+                                provider: single.clone(),
+                                slot,
+                            }]
+                        },
+                    ),
+                    // Tuple: `, e2 [, …] ) as ( s1 [, …] )` with matching arity.
+                    bind(more_exprs(&cx3), move |rest| {
+                        let mut providers = vec![tuple_first.clone()];
+                        providers.extend(rest);
+                        let providers2 = providers.clone();
+                        map(slot_tuple(providers.len()), move |slots| {
+                            providers2
+                                .iter()
+                                .cloned()
+                                .zip(slots)
+                                .map(|(provider, slot)| WithBinding { provider, slot })
+                                .collect()
+                        })
+                    }),
+                ])
+            }),
+        ),
+        // Non-paren-headed amp-expr: `provider as slot`.
+        bind(provider_no_paren(&head_cx), move |provider| {
+            let provider2 = provider.clone();
+            map(
+                keep_right(t_kw("as", Tag::Keyword), t_plain_word()),
+                move |slot| {
+                    vec![WithBinding {
+                        provider: provider2.clone(),
+                        slot,
+                    }]
+                },
+            )
+        }),
+    ])
+}
+
+/// `("," expr)+ ")"`, collecting the extra providers (the first sits before this).
+fn more_exprs(cx: &Cx) -> BoxP<Vec<Expr>> {
+    more_exprs_acc(cx, Vec::new())
+}
+
+fn more_exprs_acc(cx: &Cx, acc: Vec<Expr>) -> BoxP<Vec<Expr>> {
+    let cx2 = cx.clone();
+    bind(
+        keep_right(t_byte(b','), expr_l(cx, Pos::Normal)),
+        move |extra| {
+            let mut next = acc.clone();
+            next.push(extra);
+            let done = next.clone();
+            let cx3 = cx2.clone();
+            alt(vec![
+                map(t_byte(b')'), move |()| done.clone()),
+                lazy(move || more_exprs_acc(&cx3, next.clone())),
+            ])
+        },
+    )
+}
+
+/// `"as" "(" slot ("," slot){n-1} ")"` — exactly `n` slot names.
+fn slot_tuple(n: usize) -> BoxP<Vec<String>> {
+    keep_left(
+        keep_right(
+            seq!(t_kw("as", Tag::Keyword), t_byte(b'(')),
+            bind(t_plain_word(), move |first| {
+                map(
+                    rep_vec(n - 1, || keep_right(t_byte(b','), t_plain_word())),
+                    move |rest| {
+                        let mut slots = vec![first.clone()];
+                        slots.extend(rest);
+                        slots
+                    },
+                )
+            }),
+        ),
+        t_byte(b')'),
+    )
+}
+
+/// The non-paren `with`-item provider: a word/compound-headed app-expr, `&`-foldable.
+fn provider_no_paren(cx: &Cx) -> BoxP<Expr> {
+    let head = keep_right(
+        ws(),
+        alt(vec![
+            map(cap_bare_word(RESERVED), |word| {
+                let expr = Expr::Name(word.clone());
+                (Some(word), expr)
+            }),
+            overlay_words(cx.vocab.clone()),
+            map(cap_compound(), |raw| (None, Expr::Name(raw))),
+        ]),
+    );
+    let cx2 = cx.clone();
+    bind(app_from(head, cx), move |first| amp_rest(&cx2, first))
 }
 
 // -- commands --------------------------------------------------------------------------
 
-/// `<keyword> <name> = <expr>` (let, save, and the deliberately loose detach).
-fn name_eq_expr(cx: &Cx, word: &'static str) -> BoxP<()> {
-    seq!(
+/// `<keyword> <name> = <expr>` (let and save).
+fn name_eq_expr(
+    cx: &Cx,
+    word: &'static str,
+    build: fn(String, Expr) -> Command,
+) -> BoxP<Command> {
+    let cx2 = cx.clone();
+    keep_right(
         t_kw(word, Tag::Builtin),
-        t_plain_word(),
-        t_byte(b'='),
-        expr_l(cx, Pos::Normal),
+        bind(t_plain_word(), move |name| {
+            let cx3 = cx2.clone();
+            map(
+                keep_right(t_byte(b'='), expr_l(&cx3, Pos::Normal)),
+                move |expr| build(name.clone(), expr),
+            )
+        }),
     )
 }
 
-fn command(cx: &Cx) -> BoxP<()> {
-    alt(vec![
-        name_eq_expr(cx, "let"),
-        name_eq_expr(cx, "save"),
-        // LOOSE: no `restart <policy>` clause required — see module docs.
-        name_eq_expr(cx, "detach"),
-        then(
-            t_kw("svc", Tag::Builtin),
-            alt(vec![
-                pure(()),
-                t_kw("list", Tag::Builtin),
-                then(
-                    alt(vec![
-                        t_kw("log", Tag::Builtin),
-                        t_kw("stop", Tag::Builtin),
-                        t_kw("clear", Tag::Builtin),
-                    ]),
-                    t_plain_word(),
-                ),
-            ]),
-        ),
-        t_kw("help", Tag::Builtin),
-        t_kw("history", Tag::Builtin),
-        t_kw("exit", Tag::Builtin),
-        t_kw("quit", Tag::Builtin),
-        t_kw("poweroff", Tag::Builtin),
-        then(
-            t_kw("env", Tag::Builtin),
-            alt(vec![pure(()), expr_l(cx, Pos::Normal)]),
-        ),
-        then(
-            t_kw("describe", Tag::Builtin),
-            alt(vec![
-                t_byte(b'$'),
-                t_byte(b'&'),
-                // The carded words (builtins, operators, API names). Acceptance-wise
-                // this branch matters only for the reserved carded words (`describe
-                // only` is a card; plain words like `describe help` already parse as
-                // expressions) — but completion-wise it is what makes `describe d⇥`
-                // offer `describe`'s own card, and marking-wise what keeps a typed
-                // carded word green (the owner's `describe describe` report).
-                then(ws(), hint_words(cx.cards.clone())),
-                expr_l(cx, Pos::Normal),
-            ]),
-        ),
-        // `man <one token>`: exactly one bare word (reserved words included — `man let`
-        // is a card), a compound (the lexer hands `[a]` over as one Word token), or a
-        // lone `$`/`&` operator; nothing may follow but trailing space/comment.
-        then(
-            t_kw("man", Tag::Builtin),
-            then(
+/// `detach <name> = <expr> restart <policy>`. The split sits at the LAST top-level
+/// `restart` word, exactly like the old parser: the program expression is finishable
+/// before every top-level `restart` AND can consume it as an ordinary word, so the
+/// breadth-first fork carries every split — and `Bind` keeps the still-consuming
+/// program branch FIRST in the merged alternation, so the first finisher at end of
+/// line is the parse whose program ran longest, i.e. the last split.
+fn detach(cx: &Cx) -> BoxP<Command> {
+    let cx2 = cx.clone();
+    keep_right(
+        t_kw("detach", Tag::Builtin),
+        bind(t_plain_word(), move |name| {
+            let cx3 = cx2.clone();
+            keep_right(
+                t_byte(b'='),
+                bind(expr_l(&cx3, Pos::Normal), move |program| {
+                    let name2 = name.clone();
+                    let program2 = program.clone();
+                    let cx4 = cx3.clone();
+                    map(
+                        keep_right(
+                            t_kw("restart", Tag::Keyword),
+                            expr_l(&cx4, Pos::Normal),
+                        ),
+                        move |policy| Command::Detach {
+                            name: name2.clone(),
+                            expr: program2.clone(),
+                            policy,
+                        },
+                    )
+                }),
+            )
+        }),
+    )
+}
+
+fn svc(cx: &Cx) -> BoxP<Command> {
+    let _ = cx;
+    keep_right(
+        t_kw("svc", Tag::Builtin),
+        alt(vec![
+            pure(Command::SvcList),
+            map(t_kw("list", Tag::Builtin), |()| Command::SvcList),
+            bind(
+                alt(vec![
+                    map(t_kw("log", Tag::Builtin), |()| 0u8),
+                    map(t_kw("stop", Tag::Builtin), |()| 1u8),
+                    map(t_kw("clear", Tag::Builtin), |()| 2u8),
+                ]),
+                |which| {
+                    map(t_plain_word(), move |name| match which {
+                        0 => Command::SvcLog(name),
+                        1 => Command::SvcStop(name),
+                        _ => Command::SvcClear(name),
+                    })
+                },
+            ),
+        ]),
+    )
+}
+
+/// `describe`'s argument: a lone `$`/`&` operator card; a single word that ROUTES on
+/// the card tables (a carded shell word → its builtin card, a colon word → the API
+/// cards — `builtins::builtin_doc` and the colon rule, the same dispatch the session
+/// renders); otherwise an expression. The routing branch sits BEFORE the expression
+/// branch: where both finish (`describe describe`), the card wins — eosh's
+/// lone-token rule. A routed word must END the line (more tokens fall through to the
+/// expression branch, which is still alive in parallel).
+fn describe(cx: &Cx) -> BoxP<Command> {
+    keep_right(
+        t_kw("describe", Tag::Builtin),
+        alt(vec![
+            map(t_byte(b'$'), |()| Command::DescribeBuiltin(String::from("$"))),
+            map(t_byte(b'&'), |()| Command::DescribeBuiltin(String::from("&"))),
+            keep_right(
                 ws(),
                 alt(vec![
-                    lit_byte(b'$'),
-                    lit_byte(b'&'),
-                    bare_word(&[]),
-                    compound(),
-                    hint_words(cx.man_vocab.clone()),
+                    bind(cap_bare_word(&[]), |word| {
+                        if crate::builtins::builtin_doc(&word).is_some() {
+                            pure(Command::DescribeBuiltin(word))
+                        } else if word.contains(':') {
+                            pure(Command::DescribeApi(word))
+                        } else {
+                            fail()
+                        }
+                    }),
+                    overlay_words(cx.cards.clone()),
                 ]),
             ),
+            map(expr_l(cx, Pos::Normal), Command::Describe),
+        ]),
+    )
+}
+
+/// `man <one token>`: exactly one bare word (reserved words included — `man let` is a
+/// card), a compound (one `Token::Word` to the lexer), or a lone `$`/`&`; nothing may
+/// follow but trailing space/comment.
+fn man(cx: &Cx) -> BoxP<Command> {
+    keep_right(
+        t_kw("man", Tag::Builtin),
+        keep_right(
+            ws(),
+            alt(vec![
+                map(lit_byte(b'$'), |()| Command::Man(String::from("$"))),
+                map(lit_byte(b'&'), |()| Command::Man(String::from("&"))),
+                map(cap_bare_word(&[]), Command::Man),
+                map(cap_compound(), Command::Man),
+                overlay_words(cx.man_vocab.clone()),
+            ]),
         ),
-        then(t_kw("imports", Tag::Builtin), expr_l(cx, Pos::Normal)),
-        expr(cx, Pos::Head),
-        pure(()),
+    )
+}
+
+fn command(cx: &Cx) -> BoxP<Command> {
+    fn make_let(name: String, expr: Expr) -> Command {
+        Command::Let { name, expr }
+    }
+    fn make_save(name: String, expr: Expr) -> Command {
+        Command::Save { name, expr }
+    }
+    alt(vec![
+        name_eq_expr(cx, "let", make_let),
+        name_eq_expr(cx, "save", make_save),
+        detach(cx),
+        svc(cx),
+        map(t_kw("help", Tag::Builtin), |()| Command::Help),
+        map(t_kw("history", Tag::Builtin), |()| Command::History),
+        map(t_kw("exit", Tag::Builtin), |()| Command::Exit),
+        map(t_kw("quit", Tag::Builtin), |()| Command::Exit),
+        map(t_kw("poweroff", Tag::Builtin), |()| Command::Poweroff),
+        keep_right(
+            t_kw("env", Tag::Builtin),
+            alt(vec![
+                pure(Command::Env),
+                map(expr_l(cx, Pos::Normal), Command::EnvOf),
+            ]),
+        ),
+        describe(cx),
+        man(cx),
+        map(
+            keep_right(t_kw("imports", Tag::Builtin), expr_l(cx, Pos::Normal)),
+            Command::Imports,
+        ),
+        map(expr(cx, Pos::Head), Command::Run),
+        pure(Command::Empty),
     ])
 }
 
@@ -639,10 +936,8 @@ fn build_slots(program: &ProgramArgs, vocab: &[HintEntry]) -> ProgramSlots {
     }
 }
 
-/// The whole-line parser: feed it the line's bytes (via [`crate::inc::feed_bytes`])
-/// and `Eof`; it finishes exactly on lines whose language is a superset of
-/// `eosh_core::parse::parse_command`'s.
-pub fn command_line(vocab: &Vocab) -> BoxP<()> {
+/// Build the grammar's shared context from a vocabulary snapshot.
+fn build_cx(vocab: &Vocab) -> Cx {
     let filter = |excluded: &'static [&'static str]| -> Rc<Vec<HintEntry>> {
         Rc::new(
             vocab
@@ -671,14 +966,29 @@ pub fn command_line(vocab: &Vocab) -> BoxP<()> {
                 .cloned(),
         )
         .collect();
-    let cx = Cx {
+    Cx {
         head_vocab: filter(CMD_HEAD_EXCLUDED),
         vocab: normal,
         programs: Rc::new(programs),
         cards: Rc::new(cards),
         man_vocab: Rc::new(man_vocab),
-    };
-    then(command(&cx), trailing())
+    }
+}
+
+/// THE whole-line parser: feed it the line's bytes (via [`crate::inc::feed_bytes`])
+/// and `Eof`; it finishes exactly on the lines eosh executes, with the executed
+/// [`Command`] as its value — the editor's accumulated parse IS the parse.
+pub fn command_line(vocab: &Vocab) -> BoxP<Command> {
+    let cx = build_cx(vocab);
+    keep_left(command(&cx), trailing())
+}
+
+/// A standalone expression line (the `parse_expr` entry): one [`Expr`], then trailing
+/// space/comment. Head-position dispatch words do not apply — `help x` is an
+/// application here, as it always was for `parse_expr`.
+pub fn expr_line(vocab: &Vocab) -> BoxP<Expr> {
+    let cx = build_cx(vocab);
+    keep_left(expr(&cx, Pos::Normal), trailing())
 }
 
 #[cfg(test)]
@@ -689,7 +999,7 @@ mod tests {
     use crate::input::Input;
     use alloc::format;
     use alloc::string::ToString;
-    use crate::parse::{ParseError, parse_command};
+    use crate::parse::parse_command;
     use std::println;
 
     fn flag(name: &str, ty: &str) -> FlagSpec {
@@ -820,255 +1130,278 @@ mod tests {
         accepts(command_line(vocab), line)
     }
 
-    /// The corpus: every command-line literal from eosh-core's lexer/parser/session
+    fn inc_parse(vocab: &Vocab, line: &str) -> Option<crate::ast::Command> {
+        let state = feed_bytes(command_line(vocab), line.as_bytes())?;
+        crate::inc::finish(&*state)
+    }
+
+    /// The corpus: every command-line literal from the shell's lexer/parser/session
     /// tests and the builtin-card usage examples, plus edge lines from the grammar
-    /// review. Positive or negative — the differential test asks eosh-core which.
-    const CORPUS: &[&str] = &[
+    /// review — each pinned with its verdict (`true` = parses). The verdicts were
+    /// snapshotted from the retired recursive-descent parser at the moment of the
+    /// one-parser unification, after an exact-equality differential (acceptance AND
+    /// AST) ran clean over this corpus and ~12k fuzzed lines.
+    const CORPUS: &[(&str, bool)] = &[
         // lex.rs tests
-        "virtualfs --dir /tmp/sandbox $ browser --url https://example.com",
-        "only eo9:time,eo9:fs$cruncher",
-        "let det-env = (time.frozen & virtualnet)",
-        r#"echo --text "a \"b\" \\ c\nd" "#,
-        r#"fetch --url "https://example.com?a=b&c=d""#,
-        "browser # composed, then run by the shell",
-        "# a whole-line comment",
-        "time.monotonic-stub eo9:fs/fs@0.1.0 virtualfs.create",
-        "pci.admit-address --allow [{segment: 0, bus: 0, device: 1, function: 0}] $ lspci",
-        "--pairs [[1, 2], [3, 4]] --opts {a: some(1), b: (5)}",
-        r#"--names ["a]b", "c,{d", "e\"]f"]"#,
-        r#"--allow "[{segment: 0, bus: 0}]""#,
-        "only eo9:time,eo9:fs $ cruncher",
-        "--allow [{segment: 0",
-        r#"--names ["unclosed"#,
-        r#"echo "unterminated"#,
-        r#"echo "bad \q escape""#,
-        "echo --",
-        "",
-        "   \t ",
+        ("virtualfs --dir /tmp/sandbox $ browser --url https://example.com", true),
+        ("only eo9:time,eo9:fs$cruncher", true),
+        ("let det-env = (time.frozen & virtualnet)", true),
+        (r#"echo --text "a \"b\" \\ c\nd" "#, true),
+        (r#"fetch --url "https://example.com?a=b&c=d""#, true),
+        ("browser # composed, then run by the shell", true),
+        ("# a whole-line comment", true),
+        ("time.monotonic-stub eo9:fs/fs@0.1.0 virtualfs.create", true),
+        ("pci.admit-address --allow [{segment: 0, bus: 0, device: 1, function: 0}] $ lspci", true),
+        ("--pairs [[1, 2], [3, 4]] --opts {a: some(1), b: (5)}", false),
+        (r#"--names ["a]b", "c,{d", "e\"]f"]"#, false),
+        (r#"--allow "[{segment: 0, bus: 0}]""#, false),
+        ("only eo9:time,eo9:fs $ cruncher", true),
+        ("--allow [{segment: 0", false),
+        (r#"--names ["unclosed"#, false),
+        (r#"echo "unterminated"#, false),
+        (r#"echo "bad \q escape""#, false),
+        ("echo --", false),
+        ("", true),
+        ("   \t ", true),
         // parse.rs tests
-        "(virtualfs --dir /tmp/sandbox) $ (browser --url https://example.com)",
-        "virtualfs $ virtualnet $ browser",
-        "virtualfs $ (virtualnet $ browser)",
-        "(virtualnet $ virtualfs) $ browser",
-        "time.monotonic-stub & virtualnet $ app",
-        "x & y & z",
-        "(x & y) & z",
-        "posix-base & loopback-net --port 8080 $ app",
-        "interpret (virtualnet $ browser)",
-        "interpret virtualnet $ browser",
-        r#"run --program (net.none $ browser) --label "my run" --retries 3"#,
-        "only eo9:time,eo9:fs $ cruncher --input data.bin",
-        "only sandbox.no-net $ only eo9:fs $ app",
-        "only eo9:fs $ virtualnet $ browser",
-        "realfs $ only eo9:fs $ app",
-        "rename eo9:fs/fs scratch-fs $ tool",
-        "with realfs as system-fs, memfs as scratch-fs $ backup-tool --src /home --dst /backups",
-        "with (a, b) as (x, y) $ tool",
-        "with a as x, b as y $ tool",
-        "with (realnet & nat) as net, memfs & overlay as scratch $ app",
-        "with (a, b, c) as (x, y) $ tool",
-        "detach ticker = cruncher --rounds 50 restart restart.never",
-        "detach worker = cruncher restart restart.backoff --max-restarts 5 --base-delay-ms 200",
-        "detach worker = cruncher restart (restart.backoff --max-restarts 5 --base-delay-ms 200)",
-        "detach greeter = time.frozen $ hello --name svc restart restart.always",
-        "detach r = restart restart restart.never",
-        "detach r = (restart --mode soft) restart restart.never",
-        "svc",
-        "svc list",
-        "svc log ticker",
-        "svc stop ticker",
-        "svc clear ticker",
-        "svc restart ticker",
-        "only eo9:fs cruncher",
-        "rename a b",
-        "with memfs as scratch",
-        "interpret (only eo9:fs $ cruncher)",
-        "let det-env = time.monotonic-stub & virtualnet",
-        "save mything = entropy.seeded $ rng",
-        "save x rng",
-        "let x memfs",
-        "help",
-        "env",
-        "env readwrite",
-        "env net.deny $ fetcher",
-        "history",
-        "exit",
-        "quit",
-        "poweroff",
-        "describe net.none $ browser",
-        "imports browser",
-        "net.deny $ fetcher --url https://example.com",
-        "describe eo9:pci",
-        "describe eo9:pci/pci",
-        "describe eo9:fs/fs@0.1.0",
-        "describe (eo9:pci)",
-        "describe eo9:pci $ hello",
-        "describe describe",
-        "describe hello",
-        "interpret (virtualnet $ browser",
-        "with",
-        "echo --text as",
-        r#"echo --text "as""#,
-        "browser ) extra",
-        "browser --url",
-        "virtualfs.create",
-        "fs.memfs $ time.frozen $ app",
+        ("(virtualfs --dir /tmp/sandbox) $ (browser --url https://example.com)", true),
+        ("virtualfs $ virtualnet $ browser", true),
+        ("virtualfs $ (virtualnet $ browser)", true),
+        ("(virtualnet $ virtualfs) $ browser", true),
+        ("time.monotonic-stub & virtualnet $ app", true),
+        ("x & y & z", true),
+        ("(x & y) & z", true),
+        ("posix-base & loopback-net --port 8080 $ app", true),
+        ("interpret (virtualnet $ browser)", true),
+        ("interpret virtualnet $ browser", true),
+        (r#"run --program (net.none $ browser) --label "my run" --retries 3"#, true),
+        ("only eo9:time,eo9:fs $ cruncher --input data.bin", true),
+        ("only sandbox.no-net $ only eo9:fs $ app", true),
+        ("only eo9:fs $ virtualnet $ browser", true),
+        ("realfs $ only eo9:fs $ app", true),
+        ("rename eo9:fs/fs scratch-fs $ tool", true),
+        ("with realfs as system-fs, memfs as scratch-fs $ backup-tool --src /home --dst /backups", true),
+        ("with (a, b) as (x, y) $ tool", true),
+        ("with a as x, b as y $ tool", true),
+        ("with (realnet & nat) as net, memfs & overlay as scratch $ app", true),
+        ("with (a, b, c) as (x, y) $ tool", false),
+        ("detach ticker = cruncher --rounds 50 restart restart.never", true),
+        ("detach worker = cruncher restart restart.backoff --max-restarts 5 --base-delay-ms 200", true),
+        ("detach worker = cruncher restart (restart.backoff --max-restarts 5 --base-delay-ms 200)", true),
+        ("detach greeter = time.frozen $ hello --name svc restart restart.always", true),
+        ("detach r = restart restart restart.never", true),
+        ("detach r = (restart --mode soft) restart restart.never", true),
+        ("svc", true),
+        ("svc list", true),
+        ("svc log ticker", true),
+        ("svc stop ticker", true),
+        ("svc clear ticker", true),
+        ("svc restart ticker", false),
+        ("only eo9:fs cruncher", false),
+        ("rename a b", false),
+        ("with memfs as scratch", false),
+        ("interpret (only eo9:fs $ cruncher)", true),
+        ("let det-env = time.monotonic-stub & virtualnet", true),
+        ("save mything = entropy.seeded $ rng", true),
+        ("save x rng", false),
+        ("let x memfs", false),
+        ("help", true),
+        ("env", true),
+        ("env readwrite", true),
+        ("env net.deny $ fetcher", true),
+        ("history", true),
+        ("exit", true),
+        ("quit", true),
+        ("poweroff", true),
+        ("describe net.none $ browser", true),
+        ("imports browser", true),
+        ("net.deny $ fetcher --url https://example.com", true),
+        ("describe eo9:pci", true),
+        ("describe eo9:pci/pci", true),
+        ("describe eo9:fs/fs@0.1.0", true),
+        ("describe (eo9:pci)", true),
+        ("describe eo9:pci $ hello", true),
+        ("describe describe", true),
+        ("describe hello", true),
+        ("interpret (virtualnet $ browser", false),
+        ("with", false),
+        ("echo --text as", false),
+        (r#"echo --text "as""#, true),
+        ("browser ) extra", false),
+        ("browser --url", false),
+        ("virtualfs.create", true),
+        ("fs.memfs $ time.frozen $ app", true),
         // session.rs tests
-        "browser --url https://example.com",
-        "det-env $ app",
-        "detach .hidden = cruncher restart restart.never",
-        "detach t = time.frozen restart restart.never",
-        "detach t = timeit hello restart restart.never",
-        "detach w = worker restart restart.never",
-        "detach worker = cruncher --rounds 5 restart restart.never",
-        "detach worker = cruncher --seed 1 --rounds 5 restart restart.never",
-        "describe (help)",
-        "describe eo9:fs",
-        "describe eo9:fs/fs",
-        "describe eo9:nope",
-        "describe memfs",
-        "env reader",
-        "gpu.virtio  $  (draw)",
-        "gpu.virtio $ draw",
-        "hello --name a",
-        "outcomes --mode fail",
-        "outcomes --mode trap",
-        "imports memfs",
-        "let b = browser --url https://example.com",
-        "let det = time.frozen & entropy.seeded",
-        "let h = hello",
-        "let t = time.frozen",
-        "save ../escape = rng",
-        "save mine = rng",
-        "save x = y",
-        "svc clear worker",
-        "svc log ghost",
-        "svc stop worker",
-        "time.frozen $ a",
-        "timeit hello",
-        "# comment only",
+        ("browser --url https://example.com", true),
+        ("det-env $ app", true),
+        ("detach .hidden = cruncher restart restart.never", true),
+        ("detach t = time.frozen restart restart.never", true),
+        ("detach t = timeit hello restart restart.never", true),
+        ("detach w = worker restart restart.never", true),
+        ("detach worker = cruncher --rounds 5 restart restart.never", true),
+        ("detach worker = cruncher --seed 1 --rounds 5 restart restart.never", true),
+        ("describe (help)", true),
+        ("describe eo9:fs", true),
+        ("describe eo9:fs/fs", true),
+        ("describe eo9:nope", true),
+        ("describe memfs", true),
+        ("env reader", true),
+        ("gpu.virtio  $  (draw)", true),
+        ("gpu.virtio $ draw", true),
+        ("hello --name a", true),
+        ("outcomes --mode fail", true),
+        ("outcomes --mode trap", true),
+        ("imports memfs", true),
+        ("let b = browser --url https://example.com", true),
+        ("let det = time.frozen & entropy.seeded", true),
+        ("let h = hello", true),
+        ("let t = time.frozen", true),
+        ("save ../escape = rng", true),
+        ("save mine = rng", true),
+        ("save x = y", true),
+        ("svc clear worker", true),
+        ("svc log ghost", true),
+        ("svc stop worker", true),
+        ("time.frozen $ a", true),
+        ("timeit hello", true),
+        ("# comment only", true),
         // builtin-card usage examples
-        "let det = time.frozen & entropy.seeded --seed 7",
-        "save frozen-hello = time.frozen --now-seconds 5 --monotonic-ns 0 $ hello",
-        "detach worker = cruncher --rounds 100000 restart restart.never",
-        "entropy.seeded --seed 7 $ rng --count 2",
-        "time.frozen --now-seconds 0 --monotonic-ns 0 & entropy.seeded --seed 7",
-        "only eo9:text,eo9:time $ hello",
-        "rename eo9:fs/fs upper $ fs.overlay",
-        "with fs.memfs as upper, fs.readonly as lower $ fs.overlay $ ls /",
-        "describe entropy.seeded",
-        "imports entropy.seeded $ rng",
+        ("let det = time.frozen & entropy.seeded --seed 7", true),
+        ("save frozen-hello = time.frozen --now-seconds 5 --monotonic-ns 0 $ hello", true),
+        ("detach worker = cruncher --rounds 100000 restart restart.never", true),
+        ("entropy.seeded --seed 7 $ rng --count 2", true),
+        ("time.frozen --now-seconds 0 --monotonic-ns 0 & entropy.seeded --seed 7", true),
+        ("only eo9:text,eo9:time $ hello", true),
+        ("rename eo9:fs/fs upper $ fs.overlay", true),
+        ("with fs.memfs as upper, fs.readonly as lower $ fs.overlay $ ls /", true),
+        ("describe entropy.seeded", true),
+        ("imports entropy.seeded $ rng", true),
         // man (the manuals builtin: exactly one token)
-        "man telnetd",
-        "man net.l4.over-l2",
-        "man hello",
-        "man describe",
-        "man let",
-        "man as",
-        "man only",
-        "man $",
-        "man &",
-        "man eo9:fs/fs",
-        "man eo9:fs/fs@0.1.0",
-        "man [a]",
-        "man -x",
-        "man hello # trailing comment",
-        "man",
-        "man a b",
-        "man (hello)",
-        "man hello --flag x",
-        "man net.virtio $ l2check",
-        "man \"quoted\"",
-        "man --x",
-        "manx",
-        "man let = x",
+        ("man telnetd", true),
+        ("man net.l4.over-l2", true),
+        ("man hello", true),
+        ("man describe", true),
+        ("man let", true),
+        ("man as", true),
+        ("man only", true),
+        ("man $", true),
+        ("man &", true),
+        ("man eo9:fs/fs", true),
+        ("man eo9:fs/fs@0.1.0", true),
+        ("man [a]", true),
+        ("man -x", true),
+        ("man hello # trailing comment", true),
+        ("man", false),
+        ("man a b", false),
+        ("man (hello)", false),
+        ("man hello --flag x", false),
+        ("man net.virtio $ l2check", false),
+        ("man \"quoted\"", false),
+        ("man --x", false),
+        ("manx", true),
+        ("man let = x", false),
         // edge lines from the grammar review
-        "only(a)$x",
-        "only[a] $ x",
-        "letx=y",
-        "lets go",
-        "help x",
-        "env x = y",
-        "echo only",
-        "echo ---x",
-        "echo --- x",
-        "echo -",
-        "-x",
-        "a--b",
-        "describe only",
-        "describe with",
-        "describe let",
-        "describe rename",
-        "describe $",
-        "describe &",
-        "describe as",
-        "describe $ x",
-        "describe only extra",
-        "describe",
-        "[a] x",
-        "[a][b]",
-        "[]]",
-        "a (b) c",
-        "x $ env",
-        "a&b$c",
-        "a & only x $ y",
-        "((((a))))",
-        "()",
-        "svc log only",
-        "svc [x]",
-        "svc log [a]",
-        "svc log",
-        "let [n] = x",
-        "only [a] $ x",
-        "with (a) as x $ t",
-        "with (a) as (x) $ t",
-        "with (a) & b as x $ t",
-        "with a & b as x $ t",
-        "with a $ b as x $ t",
-        "with (a $ b, c) as (x, y) $ t",
-        "detach n = x restart",
-        "detach n = restart x",
-        "imports",
-        "let x = ",
-        "a --url",
-        "--url x",
-        r#""quoted" command"#,
-        "a $ ",
-        "a & ",
-        "a = b",
-        "rename a b $ c",
-        "only a , b $ c",
-        "héllo --señor niño",
-        "echo \"héllo\"",
-        "x # trailing é comment",
-        "browser#c",
-        "let x#c",
-        "a\tb",
-        "a\u{b}b",
-        "exit now",
-        "history --all",
-        "poweroff x",
-        "env (x",
-        "imports (a $ b)",
+        ("only(a)$x", false),
+        ("only[a] $ x", true),
+        ("letx=y", false),
+        ("lets go", true),
+        ("help x", false),
+        ("env x = y", false),
+        ("echo only", false),
+        ("echo ---x", false),
+        ("echo --- x", true),
+        ("echo -", true),
+        ("-x", true),
+        ("a--b", true),
+        ("describe only", true),
+        ("describe with", true),
+        ("describe let", true),
+        ("describe rename", true),
+        ("describe $", true),
+        ("describe &", true),
+        ("describe as", false),
+        ("describe $ x", false),
+        ("describe only extra", false),
+        ("describe", false),
+        ("[a] x", true),
+        ("[a][b]", true),
+        ("[]]", true),
+        ("a (b) c", true),
+        ("x $ env", true),
+        ("a&b$c", true),
+        ("a & only x $ y", false),
+        ("((((a))))", true),
+        ("()", false),
+        ("svc log only", false),
+        ("svc [x]", false),
+        ("svc log [a]", true),
+        ("svc log", false),
+        ("let [n] = x", true),
+        ("only [a] $ x", true),
+        ("with (a) as x $ t", true),
+        ("with (a) as (x) $ t", false),
+        ("with (a) & b as x $ t", false),
+        ("with a & b as x $ t", true),
+        ("with a $ b as x $ t", false),
+        ("with (a $ b, c) as (x, y) $ t", true),
+        ("detach n = x restart", false),
+        ("detach n = restart x", false),
+        ("imports", false),
+        ("let x = ", false),
+        ("a --url", false),
+        ("--url x", false),
+        (r#""quoted" command"#, false),
+        ("a $ ", false),
+        ("a & ", false),
+        ("a = b", false),
+        ("rename a b $ c", true),
+        ("only a , b $ c", true),
+        ("héllo --señor niño", true),
+        ("echo \"héllo\"", true),
+        ("x # trailing é comment", true),
+        ("browser#c", true),
+        ("let x#c", false),
+        ("a\tb", true),
+        ("a\u{b}b", true),
+        ("exit now", false),
+        ("history --all", false),
+        ("poweroff x", false),
+        ("env (x", false),
+        ("imports (a $ b)", true),
     ];
 
-    /// THE SOUNDNESS GATE (the design's one invariant): everything parse_command
-    /// accepts, the incremental grammar accepts — with the empty vocabulary AND a
-    /// populated one (soundness must never depend on what is completable).
+    /// THE ONE-PARSER GATE, as direct pins: every corpus line's accept/reject verdict
+    /// holds — with the empty vocabulary AND a populated one (the language must never
+    /// depend on what is completable) — and on green lines `parse_command` (the
+    /// driver) and the grammar agree on the constructed Command regardless of
+    /// vocabulary (hints can never change the value).
     #[test]
-    fn differential_superset_on_corpus() {
+    fn corpus_verdicts_are_pinned() {
         let empty = Vocab::default();
         let fake = fake_vocab();
         let mut failures = Vec::new();
         let mut positives = 0usize;
-        for line in CORPUS {
-            if parse_command(line).is_ok() {
+        for &(line, ok) in CORPUS {
+            if inc_accepts(&fake, line) != ok {
+                failures.push(format!("verdict flip (fake vocab, want {ok}): {line:?}"));
+                continue;
+            }
+            if inc_accepts(&empty, line) != ok {
+                failures.push(format!("verdict flip (empty vocab, want {ok}): {line:?}"));
+                continue;
+            }
+            if parse_command(line).is_ok() != ok {
+                failures.push(format!("driver verdict flip (want {ok}): {line:?}"));
+                continue;
+            }
+            if ok {
                 positives += 1;
-                if !inc_accepts(&empty, line) {
-                    failures.push(format!("FALSE RED (empty vocab): {line:?}"));
-                }
-                if !inc_accepts(&fake, line) {
-                    failures.push(format!("FALSE RED (fake vocab): {line:?}"));
+                let driver = parse_command(line).expect("checked");
+                match inc_parse(&fake, line) {
+                    Some(got) if got == driver => {}
+                    other => failures.push(format!(
+                        "value disagreement: {line:?}\n  driver: {driver:?}\n  grammar(fake vocab): {other:?}"
+                    )),
                 }
             }
         }
@@ -1077,48 +1410,6 @@ mod tests {
             "corpus shrank? only {positives} positive lines"
         );
         assert!(failures.is_empty(), "{}", failures.join("\n"));
-    }
-
-    /// The reverse direction is informational: where the incremental grammar is looser
-    /// than eosh, the line must be on the documented-loose list — today exactly the
-    /// `detach` restart clause (any flavor of its absence/garbling).
-    #[test]
-    fn looseness_is_exactly_the_documented_list() {
-        let vocab = fake_vocab();
-        let mut undocumented = Vec::new();
-        let mut loose = 0usize;
-        for line in CORPUS {
-            if parse_command(line).is_err() && inc_accepts(&vocab, line) {
-                loose += 1;
-                if !line.trim_start().starts_with("detach") {
-                    undocumented.push(*line);
-                }
-            }
-        }
-        println!("corpus looseness: {loose} lines (all detach)");
-        assert!(
-            undocumented.is_empty(),
-            "undocumented looseness: {undocumented:?}"
-        );
-        // And the canonical loose line really is loose (so the doc stays honest).
-        let no_restart = "detach ticker = cruncher --rounds 50";
-        assert!(parse_command(no_restart).is_err());
-        assert!(inc_accepts(&vocab, no_restart));
-    }
-
-    /// Exact agreement pinned on the corpus lines that must be RED: everything
-    /// parse_command rejects except the documented-loose detach lines.
-    #[test]
-    fn tight_on_non_detach_negatives() {
-        let vocab = fake_vocab();
-        for line in CORPUS {
-            if parse_command(line).is_err() && !line.trim_start().starts_with("detach") {
-                assert!(
-                    !inc_accepts(&vocab, line),
-                    "must reject (eosh rejects): {line:?}"
-                );
-            }
-        }
     }
 
     /// A deterministic xorshift64* generator — no Date/now, no rand dependency.
@@ -1137,10 +1428,12 @@ mod tests {
         }
     }
 
-    /// Fuzzed differential: token-soup lines, raw byte lines, and corpus mutations.
-    /// Same implication as the corpus test; reverse disagreements must be detach.
+    /// Fuzzed self-differential: token-soup lines, raw byte lines, and corpus
+    /// mutations — the driver (`parse_command`) and the raw grammar must agree on
+    /// acceptance and value, with the empty and the populated vocabulary, on ~12k
+    /// generated lines (also a no-panic/no-blowup sweep over hostile input).
     #[test]
-    fn differential_superset_fuzzed() {
+    fn fuzzed_driver_grammar_agreement() {
         const TOKENS: &[&str] = &[
             "hello",
             "time.frozen",
@@ -1220,7 +1513,7 @@ mod tests {
         }
         // Corpus mutations: replace, insert, or delete one byte.
         for _ in 0..5000 {
-            let base = CORPUS[rng.below(CORPUS.len())];
+            let base = CORPUS[rng.below(CORPUS.len())].0;
             let mut bytes = base.as_bytes().to_vec();
             let mutation = rng.below(3);
             let printable = (0x20 + rng.below(0x5f)) as u8;
@@ -1242,34 +1535,21 @@ mod tests {
         }
 
         let mut positives = 0usize;
-        let mut loose = 0usize;
         let mut failures = Vec::new();
         for line in &lines {
-            let core = parse_command(line);
-            let inc = inc_accepts(&fake, line);
-            match core {
-                Ok(_) => {
-                    positives += 1;
-                    if !inc {
-                        failures.push(format!("FALSE RED: {line:?}"));
-                    }
-                    if !inc_accepts(&empty, line) {
-                        failures.push(format!("FALSE RED (empty vocab): {line:?}"));
-                    }
-                }
-                Err(err) if inc => {
-                    loose += 1;
-                    if !line.trim_start().starts_with("detach") {
-                        failures.push(format!("undocumented looseness: {line:?} (eosh: {err:?})"));
-                    }
-                }
-                Err(_) => {}
+            let driver = parse_command(line).ok();
+            let grammar_fake = inc_parse(&fake, line);
+            let grammar_empty = inc_parse(&empty, line);
+            if driver != grammar_fake || driver != grammar_empty {
+                failures.push(format!(
+                    "disagreement: {line:?}\n  driver: {driver:?}\n  grammar(fake): {grammar_fake:?}\n  grammar(empty): {grammar_empty:?}"
+                ));
+            }
+            if driver.is_some() {
+                positives += 1;
             }
         }
-        println!(
-            "fuzz: {} lines, {positives} eosh-positive, {loose} loose (detach)",
-            lines.len()
-        );
+        println!("fuzz: {} lines, {positives} positive", lines.len());
         assert!(positives >= 300, "fuzz generator degenerated: {positives}");
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
@@ -1368,7 +1648,7 @@ mod tests {
             );
             checked += 1;
         };
-        for line in CORPUS {
+        for (line, _) in CORPUS {
             check(line);
         }
         // Token soup biased toward flag/value shapes.
@@ -1555,7 +1835,7 @@ mod tests {
         let vocab = fake_vocab();
         let mut states = 0usize;
         let mut residual = 0usize;
-        for line in CORPUS {
+        for (line, _) in CORPUS {
             let mut parser = command_line(&vocab);
             residual += sanity_check(&*parser);
             states += 1;
@@ -1750,16 +2030,15 @@ mod tests {
             assert!(parse_command(line).is_ok(), "corpus assumption: {line:?}");
             assert!(inc_accepts(&vocab, line), "must be green: {line:?}");
         }
-        // The documented-loose detach forms (eosh red, incremental green).
+        // The once-loose detach forms: with the single parser the restart clause is
+        // required for real — these are red here exactly as they failed in eosh.
         for line in [
             "detach ticker = cruncher --rounds 50",
             "detach n = x restart",
+            "detach n = (a restart b)",
         ] {
-            assert!(matches!(
-                parse_command(line),
-                Err(ParseError::DetachNeedsRestart) | Err(ParseError::UnexpectedEnd { .. })
-            ));
-            assert!(inc_accepts(&vocab, line), "documented loose: {line:?}");
+            assert!(parse_command(line).is_err(), "corpus assumption: {line:?}");
+            assert!(!inc_accepts(&vocab, line), "must be red now: {line:?}");
         }
     }
 }
