@@ -90,16 +90,23 @@ kbd = usb.ohci --region usb-host0-ohci $ usb.kbd restart restart.always
 console = eosh use l4=lan
 ";
 
-/// The QEMU shape of station-net: the virtio NIC under slirp's default layout
-/// (10.0.2.15/24, gateway 10.0.2.2 — the middleware's documented default, no
-/// configuration needed). Boot it with `station-net pci` (the check-share gate's curl
-/// leg). The keyboard service is the board profile's line (and check-station's QEMU
+/// The QEMU shape of station-net: the virtio NIC with `--address dhcp` on the tail
+/// provider, acquiring slirp's built-in DHCP service's lease (10.0.2.15/24, gateway
+/// 10.0.2.2, DNS 10.0.2.3 — the addressing the unconfigured default would also yield,
+/// and the lease's DNS server is what the gated `dns-servers` leg asserts). The flag is
+/// deliberate regression coverage, making this line the exact twin of the board's: a
+/// share-owning service's tail segment is a provider whose flags must route to
+/// `configure` (not `main` — a factory service has none). The flag-less spelling once
+/// let this class pass QEMU and fail on silicon, so the QEMU battery must exercise the
+/// flagged-tail share shape (check-share leg 3; the flag-less share shape stays covered
+/// by `gatedemo`). Boot it with `station-net pci` (the check-share gate's curl leg).
+/// The keyboard service is the board profile's line (and check-station's QEMU
 /// subject); this config keeps the QEMU gate transcript single-subject.
 #[cfg(not(feature = "board-opi5plus"))]
 const STATION_NET_SERVICES_CONFIG: &str = "\
 # the net station (the `station-net` boot token): init owns the net stack; the console
 # children reach it through the kernel call gate.
-lan = net.virtio $ net.l4.over-l2 share eo9:net/l4 restart restart.always
+lan = net.virtio $ net.l4.over-l2 --address dhcp share eo9:net/l4 restart restart.always
 console = eosh use l4=lan
 ";
 
