@@ -6134,7 +6134,7 @@ fn check_share(root: &Path) -> Result<(), String> {
     outcome?;
 
     println!(
-        "xtask: check-share ok — the kernel call gate end to end: R2 PASS; bare          sockcheck through a loopback share with typed severance; bare curl through the          init-owned virtio net stack ({} fixture bytes, no composition typed anywhere)",
+        "xtask: check-share ok — the kernel call gate end to end: R2 PASS; bare          sockcheck through a loopback share with typed severance; bare curl through the          init-owned virtio net stack ({} fixture bytes); and bare `curl example.com`          resolved through the gated dns-servers + UDP DNS path (no composition typed          anywhere)",
         CURL_FIXTURE_BODY.len()
     );
     Ok(())
