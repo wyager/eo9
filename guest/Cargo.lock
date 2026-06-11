@@ -397,6 +397,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-example-stickflash"
+version = "0.0.0"
+dependencies = [
+ "eo9-fatwalk",
+ "eo9-flashwire",
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-example-telnetd"
 version = "0.0.0"
 dependencies = [
@@ -436,6 +446,10 @@ dependencies = [
  "eo9-guest",
  "wit-bindgen",
 ]
+
+[[package]]
+name = "eo9-fatwalk"
+version = "0.1.0"
 
 [[package]]
 name = "eo9-flashwire"

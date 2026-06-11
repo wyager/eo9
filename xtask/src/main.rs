@@ -134,6 +134,7 @@ const MANUALED_COMPONENTS: &[&str] = &[
     "eo9-example-curl",
     "eo9-stub-usb-msd",
     "eo9-stub-disk-part",
+    "eo9-example-stickflash",
 ];
 
 /// Manual-validation rule version, part of the componentize stamp so changing the
@@ -310,6 +311,13 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // `kexec` token:
     //   net.virtio $ net.l4.over-l2 $ oskexec --secret <16+ bytes> --bootargs "pci"
     ("eo9-example-oskexec", "oskexec"),
+    // The boot-stick rewriter (docs/board/usb-msd-plan.md §4, oskexec's sibling —
+    // same eo9-flashwire wire, the fatwalk-over-disk sink, read-back-verified):
+    //   net.virtio $ net.l4.over-l2 $ usb.ohci-pci $ usb.msd $ disk.part --partition 1
+    //     $ stickflash --secret <16+ bytes>
+    // `check-stickflash` is the scripted QEMU gate (slirp hostfwd to :9910, a
+    // build-stick scratch image on usb-storage, send_image.py --stick from the host).
+    ("eo9-example-stickflash", "stickflash"),
     // The two-stack transport check, so the full shared-link payoff runs at the metal
     // prompt — two l4 stacks, each riding its own switch port, each resolving real DNS
     // (one physical NIC, two virtual MACs, two IP stacks; plan/09 D31):
@@ -480,6 +488,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         "check-share" => {
             expect_no_args("check-share", rest)?;
             check_share(&root)
+        }
+        "check-stickflash" => {
+            expect_no_args("check-stickflash", rest)?;
+            check_stickflash(&root)
         }
         "check-part" => {
             expect_no_args("check-part", rest)?;
@@ -702,6 +714,17 @@ COMMANDS:
                          refusal after `svc stop lan`; the station-net boot (virtio share)
                          with a bare `curl` fetching a host fixture — no composition typed
                          anywhere.
+    check-stickflash     Build a scratch boot stick with `build-stick` (a patterned dummy
+                         EO9.IMG in a 2 MiB slot), attach it as usb-storage on a pci-ohci
+                         bus next to the slirp NIC, and drive the full network stick
+                         rewrite at the serial eosh prompt: the refusal arm first (wrong
+                         secret twice -> typed refusals, no writes, the stick file
+                         byte-identical after QEMU exits), then the flash arm (a DIFFERENT
+                         patterned image sent with send_image.py --stick: transfer
+                         narration, the fatwalk write plan, read-back CRC verify, the 'K'
+                         verdict) — and after QEMU exits, EO9.IMG inside the stick file
+                         must BE the sent padded variant (walked with eo9-fatwalk
+                         host-side) with BOOT.SCR untouched
     check-curl           Boot the same machine (no host-forward needed: the guest dials
                          out), serve a fixture file from a loopback-bound
                          `python3 -m http.server` on an OS-assigned port, drive
@@ -956,9 +979,9 @@ fn build(root: &Path) -> Result<(), String> {
     // checking it against the bare-metal target. This runs after the kernel build so
     // rustup has already ensured that target is installed for the pinned toolchain (the
     // root workspace's rust-toolchain.toml does not list it; the kernel's does).
-    // eo9-fatwalk and eo9-flashwire ride the same check: fatwalk's guest consumer
-    // (stickflash, usb-msd-plan L5) is not in the tree yet and oskexec covers only
-    // flashwire, so the no_std claims must not silently rot in the meantime.
+    // eo9-fatwalk and eo9-flashwire ride the same check: their guest consumers
+    // (stickflash for both, oskexec for flashwire) build only for wasm32, so the
+    // bare-metal no_std claims must not silently rot.
     run(
         root,
         "cargo",
@@ -6359,6 +6382,26 @@ fn spawn_net_qemu(
     ),
     String,
 > {
+    spawn_net_qemu_with(cmd, root, image, append, netdev, &[])
+}
+
+/// [`spawn_net_qemu`] plus arbitrary extra QEMU arguments (check-stickflash hangs a
+/// pci-ohci controller and a usb-storage stick off the same machine).
+fn spawn_net_qemu_with(
+    cmd: &str,
+    root: &Path,
+    image: &Path,
+    append: &str,
+    netdev: &str,
+    extra_args: &[String],
+) -> Result<
+    (
+        std::process::Child,
+        std::process::ChildStdin,
+        std::sync::mpsc::Receiver<u8>,
+    ),
+    String,
+> {
     use std::sync::mpsc;
 
     let mut command = Command::new("qemu-system-aarch64");
@@ -6372,6 +6415,7 @@ fn spawn_net_qemu(
         .args(["-append", append])
         .args(["-netdev", netdev])
         .args(["-device", "virtio-net-pci,netdev=eo9net,disable-legacy=on"])
+        .args(extra_args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
@@ -6959,6 +7003,345 @@ fn check_kexec(root: &Path) -> Result<(), String> {
         "xtask: check-kexec ok — kernel A granted kexec, oskexec authenticated and \
          staged kernel B over tcp:127.0.0.1:{host_port}, the dance jumped, and kernel \
          B's `{KEXEC_B_STAMP}` banner came up on the same serial stream"
+    );
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------------------
+// check-stickflash: headless end-to-end verification of the network boot-stick rewrite
+// (docs/board/usb-msd-plan.md L5/L6 — the whole §0 chain minus silicon and minus the
+// reboot-from-stick leg): eo9-flashwire over slirp, usb.msd over pci-ohci, disk.part's
+// partition window, eo9-fatwalk's write plan, read-back CRC verification. Two QEMU boots
+// over ONE scratch stick image built by `cargo xtask build-stick`:
+//
+//   arm 1 (refusal): send_image --stick with a WRONG secret, twice — typed refusal
+//   narration, the one-retry exit, and after QEMU exits the stick file must be
+//   byte-identical (a refused session never writes);
+//   arm 2 (flash): send a DIFFERENT patterned image with the right secret — slot
+//   discovery, transfer narration, the write plan, read-back CRC ok, the 'K' verdict,
+//   `ok: flashed(`; after QEMU exits, EO9.IMG inside the stick file must BE the sent
+//   variant (padded to the slot, walked back out with eo9-fatwalk host-side) and
+//   BOOT.SCR must be untouched (v1 never rewrites it — the crc32-gate follow-up does).
+// ----------------------------------------------------------------------------------------
+
+/// stickflash's default listen port inside the guest (eo9-flashwire's 9910).
+const STICKFLASH_GUEST_PORT: u16 = 9910;
+/// The gate's preshared secret (>= 16 bytes; typed at the eosh prompt and passed to
+/// send_image.py --stick).
+const STICKFLASH_SECRET: &str = "check-stickflash-preshared-secret";
+/// The refusal arm's wrong secret (also >= 16 bytes so send_image agrees to send it).
+const STICKFLASH_WRONG_SECRET: &str = "wrong-secret-0123456789abcdef";
+/// The gate stick's EO9.IMG slot: 2 MiB keeps the slirp transfer and the QD1 BOT flash
+/// quick while still crossing 32 ack boundaries and many READ/WRITE(10) chunks.
+const STICKFLASH_SLOT_MIB: u64 = 2;
+
+/// Deterministic patterned bytes for the gate's image variants. Offset-dependent and
+/// tag-distinguished: a write landing at the wrong offset (or the old image surviving)
+/// can never reproduce the expected bytes.
+fn stickflash_pattern(tag: u8, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| ((i as u64).wrapping_mul(0x9E37_79B1) >> 16) as u8 ^ tag)
+        .collect()
+}
+
+/// Walk `name` back out of a built stick image via eo9-fatwalk — the gate's host-side
+/// ground truth runs on the SAME crate the guest flasher plans with, against the same
+/// partition window build-stick's self-check uses.
+fn stick_file_bytes(stick: &[u8], name: &str) -> Result<Vec<u8>, String> {
+    let mut window = StickPartition {
+        bytes: stick,
+        offset: (STICK_PART_FIRST_LBA * 512) as usize,
+    };
+    let volume = eo9_fatwalk::Volume::open(&mut window)
+        .map_err(|err| format!("check-stickflash: the stick is not walkable: {err:?}"))?;
+    let map = volume
+        .locate(&mut window, name)
+        .map_err(|err| format!("check-stickflash: locate {name}: {err:?}"))?;
+    let runs = volume
+        .runs(&map, 0, u64::from(map.size))
+        .map_err(|err| format!("check-stickflash: runs for {name}: {err:?}"))?;
+    let mut bytes = Vec::with_capacity(map.size as usize);
+    for run in &runs {
+        let at = (STICK_PART_FIRST_LBA * 512 + run.lba * 512) as usize;
+        bytes.extend_from_slice(&stick[at..at + run.sectors as usize * 512]);
+    }
+    bytes.truncate(map.size as usize);
+    Ok(bytes)
+}
+
+fn check_stickflash(root: &Path) -> Result<(), String> {
+    let image = build_kernel(root, "aarch64")?;
+    let target = root.join("kernel").join("target");
+    let slot_bytes = (STICKFLASH_SLOT_MIB * 1024 * 1024) as usize;
+
+    // The two image variants: A is baked into the stick by build-stick; B is what the
+    // gate flashes over it. Different tags AND different (deliberately odd) lengths —
+    // the padding paths on both sides (build-stick for A, send_image --stick for B)
+    // must agree on the same fixed slot.
+    let a_bytes = stickflash_pattern(0x00, 1_400_000);
+    let b_bytes = stickflash_pattern(0xB5, 1_234_567);
+    let dummy_a = target.join("check-stickflash-a.img");
+    let variant_b = target.join("check-stickflash-b.img");
+    write_if_different(&dummy_a, &a_bytes)?;
+    write_if_different(&variant_b, &b_bytes)?;
+    let mut padded_a = a_bytes;
+    padded_a.resize(slot_bytes, 0);
+    let mut padded_b = b_bytes;
+    padded_b.resize(slot_bytes, 0);
+
+    let stick = target.join("eo9-stickflash-stick.img");
+    build_stick(
+        root,
+        &[
+            "--image".to_string(),
+            dummy_a.display().to_string(),
+            "--out".to_string(),
+            stick.display().to_string(),
+            "--slot-mib".to_string(),
+            STICKFLASH_SLOT_MIB.to_string(),
+        ],
+    )?;
+
+    // Ground truth before any boot: the baked EO9.IMG is padded A, and BOOT.SCR is
+    // captured for the untouched-after-flash assertion.
+    let built = std::fs::read(&stick)
+        .map_err(|err| format!("check-stickflash: reading {}: {err}", stick.display()))?;
+    if stick_file_bytes(&built, "EO9.IMG")? != padded_a {
+        return Err(String::from(
+            "check-stickflash: the freshly built stick's EO9.IMG is not the padded \
+             variant A (build-stick or the walker is broken)",
+        ));
+    }
+    let baseline_bootscr = stick_file_bytes(&built, "BOOT.SCR")?;
+    drop(built);
+
+    let composition = format!(
+        "net.virtio $ net.l4.over-l2 $ usb.ohci-pci $ usb.msd $ disk.part --partition 1 \
+         $ stickflash --secret {STICKFLASH_SECRET}"
+    );
+    let send_image_py = root
+        .join("boards")
+        .join("opi5-serial-loader")
+        .join("tools")
+        .join("send_image.py");
+    let send_stick = |host_port: u16, secret: &str, image: &Path| -> Result<bool, String> {
+        let status = Command::new("python3")
+            .current_dir(root)
+            .arg(&send_image_py)
+            .arg(image)
+            .arg("--stick")
+            .arg(format!("127.0.0.1:{host_port}"))
+            .arg("--secret")
+            .arg(secret)
+            .arg("--slot-mib")
+            .arg(STICKFLASH_SLOT_MIB.to_string())
+            .status()
+            .map_err(|err| format!("check-stickflash: running send_image.py: {err}"))?;
+        Ok(status.success())
+    };
+    let boot = |what: &str| -> Result<
+        (
+            std::process::Child,
+            std::process::ChildStdin,
+            std::sync::mpsc::Receiver<u8>,
+            u16,
+        ),
+        String,
+    > {
+        // A fresh derived host port per arm (gate lesson: never a fixed port).
+        let host_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|listener| listener.local_addr())
+            .map_err(|err| format!("check-stickflash: deriving a free host port: {err}"))?
+            .port();
+        println!("xtask: check-stickflash — {what} (hostfwd 127.0.0.1:{host_port})");
+        let devices = [
+            "-device".to_string(),
+            "pci-ohci,id=eo9ohci".to_string(),
+            "-drive".to_string(),
+            format!("file={},if=none,format=raw,id=stick", stick.display()),
+            "-device".to_string(),
+            "usb-storage,bus=eo9ohci.0,drive=stick".to_string(),
+        ];
+        let (child, stdin, receiver) = spawn_net_qemu_with(
+            "check-stickflash",
+            root,
+            &image,
+            "pci",
+            &format!("user,id=eo9net,hostfwd=tcp:127.0.0.1:{host_port}-:{STICKFLASH_GUEST_PORT}"),
+            &devices,
+        )?;
+        Ok((child, stdin, receiver, host_port))
+    };
+
+    // ----- arm 1: the refusal — wrong secret twice, the stick must be untouched -----
+    let (mut child, mut stdin, receiver, host_port) =
+        boot("arm 1 (refusal): wrong secret twice, the stick must stay untouched")?;
+    let drive = (|| -> Result<(), String> {
+        let wait =
+            |marker: &str, what: &str| serial_wait_for("check-stickflash", &receiver, marker, what);
+        wait("eosh>", "the eosh prompt")?;
+        console_type_line("check-stickflash", &mut stdin, &composition)?;
+        // The slot line proves the whole storage half of the chain before any network
+        // peer exists: usb.msd enumerated, disk.part windowed partition 1, fatwalk
+        // walked the FAT and located EO9.IMG at the fixed slot size.
+        wait(
+            &format!("stickflash: EO9.IMG slot {slot_bytes} bytes"),
+            "the FAT slot-discovery line",
+        )?;
+        wait(
+            &format!("stickflash: listening on :{STICKFLASH_GUEST_PORT}"),
+            "stickflash to start listening",
+        )?;
+        if send_stick(host_port, STICKFLASH_WRONG_SECRET, &variant_b)? {
+            return Err(String::from(
+                "check-stickflash: send_image.py --stick SUCCEEDED with the wrong \
+                 secret (the refusal arm must fail host-side)",
+            ));
+        }
+        wait(
+            "stickflash: authentication failed - refused",
+            "the first typed authentication refusal",
+        )?;
+        if send_stick(host_port, STICKFLASH_WRONG_SECRET, &variant_b)? {
+            return Err(String::from(
+                "check-stickflash: the second wrong-secret send SUCCEEDED",
+            ));
+        }
+        let refused = wait(
+            "no authenticated session within 2 attempts",
+            "stickflash's one-retry exit",
+        )?;
+        if !refused.contains("error:") {
+            return Err(String::from(
+                "check-stickflash: the one-retry exit appeared but not as a typed \
+                 error at the prompt (see the serial output above)",
+            ));
+        }
+        wait("eosh>", "the prompt after the refusal exit")?;
+        console_type_line("check-stickflash", &mut stdin, "exit")?;
+        Ok(())
+    })();
+    if let Err(err) = drive {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    let _ = child.wait();
+
+    // The stick file after the refusal arm: byte-identical, both files.
+    let after_refusal = std::fs::read(&stick)
+        .map_err(|err| format!("check-stickflash: re-reading {}: {err}", stick.display()))?;
+    if stick_file_bytes(&after_refusal, "EO9.IMG")? != padded_a {
+        return Err(String::from(
+            "check-stickflash: EO9.IMG CHANGED across the refusal arm — a refused \
+             session must never write",
+        ));
+    }
+    if stick_file_bytes(&after_refusal, "BOOT.SCR")? != baseline_bootscr {
+        return Err(String::from(
+            "check-stickflash: BOOT.SCR changed across the refusal arm",
+        ));
+    }
+    drop(after_refusal);
+    println!(
+        "xtask: check-stickflash — refusal arm ok: two typed refusals, the one-retry \
+         exit, and the stick file is byte-identical"
+    );
+
+    // ----- arm 2: the flash — variant B over the wire, verified end to end -----
+    let (mut child, mut stdin, receiver, host_port) =
+        boot("arm 2 (flash): variant B over send_image.py --stick")?;
+    let drive = (|| -> Result<(), String> {
+        let wait =
+            |marker: &str, what: &str| serial_wait_for("check-stickflash", &receiver, marker, what);
+        let tail = |text: &str, keep: usize| {
+            let start = text.len().saturating_sub(keep);
+            text[start..].to_string()
+        };
+        wait("eosh>", "the eosh prompt")?;
+        console_type_line("check-stickflash", &mut stdin, &composition)?;
+        let slot_line = wait(
+            &format!("stickflash: EO9.IMG slot {slot_bytes} bytes"),
+            "the FAT slot-discovery line",
+        )?;
+        println!(
+            "\n----- check-stickflash: the chain comes up (enumeration + slot) -----\n{}",
+            tail(&slot_line, 700)
+        );
+        wait(
+            &format!("stickflash: listening on :{STICKFLASH_GUEST_PORT}"),
+            "stickflash to start listening",
+        )?;
+        println!(
+            "xtask: check-stickflash — sending {} over tcp:127.0.0.1:{host_port}",
+            variant_b.display()
+        );
+        if !send_stick(host_port, STICKFLASH_SECRET, &variant_b)? {
+            return Err(String::from(
+                "check-stickflash: send_image.py --stick failed — see its output above",
+            ));
+        }
+        // By the time send_image saw 'K', every flash step already narrated; these
+        // waits drain the same serial stream in order and print the receipts.
+        wait(
+            &format!("stickflash: image {slot_bytes} bytes incoming"),
+            "the header acceptance line",
+        )?;
+        wait("stickflash: write plan:", "the write-plan line")?;
+        let verified = wait("matches the wire", "the read-back CRC verdict")?;
+        println!(
+            "\n----- check-stickflash: write + read-back verify -----\n{}",
+            tail(&verified, 900)
+        );
+        let outcome = wait("ok: flashed(", "the typed flashed outcome")?;
+        if !outcome.contains("Reset to boot it.") {
+            return Err(String::from(
+                "check-stickflash: the flashed outcome arrived without the \
+                 reset-to-boot-it narration",
+            ));
+        }
+        wait("eosh>", "the prompt after the flash")?;
+        console_type_line("check-stickflash", &mut stdin, "exit")?;
+        Ok(())
+    })();
+    if let Err(err) = drive {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    let _ = child.wait();
+
+    // The host-side byte verification: EO9.IMG inside the stick file IS the sent
+    // padded variant B, and BOOT.SCR is exactly what build-stick wrote.
+    let flashed = std::fs::read(&stick)
+        .map_err(|err| format!("check-stickflash: re-reading {}: {err}", stick.display()))?;
+    let final_img = stick_file_bytes(&flashed, "EO9.IMG")?;
+    if final_img != padded_b {
+        let first_diff = final_img
+            .iter()
+            .zip(padded_b.iter())
+            .position(|(have, want)| have != want);
+        return Err(format!(
+            "check-stickflash: EO9.IMG after the flash is NOT the sent variant B \
+             (length {} vs {}, first differing byte at {:?})",
+            final_img.len(),
+            padded_b.len(),
+            first_diff
+        ));
+    }
+    if stick_file_bytes(&flashed, "BOOT.SCR")? != baseline_bootscr {
+        return Err(String::from(
+            "check-stickflash: BOOT.SCR changed across the flash — v1 must leave it \
+             untouched (the crc32-gate rewrite is a recorded follow-up)",
+        ));
+    }
+
+    println!(
+        "xtask: check-stickflash ok — the wrong secret refused twice with the stick \
+         byte-identical, then variant B ({STICKFLASH_SLOT_MIB} MiB slot) flashed over \
+         tcp:127.0.0.1:{host_port}: write plan executed, read-back CRC matched the \
+         wire, 'K' answered, and host-side fatwalk confirms EO9.IMG IS the sent padded \
+         bytes with BOOT.SCR untouched"
     );
     Ok(())
 }
