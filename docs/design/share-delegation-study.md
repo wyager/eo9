@@ -154,3 +154,26 @@ Migration (cheap, pre-merge — area/41 is not on master yet):
 * **Inherited, unchanged:** `dns_servers: Option<Func>` (`gate.rs:870`) remains for old providers — honest version skew, no longer tail skew.
 * **Deferred:** `&` admitting a binary final layer (binary-that-serves via lifting); until then that case uses self-authored factory exports or spawn grants (M2's shape needs neither).
 * No new workarounds introduced by this study.
+
+## Postscript: the owner pushed past B (2026-06-10, settled in area/41)
+
+The recommendation above (B, `&`-lift with a get-only factory layer) was approved and
+then immediately superseded by the owner's sharper question: "ought we just expose the
+factory methods on the providers themselves, since `l4.factory` is basically a no-op
+signifier?" Final settled shape, implemented in area/41's respin:
+
+- The blessed `eo9:net/l4-factory` INTERFACE survives as the kernel's uniform mint
+  point and the R7 validation target — but no standalone component implements it.
+- Every l4 provider exports it natively (11-12 lines each; filtered's `get()` mints
+  filtered sessions, so policy sharing composes as a plain `stack $ net.l4.filtered`).
+- Serving compositions are plain provider chains plus the share clause; the marker
+  role the study assigned to `&` is carried (authoritatively) by the share grant —
+  export ≠ grant.
+- `&` retreats to retrofit duty: adding a factory to a third-party provider that
+  lacks one. Doctrine line as merged: "`$` seals — a provider-tailed chain serves;
+  `&` retrofits."
+- The B-vs-C spike (wac resource-type unification) was obviated: with no lift there
+  is no cross-component type-unification question.
+
+The analysis above stands as the reasoning record — particularly the D rejection
+(handle-as-capability primitive), which the final shape did not revisit.
