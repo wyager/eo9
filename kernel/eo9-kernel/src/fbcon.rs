@@ -17,23 +17,51 @@
 //!   policy is tee, not switch: serial transcripts remain the bench instrument.
 //!
 //! **Safety in all printing contexts.** The console itself is lock-free (uart.rs: every
-//! write goes straight to the MMIO registers); fbcon must not change that. The grid state
-//! is guarded by a try-enter flag, never a spinlock: if a print re-enters mid-tee (an
-//! exception handler or panic printing while a tee is in progress on the single boot
-//! core), the inner bytes skip the framebuffer — serial still carries them — instead of
-//! deadlocking. The panic path therefore prints to HDMI whenever the panic did not strike
-//! mid-tee, and never hangs when it did.
+//! write goes straight to the MMIO registers); fbcon must not change that. Tee bytes
+//! flow through a lock-free SPSC ring (the `rxring` discipline, mirrored): `tee_byte`
+//! always enqueues — a print re-entering mid-tee (an exception handler or an IRQ-context
+//! `kprintln!` landing while a render is in progress on the single boot core) parks its
+//! bytes in the ring instead of losing them, and the renderer behind the BUSY try-enter
+//! guard drains the ring when the interrupted render resumes. The only remaining drops
+//! are a full ring and the few-instruction producer window, both COUNTED and surfaced
+//! by a rate-limited `fbcon: N tee bytes dropped` note (the no-silent-loss doctrine);
+//! nothing ever blocks or deadlocks. The panic path clears the stale guards first
+//! (`panic_reset` — the pre-empted renderer never resumes), so the report reaches HDMI
+//! even when the panic struck mid-render.
 //!
 //! **Cost discipline.** Inactive (token absent): one relaxed load per byte on board
 //! builds, nothing at all elsewhere (the module compiles out of non-board kernels except
 //! for host tests). Active: bounded work per byte — at most two cell paints (glyph +
 //! cursor, ≤ 768 framebuffer bytes) except on a line-feed past the last row, which
 //! scrolls by repainting the grid from the 3000-byte shadow text (writes only; reading
-//! Device-nGnRnE memory back for a memmove would double the cost).
+//! Device-nGnRnE memory back for a memmove would double the cost), and on erase-to-EOL
+//! (CSI K), which black-fills at most one row of pixels.
 //!
-//! **Escape stripping.** The kernel emits no escape sequences today; a future colored
-//! print must not corrupt the grid, so ESC-led sequences (CSI through its final byte,
-//! two-byte ESC-x otherwise) are stripped, never rendered.
+//! **The CSI subset.** fbcon renders exactly the emission alphabet of the repo's
+//! console writers — the area/40 wrap-aware editor contract (the complete table in
+//! guest/eosh/eosh-inc/src/editor.rs module docs: `\b \b` same-row erase, `\r` to
+//! column 0, `\r\n` row advance on last-column fill, `ESC[K` EL0, `ESC[A` CUU,
+//! `ESC[<n>G` CHA, SGR 31/0 and 7/27 zero-width; 1 char = 1 cell; the board width is
+//! `COLS` = 100, const-asserted on their side) plus the kernel read-line echo
+//! (`\b \b` only):
+//!
+//! * **SGR** (`ESC [ … m`): parameter 31 sets the red pen, 0 (or no parameter) resets
+//!   to white; all other parameters — including the editor's zero-width 7/27 — are
+//!   ignored. Red breaks the grayscale (r=g=b) chroma-mangling immunity above — under
+//!   the boot-state-dependent link mismatch the mark renders wrong-hued but still
+//!   *distinct*, which is the marking's whole job; rendering `Marker::INVERSE`
+//!   (SGR 7/27) as true inverse video remains the colorspace-proof follow-up.
+//! * **CSI K** (parameter 0 or none): erase from the cursor to the end of the line.
+//! * **CSI A** (CUU): up one row, column preserved, clamped at the top — never a
+//!   reverse scroll. The editor emits it bare; an optional count is accepted
+//!   defensively (0 counts as 1).
+//! * **CSI G** (CHA): 1-based column set, clamped to `[1, COLS]` (0 counts as 1).
+//!   The editor's wrap-boundary backspace reaches the last column of the row above
+//!   with `ESC[<width>G`.
+//!
+//! Everything else ESC-led is consumed and ignored as before (CSI through its final
+//! byte — unknown finals, malformed parameter bytes and parameter overflows consume the
+//! whole sequence without effect — and two-byte ESC-x otherwise), never rendered.
 
 use crate::gfxfb;
 
@@ -159,6 +187,21 @@ fn glyph(cell: u8) -> &'static [u8; 8] {
     }
 }
 
+/// Cell attribute: the red pen (SGR 31) is set, white otherwise. Stored per cell in the
+/// shadow attribute plane so scroll and redraw reproduce the marking.
+const ATTR_RED: u8 = 1;
+
+/// Foreground bytes for an attribute, in the framebuffer's B, G, R memory order
+/// (gfxfb's little-endian DRM `RGB888` convention). White is the default; red is the
+/// M3 inadmissible-region mark (SGR 31).
+fn fg(attr: u8) -> [u8; 3] {
+    if attr & ATTR_RED != 0 {
+        [0x00, 0x00, 0xff]
+    } else {
+        [0xff; 3]
+    }
+}
+
 // -------------------------------------------------------------------------------------
 // The blitter core
 // -------------------------------------------------------------------------------------
@@ -189,30 +232,69 @@ pub trait Surface {
     fn write(&mut self, offset: usize, bytes: &[u8]);
 }
 
-/// ANSI/CSI stripping state (a future colored print must not corrupt the grid).
+/// ANSI/CSI parsing state (the supported subset renders; everything else is consumed
+/// so a colored or cursor-moving print can never corrupt the grid).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Esc {
     /// Ordinary bytes.
     Ground,
     /// An ESC (0x1B) has been seen; deciding the sequence shape.
     Escape,
-    /// Inside `ESC [` … ; stripping until the final byte (0x40..=0x7E).
+    /// Inside `ESC [` … ; collecting parameters until the final byte (0x40..=0x7E).
     Csi,
 }
 
-/// The console grid: shadow text (what each cell holds), cursor, escape-strip state.
-/// The framebuffer is write-only downstream of this struct — every repaint renders from
-/// the shadow, so scroll never reads device memory.
+/// How many numeric CSI parameters are kept; longer sequences are consumed whole and
+/// ignored (nothing in the repo emits more than two — the census in the module docs).
+const CSI_MAX_PARAMS: usize = 4;
+
+/// Parameter accumulator for one CSI sequence.
+#[derive(Clone, Copy)]
+struct CsiState {
+    /// Parameter values, `params[..=n]` meaningful once `any` is set (empty slots are
+    /// 0, matching the ANSI default-parameter rule).
+    params: [u16; CSI_MAX_PARAMS],
+    /// The slot currently accumulating.
+    n: usize,
+    /// Whether any parameter byte (digit or `;`) arrived — distinguishes `ESC[m`
+    /// (zero parameters) from `ESC[0m` for dispatchers that care about the count.
+    any: bool,
+    /// Set on malformed input (non-numeric parameter bytes, intermediates, parameter
+    /// overflow): the sequence is still consumed to its final byte, then ignored.
+    poisoned: bool,
+}
+
+impl CsiState {
+    const fn new() -> CsiState {
+        CsiState {
+            params: [0; CSI_MAX_PARAMS],
+            n: 0,
+            any: false,
+            poisoned: false,
+        }
+    }
+}
+
+/// The console grid: shadow text + attribute planes (what each cell holds), cursor,
+/// pen, escape-parse state. The framebuffer is write-only downstream of this struct —
+/// every repaint renders from the shadow, so scroll never reads device memory.
 #[derive(Clone)]
 pub struct Grid {
     /// Row-major cell contents; `0` = never written (renders as space).
     text: [u8; COLS * ROWS],
+    /// Row-major cell attributes ([`ATTR_RED`]); scroll and redraw carry them with the
+    /// text so the M3 marking survives both.
+    attrs: [u8; COLS * ROWS],
     /// Cursor column, `0..COLS`.
     col: usize,
     /// Cursor row, `0..ROWS`.
     row: usize,
-    /// Escape-sequence stripping state.
+    /// The current pen: attributes stamped on every glyph printed (SGR sets/resets it).
+    pen: u8,
+    /// Escape-sequence parsing state.
     esc: Esc,
+    /// CSI parameter accumulator (meaningful while `esc == Esc::Csi`).
+    csi: CsiState,
 }
 
 impl Grid {
@@ -221,16 +303,32 @@ impl Grid {
     pub const fn new() -> Grid {
         Grid {
             text: [0; COLS * ROWS],
+            attrs: [0; COLS * ROWS],
             col: 0,
             row: 0,
+            pen: 0,
             esc: Esc::Ground,
+            csi: CsiState::new(),
         }
     }
 
-    /// Paint one cell: the glyph for `cell`, white-on-black, or inverted (the cursor
-    /// block). 16 row writes of 24 bytes.
-    fn paint_cell(&self, s: &mut impl Surface, row: usize, col: usize, cell: u8, inverted: bool) {
+    /// Paint one cell: the glyph for `cell` in its attribute's foreground on black, or
+    /// inverted (the cursor block — background pixels light up, glyph pixels go black).
+    /// The inverted block is always white: the cursor's color is the console's, not the
+    /// text's (a red block would otherwise appear over invisible red-attributed spaces,
+    /// e.g. the cells the editor's BS-space-BS erase writes inside a marked region).
+    /// 16 row writes of 24 bytes.
+    fn paint_cell(
+        &self,
+        s: &mut impl Surface,
+        row: usize,
+        col: usize,
+        cell: u8,
+        attr: u8,
+        inverted: bool,
+    ) {
         let bitmap = glyph(cell);
+        let color = fg(if inverted { 0 } else { attr });
         let base = row * CELL_H * gfxfb::STRIDE + col * CELL_ROW_BYTES;
         for py in 0..CELL_H {
             // Each 8×8 font row covers two pixel rows (the vertical doubling).
@@ -239,14 +337,14 @@ impl Grid {
             for px in 0..CELL_W {
                 // LSB = leftmost pixel (the font8x8 convention).
                 if ((bits >> px) & 1 != 0) != inverted {
-                    out[px * gfxfb::FB_BPP..(px + 1) * gfxfb::FB_BPP].fill(0xff);
+                    out[px * gfxfb::FB_BPP..(px + 1) * gfxfb::FB_BPP].copy_from_slice(&color);
                 }
             }
             s.write(base + py * gfxfb::STRIDE, &out);
         }
     }
 
-    /// Repaint every cell from the shadow text (normal video), one full pixel row per
+    /// Repaint every cell from the shadow planes (normal video), one full pixel row per
     /// write. On an empty grid this is the screen clear.
     fn repaint(&self, s: &mut impl Surface) {
         for trow in 0..ROWS {
@@ -254,10 +352,11 @@ impl Grid {
                 let mut out = [0u8; gfxfb::STRIDE];
                 for tcol in 0..COLS {
                     let bits = glyph(self.text[trow * COLS + tcol])[py / 2];
+                    let color = fg(self.attrs[trow * COLS + tcol]);
                     for px in 0..CELL_W {
                         if (bits >> px) & 1 != 0 {
                             let at = tcol * CELL_ROW_BYTES + px * gfxfb::FB_BPP;
-                            out[at..at + gfxfb::FB_BPP].fill(0xff);
+                            out[at..at + gfxfb::FB_BPP].copy_from_slice(&color);
                         }
                     }
                 }
@@ -269,24 +368,14 @@ impl Grid {
     /// Paint the cursor: the cell under it in inverted video (a solid block on an empty
     /// cell — the live-typing feel the demo wants).
     fn cursor(&self, s: &mut impl Surface) {
-        self.paint_cell(
-            s,
-            self.row,
-            self.col,
-            self.text[self.row * COLS + self.col],
-            true,
-        );
+        let at = self.row * COLS + self.col;
+        self.paint_cell(s, self.row, self.col, self.text[at], self.attrs[at], true);
     }
 
     /// Un-paint the cursor (repaint its cell in normal video).
     fn uncursor(&self, s: &mut impl Surface) {
-        self.paint_cell(
-            s,
-            self.row,
-            self.col,
-            self.text[self.row * COLS + self.col],
-            false,
-        );
+        let at = self.row * COLS + self.col;
+        self.paint_cell(s, self.row, self.col, self.text[at], self.attrs[at], false);
     }
 
     /// Full redraw: every cell from the shadow plus the cursor. Activation paints the
@@ -298,42 +387,150 @@ impl Grid {
     }
 
     /// Advance to the next row; on the last row, scroll by one (shadow memmove + full
-    /// repaint — the framebuffer is never read).
+    /// repaint — the framebuffer is never read). Attributes travel with their text.
     fn line_feed(&mut self, s: &mut impl Surface) {
         if self.row + 1 < ROWS {
             self.row += 1;
         } else {
             self.text.copy_within(COLS.., 0);
             self.text[(ROWS - 1) * COLS..].fill(0);
+            self.attrs.copy_within(COLS.., 0);
+            self.attrs[(ROWS - 1) * COLS..].fill(0);
             self.repaint(s);
         }
     }
 
-    /// Feed one console byte: strip escapes, handle LF/CR/BS/TAB, render printables
-    /// (anything else printable-positioned renders the box glyph), keep the cursor
-    /// painted. Bounded work: at most two cell paints, plus the repaint on a scroll.
+    /// CSI K (mode 0): clear the shadow from the cursor to the end of the row, black-fill
+    /// those pixels (one write per pixel row — bounded by a single row), repaint the
+    /// cursor. The erased cells lose their attributes too: erase produces empty cells,
+    /// not red-tinted ones.
+    fn erase_to_eol(&mut self, s: &mut impl Surface) {
+        let start = self.row * COLS + self.col;
+        let end = (self.row + 1) * COLS;
+        self.text[start..end].fill(0);
+        self.attrs[start..end].fill(0);
+        let bytes = (COLS - self.col) * CELL_ROW_BYTES;
+        let base = self.row * CELL_H * gfxfb::STRIDE + self.col * CELL_ROW_BYTES;
+        let zeros = [0u8; gfxfb::STRIDE];
+        for py in 0..CELL_H {
+            s.write(base + py * gfxfb::STRIDE, &zeros[..bytes]);
+        }
+        self.cursor(s);
+    }
+
+    /// Act on a completed, well-formed CSI sequence. The rendered subset is exactly the
+    /// console's emission alphabet (module docs — the area/40 editor contract): SGR
+    /// 0/31, CSI K mode 0, CSI A (CUU) and CSI G (CHA). Every other final (other
+    /// cursor moves, clears, unknown SGR parameters) is ignored.
+    fn csi_dispatch(&mut self, final_byte: u8, s: &mut impl Surface) {
+        let count = if self.csi.any { self.csi.n + 1 } else { 0 };
+        match final_byte {
+            b'm' => {
+                // SGR. No parameters = reset (the ANSI default-0 rule).
+                if count == 0 {
+                    self.pen = 0;
+                }
+                for &param in &self.csi.params[..count] {
+                    match param {
+                        0 => self.pen = 0,
+                        31 => self.pen |= ATTR_RED,
+                        _ => {}
+                    }
+                }
+            }
+            b'K' => {
+                // EL: only mode 0 (cursor to end of line) is emitted/rendered.
+                if count == 0 || self.csi.params[0] == 0 {
+                    self.erase_to_eol(s);
+                }
+            }
+            b'A' => {
+                // CUU: up `n` rows (the editor emits it bare = 1; 0 counts as 1),
+                // column preserved, clamped at the top row — never a reverse scroll.
+                let n = if count == 0 {
+                    1
+                } else {
+                    self.csi.params[0].max(1) as usize
+                };
+                if self.row > 0 {
+                    self.uncursor(s);
+                    self.row = self.row.saturating_sub(n);
+                    self.cursor(s);
+                }
+            }
+            b'G' => {
+                // CHA: 1-based column set, clamped to [1, COLS] (0 counts as 1). The
+                // editor's wrap-boundary backspace targets the last column this way.
+                let n = if count == 0 {
+                    1
+                } else {
+                    self.csi.params[0] as usize
+                };
+                let col = n.clamp(1, COLS) - 1;
+                if col != self.col {
+                    self.uncursor(s);
+                    self.col = col;
+                    self.cursor(s);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Feed one console byte: parse escapes (rendering the CSI subset, consuming the
+    /// rest), handle LF/CR/BS/TAB, render printables in the current pen (anything else
+    /// printable-positioned renders the box glyph), keep the cursor painted. Bounded
+    /// work: at most two cell paints, plus the repaint on a scroll and the row fill on
+    /// an erase.
     pub fn feed(&mut self, byte: u8, s: &mut impl Surface) {
         match self.esc {
             Esc::Escape => {
                 // ESC [ opens a CSI; ESC ESC stays armed; any other byte completes a
-                // two-byte sequence. All stripped.
+                // two-byte sequence (consumed).
                 self.esc = match byte {
-                    b'[' => Esc::Csi,
+                    b'[' => {
+                        self.csi = CsiState::new();
+                        Esc::Csi
+                    }
                     0x1b => Esc::Escape,
                     _ => Esc::Ground,
                 };
                 return;
             }
             Esc::Csi => match byte {
-                // Parameter/intermediate bytes: keep stripping.
-                0x20..=0x3f => return,
-                // The final byte ends the sequence.
-                0x40..=0x7e => {
-                    self.esc = Esc::Ground;
+                b'0'..=b'9' => {
+                    let slot = &mut self.csi.params[self.csi.n];
+                    *slot = slot.saturating_mul(10).saturating_add((byte - b'0') as u16);
+                    self.csi.any = true;
                     return;
                 }
-                // A control byte inside a CSI: abort the strip and process it normally
-                // (eating a stray LF would lose a line; malformed input, defensive).
+                b';' => {
+                    if self.csi.n + 1 < CSI_MAX_PARAMS {
+                        self.csi.n += 1;
+                    } else {
+                        // Too many parameters: consume the rest, ignore the sequence.
+                        self.csi.poisoned = true;
+                    }
+                    self.csi.any = true;
+                    return;
+                }
+                // Other parameter/intermediate bytes (`?`, `<`, SP..`/`, …): nothing we
+                // render uses them — consume to the final, then ignore.
+                0x20..=0x3f => {
+                    self.csi.poisoned = true;
+                    return;
+                }
+                // The final byte ends the sequence; well-formed ones dispatch.
+                0x40..=0x7e => {
+                    self.esc = Esc::Ground;
+                    if !self.csi.poisoned {
+                        self.csi_dispatch(byte, s);
+                    }
+                    return;
+                }
+                // A control byte inside a CSI: abort the sequence and process it
+                // normally (eating a stray LF would lose a line; malformed input,
+                // defensive).
                 _ => self.esc = Esc::Ground,
             },
             Esc::Ground => {}
@@ -369,12 +566,15 @@ impl Grid {
             }
             // Other C0 controls (BEL, VT, …): ignored, not boxed.
             0x00..=0x1f => {}
-            // Printable ASCII renders its glyph; 0x7F and the high half render the box
-            // (the shadow keeps the raw byte so a repaint reproduces the box).
+            // Printable ASCII renders its glyph in the current pen; 0x7F and the high
+            // half render the box (the shadow keeps the raw byte so a repaint
+            // reproduces the box).
             _ => {
-                self.text[self.row * COLS + self.col] = byte;
+                let at = self.row * COLS + self.col;
+                self.text[at] = byte;
+                self.attrs[at] = self.pen;
                 // Painting the glyph overwrites the inverted cursor block in place.
-                self.paint_cell(s, self.row, self.col, byte, false);
+                self.paint_cell(s, self.row, self.col, byte, self.pen, false);
                 self.col += 1;
                 if self.col == COLS {
                     self.col = 0;
@@ -382,6 +582,98 @@ impl Grid {
                 }
                 self.cursor(s);
             }
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------
+// The tee ring (host-tested; used by the kernel tee below)
+// -------------------------------------------------------------------------------------
+
+/// The tee ring: a lock-free single-producer/single-consumer byte ring between
+/// `tee_byte` (producer — any printing context, including IRQ/exception handlers) and
+/// the renderer drain behind the BUSY guard (consumer). Mirrors `crate::rxring`'s
+/// head/tail acquire-release discipline (mirrored, not reused: rxring's producer side
+/// notes the executor input edge — the wrong side effect for console *output* — and its
+/// capacity is the paste-line bound, not a render backlog bound).
+///
+/// Capacity: the long renderer windows are a scroll repaint (~1.1 MB of device writes)
+/// and an erase row-fill; the bytes arriving meanwhile are IRQ-context `kprintln!`
+/// lines, a few hundred bytes at worst. 1 KiB parks several such lines; beyond that the
+/// producer drops (counted, surfaced — never silent).
+#[cfg(any(
+    test,
+    all(
+        target_os = "none",
+        target_arch = "aarch64",
+        feature = "board-opi5plus"
+    )
+))]
+mod ring {
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Ring capacity (power of two; one slot stays empty to distinguish full from
+    /// empty).
+    pub(super) const TEE_RING_CAP: usize = 1024;
+
+    /// The SPSC byte ring. Producer serialization (one pusher at a time) and consumer
+    /// serialization (one popper at a time) are the *caller's* contract — in the tee
+    /// they are the PUSH_BUSY and BUSY try-enter guards respectively.
+    pub(super) struct TeeRing {
+        buf: UnsafeCell<[u8; TEE_RING_CAP]>,
+        /// Next index the producer will write.
+        head: AtomicUsize,
+        /// Next index the consumer will read.
+        tail: AtomicUsize,
+    }
+
+    // SAFETY: access is coordinated through `head`/`tail` with acquire/release ordering
+    // under the caller's single-producer/single-consumer contract.
+    unsafe impl Sync for TeeRing {}
+
+    impl TeeRing {
+        pub(super) const fn new() -> TeeRing {
+            TeeRing {
+                buf: UnsafeCell::new([0; TEE_RING_CAP]),
+                head: AtomicUsize::new(0),
+                tail: AtomicUsize::new(0),
+            }
+        }
+
+        /// Publish `byte`, or return `false` when the ring is full (the caller counts
+        /// the drop — never overwrite unrendered bytes).
+        pub(super) fn push(&self, byte: u8) -> bool {
+            let head = self.head.load(Ordering::Relaxed);
+            let next = (head + 1) % TEE_RING_CAP;
+            if next == self.tail.load(Ordering::Acquire) {
+                return false;
+            }
+            // SAFETY: the caller is the sole producer; this slot is at `head`, ahead of
+            // the consumer's `tail`.
+            unsafe { (*self.buf.get())[head] = byte };
+            self.head.store(next, Ordering::Release);
+            true
+        }
+
+        /// Take one byte, or `None` when the ring is empty.
+        pub(super) fn pop(&self) -> Option<u8> {
+            let tail = self.tail.load(Ordering::Relaxed);
+            if tail == self.head.load(Ordering::Acquire) {
+                return None;
+            }
+            // SAFETY: the caller is the sole consumer; this slot was published by the
+            // producer (head moved past it with release ordering, observed by the
+            // acquire load above).
+            let byte = unsafe { (*self.buf.get())[tail] };
+            self.tail
+                .store((tail + 1) % TEE_RING_CAP, Ordering::Release);
+            Some(byte)
+        }
+
+        /// Whether nothing is waiting (the drain loop's exit re-check).
+        pub(super) fn is_empty(&self) -> bool {
+            self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Relaxed)
         }
     }
 }
@@ -399,11 +691,12 @@ mod tee {
     use core::cell::UnsafeCell;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use super::ring::TeeRing;
     use super::{COLS, Grid, ROWS, Surface};
     use crate::gfxfb;
 
-    /// The grid behind the tee. Sole mutator is [`tee_byte`] under the [`BUSY`] guard
-    /// (plus [`activate`] before [`ACTIVE`] is ever true); single boot core.
+    /// The grid behind the tee. Sole mutator is the [`drain`] loop under the [`BUSY`]
+    /// guard (plus [`activate`] before [`ACTIVE`] is ever true); single boot core.
     struct GridCell(UnsafeCell<Grid>);
     // SAFETY: every `&mut` borrow is serialized by the BUSY try-enter guard below (and
     // activation happens-before the first guarded borrow via the ACTIVE release store).
@@ -412,9 +705,23 @@ mod tee {
     static GRID: GridCell = GridCell(UnsafeCell::new(Grid::new()));
     /// Whether the tee is live (the `fbcon` token was accepted and the surface located).
     static ACTIVE: AtomicBool = AtomicBool::new(false);
-    /// Try-enter guard: a print re-entering mid-tee (exception/panic on the boot core)
-    /// skips the framebuffer instead of deadlocking or aliasing the grid.
+    /// Consumer try-enter guard: whoever wins it drains the ring into the grid; a print
+    /// re-entering mid-render (exception/IRQ print on the boot core) loses the swap,
+    /// parks its bytes in the ring and returns — the interrupted holder drains them
+    /// when it resumes. Never blocks, never aliases the grid.
     static BUSY: AtomicBool = AtomicBool::new(false);
+    /// Producer try-enter guard: serializes ring pushes against a print re-entering in
+    /// the few-instruction push window itself (single core — the inner pusher cannot
+    /// wait for the interrupted one). The loser drops its byte, COUNTED in [`DROPPED`].
+    static PUSH_BUSY: AtomicBool = AtomicBool::new(false);
+    /// The ring between every printing context and the renderer ([`super::ring`]).
+    static TEE_RING: TeeRing = TeeRing::new();
+    /// Total tee bytes lost (ring full, or the producer-window collision above). Never
+    /// silent: [`drain`] surfaces growth through the rate-limited note below.
+    static DROPPED: AtomicUsize = AtomicUsize::new(0);
+    /// The drop count already reported (rate limit state: report on first loss, then
+    /// only when the count has doubled — a sustained overflow cannot spam the console).
+    static NOTED: AtomicUsize = AtomicUsize::new(0);
     /// The located, map-checked surface base (set before `ACTIVE`).
     static FB_BASE: AtomicUsize = AtomicUsize::new(0);
 
@@ -481,23 +788,86 @@ mod tee {
     }
 
     /// The per-byte tee, called from the console TX chokepoint (`uart::put_byte`).
-    /// Inactive cost: one relaxed load. Never blocks: re-entry (an exception or panic
-    /// printing while a tee is in progress) skips the framebuffer for those bytes —
-    /// serial still carries them.
+    /// Inactive cost: one relaxed load. Never blocks: the byte is parked in the ring
+    /// (always, except the two counted drop windows) and rendered by whoever holds —
+    /// or now wins — the BUSY guard. Re-entrant prints (exception/IRQ printing while a
+    /// render is in progress) therefore reach the framebuffer once the interrupted
+    /// render resumes, instead of being silently lost.
     pub fn tee_byte(byte: u8) {
         if !ACTIVE.load(Ordering::Relaxed) || MUTED.load(Ordering::Relaxed) {
             return;
         }
-        if BUSY.swap(true, Ordering::Acquire) {
+        // Producer side: the try-enter guard serializes against a print that
+        // interrupted another print inside this same window (single core — waiting
+        // would deadlock). The loser's byte is dropped but counted.
+        if PUSH_BUSY.swap(true, Ordering::Acquire) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let mut surface = FbSurface {
-            base: FB_BASE.load(Ordering::Relaxed),
-        };
-        // SAFETY: the BUSY try-enter guard makes this the only live `&mut Grid` (single
-        // core; re-entrant prints bailed out above), and ACTIVE's release store ordered
-        // activation's initialization before this borrow.
-        unsafe { (*GRID.0.get()).feed(byte, &mut surface) };
+        if !TEE_RING.push(byte) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        PUSH_BUSY.store(false, Ordering::Release);
+        drain();
+    }
+
+    /// Render everything waiting in the ring, if no one else already is. The loop
+    /// re-checks after releasing BUSY: a byte parked between the last empty pop and
+    /// the release would otherwise sit unrendered until the next print (a backstop
+    /// rescuing event-path work is a bug — the event path delivers it here).
+    fn drain() {
+        loop {
+            if BUSY.swap(true, Ordering::Acquire) {
+                // The interrupted holder (below us on this core's stack) drains the
+                // ring — including our bytes — when it resumes.
+                return;
+            }
+            let mut surface = FbSurface {
+                base: FB_BASE.load(Ordering::Relaxed),
+            };
+            // SAFETY: the BUSY try-enter guard makes this the only live `&mut Grid`
+            // (single core; re-entrant prints bailed out above), and ACTIVE's release
+            // store ordered activation's initialization before this borrow.
+            let grid = unsafe { &mut *GRID.0.get() };
+            while let Some(byte) = TEE_RING.pop() {
+                grid.feed(byte, &mut surface);
+            }
+            note_drops();
+            BUSY.store(false, Ordering::Release);
+            if TEE_RING.is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// Surface tee-byte loss loudly but rate-limited (no-silent-loss doctrine): log on
+    /// the first lost byte, then only when the total has at least doubled since the
+    /// last note. Called while holding BUSY; the note's own bytes re-enter `tee_byte`,
+    /// park in the ring (the BUSY swap fails for them) and are rendered by our caller's
+    /// drain loop — bounded, no recursion.
+    fn note_drops() {
+        let dropped = DROPPED.load(Ordering::Relaxed);
+        let noted = NOTED.load(Ordering::Relaxed);
+        if dropped == noted {
+            return;
+        }
+        if noted == 0 || dropped >= noted.saturating_mul(2) {
+            NOTED.store(dropped, Ordering::Relaxed);
+            crate::kprintln!(
+                "fbcon: {dropped} console bytes dropped from the HDMI tee \
+                 (ring overflow or re-entrant print; serial carried them)"
+            );
+        }
+    }
+
+    /// Panic-path reset: clear the try-enter guards so the panic report renders even
+    /// when the panic struck mid-render or mid-push. Sound to force only because the
+    /// pre-empted holder's frame never resumes — the panic handler does not return —
+    /// so the guard it left set would otherwise mute HDMI for the whole report. The
+    /// grid may be mid-sequence (a torn CSI parse garbles at most the next cells);
+    /// `feed` itself stays memory-safe on any state.
+    pub fn panic_reset() {
+        PUSH_BUSY.store(false, Ordering::Release);
         BUSY.store(false, Ordering::Release);
     }
 }
@@ -507,7 +877,7 @@ mod tee {
     target_arch = "aarch64",
     feature = "board-opi5plus"
 ))]
-pub use tee::{activate, set_tee_mute, tee_byte};
+pub use tee::{activate, panic_reset, set_tee_mute, tee_byte};
 
 #[cfg(not(all(
     target_os = "none",
@@ -581,6 +951,32 @@ mod tests {
             fb.0, fresh.0,
             "incremental painting diverged from a full redraw"
         );
+    }
+
+    /// White foreground bytes (B, G, R memory order).
+    const WHITE: [u8; 3] = [0xff; 3];
+    /// Red foreground bytes (B, G, R memory order — gfxfb's DRM `RGB888` convention).
+    const RED: [u8; 3] = [0x00, 0x00, 0xff];
+
+    /// Assert cell (`trow`,`tcol`) renders `ch`'s glyph in `color` on black (normal
+    /// video — not the cursor cell).
+    fn assert_cell_color(fb: &ModelFb, trow: usize, tcol: usize, ch: u8, color: [u8; 3]) {
+        let bitmap = glyph(ch);
+        for py in 0..CELL_H {
+            for px in 0..CELL_W {
+                let set = (bitmap[py / 2] >> px) & 1 != 0;
+                let at = (trow * CELL_H + py) * gfxfb::STRIDE
+                    + tcol * CELL_ROW_BYTES
+                    + px * gfxfb::FB_BPP;
+                let want = if set { color } else { [0u8; 3] };
+                assert_eq!(
+                    &fb.0[at..at + 3],
+                    &want,
+                    "pixel ({px},{py}) of cell ({trow},{tcol}) {:?}",
+                    char::from(ch)
+                );
+            }
+        }
     }
 
     #[test]
@@ -710,5 +1106,253 @@ mod tests {
         let (grid, fb) = render("\t\t");
         assert_eq!((grid.row, grid.col), (0, 16));
         assert_matches_redraw(&grid, &fb);
+    }
+
+    /// Bench bug "characters go missing": a blank or colliding glyph hides exactly like
+    /// a dropped byte. Space is the one legitimately blank glyph; every other printable
+    /// must render visibly and distinctly (the table is `font8x8_basic` verbatim — this
+    /// pins that a future edit cannot blank or duplicate an entry), and the non-ASCII
+    /// fallback must be visible too.
+    #[test]
+    fn every_printable_glyph_is_populated_and_distinct() {
+        let pop = |bitmap: &[u8; 8]| bitmap.iter().map(|row| row.count_ones()).sum::<u32>();
+        assert_eq!(pop(glyph(b' ')), 0, "space must be blank");
+        for byte in 0x21..=0x7eu8 {
+            assert!(
+                pop(glyph(byte)) >= 4,
+                "glyph {byte:#04x} {:?} is blank or near-blank",
+                char::from(byte)
+            );
+        }
+        for a in 0x20..=0x7eu8 {
+            for b in (a + 1)..=0x7eu8 {
+                assert_ne!(
+                    glyph(a),
+                    glyph(b),
+                    "glyphs {:?} and {:?} collide",
+                    char::from(a),
+                    char::from(b)
+                );
+            }
+        }
+        assert!(pop(&BOX_GLYPH) >= 4, "the unknown-byte box must be visible");
+    }
+
+    #[test]
+    fn sgr_31_renders_red_and_sgr_0_resets() {
+        let (grid, fb) = render("w\u{1b}[31mr\u{1b}[0mn");
+        assert_cell_color(&fb, 0, 0, b'w', WHITE);
+        assert_cell_color(&fb, 0, 1, b'r', RED);
+        assert_cell_color(&fb, 0, 2, b'n', WHITE);
+        assert_eq!(grid.attrs[..3], [0, ATTR_RED, 0]);
+        assert_matches_redraw(&grid, &fb);
+    }
+
+    #[test]
+    fn sgr_parameter_shapes() {
+        // 31 applies even alongside ignored parameters.
+        let (grid, fb) = render("\u{1b}[1;31mx");
+        assert_cell_color(&fb, 0, 0, b'x', RED);
+        assert_matches_redraw(&grid, &fb);
+        // An empty SGR resets (the ANSI default-0 rule).
+        let (grid, fb) = render("\u{1b}[31m\u{1b}[my");
+        assert_cell_color(&fb, 0, 0, b'y', WHITE);
+        assert_matches_redraw(&grid, &fb);
+        // Unknown parameters alone change nothing.
+        let (grid, fb) = render("\u{1b}[32mz");
+        assert_cell_color(&fb, 0, 0, b'z', WHITE);
+        assert_matches_redraw(&grid, &fb);
+    }
+
+    #[test]
+    fn red_marking_survives_a_scroll() {
+        let mut grid = Grid::new();
+        let mut fb = ModelFb::new();
+        grid.redraw(&mut fb);
+        feed_str(&mut grid, &mut fb, "ok\n\u{1b}[31mbad\u{1b}[0m\n");
+        // 27 line feeds reach the last row; the 28th scrolls once: `ok` falls off,
+        // `bad` lands on row 0 — still red (the attribute plane scrolled with it).
+        for _ in 0..28 {
+            feed_str(&mut grid, &mut fb, "\n");
+        }
+        assert_eq!(&grid.text[..3], b"bad");
+        assert_eq!(grid.attrs[..3], [ATTR_RED; 3]);
+        assert_cell_color(&fb, 0, 0, b'b', RED);
+        assert_matches_redraw(&grid, &fb);
+    }
+
+    #[test]
+    fn csi_k_erases_to_the_end_of_the_line() {
+        let (grid, fb) = render("abcdef\rxy\u{1b}[K");
+        assert_eq!(&grid.text[..2], b"xy");
+        assert!(grid.text[2..COLS].iter().all(|&c| c == 0));
+        assert_eq!((grid.row, grid.col), (0, 2));
+        assert_matches_redraw(&grid, &fb);
+        // Beyond the cursor block the row is black.
+        for py in 0..CELL_H {
+            let from = py * gfxfb::STRIDE + 3 * CELL_ROW_BYTES;
+            let to = (py + 1) * gfxfb::STRIDE;
+            assert!(
+                fb.0[from..to].iter().all(|&b| b == 0),
+                "row {py} not erased"
+            );
+        }
+        // An explicit mode 0 behaves identically.
+        let (_, explicit) = render("abcdef\rxy\u{1b}[0K");
+        assert_eq!(explicit.0, fb.0);
+    }
+
+    #[test]
+    fn erase_with_a_red_pen_leaves_clean_cells_but_keeps_the_pen() {
+        let (grid, fb) = render("\u{1b}[31mab\r\u{1b}[K");
+        assert!(grid.text[..COLS].iter().all(|&c| c == 0));
+        assert!(grid.attrs[..COLS].iter().all(|&a| a == 0));
+        assert_matches_redraw(&grid, &fb);
+        let (grid, fb) = render("\u{1b}[31mab\r\u{1b}[Kz");
+        assert_cell_color(&fb, 0, 0, b'z', RED);
+        assert_matches_redraw(&grid, &fb);
+    }
+
+    /// Census discipline: nothing in the repo emits EL modes 1/2, CUD/CUF/CUP-style
+    /// cursor moves, clears or exotic parameter shapes — they are consumed whole with
+    /// no effect (the day something emits one, implement it; never let it leak glyphs
+    /// or move the cursor).
+    #[test]
+    fn unimplemented_csi_sequences_are_consumed_without_effect() {
+        let (grid, fb) = render(
+            "ab\u{1b}[1K\u{1b}[2K\u{1b}[B\u{1b}[2J\u{1b}[99999m\u{1b}[1;2;3;4;5m\u{1b}[?25lc",
+        );
+        let (plain_grid, plain_fb) = render("abc");
+        assert_eq!(grid.text[..], plain_grid.text[..]);
+        assert_eq!((grid.row, grid.col), (plain_grid.row, plain_grid.col));
+        assert_eq!(fb.0, plain_fb.0);
+        assert_matches_redraw(&grid, &fb);
+    }
+
+    /// Bench bug "render errors with history recall": the exact eosh-inc editor stream
+    /// (census in the module docs) — prompt, red-marked tail, recall's BS-space-BS
+    /// erase, marker close, recalled line echo — must leave the screen exactly like a
+    /// freshly typed line.
+    #[test]
+    fn the_editor_marker_and_recall_stream_renders_like_a_fresh_line() {
+        let mut grid = Grid::new();
+        let mut fb = ModelFb::new();
+        grid.redraw(&mut fb);
+        feed_str(&mut grid, &mut fb, "eosh> help \u{1b}[31mqq");
+        assert_cell_color(&fb, 0, 11, b'q', RED);
+        assert_cell_color(&fb, 0, 12, b'q', RED);
+        // Recall: the editor erases the 7 line chars (`help qq`), then closes the mark.
+        for _ in 0..7 {
+            feed_str(&mut grid, &mut fb, "\u{8} \u{8}");
+        }
+        feed_str(&mut grid, &mut fb, "\u{1b}[0m");
+        assert_eq!((grid.row, grid.col), (0, 6));
+        // The recalled entry echoes.
+        feed_str(&mut grid, &mut fb, "curl q");
+        let (_, fresh) = render("eosh> curl q");
+        assert_eq!(
+            fb.0, fresh.0,
+            "recall repaint must render like a fresh line"
+        );
+        assert_matches_redraw(&grid, &fb);
+    }
+
+    /// area/40's wrap-boundary backspace contract: erasing past a wrap emits
+    /// `CSI A` `CSI <width>G` `CSI K` — up one row, last column, erase to EOL. A
+    /// two-row line must unwrap cleanly back onto the first row.
+    #[test]
+    fn the_wrap_boundary_backspace_composite_unwraps_to_the_row_above() {
+        let mut grid = Grid::new();
+        let mut fb = ModelFb::new();
+        grid.redraw(&mut fb);
+        for _ in 0..COLS {
+            grid.feed(b'a', &mut fb);
+        }
+        grid.feed(b'b', &mut fb);
+        assert_eq!((grid.row, grid.col), (1, 1));
+        // Same-row erase of `b` first (`\b \b`), then the wrap-boundary composite.
+        feed_str(&mut grid, &mut fb, "\u{8} \u{8}");
+        assert_eq!((grid.row, grid.col), (1, 0));
+        feed_str(&mut grid, &mut fb, "\u{1b}[A\u{1b}[100G\u{1b}[K");
+        assert_eq!((grid.row, grid.col), (0, COLS - 1));
+        assert_eq!(grid.text[COLS - 1], 0, "the last column must be erased");
+        assert_eq!(&grid.text[..COLS - 1], &[b'a'; COLS - 1][..]);
+        assert_matches_redraw(&grid, &fb);
+    }
+
+    /// area/40's recall-replace contract: `\r` `CSI K`, then (`CSI A` `CSI K`) per
+    /// wrapped row, then the re-emit. Replacing a two-row line with a shorter one must
+    /// leave zero residue — the frame equals a freshly typed short line.
+    #[test]
+    fn the_recall_repaint_composite_clears_a_wrapped_line_without_residue() {
+        let mut grid = Grid::new();
+        let mut fb = ModelFb::new();
+        grid.redraw(&mut fb);
+        feed_str(&mut grid, &mut fb, "eosh> ");
+        for _ in 0..144 {
+            grid.feed(b'x', &mut fb);
+        }
+        // 6 prompt + 144 = a full row 0 plus 50 chars on row 1.
+        assert_eq!((grid.row, grid.col), (1, 50));
+        feed_str(&mut grid, &mut fb, "\r\u{1b}[K\u{1b}[A\u{1b}[K");
+        assert_eq!((grid.row, grid.col), (0, 0));
+        feed_str(&mut grid, &mut fb, "eosh> curl");
+        let (_, fresh) = render("eosh> curl");
+        assert_eq!(
+            fb.0, fresh.0,
+            "no residue may survive the wrapped-line replace"
+        );
+        assert_matches_redraw(&grid, &fb);
+    }
+
+    #[test]
+    fn cuu_and_cha_clamp_at_the_edges() {
+        // CUU at the top row: no move, never a reverse scroll (bare and counted).
+        let (grid, fb) = render("ab\u{1b}[A\u{1b}[5Ac");
+        assert_eq!((grid.row, grid.col), (0, 3));
+        assert_eq!(&grid.text[..3], b"abc");
+        assert_matches_redraw(&grid, &fb);
+        // A counted CUU clamps to row 0; count 0 acts as 1.
+        let (grid, fb) = render("\n\n\n\u{1b}[7Ax\u{1b}[0Ay");
+        assert_eq!((grid.row, grid.col), (0, 2));
+        assert_eq!(&grid.text[..2], b"xy");
+        assert_matches_redraw(&grid, &fb);
+        // CHA beyond the width clamps to the last column (the glyph then wraps).
+        let (grid, fb) = render("\u{1b}[999Gz");
+        assert_eq!(grid.text[COLS - 1], b'z');
+        assert_eq!((grid.row, grid.col), (1, 0));
+        assert_matches_redraw(&grid, &fb);
+        // Bare CSI G and an explicit 0 both go to column 1.
+        let (grid, fb) = render("abc\u{1b}[Gz");
+        assert_eq!(&grid.text[..3], b"zbc");
+        assert_eq!((grid.row, grid.col), (0, 1));
+        assert_matches_redraw(&grid, &fb);
+        let (grid, fb) = render("abc\u{1b}[0Gz");
+        assert_eq!(&grid.text[..3], b"zbc");
+        assert_matches_redraw(&grid, &fb);
+    }
+
+    #[test]
+    fn tee_ring_carries_bytes_in_order_and_reports_full() {
+        use super::ring::{TEE_RING_CAP, TeeRing};
+        let ring = TeeRing::new();
+        assert!(ring.is_empty());
+        for i in 0..TEE_RING_CAP - 1 {
+            assert!(ring.push((i % 251) as u8), "push {i} refused");
+        }
+        // One slot stays empty to distinguish full from empty; a full ring refuses
+        // (the tee counts that refusal as a drop) instead of overwriting.
+        assert!(!ring.push(0xaa));
+        for i in 0..TEE_RING_CAP - 1 {
+            assert_eq!(ring.pop(), Some((i % 251) as u8));
+        }
+        assert_eq!(ring.pop(), None);
+        assert!(ring.is_empty());
+        // Wraparound preserves order.
+        for round in 0..2 * TEE_RING_CAP {
+            assert!(ring.push((round % 256) as u8));
+            assert_eq!(ring.pop(), Some((round % 256) as u8));
+        }
+        assert!(ring.is_empty());
     }
 }

@@ -15,9 +15,14 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     // A panic can fire inside a serial-only print window (the watchdog heartbeat mutes
     // the fbcon tee around its `hb` line, and nothing on that path would ever unmute).
     // Serial-only is the window's property, never the panic's: clear the mute first so
-    // the report below also reaches the HDMI console.
+    // the report below also reaches the HDMI console. Likewise a panic can strike
+    // mid-render or mid-push — the pre-empted frame never resumes, so its stale
+    // try-enter guards would mute HDMI for the whole report; clear them too.
     #[cfg(feature = "board-opi5plus")]
-    crate::fbcon::set_tee_mute(false);
+    {
+        crate::fbcon::set_tee_mute(false);
+        crate::fbcon::panic_reset();
+    }
     crate::kprintln!();
     crate::kprintln!("KERNEL PANIC: {info}");
     #[cfg(feature = "board-opi5plus")]
