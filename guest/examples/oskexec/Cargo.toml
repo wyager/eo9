@@ -12,4 +12,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 eo9-guest = { workspace = true }
+# The wire protocol lives in the shared crate (host-tested; stickflash speaks the
+# same bytes) — this example keeps only the transport, the kexec sink, and narration.
+eo9-flashwire = { workspace = true }
 wit-bindgen = { workspace = true }

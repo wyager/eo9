@@ -1,0 +1,26 @@
+# eo9-fatwalk is the pure FAT32 walk-and-overwrite core of the stick flasher
+# (docs/board/usb-msd-plan.md §3.1): parse the boot sector, find a file by 8.3 name in
+# the root directory, walk its cluster chain (read-only against the FAT, first FAT
+# only), map byte ranges to partition-relative LBAs, and produce the LBA+data write
+# list for a SAME-SIZE in-place content overwrite. There is deliberately no
+# allocation, no directory write, and no FAT write anywhere in this crate — the
+# fixed-slot stick build (`cargo xtask build-stick`) makes every rewrite same-size, so
+# the FAT and the directory never change. A stick formatted any other way gets a typed
+# refusal, never a write (plan §8 risk 6).
+#
+# Used by the stickflash example (and by xtask's build-stick self-check); NOT exposed
+# as a component — a general fat.put/fs.fat middleware is the recorded follow-up.
+# Host-tested against mtools-built fixture images (the load-as-test-input discipline);
+# the tests need mformat/mcopy/mdel/mdir on PATH (`brew install mtools`).
+#
+# no_std claim is kept honest with: cargo check -p eo9-fatwalk --target aarch64-unknown-none
+# (also exercised by `cargo xtask build` alongside eo9-sched).
+[package]
+name = "eo9-fatwalk"
+description = "Minimal FAT32 read-side walking (boot sector, 8.3 root lookup, cluster chains, byte-range to LBA) plus same-size in-place overwrite planning: the pure core of Eo9's stick flasher. No allocation, no FAT or directory writes."
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]

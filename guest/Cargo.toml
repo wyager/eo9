@@ -47,6 +47,10 @@ eo9-dns = { path = "../crates/eo9-dns" }
 # The URL core of the curl example (http:// parsing, redirect-target resolution, the
 # request-injection control-byte refusal): no_std, host-tested in the root workspace.
 eo9-curl-core = { path = "../crates/eo9-curl-core" }
+# The network-flash wire protocol (EO9L framing, preshared-secret handshake, ack
+# batching, CRC verdict, commit go-ahead) shared byte-identically by the oskexec and
+# stickflash examples: no_std, host-tested in the root workspace — same pattern.
+eo9-flashwire = { path = "../crates/eo9-flashwire" }
 # The OHCI device core (register map, ED/TD encode/decode, HCCA, enumeration state
 # machine, HID boot decode, and the RegionIo-generic driver) for the usb.ohci /
 # usb.ohci-pci shells and the usbcheck/hidcheck examples: no_std, host-tested in the

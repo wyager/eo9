@@ -406,6 +406,7 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        "build-stick" => build_stick(&root, rest),
         "check-gpu" => {
             expect_no_args("check-gpu", rest)?;
             check_gpu(&root)
@@ -559,6 +560,19 @@ COMMANDS:
                          aarch64: precompiles the seed/async canaries, eo9-example-hello,
                          entropy.seeded, and the store image and embeds them; riscv64: the
                          feature-less image (boot/serial/heap/timer/interrupts so far)
+    build-stick [--image <path>] [--out <path>] [--slot-mib N] [--bootargs <text>]
+                         Build the USB boot stick image (MBR + one FAT32 partition):
+                         EO9.IMG zero-padded to a FIXED slot (default 56 MiB) and BOOT.SCR
+                         rendered with fixed-width CRC/size fields, so every reflash is a
+                         same-size in-place cluster overwrite (docs/board/usb-msd-plan.md
+                         §3.1 — no FAT writes ever). The stick carries the MINIMAL/station
+                         board profile: --image defaults to building it; the full image is
+                         past the 62 MiB structural boot cap (kexec-only) and is refused.
+                         --out defaults to kernel/target/eo9-stick.img.
+                         Needs mtools (mformat/mcopy/mdir); the loose stick files also land
+                         in kernel/target/stick-stage/ for Finder-style staging. The built
+                         image is self-checked back through eo9-fatwalk (locate EO9.IMG,
+                         walk the chain, CRC the clusters against the baked value)
     qemu <arch>          Build the kernel image and boot it under QEMU with serial on stdio
                          (aarch64 or riscv64; exits when the kernel powers off, Ctrl-A X to quit)
     check-repl           Boot the aarch64 kernel under QEMU and drive the eosh per-key editor
@@ -782,6 +796,17 @@ fn doctor(root: &Path) -> Result<(), String> {
     }
 
     // Optional: QEMU, only needed to boot the bare-metal kernel.
+    match probe(root, "mformat", &["-V"]) {
+        Some(version) => println!(
+            "  ok       {}",
+            version.lines().next().unwrap_or("mtools").trim()
+        ),
+        None => println!(
+            "  optional mtools (mformat/mcopy/mdir) not found — needed by `cargo xtask ci` \
+             (the fatwalk fixture tests build their FAT images with mtools) and by \
+             `build-stick`; install with `brew install mtools` / `apt install mtools`"
+        ),
+    }
     match probe(root, "qemu-system-aarch64", &["--version"]) {
         Some(version) => println!(
             "  ok       {}",
@@ -870,10 +895,23 @@ fn build(root: &Path) -> Result<(), String> {
     // checking it against the bare-metal target. This runs after the kernel build so
     // rustup has already ensured that target is installed for the pinned toolchain (the
     // root workspace's rust-toolchain.toml does not list it; the kernel's does).
+    // eo9-fatwalk and eo9-flashwire ride the same check: fatwalk's guest consumer
+    // (stickflash, usb-msd-plan L5) is not in the tree yet and oskexec covers only
+    // flashwire, so the no_std claims must not silently rot in the meantime.
     run(
         root,
         "cargo",
-        ["check", "-p", "eo9-sched", "--target", KERNEL_CHECK_TARGET],
+        [
+            "check",
+            "-p",
+            "eo9-sched",
+            "-p",
+            "eo9-fatwalk",
+            "-p",
+            "eo9-flashwire",
+            "--target",
+            KERNEL_CHECK_TARGET,
+        ],
     )
 }
 
@@ -3328,6 +3366,365 @@ fn lint(root: &Path) -> Result<(), String> {
             "warnings",
         ],
     )
+}
+
+// ----------------------------------------------------------------------------------------
+// build-stick: the fixed-slot USB boot stick (docs/board/usb-msd-plan.md §3.1). One MBR,
+// one FAT32 partition, three 8.3 files — EO9.IMG zero-padded to a fixed slot size and
+// BOOT.SCR rendered with fixed-width CRC/size fields — so every future reflash
+// (stickflash, the plan's L5) is a same-size in-place cluster overwrite: no FAT writes,
+// no directory writes, no allocation, ever. This is the canonical stick builder; the
+// bench's .claude/board-bringup/make_bootscr.py is retired to a thin pointer at this.
+// ----------------------------------------------------------------------------------------
+
+/// The structural boot cap, in MiB: every non-kexec boot path loads the image at
+/// 0x0020_0000 and 0x0400_0000 is spoken for (the serial-loader stub's home; the same
+/// window `build_kernel_opi5plus` enforces for the minimal image) — 62 MiB is the most
+/// image any stick (or serial) boot can ever run. An image past this is kexec-only and
+/// therefore out of stick scope by construction.
+const STICK_BOOT_CAP_MIB: u64 = 62;
+/// The fixed EO9.IMG slot, in MiB (the plan's stated default): the stick carries the
+/// MINIMAL/station board profile (~35 MiB today — the full image is past
+/// [`STICK_BOOT_CAP_MIB`] and out of stick scope), so 56 MiB is comfortable growth
+/// headroom under the cap. Growing it is `--slot-mib` plus one Mac-side restage of the
+/// physical stick.
+const STICK_SLOT_MIB: u64 = 56;
+/// FAT partition headroom past the slot for BOOT.SCR, BOOTARGS.TXT, and filesystem
+/// overhead (two FATs + root directory ≈ 1.1 MiB at 512-byte clusters).
+const STICK_PART_HEADROOM_MIB: u64 = 8;
+/// The partition starts at LBA 2048 (the standard 1 MiB alignment).
+const STICK_PART_FIRST_LBA: u64 = 2048;
+/// The bench's standing boot grants (.claude/board-bringup stick BOOTARGS.TXT).
+const STICK_DEFAULT_BOOTARGS: &str = "station pci platform console-sink fbcon kexec";
+
+/// The BOOT.SCR script text. Still the unconditional-go form — the crc32-gated variant
+/// waits on its A0 bench recon (usb-boot-demo-plan; the gate construction is proven, the
+/// vendor U-Boot's crc32-over-USB-loaded-memory leg is not) — but the image CRC and slot
+/// size are ALREADY baked in as fixed-width (8-hex-digit) environment fields: every
+/// build of this script is byte-identical in length, so the future crc32-gate rewrite
+/// and every stickflash BOOT.SCR commit stay same-size in-place overwrites.
+fn stick_bootscr_script(image_crc: u32, slot_bytes: u64) -> String {
+    format!(
+        "echo EO9: USB boot - EO9.IMG slot crc 0x{image_crc:08x} size 0x{slot_bytes:08x} \
+         (unconditional go until the crc32-gate A0 recon)\n\
+         setenv eo9_img_crc 0x{image_crc:08x}\n\
+         setenv eo9_img_size 0x{slot_bytes:08x}\n\
+         fatload ${{devtype}} ${{devnum}}:${{distro_bootpart}} 0x00100000 BOOTARGS.TXT\n\
+         fatload ${{devtype}} ${{devnum}}:${{distro_bootpart}} 0x00200000 EO9.IMG\n\
+         go 0x00200000\n"
+    )
+}
+
+/// Wrap a script in the U-Boot legacy image header (`mkimage -A arm64 -O linux -T script`
+/// without mkimage — ported from the bench's make_bootscr.py, now the canonical
+/// implementation). Header: 64 bytes big-endian (struct legacy_img_hdr): magic, hcrc
+/// (CRC over the header with the hcrc field zeroed), time (0 — deterministic builds),
+/// size, load, ep, dcrc, os, arch, type, comp, name[32]. Script payload: two BE u32
+/// (script byte length, 0) then the text — what `source`/`boot_a_script` expect.
+fn uboot_legacy_script(script: &str) -> Vec<u8> {
+    const IH_MAGIC: u32 = 0x27051956;
+    const IH_OS_LINUX: u8 = 5;
+    const IH_ARCH_ARM64: u8 = 22;
+    const IH_TYPE_SCRIPT: u8 = 6;
+    const IH_COMP_NONE: u8 = 0;
+
+    let mut payload = Vec::with_capacity(script.len() + 8);
+    payload.extend_from_slice(&(script.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.extend_from_slice(script.as_bytes());
+    let dcrc = eo9_flashwire::Crc32::of(&payload);
+
+    let header = |hcrc: u32| {
+        let mut h = Vec::with_capacity(64);
+        h.extend_from_slice(&IH_MAGIC.to_be_bytes());
+        h.extend_from_slice(&hcrc.to_be_bytes());
+        h.extend_from_slice(&0u32.to_be_bytes()); // ih_time: 0, reproducible
+        h.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        h.extend_from_slice(&0u32.to_be_bytes()); // ih_load: scripts ignore it
+        h.extend_from_slice(&0u32.to_be_bytes()); // ih_ep
+        h.extend_from_slice(&dcrc.to_be_bytes());
+        h.push(IH_OS_LINUX);
+        h.push(IH_ARCH_ARM64);
+        h.push(IH_TYPE_SCRIPT);
+        h.push(IH_COMP_NONE);
+        let mut name = [0u8; 32];
+        name[..19].copy_from_slice(b"EO9 USB boot script");
+        h.extend_from_slice(&name);
+        h
+    };
+    let hcrc = eo9_flashwire::Crc32::of(&header(0));
+    let mut out = header(hcrc);
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// One MBR: a single FAT32-LBA (type 0x0C) partition at [`STICK_PART_FIRST_LBA`],
+/// CHS fields pinned to the LBA-only 0xFF convention.
+fn stick_mbr(partition_sectors: u32) -> [u8; 512] {
+    let mut mbr = [0u8; 512];
+    let entry = 0x1BE;
+    mbr[entry] = 0x00; // not flagged active; U-Boot's distro scan does not require it
+    mbr[entry + 1..entry + 4].copy_from_slice(&[0xFF, 0xFF, 0xFF]); // CHS first: LBA-only
+    mbr[entry + 4] = 0x0C; // FAT32 LBA
+    mbr[entry + 5..entry + 8].copy_from_slice(&[0xFF, 0xFF, 0xFF]); // CHS last
+    mbr[entry + 8..entry + 12].copy_from_slice(&(STICK_PART_FIRST_LBA as u32).to_le_bytes());
+    mbr[entry + 12..entry + 16].copy_from_slice(&partition_sectors.to_le_bytes());
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+    mbr
+}
+
+/// The built stick image's FAT32 partition, windowed for the eo9-fatwalk self-check
+/// (the same windowing disk.part performs on the board).
+struct StickPartition<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl eo9_fatwalk::SectorRead for StickPartition<'_> {
+    type Error = String;
+    fn read_sector(&mut self, lba: u64, out: &mut [u8; 512]) -> Result<(), String> {
+        let at = self.offset + lba as usize * 512;
+        if at + 512 > self.bytes.len() {
+            return Err(format!("read past the stick image (partition lba {lba})"));
+        }
+        out.copy_from_slice(&self.bytes[at..at + 512]);
+        Ok(())
+    }
+}
+
+fn build_stick(root: &Path, rest: &[String]) -> Result<(), String> {
+    // --- arguments -------------------------------------------------------------------
+    let mut image: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut slot_mib = STICK_SLOT_MIB;
+    let mut bootargs = STICK_DEFAULT_BOOTARGS.to_string();
+    let mut arguments = rest.iter();
+    while let Some(argument) = arguments.next() {
+        let value = |name: &str, value: Option<&String>| {
+            value
+                .cloned()
+                .ok_or_else(|| format!("build-stick: `{name}` needs a value"))
+        };
+        match argument.as_str() {
+            "--image" => image = Some(PathBuf::from(value("--image", arguments.next())?)),
+            "--out" => out = Some(PathBuf::from(value("--out", arguments.next())?)),
+            "--slot-mib" => {
+                let raw = value("--slot-mib", arguments.next())?;
+                slot_mib = raw
+                    .parse()
+                    .map_err(|_| format!("build-stick: `--slot-mib {raw}` is not a number"))?;
+                if slot_mib == 0 || slot_mib > STICK_BOOT_CAP_MIB {
+                    return Err(format!(
+                        "build-stick: `--slot-mib` must be 1..={STICK_BOOT_CAP_MIB}: \
+                         {STICK_BOOT_CAP_MIB} MiB (load 0x0020_0000 up to 0x0400_0000) \
+                         is the structural boot cap — a bigger slot could only hold an \
+                         image no boot path can run"
+                    ));
+                }
+            }
+            "--bootargs" => bootargs = value("--bootargs", arguments.next())?,
+            other => {
+                return Err(format!(
+                    "build-stick: unknown argument `{other}` (accepted: --image <path>, \
+                     --out <path>, --slot-mib N, --bootargs <text>)"
+                ));
+            }
+        }
+    }
+    let out = out.unwrap_or_else(|| root.join("kernel").join("target").join("eo9-stick.img"));
+    let slot_bytes = slot_mib * 1024 * 1024;
+
+    // --- the payload: the board image, zero-padded to the fixed slot -------------------
+    // THE STICK CARRIES THE MINIMAL/STATION PROFILE, BY CONSTRUCTION: the FULL board
+    // image (65.0 MiB at this lane's build; the bulk lane measured 65.6) is past the
+    // 62 MiB structural boot cap (load 0x0020_0000 up to 0x0400_0000), so no boot path
+    // can run it from the stick (or anywhere else) — kexec into a staged copy is its
+    // only transport. That puts it out of stick scope regardless of slot sizing. The
+    // minimal image (~35 MiB, and it carries init/eosh/the station set) is the stick
+    // payload; the 56 MiB default slot gives it comfortable growth headroom under the
+    // cap. See docs/board/usb-msd-plan.md §3.1 (sizing note).
+    let image_path = match image {
+        Some(path) => path,
+        None => build_kernel_opi5plus(root, true)?,
+    };
+    let image_bytes = std::fs::read(&image_path)
+        .map_err(|err| format!("build-stick: reading {}: {err}", image_path.display()))?;
+    let image_mib = image_bytes.len() as f64 / (1024.0 * 1024.0);
+    if image_bytes.len() as u64 > STICK_BOOT_CAP_MIB * 1024 * 1024 {
+        return Err(format!(
+            "build-stick: {} is {image_mib:.1} MiB — past the {STICK_BOOT_CAP_MIB} MiB \
+             structural boot cap (load 0x0020_0000 up to 0x0400_0000), so NO boot path \
+             can run it from a stick: it is out of stick scope by construction, not by \
+             slot sizing (kexec into a staged copy is its only transport). Build the \
+             minimal image instead, or trim the store.",
+            image_path.display()
+        ));
+    }
+    if image_bytes.len() as u64 > slot_bytes {
+        return Err(format!(
+            "build-stick: {} is {image_mib:.1} MiB — past the {slot_mib} MiB EO9.IMG \
+             slot. Grow it with `--slot-mib` (max {STICK_BOOT_CAP_MIB}, the structural \
+             boot cap) and restage the physical stick once: the slot size is the \
+             same-size-rewrite contract.",
+            image_path.display()
+        ));
+    }
+    let mut padded = image_bytes;
+    let raw_len = padded.len();
+    padded.resize(slot_bytes as usize, 0);
+    let image_crc = eo9_flashwire::Crc32::of(&padded);
+
+    // --- the three stick files --------------------------------------------------------
+    let bootscr = uboot_legacy_script(&stick_bootscr_script(image_crc, slot_bytes));
+    let stage = root.join("kernel").join("target").join("stick-stage");
+    std::fs::create_dir_all(&stage)
+        .map_err(|err| format!("build-stick: creating {}: {err}", stage.display()))?;
+    let stage_file = |name: &str, bytes: &[u8]| -> Result<PathBuf, String> {
+        let path = stage.join(name);
+        std::fs::write(&path, bytes)
+            .map_err(|err| format!("build-stick: writing {}: {err}", path.display()))?;
+        Ok(path)
+    };
+    let staged_image = stage_file("EO9.IMG", &padded)?;
+    let staged_bootargs = stage_file("BOOTARGS.TXT", bootargs.as_bytes())?;
+    let staged_bootscr = stage_file("BOOT.SCR", &bootscr)?;
+
+    // --- assemble: MBR + FAT32 partition via mtools ------------------------------------
+    let part_mib = slot_mib + STICK_PART_HEADROOM_MIB;
+    let part_sectors = part_mib * 2048;
+    let total_bytes = STICK_PART_FIRST_LBA * 512 + part_mib * 1024 * 1024;
+    let _ = std::fs::remove_file(&out); // a stale filesystem must not survive underneath
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&out)
+            .map_err(|err| format!("build-stick: creating {}: {err}", out.display()))?;
+        file.set_len(total_bytes)
+            .map_err(|err| format!("build-stick: sizing {}: {err}", out.display()))?;
+        file.write_all(&stick_mbr(part_sectors as u32))
+            .map_err(|err| format!("build-stick: writing the MBR: {err}"))?;
+    }
+    // mtools' offset syntax addresses the partition inside the image. 512-byte clusters
+    // keep the cluster count past the FAT32 floor at any plausible slot size; geometry
+    // h=16 s=32 divides every whole-MiB partition.
+    let partition = format!("{}@@{}", out.display(), STICK_PART_FIRST_LBA * 512);
+    run(
+        root,
+        "mformat",
+        [
+            "-i",
+            partition.as_str(),
+            "-T",
+            &part_sectors.to_string(),
+            "-h",
+            "16",
+            "-s",
+            "32",
+            "-c",
+            "1",
+            "-F",
+            "::",
+        ],
+    )
+    .map_err(|err| format!("{err} (build-stick needs mtools: `brew install mtools`)"))?;
+    for (path, name) in [
+        (&staged_image, "::EO9.IMG"),
+        (&staged_bootargs, "::BOOTARGS.TXT"),
+        (&staged_bootscr, "::BOOT.SCR"),
+    ] {
+        run(
+            root,
+            "mcopy",
+            ["-i", partition.as_str(), path.to_str().unwrap(), name],
+        )?;
+    }
+
+    // --- self-check: walk the built image back through eo9-fatwalk ---------------------
+    // The same code path the board-side flasher will use (locate, chain-walk, byte-range
+    // to LBA) must reproduce the exact bytes and CRC we just baked — and BOOT.SCR must
+    // come back byte-identical too.
+    let built = std::fs::read(&out)
+        .map_err(|err| format!("build-stick: re-reading {}: {err}", out.display()))?;
+    let mut window = StickPartition {
+        bytes: &built,
+        offset: (STICK_PART_FIRST_LBA * 512) as usize,
+    };
+    let volume = eo9_fatwalk::Volume::open(&mut window)
+        .map_err(|err| format!("build-stick self-check: not a walkable FAT32: {err:?}"))?;
+    let map = volume
+        .locate(&mut window, "EO9.IMG")
+        .map_err(|err| format!("build-stick self-check: locate EO9.IMG: {err:?}"))?;
+    if u64::from(map.size) != slot_bytes {
+        return Err(format!(
+            "build-stick self-check: EO9.IMG is {} bytes on the stick, expected the \
+             {slot_bytes}-byte slot",
+            map.size
+        ));
+    }
+    let runs = volume
+        .runs(&map, 0, slot_bytes)
+        .map_err(|err| format!("build-stick self-check: runs: {err:?}"))?;
+    let mut walked = eo9_flashwire::Crc32::new();
+    for run in &runs {
+        let at = (STICK_PART_FIRST_LBA * 512 + run.lba * 512) as usize;
+        walked.update(&built[at..at + run.sectors as usize * 512]);
+    }
+    if walked.finalize() != image_crc {
+        return Err(format!(
+            "build-stick self-check: the chain-walked EO9.IMG CRC {:08x} does not match \
+             the baked {image_crc:08x}",
+            walked.finalize()
+        ));
+    }
+    let scr = volume
+        .locate(&mut window, "BOOT.SCR")
+        .map_err(|err| format!("build-stick self-check: locate BOOT.SCR: {err:?}"))?;
+    let scr_runs = volume
+        .runs(&scr, 0, u64::from(scr.size))
+        .map_err(|err| format!("build-stick self-check: BOOT.SCR runs: {err:?}"))?;
+    let mut scr_bytes = Vec::with_capacity(scr.size as usize);
+    for run in &scr_runs {
+        let at = (STICK_PART_FIRST_LBA * 512 + run.lba * 512) as usize;
+        scr_bytes.extend_from_slice(&built[at..at + run.sectors as usize * 512]);
+    }
+    scr_bytes.truncate(scr.size as usize);
+    if scr_bytes != bootscr {
+        return Err("build-stick self-check: BOOT.SCR read back differently than written".into());
+    }
+
+    // mdir as the foreign-implementation listing (and the operator's receipt).
+    run(root, "mdir", ["-i", partition.as_str(), "::"])?;
+
+    println!(
+        "xtask: built stick image {} ({} MiB: MBR + {part_mib} MiB FAT32 at LBA \
+         {STICK_PART_FIRST_LBA})",
+        out.display(),
+        total_bytes / (1024 * 1024),
+    );
+    println!(
+        "xtask:   EO9.IMG    {raw_len} bytes of {} padded to the {slot_mib} MiB slot \
+         (crc32 {image_crc:08x} over the padded slot)",
+        image_path.display(),
+    );
+    println!(
+        "xtask:   BOOT.SCR   {} bytes, fixed-width crc/size fields, unconditional go \
+         (the crc32 gate waits on its A0 recon)",
+        bootscr.len()
+    );
+    println!("xtask:   BOOTARGS.TXT \"{bootargs}\"");
+    println!(
+        "xtask:   self-check: eo9-fatwalk walked EO9.IMG's {} cluster(s) in {} run(s); \
+         CRC and BOOT.SCR bytes match",
+        map.chain.len(),
+        runs.len()
+    );
+    println!(
+        "xtask: stage the physical stick with `sudo dd if={} of=/dev/rdiskN bs=1m` (one \
+         time), or copy {}/{{EO9.IMG,BOOTARGS.TXT,BOOT.SCR}} onto an already-staged stick",
+        out.display(),
+        stage.display()
+    );
+    Ok(())
 }
 
 /// The merge gate (plan/01-workspace.md): everything a reviewer agent runs before merging.
@@ -6510,4 +6907,72 @@ fn host_load() -> String {
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .unwrap_or_else(|| "(load unavailable)".to_string())
+}
+
+#[cfg(test)]
+mod stick_tests {
+    use super::*;
+
+    /// The same-size-rewrite contract: any CRC, any (in-range) slot size, the rendered
+    /// BOOT.SCR is byte-count-identical — the fields are fixed-width.
+    #[test]
+    fn bootscr_is_byte_count_invariant_across_builds() {
+        let a = uboot_legacy_script(&stick_bootscr_script(0x0000_0001, 56 * 1024 * 1024));
+        let b = uboot_legacy_script(&stick_bootscr_script(0xFFFF_FFFF, 1024 * 1024));
+        assert_eq!(a.len(), b.len());
+        assert_ne!(a, b);
+        // And the unconditional-go form holds until the crc32-gate A0 recon.
+        let text = stick_bootscr_script(0xDEAD_BEEF, 56 * 1024 * 1024);
+        assert!(text.contains("go 0x00200000\n"));
+        assert!(text.contains("setenv eo9_img_crc 0xdeadbeef\n"));
+        assert!(text.contains("setenv eo9_img_size 0x03800000\n"));
+        assert!(
+            text.contains("fatload ${devtype} ${devnum}:${distro_bootpart} 0x00200000 EO9.IMG\n")
+        );
+    }
+
+    /// The U-Boot legacy header, pinned: 64-byte header, big-endian fields, dcrc over
+    /// the (length-prefixed) payload, hcrc over the header with its own field zeroed —
+    /// the make_bootscr.py construction, now canonical here.
+    #[test]
+    fn uboot_legacy_header_pins() {
+        let script = "echo hi\n";
+        let image = uboot_legacy_script(script);
+        assert_eq!(image.len(), 64 + 8 + script.len());
+        let be32 = |at: usize| u32::from_be_bytes(image[at..at + 4].try_into().unwrap());
+        assert_eq!(be32(0), 0x27051956); // ih_magic
+        assert_eq!(be32(8), 0); // ih_time: deterministic
+        assert_eq!(be32(12), 8 + script.len() as u32); // ih_size
+        // dcrc over the payload.
+        assert_eq!(be32(24), eo9_flashwire::Crc32::of(&image[64..]));
+        // hcrc over the header with the hcrc field zeroed.
+        let mut header = image[..64].to_vec();
+        let hcrc = be32(4);
+        header[4..8].fill(0);
+        assert_eq!(hcrc, eo9_flashwire::Crc32::of(&header));
+        // os/arch/type/comp: linux / arm64 / script / none.
+        assert_eq!(&image[28..32], &[5, 22, 6, 0]);
+        // The payload's own framing: BE script length, then the reserved 0.
+        assert_eq!(be32(64), script.len() as u32);
+        assert_eq!(be32(68), 0);
+        assert_eq!(&image[72..], script.as_bytes());
+    }
+
+    /// The MBR: one FAT32-LBA partition at LBA 2048, signature in place.
+    #[test]
+    fn mbr_pins() {
+        let mbr = stick_mbr(131072);
+        assert_eq!(&mbr[510..], &[0x55, 0xAA]);
+        assert_eq!(mbr[0x1BE + 4], 0x0C);
+        assert_eq!(
+            u32::from_le_bytes(mbr[0x1BE + 8..0x1BE + 12].try_into().unwrap()),
+            2048
+        );
+        assert_eq!(
+            u32::from_le_bytes(mbr[0x1BE + 12..0x1BE + 16].try_into().unwrap()),
+            131072
+        );
+        // The other three entries stay empty.
+        assert!(mbr[0x1CE..0x1FE].iter().all(|&b| b == 0));
+    }
 }
