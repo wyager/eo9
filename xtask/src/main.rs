@@ -36,6 +36,10 @@ const GUEST_COMPONENTS: &[&str] = &[
     "eo9-example-vnic4check",
     "eo9-example-bridgecheck",
     "eo9-example-cancelcheck",
+    // The disk.part window probe (docs/board/usb-msd-plan.md §2 / sdcard-plan.md §B.3):
+    // window size + magic + write round-trip + the out-of-range edge refusals, or a
+    // typed table refusal (GPT, absent partition).
+    "eo9-example-partcheck",
     // The smallest executor: runs another program (a component-typed main argument)
     // and reports how long it took (plan/03 component arguments).
     "eo9-example-time",
@@ -61,6 +65,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     // Standard stub providers (guest/stubs/*, plan/09-providers-stubs.md).
     "eo9-stub-disk-mem",
     "eo9-stub-disk-none",
+    "eo9-stub-disk-part",
     "eo9-stub-disk-virtio",
     "eo9-stub-entropy-none",
     "eo9-stub-entropy-seeded",
@@ -127,7 +132,11 @@ const MANUALED_COMPONENTS: &[&str] = &[
     "eo9-example-l2check",
     "eo9-example-l4check",
     "eo9-example-curl",
+<<<<<<< HEAD
     "eo9-stub-usb-msd",
+=======
+    "eo9-stub-disk-part",
+>>>>>>> area/50-disk-part
 ];
 
 /// Manual-validation rule version, part of the componentize stamp so changing the
@@ -201,6 +210,13 @@ const KERNEL_STORE_COMPONENTS: &[(&str, &str)] = &[
     // virtio disk (boot with the `pci` grant and the xtask `disk` flag).
     ("eo9-stub-disk-virtio", "disk.virtio"),
     ("eo9-stub-fs-eofs", "fs.eofs"),
+    // The partition-table middleware and its window probe (docs/board/usb-msd-plan.md
+    // §2 / sdcard-plan.md §B.3 — shared by the USB-MSD and SD lanes), so a partitioned
+    // disk serves one partition as a windowed eo9:disk at the metal prompt:
+    //   disk.virtio $ disk.part --partition 1 $ partcheck --mode window
+    //   disk.virtio $ disk.part --partition 2 $ fs.eofs $ <program>
+    ("eo9-stub-disk-part", "disk.part"),
+    ("eo9-example-partcheck", "partcheck"),
     // The path-policy fs attenuator and its standard subtree policy, so per-path grants
     // compose at the metal prompt: `fs.policy-subtree --prefix /x --access read-only $
     // fs.filtered $ <program>` ("policies are programs", SPEC).
@@ -464,9 +480,15 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("check-kexec", rest)?;
             check_kexec(&root)
         }
+<<<<<<< HEAD
         "check-share" => {
             expect_no_args("check-share", rest)?;
             check_share(&root)
+=======
+        "check-part" => {
+            expect_no_args("check-part", rest)?;
+            check_part(&root)
+>>>>>>> area/50-disk-part
         }
         "check-curl" => {
             expect_no_args("check-curl", rest)?;
@@ -691,6 +713,15 @@ COMMANDS:
                          `net.virtio $ net.l4.over-l2 $ curl http://10.0.2.2:<port>/hello.txt`
                          at the serial eosh prompt (10.0.2.2 is slirp's host alias), and
                          assert the status line, the body bytes, and the counts line
+    check-part           Boot the aarch64 kernel twice with xtask-built partitioned fixture
+                         disks as virtio-blk functions and drive the disk.part middleware at
+                         the serial eosh prompt: over the MBR fixture,
+                         `disk.virtio $ disk.part [--partition N] $ partcheck` pins the
+                         default-partition and partition-2 windows (size, the magic at the
+                         partition start, a write round-trip, the typed out-of-range edge
+                         refusals) and the absent-partition typed refusal; over the GPT
+                         fixture the chain answers the typed GPT-not-supported refusal —
+                         never a misread of the protective MBR
     firstpoll-ab [--rounds N] [--gate-only]
                          A/B gate for the vendored `first-poll-inline` feature
                          (docs/spikes/first-poll-inline.md): run the async-hardening matrix,
@@ -4745,6 +4776,294 @@ fn compare_ppm(path: &Path, frame: u32) -> Result<(), String> {
 
 // ----------------------------------------------------------------------------------------
 // ----------------------------------------------------------------------------------------
+// check-part: headless verification of the disk.part partition-table middleware
+// (wit/disk part world, crates/eo9-partwalk, guest/stubs/disk-part, partcheck) — the
+// component the USB-MSD and SD-card storage lanes share (docs/board/usb-msd-plan.md §2,
+// docs/board/sdcard-plan.md §B.3).
+//
+// Two boots, each with an xtask-built fixture image as a modern virtio-blk function:
+//
+//   boot 1 (MBR fixture: p1 FAT-typed at LBA 2048 / 1 MiB, p2 0xDA at LBA 4096 / 2 MiB,
+//   a known magic string at each partition's first sector):
+//     `disk.virtio $ disk.part $ partcheck --mode window --magic …`            (default = p1)
+//     `disk.virtio $ disk.part --partition 2 $ partcheck --mode window …`      (windows move)
+//     `disk.virtio $ disk.part --partition 3 $ partcheck --mode refusal …`     (absent, typed)
+//   boot 2 (GPT fixture: protective 0xEE MBR + an "EFI PART" header at LBA 1):
+//     `disk.virtio $ disk.part $ partcheck --mode refusal --needle GPT`        (typed, no misread)
+//
+// partcheck's window mode also pins the boundary semantics from inside the guest: reads
+// and writes at/crossing the window end answer the typed out-of-range, a zero-length
+// read at exactly the end succeeds, and a write round-trip inside the window holds.
+// ----------------------------------------------------------------------------------------
+
+/// How long to wait for the eosh prompt / a step outcome before declaring the boot hung
+/// (on-target compilation of the composed chains dominates, same as check-usb).
+const PART_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The first sector of each MBR-fixture partition carries this magic (suffixed P1/P2),
+/// so partcheck can prove the window starts exactly at the partition start.
+const PART_FIXTURE_MAGIC: &str = "EO9-PART-FIXTURE-";
+
+/// Build the two 8 MiB partitioned fixture images under kernel/target, rewriting them
+/// every run (partcheck's window probe writes into the MBR fixture, so a fresh, known
+/// state each run keeps the gate deterministic). Returns (mbr_path, gpt_path).
+fn ensure_part_fixtures(root: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let dir = root.join("kernel").join("target");
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+
+    const SECTOR: usize = 512;
+    const TOTAL_SECTORS: usize = 16384; // 8 MiB
+
+    /// A 16-byte MBR entry at `slot`: (type, start LBA, sector count).
+    fn write_entry(image: &mut [u8], slot: usize, partition_type: u8, start: u32, count: u32) {
+        let at = 446 + slot * 16;
+        image[at + 4] = partition_type;
+        image[at + 8..at + 12].copy_from_slice(&start.to_le_bytes());
+        image[at + 12..at + 16].copy_from_slice(&count.to_le_bytes());
+    }
+
+    let mut mbr = vec![0u8; TOTAL_SECTORS * SECTOR];
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+    // p1: FAT32-LBA-typed, LBA 2048, 2048 sectors (1 MiB) — the usb-boot stick's
+    // partition-1-at-2048 layout in miniature. p2: 0xDA non-FS data, LBA 4096,
+    // 4096 sectors (2 MiB) — the SD plan's eofs-partition type.
+    write_entry(&mut mbr, 0, 0x0C, 2048, 2048);
+    write_entry(&mut mbr, 1, 0xDA, 4096, 4096);
+    let p1_magic = format!("{PART_FIXTURE_MAGIC}P1");
+    let p2_magic = format!("{PART_FIXTURE_MAGIC}P2");
+    mbr[2048 * SECTOR..2048 * SECTOR + p1_magic.len()].copy_from_slice(p1_magic.as_bytes());
+    mbr[4096 * SECTOR..4096 * SECTOR + p2_magic.len()].copy_from_slice(p2_magic.as_bytes());
+
+    let mut gpt = vec![0u8; TOTAL_SECTORS * SECTOR];
+    gpt[510] = 0x55;
+    gpt[511] = 0xAA;
+    // The protective MBR: one 0xEE entry from LBA 1 to the end, plus a plausible GPT
+    // header signature at LBA 1 — disk.part must refuse on the 0xEE entry alone and
+    // never read this as one giant partition.
+    write_entry(&mut gpt, 0, 0xEE, 1, (TOTAL_SECTORS - 1) as u32);
+    gpt[SECTOR..SECTOR + 8].copy_from_slice(b"EFI PART");
+
+    let mbr_path = dir.join("eo9-part-fixture-mbr.raw");
+    let gpt_path = dir.join("eo9-part-fixture-gpt.raw");
+    std::fs::write(&mbr_path, &mbr)
+        .map_err(|err| format!("failed to write {}: {err}", mbr_path.display()))?;
+    std::fs::write(&gpt_path, &gpt)
+        .map_err(|err| format!("failed to write {}: {err}", gpt_path.display()))?;
+    Ok((mbr_path, gpt_path))
+}
+
+fn check_part(root: &Path) -> Result<(), String> {
+    let arch = "aarch64";
+    let image = build_kernel(root, arch)?;
+    let (mbr_fixture, gpt_fixture) = ensure_part_fixtures(root)?;
+
+    println!(
+        "xtask: check-part — booting {} twice with partitioned fixture disks, driving \
+         `disk.virtio $ disk.part …` chains at the eosh prompt",
+        image.display()
+    );
+
+    // Boot 1: the MBR fixture — both windows serve, the absent partition refuses typed.
+    let p1_magic = format!("{PART_FIXTURE_MAGIC}P1");
+    let p2_magic = format!("{PART_FIXTURE_MAGIC}P2");
+    check_part_boot(
+        root,
+        &image,
+        &mbr_fixture,
+        "the MBR fixture",
+        &[
+            (
+                &format!("disk.virtio $ disk.part $ partcheck --mode window --magic {p1_magic}"),
+                "ok: window(",
+                // p1 is 2048 sectors = 1 MiB; the window starts at the partition start
+                // (the magic check) and every edge refusal fires.
+                &[
+                    "partcheck: window size=1048576",
+                    "magic at offset 0 matches - ok",
+                    "write+read-back",
+                    "read at the window end answered out-of-range - ok",
+                    "read crossing the window end answered out-of-range - ok",
+                    "write at the window end answered out-of-range - ok",
+                    "zero-length read at the window end succeeded - ok",
+                    "partcheck: flush - ok",
+                ],
+            ),
+            (
+                &format!(
+                    "disk.virtio $ disk.part --partition 2 $ partcheck --mode window \
+                     --magic {p2_magic}"
+                ),
+                "ok: window(",
+                // p2 is 4096 sectors = 2 MiB at a different start: the window moved.
+                &[
+                    "partcheck: window size=2097152",
+                    "magic at offset 0 matches - ok",
+                ],
+            ),
+            (
+                "disk.virtio $ disk.part --partition 3 $ partcheck --mode refusal \
+                 --needle absent",
+                "ok: refused(",
+                &["disk.part: partition 3 is absent from the partition table"],
+            ),
+        ],
+    )?;
+
+    // Boot 2: the GPT fixture — the typed v1 refusal, never a misread.
+    check_part_boot(
+        root,
+        &image,
+        &gpt_fixture,
+        "the GPT fixture",
+        &[(
+            "disk.virtio $ disk.part $ partcheck --mode refusal --needle GPT",
+            "ok: refused(",
+            &["GPT partition table not supported in v1"],
+        )],
+    )?;
+
+    println!(
+        "xtask: check-part ok — both MBR partition windows served with their magic and \
+         edge refusals (sizes 1048576/2097152), the absent partition refused typed, and \
+         the GPT fixture answered the typed v1 refusal"
+    );
+    Ok(())
+}
+
+/// One check-part boot: attach `fixture` as a modern virtio-blk function, wait for the
+/// eosh prompt, and for each (line, success marker, required transcript lines) step,
+/// type the line and assert the markers.
+fn check_part_boot(
+    root: &Path,
+    image: &Path,
+    fixture: &Path,
+    what: &str,
+    steps: &[(&str, &str, &[&str])],
+) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::sync::mpsc;
+
+    let arch = "aarch64";
+    let mut command = Command::new(format!("qemu-system-{arch}"));
+    command
+        .current_dir(root)
+        .args(["-M", "virt,gic-version=2,highmem=off", "-cpu", "max"])
+        .args(["-device", "virtio-rng-pci"])
+        .args(["-smp", "1", "-m", KERNEL_QEMU_MEMORY, "-nographic"])
+        .arg("-kernel")
+        .arg(image)
+        .args(["-append", "pci"])
+        .arg("-drive")
+        .arg(format!(
+            "if=none,format=raw,id=eo9part,file={}",
+            fixture.display()
+        ))
+        .args(["-device", "virtio-blk-pci,drive=eo9part,disable-legacy=on"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("check-part: failed to spawn qemu-system-{arch}: {err}"))?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+
+    // Reader thread: forward serial bytes over a channel so waits can time out.
+    let (sender, receiver) = mpsc::channel::<u8>();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut stdout = stdout;
+        let mut byte = [0u8; 1];
+        while let Ok(n) = stdout.read(&mut byte) {
+            if n == 0 || sender.send(byte[0]).is_err() {
+                break;
+            }
+        }
+    });
+
+    /// Accumulate serial output until `marker` appears, or time out.
+    fn wait_for(receiver: &mpsc::Receiver<u8>, marker: &str, what: &str) -> Result<String, String> {
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + PART_STEP_TIMEOUT;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| {
+                    format!(
+                        "check-part: timed out waiting for {what} (last output: …{})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    )
+                })?;
+            match receiver.recv_timeout(remaining) {
+                Ok(byte) => {
+                    seen.push(byte as char);
+                    if seen.contains(marker) {
+                        return Ok(seen);
+                    }
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "check-part: the serial stream ended or timed out waiting for {what} \
+                         (last output: …{})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Type a line the way a human would (the metal console drops fast input —
+    /// plan/12 D49; same pacing as check-usb / check-gpu).
+    fn type_line(stdin: &mut std::process::ChildStdin, line: &str) -> Result<(), String> {
+        for byte in line.as_bytes() {
+            stdin
+                .write_all(core::slice::from_ref(byte))
+                .map_err(|err| format!("check-part: writing to the console: {err}"))?;
+            stdin
+                .flush()
+                .map_err(|err| format!("check-part: flushing the console: {err}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        stdin
+            .write_all(b"\n")
+            .and_then(|()| stdin.flush())
+            .map_err(|err| format!("check-part: writing to the console: {err}"))
+    }
+
+    let drive = (|| -> Result<(), String> {
+        wait_for(&receiver, "eosh>", &format!("the eosh prompt ({what})"))?;
+        for (line, success_marker, required) in steps {
+            type_line(&mut stdin, line)?;
+            let output = wait_for(
+                &receiver,
+                success_marker,
+                &format!("`{success_marker}` after `{line}` ({what})"),
+            )?;
+            for needed in *required {
+                if !output.contains(needed) {
+                    return Err(format!(
+                        "check-part: `{line}` reached its outcome but the transcript is \
+                         missing `{needed}` (see the serial output above)"
+                    ));
+                }
+            }
+            wait_for(&receiver, "eosh>", &format!("the prompt after `{line}`"))?;
+        }
+        type_line(&mut stdin, "exit")?;
+        Ok(())
+    })();
+    if let Err(err) = drive {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    let _ = child.wait();
+    Ok(())
+}
+
 // check-usb: headless verification of the USB host stack M0 lane (wit/platform, wit/usb,
 // the eo9-ohci core, usb.ohci-pci/usb.ohci, usbcheck/hidcheck/platcheck) — see
 // docs/board/usb-ohci-plan.md.

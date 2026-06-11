@@ -1,0 +1,17 @@
+[package]
+name = "eo9-stub-disk-part"
+description = "Eo9 provider stub: disk.part — partition-table middleware that imports eo9:disk (a whole device), parses the MBR on first use (GPT refuses typed), and re-exports eo9:disk as a strict window over the configured partition (targets the eo9:disk/part world)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+# The MBR parse / extended-chain walk / validation core (pure, host-tested).
+eo9-partwalk = { workspace = true }
+wit-bindgen = { workspace = true }

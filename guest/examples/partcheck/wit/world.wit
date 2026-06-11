@@ -1,0 +1,51 @@
+// partcheck — the disk.part window probe (docs/board/usb-msd-plan.md §2 /
+// sdcard-plan.md §B.3: the partition-table middleware both storage lanes share).
+//
+// Two modes against whatever eo9:disk it is composed over:
+//
+//   --mode window   the disk must serve: wake it, report its size, verify the
+//                   fixture magic at offset 0 (when given), round-trip a write
+//                   inside the window, and pin the typed out-of-range refusals at
+//                   the window's edges (read/write at and crossing the end; a
+//                   zero-length read at the end must still succeed).
+//   --mode refusal  the disk must refuse typed: the first read must fail, and the
+//                   error text must contain the expected needle (when given) — the
+//                   GPT / absent-partition / invalid-table probes.
+//
+//   disk.virtio $ disk.part --partition 1 $ partcheck --mode window --magic …  (QEMU gate)
+//   disk.virtio $ disk.part $ partcheck --mode refusal --needle GPT            (GPT fixture)
+package eo9-examples:partcheck@0.1.0;
+
+/// Probes one composed disk window (or its typed refusal).
+world partcheck {
+    import eo9:disk/disk@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    variant program-success {
+        /// Window mode passed; carries `size=<bytes> probes=<n>`.
+        window(string),
+        /// Refusal mode passed; carries the typed error text observed.
+        refused(string),
+    }
+
+    variant program-failure {
+        /// An argument value was rejected (unknown mode).
+        bad-arguments(string),
+        /// A disk operation failed where success was required.
+        disk(string),
+        /// Bytes read back did not match (the magic, or the write round-trip), or a
+        /// refusal's text missed the expected needle.
+        mismatch(string),
+        /// An operation succeeded where a typed refusal was required — the window
+        /// (or the table refusal) is not being enforced.
+        unexpected-success(string),
+        /// A console error.
+        io(string),
+    }
+
+    /// `mode`: `window` or `refusal`. `magic`: expected bytes at offset 0 (window
+    /// mode, optional). `needle`: substring the refusal text must contain (refusal
+    /// mode, optional).
+    export main: async func(mode: string, magic: option<string>, needle: option<string>)
+        -> result<program-success, program-failure>;
+}
