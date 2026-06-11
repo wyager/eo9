@@ -107,8 +107,9 @@
 //!
 //! UTF-8: `read-key` delivers multi-byte characters as their individual `char` bytes;
 //! the editor assembles them (echoing only complete characters, so the emitted stream
-//! stays valid UTF-8 for the `text.write` API) and steps the parser per byte — bytes
-//! >= 0x80 as [`crate::input::Input::Text`], real bytes into captured values — so its
+//! stays valid UTF-8 for the `text.write` API) and steps the parser per byte (a byte
+//! at 0x80 or above steps as [`crate::input::Input::Text`], the real byte reaching
+//! captured values), so its
 //! viability verdicts AND the accumulated parse agree exactly with a reparse. Invalid
 //! sequences are dropped, like the host editor did.
 //!
