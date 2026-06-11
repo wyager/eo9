@@ -569,6 +569,19 @@ async fn port_recv(slot: Slot) -> Result<Option<Vec<u8>>, BridgeError> {
     Ok(with_state(|state| state.rx[slot.index()].pop_front()))
 }
 
+/// `wait-recv` for one port: the documented poll-fallback — return immediately, so a
+/// consumer's wait loop degrades to exactly the poll cadence it ran before the
+/// operation existed. Forwarding the wait to the uplink's own `wait-recv` is NOT done
+/// deliberately (the same reasoning as the switch): the uplink is an exclusive slot
+/// shared by both ports, and a port parked on it for the caller's bound would starve
+/// the sibling's every operation into the typed busy answer for the duration. An
+/// event-driven park here needs a cross-port wake — recorded as the follow-up next to
+/// the A2 board leg; until then both ports stay honestly polled.
+async fn port_wait_recv(slot: Slot, _max_wait_ns: u64) -> Result<(), BridgeError> {
+    let _ = slot;
+    Ok(())
+}
+
 // ------------------------------------------------------------------------------------------
 // The two exported ports (the same macro shape as the switch: each named export mints
 // its own nominal types, and this is where they meet the shared logic).
@@ -657,6 +670,13 @@ macro_rules! port_binding {
                     .map(|bytes_sent| exports::$module::SendResult { bytes_sent })
                     .map_err($error);
                 (frame, outcome)
+            }
+
+            async fn wait_recv(
+                _iface: exports::$module::L2InterfaceBorrow<'_>,
+                max_wait_ns: u64,
+            ) -> Result<(), exports::$module::L2Error> {
+                port_wait_recv($slot, max_wait_ns).await.map_err($error)
             }
 
             async fn recv_frame(

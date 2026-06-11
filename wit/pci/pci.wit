@@ -172,9 +172,15 @@ interface pci {
     enable-interrupts: async func(dev: borrow<device>, kind: interrupt-kind, count: u32)
         -> result<list<interrupt>, pci-error>;
 
-    /// Wait for the next delivery on this vector. Returns the number of deliveries
-    /// coalesced since the previous wait (at least 1); call again for the next batch.
-    wait: async func(i: borrow<interrupt>) -> result<u64, pci-error>;
+    /// Wait for the next delivery on this vector, for at most `max-ns` nanoseconds.
+    /// Returns the number of deliveries coalesced since the previous wait (at least 1);
+    /// call again for the next batch. The provider clamps `max-ns` to its own wait
+    /// bound (the SPEC's awaits-are-bounded rule), so `u64::MAX` means exactly "the
+    /// provider's bound"; either bound expiring is a typed `io` error, never a hang.
+    /// The caller-stated bound is what lets a driver park on a device event while a
+    /// consumer above still owns the wall-clock policy (a protocol deadline shortens
+    /// the park; drivers themselves hold no time capability).
+    wait: async func(i: borrow<interrupt>, max-ns: u64) -> result<u64, pci-error>;
 
     // --- DMA ----------------------------------------------------------------------
 

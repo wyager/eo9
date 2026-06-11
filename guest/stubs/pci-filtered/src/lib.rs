@@ -289,8 +289,8 @@ impl pci::Guest for Stub {
             .collect())
     }
 
-    async fn wait(i: pci::InterruptBorrow<'_>) -> Result<u64, PciError> {
-        underlying::wait(&i.get::<FilteredInterrupt>().inner)
+    async fn wait(i: pci::InterruptBorrow<'_>, max_ns: u64) -> Result<u64, PciError> {
+        underlying::wait(&i.get::<FilteredInterrupt>().inner, max_ns)
             .await
             .map_err(map_error)
     }

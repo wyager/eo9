@@ -41,8 +41,14 @@
 //!   by awaiting its own l4 call. smoltcp itself never touches the link: its device
 //!   abstraction runs over in-memory frame queues ([`QueueDevice`]), and all I/O
 //!   happens between `poll`s in the pump — so the sync stack core and the async link
-//!   never meet on one call stack. Nothing here blocks forever: every wait is bounded
-//!   by its operation's wall-clock deadline plus the frozen-clock backstop.
+//!   never meet on one call stack. An empty pump round does not spin: the wait loop
+//!   parks on the link's receive event (`l2::wait-recv`, the net.virtio RX interrupt
+//!   on metal), bounded by the operation's window and the stack's next timed
+//!   obligation (`poll_delay`), so an idle listener costs the machine nothing while
+//!   protocol deadlines still fire on time; a link with no receive event answers the
+//!   wait immediately and the loop polls exactly as it always did. Nothing here blocks
+//!   forever: every wait is bounded by its operation's wall-clock deadline plus the
+//!   frozen-clock backstop.
 //! * **Bounds.** At most 16 sockets (TCP + UDP combined), 16 KiB TCP buffers per
 //!   direction, 8 × 1536 B received / 4 × 1536 B queued UDP datagrams per socket, a
 //!   32-frame receive queue, and per-operation wall-clock deadlines (4 s receive, 6 s
@@ -720,9 +726,11 @@ fn poll_stack(link: &Link) {
     }
 }
 
-/// Hand everything the stack queued to the l2 provider.
-async fn flush_tx(link: &Link) -> Result<(), L4Error> {
+/// Hand everything the stack queued to the l2 provider. Returns whether any frame was
+/// handed over (progress, for the wait loop's park decision).
+async fn flush_tx(link: &Link) -> Result<bool, L4Error> {
     let frames: Vec<Vec<u8>> = with_net(|n| n.dev.tx.drain(..).collect());
+    let sent_any = !frames.is_empty();
     for frame in frames {
         let buffer = Buffer::new(frame.len() as u64);
         buffer.write(0, &frame);
@@ -735,14 +743,16 @@ async fn flush_tx(link: &Link) -> Result<(), L4Error> {
             Err(_) => {}
         }
     }
-    Ok(())
+    Ok(sent_any)
 }
 
 /// One pump round: let the stack emit what is due, hand it to the link, pull a few
-/// frames the other way, and let the stack process them.
-async fn pump(link: &Link) -> Result<(), L4Error> {
+/// frames the other way, and let the stack process them. Returns whether any frame
+/// moved in either direction — `false` means the round was empty, so the caller may
+/// park on the link's receive event instead of spinning another round.
+async fn pump(link: &Link) -> Result<bool, L4Error> {
     poll_stack(link);
-    flush_tx(link).await?;
+    let mut sent_any = flush_tx(link).await?;
 
     let mut received_any = false;
     for _ in 0..RX_BATCH {
@@ -769,9 +779,9 @@ async fn pump(link: &Link) -> Result<(), L4Error> {
     }
     if received_any {
         poll_stack(link);
-        flush_tx(link).await?;
+        sent_any |= flush_tx(link).await?;
     }
-    Ok(())
+    Ok(received_any || sent_any)
 }
 
 /// Pump the link until `check` reports a result or the wall-clock deadline passes.
@@ -784,6 +794,16 @@ async fn pump(link: &Link) -> Result<(), L4Error> {
 /// left is the [`FROZEN_CLOCK_ROUNDS`] backstop, which fires only after that many
 /// consecutive rounds with zero observed clock movement (a frozen test clock, where the
 /// deadline can never expire) and keeps the wait finite even then.
+///
+/// **The wait parks, it does not spin** (the timer-crutch audit's A2): a pump round
+/// that moved no frame, advanced no socket, and has nothing due means the only thing
+/// that can change the outcome is traffic — so the loop parks on the link's receive
+/// event (`l2::wait-recv`) instead of burning empty pump rounds. The park is bounded by
+/// whichever comes first of the operation's remaining window and the stack's next timed
+/// obligation (`poll_delay`: ARP/TCP retransmits, delayed ACKs, DHCP timers — protocol
+/// deadlines stay deadline-bounded waits, never spin-counted), and the event provider
+/// clamps it again with its own bound. An l2 provider with no receive event returns
+/// immediately, degrading this loop to exactly the poll cadence it always had.
 async fn wait_until<T>(
     link: &Link,
     deadline_ns: u64,
@@ -818,7 +838,40 @@ async fn wait_until<T>(
             }
             return Err(L4Error::TimedOut);
         }
-        pump(link).await?;
+        let progressed = pump(link).await?;
+        if progressed {
+            continue;
+        }
+        // The pump's poll can advance socket state without moving a frame (a
+        // retransmit-exhausted connect falling to Closed, an RTO firing): answer
+        // before parking, or the park would sit on an already-decided outcome.
+        if let Some(result) = check() {
+            return result;
+        }
+        // Nothing moved and nothing is decided: park until traffic (the rx event),
+        // the stack's next timed obligation, or the operation's own window — the
+        // earliest of the three. A zero bound means stack work is due right now, so
+        // loop straight into the next pump instead.
+        let now = now_ns(&link.clock);
+        let remaining = deadline_ns.saturating_sub(now.saturating_sub(start));
+        let stack_due_ns = with_net(|n| {
+            let timestamp = smol_instant(now);
+            n.iface
+                .poll_delay(timestamp, &n.sockets)
+                .map(|delay| delay.total_micros().saturating_mul(1_000))
+        });
+        let bound = stack_due_ns.map_or(remaining, |due| due.min(remaining));
+        if bound > 0 {
+            match l2::wait_recv(&link.iface, bound).await {
+                // Woken by the rx event, by a bound, or immediately by a provider
+                // with no event source: re-poll either way (the wait is advisory).
+                Ok(()) => {}
+                Err(l2::L2Error::Denied) => return Err(L4Error::Denied),
+                // Any other wait failure degrades to polling; the deadline above
+                // keeps the loop bounded.
+                Err(_) => {}
+            }
+        }
     }
 }
 

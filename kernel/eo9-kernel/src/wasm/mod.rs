@@ -394,6 +394,10 @@ pub(crate) mod idle_site {
     pub const READ_LINE: u8 = 1;
     pub const SLEEP: u8 = 2;
     pub const INTX: u8 = 3;
+    /// `task.wait`/`task.runnable` parked on the completion doorbell (area/36) — also
+    /// registered here so Ctrl-C rides the input edge and the orphaned-pend detector
+    /// sees the park as wired, not orphaned.
+    pub const WAIT: u8 = 4;
 }
 
 /// Register a waker to re-drive after the next `wfi` (called by a parked host future).
@@ -421,7 +425,7 @@ fn idle_waker_site_mask() -> usize {
         .iter()
         .fold(0usize, |mask, (_, site)| mask | (1 << site));
     IDLE_WAKER.unlock();
-    mask & 0xf
+    mask & 0x1f
 }
 
 /// Host-call census indices (`drive-stats`): one counter per provider entry point on
@@ -703,7 +707,7 @@ pub(crate) fn idle_wait() -> WakeKind {
     {
         let mut bucket = idle_waker_site_mask();
         if !maintenance_rated {
-            bucket |= 0x10;
+            bucket |= 0x20;
         }
         drive_stats::PARK_MASKS[bucket].fetch_add(1, Ordering::Relaxed);
     }
@@ -765,7 +769,32 @@ pub(crate) fn idle_wait() -> WakeKind {
             );
         }
     }
-    wake_idle();
+    // Due-event delivery, post-wfi edition (the same no-blanket-wake rule as
+    // `deliver_due_events`): an Event-rated wake delivers an interrupt and a
+    // Deadline-rated wake delivers an expired requested deadline — ring the parked
+    // futures so they observe it. A maintenance-rated wake delivered *nothing*: ring
+    // only a raised input edge (scavenged bytes), otherwise nothing — parked futures
+    // stay parked, their wakers stay registered (deduplicated by `will_wake`), and the
+    // next pass's `any_runnable` keeps meaning "stranded work", so the shell loops'
+    // runnable-after-backstop detector stays a regression alarm instead of firing on
+    // every feed-kick cadence (the area/36 false-positive: the blanket ring re-polled
+    // parked guests on each maintenance wake, and the resulting activity read as
+    // runnable-after-backstop). The consumed-but-unexpired requested deadline is
+    // re-published below — without the blanket re-poll nothing else would re-arm it,
+    // and the sleeper's deadline-rated wake must still arrive on time.
+    if kind == WakeKind::Backstop {
+        if requested != u64::MAX && requested > woke {
+            request_timer_wake(requested);
+        }
+        if crate::rxring::input_edge_pending() || crate::pci::intx_edge_pending() {
+            // The INTx edge: a delivery recorded while the core was awake (the 5a65d74
+            // race) — without this ring it would wait one extra pass for the entry
+            // gate. Same producer-class exception as the input edge.
+            wake_idle();
+        }
+    } else {
+        wake_idle();
+    }
     kind
 }
 
@@ -834,10 +863,10 @@ pub(crate) mod drive_stats {
     const ZERO: AtomicU64 = AtomicU64::new(0);
     pub static HOST_CALLS: [AtomicU64; super::host_call::N] = [ZERO; super::host_call::N];
 
-    /// Park-composition histogram: bits 0..3 = the [`super::idle_site`] tags with a
-    /// registered idle waker at the moment of the park, bit 4 = the armed delay belongs
+    /// Park-composition histogram: bits 0..4 = the [`super::idle_site`] tags with a
+    /// registered idle waker at the moment of the park, bit 5 = the armed delay belongs
     /// to a *requested* deadline (clear = a maintenance entry decides the wake).
-    pub static PARK_MASKS: [AtomicU64; 32] = [ZERO; 32];
+    pub static PARK_MASKS: [AtomicU64; 64] = [ZERO; 64];
 
     /// Key→echo meter: kernel-side input-arrival → first guest `text.write` latency
     /// (count / total ns / max ns). The harness-immune per-keystroke ground truth.
@@ -882,9 +911,16 @@ pub(crate) mod drive_stats {
             }
             // Render the bucket as site letters (K=read-key, L=read-line, S=sleep,
             // X=intx) plus D when a requested deadline armed the wake.
-            let mut tag = [0u8; 5];
+            let mut tag = [0u8; 6];
             let mut len = 0;
-            for (bit, letter) in [(0, b'K'), (1, b'L'), (2, b'S'), (3, b'X'), (4, b'D')] {
+            for (bit, letter) in [
+                (0, b'K'),
+                (1, b'L'),
+                (2, b'S'),
+                (3, b'X'),
+                (4, b'W'),
+                (5, b'D'),
+            ] {
                 if mask & (1 << bit) != 0 {
                     tag[len] = letter;
                     len += 1;

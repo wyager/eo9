@@ -421,6 +421,55 @@ static PARENTS: KLock<Vec<Option<u32>>> = KLock::new(Vec::new());
 /// `drive_children`).
 static CURRENT_PARENT: AtomicU32 = AtomicU32::new(u32::MAX);
 
+/// Wakers parked in `task.wait`/`task.runnable` on a child's completion, parallel to
+/// [`CHILDREN`] by index (the [`PARENTS`] pattern). The completion *event* is the drive
+/// loop's own `Running → Done` transition (and the kill paths'), so those transitions ring
+/// these wakers — the event-driven replacement for the old `wake_by_ref` self-wake, which
+/// kept every waiting parent permanently runnable and the executor hot for the whole
+/// lifetime of any foreground child (the area/36 idle-listener finding: a fully parked
+/// telnetd still burned the core at ~190k passes/s because the console's and telnetd's
+/// `task.wait`s spun the drive loop). A parked waiter still observes Ctrl-C promptly
+/// without self-waking: console input raises a UART interrupt, the executor wakes, and
+/// every drive pass re-polls every running child — the self-wake never carried that edge,
+/// it only burned the gap between edges.
+static WAIT_WAKERS: KLock<Vec<Vec<Waker>>> = KLock::new(Vec::new());
+
+/// Whether a completion rang parked waiters since the last top-level pass consumed this
+/// flag. Lets [`drive_children`] rate a pass that transitioned a child to `Done` as
+/// runnable — the waiter checked in earlier in the same pass with its rung flag already
+/// read, so without this the executor could park for a full timer cadence between the
+/// completion and the waiter's resolving re-poll. Consumed at the end of each top-level
+/// pass (never by a nested fibercompile pump pass), keeping the loop hot exactly one
+/// extra pass; the park gate's stranded-runnable finding stays what it is — a regression
+/// detector — because the hot rating means the gate is never reached on this path.
+static COMPLETION_RUNG: AtomicBool = AtomicBool::new(false);
+
+/// Park `waker` until child `rep` completes (deduplicated by `will_wake`).
+fn register_wait_waker(rep: usize, waker: &Waker) {
+    WAIT_WAKERS.with(|wakers| {
+        if wakers.len() <= rep {
+            wakers.resize_with(rep + 1, Vec::new);
+        }
+        let parked = &mut wakers[rep];
+        if !parked.iter().any(|existing| existing.will_wake(waker)) {
+            parked.push(waker.clone());
+        }
+    });
+}
+
+/// Ring every waker parked on child `rep` (its slot just became `Done`). Wakes outside
+/// the registry lock; a ring with no parked waiters is a no-op.
+fn ring_wait_wakers(rep: usize) {
+    let parked =
+        WAIT_WAKERS.with(|wakers| wakers.get_mut(rep).map(core::mem::take).unwrap_or_default());
+    if !parked.is_empty() {
+        COMPLETION_RUNG.store(true, Ordering::Release);
+        for waker in parked {
+            waker.wake();
+        }
+    }
+}
+
 /// Save/restore the current-parent marker around a nested scheduling pass run from
 /// *inside* a child's poll (fibercompile's pump): the nested `drive_children` would
 /// otherwise reset the marker to "none" on its way out, and a spawn later in the
@@ -457,9 +506,9 @@ fn kill_task_tree(rep: usize) -> KOutcome {
     // Kill descendants first (depth doesn't matter — the registry is flat; we just need to
     // catch every transitive child). Iterate to a fixed point so grandchildren are caught.
     loop {
-        let killed_any = CHILDREN.with(|children| {
+        let killed_this_round = CHILDREN.with(|children| {
             PARENTS.with(|parents| {
-                let mut killed = false;
+                let mut killed = Vec::new();
                 for i in 0..children.len() {
                     let is_descendant = is_descendant_of(parents, i, rep);
                     if !is_descendant {
@@ -469,18 +518,22 @@ fn kill_task_tree(rep: usize) -> KOutcome {
                         children.get_mut(i).and_then(Option::as_mut)
                     {
                         *slot = ChildSlot::Done(KOutcome::Killed);
-                        killed = true;
+                        killed.push(i);
                     }
                 }
                 killed
             })
         });
-        if !killed_any {
+        if killed_this_round.is_empty() {
             break;
+        }
+        // Each transition to Done is a completion event for anything parked on it.
+        for index in killed_this_round {
+            ring_wait_wakers(index);
         }
     }
     // Then the target itself.
-    CHILDREN.with(|children| match children.get_mut(rep) {
+    let outcome = CHILDREN.with(|children| match children.get_mut(rep) {
         Some(slot) => match slot {
             Some(ChildSlot::Done(outcome)) => outcome.clone(),
             Some(ChildSlot::Running(_) | ChildSlot::Polling) => {
@@ -490,7 +543,9 @@ fn kill_task_tree(rep: usize) -> KOutcome {
             None => KOutcome::Killed,
         },
         None => KOutcome::Killed,
-    })
+    });
+    ring_wait_wakers(rep);
+    outcome
 }
 
 /// Whether child index `i` is a (transitive) descendant of `ancestor`, walking [`PARENTS`].
@@ -534,6 +589,8 @@ pub struct DriveStatus {
 pub fn reset_children() {
     CHILDREN.with(|children| children.clear());
     PARENTS.with(|parents| parents.clear());
+    WAIT_WAKERS.with(|wakers| wakers.clear());
+    COMPLETION_RUNG.store(false, Ordering::Release);
     CURRENT_PARENT.store(u32::MAX, Ordering::Release);
 }
 
@@ -563,7 +620,8 @@ pub fn drive_children() -> DriveStatus {
     // A fresh top-level pass restarts the executor's park-gate registry (the services
     // pump appends to it). A *nested* pass (fibercompile's pump, running inside a
     // child's poll — CURRENT_PARENT is set) must not clear the outer pass's wakers.
-    if CURRENT_PARENT.load(Ordering::Acquire) == u32::MAX {
+    let top_level = CURRENT_PARENT.load(Ordering::Acquire) == u32::MAX;
+    if top_level {
         super::begin_drive_pass();
     }
     let mut index = 0usize;
@@ -628,6 +686,13 @@ pub fn drive_children() -> DriveStatus {
                 _ => false,
             }
         });
+        if !still_running {
+            // The completion event: deliver it to any parent parked in `task.wait`/
+            // `task.runnable` on this child (covers the normal Ready check-in above and
+            // the killed/dropped arm — the kill paths ring too, but a kill that landed
+            // mid-poll only reaches the registry here).
+            ring_wait_wakers(index);
+        }
         if still_running {
             status.any_running = true;
             #[cfg(feature = "drive-stats")]
@@ -648,6 +713,15 @@ pub fn drive_children() -> DriveStatus {
             super::register_pass_waker(child_waker);
         }
         index += 1;
+    }
+    // A completion this pass rang parked waiters whose rung flags were read before the
+    // ring (a waiter checks in earlier in the pass than the child that completes after
+    // it): rate the pass runnable so the loop re-polls hot and the waiter resolves on
+    // the very next pass instead of sleeping a timer cadence on a delivered event.
+    // Top-level passes only — a nested fibercompile pump must not consume the flag the
+    // outer pass needs.
+    if top_level && COMPLETION_RUNG.swap(false, Ordering::AcqRel) {
+        status.any_runnable = true;
     }
     status
 }
@@ -2567,9 +2641,21 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                                 let outcome = kill_task_tree(rep);
                                 return Poll::Ready(Ok(outcome));
                             }
-                            // The child makes progress on the shell's drive loop between
-                            // polls of the shell; stay runnable so that loop keeps turning.
-                            cx.waker().wake_by_ref();
+                            // Park on the child's completion doorbell: the drive loop's
+                            // own Done transition (and the kill paths') rings it the
+                            // instant the outcome exists. No self-wake — that kept this
+                            // waiter permanently runnable and the executor hot for the
+                            // child's whole lifetime (area/36: a fully parked telnetd
+                            // still burned the core at ~190k passes/s through the
+                            // console's and telnetd's waits). The idle-waker
+                            // registration is what keeps the Ctrl-C arm above live
+                            // while parked: console input raises the edge, `wake_idle`
+                            // / `deliver_due_events` ring the registered wakers (idle
+                            // and hot stretches respectively), and this poll re-runs
+                            // and consumes the interrupt key. Both registries dedup by
+                            // `will_wake`, so re-registering each re-poll cannot grow.
+                            register_wait_waker(rep, cx.waker());
+                            super::register_idle_waker(cx.waker(), super::idle_site::WAIT);
                             Poll::Pending
                         }
                     }
@@ -2594,7 +2680,9 @@ pub fn add_exec(linker: &mut Linker<KernelState>) -> Result<()> {
                     if done {
                         Poll::Ready(())
                     } else {
-                        cx.waker().wake_by_ref();
+                        // Same parking shape as `wait` (no self-wake — see there).
+                        register_wait_waker(rep, cx.waker());
+                        super::register_idle_waker(cx.waker(), super::idle_site::WAIT);
                         Poll::Pending
                     }
                 })

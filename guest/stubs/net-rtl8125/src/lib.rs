@@ -1796,6 +1796,18 @@ impl l2::Guest for Stub {
         }
     }
 
+    async fn wait_recv(
+        _iface: l2::L2InterfaceBorrow<'_>,
+        _max_wait_ns: u64,
+    ) -> Result<(), L2Error> {
+        // Poll fallback, deliberately: the RTL8125's ISR exists, but rk3588 PCIe INTx
+        // is not wired in the kernel yet (`arch::pci_intx::WIRED = false`; the
+        // rk3588_pcie deferral). Returning immediately keeps the board path exactly as
+        // it was — consumers poll on their own cadence — until the INTx plumbing lands
+        // and this can mirror net.virtio's interrupt wait (GAPS: the A2 board leg).
+        Ok(())
+    }
+
     async fn recv_frame(
         _iface: l2::L2InterfaceBorrow<'_>,
         dst: Buffer,
