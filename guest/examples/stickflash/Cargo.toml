@@ -1,0 +1,22 @@
+[package]
+name = "eo9-example-stickflash"
+description = "Eo9 example program: receive an EO9.IMG over TCP (the shared eo9-flashwire protocol, oskexec's sibling) and rewrite the boot stick's fixed FAT slot in place through the composed eo9:disk — fatwalk write plan, read-back CRC verification, typed torn-write honesty (targets the eo9-examples:stickflash/stickflash world: text + time + net l4 + disk + io)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+# A core wasm module that `cargo xtask build-guest` turns into a component.
+crate-type = ["cdylib"]
+
+[dependencies]
+eo9-guest = { workspace = true }
+# The wire protocol lives in the shared crate (host-tested; oskexec speaks the same
+# bytes) — this example keeps only the transport, the fatwalk-over-disk sink, and
+# narration.
+eo9-flashwire = { workspace = true }
+# The FAT32 walk + same-size overwrite planner (pure, host-tested; the same crate
+# build-stick's self-check walks the built image with).
+eo9-fatwalk = { workspace = true }
+wit-bindgen = { workspace = true }

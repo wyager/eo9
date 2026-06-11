@@ -55,6 +55,10 @@ eo9-curl-core = { path = "../crates/eo9-curl-core" }
 # batching, CRC verdict, commit go-ahead) shared byte-identically by the oskexec and
 # stickflash examples: no_std, host-tested in the root workspace — same pattern.
 eo9-flashwire = { path = "../crates/eo9-flashwire" }
+# The FAT32 walk + same-size overwrite planner for the stickflash example: no_std,
+# host-tested in the root workspace (and walked by xtask build-stick's self-check) —
+# same pattern.
+eo9-fatwalk = { path = "../crates/eo9-fatwalk" }
 # The OHCI device core (register map, ED/TD encode/decode, HCCA, enumeration state
 # machine, HID boot decode, and the RegionIo-generic driver) for the usb.ohci /
 # usb.ohci-pci shells and the usbcheck/hidcheck examples: no_std, host-tested in the

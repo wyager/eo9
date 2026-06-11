@@ -398,3 +398,49 @@ The USB-boot round A1 ran with the stick in USB2-A #2 (mouse omitted, keyboard i
 found the stick, sourced /boot.scr, and loaded BOOTARGS.TXT + EO9.IMG at 25.9 MiB/s.
 (The kernel then hit the junk-x0 hang — area/43's lane — but that is past every
 U-Boot leg R0 gates on.) All further lanes are unblocked; workaround 3 is retired.
+
+## Appendix: the stickflash boot configuration (L5 delivery, 2026-06-10)
+
+L5 landed `guest/examples/stickflash` + `send_image.py --stick` + the
+`check-stickflash` gate. Settled facts the lane pinned, superseding details above:
+
+- **Flag reconciliation**: the partition middleware's selector is
+  **`disk.part --partition N`** (1-based, fdisk numbering; default 1) — §2/§4.2's
+  `--index` spelling predates the L3 delivery and is superseded.
+- **Who pads**: **the host**. `send_image.py --stick` zero-pads to the slot
+  (`--slot-mib`, default 56 = build-stick's default) before CRC'ing, so the header
+  length always equals the slot, the wire CRC covers the padded slot (the same value
+  build-stick bakes), and the board side keeps zero FAT-allocation logic. A length
+  that differs from the on-stick slot is a typed refusal before a payload byte flows.
+- **Verdict ordering** (per §3.2's write-then-verify): stickflash answers `K` only
+  AFTER the write plan executed and the read-back CRC matched; `G` is the host's
+  receipt confirmation, not a commit gate (nothing irreversible remains). The
+  send_image verdict deadline scales with the slot accordingly.
+- **v1 scope honesty**: `BOOT.SCR` is NOT rewritten (today's script is
+  unconditional-go; its baked crc/size env fields are consumed by nothing, so going
+  stale is harmless). The §3.1 step-4 commit-point write lands together with the
+  crc32-gated BOOT.SCR (the A0-recon follow-up). Until then a torn EO9.IMG is
+  caught by the gate only once that gate exists — the recovery story today is
+  re-run-or-serial either way.
+
+**The QEMU gate chain** (check-stickflash, proven):
+
+```
+net.virtio $ net.l4.over-l2 $ usb.ohci-pci $ usb.msd $ disk.part --partition 1
+    $ stickflash --secret <16+ bytes>
+```
+
+**The board init config line** (the §4.2 shape with the settled flags; goes live at
+bench time — R3 — under init with station-net, NOT baked by the L5 lane):
+
+```
+flash = net.rtl8125 --advertise-max 1000 $ (net.l4.over-l2 --address dhcp)
+        $ usb.ohci --region usb-host1-ohci $ usb.msd $ disk.part --partition 1
+        $ stickflash --secret-file … restart restart.always
+```
+
+(Secret delivery into the init grammar — literal `--secret` vs a file/env
+indirection — is a bench-time decision; the gate types the literal at the prompt.
+The minimal/station store does not yet bake usb.msd/disk.part/mdcheck/stickflash:
+that addition is R1's first move, deliberately left out of L5 per the
+no-baked-config-changes rule.)

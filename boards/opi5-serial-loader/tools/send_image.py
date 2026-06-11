@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
-"""Send a kernel image to the serial-loader stub (UART) or to oskexec (TCP kexec).
+"""Send a kernel image to the serial-loader stub (UART), to oskexec (TCP kexec), or
+to stickflash (TCP boot-stick rewrite).
 
     python3 send_image.py kernel/target/eo9-opi5plus-min.img \
         --load-addr 0x00200000 --x0 0xeb9f6c38
 
     python3 send_image.py kernel/target/eo9-opi5plus-min.img \
         --tcp 10.20.3.70:9909 --secret "$EO9_KEXEC_SECRET"
+
+    python3 send_image.py kernel/target/eo9-opi5plus-min.img \
+        --stick 10.20.3.70:9910 --secret "$EO9_KEXEC_SECRET"
+
+--stick speaks the SAME frames as --tcp (eo9-flashwire pins them) to the stickflash
+service: the image is zero-padded host-side to the stick's fixed EO9.IMG slot
+(--slot-mib, default 56 — must match `cargo xtask build-stick`), the CRC covers the
+padded slot, and 'K' arrives only after the board wrote the slot AND read it back
+verified — so the verdict wait is minutes at full-speed USB, not seconds. On 'K' the
+stick is done; reset the board to boot it (stickflash never auto-resets).
 
 Serial protocol (must match src/lib.rs, pinned by --selftest):
   "EO9L" + <Q load_addr> + <Q length> + <Q x0_value> + payload + <I crc32(payload)>
@@ -154,7 +165,7 @@ def tcp_recv_scan(sock, seen: int, block: bool) -> tuple[int, bytes]:
     except (BlockingIOError, socketlib.timeout, TimeoutError):
         return seen, b""
     if not data:
-        print("\nconnection closed by oskexec mid-transfer — re-run", file=sys.stderr)
+        print("\nconnection closed by the receiver mid-transfer — re-run", file=sys.stderr)
         sys.exit(1)
     return scan_stub_bytes(data, seen)
 
@@ -189,18 +200,26 @@ TCP_CHUNK = 64 * 1024
 TCP_ACK_STALL_SECONDS = 60.0
 
 
-def tcp_send(args, payload: bytes, crc: int) -> None:
-    """The --tcp transport: authenticate, stream, verify, send the go-ahead."""
+def tcp_send(args, payload: bytes, crc: int, stick: bool = False) -> None:
+    """The --tcp/--stick transport: authenticate, stream, verify, send the go-ahead.
+
+    The frames are identical either way (eo9-flashwire pins them); the differences are
+    the peer (oskexec :9909 vs stickflash :9910), the payload (--stick pre-pads to the
+    EO9.IMG slot — see main), the verdict wait (stickflash writes AND read-back-verifies
+    the whole slot between our CRC and its 'K', so the deadline scales with the slot at
+    full-speed-USB rates), and what success means (a verified stick, not a jump)."""
     import socket
 
-    host, _, port_text = args.tcp.rpartition(":")
+    flag, endpoint = ("--stick", args.stick) if stick else ("--tcp", args.tcp)
+    peer = "stickflash" if stick else "oskexec"
+    host, _, port_text = endpoint.rpartition(":")
     if not host or not port_text.isdigit():
-        print(f"--tcp expects host:port (got {args.tcp!r})", file=sys.stderr)
+        print(f"{flag} expects host:port (got {endpoint!r})", file=sys.stderr)
         sys.exit(2)
     secret = (args.secret or "").encode()
     if len(secret) < 16:
         print(
-            "--tcp needs a preshared secret of >= 16 bytes (--secret or the "
+            f"{flag} needs a preshared secret of >= 16 bytes (--secret or the "
             "EO9_KEXEC_SECRET environment variable)",
             file=sys.stderr,
         )
@@ -208,14 +227,14 @@ def tcp_send(args, payload: bytes, crc: int) -> None:
 
     print(
         f"{args.image}: {len(payload)} bytes -> tcp {host}:{port_text} "
-        f"(kexec), crc {crc:08x}"
+        f"({'stick flash' if stick else 'kexec'}), crc {crc:08x}"
     )
     sock = socket.create_connection((host, int(port_text)), timeout=30)
     try:
         sock.sendall(MAGIC + struct.pack("<H", len(secret)) + secret)
         verdict = tcp_wait_byte(sock, b"AE", 30, "the authentication verdict")
         if verdict == b"E":
-            print("oskexec refused the secret — re-run (it allows ONE retry, then exits)",
+            print(f"{peer} refused the secret — re-run (it allows ONE retry, then exits)",
                   file=sys.stderr)
             sys.exit(1)
         sock.sendall(struct.pack("<QQQ", args.load_addr, len(payload), args.x0))
@@ -238,7 +257,7 @@ def tcp_send(args, payload: bytes, crc: int) -> None:
             ):
                 print(
                     f"\nno ack progress for {TCP_ACK_STALL_SECONDS:g}s mid-transfer "
-                    f"(acked {acks * ACK_INTERVAL}/{len(payload)}) — oskexec gone? re-run",
+                    f"(acked {acks * ACK_INTERVAL}/{len(payload)}) — {peer} gone? re-run",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -264,7 +283,7 @@ def tcp_send(args, payload: bytes, crc: int) -> None:
                 note_progress(before, acks)
                 check_stall(sent)
             if term:
-                print(f"\noskexec answered {term.decode()!r} mid-transfer", file=sys.stderr)
+                print(f"\n{peer} answered {term.decode()!r} mid-transfer", file=sys.stderr)
                 sys.exit(1)
             now = time.time()
             if now - last_paint >= 0.5 or sent == len(payload):
@@ -277,8 +296,15 @@ def tcp_send(args, payload: bytes, crc: int) -> None:
                 last_paint = now
         send_blocking(struct.pack("<I", crc))
 
-        # Drain the remaining acks + the verdict (generous: staging + CRC guest-side).
-        deadline = time.time() + 120 + len(payload) / 1_000_000
+        # Drain the remaining acks + the verdict. Generous on purpose: oskexec only
+        # CRCs guest-side, but stickflash WRITES and READ-BACK-VERIFIES the whole slot
+        # before its 'K' (write-then-verify before declaring success), at full-speed
+        # USB rates on the board (~0.5-1 MiB/s each way) — so the stick deadline
+        # scales with the slot.
+        if stick:
+            deadline = time.time() + 300 + len(payload) / 200_000
+        else:
+            deadline = time.time() + 120 + len(payload) / 1_000_000
         verdict = b""
         while time.time() < deadline:
             acks, term = tcp_recv_scan(sock, acks, block=True)
@@ -288,15 +314,31 @@ def tcp_send(args, payload: bytes, crc: int) -> None:
         print()
         if verdict == b"K":
             send_blocking(b"G")
-            print(
-                f"K: verified ({acks} acks) — go-ahead sent; oskexec is committing. "
-                "Watch the board/QEMU serial console for the new kernel's banner."
-            )
+            if stick:
+                print(
+                    f"K: EO9.IMG rewritten and read-back-verified ({acks} acks) — "
+                    "confirmation sent. Reset the board to boot the new image."
+                )
+            else:
+                print(
+                    f"K: verified ({acks} acks) — go-ahead sent; oskexec is committing. "
+                    "Watch the board/QEMU serial console for the new kernel's banner."
+                )
         elif verdict == b"E":
-            print("E: oskexec refused (crc/stage) — system untouched; re-run", file=sys.stderr)
+            if stick:
+                print(
+                    "E: stickflash refused or failed — read ITS console narration: a "
+                    "refusal before any write leaves the stick untouched; a failure "
+                    "after writes began means the stick is possibly torn (re-run; the "
+                    "boot CRC gate catches a torn image)",
+                    file=sys.stderr,
+                )
+            else:
+                print("E: oskexec refused (crc/stage) — system untouched; re-run",
+                      file=sys.stderr)
             sys.exit(1)
         else:
-            print("no verdict (timeout) — check oskexec is still running; re-run",
+            print(f"no verdict (timeout) — check {peer} is still running; re-run",
                   file=sys.stderr)
             sys.exit(1)
     finally:
@@ -318,6 +360,23 @@ def main() -> None:
         metavar="HOST:PORT",
         help="send over TCP to a listening oskexec (network kexec) instead of the "
         "serial stub; requires --secret / EO9_KEXEC_SECRET",
+    )
+    ap.add_argument(
+        "--stick",
+        default=None,
+        metavar="HOST:PORT",
+        help="send over TCP to a listening stickflash (boot-stick rewrite, port 9910): "
+        "the same frames as --tcp, but the image is first zero-padded to the EO9.IMG "
+        "slot (--slot-mib) so the rewrite is the same-size in-place overwrite "
+        "build-stick promises; requires --secret / EO9_KEXEC_SECRET",
+    )
+    ap.add_argument(
+        "--slot-mib",
+        type=int,
+        default=56,
+        help="the stick's fixed EO9.IMG slot size in MiB for --stick padding (must "
+        "match what `cargo xtask build-stick` baked; default 56). stickflash refuses "
+        "a length that differs from the slot on its stick.",
     )
     ap.add_argument(
         "--secret",
@@ -360,7 +419,34 @@ def main() -> None:
 
         sys.stdout = _Tee(sys.stdout, logf)
 
+    if args.tcp and args.stick:
+        print("--tcp and --stick are mutually exclusive (different receivers)",
+              file=sys.stderr)
+        sys.exit(2)
+
     payload = open(args.image, "rb").read()
+
+    if args.stick:
+        # THE HOST PADS (the documented side — guest/examples/stickflash): zero-fill
+        # to the fixed slot so the header length equals the slot, the CRC covers the
+        # padded slot (the same value build-stick bakes), and the board-side rewrite
+        # stays a same-size in-place cluster overwrite with zero FAT logic.
+        slot = args.slot_mib * 1024 * 1024
+        if len(payload) > slot:
+            print(
+                f"{args.image} is {len(payload)} bytes — past the {args.slot_mib} MiB "
+                "EO9.IMG slot. Rebuild the stick with a bigger --slot-mib (and pass "
+                "the same value here), or trim the image.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if len(payload) < slot:
+            print(f"padding {len(payload)} bytes to the {args.slot_mib} MiB slot")
+            payload = payload + b"\x00" * (slot - len(payload))
+        crc = binascii.crc32(payload) & 0xFFFFFFFF
+        tcp_send(args, payload, crc, stick=True)
+        return
+
     crc = binascii.crc32(payload) & 0xFFFFFFFF
 
     if args.tcp:

@@ -1,0 +1,97 @@
+// stickflash — receive an EO9.IMG over TCP and rewrite the boot stick's FAT slot in
+// place (docs/board/usb-msd-plan.md §4: oskexec's sibling — same wire protocol via
+// the shared eo9-flashwire crate, a disk sink instead of the kexec sink, and a
+// capability-narrower world: its blast radius is exactly the composed disk window).
+//
+// An ordinary Eo9 program: it holds text (narration), time (transfer/flash timing),
+// one transport capability (eo9:net/l4 — composed), and one block device
+// (eo9:disk — the boot stick's FAT32 partition, composed:
+// `usb.ohci $ usb.msd $ disk.part --partition 1 $ stickflash` on the board).
+// Offset 0 of the composed disk IS the partition's boot sector — partition
+// windowing is disk.part's job, never this program's (usb-msd-plan §2).
+//
+// Wire protocol (byte-identical to oskexec — eo9-flashwire pins it; the host side is
+// boards/opi5-serial-loader/tools/send_image.py --stick):
+//
+//   "EO9L"                       magic (4 bytes)
+//   <H secret-len> <secret>      preshared secret (little-endian u16 length + bytes)
+//   --> 'A'                      authenticated (or 'E' + close: refused)
+//   <Q load-addr> <Q len> <Q x0> header — load-addr/x0 carried for framing parity and
+//                                IGNORED; len must EQUAL the EO9.IMG slot size (the
+//                                host pads: send_image --stick zero-pads to the slot
+//                                before CRC'ing, matching build-stick's baked layout)
+//   <payload>                    len bytes, received into memory
+//   <-- 'k'                      per full 64 KiB received (progress)
+//   <I crc32>                    CRC-32 (IEEE) of the (padded) payload
+//   ... the flash happens HERE: wire CRC verified, then the fatwalk write plan runs
+//   through eo9:disk, then every written range is read back and CRC-verified ...
+//   --> 'K'                      sent ONLY after the read-back matches (write-then-
+//                                verify before declaring success — usb-msd-plan §3.2;
+//                                'E' on any refusal or write/verify failure)
+//   <-- 'G'                      host confirmation that 'K' arrived (the shared frame;
+//                                nothing is left to commit — the stick already carries
+//                                the verified image either way)
+//
+// SECURITY: same posture as oskexec — a mandatory >= 16-byte preshared secret,
+// full-length compare, one retry then exit, cleartext on the LAN (trusted-LAN/bench
+// tool). The authority here is the composed disk window, not the kernel: a
+// compromised peer can corrupt the boot stick, and the boot-time CRC gate plus the
+// serial loader are the recovery story (usb-msd-plan §3.2).
+//
+// TORN-WRITE HONESTY: any failure after the first cluster write leaves the stick
+// possibly torn. That is narrated LOUDLY and typed (`torn`); recovery is a re-run, or
+// the serial path if the stick no longer boots. BOOT.SCR is NOT rewritten in v1 (it
+// is the unconditional-go script today; its baked crc/size env fields go stale
+// harmlessly because nothing consumes them yet) — the BOOT.SCR commit-point write
+// lands together with the crc32-gated script (usb-msd-plan §3.1/§3.2 follow-up).
+package eo9-examples:stickflash@0.1.0;
+
+/// Serves exactly one stick flash over TCP: authenticate, receive the slot-sized
+/// image, overwrite EO9.IMG's clusters in place, read back and CRC-verify, then
+/// answer 'K' and exit ("reset to boot it" — v1 never auto-resets).
+///
+///   net.virtio $ net.l4.over-l2 $ usb.ohci-pci $ usb.msd $ disk.part --partition 1
+///       $ stickflash --secret <16+ bytes>                       (the QEMU gate)
+///   net.rtl8125 $ (net.l4.over-l2 --address dhcp) $ usb.ohci --region usb-host1-ohci
+///       $ usb.msd $ disk.part --partition 1
+///       $ stickflash --secret <16+ bytes>                       (the board)
+world stickflash {
+    import eo9:text/text@0.1.0;
+    import eo9:time/time@0.1.0;
+    import eo9:net/l4@0.1.0;
+    import eo9:disk/disk@0.1.0;
+
+    variant program-success {
+        /// The slot was rewritten and read-back-verified (carries bytes + crc; the
+        /// operator resets the board to boot the new image).
+        flashed(string),
+    }
+
+    variant program-failure {
+        /// An argument was unusable (e.g. a secret shorter than 16 bytes).
+        bad-arguments(string),
+        /// The transport or disk capability refused (e.g. composed over a deny stub).
+        denied,
+        /// A transport operation failed, carrying the l4 API's own error.
+        net(string),
+        /// The peer broke the framing (bad magic, short header, failed
+        /// authentication after the one retry).
+        protocol(string),
+        /// The image or the volume was refused BEFORE any write: wire CRC mismatch,
+        /// image length != the slot size, a foreign FAT layout, EO9.IMG missing.
+        /// The stick is untouched.
+        refused(string),
+        /// A disk operation failed before any write began. The stick is untouched.
+        disk(string),
+        /// A write or the read-back verification failed AFTER cluster writes began:
+        /// the stick is POSSIBLY TORN. The boot-time CRC gate fails through to the
+        /// prompt on a torn EO9.IMG; recovery is a re-run or the serial loader.
+        torn(string),
+    }
+
+    /// `port`: TCP listen port (default 9910; 9909 is oskexec). `secret`: the
+    /// preshared authentication secret (>= 16 bytes; the operator passes the same
+    /// value to send_image.py --stick).
+    export main: async func(port: option<u16>, secret: string)
+        -> result<program-success, program-failure>;
+}
