@@ -56,6 +56,10 @@ eo9-flashwire = { path = "../crates/eo9-flashwire" }
 # usb.ohci-pci shells and the usbcheck/hidcheck examples: no_std, host-tested in the
 # root workspace — the same shared-engine pattern as eo9-eofs and eo9-rtl8125.
 eo9-ohci = { path = "../crates/eo9-ohci" }
+# The mass-storage protocol core (BOT CBW/CSW framing, the error-recovery ladder, the
+# six-command SCSI set) for the usb.msd driver: no_std, host-tested in the root
+# workspace against scripted endpoint mocks — same pattern.
+eo9-msd = { path = "../crates/eo9-msd" }
 # The TCP/IP engine for the net.l4.over-l2 middleware provider (plan/09 Decision 18):
 # no_std + alloc, Ethernet + IPv4 + TCP + UDP only. Guest-workspace-only — it never
 # enters the host or kernel dependency tree.

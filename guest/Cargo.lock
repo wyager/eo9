@@ -332,6 +332,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eo9-example-mdcheck"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "eo9-example-oskexec"
 version = "0.0.0"
 dependencies = [
@@ -432,6 +440,10 @@ dependencies = [
  "dlmalloc",
  "wit-bindgen",
 ]
+
+[[package]]
+name = "eo9-msd"
+version = "0.1.0"
 
 [[package]]
 name = "eo9-ohci"
@@ -849,6 +861,16 @@ name = "eo9-stub-usb-kbd"
 version = "0.0.0"
 dependencies = [
  "eo9-guest",
+ "eo9-ohci",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "eo9-stub-usb-msd"
+version = "0.0.0"
+dependencies = [
+ "eo9-guest",
+ "eo9-msd",
  "eo9-ohci",
  "wit-bindgen",
 ]

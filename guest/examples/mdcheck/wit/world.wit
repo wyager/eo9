@@ -1,0 +1,45 @@
+// mdcheck — the block-device probe the mass-storage gate drives (docs/board/
+// usb-msd-plan.md §5.1, the check-msd leg): size, a high-address scratch
+// write+read-back, and the typed past-capacity refusal — all through plain
+// eo9:disk, so the same probe runs over usb.msd, disk.virtio, or disk.mem.
+package eo9-examples:mdcheck@0.1.0;
+
+/// Probes the composed block device: report its size, write an offset-dependent
+/// pattern to the HIGHEST `span` bytes (high LBAs — the far end of the device, where
+/// an LBA-encoding bug cannot hide at offset 0), read it back byte-exact, and check
+/// that reads and writes past the capacity answer the typed `out-of-range` (never
+/// partial I/O, never a trap).
+///
+///   usb.ohci-pci $ usb.msd $ mdcheck                 (the check-msd QEMU gate)
+///   disk.mem --size 2097152 $ mdcheck                (usermode)
+///   pci.admit-vendor --allow … $ pci.filtered $ disk.virtio $ mdcheck
+world mdcheck {
+    import eo9:disk/disk@0.1.0;
+    import eo9:text/text@0.1.0;
+
+    variant program-success {
+        /// Every probe passed; carries the number of scratch bytes round-tripped.
+        verified(u64),
+    }
+
+    variant program-failure {
+        /// An argument value was rejected (e.g. a zero span).
+        bad-arguments(string),
+        /// The device is too small for the scratch span (carries size and span).
+        too-small(string),
+        /// A disk operation failed with an unexpected typed error.
+        disk(string),
+        /// The read-back differed from what was written (offset + first differing
+        /// byte — the data-path corruption this probe exists to catch).
+        mismatch(string),
+        /// A past-capacity access did NOT answer out-of-range (carries what it
+        /// answered instead — the bounds-check regression arm).
+        not-refused(string),
+        /// A console error.
+        io(string),
+    }
+
+    /// `span`: how many bytes of the device's top end to write+verify (default
+    /// 65536; capped to the device size).
+    export main: async func(span: option<u32>) -> result<program-success, program-failure>;
+}

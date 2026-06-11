@@ -372,7 +372,7 @@ async fn probe_bot(device: &usb::Device, config_blob: &[u8]) -> Result<(), Progr
     cbw[13] = 0; // LUN 0
     cbw[14] = 6; // bCBWCBLength
     cbw[15] = 0x12; // INQUIRY
-    cbw[18] = 36; // allocation length
+    cbw[19] = 36; // allocation length LSB (SPC-3 §6.4: CDB bytes 3..4, big-endian)
     usb::bulk_write(&endpoint_out, cbw.to_vec())
         .await
         .map_err(usb_failure)?;
