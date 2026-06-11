@@ -8,7 +8,7 @@
         content="The full Eo9 operating system — runtime, capability algebra, compiler, and the eosh shell — compiled to WebAssembly and running entirely in this page.">
   <link rel="icon" type="image/svg+xml" href="/logo.svg">
   <link rel="stylesheet" href="/style.css">
-  <link rel="stylesheet" href="/vm/vm.b7c2d1b49a4561f0.css">
+  <link rel="stylesheet" href="/vm/vm.a9de907f98e8da27.css">
 </head>
 <body>
 
@@ -131,9 +131,12 @@
     browser — so it is slower. On real hardware, Eo9 compiles programs and compositions to native
     code on the machine itself. Also not here: persistence (the filesystem is in-memory and resets on
     reload) and real networking — the network stacks above (loopback, the switch) are themselves
-    in-page providers; nothing reaches your network. Genuinely blocking operations (the prompt's <code>read-line</code>,
-    <code>time.sleep</code>) suspend the whole VM with JavaScript Promise Integration, so this page
-    needs a JSPI-capable browser — current Chrome or Edge.
+    in-page providers; nothing reaches your network. Genuinely blocking operations (the prompt's
+    per-keystroke <code>read-key</code>, <code>time.sleep</code>) suspend the whole VM with
+    JavaScript Promise Integration, so this page needs a JSPI-capable browser — current Chrome or
+    Edge. The prompt is the shell's real editor: it parses as you type, marks input that cannot
+    run in red, completes names and flags on TAB, and recalls history with the arrow keys —
+    exactly as on the serial console of the bare-metal kernel.
   </p>
 
 </main>
@@ -144,6 +147,6 @@
      <a href="https://github.com/wyager/eo9/blob/master/SPEC.md">Spec</a></p>
 </footer>
 
-<script type="module" src="/vm/vm.3363de7463cd0276.js"></script>
+<script type="module" src="/vm/vm.af33d10096a8cefa.js"></script>
 </body>
 </html>

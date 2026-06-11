@@ -1040,3 +1040,14 @@ error" instead of the parameter-naming refusal QEMU-side development shows. Same
 class as the registry's typed-refusal discipline everywhere else. Lane: thread the
 typed configure error through the kernel algebra shim (small; the WIT vocabulary
 already exists).
+
+## The web blob carries a KeyDecoder copy — pinned by a contract corpus, extraction queued (area/54 review, 2026-06-11)
+The blob's per-keystroke input decoder mirrors kernel/eo9-kernel/src/keydecoder.rs
+line for line (the kernel module lives inside the eo9-kernel BINARY crate — not
+importable without extracting a crate, which means a kernel rebuild; deferred while
+the bench image is freshly flashed). The copy is NOT silent: the blob's
+keydecoder_contract test module carries the kernel suite's exact byte vectors, so
+drift between the two decoders fails a host test rather than corrupting page input.
+Lane (next kernel-touching change): extract crates/eo9-keydec (no_std, dep'd by
+eo9-kernel and web-eo9-blob), delete the copy, keep the corpus as the crate's tests
+— the same one-surface rule the parser unification just enforced.

@@ -28,6 +28,14 @@ unsafe extern "C" {
     /// UTF-8 at `ptr`; returns the byte length, `-1` for end-of-input, `-2` if the browser
     /// cannot suspend (no JSPI).
     fn host_read_line(ptr: *mut u8, cap: usize) -> i32;
+    /// **JSPI** — one byte of per-keystroke terminal input. The page encodes keydown
+    /// events as the SAME byte stream the serial console and usb.kbd produce (printables
+    /// as themselves, Enter `\r`, Backspace 0x7f, Tab, arrows as `ESC [ A/B/C/D`, Ctrl-C
+    /// as 0x03), and this returns it one byte at a time: `0..=255` is a byte, `-1` is
+    /// end-of-input, `-2` means the browser cannot suspend (no JSPI), `-3` means the
+    /// transport is line-based (the node verify harnesses) — the read-key caller answers
+    /// `unsupported` and eosh falls back to its read-line loop.
+    fn host_read_key() -> i32;
     /// **JSPI** — fetch `/vm/store/<name>.cwasm`; returns its byte length and caches the
     /// bytes on the JS side, `-1` if the fetch failed, `-2` if the browser cannot suspend.
     fn host_fetch_len(name_ptr: *const u8, name_len: usize) -> i32;
@@ -74,6 +82,12 @@ pub fn random_fill(buffer: &mut [u8]) {
 
 pub fn sleep_ms(ms: f64) {
     unsafe { host_sleep_ms(ms) }
+}
+
+/// One byte of per-keystroke terminal input, or a negative status (see the import docs:
+/// `-1` end-of-input, `-2` no JSPI, `-3` line-based transport).
+pub fn read_key_byte() -> i32 {
+    unsafe { host_read_key() }
 }
 
 /// One line from the page terminal (`None` = end of input, including the no-JSPI case —

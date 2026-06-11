@@ -16,13 +16,16 @@ const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 let memory = null;
 let fetched = null;
-const lines = [];
+// Output arrives as raw terminal chunks (newlines included — the page interprets the
+// stream; see vm.js); accumulate and split on newlines, stripping the per-chunk U+0001
+// stderr marker.
+let raw = "";
 
 const imports = {
   env: {
-    // Standard-error lines carry a leading U+0001 marker (the page styles them); strip it here.
-    host_write: (ptr, len) =>
-      lines.push(decoder.decode(new Uint8Array(memory.buffer, ptr, len)).replace(/^\u0001/, "")),
+    host_write: (ptr, len) => {
+      raw += decoder.decode(new Uint8Array(memory.buffer, ptr, len)).replace(/^\u0001/, "");
+    },
     host_now_ms: () => Date.now(),
     host_monotonic_ns: () => performance.now() * 1e6,
     host_random_fill: (ptr, len) => {
@@ -37,6 +40,8 @@ const imports = {
     host_gfx_present: () => {},
     host_sleep_ms: new WebAssembly.Suspending((ms) => new Promise((r) => setTimeout(r, ms))),
     host_read_line: new WebAssembly.Suspending(async () => -1),
+    // This harness is a line-based transport: -3 sends eosh down its read-line path.
+    host_read_key: new WebAssembly.Suspending(async () => -3),
     host_fetch_len: new WebAssembly.Suspending(async (namePtr, nameLen) => {
       const name = decoder.decode(new Uint8Array(memory.buffer, namePtr, nameLen));
       try {
@@ -71,7 +76,7 @@ const rc = await runProgram(nP, nL, aP, aL);
 x.web_free(nP, nL);
 x.web_free(aP, aL);
 
-console.log(lines.join("\n"));
-const ok = rc === 0 && lines.some((l) => /round-tripped\(10\)/.test(l));
+console.log(raw);
+const ok = rc === 0 && /round-tripped\(10\)/.test(raw);
 console.log(`\nreadwrite rc=${rc} -> ${ok ? "PASS" : "FAIL"}`);
 process.exit(ok ? 0 : 1);

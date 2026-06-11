@@ -30,8 +30,11 @@ mod host;
 mod providers;
 mod store;
 
+// One diagnostic line on the page terminal. The page interprets the output stream like a
+// terminal (it no longer renders one DOM line per host write), so the newline is explicit;
+// one host write keeps the line and its U+0001 error marker (when present) in one chunk.
 fn out(message: &str) {
-    host::write_out(message)
+    host::write_out(&std::format!("{message}\n"))
 }
 
 #[macro_export]
