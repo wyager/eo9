@@ -422,6 +422,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("check-usb", rest)?;
             check_usb(&root)
         }
+        "check-usb-bulk" => {
+            expect_no_args("check-usb-bulk", rest)?;
+            check_usb_bulk(&root)
+        }
         "check-usb-hub" => {
             expect_no_args("check-usb-hub", rest)?;
             check_usb_hub(&root)
@@ -579,6 +583,13 @@ COMMANDS:
                          QEMU keyboard, 0627:0001), `usb.ohci $ usbcheck` (typed no-controller
                          — no OHCI region on QEMU), and `usb.ohci-pci $ hidcheck` with QMP
                          input-send-event key injection (decoded boot-protocol keystrokes)
+    check-usb-bulk       Boot the aarch64 kernel under QEMU with a mass-storage stick on the
+                         OHCI bus (-device pci-ohci -device usb-storage over a scratch raw
+                         image) and drive `usb.ohci-pci $ usbcheck --bot-probe true` at the
+                         serial eosh prompt: enumerate 46f4:0001, open the bulk pair, and
+                         round-trip one opaque BOT INQUIRY (CBW out, 36 data bytes in, the
+                         CSW in as a short read) — the usb-msd plan's L1 bulk leg; the full
+                         mass-storage gate (check-msd) arrives with the L2 msd lane
     check-usb-hub        Boot the aarch64 kernel under QEMU with the keyboard BEHIND a hub
                          (-device usb-hub + usb-kbd on its port 1) plus the console-sink
                          grant, and drive the full M4 keyboard chain: hidcheck through the
@@ -4574,6 +4585,171 @@ fn qmp_inject_keys(socket: &Path, keys: &[&str]) -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
     }
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------------------
+// check-usb-bulk: the L1 bulk-endpoint leg (docs/board/usb-msd-plan.md §5.1) — QEMU's
+// `-device usb-storage` on the OHCI bus (verified live on QEMU 11.0.0: full-speed
+// attach, the same -M virt vehicle as check-usb), driven by `usbcheck --bot-probe
+// true`: enumerate 46f4:0001, find the mass-storage bulk pair in the descriptor walk,
+// and round-trip ONE opaque BOT INQUIRY — the CBW as a bulk-out, 36 data bytes as a
+// bulk-in, the CSW as a deliberately-oversized-ask bulk-in (the short-read/residue
+// path). The BOT/SCSI protocol layer and the real mass-storage gate (check-msd) are
+// the L2 msd lane's; this leg pins only that the bulk surface moves bytes end to end.
+// ----------------------------------------------------------------------------------------
+
+fn check_usb_bulk(root: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::sync::mpsc;
+
+    let arch = "aarch64";
+    let image = build_kernel(root, arch)?;
+
+    // A scratch raw disk for usb-storage to expose: 1 MiB of zeros — this leg never
+    // reads sectors (READ(10) is L2's), only INQUIRY, so contents are irrelevant.
+    let stick = root
+        .join("kernel")
+        .join("target")
+        .join("eo9-usb-bulk-stick.img");
+    std::fs::write(&stick, vec![0u8; 1 << 20])
+        .map_err(|err| format!("check-usb-bulk: writing the scratch stick image: {err}"))?;
+
+    println!(
+        "xtask: check-usb-bulk — booting {} with -device usb-storage on the OHCI bus, \
+         driving `usb.ohci-pci $ usbcheck --bot-probe true` at the eosh prompt",
+        image.display()
+    );
+
+    let mut command = Command::new(format!("qemu-system-{arch}"));
+    command
+        .current_dir(root)
+        .args(["-M", "virt,gic-version=2,highmem=off", "-cpu", "max"])
+        .args(["-device", "virtio-rng-pci"])
+        .args(["-smp", "1", "-m", KERNEL_QEMU_MEMORY, "-nographic"])
+        .arg("-kernel")
+        .arg(&image)
+        .args(["-append", "pci"])
+        .args(["-device", "pci-ohci,id=eo9ohci"])
+        .arg("-drive")
+        .arg(format!(
+            "file={},if=none,format=raw,id=stick",
+            stick.display()
+        ))
+        .args(["-device", "usb-storage,bus=eo9ohci.0,drive=stick"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("check-usb-bulk: failed to spawn qemu-system-{arch}: {err}"))?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+
+    // Reader thread: forward serial bytes over a channel so waits can time out.
+    let (sender, receiver) = mpsc::channel::<u8>();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut stdout = stdout;
+        let mut byte = [0u8; 1];
+        while let Ok(n) = stdout.read(&mut byte) {
+            if n == 0 || sender.send(byte[0]).is_err() {
+                break;
+            }
+        }
+    });
+
+    /// Accumulate serial output until `marker` appears, or time out.
+    fn wait_for(receiver: &mpsc::Receiver<u8>, marker: &str, what: &str) -> Result<String, String> {
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + USB_STEP_TIMEOUT;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| {
+                    format!(
+                        "check-usb-bulk: timed out waiting for {what} (last output: …{})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    )
+                })?;
+            match receiver.recv_timeout(remaining) {
+                Ok(byte) => {
+                    seen.push(byte as char);
+                    if seen.contains(marker) {
+                        return Ok(seen);
+                    }
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "check-usb-bulk: the serial stream ended or timed out waiting for \
+                         {what} (last output: …{})",
+                        &seen[seen.len().saturating_sub(400)..]
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Type a line the way a human would (the metal console drops fast input —
+    /// plan/12 D49; same pacing as check-usb).
+    fn type_line(stdin: &mut std::process::ChildStdin, line: &str) -> Result<(), String> {
+        for byte in line.as_bytes() {
+            stdin
+                .write_all(core::slice::from_ref(byte))
+                .map_err(|err| format!("check-usb-bulk: writing to the console: {err}"))?;
+            stdin
+                .flush()
+                .map_err(|err| format!("check-usb-bulk: flushing the console: {err}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        stdin
+            .write_all(b"\n")
+            .and_then(|()| stdin.flush())
+            .map_err(|err| format!("check-usb-bulk: writing to the console: {err}"))
+    }
+
+    let drive = (|| -> Result<(), String> {
+        wait_for(&receiver, "eosh>", "the eosh prompt")?;
+
+        // The one leg: enumerate the QEMU stick, open the bulk pair, and round-trip
+        // the opaque BOT INQUIRY (CBW out / data in / short-read CSW in).
+        type_line(&mut stdin, "usb.ohci-pci $ usbcheck --bot-probe true")?;
+        let output = wait_for(&receiver, "ok: enumerated(1)", "the BOT round trip")?;
+        for line in [
+            "usb.ohci-pci: OHCI 1.0",
+            "usbcheck: device 46f4:0001",
+            "bulk IN",
+            "bulk OUT",
+            "usbcheck: bot: bulk pair open",
+            "vendor 'QEMU'",
+            "usbcheck: bot: csw status 0 residue 0",
+            "usbcheck: bot round-trip ok (cbw out 31, data in 36, csw in 13)",
+        ] {
+            if !output.contains(line) {
+                return Err(format!(
+                    "check-usb-bulk: usbcheck finished but its transcript is missing \
+                     `{line}` (see the serial output above)"
+                ));
+            }
+        }
+        wait_for(&receiver, "eosh>", "the prompt after the BOT probe")?;
+
+        type_line(&mut stdin, "exit")?;
+        Ok(())
+    })();
+    if let Err(err) = drive {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+    let _ = child.wait();
+
+    println!(
+        "xtask: check-usb-bulk ok — the QEMU stick enumerated on the OHCI bus, the bulk \
+         pair opened, and one opaque BOT INQUIRY round-tripped (bulk-out CBW, bulk-in \
+         data, short-read bulk-in CSW with status 0)"
+    );
     Ok(())
 }
 

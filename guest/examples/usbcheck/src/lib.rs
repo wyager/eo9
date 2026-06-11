@@ -42,6 +42,7 @@ eo9_guest::main! {
     async fn main(
         watch_ms: Option<u32>,
         hub_peek: Option<bool>,
+        bot_probe: Option<bool>,
     ) -> Result<ProgramSuccess, ProgramFailure> {
         let io_failure = |err: text::TextError| ProgramFailure::Io(format!("{err:?}"));
         let usb_failure = |err: usb::UsbError| match err {
@@ -274,8 +275,160 @@ eo9_guest::main! {
             }
         }
 
+        // The BOT probe (the usb-msd plan's L1 bulk leg): one opaque CBW/data/CSW
+        // round trip over the freshly grown bulk surface — see `probe_bot`.
+        if bot_probe.unwrap_or(false) {
+            probe_bot(&device, &blob).await?;
+        }
+
         Ok(ProgramSuccess::Enumerated(port))
     }
+}
+
+/// The mass-storage interface class (USB MSC overview §1; subclass/protocol stay
+/// unchecked here — refusing odd flavours is `usb.msd`'s job, not the probe's).
+const CLASS_MASS_STORAGE: u8 = 0x08;
+
+/// The L1 bulk probe (docs/board/usb-msd-plan.md §5.1, the pre-L2 QEMU leg): find
+/// the mass-storage interface's bulk pair in the already-read configuration,
+/// SET_CONFIGURATION, open both endpoints, and round-trip ONE Bulk-Only Transport
+/// command — INQUIRY — as OPAQUE bytes: a 31-byte CBW out, 36 data bytes in, the
+/// 13-byte CSW in (asked with 64 so the answer is a SHORT read — the residue path
+/// BOT depends on). This proves bulk-out/bulk-in end to end against `-device
+/// usb-storage` without any BOT/SCSI protocol layer: encode/decode of these wire
+/// shapes is `crates/eo9-msd`'s (the L2 lane); the fixtures here stay opaque by
+/// design.
+async fn probe_bot(device: &usb::Device, config_blob: &[u8]) -> Result<(), ProgramFailure> {
+    let io_failure = |err: text::TextError| ProgramFailure::Io(format!("{err:?}"));
+    let usb_failure = |err: usb::UsbError| ProgramFailure::Io(format!("bot-probe: {err:?}"));
+
+    // The bulk pair, from the descriptor walk the caller already printed.
+    let mut in_msd = false;
+    let mut bulk_in: Option<(u8, u16)> = None;
+    let mut bulk_out: Option<(u8, u16)> = None;
+    for entry in descriptor::descriptors(config_blob) {
+        match entry {
+            Descriptor::Interface(interface) => {
+                in_msd = interface.class == CLASS_MASS_STORAGE;
+            }
+            Descriptor::Endpoint(endpoint) if in_msd && endpoint.attributes & 0b11 == 2 => {
+                let slot = if endpoint.is_in() {
+                    &mut bulk_in
+                } else {
+                    &mut bulk_out
+                };
+                slot.get_or_insert((endpoint.address, endpoint.max_packet_size));
+            }
+            _ => {}
+        }
+    }
+    let (in_address, in_mps) = bulk_in.ok_or_else(|| {
+        ProgramFailure::Io(String::from(
+            "bot-probe: no mass-storage (class 08) bulk-IN endpoint in the configuration",
+        ))
+    })?;
+    let (out_address, out_mps) = bulk_out.ok_or_else(|| {
+        ProgramFailure::Io(String::from(
+            "bot-probe: no mass-storage (class 08) bulk-OUT endpoint in the configuration",
+        ))
+    })?;
+
+    // SET_CONFIGURATION first: bulk toggles start at DATA0 from here (§9.4.5).
+    let configuration = descriptor::ConfigurationDescriptor::parse(config_blob)
+        .map(|c| c.configuration_value)
+        .unwrap_or(1);
+    let setup = eo9_ohci::setup::set_configuration(configuration);
+    usb::control_out(
+        device,
+        setup.request_type,
+        setup.request,
+        setup.value,
+        setup.index,
+        alloc::vec::Vec::new(),
+    )
+    .await
+    .map_err(usb_failure)?;
+
+    let endpoint_in = usb::open_bulk_in(device, in_address, in_mps)
+        .await
+        .map_err(usb_failure)?;
+    let endpoint_out = usb::open_bulk_out(device, out_address, out_mps)
+        .await
+        .map_err(usb_failure)?;
+    text::write_out_line(&format!(
+        "usbcheck: bot: bulk pair open (IN {in_address:#04x} mps {in_mps}, \
+         OUT {out_address:#04x} mps {out_mps})"
+    ))
+    .map_err(io_failure)?;
+
+    // One CBW (USB MSC BOT 1.0 §5.1), an opaque fixture: dCBWSignature "USBC",
+    // tag 0xe0900001, 36 bytes IN, LUN 0, 6-byte CDB = INQUIRY(36).
+    const TAG: [u8; 4] = [0x01, 0x00, 0x90, 0xe0];
+    let mut cbw = [0u8; 31];
+    cbw[0..4].copy_from_slice(b"USBC");
+    cbw[4..8].copy_from_slice(&TAG);
+    cbw[8..12].copy_from_slice(&36u32.to_le_bytes());
+    cbw[12] = 0x80; // bmCBWFlags: data IN
+    cbw[13] = 0; // LUN 0
+    cbw[14] = 6; // bCBWCBLength
+    cbw[15] = 0x12; // INQUIRY
+    cbw[18] = 36; // allocation length
+    usb::bulk_write(&endpoint_out, cbw.to_vec())
+        .await
+        .map_err(usb_failure)?;
+
+    // Data stage: 36 bytes of standard INQUIRY data (looped per the short-read
+    // contract, though one full-speed transfer answers it whole).
+    let mut inquiry = alloc::vec::Vec::new();
+    while inquiry.len() < 36 {
+        let chunk = usb::bulk_read(&endpoint_in, (36 - inquiry.len()) as u32)
+            .await
+            .map_err(usb_failure)?;
+        if chunk.is_empty() {
+            return Err(ProgramFailure::Io(format!(
+                "bot-probe: the data stage dried up at {} byte(s)",
+                inquiry.len()
+            )));
+        }
+        inquiry.extend_from_slice(&chunk);
+    }
+    let vendor = core::str::from_utf8(&inquiry[8..16])
+        .unwrap_or("?")
+        .trim_end();
+    text::write_out_line(&format!(
+        "usbcheck: bot: inquiry type {:#04x} vendor '{}' ({} byte(s) in)",
+        inquiry[0] & 0x1f,
+        vendor,
+        inquiry.len(),
+    ))
+    .map_err(io_failure)?;
+
+    // Status stage: the 13-byte CSW, asked with 64 — the short-read pin.
+    let csw = usb::bulk_read(&endpoint_in, 64)
+        .await
+        .map_err(usb_failure)?;
+    if csw.len() != 13 || csw[0..4] != *b"USBS" || csw[4..8] != TAG {
+        return Err(ProgramFailure::Io(format!(
+            "bot-probe: bad CSW ({} byte(s), head {:02x?})",
+            csw.len(),
+            &csw[..csw.len().min(8)],
+        )));
+    }
+    let residue = u32::from_le_bytes(csw[8..12].try_into().expect("13-byte CSW"));
+    text::write_out_line(&format!(
+        "usbcheck: bot: csw status {} residue {}",
+        csw[12], residue
+    ))
+    .map_err(io_failure)?;
+    if csw[12] != 0 {
+        return Err(ProgramFailure::Io(format!(
+            "bot-probe: CSW reports command failure (status {})",
+            csw[12]
+        )));
+    }
+    text::write_out_line("usbcheck: bot round-trip ok (cbw out 31, data in 36, csw in 13)")
+        .map_err(io_failure)?;
+    Ok(())
 }
 
 /// Configure the hub, power every downstream port, and print each port's decoded

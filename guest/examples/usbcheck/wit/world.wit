@@ -46,6 +46,16 @@ world usbcheck {
     /// device speed via hub-class control transfers — a DIAGNOSTIC (where does the
     /// keyboard sit, at what speed), not hub support; devices behind the hub are
     /// not enumerated.
-    export main: async func(watch-ms: option<u32>, hub-peek: option<bool>)
-        -> result<program-success, program-failure>;
+    /// `bot-probe`: when the enumerated device carries a mass-storage interface
+    /// (class 08), additionally SET_CONFIGURATION, open its bulk pair, and
+    /// round-trip ONE opaque Bulk-Only Transport INQUIRY (31-byte CBW out, 36 data
+    /// bytes in, 13-byte CSW in — the CSW deliberately asked oversized to walk the
+    /// short-read path): the L1 bulk-endpoint leg of docs/board/usb-msd-plan.md
+    /// §5.1. A PROBE of the transfer surface, not mass-storage support — the
+    /// BOT/SCSI protocol layer is `usb.msd`'s (the L2 lane).
+    export main: async func(
+        watch-ms: option<u32>,
+        hub-peek: option<bool>,
+        bot-probe: option<bool>,
+    ) -> result<program-success, program-failure>;
 }
