@@ -40,6 +40,7 @@ const GUEST_COMPONENTS: &[&str] = &[
     // window size + magic + write round-trip + the out-of-range edge refusals, or a
     // typed table refusal (GPT, absent partition).
     "eo9-example-partcheck",
+    "eo9-example-stickflash",
     // The smallest executor: runs another program (a component-typed main argument)
     // and reports how long it took (plan/03 component arguments).
     "eo9-example-time",

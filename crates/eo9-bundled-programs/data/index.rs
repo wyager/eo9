@@ -30,6 +30,7 @@ static BUNDLED_COMPONENTS: &[(&str, &[u8])] = &[
     ("eo9-example-readwrite", include_bytes!("eo9-example-readwrite.wasm") as &[u8]),
     ("eo9-example-sinkcheck", include_bytes!("eo9-example-sinkcheck.wasm") as &[u8]),
     ("eo9-example-sockcheck", include_bytes!("eo9-example-sockcheck.wasm") as &[u8]),
+    ("eo9-example-stickflash", include_bytes!("eo9-example-stickflash.wasm") as &[u8]),
     ("eo9-example-telnetd", include_bytes!("eo9-example-telnetd.wasm") as &[u8]),
     ("eo9-example-time", include_bytes!("eo9-example-time.wasm") as &[u8]),
     ("eo9-example-usbcheck", include_bytes!("eo9-example-usbcheck.wasm") as &[u8]),
