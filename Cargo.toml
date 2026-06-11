@@ -74,3 +74,9 @@ eo9-runtime = { path = "crates/eo9-runtime", version = "0.1.0" }
 eo9-sched = { path = "crates/eo9-sched" }
 eo9-store = { path = "crates/eo9-store", version = "0.1.0" }
 eo9-eofs = { path = "crates/eo9-eofs", version = "0.1.0" }
+# The USB-stick flasher cores (docs/board/usb-msd-plan.md L4): the FAT32
+# walk/overwrite-plan crate and the network-flash wire protocol shared by oskexec and
+# stickflash. Both no_std, host-tested here, consumed by the guest workspace (and
+# eo9-flashwire/eo9-fatwalk by xtask's build-stick).
+eo9-fatwalk = { path = "crates/eo9-fatwalk" }
+eo9-flashwire = { path = "crates/eo9-flashwire" }

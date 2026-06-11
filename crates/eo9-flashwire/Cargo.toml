@@ -1,0 +1,27 @@
+# eo9-flashwire is the pure, host-testable wire-protocol core of the network flash
+# path, factored out of guest/examples/oskexec (docs/board/usb-msd-plan.md §4.1) so
+# oskexec and the stickflash sibling speak the protocol byte-identically: the EO9L
+# magic, the preshared-secret authentication frame, the 24-byte serial-loader header,
+# the streamed payload with a 'k' ack per 64 KiB, the trailing CRC, and the
+# verdict-then-go-ahead commit dance. The host side of the same wire lives in
+# boards/opi5-serial-loader/tools/send_image.py — the constants here are the contract
+# both ends pin (the crate tests carry the same CRC vector as send_image.py
+# --selftest).
+#
+# The crate is sans-I/O: callers own the sockets, the buffers, and the sink (oskexec's
+# kexec.stage, stickflash's fatwalk-over-disk); this crate owns every protocol
+# decision — frame validation, CRC accounting, ack batching — so the wire behavior
+# cannot drift between consumers (the eo9-dns / eo9-rtl8125 precedent: pure logic in a
+# library crate the workspace tests, the components stay thin I/O shells).
+#
+# no_std claim is kept honest with: cargo check -p eo9-flashwire --target aarch64-unknown-none
+# (also exercised by `cargo xtask build` alongside eo9-sched).
+[package]
+name = "eo9-flashwire"
+description = "The Eo9 network-flash wire protocol (EO9L framing, preshared-secret handshake, ack-paced payload stream, CRC verdict and commit go-ahead): the pure core shared by the oskexec and stickflash example programs."
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]

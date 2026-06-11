@@ -9,6 +9,12 @@
 //! console is the new kernel's banner. Every failure is a typed refusal that leaves
 //! the running system untouched.
 //!
+//! The wire protocol itself (EO9L magic, secret frame, 24-byte header, ack-paced
+//! payload, CRC verdict, 'G' go-ahead) lives in the shared `eo9-flashwire` crate —
+//! host-tested, and spoken byte-identically by the stickflash sibling
+//! (docs/board/usb-msd-plan.md §4.1). This program owns the transport (recv/send and
+//! the buffer-reuse pacing), the kexec sink, session retry, and narration.
+//!
 //! One-shot by design: one successful flash, or two failed/broken sessions, and the
 //! program exits — the listener exists only while an operator is actively flashing.
 //!
@@ -26,6 +32,10 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use eo9_flashwire::{
+    AUTHENTICATED, CRC_FRAME, GO_AHEAD, HEADER_FRAME, Handshake, KEXEC_PORT, MAGIC, MAX_SESSIONS,
+    MIN_SECRET, PROGRESS_ACK, REFUSED, Refusal, SECRET_LEN_FRAME, Transfer, VERIFIED,
+};
 use eo9_guest::api::net::l4;
 use eo9_guest::buffer;
 use eo9_guest::text;
@@ -37,56 +47,20 @@ eo9_guest::bindings!({
 
 use eo9_guest::api::kexec::kexec;
 
-/// The default listen port (chosen clear of the repo's telnet fixture port).
-const DEFAULT_PORT: u16 = 9909;
-/// Wire magic — the serial-loader protocol's, in receive order.
-const MAGIC: [u8; 4] = *b"EO9L";
-/// A `k` progress byte goes back after every this-many payload bytes (protocol parity
-/// with the serial stub).
-const ACK_INTERVAL: u64 = 64 * 1024;
-/// Console narration every this-many payload bytes.
+/// The default listen port (eo9_flashwire::KEXEC_PORT, chosen clear of the repo's
+/// telnet fixture port).
+const DEFAULT_PORT: u16 = KEXEC_PORT;
+/// Console narration every this-many payload bytes (narration pacing is this
+/// program's, not the protocol's: the 'k' ack cadence lives in eo9-flashwire).
 const PROGRESS_INTERVAL: u64 = 4 * 1024 * 1024;
 /// Image ceiling: the kernel's staging-region capacity (64 MiB reservation minus the
 /// 64 KiB stub slot — kernel/eo9-kernel/src/arch/aarch64/mmu.rs, kept in sync by the
 /// check-kexec gate actually flashing a full image). Anything larger is refused before
 /// a byte is staged.
 const MAX_IMAGE: u64 = 64 * 1024 * 1024 - 64 * 1024;
-/// Minimum preshared-secret length (operator-enforced entropy floor).
-const MIN_SECRET: usize = 16;
-/// Authentication / framing attempts: one retry, then exit (no oracle loops).
-const MAX_SESSIONS: u32 = 2;
 /// Transfer receive-buffer size (one buffer, reused across the whole stream — see the
 /// allocation note at the streaming loop).
 const CHUNK: u64 = 256 * 1024;
-
-/// CRC-32 (IEEE, reflected) — must match send_image.py's binascii.crc32 and the
-/// kernel's commit-side check.
-const CRC_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            c = if c & 1 != 0 {
-                (c >> 1) ^ 0xEDB8_8320
-            } else {
-                c >> 1
-            };
-            bit += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-};
-
-fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
-    for &b in bytes {
-        crc = (crc >> 8) ^ CRC_TABLE[((crc ^ u32::from(b)) & 0xFF) as usize];
-    }
-    crc
-}
 
 /// The l4 API's own error, rendered into the world's failure variant.
 fn net_failure(err: l4::L4Error) -> ProgramFailure {
@@ -136,58 +110,41 @@ async fn send_all(conn: &l4::TcpConnection, bytes: &[u8]) -> Result<(), ProgramF
     Ok(())
 }
 
-fn le_u64(bytes: &[u8]) -> u64 {
-    let mut array = [0u8; 8];
-    array.copy_from_slice(&bytes[..8]);
-    u64::from_le_bytes(array)
-}
-
-/// Full-length byte compare: examines every wire byte regardless of where the first
-/// mismatch is (and folds the length difference in), so the comparison's timing does
-/// not narrate the match prefix. Overkill at this layer — the wire is cleartext — but
-/// it costs three lines and removes the timing-oracle pattern outright.
-fn secret_matches(wire: &[u8], expected: &[u8]) -> bool {
-    let mut diff = (wire.len() ^ expected.len()) as u32;
-    for (i, &byte) in wire.iter().enumerate() {
-        diff |= u32::from(byte ^ expected[i % expected.len().max(1)]);
-    }
-    diff == 0
-}
-
 /// One accepted session up to (but not including) the payload: magic, secret frame,
-/// verdict byte. `Ok(true)` = authenticated, proceed on this connection;
-/// `Ok(false)` = refused (already answered 'E'), caller may retry once.
+/// verdict byte — every judgment is eo9-flashwire's. `Ok(true)` = authenticated,
+/// proceed on this connection; `Ok(false)` = refused (already answered 'E'), caller
+/// may retry once.
 async fn authenticate(conn: &l4::TcpConnection, secret: &str) -> Result<bool, ProgramFailure> {
+    let handshake = Handshake::new(secret.as_bytes());
     let Some(magic) = recv_exact(conn, MAGIC.len()).await? else {
         say("oskexec: peer closed before the magic");
         return Ok(false);
     };
-    if magic != MAGIC {
+    if handshake.feed_magic(&magic).is_err() {
         say("oskexec: bad magic — refused");
-        let _ = send_all(conn, b"E").await;
+        let _ = send_all(conn, &[REFUSED]).await;
         return Ok(false);
     }
-    let Some(len_bytes) = recv_exact(conn, 2).await? else {
+    let Some(len_bytes) = recv_exact(conn, SECRET_LEN_FRAME).await? else {
         say("oskexec: peer closed before the secret");
         return Ok(false);
     };
-    let wire_len = usize::from(u16::from_le_bytes([len_bytes[0], len_bytes[1]]));
-    if wire_len == 0 || wire_len > 256 {
+    let Ok(wire_len) = handshake.feed_secret_length(&[len_bytes[0], len_bytes[1]]) else {
         say("oskexec: unbelievable secret length — refused");
-        let _ = send_all(conn, b"E").await;
+        let _ = send_all(conn, &[REFUSED]).await;
         return Ok(false);
-    }
+    };
     // Read the whole frame before judging it (no short-circuit on length).
     let Some(wire_secret) = recv_exact(conn, wire_len).await? else {
         say("oskexec: peer closed inside the secret");
         return Ok(false);
     };
-    if !secret_matches(&wire_secret, secret.as_bytes()) {
+    if handshake.feed_secret(&wire_secret).is_err() {
         say("oskexec: authentication failed — refused");
-        let _ = send_all(conn, b"E").await;
+        let _ = send_all(conn, &[REFUSED]).await;
         return Ok(false);
     }
-    send_all(conn, b"A").await?;
+    send_all(conn, &[AUTHENTICATED]).await?;
     Ok(true)
 }
 
@@ -243,36 +200,47 @@ eo9_guest::main! {
 
         // Header: load_addr and x0 are framing parity with the serial wire — ignored
         // here (the kernel's dance owns every address); length is enforced.
-        let Some(header) = recv_exact(&conn, 24).await? else {
+        let mut transfer = Transfer::new(MAX_IMAGE);
+        let Some(header) = recv_exact(&conn, HEADER_FRAME).await? else {
             return Err(ProgramFailure::Protocol("peer closed before the header".into()));
         };
-        let (load_addr, len, x0) = (le_u64(&header[0..]), le_u64(&header[8..]), le_u64(&header[16..]));
-        if len == 0 || len > MAX_IMAGE {
-            let _ = send_all(&conn, b"E").await;
-            return Err(ProgramFailure::Protocol(format!(
-                "refused image length {len} (1..={MAX_IMAGE})"
-            )));
-        }
+        let header = match transfer.feed_header(&header) {
+            Ok(header) => header,
+            Err(Refusal::BadImageLength { length, .. }) => {
+                let _ = send_all(&conn, &[REFUSED]).await;
+                return Err(ProgramFailure::Protocol(format!(
+                    "refused image length {length} (1..={MAX_IMAGE})"
+                )));
+            }
+            // feed_header refuses only on length; never trap a service on a
+            // can't-happen path — surface it as the typed failure it would be.
+            Err(other) => {
+                let _ = send_all(&conn, &[REFUSED]).await;
+                return Err(ProgramFailure::Protocol(format!(
+                    "unexpected header refusal {other:?}"
+                )));
+            }
+        };
+        let len = header.length;
         say(&format!(
-            "oskexec: image {len} bytes incoming (header load_addr {load_addr:#x} / \
-             x0 {x0:#x} noted and ignored — the kexec dance owns the addresses)"
+            "oskexec: image {len} bytes incoming (header load_addr {:#x} / \
+             x0 {:#x} noted and ignored — the kexec dance owns the addresses)",
+            header.load_addr, header.x0
         ));
 
-        // Stream to stage(): CRC as we go, a 'k' per 64 KiB, narration per 4 MiB.
+        // Stream to stage(): CRC as we go (eo9-flashwire's accounting), a 'k' per
+        // 64 KiB, narration per 4 MiB.
         // The receive buffer and the ack byte's buffer are allocated ONCE and ride the
         // owned-buffer round-trip (the pattern the io API is built around): allocating
         // a fresh host buffer per chunk measurably decayed the transfer pace over a
         // 60 MiB stream (the check-kexec gate's first runs — see GAPS, kexec entry).
         // The reusable buffer is full-size; near the payload's end it is swapped for
         // exact-remainder buffers so a recv can never swallow the trailing CRC bytes.
-        let mut offset = 0u64;
-        let mut crc = 0xFFFF_FFFFu32;
-        let mut next_ack = ACK_INTERVAL;
         let mut next_progress = PROGRESS_INTERVAL;
         let mut dst = buffer::with_capacity(CHUNK);
         let mut dst_capacity = CHUNK;
-        while offset < len {
-            let remaining = len - offset;
+        while !transfer.complete() {
+            let remaining = transfer.remaining();
             if remaining < dst_capacity {
                 dst = buffer::with_capacity(remaining);
                 dst_capacity = remaining;
@@ -282,58 +250,61 @@ eo9_guest::main! {
             let result = received.map_err(net_failure)?;
             if result.bytes_received == 0 {
                 return Err(ProgramFailure::Protocol(format!(
-                    "peer closed mid-payload at {offset}/{len} bytes"
+                    "peer closed mid-payload at {}/{len} bytes",
+                    transfer.offset()
                 )));
             }
             let chunk = buffer::prefix_to_vec(&dst, result.bytes_received);
-            crc = crc32_update(crc, &chunk);
-            let staged_len = chunk.len() as u64;
-            if let Err(error) = kexec::stage(&kx, offset, chunk).await {
-                let _ = send_all(&conn, b"E").await;
+            let progress = transfer.feed_payload(&chunk);
+            if let Err(error) = kexec::stage(&kx, progress.offset - chunk.len() as u64, chunk).await {
+                let _ = send_all(&conn, &[REFUSED]).await;
                 return Err(ProgramFailure::Refused(format!("stage: {error:?}")));
             }
-            offset += staged_len;
             // Batch every ack this chunk earned into ONE send ('k' per 64 KiB crossed;
             // the host counts bytes, not segments) — transport calls are the expensive
             // unit on this path, so one burst beats one send per boundary.
-            let mut due = 0usize;
-            while offset >= next_ack {
-                due += 1;
-                next_ack += ACK_INTERVAL;
+            if progress.acks_due > 0 {
+                send_all(&conn, &alloc::vec![PROGRESS_ACK; progress.acks_due]).await?;
             }
-            if due > 0 {
-                send_all(&conn, &alloc::vec![b'k'; due]).await?;
-            }
-            if offset >= next_progress || offset == len {
-                say(&format!("oskexec: staged {offset}/{len} bytes"));
+            if progress.offset >= next_progress || progress.offset == len {
+                say(&format!("oskexec: staged {}/{len} bytes", progress.offset));
                 next_progress += PROGRESS_INTERVAL;
             }
         }
-        let crc = !crc;
 
-        let Some(wire_crc) = recv_exact(&conn, 4).await? else {
+        let Some(wire_crc) = recv_exact(&conn, CRC_FRAME).await? else {
             return Err(ProgramFailure::Protocol("peer closed before the crc".into()));
         };
-        let wire_crc = u32::from_le_bytes([wire_crc[0], wire_crc[1], wire_crc[2], wire_crc[3]]);
-        if wire_crc != crc {
-            let _ = send_all(&conn, b"E").await;
-            return Err(ProgramFailure::Refused(format!(
-                "crc mismatch: received bytes {crc:08x}, wire said {wire_crc:08x} — \
-                 nothing committed, system untouched"
-            )));
-        }
+        let crc = match transfer.feed_crc(&wire_crc) {
+            Ok(crc) => crc,
+            Err(Refusal::CrcMismatch { computed, wire }) => {
+                let _ = send_all(&conn, &[REFUSED]).await;
+                return Err(ProgramFailure::Refused(format!(
+                    "crc mismatch: received bytes {computed:08x}, wire said {wire:08x} — \
+                     nothing committed, system untouched"
+                )));
+            }
+            // feed_crc refuses only on mismatch; same never-trap posture as above.
+            Err(other) => {
+                let _ = send_all(&conn, &[REFUSED]).await;
+                return Err(ProgramFailure::Protocol(format!(
+                    "unexpected crc refusal {other:?}"
+                )));
+            }
+        };
 
         // Verdict, then the go-ahead: the host answering 'G' proves the 'K' arrived,
         // so the success byte cannot be lost when commit ends this machine.
-        send_all(&conn, b"K").await?;
+        send_all(&conn, &[VERIFIED]).await?;
         let Some(go) = recv_exact(&conn, 1).await? else {
             return Err(ProgramFailure::Protocol(
                 "peer closed before the go-ahead — not committing".into(),
             ));
         };
-        if go != b"G" {
+        if transfer.feed_go_ahead(go[0]).is_err() {
             return Err(ProgramFailure::Protocol(format!(
-                "expected the 'G' go-ahead, got {go:?} — not committing"
+                "expected the '{}' go-ahead, got {go:?} — not committing",
+                GO_AHEAD as char
             )));
         }
 
