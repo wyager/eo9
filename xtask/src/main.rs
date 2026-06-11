@@ -6096,6 +6096,25 @@ fn check_share(root: &Path) -> Result<(), String> {
                 "the fixture body on the console",
             )?;
             wait_for("ok: fetched(", "curl's typed outcome")?;
+            // The hostname leg (area/42's curl-ux through the gate): bare
+            // `curl example.com` — the scheme defaults, the resolver defaults to the
+            // transport's dns-servers (a GATED introspection call answering slirp's
+            // 10.0.2.3), and the DNS question itself rides gated UDP
+            // (bind-udp/send-to/recv-from into the owner's store). The two narration
+            // lines are the deterministic assertions; the fetch outcome after them
+            // depends on the dev machine's internet reach (the same upstream-DNS
+            // dependency check-dhcp already carries), so the leg only requires the
+            // prompt to come back typed either way.
+            console_type_line("check-share", &mut stdin, "curl example.com")?;
+            wait_for(
+                "curl: resolver 10.0.2.3 (the transport's dns-servers)",
+                "the gated dns-servers answer",
+            )?;
+            wait_for(
+                "curl: resolved example.com -> ",
+                "the gated UDP DNS resolution",
+            )?;
+            wait_for("eosh>", "the prompt after the hostname fetch")?;
             console_type_line("check-share", &mut stdin, "svc stop lan")?;
             wait_for("stopped: lan", "the owner's stop")?;
             console_type_line("check-share", &mut stdin, "exit")?;
