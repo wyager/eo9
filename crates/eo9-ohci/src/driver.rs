@@ -171,6 +171,11 @@ const FRAME_POLL_LIMIT_PER_MS: u32 = 50_000;
 /// A control transfer (multi-packet at 8-byte MPS, plus low-speed) spans a few
 /// frames; the ED-drain poll is bounded accordingly.
 const CONTROL_POLL_LIMIT: u32 = 500_000;
+/// A bulk transfer (one TD, up to two pages): ~7 frames when the device streams at
+/// the full-speed line rate, arbitrarily longer when it NAKs (a stick mid-program) —
+/// bounded the same way as control, in host calls; an expiry takes the TD back
+/// (the NAK-forever cancel path) and reports typed.
+const BULK_POLL_LIMIT: u32 = 500_000;
 /// Done-queue walk bound: the arena only holds TD_SLOTS TDs.
 const DONE_QUEUE_LIMIT: usize = arena::TD_SLOTS as usize + 2;
 /// Event mode: the HccaDoneHead writeback for a retired DI_IMMEDIATE TD lands at the
@@ -186,6 +191,11 @@ pub struct Ohci<R: RegionIo> {
     /// The interrupt-IN endpoint's re-arm state: which TD slot is pending and which
     /// is the dummy tail, plus the buffer length to read back.
     interrupt: Option<InterruptState>,
+    /// The resident bulk EDs' queue state (one IN, one OUT — usb-msd-plan §1.1).
+    /// The EDs themselves live in the arena so the controller-owned toggleCarry
+    /// survives across transfers; this is just the TD slot ping-pong.
+    bulk_in: Option<BulkState>,
+    bulk_out: Option<BulkState>,
     /// Done-queue writebacks consumed AHEAD of their reap (the stale-drain in
     /// `read_report`'s spurious-wake arm can eat a writeback that lands between the
     /// ED-head check and the drain): the next counted reap takes this credit first,
@@ -203,12 +213,30 @@ struct InterruptState {
     max_packet: u16,
 }
 
+/// One bulk direction's TD slot pair: `dummy_slot` is the queue's current dummy tail
+/// (where the next TD is written — the ED's head points there while idle),
+/// `pending_slot` is the free slot that becomes the new dummy. They ping-pong per
+/// transfer, the interrupt endpoint's tail-swap shape.
+struct BulkState {
+    pending_slot: u64,
+    dummy_slot: u64,
+}
+
+/// Which resident bulk ED a call addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BulkDir {
+    In,
+    Out,
+}
+
 impl<R: RegionIo> Ohci<R> {
     pub fn new(io: R) -> Ohci<R> {
         Ohci {
             io,
             info: None,
             interrupt: None,
+            bulk_in: None,
+            bulk_out: None,
             events: false,
             reaped_credit: 0,
         }
@@ -1254,6 +1282,330 @@ impl<R: RegionIo> Ohci<R> {
         }
     }
 
+    /// Put a bulk-IN endpoint on the bulk list (a resident ED at
+    /// [`arena::BULK_IN_ED`]; the toggle starts at DATA0 — open after
+    /// SET_CONFIGURATION, USB 2.0 §9.4.5). Re-opening rebuilds the ED, resetting the
+    /// toggle.
+    pub async fn open_bulk_in(
+        &mut self,
+        address: u8,
+        low_speed: bool,
+        endpoint: u8,
+        max_packet: u16,
+    ) -> Result<(), DriverError<R::Error>> {
+        self.open_bulk(BulkDir::In, address, low_speed, endpoint, max_packet)
+            .await
+    }
+
+    /// Put a bulk-OUT endpoint on the bulk list (the ED at [`arena::BULK_OUT_ED`]).
+    pub async fn open_bulk_out(
+        &mut self,
+        address: u8,
+        low_speed: bool,
+        endpoint: u8,
+        max_packet: u16,
+    ) -> Result<(), DriverError<R::Error>> {
+        self.open_bulk(BulkDir::Out, address, low_speed, endpoint, max_packet)
+            .await
+    }
+
+    async fn open_bulk(
+        &mut self,
+        dir: BulkDir,
+        address: u8,
+        low_speed: bool,
+        endpoint: u8,
+        max_packet: u16,
+    ) -> Result<(), DriverError<R::Error>> {
+        let base = self.io.dma_base();
+        let (ed_offset, ed_direction, pending, dummy) = match dir {
+            // Slot ownership per arena::TD_POOL: bulk-IN rides 6/7, bulk-OUT 8/9.
+            BulkDir::In => (arena::BULK_IN_ED, EdDirection::In, 6u64, 7u64),
+            BulkDir::Out => (arena::BULK_OUT_ED, EdDirection::Out, 8u64, 9u64),
+        };
+
+        // Take the list away from the controller while it is rebuilt: a half-written
+        // ED chain must never be walked (the same reason the kernel's region quiesce
+        // — HcControl = 0 — kills BulkListEnable along with the other list enables).
+        self.set_bulk_list_enable(false).await?;
+
+        // An empty queue: head = tail = the dummy TD; toggleCarry starts at DATA0.
+        self.io.dma_write(
+            arena::td_slot(dummy),
+            &TransferDescriptor::default().encode(),
+        );
+        let ed = EndpointDescriptor {
+            function_address: address,
+            endpoint_number: endpoint & 0xf,
+            direction: ed_direction,
+            low_speed,
+            max_packet_size: max_packet,
+            head: base + arena::td_slot(dummy) as u32,
+            tail: base + arena::td_slot(dummy) as u32,
+            ..EndpointDescriptor::default()
+        };
+        self.io.dma_write(ed_offset, &ed.encode());
+
+        let state = BulkState {
+            pending_slot: pending,
+            dummy_slot: dummy,
+        };
+        match dir {
+            BulkDir::In => self.bulk_in = Some(state),
+            BulkDir::Out => self.bulk_out = Some(state),
+        }
+        self.publish_bulk_list().await
+    }
+
+    /// Relink the open bulk EDs into one list (IN first, then OUT), point
+    /// HcBulkHeadED at it, and re-enable BulkListEnable. Called with the list
+    /// disabled (see [`open_bulk`](Self::open_bulk)).
+    async fn publish_bulk_list(&mut self) -> Result<(), DriverError<R::Error>> {
+        let io = |e| DriverError::Io(e);
+        let base = self.io.dma_base();
+        let in_open = self.bulk_in.is_some();
+        let out_open = self.bulk_out.is_some();
+        let out_bus = base + arena::BULK_OUT_ED as u32;
+        if in_open {
+            let mut ed_bytes = [0u8; 16];
+            self.io.dma_read(arena::BULK_IN_ED, &mut ed_bytes);
+            let mut ed = EndpointDescriptor::decode(&ed_bytes);
+            ed.next = if out_open { out_bus } else { 0 };
+            self.io.dma_write(arena::BULK_IN_ED, &ed.encode());
+        }
+        if out_open {
+            let mut ed_bytes = [0u8; 16];
+            self.io.dma_read(arena::BULK_OUT_ED, &mut ed_bytes);
+            let mut ed = EndpointDescriptor::decode(&ed_bytes);
+            ed.next = 0;
+            self.io.dma_write(arena::BULK_OUT_ED, &ed.encode());
+        }
+        let head = if in_open {
+            base + arena::BULK_IN_ED as u32
+        } else if out_open {
+            out_bus
+        } else {
+            0
+        };
+        self.io
+            .write32(reg::HC_BULK_HEAD_ED, head)
+            .await
+            .map_err(io)?;
+        self.io
+            .write32(reg::HC_BULK_CURRENT_ED, 0)
+            .await
+            .map_err(io)?;
+        if head != 0 {
+            self.set_bulk_list_enable(true).await?;
+        }
+        Ok(())
+    }
+
+    async fn set_bulk_list_enable(&mut self, on: bool) -> Result<(), DriverError<R::Error>> {
+        let control = self
+            .io
+            .read32(reg::HC_CONTROL)
+            .await
+            .map_err(DriverError::Io)?;
+        let value = if on {
+            control | bits::CONTROL_BLE
+        } else {
+            control & !bits::CONTROL_BLE
+        };
+        self.io
+            .write32(reg::HC_CONTROL, value)
+            .await
+            .map_err(DriverError::Io)?;
+        Ok(())
+    }
+
+    /// Read up to `buf.len()` bytes from the opened bulk-IN endpoint as ONE transfer
+    /// (clamped to the arena's bulk window, [`arena::BULK_BUFFER_LEN`]). Short reads
+    /// are normal — the device terminates a bulk transfer with a short packet (the
+    /// R bit is set, so a short packet is a clean completion, not an error) — and so
+    /// is an answer shorter than the ask when the ask exceeds the window: the caller
+    /// loops until its protocol layer's expected count is in.
+    pub async fn bulk_read(&mut self, buf: &mut [u8]) -> Result<usize, DriverError<R::Error>> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let base = self.io.dma_base();
+        let length = (buf.len() as u64).min(arena::BULK_BUFFER_LEN) as u32;
+        let td = self.run_bulk_td(BulkDir::In, length).await?;
+        let received = td.bytes_transferred(base + arena::BULK_BUFFER as u32, length) as usize;
+        let copied = received.min(buf.len());
+        self.io.dma_read(arena::BULK_BUFFER, &mut buf[..copied]);
+        Ok(copied)
+    }
+
+    /// Write `data` to the opened bulk-OUT endpoint, looping one TD at a time over
+    /// the arena's bulk window (the v1 QD1 grain — usb-msd-plan §1.1); returns once
+    /// every byte is accepted. Empty `data` sends one zero-length packet. Toggle
+    /// continuity across the chunks (and across calls) is the resident ED's
+    /// toggleCarry.
+    pub async fn bulk_write(&mut self, data: &[u8]) -> Result<(), DriverError<R::Error>> {
+        if data.is_empty() {
+            self.run_bulk_td(BulkDir::Out, 0).await?;
+            return Ok(());
+        }
+        for chunk in data.chunks(arena::BULK_BUFFER_LEN as usize) {
+            self.io.dma_write(arena::BULK_BUFFER, chunk);
+            self.run_bulk_td(BulkDir::Out, chunk.len() as u32).await?;
+        }
+        Ok(())
+    }
+
+    /// Queue ONE general TD on a resident bulk ED, signal BulkListFilled, drain to
+    /// retirement, reap the done-queue writeback COUNTED (the area/37 credit
+    /// discipline — bulk TDs request the writeback interrupt in event mode exactly
+    /// like control TDs, and their writebacks must be collected before the slot is
+    /// reused), and judge the condition code.
+    ///
+    /// Halted-ED recovery: an error retirement halts the ED (the failing TD is
+    /// already retired and the head already advanced, §4.3.1.3.5). The host half is
+    /// recovered HERE — Halt cleared, toggleCarry reset to DATA0 — so the endpoint
+    /// is usable the moment the consumer completes the device half with
+    /// CLEAR_FEATURE(ENDPOINT_HALT) over the existing control path (which resets the
+    /// device's toggle to DATA0, USB 2.0 §9.4.5 — the two halves land aligned).
+    async fn run_bulk_td(
+        &mut self,
+        dir: BulkDir,
+        length: u32,
+    ) -> Result<TransferDescriptor, DriverError<R::Error>> {
+        let io = |e| DriverError::Io(e);
+        let base = self.io.dma_base();
+        let (ed_offset, pid, not_open) = match dir {
+            BulkDir::In => (arena::BULK_IN_ED, TdPid::In, "bulk-IN endpoint not open"),
+            BulkDir::Out => (arena::BULK_OUT_ED, TdPid::Out, "bulk-OUT endpoint not open"),
+        };
+        let state = match dir {
+            BulkDir::In => self.bulk_in.as_ref(),
+            BulkDir::Out => self.bulk_out.as_ref(),
+        }
+        .ok_or(DriverError::Timeout(not_open))?;
+        let (td_slot, new_dummy) = (state.dummy_slot, state.pending_slot);
+
+        // The TD goes into the queue's current dummy slot (where the ED's head
+        // points); the freed slot becomes the new dummy tail — the standard
+        // tail-swap (the controller owns head, we only move tail).
+        let mut td = TransferDescriptor::new(
+            pid,
+            // Toggle from the ED's carry — the across-transfer continuity bulk
+            // needs (TdToggle::FromEd, §4.3.1.2).
+            TdToggle::FromEd,
+            (length > 0).then_some((base + arena::BULK_BUFFER as u32, length)),
+        );
+        if self.events {
+            // Event mode: request the done-queue writeback per TD (DI = 0), the
+            // control path's rationale verbatim — a DI_NONE TD would defer the
+            // writeback indefinitely and the deferred chain would later be walked
+            // over recycled slots.
+            td.delay_interrupt = DI_IMMEDIATE;
+        }
+        td.next = base + arena::td_slot(new_dummy) as u32;
+        self.io.dma_write(
+            arena::td_slot(new_dummy),
+            &TransferDescriptor::default().encode(),
+        );
+        self.io.dma_write(arena::td_slot(td_slot), &td.encode());
+        // Publish the new tail (head and toggle are controller-owned:
+        // read-modify-write, same as the interrupt re-arm).
+        let mut ed_bytes = [0u8; 16];
+        self.io.dma_read(ed_offset, &mut ed_bytes);
+        let mut ed = EndpointDescriptor::decode(&ed_bytes);
+        let tail = base + arena::td_slot(new_dummy) as u32;
+        ed.tail = tail;
+        self.io.dma_write(ed_offset, &ed.encode());
+        let state = match dir {
+            BulkDir::In => self.bulk_in.as_mut(),
+            BulkDir::Out => self.bulk_out.as_mut(),
+        }
+        .expect("checked open above");
+        state.dummy_slot = new_dummy;
+        state.pending_slot = td_slot;
+
+        // Tell the controller the bulk list has work (§7.1.3 — without
+        // BulkListFilled the controller stops scanning an emptied list).
+        self.io
+            .write32(reg::HC_COMMAND_STATUS, bits::CMD_BLF)
+            .await
+            .map_err(io)?;
+
+        // Drain: the ED's head catches its tail (the TD retired), or halts.
+        let mut polls = 0u32;
+        let halted = loop {
+            let mut ed_bytes = [0u8; 16];
+            self.io.dma_read(ed_offset, &mut ed_bytes);
+            let current = EndpointDescriptor::decode(&ed_bytes);
+            if current.halted || current.head == tail {
+                break current.halted;
+            }
+            polls += 1;
+            if polls > BULK_POLL_LIMIT {
+                // The NAK-forever cancel path: sKip the ED so the controller stops
+                // visiting it (§4.2.2), give it a frame to finish any in-flight
+                // access, then re-check once — the TD may have retired in the race
+                // window.
+                let mut ed_bytes = [0u8; 16];
+                self.io.dma_read(ed_offset, &mut ed_bytes);
+                let mut ed = EndpointDescriptor::decode(&ed_bytes);
+                ed.skip = true;
+                self.io.dma_write(ed_offset, &ed.encode());
+                self.wait_ms(2).await?;
+                let mut ed_bytes = [0u8; 16];
+                self.io.dma_read(ed_offset, &mut ed_bytes);
+                let mut ed = EndpointDescriptor::decode(&ed_bytes);
+                if ed.halted || ed.head == tail {
+                    // Retired after all: lift the skip and judge below.
+                    let halted = ed.halted;
+                    ed.skip = false;
+                    self.io.dma_write(ed_offset, &ed.encode());
+                    break halted;
+                }
+                // Still pending: take the TD back — empty the queue (head = tail;
+                // toggle preserved as read) and lift the skip. No writeback is owed:
+                // the TD never retired, so nothing was (or will be) pushed onto the
+                // done queue for it.
+                ed.head = tail;
+                ed.skip = false;
+                self.io.dma_write(ed_offset, &ed.encode());
+                return Err(DriverError::Timeout("bulk transfer"));
+            }
+        };
+
+        // Exactly one TD retired either way (an error retirement also advances the
+        // head, §4.3.1.3.5): collect its writeback before the slot can be reused —
+        // counted in event mode, one best-effort take in polled mode (the
+        // reap/credit discipline shared with the control and interrupt paths).
+        self.reap_done_queue(1).await?;
+
+        let mut td_bytes = [0u8; 16];
+        self.io.dma_read(arena::td_slot(td_slot), &mut td_bytes);
+        let retired = TransferDescriptor::decode(&td_bytes);
+        match retired.condition_code {
+            ConditionCode::NoError if !halted => Ok(retired),
+            code => {
+                if halted {
+                    // Recover the host half now (see the method doc): clear Halt,
+                    // reset toggleCarry to DATA0.
+                    let mut ed_bytes = [0u8; 16];
+                    self.io.dma_read(ed_offset, &mut ed_bytes);
+                    let mut ed = EndpointDescriptor::decode(&ed_bytes);
+                    ed.halted = false;
+                    ed.toggle_carry = false;
+                    self.io.dma_write(ed_offset, &ed.encode());
+                }
+                Err(match code {
+                    ConditionCode::Stall => DriverError::Stall,
+                    // Halted yet judged clean: genuinely anomalous — the control
+                    // path's NotAccessed honesty, verbatim.
+                    ConditionCode::NoError => DriverError::Transfer(ConditionCode::NotAccessed),
+                    other => DriverError::Transfer(other),
+                })
+            }
+        }
+    }
+
     /// Park until the root hub signals a status change (RHSC — audit A4), where
     /// events are live; `Unsupported` otherwise (the caller paces its own sweeps).
     /// On a delivery the RHSC latch is acknowledged here — the per-port change bits
@@ -1389,6 +1741,30 @@ mod tests {
         /// stage it answers).
         control_response: Vec<u8>,
         control_refused: bool,
+        /// --- the scripted bulk device (the usb-storage shape) ---
+        /// Answers for bulk-IN TDs, one entry per transfer; an entry shorter than
+        /// the TD's buffer is a SHORT PACKET (the BOT residue case). Empty queue =
+        /// the device NAKs (nothing to send yet).
+        bulk_in_answers: std::collections::VecDeque<Vec<u8>>,
+        /// Payloads captured from bulk-OUT TDs, one entry per TD.
+        bulk_out_received: Vec<Vec<u8>>,
+        /// NAK-forever switches per direction: the pending TD is never retired (a
+        /// dead/stuck device — the driver's cancel path's forcing case).
+        bulk_nak_in: bool,
+        bulk_nak_out: bool,
+        /// Script the NEXT TD of a direction to retire Stall and halt its ED (the
+        /// BOT error-signalling shape).
+        bulk_stall_next_in: bool,
+        bulk_stall_next_out: bool,
+        /// Whether the HCD signalled BulkListFilled (HcCommandStatus.BLF): STRICT —
+        /// the bulk list is served only under BulkListEnable AND this flag (§6.4.3/
+        /// §7.1.3: the HC stops scanning an emptied list until BLF sets again). A
+        /// driver that forgets either bit moves no bulk bytes here, where QEMU's
+        /// permissive model would let it pass.
+        bulk_list_filled: bool,
+        /// (direction, ED toggle carry consumed, DelayInterrupt, payload bytes) per
+        /// processed bulk TD — the toggle-continuity and DI-discipline pins.
+        bulk_log: Vec<(EdDirection, bool, u8, usize)>,
     }
 
     const DMA_BASE: u32 = 0x4000_0000;
@@ -1461,6 +1837,14 @@ mod tests {
                 control_retire_limit: u32::MAX,
                 control_response: Vec::new(),
                 control_refused: false,
+                bulk_in_answers: std::collections::VecDeque::new(),
+                bulk_out_received: Vec::new(),
+                bulk_nak_in: false,
+                bulk_nak_out: false,
+                bulk_stall_next_in: false,
+                bulk_stall_next_out: false,
+                bulk_list_filled: false,
+                bulk_log: Vec::new(),
             }
         }
 
@@ -1689,6 +2073,7 @@ mod tests {
                 self.process_control_list();
             }
             self.process_periodic();
+            self.process_bulk_list();
             self.flush_done();
         }
 
@@ -1759,6 +2144,145 @@ mod tests {
                 .copy_from_slice(&encoded_ed);
         }
 
+        /// The bulk list, STRICT the way silicon is: served only when BulkListEnable
+        /// is set AND the HCD has signalled BulkListFilled — a driver that forgets
+        /// either bit moves no bulk bytes (the regression QEMU's permissive model
+        /// would hide, the PeriodicStart strictness's sibling). One TD per ED per
+        /// frame: the per-frame pacing that keeps toggle order observable and
+        /// SPLITS multi-chunk transfers' writebacks across ticks.
+        fn process_bulk_list(&mut self) {
+            if self.register(reg::HC_CONTROL) & bits::CONTROL_BLE == 0 {
+                return;
+            }
+            if !self.bulk_list_filled {
+                return;
+            }
+            let mut ed_address = self.register(reg::HC_BULK_HEAD_ED);
+            let mut pending = false;
+            while ed_address != 0 {
+                let mut ed_bytes = [0u8; 16];
+                ed_bytes.copy_from_slice(self.arena_slice(ed_address, 16));
+                let mut ed = EndpointDescriptor::decode(&ed_bytes);
+                let next_ed = ed.next & !0xf;
+                if !ed.skip && !ed.halted && ed.head != ed.tail {
+                    self.bulk_service_ed(ed_address, &mut ed);
+                    if !ed.skip && !ed.halted && ed.head != ed.tail {
+                        // Still work queued (a NAK, or more TDs): keep scanning at
+                        // the next ticks without a fresh BLF — the HC only stops
+                        // when the list empties.
+                        pending = true;
+                    }
+                }
+                ed_address = next_ed;
+            }
+            if !pending {
+                self.bulk_list_filled = false;
+            }
+        }
+
+        /// Serve ONE TD on one bulk ED: NAK scripting, stall scripting, the data
+        /// move, and — the load-bearing part — the DATA TOGGLE model: the toggle
+        /// comes from the ED's toggleCarry (the TDs must say `FromEd`), advances
+        /// once per packet, and the final value is carried back into the ED — so
+        /// toggle continuity ACROSS transfers is real here, and a driver that
+        /// rebuilt the ED (losing the carry) or carried explicit DATA0/1 toggles
+        /// would desynchronize visibly in the recorded log.
+        fn bulk_service_ed(&mut self, ed_address: u32, ed: &mut EndpointDescriptor) {
+            let nak = match ed.direction {
+                EdDirection::In => self.bulk_nak_in,
+                EdDirection::Out => self.bulk_nak_out,
+                EdDirection::FromTd => false,
+            };
+            if nak {
+                return;
+            }
+            let td_address = ed.head;
+            let mut td_bytes = [0u8; 16];
+            td_bytes.copy_from_slice(self.arena_slice(td_address, 16));
+            let mut td = TransferDescriptor::decode(&td_bytes);
+            assert_eq!(
+                td.data_toggle,
+                TdToggle::FromEd,
+                "bulk TDs must take their toggle from the ED's carry (§4.3.1.2)"
+            );
+            let mps = usize::from(ed.max_packet_size.max(1));
+            let carry = ed.toggle_carry;
+            let stall = match ed.direction {
+                EdDirection::In => std::mem::take(&mut self.bulk_stall_next_in),
+                EdDirection::Out => std::mem::take(&mut self.bulk_stall_next_out),
+                EdDirection::FromTd => false,
+            };
+            if stall {
+                td.condition_code = ConditionCode::Stall;
+                ed.halted = true;
+                self.bulk_log
+                    .push((ed.direction, carry, td.delay_interrupt, 0));
+            } else {
+                let (length, packets) = match ed.direction {
+                    EdDirection::Out => {
+                        // Read the OUT payload (CBP..BufferEnd inclusive; 0/0 = a
+                        // zero-length packet).
+                        let data = if td.current_buffer == 0 {
+                            Vec::new()
+                        } else {
+                            let len = (td.buffer_end - td.current_buffer + 1) as usize;
+                            self.arena_slice(td.current_buffer, len).to_vec()
+                        };
+                        let packets = data.len().div_ceil(mps).max(1);
+                        let len = data.len();
+                        self.bulk_out_received.push(data);
+                        td.current_buffer = 0;
+                        (len, packets)
+                    }
+                    EdDirection::In => {
+                        // Nothing scripted = the device NAKs this visit.
+                        let Some(answer) = self.bulk_in_answers.pop_front() else {
+                            return;
+                        };
+                        let capacity = if td.current_buffer == 0 {
+                            0
+                        } else {
+                            (td.buffer_end - td.current_buffer + 1) as usize
+                        };
+                        let send = answer.len().min(capacity);
+                        if send > 0 {
+                            let start = td.current_buffer;
+                            let payload = answer[..send].to_vec();
+                            self.arena_slice(start, send).copy_from_slice(&payload);
+                        }
+                        // CBP: 0 when the buffer filled exactly, else the next
+                        // unfilled byte (§4.3.1.3.5 — the short-packet residue).
+                        td.current_buffer = if send == capacity {
+                            0
+                        } else {
+                            td.current_buffer + send as u32
+                        };
+                        (send, send.div_ceil(mps).max(1))
+                    }
+                    EdDirection::FromTd => (0, 1),
+                };
+                // The toggle advances once per packet; the carry written back is
+                // the NEXT transfer's starting toggle (USB 2.0 §8.6).
+                if packets % 2 == 1 {
+                    ed.toggle_carry = !ed.toggle_carry;
+                }
+                td.condition_code = ConditionCode::NoError;
+                self.bulk_log
+                    .push((ed.direction, carry, td.delay_interrupt, length));
+            }
+            ed.head = td.next & !0xf;
+            if td.delay_interrupt != crate::schedule::DI_NONE {
+                self.done_di_armed = true;
+            }
+            td.next = self.done_head;
+            let encoded = td.encode();
+            self.arena_slice(td_address, 16).copy_from_slice(&encoded);
+            self.done_head = td_address;
+            let encoded_ed = ed.encode();
+            self.arena_slice(ed_address, 16)
+                .copy_from_slice(&encoded_ed);
+        }
+
         /// HccaDoneHead writeback, gated on WDH exactly as §5.2.9 describes (the HC
         /// only writes when the driver has acknowledged the previous batch) AND on a
         /// retired TD having requested the interrupt (§4.3.1.2: an accumulator of
@@ -1814,6 +2338,11 @@ mod tests {
                     }
                     if value & bits::CMD_CLF != 0 {
                         self.process_control_list();
+                    }
+                    if value & bits::CMD_BLF != 0 {
+                        // The list is served from frame ticks (silicon pacing),
+                        // never inline — a driver that polls nothing sees nothing.
+                        self.bulk_list_filled = true;
                     }
                 }
                 reg::HC_INTERRUPT_STATUS => {
@@ -2556,5 +3085,306 @@ mod tests {
         // again.
         driver.io().wait_script.push_back(WaitOutcome::TimedOut);
         assert_eq!(run(driver.wait_port_change()), Ok(WaitOutcome::TimedOut));
+    }
+
+    // --------------------------------------------------------------------------------
+    // Bulk (the usb-msd-plan L1 lane: list management, toggles, halt recovery, NAK
+    // cancel, coexistence, and the event-mode reap discipline)
+    // --------------------------------------------------------------------------------
+
+    /// Decode a resident bulk ED straight out of the mock's arena.
+    fn read_bulk_ed(mock: &MockOhci, offset: u64) -> EndpointDescriptor {
+        let start = offset as usize;
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&mock.arena[start..start + 16]);
+        EndpointDescriptor::decode(&bytes)
+    }
+
+    /// The recorded (carry, length) pairs for one bulk direction.
+    fn bulk_carries(mock: &MockOhci, direction: EdDirection) -> Vec<(bool, usize)> {
+        mock.bulk_log
+            .iter()
+            .filter(|(dir, ..)| *dir == direction)
+            .map(|&(_, carry, _, length)| (carry, length))
+            .collect()
+    }
+
+    #[test]
+    fn bulk_round_trip_pins_toggle_continuity_across_transfers() {
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.open_bulk_in(1, false, 1, 64)).unwrap();
+        run(driver.open_bulk_out(1, false, 2, 64)).unwrap();
+
+        // The list is published: head -> IN ED -> OUT ED -> end, BulkListEnable on.
+        assert_eq!(
+            driver.io().register(reg::HC_BULK_HEAD_ED),
+            DMA_BASE + arena::BULK_IN_ED as u32
+        );
+        let in_ed = read_bulk_ed(driver.io(), arena::BULK_IN_ED);
+        assert_eq!(in_ed.next, DMA_BASE + arena::BULK_OUT_ED as u32);
+        assert_eq!(read_bulk_ed(driver.io(), arena::BULK_OUT_ED).next, 0);
+        assert_ne!(
+            driver.io().register(reg::HC_CONTROL) & bits::CONTROL_BLE,
+            0,
+            "open must set BulkListEnable"
+        );
+
+        // OUT: 96 bytes (2 packets at MPS 64 — even, carry stays DATA0), then 64
+        // (1 packet — carry flips to DATA1), then 32 (rides DATA1). The carries the
+        // device consumed pin toggle continuity ACROSS transfers (USB 2.0 §8.6) —
+        // the FromEd discipline the BOT data phase depends on.
+        run(driver.bulk_write(&[0xaa; 96])).unwrap();
+        run(driver.bulk_write(&[0xbb; 64])).unwrap();
+        run(driver.bulk_write(&[0xcc; 32])).unwrap();
+        assert_eq!(
+            bulk_carries(driver.io(), EdDirection::Out),
+            vec![(false, 96), (false, 64), (true, 32)]
+        );
+        assert_eq!(driver.io().bulk_out_received.len(), 3);
+        assert_eq!(driver.io().bulk_out_received[0], vec![0xaa; 96]);
+        assert_eq!(driver.io().bulk_out_received[2], vec![0xcc; 32]);
+
+        // IN: a full 64-byte answer (1 packet — carry flips), then a 13-byte SHORT
+        // packet into a 64-byte ask (the CSW shape: short reads are clean
+        // completions with the residue measured, the BOT requirement).
+        driver.io().bulk_in_answers.push_back(vec![0x11; 64]);
+        driver.io().bulk_in_answers.push_back(vec![0x22; 13]);
+        let mut buf = [0u8; 64];
+        assert_eq!(run(driver.bulk_read(&mut buf)).unwrap(), 64);
+        assert_eq!(buf, [0x11; 64]);
+        let received = run(driver.bulk_read(&mut buf)).unwrap();
+        assert_eq!(received, 13, "a short packet answers its real length");
+        assert_eq!(&buf[..13], &[0x22; 13]);
+        assert_eq!(
+            bulk_carries(driver.io(), EdDirection::In),
+            vec![(false, 64), (true, 13)]
+        );
+
+        // Polled mode: every bulk TD kept DI_NONE (no writeback interrupt asked for
+        // — the polled discipline; event mode is pinned separately).
+        assert!(
+            driver
+                .io()
+                .bulk_log
+                .iter()
+                .all(|&(_, _, di, _)| di == crate::schedule::DI_NONE),
+            "polled-mode bulk TDs must not request the writeback interrupt"
+        );
+    }
+
+    #[test]
+    fn bulk_write_chunks_an_oversized_payload_through_one_window() {
+        // 10 KiB > the 8 KiB arena window: the driver loops one TD per chunk
+        // (8 KiB + 2 KiB), toggle continuity riding the ED carry across chunks.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.open_bulk_out(1, false, 2, 64)).unwrap();
+        let payload: Vec<u8> = (0..0x2800u32).map(|i| i as u8).collect();
+        run(driver.bulk_write(&payload)).unwrap();
+        let received = &driver.io().bulk_out_received;
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].len(), arena::BULK_BUFFER_LEN as usize);
+        assert_eq!(received[1].len(), 0x800);
+        let mut joined = received[0].clone();
+        joined.extend_from_slice(&received[1]);
+        assert_eq!(joined, payload, "the chunks reassemble byte-exact");
+        // 8 KiB = 128 packets (even), 2 KiB = 32 packets (even): both start DATA0.
+        assert_eq!(
+            bulk_carries(driver.io(), EdDirection::Out),
+            vec![(false, 0x2000), (false, 0x800)]
+        );
+    }
+
+    #[test]
+    fn a_bulk_stall_recovers_the_halted_ed_and_resets_the_toggle() {
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.open_bulk_in(1, false, 1, 64)).unwrap();
+
+        // Advance the toggle off DATA0 first, so the post-recovery reset is visible.
+        driver.io().bulk_in_answers.push_back(vec![0x11; 64]);
+        let mut buf = [0u8; 64];
+        assert_eq!(run(driver.bulk_read(&mut buf)).unwrap(), 64);
+        assert!(read_bulk_ed(driver.io(), arena::BULK_IN_ED).toggle_carry);
+
+        // The device STALLs the next IN (BOT error signalling): typed `Stall`, and
+        // the driver recovers the HOST half before returning — Halt cleared,
+        // toggleCarry back to DATA0 (matching the device's toggle after the
+        // CLEAR_FEATURE(ENDPOINT_HALT) the consumer owes).
+        driver.io().bulk_stall_next_in = true;
+        assert_eq!(run(driver.bulk_read(&mut buf)), Err(DriverError::Stall));
+        let ed = read_bulk_ed(driver.io(), arena::BULK_IN_ED);
+        assert!(!ed.halted, "the Halt bit must be cleared by the recovery");
+        assert!(!ed.toggle_carry, "the toggle must reset to DATA0");
+
+        // The endpoint is live again, restarting at DATA0.
+        driver.io().bulk_in_answers.push_back(vec![0x33; 8]);
+        assert_eq!(run(driver.bulk_read(&mut buf)).unwrap(), 8);
+        let carries = bulk_carries(driver.io(), EdDirection::In);
+        assert_eq!(
+            carries.last(),
+            Some(&(false, 8)),
+            "the post-recovery transfer must restart at DATA0"
+        );
+    }
+
+    #[test]
+    fn a_nak_forever_bulk_device_times_out_typed_and_the_endpoint_survives() {
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.open_bulk_in(1, false, 1, 64)).unwrap();
+
+        // NAK forever: the bounded drain expires, the driver TAKES THE TD BACK (the
+        // sKip-fence cancel), and reports typed — never a hang.
+        driver.io().bulk_nak_in = true;
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            run(driver.bulk_read(&mut buf)),
+            Err(DriverError::Timeout("bulk transfer"))
+        );
+        let ed = read_bulk_ed(driver.io(), arena::BULK_IN_ED);
+        assert!(!ed.skip, "the cancel must lift its own sKip fence");
+        assert_eq!(ed.head, ed.tail, "the cancelled TD must leave the queue");
+        assert!(!ed.halted);
+
+        // The device comes back: the next transfer flows over the same ED.
+        driver.io().bulk_nak_in = false;
+        driver.io().bulk_in_answers.push_back(vec![0x44; 16]);
+        assert_eq!(run(driver.bulk_read(&mut buf)).unwrap(), 16);
+        assert_eq!(&buf[..16], &[0x44; 16]);
+    }
+
+    #[test]
+    fn bulk_and_the_interrupt_keyboard_coexist() {
+        // The check-usb invariant, host-pinned: opening and driving the bulk pair
+        // must not disturb the periodic schedule (the kbd keeps reporting), and
+        // vice versa — both list enables live side by side.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.open_interrupt_in(1, false, 1, 8, 1)).unwrap();
+
+        let mut report = [0u8; 8];
+        driver.io().pending_reports.push_back(vec![0, 0, 0x0b, 0]);
+        let mut received = None;
+        for _ in 0..200 {
+            if let Some(length) = run(driver.poll_interrupt(&mut report)).unwrap() {
+                received = Some(length);
+                break;
+            }
+        }
+        assert_eq!(received, Some(4), "the kbd reports before bulk opens");
+
+        run(driver.open_bulk_in(2, false, 1, 64)).unwrap();
+        run(driver.open_bulk_out(2, false, 2, 64)).unwrap();
+        let control = driver.io().register(reg::HC_CONTROL);
+        assert_ne!(control & bits::CONTROL_PLE, 0, "periodic stays enabled");
+        assert_ne!(control & bits::CONTROL_BLE, 0, "bulk is enabled");
+
+        run(driver.bulk_write(&[0x55; 31])).unwrap();
+        driver.io().bulk_in_answers.push_back(vec![0x66; 13]);
+        let mut buf = [0u8; 64];
+        assert_eq!(run(driver.bulk_read(&mut buf)).unwrap(), 13);
+
+        // And the keyboard still reports after the bulk traffic.
+        driver.io().pending_reports.push_back(vec![0, 0, 0x28, 0]);
+        let mut received = None;
+        for _ in 0..200 {
+            if let Some(length) = run(driver.poll_interrupt(&mut report)).unwrap() {
+                received = Some(length);
+                break;
+            }
+        }
+        assert_eq!(received, Some(4), "the kbd must keep reporting after bulk");
+        assert_eq!(&report[..4], &[0, 0, 0x28, 0]);
+    }
+
+    #[test]
+    fn event_mode_bulk_requests_writebacks_and_reaps_them_counted() {
+        // The area/37 credit discipline applied to bulk: in event mode every bulk
+        // TD requests the done-queue writeback (DI = 0) and the transfer reaps it
+        // COUNTED before returning — no unconsumed chain, no unacknowledged WDH,
+        // so the slots are safely reusable and the next endpoint wait cannot
+        // inherit a stale edge.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.enable_events()).unwrap();
+        run(driver.open_bulk_in(1, false, 1, 64)).unwrap();
+        run(driver.open_bulk_out(1, false, 2, 64)).unwrap();
+
+        run(driver.bulk_write(&[0x5a; 31])).unwrap();
+        assert_eq!(driver.io().done_head, 0, "the OUT writeback was reaped");
+        assert!(!driver.io().wdh, "WDH acknowledged after the OUT reap");
+
+        driver.io().bulk_in_answers.push_back(vec![0x99; 13]);
+        let mut buf = [0u8; 64];
+        assert_eq!(run(driver.bulk_read(&mut buf)).unwrap(), 13);
+        assert_eq!(driver.io().done_head, 0, "the IN writeback was reaped");
+        assert!(!driver.io().wdh, "WDH acknowledged after the IN reap");
+
+        assert!(
+            driver
+                .io()
+                .bulk_log
+                .iter()
+                .all(|&(_, _, di, _)| di == DI_IMMEDIATE),
+            "event-mode bulk TDs must request the writeback interrupt"
+        );
+    }
+
+    #[test]
+    fn event_mode_bulk_and_keyboard_share_the_done_queue_cleanly() {
+        // Interleave WDH-parked keyboard reads with counted bulk reaps on the same
+        // controller: the count/credit accounting must keep every writeback
+        // attributed — no leftover chain, no starved read.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.enable_events()).unwrap();
+        run(driver.open_interrupt_in(1, false, 1, 8, 10)).unwrap();
+        run(driver.open_bulk_in(2, false, 1, 64)).unwrap();
+        run(driver.open_bulk_out(2, false, 2, 64)).unwrap();
+
+        let mut report = [0u8; 8];
+        driver.io().pending_reports.push_back(vec![0, 0, 0x0b, 0]);
+        driver.io().wait_script.push_back(WaitOutcome::Delivered);
+        let read = run(driver.read_report(&mut report)).unwrap();
+        assert_eq!(read.length, Some(4));
+
+        run(driver.bulk_write(&[0xab; 64])).unwrap();
+        driver.io().bulk_in_answers.push_back(vec![0xcd; 36]);
+        let mut buf = [0u8; 64];
+        assert_eq!(run(driver.bulk_read(&mut buf)).unwrap(), 36);
+
+        driver.io().pending_reports.push_back(vec![0, 0, 0x28, 0]);
+        driver.io().wait_script.push_back(WaitOutcome::Delivered);
+        let read = run(driver.read_report(&mut report)).unwrap();
+        assert_eq!(read.length, Some(4), "the kbd read survives bulk traffic");
+        assert_eq!(driver.io().done_head, 0, "nothing left on the accumulator");
+        assert!(!driver.io().wdh, "no unacknowledged WDH at rest");
+    }
+
+    #[test]
+    fn the_strict_mock_refuses_bulk_traffic_without_ble() {
+        // BulkListEnable is load-bearing (the strictness sibling of the
+        // PeriodicStart pin): sabotage it and the queued TD must NOT move; restore
+        // it and the same endpoint flows.
+        let mut driver = Ohci::new(MockOhci::new());
+        run(driver.bring_up()).unwrap();
+        run(driver.open_bulk_out(1, false, 2, 64)).unwrap();
+        let control = driver.io().register(reg::HC_CONTROL);
+        driver
+            .io()
+            .registers
+            .insert(reg::HC_CONTROL, control & !bits::CONTROL_BLE);
+        assert_eq!(
+            run(driver.bulk_write(&[0x77; 8])),
+            Err(DriverError::Timeout("bulk transfer")),
+            "the strict mock must move no bulk bytes with BLE clear"
+        );
+        assert!(driver.io().bulk_out_received.is_empty());
+
+        driver.io().registers.insert(reg::HC_CONTROL, control);
+        run(driver.bulk_write(&[0x88; 8])).unwrap();
+        assert_eq!(driver.io().bulk_out_received, vec![vec![0x88; 8]]);
     }
 }

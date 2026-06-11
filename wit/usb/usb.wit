@@ -1,6 +1,6 @@
 /// eo9:usb — a USB host capability at the device level: root-hub port status, device
-/// attachment (reset + address + descriptor head), control transfers, and interrupt-IN
-/// endpoints.
+/// attachment (reset + address + descriptor head), control transfers, interrupt-IN
+/// endpoints, and bulk endpoints.
 ///
 /// This is what a USB *host controller driver* exports and what USB-aware programs
 /// import (docs/board/usb-ohci-plan.md §2): the controller shells (`usb.ohci` over
@@ -9,11 +9,14 @@
 /// `hidcheck`, eventually the HID-to-console service) speaks setup packets and
 /// descriptors — the same split eo9:net draws between the NIC driver and the l2
 /// consumer. The interface is deliberately transfer-shaped, not class-shaped: HID,
-/// hubs, and everything else are the consumer's business.
+/// hubs, mass storage, and everything else are the consumer's business.
 ///
-/// v1 scope is what a boot-protocol keyboard/mouse needs — control transfers and
-/// interrupt-IN polling. Bulk and isochronous endpoints arrive with their first
-/// consumer.
+/// v1 scope was what a boot-protocol keyboard/mouse needs — control transfers and
+/// interrupt-IN polling. Bulk endpoints arrived with their first consumer (`usb.msd`,
+/// docs/board/usb-msd-plan.md §1.1): `open-bulk-in`/`open-bulk-out` plus
+/// `bulk-read`/`bulk-write`, transfer-shaped like everything else — the Bulk-Only
+/// Transport protocol that rides them lives in the consumer. Isochronous endpoints
+/// still await theirs.
 package eo9:usb@0.1.0;
 
 /// Root-handle type (types-only interface — see plan/02-wit.md Decisions).
@@ -88,7 +91,10 @@ interface usb {
 
     /// An attached (reset + addressed) device on one root-hub port.
     resource device;
-    /// An opened interrupt-IN endpoint on an attached device.
+    /// An opened endpoint on an attached device: interrupt-IN (`open-interrupt-in`,
+    /// read with `read`) or bulk (`open-bulk-in`/`open-bulk-out`, moved with
+    /// `bulk-read`/`bulk-write`). Operations of the wrong shape for the endpoint's
+    /// kind answer `unsupported`.
     resource endpoint;
 
     /// Bring up the controller if needed (claiming it through the underlying
@@ -150,12 +156,51 @@ interface usb {
         interval-ms: u8,
     ) -> result<endpoint, usb-error>;
 
+    /// Open a bulk-IN endpoint (number and max packet size come from the device's
+    /// configuration descriptor, which the consumer parsed). The data toggle starts
+    /// at DATA0 — open after SET_CONFIGURATION (USB 2.0 §9.4.5) — and lives in the
+    /// provider for the endpoint's lifetime. Re-opening the same direction resets
+    /// the toggle to DATA0.
+    open-bulk-in: async func(
+        d: borrow<device>,
+        endpoint: u8,
+        max-packet: u16,
+    ) -> result<endpoint, usb-error>;
+
+    /// Open a bulk-OUT endpoint. Same contract as `open-bulk-in`.
+    open-bulk-out: async func(
+        d: borrow<device>,
+        endpoint: u8,
+        max-packet: u16,
+    ) -> result<endpoint, usb-error>;
+
+    /// Read up to `length` bytes from a bulk-IN endpoint. Short reads are normal
+    /// (the device terminates a bulk transfer with a short or zero-length packet —
+    /// same contract as `read`); the provider may also answer fewer bytes than
+    /// `length` per call (its transfer-window grain) — loop until the protocol
+    /// layer's expected count is in.
+    ///
+    /// A `stall` answer is the device halting the endpoint (BOT error signalling):
+    /// the provider has already recovered ITS half (the halted schedule entry is
+    /// cleared and the host-side toggle reset to DATA0); the consumer must issue
+    /// CLEAR_FEATURE(ENDPOINT_HALT) via `control-out` — which resets the DEVICE's
+    /// toggle to DATA0 (USB 2.0 §9.4.5) — before the next transfer on this endpoint.
+    bulk-read: async func(e: borrow<endpoint>, length: u32) -> result<list<u8>, usb-error>;
+
+    /// Write `data` to a bulk-OUT endpoint (the provider loops over its
+    /// transfer-window grain internally; the call returns once every byte is
+    /// accepted). Empty `data` sends one zero-length packet. `stall` carries the
+    /// same halt-recovery contract as `bulk-read`.
+    bulk-write: async func(e: borrow<endpoint>, data: list<u8>) -> result<_, usb-error>;
+
     /// Whether reads on this endpoint are event-driven: `true` means `read` parks on
     /// the controller's interrupt (the consumer drops its poll pacing and just calls
     /// `read` again on an empty answer); `false` means reads are short polls and the
     /// consumer owns the pacing (the capability-gated fallback where the underlying
     /// device capability routes no interrupts — drivers hold no time capability, so
-    /// the pacing has to live with the consumer).
+    /// the pacing has to live with the consumer). Bulk transfers complete within the
+    /// call either way (their completions ride the same done-queue writeback; the
+    /// flag matters to `read` pacing only).
     event-driven: func(e: borrow<endpoint>) -> bool;
 
     /// The next report on the endpoint. Where the controller's interrupt is routed
