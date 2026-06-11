@@ -193,9 +193,16 @@ enum EscState {
 /// Escape-sequence decoder for the page's per-keystroke input: raw bytes in (the page
 /// encodes keydown events as the SAME stream the serial console and usb.kbd produce),
 /// semantic [`WitKey`]s out. Mirrors the kernel's `keydecoder::KeyDecoder` (mirrored,
-/// not reused — that module is kernel-private and this crate targets wasm32): arrows
-/// decode, unknown CSI finals are consumed silently (no `[A`-style garbage leaks into a
-/// line), a lone ESC is dropped and the byte after it decodes normally.
+/// not reused — that module lives inside the eo9-kernel BINARY crate, so it is not
+/// importable; extracting a shared `eo9-keydec` crate is the recorded follow-up, GAPS
+/// "the web blob carries a KeyDecoder copy"): arrows decode, unknown CSI finals are
+/// consumed silently (no `[A`-style garbage leaks into a line), a lone ESC is dropped
+/// and the byte after it decodes normally.
+///
+/// CONTRACT CORPUS: the test module at the bottom of this file carries the kernel
+/// suite's exact byte vectors (kernel/eo9-kernel/src/keydecoder.rs, the area/31
+/// tests). Any change to either decoder must keep both suites green on the SAME
+/// vectors — two copies are tolerable only while they are provably identical.
 #[derive(Default)]
 struct KeyDecoder {
     state: EscState,
@@ -293,6 +300,7 @@ enum WitTextError {
 #[derive(Clone, Copy, ComponentType, Lift, Lower)]
 #[component(variant)]
 #[allow(dead_code)] // Eof satisfies the interface type (end-of-input is the `none` answer)
+#[cfg_attr(test, derive(Debug, PartialEq))]
 enum WitKey {
     #[component(name = "char")]
     Char(u8),
@@ -897,4 +905,70 @@ fn add_gfx(linker: &mut Linker<WebState>) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+
+// -------------------------------------------------------------------------------------
+// The KeyDecoder contract corpus (host tests): the kernel suite's exact vectors
+// (kernel/eo9-kernel/src/keydecoder.rs) against this mirrored copy — drift between the
+// two decoders fails here, never silently in the page.
+// -------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod keydecoder_contract {
+    use super::{KeyDecoder, WitKey};
+
+    fn events(bytes: &[u8]) -> Vec<WitKey> {
+        let mut decoder = KeyDecoder::default();
+        bytes.iter().filter_map(|&byte| decoder.push(byte)).collect()
+    }
+
+    #[test]
+    fn arrows_decode_to_their_events() {
+        assert_eq!(events(b"\x1b[A"), [WitKey::Up]);
+        assert_eq!(events(b"\x1b[B"), [WitKey::Down]);
+        assert_eq!(events(b"\x1b[C"), [WitKey::Right]);
+        assert_eq!(events(b"\x1b[D"), [WitKey::Left]);
+        assert_eq!(events(b"\x1bOA"), [WitKey::Up]);
+    }
+
+    #[test]
+    fn unknown_csi_finals_are_consumed_silently() {
+        assert_eq!(events(b"\x1b[H"), []);
+        assert_eq!(events(b"\x1b[Hx"), [WitKey::Char(b'x')]);
+        assert_eq!(events(b"\x1b[F"), []);
+        assert_eq!(events(b"\x1b[Fx"), [WitKey::Char(b'x')]);
+    }
+
+    #[test]
+    fn parameter_byte_sequences_are_consumed_whole() {
+        assert_eq!(events(b"\x1b[3~"), []);
+        assert_eq!(events(b"\x1b[3~x"), [WitKey::Char(b'x')]);
+        assert_eq!(events(b"\x1b[1;2A"), [WitKey::Up]);
+    }
+
+    #[test]
+    fn lone_and_doubled_esc_resolve_to_the_following_byte() {
+        assert_eq!(events(b"\x1bx"), [WitKey::Char(b'x')]);
+        assert_eq!(events(b"\x1b\x1b[A"), [WitKey::Up]);
+    }
+
+    #[test]
+    fn sequences_split_across_pushes_hold_state() {
+        let mut decoder = KeyDecoder::default();
+        assert_eq!(decoder.push(0x1b), None);
+        assert_eq!(decoder.push(b'['), None);
+        assert_eq!(decoder.push(b'3'), None);
+        assert_eq!(decoder.push(b'~'), None);
+        assert_eq!(decoder.push(b'q'), Some(WitKey::Char(b'q')));
+    }
+
+    #[test]
+    fn plain_bytes_decode_unchanged() {
+        assert_eq!(events(b"\r"), [WitKey::Enter]);
+        assert_eq!(events(b"\x7f"), [WitKey::Backspace]);
+        assert_eq!(events(b"\t"), [WitKey::Tab]);
+        assert_eq!(events(b"\x03"), [WitKey::Ctrl(0x03)]);
+        assert_eq!(events(b"hi"), [WitKey::Char(b'h'), WitKey::Char(b'i')]);
+    }
 }
