@@ -1021,3 +1021,13 @@ declaring its own world with the wrap idiom (a fresh exported interface whose
 resource wraps the imported one, the disk-part world.wit shape). When disk.readonly
 (or any disk middleware) gets built, use the wrap idiom — do not copy the dormant
 world. Lane: fix or delete the dormant world so it cannot be copied.
+
+## Bundle residue sub-case: cross-lane blob merges (area/51 workaround 4, reviewer-confirmed 2026-06-10)
+A `--theirs` (or `--ours`) resolution of a bundle-blob merge conflict can take a
+STALE blob from the side whose sources lost the merge — area/51's first resolution
+took a pre-bulk OHCI shell (caught by the lane, rebuilt ee878f2f), and the review's
+post-merge canonical refresh re-canonicalized both shells again (2 blobs changed).
+The standing rule covers it mechanically — blob conflicts are resolved arbitrarily
+and the MAIN-CHECKOUT refresh immediately after is the canonical step, never
+skippable — but the sub-case is recorded so a future reviewer treats any --theirs
+blob resolution as provisional until the refresh lands.
