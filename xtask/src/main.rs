@@ -477,15 +477,13 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             expect_no_args("check-kexec", rest)?;
             check_kexec(&root)
         }
-<<<<<<< HEAD
         "check-share" => {
             expect_no_args("check-share", rest)?;
             check_share(&root)
-=======
+        }
         "check-part" => {
             expect_no_args("check-part", rest)?;
             check_part(&root)
->>>>>>> area/50-disk-part
         }
         "check-curl" => {
             expect_no_args("check-curl", rest)?;
