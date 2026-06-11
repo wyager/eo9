@@ -131,9 +131,14 @@ fn render_expected<T: 'static>(state: &dyn IncParse<T>) -> String {
         let has_word = has(b'a') && has(b'z') && has(b'0');
         let mut comps: Vec<Completion> = Vec::new();
         state.completions(&mut comps);
-        if has_word {
-            items.push(String::from("a word"));
-        } else if !comps.is_empty() {
+        // The interesting bytes: everything but whitespace and the comment opener
+        // (both are always-available noise next to the real expectation).
+        let interesting: Vec<u8> = bytes
+            .iter()
+            .copied()
+            .filter(|&b| !matches!(b, 0x09..=0x0D | b' ' | b'#'))
+            .collect();
+        if !has_word && !comps.is_empty() {
             // Keyword-only position: name the words themselves.
             let mut words: Vec<String> = comps.into_iter().map(|c| c.word).collect();
             words.sort();
@@ -144,31 +149,30 @@ fn render_expected<T: 'static>(state: &dyn IncParse<T>) -> String {
                 format!("one of: {}", words.join(", "))
             };
             items.push(shown);
-        }
-        if has(b'"') {
-            items.push(String::from("a quoted string"));
-        }
-        for &(byte, label) in &[
-            (b'$', "`$`"),
-            (b'&', "`&`"),
-            (b'(', "`(`"),
-            (b')', "`)`"),
-            (b',', "`,`"),
-            (b'=', "`=`"),
-        ] {
-            if has(byte) {
-                items.push(String::from(label));
-            }
-        }
-        if items.is_empty() {
-            // Small exact sets nothing above covered (e.g. the five escape bytes
-            // inside a quoted string): list them verbatim, skipping whitespace and
-            // the comment opener.
-            for &b in &bytes {
-                if b.is_ascii_whitespace() || b == b'#' {
-                    continue;
-                }
+        } else if !has_word && interesting.len() <= 6 {
+            // A small exact set (the `=` after a let name, the five escape bytes
+            // inside a quoted string, a gate's `,`/`$`): list it verbatim.
+            for &b in &interesting {
                 items.push(format!("`{}`", char::from(b).escape_debug()));
+            }
+        } else {
+            if has_word {
+                items.push(String::from("a word"));
+            }
+            if has(b'"') {
+                items.push(String::from("a quoted string"));
+            }
+            for &(byte, label) in &[
+                (b'$', "`$`"),
+                (b'&', "`&`"),
+                (b'(', "`(`"),
+                (b')', "`)`"),
+                (b',', "`,`"),
+                (b'=', "`=`"),
+            ] {
+                if has(byte) {
+                    items.push(String::from(label));
+                }
             }
         }
     }
@@ -849,6 +853,35 @@ mod tests {
     }
 
     // -- errors ---------------------------------------------------------------------
+
+    /// Representative renderings of the positional errors — the user-facing strings
+    /// (sessions prefix them with "parse error: "). Pinned so the rendering cannot
+    /// drift silently; update deliberately when the renderer is improved.
+    #[test]
+    fn error_messages_render_position_and_admissible_set() {
+        let msg = |line: &str| parse_command(line).expect_err(line).to_string();
+        assert_eq!(
+            msg("only eo9:fs cruncher"),
+            "at column 13: expected `$` or `,`, found `c`"
+        );
+        assert_eq!(msg("svc restart ticker").contains("one of:"), true);
+        assert_eq!(
+            msg("let x memfs"),
+            "at column 7: expected `=`, found `m`"
+        );
+        assert_eq!(
+            msg("browser ) extra").contains("end of line"),
+            true
+        );
+        assert!(msg("echo \"unterminated").contains("not closed"), "{}", msg("echo \"unterminated"));
+        assert!(msg("echo \"bad \\q escape\"").contains("`\\\\`"), "{}", msg("echo \"bad \\q escape\""));
+        assert!(msg("browser --url").starts_with("unexpected end of line"));
+        assert!(msg("detach n = x").starts_with("unexpected end of line"));
+        // Column counts characters, not bytes.
+        let err = parse_command("héllo )x").expect_err("trailing )");
+        assert_eq!(err.column, 7);
+        assert_eq!(err.found, Some(')'));
+    }
 
     #[test]
     fn unclosed_group_is_an_error() {
