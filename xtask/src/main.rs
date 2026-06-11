@@ -2442,6 +2442,15 @@ fn build_kernel_opi5plus(root: &Path, minimal: bool) -> Result<PathBuf, String> 
                 //   sinkcheck --text hello      (sink mechanics without a keyboard)
                 ("eo9-stub-usb-kbd", "usb.kbd"),
                 ("eo9-example-sinkcheck", "sinkcheck"),
+                // The stick-flash chain (docs/board/usb-msd-plan.md R1's first move):
+                // the board rewrites its own boot stick from the serial-loaded image —
+                //   usb.ohci --region usb-host1-ohci $ usb.msd $ disk.part --partition 1
+                //     $ stickflash --secret <16+ bytes>
+                // (the stick sits on usb_host1; the kbd service owns usb-host0-ohci —
+                // see the plan's R1 drill for the region/collision rule).
+                ("eo9-stub-usb-msd", "usb.msd"),
+                ("eo9-stub-disk-part", "disk.part"),
+                ("eo9-example-stickflash", "stickflash"),
                 // init, so the default boot runs the service supervisor and the
                 // console session holds eo9:svc — `detach kbd = usb.ohci $ usb.kbd
                 // restart restart.always` is the demo's persistent keyboard shape.
