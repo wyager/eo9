@@ -400,11 +400,21 @@ struct ShellDevice {
     config: Vec<u8>,
 }
 
-/// The opened interrupt-IN endpoint (one per controller in v1 — the core owns its
-/// re-arm state). Carries whether reads park on the controller interrupt, decided
-/// once at bring-up by capability availability (the consumer's pacing signal).
+/// An opened endpoint: the interrupt-IN report endpoint or one half of the bulk
+/// pair (one of each per controller in v1 — the core owns the schedule state).
+/// Carries whether reads park on the controller interrupt, decided once at bring-up
+/// by capability availability (the consumer's pacing signal), and which kind of
+/// endpoint the handle names (wrong-shaped operations answer `unsupported`).
 struct ShellEndpoint {
     events: bool,
+    kind: EndpointKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EndpointKind {
+    InterruptIn,
+    BulkIn,
+    BulkOut,
 }
 
 impl types::Guest for Shell {
@@ -597,14 +607,79 @@ impl usb::Guest for Shell {
             .map_err(map_driver_error)?;
         Ok(usb::Endpoint::new(ShellEndpoint {
             events: guard.events(),
+            kind: EndpointKind::InterruptIn,
         }))
+    }
+
+    async fn open_bulk_in(
+        d: usb::DeviceBorrow<'_>,
+        endpoint: u8,
+        max_packet: u16,
+    ) -> Result<usb::Endpoint, UsbError> {
+        let device = d.get::<ShellDevice>();
+        let (address, low_speed) = (device.address, device.low_speed);
+        let mut guard = acquire().await?;
+        guard
+            .open_bulk_in(address, low_speed, endpoint, max_packet)
+            .await
+            .map_err(map_driver_error)?;
+        Ok(usb::Endpoint::new(ShellEndpoint {
+            events: guard.events(),
+            kind: EndpointKind::BulkIn,
+        }))
+    }
+
+    async fn open_bulk_out(
+        d: usb::DeviceBorrow<'_>,
+        endpoint: u8,
+        max_packet: u16,
+    ) -> Result<usb::Endpoint, UsbError> {
+        let device = d.get::<ShellDevice>();
+        let (address, low_speed) = (device.address, device.low_speed);
+        let mut guard = acquire().await?;
+        guard
+            .open_bulk_out(address, low_speed, endpoint, max_packet)
+            .await
+            .map_err(map_driver_error)?;
+        Ok(usb::Endpoint::new(ShellEndpoint {
+            events: guard.events(),
+            kind: EndpointKind::BulkOut,
+        }))
+    }
+
+    async fn bulk_read(e: usb::EndpointBorrow<'_>, length: u32) -> Result<Vec<u8>, UsbError> {
+        if e.get::<ShellEndpoint>().kind != EndpointKind::BulkIn {
+            return Err(UsbError::Unsupported);
+        }
+        let mut guard = acquire().await?;
+        // One TD per call, clamped to the arena's bulk window: an answer shorter
+        // than the ask is the WIT's short-read contract — the consumer loops.
+        let ask = (length as u64).min(arena::BULK_BUFFER_LEN) as usize;
+        let mut buffer = alloc::vec![0u8; ask];
+        let received = guard
+            .bulk_read(&mut buffer)
+            .await
+            .map_err(map_driver_error)?;
+        buffer.truncate(received);
+        Ok(buffer)
+    }
+
+    async fn bulk_write(e: usb::EndpointBorrow<'_>, data: Vec<u8>) -> Result<(), UsbError> {
+        if e.get::<ShellEndpoint>().kind != EndpointKind::BulkOut {
+            return Err(UsbError::Unsupported);
+        }
+        let mut guard = acquire().await?;
+        guard.bulk_write(&data).await.map_err(map_driver_error)
     }
 
     fn event_driven(e: usb::EndpointBorrow<'_>) -> bool {
         e.get::<ShellEndpoint>().events
     }
 
-    async fn read(_e: usb::EndpointBorrow<'_>) -> Result<Vec<u8>, UsbError> {
+    async fn read(e: usb::EndpointBorrow<'_>) -> Result<Vec<u8>, UsbError> {
+        if e.get::<ShellEndpoint>().kind != EndpointKind::InterruptIn {
+            return Err(UsbError::Unsupported);
+        }
         let mut guard = acquire().await?;
         let mut report = [0u8; arena::INTERRUPT_BUFFER_LEN as usize];
         match guard.read_report(&mut report).await {

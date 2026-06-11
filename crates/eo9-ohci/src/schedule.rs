@@ -356,9 +356,16 @@ pub mod arena {
     pub const CONTROL_ED: u64 = 0x100;
     /// The interrupt ED (the HID interrupt-IN endpoint).
     pub const INTERRUPT_ED: u64 = 0x110;
-    /// TD pool: slots of 16 bytes.
+    /// TD pool: slots of 16 bytes. Slot ownership: 0-3 the control path, 4-5 the
+    /// interrupt endpoint's ping-pong pair, 6-7 the bulk-IN pair, 8-9 the bulk-OUT
+    /// pair (each pair is pending TD + dummy tail, the same shape everywhere).
     pub const TD_POOL: u64 = 0x120;
-    pub const TD_SLOTS: u64 = 8;
+    pub const TD_SLOTS: u64 = 10;
+    /// The two resident bulk EDs (IN then OUT on the bulk list —
+    /// docs/board/usb-msd-plan.md §1.1; resident so the controller-owned toggleCarry
+    /// survives across transfers, which is exactly what `TdToggle::FromEd` is for).
+    pub const BULK_IN_ED: u64 = 0x1c0;
+    pub const BULK_OUT_ED: u64 = 0x1d0;
     /// Control-transfer data buffer (descriptor reads fit comfortably).
     pub const CONTROL_BUFFER: u64 = 0x200;
     pub const CONTROL_BUFFER_LEN: u64 = 0x200;
@@ -367,8 +374,15 @@ pub mod arena {
     /// Interrupt-IN report buffer.
     pub const INTERRUPT_BUFFER: u64 = 0x440;
     pub const INTERRUPT_BUFFER_LEN: u64 = 0x40;
+    /// Bulk data buffer: one general TD's reach is at most two 4 KiB pages
+    /// (OHCI 1.0a §4.3.1.1), and this window starts page-aligned within the
+    /// page-aligned arena, so a full-window transfer is exactly one TD — the v1
+    /// one-TD-at-a-time grain (8 KiB per round against a ~1 MB/s full-speed bus;
+    /// TD chaining is the recorded follow-up, usb-msd-plan §1.1).
+    pub const BULK_BUFFER: u64 = 0x1000;
+    pub const BULK_BUFFER_LEN: u64 = 0x2000;
     /// Total arena size to allocate.
-    pub const SIZE: u64 = 0x1000;
+    pub const SIZE: u64 = 0x3000;
 
     /// Offset of TD-pool slot `slot`.
     pub const fn td_slot(slot: u64) -> u64 {
@@ -421,6 +435,23 @@ mod tests {
         let bytes = ed.encode();
         // dword0 = FA=2 | EN=1<<7 | D=10<<11 | K=1<<14 | MPS=8<<16 = 0x0008_5082.
         assert_eq!(&bytes[0..4], &0x0008_5082u32.to_le_bytes());
+    }
+
+    #[test]
+    fn ed_bulk_out_shape() {
+        // A full-speed bulk-OUT endpoint 2 on function 1, MPS 64 — the usb-storage
+        // shape (direction encoded in the ED, TDs carry FromEd toggles).
+        let ed = EndpointDescriptor {
+            function_address: 1,
+            endpoint_number: 2,
+            direction: EdDirection::Out,
+            max_packet_size: 64,
+            ..EndpointDescriptor::default()
+        };
+        let bytes = ed.encode();
+        // dword0 = FA=1 | EN=2<<7 | D=01<<11 | MPS=64<<16 = 0x0040_0901.
+        assert_eq!(&bytes[0..4], &0x0040_0901u32.to_le_bytes());
+        assert_eq!(EndpointDescriptor::decode(&bytes), ed);
     }
 
     #[test]
@@ -534,17 +565,26 @@ mod tests {
         assert_eq!(arena::HCCA % 256, 0);
         assert_eq!(arena::CONTROL_ED % 16, 0);
         assert_eq!(arena::INTERRUPT_ED % 16, 0);
+        assert_eq!(arena::BULK_IN_ED % 16, 0);
+        assert_eq!(arena::BULK_OUT_ED % 16, 0);
         for slot in 0..arena::TD_SLOTS {
             assert_eq!(arena::td_slot(slot) % 16, 0);
         }
+        // The bulk buffer starts page-aligned so its full window spans exactly the
+        // two physical pages one general TD can address (§4.3.1.1).
+        assert_eq!(arena::BULK_BUFFER % 0x1000, 0);
+        assert_eq!(arena::BULK_BUFFER_LEN, 0x2000);
         let windows = [
             (arena::HCCA, super::hcca::SIZE),
             (arena::CONTROL_ED, 16),
             (arena::INTERRUPT_ED, 16),
+            (arena::BULK_IN_ED, 16),
+            (arena::BULK_OUT_ED, 16),
             (arena::TD_POOL, 16 * arena::TD_SLOTS),
             (arena::CONTROL_BUFFER, arena::CONTROL_BUFFER_LEN),
             (arena::SETUP_BUFFER, 8),
             (arena::INTERRUPT_BUFFER, arena::INTERRUPT_BUFFER_LEN),
+            (arena::BULK_BUFFER, arena::BULK_BUFFER_LEN),
         ];
         for (i, &(start_a, len_a)) in windows.iter().enumerate() {
             assert!(start_a + len_a <= arena::SIZE);
